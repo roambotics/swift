@@ -2907,8 +2907,10 @@ namespace {
       
       // For native key paths, traverse the key path components to set up
       // appropriate type relationships at each level.
+      auto rootLocator =
+          CS.getConstraintLocator(E, ConstraintLocator::KeyPathRoot);
       auto locator = CS.getConstraintLocator(E);
-      Type root = CS.createTypeVariable(locator);
+      Type root = CS.createTypeVariable(rootLocator);
 
       // If a root type was explicitly given, then resolve it now.
       if (auto rootRepr = E->getRootType()) {
@@ -3015,7 +3017,9 @@ namespace {
         base = optTy;
       }
 
-      auto rvalueBase = CS.createTypeVariable(locator);
+      auto baseLocator =
+          CS.getConstraintLocator(E, ConstraintLocator::KeyPathValue);
+      auto rvalueBase = CS.createTypeVariable(baseLocator);
       CS.addConstraint(ConstraintKind::Equal, base, rvalueBase, locator);
       
       // The result is a KeyPath from the root to the end component.
@@ -3272,6 +3276,38 @@ namespace {
         if (isa<ParenExpr>(expr) || isa<TupleExpr>(expr)) {
           if (shouldSanitizeArgumentList(expr))
             expr = sanitizeArgumentList(expr);
+        }
+
+        // If this expression represents keypath based dynamic member
+        // lookup, let's convert it back to the original form of
+        // member or subscript reference.
+        if (auto *SE = dyn_cast<SubscriptExpr>(expr)) {
+          if (auto *TE = dyn_cast<TupleExpr>(SE->getIndex())) {
+            auto isImplicitKeyPathExpr = [](Expr *argExpr) -> bool {
+              if (auto *KP = dyn_cast<KeyPathExpr>(argExpr))
+                return KP->isImplicit();
+              return false;
+            };
+
+            if (TE->isImplicit() && TE->getNumElements() == 1 &&
+                TE->getElementName(0) == TC.Context.Id_dynamicMember &&
+                isImplicitKeyPathExpr(TE->getElement(0))) {
+              auto *keyPathExpr = cast<KeyPathExpr>(TE->getElement(0));
+              auto *componentExpr = keyPathExpr->getParsedPath();
+
+              if (auto *UDE = dyn_cast<UnresolvedDotExpr>(componentExpr)) {
+                UDE->setBase(SE->getBase());
+                return {true, UDE};
+              }
+
+              if (auto *subscript = dyn_cast<SubscriptExpr>(componentExpr)) {
+                subscript->setBase(SE->getBase());
+                return {true, subscript};
+              }
+
+              llvm_unreachable("unknown keypath component type");
+            }
+          }
         }
 
         // Now, we're ready to walk into sub expressions.

@@ -117,6 +117,7 @@ bool constraints::areConservativelyCompatibleArgumentLabels(
 
   case OverloadChoiceKind::BaseType:
   case OverloadChoiceKind::DynamicMemberLookup:
+  case OverloadChoiceKind::KeyPathDynamicMemberLookup:
   case OverloadChoiceKind::TupleIndex:
     return true;
   }
@@ -127,7 +128,7 @@ bool constraints::areConservativelyCompatibleArgumentLabels(
   // we can get an unapplied declaration reference back.
   bool hasCurriedSelf;
   if (isa<SubscriptDecl>(decl)) {
-    hasCurriedSelf = false;
+    hasCurriedSelf = true;
   } else if (!baseType || baseType->is<ModuleType>()) {
     hasCurriedSelf = false;
   } else if (baseType->is<AnyMetatypeType>() && decl->isInstanceMember()) {
@@ -146,7 +147,6 @@ bool constraints::areConservativelyCompatibleArgumentLabels(
   if (auto fn = dyn_cast<AbstractFunctionDecl>(decl)) {
     fTy = fn->getInterfaceType()->castTo<AnyFunctionType>();
   } else if (auto subscript = dyn_cast<SubscriptDecl>(decl)) {
-    assert(!hasCurriedSelf && "Subscripts never have curried 'self'");
     fTy = subscript->getInterfaceType()->castTo<AnyFunctionType>();
   } else if (auto enumElement = dyn_cast<EnumElementDecl>(decl)) {
     fTy = enumElement->getInterfaceType()->castTo<AnyFunctionType>();
@@ -160,7 +160,7 @@ bool constraints::areConservativelyCompatibleArgumentLabels(
   }
 
   const AnyFunctionType *levelTy = fTy;
-  if (hasCurriedSelf) {
+  if (hasCurriedSelf && !isa<SubscriptDecl>(decl)) {
     levelTy = levelTy->getResult()->getAs<AnyFunctionType>();
     assert(levelTy && "Parameter list curry level does not match type");
   }
@@ -1641,12 +1641,12 @@ ConstraintSystem::matchExistentialTypes(Type type1, Type type2,
     return getTypeMatchFailure(locator);
 
   // FIXME; Feels like a hack...nothing actually "conforms" here, and
-  // we need to disallow conversions from @noescape functions to Any.
+  // we need to disallow conversions from types containing @noescape
+  // functions to Any.
 
   // Conformance to 'Any' always holds.
   if (type2->isAny()) {
-    auto *fnTy = type1->getAs<FunctionType>();
-    if (!fnTy || !fnTy->isNoEscape())
+    if (!type1->isNoEscape())
       return getTypeMatchSuccess();
 
     if (shouldAttemptFixes()) {
@@ -1835,21 +1835,35 @@ ConstraintSystem::matchTypesBindTypeVar(
     return getTypeMatchFailure(locator);
   }
 
-  // Disallow bindings of noescape functions to type variables that
-  // represent an opened archetype. If we allowed this it would allow
-  // the noescape function to potentially escape.
-  if (auto *fnTy = type->getAs<FunctionType>()) {
-    if (fnTy->isNoEscape() && typeVar->getImpl().getGenericParameter()) {
-      if (shouldAttemptFixes()) {
-        auto *fix = MarkExplicitlyEscaping::create(
-            *this, getConstraintLocator(locator));
-        if (recordFix(fix))
-          return getTypeMatchFailure(locator);
-
-        // Allow no-escape function to be bound with recorded fix.
-      } else {
+  // Disallow bindings of types containing noescape functions to type
+  // variables that represent an opened generic parameter. If we allowed
+  // this it would allow noescape functions to potentially escape.
+  if (type->isNoEscape() && typeVar->getImpl().getGenericParameter()) {
+    if (shouldAttemptFixes()) {
+      auto *fix = MarkExplicitlyEscaping::create(
+          *this, getConstraintLocator(locator));
+      if (recordFix(fix))
         return getTypeMatchFailure(locator);
-      }
+
+      // Allow no-escape function to be bound with recorded fix.
+    } else {
+      return getTypeMatchFailure(locator);
+    }
+  }
+
+  // We do not allow keypaths to go through AnyObject. Let's create a fix
+  // so this can be diagnosed later.
+  if (auto loc = typeVar->getImpl().getLocator()) {
+    auto locPath = loc->getPath();
+
+    if (!locPath.empty() &&
+        locPath.back().getKind() == ConstraintLocator::KeyPathRoot &&
+        type->isAnyObject()) {
+      auto *fix = AllowAnyObjectKeyPathRoot::create(
+          *this, getConstraintLocator(locator));
+
+      if (recordFix(fix))
+        return getTypeMatchFailure(locator);
     }
   }
 
@@ -1870,7 +1884,8 @@ ConstraintSystem::matchTypesBindTypeVar(
     // lvalues either.
     type.visit([&](Type t) {
       if (auto *tvt = dyn_cast<TypeVariableType>(t.getPointer()))
-        typeVar->getImpl().setCannotBindToLValue(getSavedBindings());
+        typeVar->getImpl().setCanBindToLValue(getSavedBindings(),
+                                              /*enabled=*/false);
     });
   }
 
@@ -2412,23 +2427,21 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
         type2->isExistentialType()) {
 
       // Penalize conversions to Any, and disallow conversions of
-      // noescape functions to Any.
+      // types containing noescape functions to Any.
       if (kind >= ConstraintKind::Conversion && type2->isAny()) {
-        if (auto *fnTy = type1->getAs<FunctionType>()) {
-          if (fnTy->isNoEscape()) {
-            if (shouldAttemptFixes()) {
-              auto &ctx = getASTContext();
-              auto *fix = MarkExplicitlyEscaping::create(
-                  *this, getConstraintLocator(locator), ctx.TheAnyType);
-              if (recordFix(fix))
-                return getTypeMatchFailure(locator);
-
-              // Allow 'no-escape' functions to be converted to 'Any'
-              // with a recorded fix that helps us to properly diagnose
-              // such situations.
-            } else {
+        if (type1->isNoEscape()) {
+          if (shouldAttemptFixes()) {
+            auto &ctx = getASTContext();
+            auto *fix = MarkExplicitlyEscaping::create(
+                *this, getConstraintLocator(locator), ctx.TheAnyType);
+            if (recordFix(fix))
               return getTypeMatchFailure(locator);
-            }
+
+            // Allow 'no-escape' functions to be converted to 'Any'
+            // with a recorded fix that helps us to properly diagnose
+            // such situations.
+          } else {
+            return getTypeMatchFailure(locator);
           }
         }
 
@@ -3139,8 +3152,23 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyConformsToConstraint(
       if (!recordFix(fix))
         return SolutionKind::Solved;
     }
+
+    // If this is an implicit Hashable conformance check generated for each
+    // index argument of the keypath subscript component, we could just treat
+    // it as though it conforms.
+    auto *loc = getConstraintLocator(locator);
+    if (loc->isResultOfKeyPathDynamicMemberLookup() ||
+        loc->isKeyPathSubscriptComponent()) {
+      if (protocol ==
+          getASTContext().getProtocol(KnownProtocolKind::Hashable)) {
+        auto *fix =
+            TreatKeyPathSubscriptIndexAsHashable::create(*this, type, loc);
+        if (!recordFix(fix))
+          return SolutionKind::Solved;
+      }
+    }
   }
-  
+
   // There's nothing more we can do; fail.
   return SolutionKind::Error;
 }
@@ -3535,6 +3563,10 @@ static bool hasDynamicMemberLookupAttribute(Type type,
   return result;
 }
 
+static bool isKeyPathDynamicMemberLookup(ConstraintLocator *locator) {
+  auto path = locator ? locator->getPath() : None;
+  return !path.empty() && path.back().isKeyPathDynamicMember();
+}
 
 /// Given a ValueMember, UnresolvedValueMember, or TypeMember constraint,
 /// perform a lookup into the specified base type to find a candidate list.
@@ -3566,12 +3598,23 @@ performMemberLookup(ConstraintKind constraintKind, DeclName memberName,
   // Okay, start building up the result list.
   MemberLookupResult result;
   result.OverallResult = MemberLookupResult::HasResults;
-  
+
   // If we're looking for a subscript, consider key path operations.
+  //
+  // TODO: This logic needs to be refactored to make sure that implicit
+  // keypath result is only introduced when it makes sense e.g. if there
+  // is a single argument with `keypath:` label or `\.` syntax is used.
   if (memberName.isSimpleName() &&
-      memberName.getBaseName().getKind() == DeclBaseName::Kind::Subscript) {
-    result.ViableCandidates.push_back(
-        OverloadChoice(baseTy, OverloadChoiceKind::KeyPathApplication));
+      memberName.getBaseName().getKind() == DeclBaseName::Kind::Subscript &&
+      !isKeyPathDynamicMemberLookup(memberLocator)) {
+    if (baseTy->isAnyObject()) {
+      result.addUnviable(
+          OverloadChoice(baseTy, OverloadChoiceKind::KeyPathApplication),
+          MemberLookupResult::UR_KeyPathWithAnyObjectRootType);
+    } else {
+      result.ViableCandidates.push_back(
+          OverloadChoice(baseTy, OverloadChoiceKind::KeyPathApplication));
+    }
   }
 
   // If the base type is a tuple type, look for the named or indexed member
@@ -3825,6 +3868,37 @@ performMemberLookup(ConstraintKind constraintKind, DeclName memberName,
       }
     }
 
+    // Check whether this is overload choice found via keypath
+    // based dynamic member lookup. Since it's unknown upfront
+    // what kind of declaration lookup is going to find, let's
+    // double check here that given keypath is appropriate for it.
+    if (isKeyPathDynamicMemberLookup(memberLocator)) {
+      auto path = memberLocator->getPath();
+      auto *keyPath = path.back().getKeyPath();
+      if (auto *storage = dyn_cast<AbstractStorageDecl>(decl)) {
+        // If this is an attempt to access read-only member via
+        // writable key path, let's fail this choice early.
+        if (isReadOnlyKeyPathComponent(storage) &&
+            keyPath == getASTContext().getWritableKeyPathDecl()) {
+          result.addUnviable(
+              candidate,
+              MemberLookupResult::UR_WritableKeyPathOnReadOnlyMember);
+          return;
+        }
+
+        // A nonmutating setter indicates a reference-writable base,
+        // on the other hand if setter is mutating there is no point
+        // of attempting `ReferenceWritableKeyPath` overload.
+        if (storage->isSetterMutating() &&
+            keyPath == getASTContext().getReferenceWritableKeyPathDecl()) {
+          result.addUnviable(
+              candidate,
+              MemberLookupResult::UR_ReferenceWritableKeyPathOnMutatingMember);
+          return;
+        }
+      }
+    }
+
     // Otherwise, we're good, add the candidate to the list.
     result.addViable(candidate);
   };
@@ -3855,6 +3929,27 @@ performMemberLookup(ConstraintKind constraintKind, DeclName memberName,
                                              ->getOptionalObjectType());
       return OverloadChoice::getDeclViaUnwrappedOptional(ovlBaseTy, cand,
                                                          functionRefKind);
+    }
+
+    // While looking for subscript choices it's possible to find
+    // `subscript(dynamicMember: {Writable}KeyPath)` on types
+    // marked as `@dynamicMemberLookup`, let's mark this candidate
+    // as representing "dynamic lookup" unless it's a direct call
+    // to such subscript (in that case label is expected to match).
+    if (auto *subscript = dyn_cast<SubscriptDecl>(cand)) {
+      if (hasDynamicMemberLookupAttribute(instanceTy,
+                                          DynamicMemberLookupCache) &&
+          isValidKeyPathDynamicMemberLookup(subscript, TC)) {
+        auto info =
+            getArgumentLabels(*this, ConstraintLocatorBuilder(memberLocator));
+
+        if (!(info && info->Labels.size() == 1 &&
+              info->Labels[0] == getASTContext().Id_dynamicMember)) {
+          return OverloadChoice::getDynamicMemberLookup(
+              baseTy, subscript, TC.Context.getIdentifier("subscript"),
+              /*isKeyPathBased=*/true);
+        }
+      }
     }
 
     return OverloadChoice(baseTy, cand, functionRefKind);
@@ -3946,17 +4041,21 @@ retry_after_fail:
                                             baseTy, functionRefKind,
                                             memberLocator,
                                             includeInaccessibleMembers);
-        
+
       // Reflect the candidates found as `DynamicMemberLookup` results.
       for (auto candidate : subscripts.ViableCandidates) {
-        auto decl = cast<SubscriptDecl>(candidate.getDecl());
-        if (isValidDynamicMemberLookupSubscript(decl, DC, TC))
-          result.addViable(
-            OverloadChoice::getDynamicMemberLookup(baseTy, decl, name));
+        auto *SD = cast<SubscriptDecl>(candidate.getDecl());
+        bool isKeyPathBased = isValidKeyPathDynamicMemberLookup(SD, TC);
+
+        if (isValidStringDynamicMemberLookup(SD, DC, TC) || isKeyPathBased)
+          result.addViable(OverloadChoice::getDynamicMemberLookup(
+              baseTy, SD, name, isKeyPathBased));
       }
+
       for (auto index : indices(subscripts.UnviableCandidates)) {
-        auto decl = subscripts.UnviableCandidates[index].getDecl();
-        auto choice = OverloadChoice::getDynamicMemberLookup(baseTy, decl,name);
+        auto *SD = cast<SubscriptDecl>(subscripts.UnviableCandidates[index].getDecl());
+        auto choice = OverloadChoice::getDynamicMemberLookup(
+          baseTy, SD, name, isValidKeyPathDynamicMemberLookup(SD, TC));
         result.addUnviable(choice, subscripts.UnviableReasons[index]);
       }
     }
@@ -4166,13 +4265,13 @@ fixMemberRef(ConstraintSystem &cs, Type baseTy,
              DeclName memberName, const OverloadChoice &choice,
              ConstraintLocator *locator,
              Optional<MemberLookupResult::UnviableReason> reason = None) {
-  if (!choice.isDecl())
-    return nullptr;
-
-  auto *decl = choice.getDecl();
-  if (auto *CD = dyn_cast<ConstructorDecl>(decl)) {
-    if (auto *fix = validateInitializerRef(cs, CD, locator))
-      return fix;
+  // Not all of the choices handled here are going
+  // to refer to a declaration.
+  if (choice.isDecl()) {
+    if (auto *CD = dyn_cast<ConstructorDecl>(choice.getDecl())) {
+      if (auto *fix = validateInitializerRef(cs, CD, locator))
+        return fix;
+    }
   }
 
   if (reason) {
@@ -4182,13 +4281,22 @@ fixMemberRef(ConstraintSystem &cs, Type baseTy,
       return AllowTypeOrInstanceMember::create(cs, baseTy, memberName, locator);
 
     case MemberLookupResult::UR_Inaccessible:
-      return AllowInaccessibleMember::create(cs, decl, locator);
+      assert(choice.isDecl());
+      return AllowInaccessibleMember::create(cs, choice.getDecl(), locator);
 
     case MemberLookupResult::UR_MutatingMemberOnRValue:
     case MemberLookupResult::UR_MutatingGetterOnRValue:
     case MemberLookupResult::UR_LabelMismatch:
     case MemberLookupResult::UR_UnavailableInExistential:
+    // TODO(diagnostics): Add a new fix that is suggests to
+    // add `subscript(dynamicMember: {Writable}KeyPath<T, U>)`
+    // overload here, that would help if such subscript has
+    // not been provided.
+    case MemberLookupResult::UR_WritableKeyPathOnReadOnlyMember:
+    case MemberLookupResult::UR_ReferenceWritableKeyPathOnMutatingMember:
       break;
+    case MemberLookupResult::UR_KeyPathWithAnyObjectRootType:
+      return AllowAnyObjectKeyPathRoot::create(cs, locator);
     }
   }
 
@@ -4866,7 +4974,7 @@ ConstraintSystem::simplifyKeyPathConstraint(Type keyPathTy,
         return SolutionKind::Error;
     }
   }
-  
+
   // See if we resolved overloads for all the components involved.
   enum {
     ReadOnly,
@@ -4907,38 +5015,37 @@ ConstraintSystem::simplifyKeyPathConstraint(Type keyPathTy,
       if (!choices[i].isDecl()) {
         return SolutionKind::Error;
       }
+
       auto storage = dyn_cast<AbstractStorageDecl>(choices[i].getDecl());
       if (!storage) {
         return SolutionKind::Error;
       }
-      
-      // See whether key paths can store to this component. (Key paths don't
-      // get any special power from being formed in certain contexts, such
-      // as the ability to assign to `let`s in initialization contexts, so
-      // we pass null for the DC to `isSettable` here.)
-      if (!getASTContext().isSwiftVersionAtLeast(5)) {
-        // As a source-compatibility measure, continue to allow
-        // WritableKeyPaths to be formed in the same conditions we did
-        // in previous releases even if we should not be able to set
-        // the value in this context.
-        if (!storage->isSettable(DC)) {
-          // A non-settable component makes the key path read-only, unless
-          // a reference-writable component shows up later.
-          capability = ReadOnly;
-          continue;
-        }
-      } else if (!storage->isSettable(nullptr)
-                 || !storage->isSetterAccessibleFrom(DC)) {
-        // A non-settable component makes the key path read-only, unless
-        // a reference-writable component shows up later.
+
+      // Referencing static members in key path is not currently allowed.
+      if (storage->isStatic()) {
+        if (!shouldAttemptFixes())
+          return SolutionKind::Error;
+
+        auto componentLoc =
+            locator.withPathElement(LocatorPathElt::getKeyPathComponent(i));
+        auto *fix = AllowStaticMemberRefInKeyPath::create(
+            *this, choices[i].getDecl(), getConstraintLocator(componentLoc));
+
+        if (recordFix(fix))
+          return SolutionKind::Error;
+      }
+
+      if (isReadOnlyKeyPathComponent(storage)) {
         capability = ReadOnly;
         continue;
       }
+
       // A nonmutating setter indicates a reference-writable base.
       if (!storage->isSetterMutating()) {
         capability = ReferenceWritable;
         continue;
       }
+
       // Otherwise, the key path maintains its current capability.
       break;
     }
@@ -4986,8 +5093,9 @@ done:
   if (keyPathBGT) {
     if (keyPathBGT->getDecl() == getASTContext().getKeyPathDecl())
       kpDecl = getASTContext().getKeyPathDecl();
-    else if (keyPathBGT->getDecl() == getASTContext().getWritableKeyPathDecl()
-             && capability >= Writable)
+    else if (keyPathBGT->getDecl() ==
+                 getASTContext().getWritableKeyPathDecl() &&
+             capability >= Writable)
       kpDecl = getASTContext().getWritableKeyPathDecl();
   }
   
@@ -5016,7 +5124,7 @@ ConstraintSystem::simplifyKeyPathApplicationConstraint(
     }
     return SolutionKind::Unsolved;
   };
-  
+
   if (auto clas = keyPathTy->getAs<NominalType>()) {
     if (clas->getDecl() == getASTContext().getAnyKeyPathDecl()) {
       // Read-only keypath, whose projected value is upcast to `Any?`.
@@ -6219,6 +6327,9 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyFixConstraint(
   case FixKind::AllowClosureParameterDestructuring:
   case FixKind::MoveOutOfOrderArgument:
   case FixKind::AllowInaccessibleMember:
+  case FixKind::AllowAnyObjectKeyPathRoot:
+  case FixKind::TreatKeyPathSubscriptIndexAsHashable:
+  case FixKind::AllowStaticMemberRefInKeyPath:
     llvm_unreachable("handled elsewhere");
   }
 

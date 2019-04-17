@@ -218,6 +218,8 @@ SerializedModuleLoaderBase::findModule(AccessPathElem moduleID,
                         moduleBuffer, moduleDocBuffer);
       if (!result) {
         return true;
+      } else if (result == std::errc::not_supported) {
+        return false;
       } else if (result != std::errc::no_such_file_or_directory) {
         return None;
       }
@@ -251,6 +253,8 @@ SerializedModuleLoaderBase::findModule(AccessPathElem moduleID,
                                                moduleBuffer, moduleDocBuffer);
       if (!result)
         return true;
+      else if (result == std::errc::not_supported)
+        return false;
     }
   }
 
@@ -320,6 +324,8 @@ SerializedModuleLoaderBase::findModule(AccessPathElem moduleID,
                                                moduleBuffer, moduleDocBuffer);
       if (!result)
         return true;
+      else if (result == std::errc::not_supported)
+        return false;
     }
   }
 
@@ -645,9 +651,13 @@ ModuleDecl *SerializedModuleLoaderBase::loadModule(SourceLoc importLoc,
                     isFramework)) {
       return nullptr;
     }
-    if (dependencyTracker)
-      dependencyTracker->addDependency(moduleInputBuffer->getBufferIdentifier(),
-                                       /*isSystem=*/false);
+    if (dependencyTracker) {
+      // Don't record cached artifacts as dependencies.
+      StringRef DepPath = moduleInputBuffer->getBufferIdentifier();
+      if (!isCached(DepPath)) {
+        dependencyTracker->addDependency(DepPath, /*isSystem=*/false);
+      }
+    }
   }
 
   assert(moduleInputBuffer);

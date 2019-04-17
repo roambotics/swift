@@ -173,7 +173,7 @@ public:
                                            CanSILFunctionType thunkType,
                                            CanSILFunctionType fromType,
                                            CanSILFunctionType toType,
-                                           IsSerialized_t Serialized);
+                                           CanType dynamicSelfType);
 
   /// Determine whether the given class has any instance variables that
   /// need to be destroyed.
@@ -438,11 +438,6 @@ public:
   /// function or closure at top level refers to script globals.
   void emitMarkFunctionEscapeForTopLevelCodeGlobals(SILLocation loc,
                                                 const CaptureInfo &captureInfo);
-
-  /// Get the substitutions necessary to invoke a non-member (global or local)
-  /// property.
-  SubstitutionMap
-  getNonMemberVarDeclSubstitutions(VarDecl *var);
 
   /// Map the substitutions for the original declaration to substitutions for
   /// the overridden declaration.

@@ -39,3 +39,35 @@ extension Substring {
   internal var _wholeString: String { return base }
 }
 
+extension String {
+  @available(*, unavailable, renamed: "String.withUTF8")
+  @inlinable
+  internal func _withUTF8<R>(
+    _ body: (UnsafeBufferPointer<UInt8>) throws -> R
+  ) rethrows -> R {
+    var copy = self
+    return try copy.withUTF8(body)
+  }
+}
+
+extension Substring {
+  @available(*, unavailable, renamed: "Substring.withUTF8")
+  @inlinable
+  internal func _withUTF8<R>(
+    _ body: (UnsafeBufferPointer<UInt8>) throws -> R
+  ) rethrows -> R {
+    var copy = self
+    return try copy.withUTF8(body)
+  }
+}
+
+// This function is no longer used but must be kept for ABI compatibility
+// because references to it may have been inlined.
+@usableFromInline
+internal func _branchHint(_ actual: Bool, expected: Bool) -> Bool {
+  // The LLVM intrinsic underlying int_expect_Int1 now requires an immediate
+  // argument for the expected value so we cannot call it here. This should
+  // never be called in cases where performance matters, so just return the
+  // value without any branch hint.
+  return actual
+}

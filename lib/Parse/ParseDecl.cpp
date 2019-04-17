@@ -1762,8 +1762,7 @@ bool Parser::parseDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc) {
     }
   };
 
-  // FIXME: This renaming happened before Swift 3, we can probably remove
-  // the specific fallback path at some point.
+  // Check if attr is availability, and suggest available instead
   checkInvalidAttrName("availability", "available", DAK_Available, diag::attr_renamed);
 
   // Check if attr is inlineable, and suggest inlinable instead
@@ -1813,38 +1812,6 @@ bool Parser::parseDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc) {
     diagnose(AtLoc, diag::attr_warn_unused_result_removed)
       .fixItRemove(SourceRange(AtLoc, rParenLoc));
 
-    return false;
-  }
-
-  // FIXME: Remove this after Swift 4.
-  if (DK == DAK_Count && Tok.getText() == "NSKeyedArchiverClassName") {
-    auto activeDiag = diagnose(Tok,diag::attr_nskeyedarchiverclassname_removed);
-    activeDiag.fixItReplace(Tok.getLoc(), "objc");
-    consumeToken();
-    SourceLoc lParenLoc;
-    if (consumeIf(tok::l_paren, lParenLoc)) {
-      if (Tok.is(tok::string_literal)) {
-        activeDiag.fixItRemoveChars(Tok.getLoc(),
-                                    Tok.getLoc().getAdvancedLoc(1));
-        SourceLoc endLoc = Tok.getLoc().getAdvancedLoc(Tok.getLength());
-        activeDiag.fixItRemoveChars(endLoc.getAdvancedLoc(-1), endLoc);
-      }
-      skipUntil(tok::r_paren);
-      SourceLoc rParenLoc;
-      parseMatchingToken(tok::r_paren, rParenLoc,
-                         diag::attr_warn_unused_result_expected_rparen,
-                         lParenLoc);
-    }
-    return false;
-  }
-
-  // FIXME: Remove this after Swift 4.
-  if (DK == DAK_Count &&
-      Tok.getText() == "NSKeyedArchiverEncodeNonGenericSubclassesOnly") {
-    diagnose(Tok,
-             diag::attr_nskeyedarchiverencodenongenericsubclassesonly_removed)
-      .fixItRemove(SourceRange(AtLoc, Tok.getLoc()));
-    consumeToken();
     return false;
   }
 
@@ -1999,31 +1966,10 @@ bool Parser::parseTypeAttribute(TypeAttributes &Attributes, bool justChecking) {
   StringRef Text = Tok.getText();
   SourceLoc Loc = consumeToken();
   
-  bool isAutoclosureEscaping = false;
-  SourceRange autoclosureEscapingParenRange;
   StringRef conventionName;
   StringRef witnessMethodProtocol;
 
-  // Handle @autoclosure(escaping)
-  if (attr == TAK_autoclosure) {
-    // We need to do a bit of lookahead here to make sure we parse a (weird)
-    // type like: "@autoclosure (escaping) -> Int" correctly (escaping is the
-    // name of a type here).  We also want to support the case where the
-    // function type coming up is a typealias, e.g. "@autoclosure (escaping) T".
-    if (Tok.is(tok::l_paren) && peekToken().getText() == "escaping") {
-      Parser::BacktrackingScope Backtrack(*this);
-      consumeToken(tok::l_paren);
-      consumeToken(tok::identifier);
-      isAutoclosureEscaping =
-        Tok.is(tok::r_paren) && peekToken().isNot(tok::arrow);
-    }
-
-    if (isAutoclosureEscaping) {
-      autoclosureEscapingParenRange.Start = consumeToken(tok::l_paren);
-      consumeToken(tok::identifier);
-      autoclosureEscapingParenRange.End = consumeToken(tok::r_paren);
-    }
-  } else if (attr == TAK_convention) {
+  if (attr == TAK_convention) {
     SourceLoc LPLoc;
     if (!consumeIfNotAtStartOfLine(tok::l_paren)) {
       if (!justChecking)
@@ -2086,48 +2032,10 @@ bool Parser::parseTypeAttribute(TypeAttributes &Attributes, bool justChecking) {
   switch (attr) {
   default: break;
   case TAK_autoclosure:
-    // Handle @autoclosure(escaping)
-    if (isAutoclosureEscaping) {
-      // @noescape @autoclosure(escaping) makes no sense.
-      if (Attributes.has(TAK_noescape)) {
-        diagnose(Loc, diag::attr_noescape_conflicts_escaping_autoclosure);
-      } else {
-        diagnose(Loc, diag::attr_autoclosure_escaping_deprecated)
-            .fixItReplace(autoclosureEscapingParenRange, " @escaping ");
-      }
-      Attributes.setAttr(TAK_escaping, Loc);
-    } else if (Attributes.has(TAK_noescape) && !isInSILMode()) {
-      diagnose(Loc, diag::attr_noescape_implied_by_autoclosure);
-    }
-    break;
-
-  case TAK_noescape:
-    // You can't specify @noescape and @escaping together.
-    if (Attributes.has(TAK_escaping)) {
-      diagnose(Loc, diag::attr_escaping_conflicts_noescape);
-      return false;
-    }
-
-    // @noescape after @autoclosure is redundant.
-    if (Attributes.has(TAK_autoclosure) && !isInSILMode()) {
-      diagnose(Loc, diag::attr_noescape_implied_by_autoclosure);
-    }
-
-    // @noescape is deprecated and no longer used
-    // In SIL, the polarity of @escaping is reversed.
-    // @escaping is the default and @noescape is explicit.
-    if (!isInSILMode()) {
-      diagnose(Loc, diag::attr_noescape_deprecated)
-        .fixItRemove({Attributes.AtLoc, Loc});
-    }
-    break;
   case TAK_escaping:
-    // You can't specify @noescape and @escaping together.
-    if (Attributes.has(TAK_noescape)) {
-      diagnose(Loc, diag::attr_escaping_conflicts_noescape);
-      return false;
-    }
+  case TAK_noescape:
     break;
+
   case TAK_out:
   case TAK_in:
   case TAK_owned:
@@ -2929,13 +2837,10 @@ Parser::parseDecl(ParseDeclOptions Flags,
     break;
   case tok::kw_subscript: {
     DeclParsingContext.setCreateSyntax(SyntaxKind::SubscriptDecl);
-    if (StaticLoc.isValid()) {
-      diagnose(Tok, diag::subscript_static, StaticSpelling)
-          .fixItRemove(SourceRange(StaticLoc));
-      StaticLoc = SourceLoc();
-    }
     llvm::SmallVector<Decl *, 4> Entries;
-    DeclResult = parseDeclSubscript(Flags, Attributes, Entries);
+    DeclResult = parseDeclSubscript(StaticLoc, StaticSpelling, Flags,
+                                    Attributes, Entries);
+    StaticLoc = SourceLoc(); // we handled static if present.
     if (DeclResult.hasCodeCompletion() && isCodeCompletionFirstPass())
       break;
     std::for_each(Entries.begin(), Entries.end(), Handler);
@@ -3566,7 +3471,10 @@ bool Parser::parseDeclList(SourceLoc LBLoc, SourceLoc &RBLoc,
       }
     }
   }
-  parseMatchingToken(tok::r_brace, RBLoc, ErrorDiag, LBLoc);
+  if (parseMatchingToken(tok::r_brace, RBLoc, ErrorDiag, LBLoc)) {
+    // Synthesize an r_brace syntax node if the token is absent
+    SyntaxContext->synthesize(tok::r_brace, RBLoc);
+  }
 
   // Increase counter.
   if (auto *stat = Context.Stats) {
@@ -6336,9 +6244,26 @@ parseDeclProtocol(ParseDeclOptions Flags, DeclAttributes &Attributes) {
 ///     attribute-list? 'subscript' parameter-clause '->' type
 /// \endverbatim
 ParserResult<SubscriptDecl>
-Parser::parseDeclSubscript(ParseDeclOptions Flags,
+Parser::parseDeclSubscript(SourceLoc StaticLoc,
+                           StaticSpellingKind StaticSpelling,
+                           ParseDeclOptions Flags,
                            DeclAttributes &Attributes,
                            SmallVectorImpl<Decl *> &Decls) {
+  assert(StaticLoc.isInvalid() || StaticSpelling != StaticSpellingKind::None);
+  
+  if (StaticLoc.isValid()) {
+    if (Flags.contains(PD_InStruct) || Flags.contains(PD_InEnum) ||
+               Flags.contains(PD_InProtocol)) {
+      if (StaticSpelling == StaticSpellingKind::KeywordClass) {
+        diagnose(Tok, diag::class_subscript_not_in_class,
+                 Flags.contains(PD_InProtocol))
+        .fixItReplace(StaticLoc, "static");
+        
+        StaticSpelling = StaticSpellingKind::KeywordStatic;
+      }
+    }
+  }
+  
   ParserStatus Status;
   SourceLoc SubscriptLoc = consumeToken(tok::kw_subscript);
 
@@ -6364,10 +6289,11 @@ Parser::parseDeclSubscript(ParseDeclOptions Flags,
     return makeParserCodeCompletionStatus();
 
   // Parse the parameter list.
+  DefaultArgumentInfo DefaultArgs;
   SmallVector<Identifier, 4> argumentNames;
   ParserResult<ParameterList> Indices
     = parseSingleParameterClause(ParameterContextKind::Subscript,
-                                 &argumentNames);
+                                 &argumentNames, &DefaultArgs);
   Status |= Indices;
 
   SignatureHasCodeCompletion |= Indices.hasCodeCompletion();
@@ -6412,11 +6338,14 @@ Parser::parseDeclSubscript(ParseDeclOptions Flags,
   DeclName name = DeclName(Context, DeclBaseName::createSubscript(),
                            argumentNames);
   auto *Subscript = new (Context) SubscriptDecl(name,
+                                                StaticLoc, StaticSpelling,
                                                 SubscriptLoc, Indices.get(),
                                                 ArrowLoc, ElementTy.get(),
                                                 CurDeclContext,
                                                 nullptr);
   Subscript->getAttrs() = Attributes;
+
+  DefaultArgs.setFunctionContext(Subscript, Subscript->getIndices());
 
   // Parse a 'where' clause if present, adding it to our GenericParamList.
   if (Tok.is(tok::kw_where)) {
@@ -6457,7 +6386,7 @@ Parser::parseDeclSubscript(ParseDeclOptions Flags,
   } else {
     Status |= parseGetSet(Flags, GenericParams,
                           Indices.get(), ElementTy.get(),
-                          accessors, Subscript, /*StaticLoc=*/SourceLoc());
+                          accessors, Subscript, StaticLoc);
   }
 
   bool Invalid = false;
@@ -6468,7 +6397,7 @@ Parser::parseDeclSubscript(ParseDeclOptions Flags,
   }
 
   accessors.record(*this, Subscript, (Invalid || !Status.isSuccess()),
-                   Flags, /*static*/ SourceLoc(), Attributes,
+                   Flags, StaticLoc, Attributes,
                    ElementTy.get(), Indices.get(), Decls);
 
   // No need to setLocalDiscriminator because subscripts cannot
@@ -6978,6 +6907,10 @@ Parser::parseDeclPrecedenceGroup(ParseDeclOptions flags,
         diagnose(Tok, diag::expected_precedencegroup_associativity);
         parsedAssociativity = Associativity::None;
         invalid = true;
+      } else {
+        // "left", "right" or "none" are considered contextual keywords.
+        TokReceiver->registerTokenKindChange(Tok.getLoc(),
+                                             tok::contextual_keyword);
       }
       associativity = *parsedAssociativity;
       associativityValueLoc = consumeToken();

@@ -797,8 +797,6 @@ namespace {
 
     void visitVarDecl(VarDecl *VD) {
       printCommon(VD, "var_decl");
-      if (VD->isStatic())
-        PrintWithColorRAII(OS, DeclModifierColor) << " type";
       if (VD->isLet())
         PrintWithColorRAII(OS, DeclModifierColor) << " let";
       if (VD->hasNonPatternBindingInit())
@@ -811,6 +809,9 @@ namespace {
     }
 
     void printStorageImpl(AbstractStorageDecl *D) {
+      if (D->isStatic())
+        PrintWithColorRAII(OS, DeclModifierColor) << " type";
+
       auto impl = D->getImplInfo();
       PrintWithColorRAII(OS, DeclModifierColor)
         << " readImpl="
@@ -1621,13 +1622,13 @@ public:
     if (S->hasUnknownAttr())
       OS << " @unknown";
 
-    if (auto caseBodyVars = S->getCaseBodyVariables()) {
+    if (S->hasCaseBodyVariables()) {
       OS << '\n';
       OS.indent(Indent + 2);
       PrintWithColorRAII(OS, ParenthesisColor) << '(';
       PrintWithColorRAII(OS, StmtColor) << "case_body_variables";
       OS << '\n';
-      for (auto *vd : *caseBodyVars) {
+      for (auto *vd : S->getCaseBodyVariables()) {
         OS.indent(2);
         // TODO: Printing a var decl does an Indent ... dump(vd) ... '\n'. We
         // should see if we can factor this dumping so that the caller of
@@ -3203,7 +3204,6 @@ namespace {
     void dumpParameterFlags(ParameterTypeFlags paramFlags) {
       printFlag(paramFlags.isVariadic(), "vararg");
       printFlag(paramFlags.isAutoClosure(), "autoclosure");
-      printFlag(paramFlags.isEscaping(), "escaping");
       switch (paramFlags.getValueOwnership()) {
       case ValueOwnership::Default: break;
       case ValueOwnership::Owned: printFlag("owned"); break;
