@@ -486,6 +486,7 @@ CodeCompletionResult::getCodeCompletionDeclKind(const Decl *D) {
   case DeclKind::IfConfig:
   case DeclKind::PoundDiagnostic:
   case DeclKind::MissingMember:
+  case DeclKind::OpaqueType:
     llvm_unreachable("not expecting such a declaration result");
   case DeclKind::Module:
     return CodeCompletionDeclKind::Module;
@@ -4167,7 +4168,7 @@ public:
     if (D->shouldHideFromEditor())
       return;
 
-    if (D->getAttrs().hasAttribute<FinalAttr>() ||
+    if (D->isFinal() ||
         // A 'class' member with an initial value cannot be overriden either.
         (D->isStatic() && D->getAttrs().hasAttribute<HasInitialValueAttr>()))
       return;
@@ -4252,13 +4253,12 @@ public:
       auto Proto = Conformance->getProtocol();
       if (!Proto->isAccessibleFrom(CurrDeclContext))
         continue;
-      auto NormalConformance = Conformance->getRootNormalConformance();
       for (auto Member : Proto->getMembers()) {
         auto *ATD = dyn_cast<AssociatedTypeDecl>(Member);
         if (!ATD)
           continue;
         // FIXME: Also exclude the type alias that has already been specified.
-        if (!NormalConformance->hasTypeWitness(ATD) ||
+        if (!Conformance->hasTypeWitness(ATD) ||
             !ATD->getDefaultDefinitionLoc().isNull())
           continue;
         addTypeAlias(ATD,

@@ -18,12 +18,12 @@
 #include "ConstraintSystem.h"
 #include "DerivedConformances.h"
 #include "MiscDiagnostics.h"
+#include "TypeAccessScopeChecker.h"
 #include "TypeCheckAvailability.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/StringExtras.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/AST/AccessScope.h"
-#include "swift/AST/AccessScopeChecker.h"
 #include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTMangler.h"
@@ -38,6 +38,7 @@
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/ReferencedNameTracker.h"
+#include "swift/AST/TypeDeclFinder.h"
 #include "swift/AST/TypeMatcher.h"
 #include "swift/AST/TypeWalker.h"
 #include "swift/Basic/Defer.h"
@@ -2523,8 +2524,8 @@ void ConformanceChecker::recordTypeWitness(AssociatedTypeDecl *assocType,
         // when the underlying type has sufficient access, but only in
         // non-resilient modules.
         Optional<AccessScope> underlyingTypeScope =
-            AccessScopeChecker::getAccessScope(type, DC,
-                                               /*usableFromInline*/false);
+            TypeAccessScopeChecker::getAccessScope(type, DC,
+                                                   /*usableFromInline*/false);
         assert(underlyingTypeScope.hasValue() &&
                "the type is already invalid and we shouldn't have gotten here");
 
@@ -3600,15 +3601,16 @@ void ConformanceChecker::addUsedConformances(
   if (!visited.insert(conformance).second)
     return;
 
-  auto normalConf = conformance->getRootNormalConformance();
+  if (auto normalConf = dyn_cast<NormalProtocolConformance>(
+        conformance->getRootConformance())) {;
+    if (normalConf->isIncomplete())
+      TC.UsedConformances.insert(normalConf);
 
-  if (normalConf->isIncomplete())
-    TC.UsedConformances.insert(normalConf);
-
-  // Mark each conformance in the signature as used.
-  for (auto sigConformance : normalConf->getSignatureConformances()) {
-    if (sigConformance.isConcrete())
-      addUsedConformances(sigConformance.getConcrete(), visited);
+    // Mark each conformance in the signature as used.
+    for (auto sigConformance : normalConf->getSignatureConformances()) {
+      if (sigConformance.isConcrete())
+        addUsedConformances(sigConformance.getConcrete(), visited);
+    }
   }
 }
 
@@ -4274,17 +4276,18 @@ void TypeChecker::markConformanceUsed(ProtocolConformanceRef conformance,
                                       DeclContext *dc) {
   if (conformance.isAbstract()) return;
 
-  auto normalConformance =
-    conformance.getConcrete()->getRootNormalConformance();
+  if (auto normalConformance =
+        dyn_cast<NormalProtocolConformance>(
+          conformance.getConcrete()->getRootConformance())) {;
+    // Make sure that the type checker completes this conformance.
+    if (normalConformance->isIncomplete())
+      UsedConformances.insert(normalConformance);
 
-  // Make sure that the type checker completes this conformance.
-  if (normalConformance->isIncomplete())
-    UsedConformances.insert(normalConformance);
-
-  // Record the usage of this conformance in the enclosing source
-  // file.
-  if (auto sf = dc->getParentSourceFile()) {
-    sf->addUsedConformance(normalConformance);
+    // Record the usage of this conformance in the enclosing source
+    // file.
+    if (auto sf = dc->getParentSourceFile()) {
+      sf->addUsedConformance(normalConformance);
+    }
   }
 }
 

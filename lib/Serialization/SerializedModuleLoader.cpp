@@ -400,6 +400,7 @@ FileUnit *SerializedModuleLoaderBase::loadAST(
     // We've loaded the file. Now try to bring it into the AST.
     auto fileUnit = new (Ctx) SerializedASTFile(M, *loadedModuleFile,
                                                 extendedInfo.isSIB());
+    fileUnit->setParseableInterface(extendedInfo.getParseableInterface());
     M.addFile(*fileUnit);
     if (extendedInfo.isTestable())
       M.setTestingEnabled();
@@ -757,6 +758,12 @@ TypeDecl *SerializedASTFile::lookupLocalType(llvm::StringRef MangledName) const{
   return File.lookupLocalType(MangledName);
 }
 
+OpaqueTypeDecl *
+SerializedASTFile::lookupOpaqueResultType(StringRef MangledName,
+                                          LazyResolver *resolver) {
+  return File.lookupOpaqueResultType(MangledName);
+}
+
 TypeDecl *
 SerializedASTFile::lookupNestedType(Identifier name,
                                     const NominalTypeDecl *parent) const {
@@ -843,7 +850,14 @@ SerializedASTFile::getLocalTypeDecls(SmallVectorImpl<TypeDecl*> &results) const{
   File.getLocalTypeDecls(results);
 }
 
-void SerializedASTFile::getDisplayDecls(SmallVectorImpl<Decl*> &results) const {
+void
+SerializedASTFile::getOpaqueReturnTypeDecls(
+                              SmallVectorImpl<OpaqueTypeDecl*> &results) const {
+  File.getOpaqueReturnTypeDecls(results);
+}
+
+void
+SerializedASTFile::getDisplayDecls(SmallVectorImpl<Decl*> &results) const {
   File.getDisplayDecls(results);
 }
 

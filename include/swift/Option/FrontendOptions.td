@@ -18,9 +18,6 @@ let Flags = [FrontendOption, NoDriverOption] in {
 
 def triple : Separate<["-"], "triple">, Alias<target>;
 
-def color_diagnostics : Flag<["-"], "color-diagnostics">,
-  HelpText<"Print diagnostics in color">;
-
 def primary_file : Separate<["-"], "primary-file">,
   HelpText<"Produce output for this file, not the whole module">;
 
@@ -401,6 +398,10 @@ def enable_operator_designated_types :
 def solver_enable_operator_designated_types :
   Flag<["-"], "solver-enable-operator-designated-types">,
   HelpText<"Enable operator designated types in constraint solver">;
+
+def enable_opaque_result_types :
+  Flag<["-"], "enable-opaque-result-types">,
+  HelpText<"Enable experimental opaque result types feature">;
 
 def switch_checking_invocation_threshold_EQ : Joined<["-"],
     "switch-checking-invocation-threshold=">;

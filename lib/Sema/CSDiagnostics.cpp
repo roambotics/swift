@@ -401,17 +401,21 @@ bool NoEscapeFuncToTypeConversionFailure::diagnoseAsError() {
     return true;
   }
 
+  GenericTypeParamType *paramTy = nullptr;
+
   auto path = getLocator()->getPath();
-  if (path.empty())
-    return false;
+  if (!path.empty()) {
+    auto &last = path.back();
+    if (last.getKind() == ConstraintLocator::GenericParameter)
+      paramTy = last.getGenericParameter();
+  }
 
-  auto &last = path.back();
-  if (last.getKind() != ConstraintLocator::GenericParameter)
-    return false;
-
-  auto *paramTy = last.getGenericParameter();
-  emitDiagnostic(anchor->getLoc(), diag::converting_noescape_to_type,
-                 paramTy);
+  if (paramTy) {
+    emitDiagnostic(anchor->getLoc(), diag::converting_noescape_to_type,
+                  paramTy);
+  } else {
+    emitDiagnostic(anchor->getLoc(), diag::unknown_escaping_use_of_noescape);
+  }
   return true;
 }
 
@@ -2449,9 +2453,8 @@ bool KeyPathSubscriptIndexHashableFailure::diagnoseAsError() {
   return true;
 }
 
-bool InvalidStaticMemberRefInKeyPath::diagnoseAsError() {
+SourceLoc InvalidMemberRefInKeyPath::getLoc() const {
   auto *anchor = getRawAnchor();
-  auto loc = anchor->getLoc();
 
   if (auto *KPE = dyn_cast<KeyPathExpr>(anchor)) {
     auto *locator = getLocator();
@@ -2461,9 +2464,18 @@ bool InvalidStaticMemberRefInKeyPath::diagnoseAsError() {
         });
 
     assert(component != locator->getPath().end());
-    loc = KPE->getComponents()[component->getValue()].getLoc();
+    return KPE->getComponents()[component->getValue()].getLoc();
   }
 
-  emitDiagnostic(loc, diag::expr_keypath_static_member, Member->getBaseName());
+  return anchor->getLoc();
+}
+
+bool InvalidStaticMemberRefInKeyPath::diagnoseAsError() {
+  emitDiagnostic(getLoc(), diag::expr_keypath_static_member, getName());
+  return true;
+}
+
+bool InvalidMemberWithMutatingGetterInKeyPath::diagnoseAsError() {
+  emitDiagnostic(getLoc(), diag::expr_keypath_mutating_getter, getName());
   return true;
 }
