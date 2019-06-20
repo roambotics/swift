@@ -77,8 +77,6 @@ SubstitutionMap Solution::computeSubstitutions(
   for (const auto &opened : openedTypes->second)
     subs[opened.first] = getFixedType(opened.second);
 
-  auto &tc = getConstraintSystem().getTypeChecker();
-
   auto lookupConformanceFn =
       [&](CanType original, Type replacement, ProtocolDecl *protoType)
           -> Optional<ProtocolConformanceRef> {
@@ -88,76 +86,14 @@ SubstitutionMap Solution::computeSubstitutions(
       return ProtocolConformanceRef(protoType);
     }
 
-    return tc.conformsToProtocol(replacement, protoType,
-                                 getConstraintSystem().DC,
-                                 (ConformanceCheckFlags::InExpression|
-                                  ConformanceCheckFlags::Used));
+    return TypeChecker::conformsToProtocol(replacement, protoType,
+                                           getConstraintSystem().DC,
+                                           ConformanceCheckFlags::InExpression);
   };
 
   return SubstitutionMap::get(sig,
                               QueryTypeSubstitutionMap{subs},
                               lookupConformanceFn);
-}
-
-/// Find a particular named function witness for a type that conforms to
-/// the given protocol.
-///
-/// \param tc The type check we're using.
-///
-/// \param dc The context in which we need a witness.
-///
-/// \param type The type whose witness to find.
-///
-/// \param proto The protocol to which the type conforms.
-///
-/// \param name The name of the requirement.
-///
-/// \param diag The diagnostic to emit if the protocol definition doesn't
-/// have a requirement with the given name.
-///
-/// \returns The named witness, or an empty ConcreteDeclRef if no witness
-/// could be found.
-ConcreteDeclRef findNamedWitnessImpl(
-                        TypeChecker &tc, DeclContext *dc, Type type,
-                        ProtocolDecl *proto, DeclName name,
-                        Diag<> diag,
-                        Optional<ProtocolConformanceRef> conformance = None) {
-  // Find the named requirement.
-  ValueDecl *requirement = nullptr;
-  for (auto member : proto->getMembers()) {
-    auto d = dyn_cast<ValueDecl>(member);
-    if (!d || !d->hasName())
-      continue;
-
-    if (d->getFullName().matchesRef(name)) {
-      requirement = d;
-      break;
-    }
-  }
-
-  if (!requirement || requirement->isInvalid()) {
-    tc.diagnose(proto->getLoc(), diag);
-    return nullptr;
-  }
-
-  // Find the member used to satisfy the named requirement.
-  if (!conformance) {
-    conformance = tc.conformsToProtocol(type, proto, dc,
-                                        ConformanceCheckFlags::InExpression);
-    if (!conformance)
-      return nullptr;
-  }
-
-  // For a type with dependent conformance, just return the requirement from
-  // the protocol. There are no protocol conformance tables.
-  if (!conformance->isConcrete()) {
-    auto subMap = SubstitutionMap::getProtocolSubstitutions(proto, type,
-                                                            *conformance);
-    return ConcreteDeclRef(requirement, subMap);
-  }
-
-  auto concrete = conformance->getConcrete();
-  return concrete->getWitnessDeclRef(requirement, &tc);
 }
 
 static bool shouldAccessStorageDirectly(Expr *base, VarDecl *member,
@@ -327,10 +263,16 @@ static Expr *buildDynamicMemberLookupIndexExpr(StringRef name, SourceLoc loc,
                                                DeclContext *dc,
                                                ConstraintSystem &cs) {
   auto &ctx = cs.TC.Context;
+
+  auto *stringDecl = ctx.getStringDecl();
+  auto stringType = stringDecl->getDeclaredType();
+
   // Build and type check the string literal index value to the specific
   // string type expected by the subscript.
-  Expr *nameExpr = new (ctx) StringLiteralExpr(name, loc, /*implicit*/true);
-  (void)cs.TC.typeCheckExpression(nameExpr, dc);
+  auto *nameExpr = new (ctx) StringLiteralExpr(name, loc, /*implicit*/true);
+  nameExpr->setBuiltinInitializer(ctx.getStringBuiltinInitDecl(stringDecl));
+  nameExpr->setType(stringType);
+
   cs.cacheExprTypes(nameExpr);
   return nameExpr;
 }
@@ -345,18 +287,6 @@ namespace {
     DeclContext *dc;
     const Solution &solution;
     bool SuppressDiagnostics;
-
-    /// Recognize used conformances from an imported type when we must emit
-    /// the witness table.
-    ///
-    /// This arises in _BridgedStoredNSError, where we wouldn't
-    /// otherwise pull in the witness table, causing dynamic casts to
-    /// perform incorrectly, and _ErrorCodeProtocol, where we need to
-    /// check for _BridgedStoredNSError conformances on the
-    /// corresponding ErrorType.
-    void checkForImportedUsedConformances(Type toType) {
-      cs.getTypeChecker().useBridgedNSErrorConformances(dc, toType);
-    }
 
     /// Coerce the given tuple to another tuple type.
     ///
@@ -493,10 +423,9 @@ namespace {
           if (!baseTy->is<ArchetypeType>() && !baseTy->isAnyExistentialType()) {
             auto &tc = cs.getTypeChecker();
             auto conformance =
-              tc.conformsToProtocol(
+              TypeChecker::conformsToProtocol(
                         baseTy, proto, cs.DC,
-                        (ConformanceCheckFlags::InExpression|
-                         ConformanceCheckFlags::Used));
+                        ConformanceCheckFlags::InExpression);
             if (conformance && conformance->isConcrete()) {
               if (auto witness =
                       conformance->getConcrete()->getWitnessDecl(decl, &tc)) {
@@ -1763,11 +1692,10 @@ namespace {
 
       // Try to find the conformance of the value type to _BridgedToObjectiveC.
       auto bridgedToObjectiveCConformance
-        = tc.conformsToProtocol(valueType,
-                                bridgedProto,
-                                cs.DC,
-                                (ConformanceCheckFlags::InExpression|
-                                 ConformanceCheckFlags::Used));
+        = TypeChecker::conformsToProtocol(valueType,
+                                          bridgedProto,
+                                          cs.DC,
+                                          ConformanceCheckFlags::InExpression);
 
       FuncDecl *fn = nullptr;
 
@@ -1834,8 +1762,6 @@ namespace {
     Expr *forceBridgeFromObjectiveC(Expr *object, Type valueType) {
       return bridgeFromObjectiveC(object, valueType, false);
     }
-
-    TypeAliasDecl *MaxFloatTypeDecl = nullptr;
     
   public:
     ExprRewriter(ConstraintSystem &cs, const Solution &solution,
@@ -1914,55 +1840,25 @@ namespace {
     }
     
     Expr *visitNilLiteralExpr(NilLiteralExpr *expr) {
+      auto type = simplifyType(cs.getType(expr));
+
+      // By far the most common 'nil' literal is for Optional<T>.none.
+      // We don't have to look up the witness in this case since SILGen
+      // knows how to lower it directly.
+      if (auto objectType = type->getOptionalObjectType()) {
+        cs.setType(expr, type);
+        return expr;
+      }
+
       auto &tc = cs.getTypeChecker();
       auto *protocol = tc.getProtocol(expr->getLoc(),
                                       KnownProtocolKind::ExpressibleByNilLiteral);
 
       // For type-sugar reasons, prefer the spelling of the default literal
       // type.
-      auto type = simplifyType(cs.getType(expr));
       if (auto defaultType = tc.getDefaultType(protocol, dc)) {
         if (defaultType->isEqual(type))
           type = defaultType;
-      }
-
-      // By far the most common 'nil' literal is for Optional<T>.none.
-      //
-      // Emit this case directly instead of calling Optional.init(nilLiteral:),
-      // since this generates more efficient SIL.
-      if (auto objectType = type->getOptionalObjectType()) {
-        auto *nilDecl = tc.Context.getOptionalNoneDecl();
-        tc.validateDecl(nilDecl);
-        if (!nilDecl->hasInterfaceType())
-          return nullptr;
-
-        auto genericSig =
-          nilDecl->getDeclContext()->getGenericSignatureOfContext();
-        SubstitutionMap subs =
-          SubstitutionMap::get(genericSig, llvm::makeArrayRef(objectType),
-                               { });
-        ConcreteDeclRef concreteDeclRef(nilDecl, subs);
-
-        auto nilType = FunctionType::get(
-            {FunctionType::Param(MetatypeType::get(type))}, type);
-        auto *nilRefExpr = new (tc.Context) DeclRefExpr(
-            concreteDeclRef, DeclNameLoc(expr->getLoc()),
-              /*implicit=*/true, AccessSemantics::Ordinary,
-            nilType);
-        cs.cacheType(nilRefExpr);
-
-        auto *typeExpr = TypeExpr::createImplicitHack(
-            expr->getLoc(),
-            type,
-            tc.Context);
-        cs.cacheType(typeExpr);
-
-        auto *callExpr = new (tc.Context) DotSyntaxCallExpr(
-            nilRefExpr, expr->getLoc(), typeExpr, type);
-        callExpr->setImplicit(true);
-        cs.cacheType(callExpr);
-
-        return callExpr;
       }
 
       DeclName initName(tc.Context, DeclBaseName::createConstructor(),
@@ -2002,25 +1898,18 @@ namespace {
           type = defaultType;
       }
 
-      // Find the maximum-sized builtin float type.
-      // FIXME: Cache name lookup.
-      if (!MaxFloatTypeDecl) {
-        SmallVector<ValueDecl *, 1> lookupResults;
-        tc.getStdlibModule(dc)->lookupValue(/*AccessPath=*/{},
-                                            tc.Context.Id_MaxBuiltinFloatType,
-                                            NLKind::QualifiedLookup,
-                                            lookupResults);
-        if (lookupResults.size() == 1)
-          MaxFloatTypeDecl = dyn_cast<TypeAliasDecl>(lookupResults.front());
-      }
-      if (!MaxFloatTypeDecl ||
-          !MaxFloatTypeDecl->hasInterfaceType() ||
-          !MaxFloatTypeDecl->getDeclaredInterfaceType()->is<BuiltinFloatType>()) {
+      // Get the _MaxBuiltinFloatType decl, or look for it if it's not cached.
+      auto maxFloatTypeDecl = tc.Context.get_MaxBuiltinFloatTypeDecl();
+
+      if (!maxFloatTypeDecl ||
+          !maxFloatTypeDecl->hasInterfaceType() ||
+          !maxFloatTypeDecl->getDeclaredInterfaceType()->is<BuiltinFloatType>()) {
         tc.diagnose(expr->getLoc(), diag::no_MaxBuiltinFloatType_found);
         return nullptr;
       }
-      tc.validateDecl(MaxFloatTypeDecl);
-      auto maxType = MaxFloatTypeDecl->getUnderlyingTypeLoc().getType();
+
+      tc.validateDecl(maxFloatTypeDecl);
+      auto maxType = maxFloatTypeDecl->getUnderlyingTypeLoc().getType();
 
       DeclName initName(tc.Context, DeclBaseName::createConstructor(),
                         { tc.Context.Id_floatLiteral });
@@ -2082,8 +1971,8 @@ namespace {
       ProtocolDecl *protocol = tc.getProtocol(
           expr->getLoc(), KnownProtocolKind::ExpressibleByStringLiteral);
 
-      if (!tc.conformsToProtocol(type, protocol, cs.DC,
-                                 ConformanceCheckFlags::InExpression)) {
+      if (!TypeChecker::conformsToProtocol(type, protocol, cs.DC,
+                                           ConformanceCheckFlags::InExpression)) {
         // If the type does not conform to ExpressibleByStringLiteral, it should
         // be ExpressibleByExtendedGraphemeClusterLiteral.
         protocol = tc.getProtocol(
@@ -2092,8 +1981,8 @@ namespace {
         isStringLiteral = false;
         isGraphemeClusterLiteral = true;
       }
-      if (!tc.conformsToProtocol(type, protocol, cs.DC,
-                                 ConformanceCheckFlags::InExpression)) {
+      if (!TypeChecker::conformsToProtocol(type, protocol, cs.DC,
+                                           ConformanceCheckFlags::InExpression)) {
         // ... or it should be ExpressibleByUnicodeScalarLiteral.
         protocol = tc.getProtocol(
             expr->getLoc(),
@@ -2214,8 +2103,8 @@ namespace {
         assert(proto && "Missing string interpolation protocol?");
 
         auto conformance =
-          tc.conformsToProtocol(type, proto, cs.DC,
-                              ConformanceCheckFlags::InExpression);
+          TypeChecker::conformsToProtocol(type, proto, cs.DC,
+                                          ConformanceCheckFlags::InExpression);
         assert(conformance && "string interpolation type conforms to protocol");
 
         DeclName constrName(tc.Context, DeclBaseName::createConstructor(), argLabels);
@@ -2322,7 +2211,6 @@ namespace {
       if (cs.getType(expr) && !cs.getType(expr)->hasTypeVariable())
         return expr;
 
-      auto &ctx = cs.getASTContext();
       auto &tc = cs.getTypeChecker();
 
       // Figure out the type we're converting to.
@@ -2343,34 +2231,18 @@ namespace {
       auto proto = tc.getLiteralProtocol(expr);
       assert(proto && "Missing object literal protocol?");
       auto conformance =
-        tc.conformsToProtocol(conformingType, proto, cs.DC,
-                              ConformanceCheckFlags::InExpression);
+        TypeChecker::conformsToProtocol(conformingType, proto, cs.DC,
+                                        ConformanceCheckFlags::InExpression);
       assert(conformance && "object literal type conforms to protocol");
 
-      Expr *base = TypeExpr::createImplicitHack(expr->getLoc(), conformingType,
-                                                ctx);
-      cs.cacheExprTypes(base);
-        
-      SmallVector<Expr *, 4> args;
-      if (!isa<TupleExpr>(expr->getArg()))
-        return nullptr;
-      auto tupleArg = cast<TupleExpr>(expr->getArg());
-      for (auto elt : tupleArg->getElements()) {
-        cs.setExprTypes(elt);
-        args.push_back(elt);
-      }
       DeclName constrName(tc.getObjectLiteralConstructorName(expr));
 
-      cs.cacheExprTypes(base);
-      cs.setExprTypes(base);
-
-      Expr *semanticExpr = tc.callWitness(base, dc, proto, *conformance,
-                                          constrName, args,
-                                          diag::object_literal_broken_proto);
-      if (semanticExpr)
-        cs.cacheExprTypes(semanticExpr);
-
-      expr->setSemanticExpr(semanticExpr);
+      ConcreteDeclRef witness =
+        conformance->getWitnessByName(conformingType->getRValueType(),
+                                      constrName);
+      if (!witness || !isa<AbstractFunctionDecl>(witness.getDecl()))
+        return nullptr;
+      expr->setInitializer(witness);
       return expr;
     }
 
@@ -3007,16 +2879,14 @@ namespace {
       assert(arrayProto && "type-checked array literal w/o protocol?!");
 
       auto conformance =
-        tc.conformsToProtocol(arrayTy, arrayProto, cs.DC,
-                              ConformanceCheckFlags::InExpression);
+        TypeChecker::conformsToProtocol(arrayTy, arrayProto, cs.DC,
+                                        ConformanceCheckFlags::InExpression);
       assert(conformance && "Type does not conform to protocol?");
 
       DeclName name(tc.Context, DeclBaseName::createConstructor(),
                     { tc.Context.Id_arrayLiteral });
-
       ConcreteDeclRef witness =
-          findNamedWitnessImpl(tc, dc, arrayTy->getRValueType(), arrayProto,
-                               name, diag::array_protocol_broken, conformance);
+        conformance->getWitnessByName(arrayTy->getRValueType(), name);
       if (!witness || !isa<AbstractFunctionDecl>(witness.getDecl()))
         return nullptr;
       expr->setInitializer(witness);
@@ -3054,70 +2924,25 @@ namespace {
                          KnownProtocolKind::ExpressibleByDictionaryLiteral);
 
       auto conformance =
-        tc.conformsToProtocol(dictionaryTy, dictionaryProto, cs.DC,
-                              ConformanceCheckFlags::InExpression);
+        TypeChecker::conformsToProtocol(dictionaryTy, dictionaryProto, cs.DC,
+                                        ConformanceCheckFlags::InExpression);
       if (!conformance)
         return nullptr;
 
-      // Call the witness that builds the dictionary literal.
-      // FIXME: callWitness() may end up re-doing some work we already did
-      // to convert the dictionary literal elements to the (key, value) tuple.
-      // It would be nicer to re-use them.
-      // FIXME: Cache the name.
-      // FIXME: This location info is bogus.
-      Expr *typeRef = TypeExpr::createImplicitHack(expr->getLoc(), dictionaryTy,
-                                                   tc.Context);
-      cs.cacheExprTypes(typeRef);
-
       DeclName name(tc.Context, DeclBaseName::createConstructor(),
                     { tc.Context.Id_dictionaryLiteral });
+      ConcreteDeclRef witness =
+        conformance->getWitnessByName(dictionaryTy->getRValueType(), name);
+      if (!witness || !isa<AbstractFunctionDecl>(witness.getDecl()))
+        return nullptr;
+      expr->setInitializer(witness);
 
-      // Restructure the argument to provide the appropriate labels in the
-      // tuple.
-      SmallVector<TupleTypeElt, 4> typeElements;
-      SmallVector<Identifier, 4> names;
-      bool first = true;
-      for (auto elt : expr->getElements()) {
-        if (first) {
-          typeElements.push_back(TupleTypeElt(cs.getType(elt),
-                                              tc.Context.Id_dictionaryLiteral));
-          names.push_back(tc.Context.Id_dictionaryLiteral);
-
-          first = false;
-          continue;
-        }
-
-        typeElements.push_back(cs.getType(elt));
-        names.push_back(Identifier());
+      auto elementType = expr->getElementType();
+      for (auto &element : expr->getElements()) {
+        element = coerceToType(element, elementType,
+                               cs.getConstraintLocator(element));
       }
 
-      Type argType = TupleType::get(typeElements, tc.Context);
-      assert(isa<TupleType>(argType.getPointer()));
-
-      Expr *arg =
-            TupleExpr::create(tc.Context, expr->getLBracketLoc(),
-                              expr->getElements(),
-                              names,
-                              { },
-                              expr->getRBracketLoc(),
-                              /*HasTrailingClosure=*/false,
-                              /*Implicit=*/true,
-                              argType);
-
-      cs.cacheExprTypes(arg);
-
-      cs.setExprTypes(typeRef);
-      cs.setExprTypes(arg);
-
-      Expr *result = tc.callWitness(typeRef, dc, dictionaryProto,
-                                    *conformance, name, arg,
-                                    diag::dictionary_protocol_broken);
-      if (!result)
-        return nullptr;
-
-      cs.cacheExprTypes(result);
-
-      expr->setSemanticExpr(result);
       return expr;
     }
 
@@ -3189,7 +3014,8 @@ namespace {
     }
 
     Expr *visitOpaqueValueExpr(OpaqueValueExpr *expr) {
-      llvm_unreachable("Already type-checked");
+      assert(expr->isPlaceholder() && "Already type-checked");
+      return expr;
     }
 
     Expr *visitDefaultArgumentExpr(DefaultArgumentExpr *expr) {
@@ -3290,7 +3116,6 @@ namespace {
       auto toType = simplifyType(cs.getType(expr->getCastTypeLoc()));
       auto sub = cs.coerceToRValue(expr->getSubExpr());
 
-      checkForImportedUsedConformances(toType);
       expr->setSubExpr(sub);
 
       // Set the type we checked against.
@@ -3368,8 +3193,20 @@ namespace {
           return nullptr;
 
         // Extract a Bool from the resulting expression.
-        return solution.convertOptionalToBool(result,
-                                              cs.getConstraintLocator(expr));
+        tc.requireOptionalIntrinsics(expr->getLoc());
+
+        // Match the optional value against its `Some` case.
+        auto &ctx = tc.Context;
+        auto *someDecl = tc.Context.getOptionalSomeDecl();
+        auto isSomeExpr = new (tc.Context) EnumIsCaseExpr(result, someDecl);
+        auto boolDecl = ctx.getBoolDecl();
+
+        if (!boolDecl) {
+          tc.diagnose(SourceLoc(), diag::broken_bool);
+        }
+
+        cs.setType(isSomeExpr, boolDecl ? boolDecl->getDeclaredType() : Type());
+        return isSomeExpr;
       }
 
       return expr;
@@ -3646,7 +3483,6 @@ namespace {
       // Simplify the type we're casting to.
       auto toType = simplifyType(cs.getType(expr->getCastTypeLoc()));
       expr->getCastTypeLoc().setType(toType);
-      checkForImportedUsedConformances(toType);
 
       auto &tc = cs.getTypeChecker();
 
@@ -3739,7 +3575,6 @@ namespace {
         toType = toType->getOptionalObjectType();
 
       expr->getCastTypeLoc().setType(toType);
-      checkForImportedUsedConformances(toType);
 
       // The subexpression is always an rvalue.
       auto &tc = cs.getTypeChecker();
@@ -3818,7 +3653,6 @@ namespace {
                                            bool isInsideIsExpr = false) {
       // Simplify the type we're casting to.
       auto toType = simplifyType(cs.getType(expr->getCastTypeLoc()));
-      checkForImportedUsedConformances(toType);
       expr->getCastTypeLoc().setType(toType);
 
       // The subexpression is always an rvalue.
@@ -4011,15 +3845,25 @@ namespace {
     }
 
     Expr *visitLazyInitializerExpr(LazyInitializerExpr *expr) {
-      // Since `LazyInitializerExpr` should always have a type set,
-      // there is no need to do anything here.
-      assert(cs.getType(expr)->isEqual(expr->getSubExpr()->getType()));
-      return expr;
+      llvm_unreachable("Already type-checked");
     }
     
     Expr *visitEditorPlaceholderExpr(EditorPlaceholderExpr *E) {
       simplifyExprType(E);
       auto valueType = cs.getType(E);
+
+      // TODO(diagnostics): Once all of the diagnostics are moved to
+      // new diagnostics framework this check could be eliminated.
+      //
+      // Only way for this to happen is CSDiag try to re-typecheck
+      // sub-expression which contains this placeholder with
+      // `AllowUnresolvedTypeVariables` flag set.
+      //
+      // A better solution could be to replace placeholders with this
+      // implicit call early on and type-check that call together with
+      // the rest of the constraint system.
+      if (valueType->hasUnresolvedType())
+        return nullptr;
 
       auto &tc = cs.getTypeChecker();
       auto &ctx = tc.Context;
@@ -4571,22 +4415,14 @@ namespace {
     buildKeyPathPropertyComponent(const SelectedOverload &overload,
                                   SourceLoc componentLoc,
                                   ConstraintLocator *locator) {
-      if (overload.choice.isDecl()) {
-        auto property = overload.choice.getDecl();
-
+      if (auto *property = overload.choice.getDeclOrNull()) {
         // Key paths can only refer to properties currently.
-        if (!isa<VarDecl>(property)) {
-          cs.TC.diagnose(componentLoc, diag::expr_keypath_not_property,
-                         property->getDescriptiveKind(),
-                         property->getFullName());
-        } else {
-          // Key paths don't work with mutating-get properties.
-          auto varDecl = cast<VarDecl>(property);
-          assert(!varDecl->isGetterMutating());
-          // Key paths don't currently support static members.
-          // There is a fix which diagnoses such situation already.
-          assert(!varDecl->isStatic());
-        }
+        auto varDecl = cast<VarDecl>(property);
+        // Key paths don't work with mutating-get properties.
+        assert(!varDecl->isGetterMutating());
+        // Key paths don't currently support static members.
+        // There is a fix which diagnoses such situation already.
+        assert(!varDecl->isStatic());
 
         cs.TC.requestMemberLayout(property);
 
@@ -4685,10 +4521,6 @@ namespace {
       auto hashable =
           cs.getASTContext().getProtocol(KnownProtocolKind::Hashable);
 
-      auto equatable =
-          cs.getASTContext().getProtocol(KnownProtocolKind::Equatable);
-
-      auto &TC = cs.getTypeChecker();
       auto fnType = overload.openedType->castTo<FunctionType>();
       for (const auto &param : fnType->getParams()) {
         auto indexType = simplifyType(param.getPlainType());
@@ -4696,20 +4528,9 @@ namespace {
         // verified by the solver, we just need to get it again
         // with all of the generic parameters resolved.
         auto hashableConformance =
-            TC.conformsToProtocol(indexType, hashable, cs.DC,
-                                  (ConformanceCheckFlags::Used |
-                                   ConformanceCheckFlags::InExpression));
+          TypeChecker::conformsToProtocol(indexType, hashable, cs.DC,
+                                          ConformanceCheckFlags::InExpression);
         assert(hashableConformance.hasValue());
-
-        // FIXME: Hashable implies Equatable, but we need to make sure the
-        // Equatable conformance is forced into existence during type
-        // checking so that it's available for SILGen.
-        auto eqConformance =
-            TC.conformsToProtocol(indexType, equatable, cs.DC,
-                                  (ConformanceCheckFlags::Used |
-                                   ConformanceCheckFlags::InExpression));
-        assert(eqConformance.hasValue());
-        (void)eqConformance;
 
         conformances.push_back(*hashableConformance);
       }
@@ -4741,11 +4562,6 @@ namespace {
 
     Expr *walkToExprPost(Expr *expr) {
       Expr *result = visit(expr);
-
-      // Mark any _ObjectiveCBridgeable conformances as 'used'.
-      if (result) {
-        useObjectiveCBridgeableConformances(cs.DC, cs.getType(result));
-      }
 
       assert(expr == ExprStack.back());
       ExprStack.pop_back();
@@ -4888,10 +4704,8 @@ static ConcreteDeclRef resolveLocatorToDecl(
     // Overloaded and unresolved cases: find the resolved overload.
     auto anchorLocator = cs.getConstraintLocator(anchor);
     if (auto selected = findOvlChoice(anchorLocator)) {
-      if (selected->choice.isDecl())
-        return getConcreteDeclRef(selected->choice.getDecl(),
-                                  selected->openedType,
-                                  anchorLocator);
+      if (auto *decl = selected->choice.getDeclOrNull())
+        return getConcreteDeclRef(decl, selected->openedType, anchorLocator);
     }
   }
   
@@ -4900,10 +4714,8 @@ static ConcreteDeclRef resolveLocatorToDecl(
     auto anchorLocator = cs.getConstraintLocator(anchor,
                            ConstraintLocator::UnresolvedMember);
     if (auto selected = findOvlChoice(anchorLocator)) {
-      if (selected->choice.isDecl())
-        return getConcreteDeclRef(selected->choice.getDecl(),
-                                  selected->openedType,
-                                  anchorLocator);
+      if (auto *decl = selected->choice.getDeclOrNull())
+        return getConcreteDeclRef(decl, selected->openedType, anchorLocator);
     }
   }
 
@@ -4912,10 +4724,8 @@ static ConcreteDeclRef resolveLocatorToDecl(
     auto anchorLocator = cs.getConstraintLocator(anchor,
                                                  ConstraintLocator::Member);
     if (auto selected = findOvlChoice(anchorLocator)) {
-      if (selected->choice.isDecl())
-        return getConcreteDeclRef(selected->choice.getDecl(),
-                                  selected->openedType,
-                                  anchorLocator);
+      if (auto *decl = selected->choice.getDeclOrNull())
+        return getConcreteDeclRef(decl, selected->openedType, anchorLocator);
     }
   }
 
@@ -4928,10 +4738,8 @@ static ConcreteDeclRef resolveLocatorToDecl(
     auto anchorLocator =
       cs.getConstraintLocator(anchor, ConstraintLocator::SubscriptMember);
     if (auto selected = findOvlChoice(anchorLocator)) {
-      if (selected->choice.isDecl())
-        return getConcreteDeclRef(selected->choice.getDecl(),
-                                  selected->openedType,
-                                  anchorLocator);
+      if (auto *decl = selected->choice.getDeclOrNull())
+        return getConcreteDeclRef(decl, selected->openedType, anchorLocator);
     }
   }
 
@@ -5275,8 +5083,7 @@ collectExistentialConformances(TypeChecker &tc, Type fromType, Type toType,
   for (auto proto : layout.getProtocols()) {
     conformances.push_back(
       *tc.containsProtocol(fromType, proto->getDecl(), DC,
-                           (ConformanceCheckFlags::InExpression|
-                            ConformanceCheckFlags::Used)));
+                           ConformanceCheckFlags::InExpression));
   }
 
   return tc.Context.AllocateCopy(conformances);
@@ -5506,8 +5313,7 @@ Expr *ExprRewriter::coerceCallArguments(
   // Determine whether this application has curried self.
   bool skipCurriedSelf = apply ? hasCurriedSelf(cs, callee, apply) : true;
   // Determine the parameter bindings.
-  SmallBitVector defaultMap
-    = computeDefaultMap(params, callee.getDecl(), skipCurriedSelf);
+  ParameterListInfo paramInfo(params, callee.getDecl(), skipCurriedSelf);
 
   SmallVector<AnyFunctionType::Param, 8> args;
   AnyFunctionType::decomposeInput(cs.getType(arg), args);
@@ -5522,7 +5328,7 @@ Expr *ExprRewriter::coerceCallArguments(
   MatchCallArgumentListener listener;
   SmallVector<ParamBinding, 4> parameterBindings;
   bool failed = constraints::matchCallArguments(args, params,
-                                                defaultMap,
+                                                paramInfo,
                                                 hasTrailingClosure,
                                                 /*allowFixes=*/false, listener,
                                                 parameterBindings);
@@ -5689,20 +5495,27 @@ Expr *ExprRewriter::coerceCallArguments(
       continue;
     }
 
-    auto isAutoClosureArg = [](Expr *arg) -> bool {
-      if (auto *DRE = dyn_cast<DeclRefExpr>(arg)) {
-        if (auto *PD = dyn_cast<ParamDecl>(DRE->getDecl()))
-          return PD->isAutoClosure();
+    Expr *convertedArg = nullptr;
+    auto argRequiresAutoClosureExpr = [&](const AnyFunctionType::Param &param,
+                                          Type argType) {
+      if (!param.isAutoClosure())
+        return false;
+
+      // Since it was allowed to pass function types to @autoclosure
+      // parameters in Swift versions < 5, it has to be handled as
+      // a regular function coversion by `coerceToType`.
+      if (isAutoClosureArgument(arg)) {
+        // In Swift >= 5 mode we only allow `@autoclosure` arguments
+        // to be used by value if parameter would return a function
+        // type (it just needs to get wrapped into autoclosure expr),
+        // otherwise argument must always form a call.
+        return cs.getASTContext().isSwiftVersionAtLeast(5);
       }
-      return false;
+
+      return true;
     };
 
-    Expr *convertedArg = nullptr;
-    // Since it was allowed to pass function types to @autoclosure
-    // parameters in Swift versions < 5, it has to be handled as
-    // a regular function coversion by `coerceToType`.
-    if (param.isAutoClosure() && (!argType->is<FunctionType>() ||
-                                  !isAutoClosureArg(arg))) {
+    if (argRequiresAutoClosureExpr(param, argType)) {
       assert(!param.isInOut());
 
       // If parameter is an autoclosure, we need to make sure that:
@@ -6376,10 +6189,9 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
       // Find the conformance of the source type to Hashable.
       auto hashable = tc.Context.getProtocol(KnownProtocolKind::Hashable);
       auto conformance =
-        tc.conformsToProtocol(
+        TypeChecker::conformsToProtocol(
                         cs.getType(expr), hashable, cs.DC,
-                        (ConformanceCheckFlags::InExpression |
-                         ConformanceCheckFlags::Used));
+                        ConformanceCheckFlags::InExpression);
       assert(conformance && "must conform to Hashable");
 
       return cs.cacheType(
@@ -6883,15 +6695,13 @@ Expr *ExprRewriter::convertLiteralInPlace(Expr *literal,
   Optional<ProtocolConformanceRef> builtinConformance;
   if (builtinProtocol &&
       (builtinConformance =
-         tc.conformsToProtocol(type, builtinProtocol, cs.DC,
-                               ConformanceCheckFlags::InExpression))) {
+         TypeChecker::conformsToProtocol(type, builtinProtocol, cs.DC,
+                                         ConformanceCheckFlags::InExpression))) {
 
     // Find the witness that we'll use to initialize the type via a builtin
     // literal.
-    auto witness = findNamedWitnessImpl(
-                     tc, dc, type->getRValueType(), builtinProtocol,
-                     builtinLiteralFuncName, brokenBuiltinProtocolDiag,
-                     *builtinConformance);
+    auto witness = builtinConformance->getWitnessByName(type->getRValueType(),
+                                                        builtinLiteralFuncName);
     if (!witness || !isa<AbstractFunctionDecl>(witness.getDecl()))
       return nullptr;
 
@@ -6917,7 +6727,7 @@ Expr *ExprRewriter::convertLiteralInPlace(Expr *literal,
 
   // This literal type must conform to the (non-builtin) protocol.
   assert(protocol && "requirements should have stopped recursion");
-  auto conformance = tc.conformsToProtocol(type, protocol, cs.DC,
+  auto conformance = TypeChecker::conformsToProtocol(type, protocol, cs.DC,
                                            ConformanceCheckFlags::InExpression);
   assert(conformance && "must conform to literal protocol");
 
@@ -6939,10 +6749,8 @@ Expr *ExprRewriter::convertLiteralInPlace(Expr *literal,
   }
 
   // Find the witness that we'll use to initialize the literal value.
-  auto witness = findNamedWitnessImpl(
-                   tc, dc, type->getRValueType(), protocol,
-                   literalFuncName, brokenProtocolDiag,
-                   conformance);
+  auto witness = conformance->getWitnessByName(type->getRValueType(),
+                                               literalFuncName);
   if (!witness || !isa<AbstractFunctionDecl>(witness.getDecl()))
     return nullptr;
 
@@ -7502,6 +7310,21 @@ namespace {
         // metadata types/conformances during IRGen.
         tc.requestRequiredNominalTypeLayoutForParameters(params);
 
+        // If this closure had a function builder applied, rewrite it to a
+        // closure with a single expression body containing the builder
+        // invocations.
+        auto builder =
+            Rewriter.solution.builderTransformedClosures.find(closure);
+        if (builder != Rewriter.solution.builderTransformedClosures.end()) {
+          auto singleExpr = builder->second.second;
+          auto returnStmt = new (tc.Context) ReturnStmt(
+             singleExpr->getStartLoc(), singleExpr, /*implicit=*/true);
+          auto braceStmt = BraceStmt::create(
+              tc.Context, returnStmt->getStartLoc(), ASTNode(returnStmt),
+              returnStmt->getEndLoc(), /*implicit=*/true);
+          closure->setBody(braceStmt, /*isSingleExpression=*/true);
+        }
+
         // If this is a single-expression closure, convert the expression
         // in the body to the result type of the closure.
         if (closure->hasSingleExpressionBody()) {
@@ -7543,7 +7366,11 @@ namespace {
           ClosuresToTypeCheck.push_back(closure);
         }
 
-        tc.ClosuresWithUncomputedCaptures.push_back(closure);
+        // Don't try to register captures if constraint system is used to
+        // produce diagnostics for one of the sub-expressions.
+        if (!cs.Options.contains(
+                ConstraintSystemFlags::SubExpressionDiagnostics))
+          tc.ClosuresWithUncomputedCaptures.push_back(closure);
 
         return { false, closure };
       }
@@ -7559,11 +7386,7 @@ namespace {
     }
 
     Expr *walkToExprPost(Expr *expr) override {
-      Expr *result = Rewriter.walkToExprPost(expr);
-      auto &cs = Rewriter.getConstraintSystem();
-      if (result && cs.hasType(result))
-        Rewriter.checkForImportedUsedConformances(cs.getType(result));
-      return result;
+      return Rewriter.walkToExprPost(expr);
     }
 
     /// Ignore statements.
@@ -7590,44 +7413,78 @@ Expr *ConstraintSystem::coerceToRValue(Expr *expr) {
 /// Emit the fixes computed as part of the solution, returning true if we were
 /// able to emit an error message, or false if none of the fixits worked out.
 bool ConstraintSystem::applySolutionFixes(Expr *E, const Solution &solution) {
-  llvm::SmallDenseMap<Expr *, SmallVector<const ConstraintFix *, 4>>
-      fixesPerExpr;
-
+  // First transfer all of the deduced information back
+  // to the constraint system.
   applySolution(solution);
 
-  for (auto *fix : solution.Fixes)
-    fixesPerExpr[fix->getAnchor()].push_back(fix);
+  class DiagnosticWalker : public ASTWalker {
+    Expr *root;
+    const Solution &solution;
+    llvm::SmallDenseMap<Expr *, SmallVector<ConstraintFix *, 4>> fixesPerExpr;
 
-  auto diagnoseExprFailures = [&](Expr *expr) -> bool {
-    auto fixes = fixesPerExpr.find(expr);
-    if (fixes == fixesPerExpr.end())
-      return false;
+    /// Determines whether any error have been diagnosed while
+    /// trying to apply fixes associated with a given solution.
+    bool DiagnosedAnyErrors = false;
 
-    bool diagnosedError = false;
-    for (const auto *fix : fixes->second) {
-      auto diagnosed = fix->diagnose(E);
+  public:
+    DiagnosticWalker(Expr *expr, const Solution &solution)
+        : root(expr), solution(solution) {
+      for (auto *fix : solution.Fixes)
+        fixesPerExpr[fix->getAnchor()].push_back(fix);
+    }
 
-      if (fix->isWarning()) {
-        assert(diagnosed && "warnings should always be diagnosed");
-        (void)diagnosed;
-      } else {
-        diagnosedError |= diagnosed;
+    std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+      // Diagnose root expression last.
+      if (E == root)
+        return {true, E};
+
+      if (auto *closure = dyn_cast<ClosureExpr>(E)) {
+        auto result = solution.builderTransformedClosures.find(closure);
+        if (result != solution.builderTransformedClosures.end()) {
+          auto *transformedExpr = result->second.second;
+          // Since this closure has been transformed into something
+          // else let's look inside transformed expression instead.
+          return {true, transformedExpr};
+        }
+      }
+
+      diagnose(E);
+      return {true, E};
+    }
+
+    Expr *walkToExprPost(Expr *E) override {
+      if (E == root)
+        diagnose(E);
+      return E;
+    }
+
+    std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
+      return {true, S};
+    }
+
+    bool hadErrors() const { return DiagnosedAnyErrors; }
+
+  private:
+    void diagnose(Expr *E) {
+      auto fixes = fixesPerExpr.find(E);
+      if (fixes == fixesPerExpr.end())
+        return;
+
+      for (const auto *fix : fixes->second) {
+        auto diagnosed = fix->diagnose(root);
+        if (fix->isWarning()) {
+          assert(diagnosed && "warnings should always be diagnosed");
+          (void)diagnosed;
+        } else {
+          DiagnosedAnyErrors |= diagnosed;
+        }
       }
     }
-    return diagnosedError;
   };
 
-  bool diagnosedError = false;
-  E->forEachChildExpr([&](Expr *subExpr) -> Expr * {
-    // Diagnose root expression at the end to
-    // preserve ordering.
-    if (subExpr != E)
-      diagnosedError |= diagnoseExprFailures(subExpr);
-    return subExpr;
-  });
-
-  diagnosedError |= diagnoseExprFailures(E);
-  return diagnosedError;
+  DiagnosticWalker diagnostics(E, solution);
+  E->walk(diagnostics);
+  return diagnostics.hadErrors();
 }
 
 /// Apply a given solution to the expression, producing a fully
@@ -7636,6 +7493,11 @@ Expr *ConstraintSystem::applySolution(Solution &solution, Expr *expr,
                                       Type convertType,
                                       bool discardedExpr,
                                       bool skipClosures) {
+  // Add the node types back.
+  for (auto &nodeType : solution.addedNodeTypes) {
+    setType(nodeType.first, nodeType.second);
+  }
+
   // If any fixes needed to be applied to arrive at this solution, resolve
   // them to specific expressions.
   if (!solution.Fixes.empty()) {
@@ -7658,10 +7520,6 @@ Expr *ConstraintSystem::applySolution(Solution &solution, Expr *expr,
       return nullptr;
     }
   }
-
-  // Mark any normal conformances used in this solution as "used".
-  for (auto &e : solution.Conformances)
-    TC.markConformanceUsed(e.second, DC);
 
   ExprRewriter rewriter(*this, solution, shouldSuppressDiagnostics());
   ExprWalker walker(rewriter);
@@ -7691,10 +7549,18 @@ Expr *ConstraintSystem::applySolution(Solution &solution, Expr *expr,
     if (hadError)
       return nullptr;
   }
-  
+
+  // We are supposed to use contextual type only if it is present and
+  // this expression doesn't represent the implicit return of the single
+  // expression function which got deduced to be `Never`.
+  auto shouldCoerceToContextualType = [&]() {
+    return convertType && !(getType(result)->isUninhabited() &&
+                            getContextualTypePurpose() == CTP_ReturnSingleExpr);
+  };
+
   // If we're supposed to convert the expression to some particular type,
   // do so now.
-  if (convertType) {
+  if (shouldCoerceToContextualType()) {
     result = rewriter.coerceToType(result, convertType,
                                    getConstraintLocator(expr));
     if (!result)
@@ -7778,10 +7644,9 @@ Expr *TypeChecker::callWitness(Expr *base, DeclContext *dc,
 
   if (auto metaType = type->getAs<AnyMetatypeType>())
     type = metaType->getInstanceType();
-  
-  auto witness = findNamedWitnessImpl(
-                   *this, dc, type->getRValueType(), protocol,
-                   name, brokenProtocolDiag);
+
+  // Find the member used to satisfy the named requirement.
+  auto witness = conformance.getWitnessByName(type, name);
   if (!witness || !isa<AbstractFunctionDecl>(witness.getDecl()))
     return nullptr;
 
@@ -7851,6 +7716,7 @@ Expr *TypeChecker::callWitness(Expr *base, DeclContext *dc,
   auto openedFuncType = openedType->castTo<FunctionType>();
   ::matchCallArguments(
       cs, args, openedFuncType->getParams(),
+      ConstraintKind::ArgumentConversion,
       cs.getConstraintLocator(call, ConstraintLocator::ApplyArgument));
 
   // Solve the system.
@@ -7886,23 +7752,4 @@ Expr *TypeChecker::callWitness(Expr *base, DeclContext *dc,
 
   rewriter.finalize(result);
   return result;
-}
-
-Expr *Solution::convertOptionalToBool(Expr *expr,
-                                      ConstraintLocator *locator) const {
-  auto &cs = getConstraintSystem();
-  auto &tc = cs.getTypeChecker();
-  tc.requireOptionalIntrinsics(expr->getLoc());
-
-  // Match the optional value against its `Some` case.
-  auto &ctx = tc.Context;
-  auto isSomeExpr = new (ctx) EnumIsCaseExpr(expr, ctx.getOptionalSomeDecl());
-  auto boolDecl = ctx.getBoolDecl();
-
-  if (!boolDecl) {
-    tc.diagnose(SourceLoc(), diag::broken_bool);
-  }
-
-  cs.setType(isSomeExpr, boolDecl ? boolDecl->getDeclaredType() : Type());
-  return isSomeExpr;
 }

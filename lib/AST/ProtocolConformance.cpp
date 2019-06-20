@@ -141,23 +141,15 @@ ProtocolConformanceRef::subst(Type origType,
   llvm_unreachable("Invalid conformance substitution");
 }
 
-ProtocolConformanceRef
-ProtocolConformanceRef::substOpaqueTypesWithUnderlyingTypes(Type origType) const {
-  ReplaceOpaqueTypesWithUnderlyingTypes replacer;
-  return subst(origType, replacer, replacer,
-               SubstFlags::SubstituteOpaqueArchetypes);
-}
-
 Type
-ProtocolConformanceRef::getTypeWitnessByName(Type type,
-                                             ProtocolConformanceRef conformance,
-                                             Identifier name,
-                                             LazyResolver *resolver) {
-  assert(!conformance.isInvalid());
+ProtocolConformanceRef::getTypeWitnessByName(Type type, Identifier name) const {
+  assert(!isInvalid());
 
   // Find the named requirement.
+  ProtocolDecl *proto = getRequirement();
   AssociatedTypeDecl *assocType = nullptr;
-  auto members = conformance.getRequirement()->lookupDirect(name);
+  auto members = proto->lookupDirect(name,
+                      NominalTypeDecl::LookupDirectFlags::IgnoreNewExtensions);
   for (auto member : members) {
     assocType = dyn_cast<AssociatedTypeDecl>(member);
     if (assocType)
@@ -168,21 +160,36 @@ ProtocolConformanceRef::getTypeWitnessByName(Type type,
   if (!assocType)
     return nullptr;
 
-  if (conformance.isAbstract()) {
-    // For an archetype, retrieve the nested type with the appropriate
-    // name. There are no conformance tables.
-    if (auto archetype = type->getAs<ArchetypeType>()) {
-      return archetype->getNestedType(name);
-    }
+  return assocType->getDeclaredInterfaceType().subst(
+    SubstitutionMap::getProtocolSubstitutions(proto, type, *this));
+}
 
-    return DependentMemberType::get(type, assocType);
+ConcreteDeclRef
+ProtocolConformanceRef::getWitnessByName(Type type, DeclName name) const {
+  // Find the named requirement.
+  auto *proto = getRequirement();
+  auto results =
+    proto->lookupDirect(name,
+                      NominalTypeDecl::LookupDirectFlags::IgnoreNewExtensions);
+
+  ValueDecl *requirement = nullptr;
+  for (auto *result : results) {
+    if (isa<ProtocolDecl>(result->getDeclContext()))
+      requirement = result;
   }
 
-  auto concrete = conformance.getConcrete();
-  if (!concrete->hasTypeWitness(assocType, resolver)) {
-    return nullptr;
+  if (requirement == nullptr)
+    return ConcreteDeclRef();
+
+  // For a type with dependent conformance, just return the requirement from
+  // the protocol. There are no protocol conformance tables.
+  if (!isConcrete()) {
+    auto subs = SubstitutionMap::getProtocolSubstitutions(proto, type, *this);
+    return ConcreteDeclRef(requirement, subs);
   }
-  return concrete->getTypeWitness(assocType, resolver);
+
+  auto *resolver = proto->getASTContext().getLazyResolver();
+  return getConcrete()->getWitnessDeclRef(requirement, resolver);
 }
 
 void *ProtocolConformance::operator new(size_t bytes, ASTContext &context,
@@ -448,7 +455,7 @@ bool NormalProtocolConformance::isRetroactive() const {
     // defined in a Clang module.
     if (auto nominalLoadedModule =
           dyn_cast<LoadedFile>(nominal->getModuleScopeContext())) {
-      if (auto overlayModule = nominalLoadedModule->getAdapterModule())
+      if (auto overlayModule = nominalLoadedModule->getOverlayModule())
         nominalModule = overlayModule;
     }
 
@@ -505,37 +512,6 @@ ProtocolConformanceRef::getConditionalRequirements() const {
   else
     // An abstract conformance is never conditional, as above.
     return {};
-}
-
-ProtocolConformanceRef
-ProtocolConformanceRef::getInheritedConformanceRef(ProtocolDecl *base) const {
-  if (isAbstract()) {
-    assert(getRequirement()->inheritsFrom(base));
-    return ProtocolConformanceRef(base);
-  }
-
-  auto concrete = getConcrete();
-  auto proto = concrete->getProtocol();
-  auto path =
-    proto->getGenericSignature()->getConformanceAccessPath(
-                                            proto->getSelfInterfaceType(), base);
-  ProtocolConformanceRef result = *this;
-  Type resultType = concrete->getType();
-  bool first = true;
-  for (const auto &step : path) {
-    if (first) {
-      assert(step.first->isEqual(proto->getSelfInterfaceType()));
-      assert(step.second == proto);
-      first = false;
-      continue;
-    }
-
-    result =
-        result.getAssociatedConformance(resultType, step.first, step.second);
-    resultType = result.getAssociatedType(resultType, step.first);
-  }
-
-  return result;
 }
 
 void NormalProtocolConformance::differenceAndStoreConditionalRequirements()
@@ -928,8 +904,9 @@ NormalProtocolConformance::getAssociatedConformance(Type assocType,
   // Fill in the signature conformances, if we haven't done so yet.
   if (getSignatureConformances().empty()) {
     assocType->getASTContext().getLazyResolver()
-      ->checkConformanceRequirements(
-        const_cast<NormalProtocolConformance *>(this));
+      ->resolveTypeWitness(
+        const_cast<NormalProtocolConformance *>(this),
+        nullptr);
   }
 
   assert(!getSignatureConformances().empty() &&
@@ -989,8 +966,23 @@ Witness SelfProtocolConformance::getWitness(ValueDecl *requirement,
 ConcreteDeclRef
 RootProtocolConformance::getWitnessDeclRef(ValueDecl *requirement,
                                            LazyResolver *resolver) const {
-  if (auto witness = getWitness(requirement, resolver))
-    return witness.getDeclRef();
+  if (auto witness = getWitness(requirement, resolver)) {
+    auto *witnessDecl = witness.getDecl();
+
+    // If the witness is generic, you have to call getWitness() and build
+    // your own substitutions in terms of the synthetic environment.
+    if (auto *witnessDC = dyn_cast<DeclContext>(witnessDecl))
+      assert(!witnessDC->isInnermostContextGeneric());
+
+    // If the witness is not generic, use type substitutions from the
+    // witness's parent. Don't use witness.getSubstitutions(), which
+    // are written in terms of the synthetic environment.
+    auto subs =
+      getType()->getContextSubstitutionMap(getDeclContext()->getParentModule(),
+                                           witnessDecl->getDeclContext());
+    return ConcreteDeclRef(witness.getDecl(), subs);
+  }
+
   return ConcreteDeclRef();
 }
 
@@ -1143,11 +1135,6 @@ SpecializedProtocolConformance::getWitnessDeclRef(
   auto witnessMap = baseWitness.getSubstitutions();
 
   auto combinedMap = witnessMap.subst(specializationMap);
-
-  // Fast path if the substitutions didn't change.
-  if (combinedMap == baseWitness.getSubstitutions())
-    return baseWitness;
-
   return ConcreteDeclRef(witnessDecl, combinedMap);
 }
 

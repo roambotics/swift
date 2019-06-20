@@ -19,7 +19,6 @@
 #define SWIFT_BASIC_LANGOPTIONS_H
 
 #include "swift/Config.h"
-#include "swift/Basic/CycleDiagnosticKind.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Version.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -97,12 +96,23 @@ namespace swift {
     /// Enable 'availability' restrictions for App Extensions.
     bool EnableAppExtensionRestrictions = false;
 
+    /// Require public declarations to declare an introduction OS version.
+    bool RequireExplicitAvailability = false;
+
+    /// Introduction platform and version to suggest as fix-it
+    /// when using RequireExplicitAvailability.
+    std::string RequireExplicitAvailabilityTarget;
+
     ///
     /// Support for alternate usage modes
     ///
 
     /// Enable features useful for running in the debugger.
     bool DebuggerSupport = false;
+
+    /// Enable the MemoryBufferSerializedModuleImporter.
+    /// Only used by lldb-moduleimport-test.
+    bool EnableMemoryBufferImporter = false;
 
     /// Enable the DWARFImporter. Only used by lldb-moduleimport-test.
     bool EnableDWARFImporter = false;
@@ -166,6 +176,10 @@ namespace swift {
     /// solver should be debugged.
     unsigned DebugConstraintSolverAttempt = 0;
 
+    /// Line numbers to activate the constraint solver debugger.
+    /// Should be stored sorted.
+    llvm::SmallVector<unsigned, 4> DebugConstraintSolverOnLines;
+
     /// Enable named lazy member loading.
     bool NamedLazyMemberLoading = true;
 
@@ -177,9 +191,8 @@ namespace swift {
     /// This is for testing purposes.
     std::string DebugForbidTypecheckPrefix;
 
-    /// How to diagnose cycles encountered
-    CycleDiagnosticKind EvaluatorCycleDiagnostics =
-        CycleDiagnosticKind::NoDiagnose;
+    /// Whether to dump debug info for request evaluator cycles.
+    bool DebugDumpCycles = false;
 
     /// The path to which we should emit GraphViz output for the complete
     /// request-evaluator graph.
@@ -234,6 +247,12 @@ namespace swift {
 
     /// Should we use \c ASTScope-based resolution for unqualified name lookup?
     bool EnableASTScopeLookup = false;
+    
+    /// Someday, ASTScopeLookup will supplant lookup in the parser
+    bool DisableParserLookup = false;
+
+    /// Sound we compare to ASTScope-based resolution for debugging?
+    bool CompareToASTScopeLookup = false;
 
     /// Whether to use the import as member inference system
     ///
@@ -293,16 +312,11 @@ namespace swift {
     
     /// Enable the experimental opaque result types feature.
     bool EnableOpaqueResultTypes = true;
-
+    
     /// To mimic existing system, set to false.
     /// To experiment with including file-private and private dependency info,
     /// set to true.
     bool ExperimentalDependenciesIncludeIntrafileOnes = false;
-
-    /// Enable experimental support for emitting Objective-C resilient class
-    /// stubs. This is a language option since it also determines if we admit
-    /// @objc members in extensions of classes with resilient ancestry.
-    bool EnableObjCResilientClassStubs = false;
 
     /// Sets the target we are building for and updates platform conditions
     /// to match.
@@ -378,6 +392,33 @@ namespace swift {
     bool isSwiftVersionAtLeast(unsigned major, unsigned minor = 0) const {
       return EffectiveLanguageVersion.isVersionAtLeast(major, minor);
     }
+
+    // The following deployment targets ship an Objective-C runtime supporting
+    // the class metadata update callback mechanism:
+    //
+    // - macOS 10.14.4
+    // - iOS 12.2
+    // - tvOS 12.2
+    // - watchOS 5.2
+    bool doesTargetSupportObjCMetadataUpdateCallback() const;
+
+    // The following deployment targets ship an Objective-C runtime supporting
+    // the objc_getClass() hook:
+    //
+    // - macOS 10.14.4
+    // - iOS 12.2
+    // - tvOS 12.2
+    // - watchOS 5.2
+    bool doesTargetSupportObjCGetClassHook() const;
+
+    // The following deployment targets ship an Objective-C runtime supporting
+    // the objc_loadClassref() entry point:
+    //
+    // - macOS 10.15
+    // - iOS 13
+    // - tvOS 13
+    // - watchOS 6
+    bool doesTargetSupportObjCClassStubs() const;
 
     /// Returns true if the given platform condition argument represents
     /// a supported target operating system.

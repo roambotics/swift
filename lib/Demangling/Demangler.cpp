@@ -690,7 +690,8 @@ NodePointer Demangler::demangleSymbolicReference(unsigned char rawKind,
     return nullptr;
   
   // Types register as substitutions even when symbolically referenced.
-  if (kind == SymbolicReferenceKind::Context)
+  if (kind == SymbolicReferenceKind::Context &&
+      resolved->getKind() != Node::Kind::OpaqueTypeDescriptorSymbolicReference)
     addSubstitution(resolved);
   return resolved;
 }
@@ -1805,6 +1806,18 @@ NodePointer Demangler::demangleMetatype() {
       return createWithPoppedType(Node::Kind::GenericTypeMetadataPattern);
     case 'a':
       return createWithPoppedType(Node::Kind::TypeMetadataAccessFunction);
+    case 'g':
+      return createWithChild(Node::Kind::OpaqueTypeDescriptorAccessor,
+                             popNode());
+    case 'h':
+      return createWithChild(Node::Kind::OpaqueTypeDescriptorAccessorImpl,
+                             popNode());
+    case 'j':
+      return createWithChild(Node::Kind::OpaqueTypeDescriptorAccessorKey,
+                             popNode());
+    case 'k':
+      return createWithChild(Node::Kind::OpaqueTypeDescriptorAccessorVar,
+                             popNode());
     case 'I':
       return createWithPoppedType(Node::Kind::TypeMetadataInstantiationCache);
     case 'i':
@@ -2696,6 +2709,8 @@ NodePointer Demangler::demangleSpecialType() {
       return popFunctionType(Node::Kind::AutoClosureType);
     case 'U':
       return popFunctionType(Node::Kind::UncurriedFunctionType);
+    case 'L':
+      return popFunctionType(Node::Kind::EscapingObjCBlock);
     case 'B':
       return popFunctionType(Node::Kind::ObjCBlock);
     case 'C':

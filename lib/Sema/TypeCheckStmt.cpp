@@ -15,8 +15,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "TypeChecker.h"
+#include "TypeCheckAvailability.h"
 #include "TypeCheckType.h"
 #include "MiscDiagnostics.h"
+#include "ConstraintSystem.h"
 #include "swift/Subsystems.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/ASTWalker.h"
@@ -49,6 +51,26 @@ using namespace swift;
 
 #define DEBUG_TYPE "TypeCheckStmt"
 
+#ifndef NDEBUG
+/// Determine whether the given context is for the backing property of a
+/// property wrapper.
+static bool isPropertyWrapperBackingInitContext(DeclContext *dc) {
+  auto initContext = dyn_cast<Initializer>(dc);
+  if (!initContext) return false;
+
+  auto patternInitContext = dyn_cast<PatternBindingInitializer>(initContext);
+  if (!patternInitContext) return false;
+
+  auto binding = patternInitContext->getBinding();
+  if (!binding) return false;
+
+  auto singleVar = binding->getSingleVar();
+  if (!singleVar) return false;
+
+  return singleVar->getOriginalWrappedProperty() != nullptr;
+}
+#endif
+
 namespace {
   class ContextualizeClosures : public ASTWalker {
     DeclContext *ParentDC;
@@ -58,13 +80,6 @@ namespace {
     ContextualizeClosures(DeclContext *parent,
                           unsigned nextDiscriminator = 0)
       : ParentDC(parent), NextDiscriminator(nextDiscriminator) {}
-
-    /// Change the context we're contextualizing to.  This is
-    /// basically only reasonable when processing all the different
-    /// top-level code declarations.
-    void setContext(TopLevelCodeDecl *parent) {
-      ParentDC = parent;
-    }
 
     bool hasAutoClosures() const {
       return NextDiscriminator != 0;
@@ -116,8 +131,9 @@ namespace {
               ParentDC->getContextKind() != DeclContextKind::TopLevelCodeDecl) {
             // If a closure is nested within an auto closure, we'll need to update
             // its parent to the auto closure parent.
-            assert(ParentDC->getContextKind() ==
-                   DeclContextKind::AbstractClosureExpr &&
+            assert((ParentDC->getContextKind() ==
+                      DeclContextKind::AbstractClosureExpr ||
+                    isPropertyWrapperBackingInitContext(ParentDC)) &&
                    "Incorrect parent decl context for closure");
             CE->setParent(ParentDC);
           }
@@ -216,15 +232,10 @@ bool TypeChecker::contextualizeInitializer(Initializer *DC, Expr *E) {
 }
 
 void TypeChecker::contextualizeTopLevelCode(TopLevelContext &TLC,
-                                            ArrayRef<Decl*> topLevel) {
+                                            TopLevelCodeDecl *TLCD) {
   unsigned nextDiscriminator = TLC.NextAutoClosureDiscriminator;
-  ContextualizeClosures CC(nullptr, nextDiscriminator);
-  for (auto decl : topLevel) {
-    auto topLevelCode = dyn_cast<TopLevelCodeDecl>(decl);
-    if (!topLevelCode) continue;
-    CC.setContext(topLevelCode);
-    topLevelCode->getBody()->walk(CC);
-  }
+  ContextualizeClosures CC(TLCD, nextDiscriminator);
+  TLCD->getBody()->walk(CC);
   assert(nextDiscriminator == TLC.NextAutoClosureDiscriminator &&
          "reentrant/concurrent invocation of contextualizeTopLevelCode?");
   TLC.NextAutoClosureDiscriminator = CC.NextDiscriminator;
@@ -491,10 +502,17 @@ public:
       }
     }
 
+    ContextualTypePurpose ctp = CTP_ReturnStmt;
+    if (auto func =
+            dyn_cast_or_null<FuncDecl>(TheFunc->getAbstractFunctionDecl())) {
+      if (func->hasSingleExpressionBody()) {
+        ctp = CTP_ReturnSingleExpr;
+      }
+    }
+
     auto exprTy = TC.typeCheckExpression(E, DC, TypeLoc::withoutLoc(ResultTy),
-                                         CTP_ReturnStmt,
+                                         ctp,
                                          options);
-    
     RS->setResult(E);
 
     if (!exprTy) {
@@ -722,9 +740,9 @@ public:
     {
       Type sequenceType = sequence->getType();
       auto conformance =
-        TC.conformsToProtocol(sequenceType, sequenceProto, DC,
-                              ConformanceCheckFlags::InExpression,
-                              sequence->getLoc());
+        TypeChecker::conformsToProtocol(sequenceType, sequenceProto, DC,
+                                        ConformanceCheckFlags::InExpression,
+                                        sequence->getLoc());
       if (!conformance)
         return nullptr;
 
@@ -772,9 +790,9 @@ public:
     // FIXME: Would like to customize the diagnostic emitted in
     // conformsToProtocol().
     auto genConformance =
-      TC.conformsToProtocol(generatorTy, generatorProto, DC,
-                            ConformanceCheckFlags::InExpression,
-                            sequence->getLoc());
+      TypeChecker::conformsToProtocol(generatorTy, generatorProto, DC,
+                                      ConformanceCheckFlags::InExpression,
+                                      sequence->getLoc());
     if (!genConformance)
       return nullptr;
 
@@ -1866,6 +1884,9 @@ bool TypeChecker::typeCheckAbstractFunctionBody(AbstractFunctionDecl *AFD) {
   // HACK: don't type-check the same function body twice.  This is
   // supposed to be handled by just not enqueuing things twice,
   // but that gets tricky with synthesized function bodies.
+  validateDecl(AFD);
+  (void) AFD->getBody();
+
   if (AFD->isBodyTypeChecked())
     return false;
 
@@ -1893,6 +1914,20 @@ bool TypeChecker::typeCheckAbstractFunctionBody(AbstractFunctionDecl *AFD) {
   return false;
 }
 
+static Type getFunctionBuilderType(FuncDecl *FD) {
+  Type builderType = FD->getFunctionBuilderType();
+
+  // For getters, fall back on looking on the attribute on the storage.
+  if (!builderType) {
+    auto accessor = dyn_cast<AccessorDecl>(FD);
+    if (accessor && accessor->getAccessorKind() == AccessorKind::Get) {
+      builderType = accessor->getStorage()->getFunctionBuilderType();
+    }
+  }
+
+  return builderType;
+}
+
 // Type check a function body (defined with the func keyword) that is either a
 // named function or an anonymous func expression.
 bool TypeChecker::typeCheckFunctionBodyUntil(FuncDecl *FD,
@@ -1905,9 +1940,40 @@ bool TypeChecker::typeCheckFunctionBodyUntil(FuncDecl *FD,
   BraceStmt *BS = FD->getBody();
   assert(BS && "Should have a body");
 
+  if (Type builderType = getFunctionBuilderType(FD)) {
+    return typeCheckFunctionBuilderFuncBody(FD, builderType);
+  }
+
+  if (FD->hasSingleExpressionBody()) {
+    auto resultTypeLoc = FD->getBodyResultTypeLoc();
+    auto E = FD->getSingleExpressionBody();
+
+    if (resultTypeLoc.isNull() || resultTypeLoc.getType()->isVoid()) {
+      // The function returns void.  We don't need an explicit return, no matter
+      // what the type of the expression is.  Take the inserted return back out.
+      BS->setElement(0, E);
+    }
+  }
+
   StmtChecker SC(*this, static_cast<AbstractFunctionDecl *>(FD));
   SC.EndTypeCheckLoc = EndTypeCheckLoc;
   bool HadError = SC.typeCheckBody(BS);
+
+  // If this was a function with a single expression body, let's see
+  // if implicit return statement came out to be `Never` which means
+  // that we have eagerly converted something like `{ fatalError() }`
+  // into `{ return fatalError() }` that has to be corrected here.
+  if (FD->hasSingleExpressionBody()) {
+    if (auto *stmt = BS->getElement(0).dyn_cast<Stmt *>()) {
+      if (auto *RS = dyn_cast<ReturnStmt>(stmt)) {
+        if (RS->isImplicit() && RS->hasResult()) {
+          auto returnType = RS->getResult()->getType();
+          if (returnType && returnType->isUninhabited())
+            BS->setElement(0, RS->getResult());
+        }
+      }
+    }
+  }
 
   FD->setBody(BS);
   return HadError;
@@ -1985,8 +2051,19 @@ static bool checkSuperInit(TypeChecker &tc, ConstructorDecl *fromCtor,
       // super.init() call.
       return true;
     }
+
+    // Make sure we can reference the designated initializer correctly.
+    if (fromCtor->getResilienceExpansion() == ResilienceExpansion::Minimal) {
+      TypeChecker::FragileFunctionKind fragileKind;
+      bool treatUsableFromInlineAsPublic;
+      std::tie(fragileKind, treatUsableFromInlineAsPublic) =
+        tc.getFragileFunctionKind(fromCtor);
+      tc.diagnoseInlinableDeclRef(
+          fromCtor->getLoc(), ctor, fromCtor, fragileKind,
+          treatUsableFromInlineAsPublic);
+    }
   }
-  
+
   return false;
 }
 

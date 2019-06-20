@@ -225,6 +225,8 @@ static void addCommonFrontendArgs(const ToolChain &TC, const OutputInfo &OI,
                        options::OPT_experimental_dependency_include_intrafile);
   inputArgs.AddLastArg(arguments, options::OPT_package_description_version);
   inputArgs.AddLastArg(arguments, options::OPT_serialize_diagnostics_path);
+  inputArgs.AddLastArg(arguments, options::OPT_enable_astscope_lookup);
+  inputArgs.AddLastArg(arguments, options::OPT_disable_parser_lookup);
 
   // Pass on any build config options
   inputArgs.AddAllArgs(arguments, options::OPT_D);
@@ -259,6 +261,46 @@ static void addCommonFrontendArgs(const ToolChain &TC, const OutputInfo &OI,
 
   if (llvm::sys::Process::StandardErrHasColors())
     arguments.push_back("-color-diagnostics");
+}
+
+static void addRuntimeLibraryFlags(const OutputInfo &OI,
+                                   ArgStringList &Arguments) {
+  if (!OI.RuntimeVariant)
+    return;
+
+  const OutputInfo::MSVCRuntime RT = OI.RuntimeVariant.getValue();
+
+  Arguments.push_back("-autolink-library");
+  Arguments.push_back("oldnames");
+
+  Arguments.push_back("-autolink-library");
+  switch (RT) {
+  case OutputInfo::MSVCRuntime::MultiThreaded:
+    Arguments.push_back("libcmt");
+    break;
+
+  case OutputInfo::MSVCRuntime::MultiThreadedDebug:
+    Arguments.push_back("libcmtd");
+    break;
+
+  case OutputInfo::MSVCRuntime::MultiThreadedDLL:
+    Arguments.push_back("msvcrt");
+    break;
+
+  case OutputInfo::MSVCRuntime::MultiThreadedDebugDLL:
+    Arguments.push_back("msvcrtd");
+    break;
+  }
+
+  // NOTE(compnerd) we do not support /ML and /MLd
+  Arguments.push_back("-Xcc");
+  Arguments.push_back("-D_MT");
+
+  if (RT == OutputInfo::MSVCRuntime::MultiThreadedDLL ||
+      RT == OutputInfo::MSVCRuntime::MultiThreadedDebugDLL) {
+    Arguments.push_back("-Xcc");
+    Arguments.push_back("-D_DLL");
+  }
 }
 
 ToolChain::InvocationInfo
@@ -301,6 +343,7 @@ ToolChain::constructInvocation(const CompileJobAction &job,
 
   addCommonFrontendArgs(*this, context.OI, context.Output, context.Args,
                         Arguments);
+  addRuntimeLibraryFlags(context.OI, Arguments);
 
   // Pass along an -import-objc-header arg, replacing the argument with the name
   // of any input PCH to the current action if one is present.
@@ -390,6 +433,22 @@ ToolChain::constructInvocation(const CompileJobAction &job,
       shouldStoreInvocationInDebugInfo()) {
     Arguments.push_back("-debug-info-store-invocation");
   }
+
+  if (context.Args.hasArg(
+                      options::OPT_disable_autolinking_runtime_compatibility)) {
+    Arguments.push_back("-disable-autolinking-runtime-compatibility");
+  }
+                                 
+  if (auto arg = context.Args.getLastArg(
+                                  options::OPT_runtime_compatibility_version)) {
+    Arguments.push_back("-runtime-compatibility-version");
+    Arguments.push_back(arg->getValue());
+  }
+
+  context.Args.AddLastArg(
+      Arguments,
+      options::
+          OPT_disable_autolinking_runtime_compatibility_dynamic_replacements);
 
   return II;
 }
@@ -614,6 +673,8 @@ ToolChain::constructInvocation(const InterpretJobAction &job,
 
   addCommonFrontendArgs(*this, context.OI, context.Output, context.Args,
                         Arguments);
+  addRuntimeLibraryFlags(context.OI, Arguments);
+
   context.Args.AddLastArg(Arguments, options::OPT_import_objc_header);
 
   context.Args.AddLastArg(Arguments, options::OPT_parse_sil);
@@ -825,6 +886,8 @@ ToolChain::constructInvocation(const MergeModuleJobAction &job,
 
   addCommonFrontendArgs(*this, context.OI, context.Output, context.Args,
                         Arguments);
+  addRuntimeLibraryFlags(context.OI, Arguments);
+
   addOutputsOfType(Arguments, context.Output, context.Args,
                    file_types::TY_SwiftModuleDocFile, "-emit-module-doc-path");
   addOutputsOfType(Arguments, context.Output, context.Args,
@@ -908,8 +971,11 @@ ToolChain::constructInvocation(const REPLJobAction &job,
   ArgStringList FrontendArgs;
   for (auto &s : getDriver().getSwiftProgramArgs())
     FrontendArgs.push_back(s.c_str());
+
   addCommonFrontendArgs(*this, context.OI, context.Output, context.Args,
                         FrontendArgs);
+  addRuntimeLibraryFlags(context.OI, FrontendArgs);
+
   context.Args.AddLastArg(FrontendArgs, options::OPT_import_objc_header);
   context.Args.AddAllArgs(FrontendArgs, options::OPT_l, options::OPT_framework,
                           options::OPT_L);
@@ -994,6 +1060,8 @@ ToolChain::constructInvocation(const GeneratePCHJobAction &job,
 
   addCommonFrontendArgs(*this, context.OI, context.Output, context.Args,
                         Arguments);
+  addRuntimeLibraryFlags(context.OI, Arguments);
+
   addOutputsOfType(Arguments, context.Output, context.Args,
                    file_types::TY_SerializedDiagnostics,
                    "-serialize-diagnostics-path");

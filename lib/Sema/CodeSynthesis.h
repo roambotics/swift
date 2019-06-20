@@ -42,9 +42,6 @@ class TypeChecker;
 
 class ObjCReason;
 
-// These are implemented in TypeCheckDecl.cpp.
-void makeFinal(ASTContext &ctx, ValueDecl *D);
-
 // Implemented in TypeCheckerOverride.cpp
 bool checkOverrides(ValueDecl *decl);
 
@@ -68,8 +65,6 @@ enum class ImplicitConstructorKind {
   /// name.
   Memberwise
 };
-
-bool isMemberwiseInitialized(VarDecl *var);
 
 /// Create an implicit struct or class constructor.
 ///

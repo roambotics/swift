@@ -257,7 +257,9 @@ enum class TypeMatchFlags {
   ///
   /// This is necessary because Objective-C allows optional function paramaters
   /// to be non-escaping, but Swift currently does not.
-  IgnoreNonEscapingForOptionalFunctionParam = 1 << 4
+  IgnoreNonEscapingForOptionalFunctionParam = 1 << 4,
+  /// Allow compatible opaque archetypes.
+  AllowCompatibleOpaqueTypeArchetypes = 1 << 5
 };
 using TypeMatchOptions = OptionSet<TypeMatchFlags>;
 
@@ -3111,12 +3113,32 @@ BEGIN_CAN_TYPE_WRAPPER(FunctionType, AnyFunctionType)
   }
 END_CAN_TYPE_WRAPPER(FunctionType, AnyFunctionType)
 
-/// Map the given parameter list onto a bitvector describing whether
-/// the argument type at each index has a default argument associated with
-/// it.
-SmallBitVector
-computeDefaultMap(ArrayRef<AnyFunctionType::Param> params,
-                  const ValueDecl *paramOwner, bool skipCurriedSelf);
+/// Provides information about the parameter list of a given declaration, including whether each parameter
+/// has a default argument.
+struct ParameterListInfo {
+  SmallBitVector defaultArguments;
+  std::vector<Type> functionBuilderTypes;
+
+public:
+  ParameterListInfo() { }
+
+  ParameterListInfo(ArrayRef<AnyFunctionType::Param> params,
+                    const ValueDecl *paramOwner, bool skipCurriedSelf);
+
+  /// Whether the parameter at the given index has a default argument.
+  bool hasDefaultArgument(unsigned paramIdx) const;
+
+  /// Retrieve the number of non-defaulted parameters.
+  unsigned numNonDefaultedParameters() const {
+    return defaultArguments.count();
+  }
+
+  /// Retrieve the number of parameters for which we have information.
+  unsigned size() const { return defaultArguments.size(); }
+
+  /// Retrieve the function builder type for the given parameter.
+  Type getFunctionBuilderType(unsigned paramIdx) const;
+};
 
 /// Turn a param list into a symbolic and printable representation that does not
 /// include the types, something like (: , b:, c:)
@@ -3170,6 +3192,7 @@ public:
   /// Substitute the given generic arguments into this generic
   /// function type and return the resulting non-generic type.
   FunctionType *substGenericArgs(SubstitutionMap subs);
+  FunctionType *substGenericArgs(llvm::function_ref<Type(Type)> substFn) const;
 
   void Profile(llvm::FoldingSetNodeID &ID) {
     Profile(ID, getGenericSignature(), getParams(), getResult(),
@@ -4090,7 +4113,8 @@ public:
   /// std::error_code. This is only meant to be used in assertions. When
   /// assertions are disabled, this just returns true.
   ABICompatibilityCheckResult
-  isABICompatibleWith(CanSILFunctionType other) const;
+  isABICompatibleWith(CanSILFunctionType other,
+                      SILFunction *context = nullptr) const;
 
   CanSILFunctionType substGenericArgs(SILModule &silModule,
                                       SubstitutionMap subs);
@@ -4687,6 +4711,14 @@ public:
   
   /// Get the generic environment this archetype lives in.
   GenericEnvironment *getGenericEnvironment() const;
+  
+  /// Get the protocol/class existential type that most closely represents the
+  /// set of constraints on this archetype.
+  ///
+  /// Right now, this only considers constraints on the archetype itself, not
+  /// any of its associated types, since those are the only kind of existential
+  /// type we can represent.
+  Type getExistentialType() const;
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const TypeBase *T) {
@@ -4792,6 +4824,18 @@ public:
     return T->getKind() == TypeKind::OpaqueTypeArchetype;
   }
   
+  /// Get the ordinal of the type within the declaration's opaque signature.
+  ///
+  /// If a method declared its return type as:
+  ///
+  ///   func foo() -> (some P, some Q)
+  ///
+  /// then the underlying type of `some P` would be ordinal 0, and `some Q` would be ordinal 1.
+  unsigned getOrdinal() const {
+    // TODO: multiple opaque types
+    return 0;
+  }
+  
   static void Profile(llvm::FoldingSetNodeID &ID,
                       OpaqueTypeDecl *OpaqueDecl,
                       SubstitutionMap Substitutions);
@@ -4817,17 +4861,27 @@ END_CAN_TYPE_WRAPPER(OpaqueTypeArchetypeType, ArchetypeType)
 /// to their underlying types.
 class ReplaceOpaqueTypesWithUnderlyingTypes {
 public:
-  ReplaceOpaqueTypesWithUnderlyingTypes() {}
-  
+  ModuleDecl *contextModule;
+  ResilienceExpansion contextExpansion;
+  ReplaceOpaqueTypesWithUnderlyingTypes(ModuleDecl *contextModule,
+                                        ResilienceExpansion contextExpansion)
+      : contextModule(contextModule), contextExpansion(contextExpansion) {}
+
   /// TypeSubstitutionFn
   Type operator()(SubstitutableType *maybeOpaqueType) const;
-  
+
   /// LookupConformanceFn
   Optional<ProtocolConformanceRef> operator()(CanType maybeOpaqueType,
                                               Type replacementType,
                                               ProtocolDecl *protocol) const;
+
+  bool shouldPerformSubstitution(OpaqueTypeDecl *opaque) const;
+
+  static bool shouldPerformSubstitution(OpaqueTypeDecl *opaque,
+                                        ModuleDecl *contextModule,
+                                        ResilienceExpansion contextExpansion);
 };
-  
+
 /// An archetype that represents the dynamic type of an opened existential.
 class OpenedArchetypeType final : public ArchetypeType,
     private ArchetypeTrailingObjects<OpenedArchetypeType>

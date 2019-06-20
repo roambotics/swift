@@ -417,8 +417,15 @@ ParserResult<TypeRepr> Parser::parseType(Diag<> MessageID,
   if (Tok.is(tok::arrow)) {
     // Handle type-function if we have an arrow.
     SourceLoc arrowLoc = consumeToken();
+    if (Tok.is(tok::kw_throws)) {
+      Diag<> DiagID = diag::throws_in_wrong_position;
+      diagnose(Tok.getLoc(), DiagID)
+          .fixItInsert(arrowLoc, "throws ")
+          .fixItRemove(Tok.getLoc());
+      throwsLoc = consumeToken();
+    }
     ParserResult<TypeRepr> SecondHalf =
-      parseType(diag::expected_type_function_result);
+        parseType(diag::expected_type_function_result);
     if (SecondHalf.hasCodeCompletion())
       return makeParserCodeCompletionResult<TypeRepr>();
     if (SecondHalf.isNull())
@@ -504,6 +511,16 @@ ParserResult<TypeRepr> Parser::parseType(Diag<> MessageID,
 
   return makeParserResult(applyAttributeToType(tyR, attrs, specifier,
                                                specifierLoc));
+}
+
+ParserResult<TypeRepr> Parser::parseDeclResultType(Diag<> MessageID) {
+  if (Tok.is(tok::code_complete)) {
+    if (CodeCompletion)
+      CodeCompletion->completeTypeDeclResultBeginning();
+    consumeToken(tok::code_complete);
+    return makeParserCodeCompletionStatus();
+  }
+  return parseType(MessageID);
 }
 
 ParserStatus Parser::parseGenericArguments(SmallVectorImpl<TypeRepr *> &Args,
@@ -675,6 +692,7 @@ ParserResult<TypeRepr> Parser::parseTypeIdentifier() {
 ParserResult<TypeRepr>
 Parser::parseTypeSimpleOrComposition(Diag<> MessageID,
                                      bool HandleCodeCompletion) {
+  SyntaxParsingContext SomeTypeContext(SyntaxContext, SyntaxKind::SomeType);
   // Check for the opaque modifier.
   // This is only semantically allowed in certain contexts, but we parse it
   // generally for diagnostics and recovery.
@@ -682,7 +700,12 @@ Parser::parseTypeSimpleOrComposition(Diag<> MessageID,
   if (Context.LangOpts.EnableOpaqueResultTypes
       && Tok.is(tok::identifier)
       && Tok.getRawText() == "some") {
+    // Treat some as a keyword.
+    TokReceiver->registerTokenKindChange(Tok.getLoc(), tok::contextual_keyword);
     opaqueLoc = consumeToken();
+  } else {
+    // This isn't a some type.
+    SomeTypeContext.setTransparent();
   }
   
   auto applyOpaque = [&](TypeRepr *type) -> TypeRepr* {

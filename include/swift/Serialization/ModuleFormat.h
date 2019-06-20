@@ -52,7 +52,7 @@ const uint16_t SWIFTMODULE_VERSION_MAJOR = 0;
 /// describe what change you made. The content of this comment isn't important;
 /// it just ensures a conflict if two people change the module format.
 /// Don't worry about adhering to the 80-column limit for this line.
-const uint16_t SWIFTMODULE_VERSION_MINOR = 486; // Last change: Opaque result types
+const uint16_t SWIFTMODULE_VERSION_MINOR = 495; // remove superclass from ProtocolLayout
 
 using DeclIDField = BCFixed<31>;
 
@@ -644,6 +644,7 @@ namespace input_block {
     MODULE_FLAGS, // [unused]
     SEARCH_PATH,
     FILE_DEPENDENCY,
+    DEPENDENCY_DIRECTORY,
     PARSEABLE_INTERFACE_PATH
   };
 
@@ -689,7 +690,13 @@ namespace input_block {
     FileModTimeOrContentHashField, // mtime or content hash (for validation)
     BCFixed<1>,                    // are we reading mtime (0) or hash (1)?
     BCFixed<1>,                    // SDK-relative?
+    BCVBR<8>,                      // subpath-relative index (0=none)
     BCBlob                         // path
+  >;
+
+  using DependencyDirectoryLayout = BCRecordLayout<
+    DEPENDENCY_DIRECTORY,
+    BCBlob
   >;
 
   using ParseableInterfaceLayout = BCRecordLayout<
@@ -941,7 +948,8 @@ namespace decls_block {
     GenericEnvironmentIDField, // generic environment
     AccessLevelField,       // access level
     BCVBR<4>,               // number of conformances
-    BCArray<TypeIDField>    // inherited types
+    BCVBR<4>,               // number of inherited types
+    BCArray<TypeIDField>    // inherited types, followed by dependency types
     // Trailed by the generic parameters (if any), the members record, and
     // finally conformance info (if any).
   >;
@@ -974,7 +982,8 @@ namespace decls_block {
     TypeIDField,            // superclass
     AccessLevelField,       // access level
     BCVBR<4>,               // number of conformances
-    BCArray<TypeIDField>    // inherited types
+    BCVBR<4>,               // number of inherited types
+    BCArray<TypeIDField>    // inherited types, followed by dependency types
     // Trailed by the generic parameters (if any), the members record, and
     // finally conformance info (if any).
   >;
@@ -988,7 +997,6 @@ namespace decls_block {
     BCFixed<1>,             // objc?
     BCFixed<1>,             // existential-type-supported?
     GenericEnvironmentIDField, // generic environment
-    TypeIDField,            // superclass
     AccessLevelField,       // access level
     BCArray<DeclIDField>    // inherited types
     // Trailed by the generic parameters (if any), the members record, and
@@ -1047,7 +1055,8 @@ namespace decls_block {
     AccessLevelField, // access level
     AccessLevelField, // setter access, if applicable
     DeclIDField, // opaque return type decl
-    BCArray<TypeIDField> // accessors and dependencies
+    BCFixed<2>,  // # of property wrapper backing properties
+    BCArray<TypeIDField> // accessors, backing properties, and dependencies
   >;
 
   using ParamLayout = BCRecordLayout<
@@ -1101,6 +1110,7 @@ namespace decls_block {
     TypeIDField, // interface type for opaque type
     GenericEnvironmentIDField, // generic environment
     SubstitutionMapIDField // optional substitution map for underlying type
+    // trailed by generic parameters
   >;
 
   // TODO: remove the unnecessary FuncDecl components here

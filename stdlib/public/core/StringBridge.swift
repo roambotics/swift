@@ -69,6 +69,47 @@ internal func _cocoaStringSubscript(
   return _swift_stdlib_CFStringGetCharacterAtIndex(cfSelf, position)
 }
 
+@_effects(releasenone)
+internal func _cocoaStringCopyUTF8(
+  _ target: _CocoaString,
+  into bufPtr: UnsafeMutableBufferPointer<UInt8>
+) -> Int? {
+  let ptr = bufPtr.baseAddress._unsafelyUnwrappedUnchecked
+  let len = _stdlib_binary_CFStringGetLength(target)
+  var count = 0
+  let converted = _swift_stdlib_CFStringGetBytes(
+    target,
+    _swift_shims_CFRange(location: 0, length: len),
+    kCFStringEncodingUTF8,
+    0,
+    0,
+    ptr,
+    bufPtr.count,
+    &count
+  )
+  return len == converted ? count : nil
+}
+
+@_effects(readonly)
+internal func _cocoaStringUTF8Count(
+  _ target: _CocoaString,
+  range: Range<Int>
+) -> Int? {
+  var count = 0
+  let len = _stdlib_binary_CFStringGetLength(target)
+  let converted = _swift_stdlib_CFStringGetBytes(
+    target,
+    _swift_shims_CFRange(location: range.startIndex, length: range.count),
+    kCFStringEncodingUTF8,
+    0,
+    0,
+    UnsafeMutablePointer<UInt8>(Builtin.inttoptr_Word(0._builtinWordValue)),
+    0,
+    &count
+  )
+  return converted == len ? count : nil
+}
+
 @_effects(readonly)
 internal func _cocoaStringCompare(
   _ string: _CocoaString, _ other: _CocoaString
@@ -125,11 +166,6 @@ private var kCFStringEncodingUTF8 : _swift_shims_CFStringEncoding {
   @inline(__always) get { return 0x8000100 }
 }
 
-@_effects(readonly)
-private func _unsafeAddressOfCocoaStringClass(_ str: _CocoaString) -> UInt {
-  return _swift_stdlib_unsafeAddressOfClass(str)
-}
-
 internal enum _KnownCocoaString {
   case storage
   case shared
@@ -148,7 +184,7 @@ internal enum _KnownCocoaString {
     }
 #endif
     
-    switch _unsafeAddressOfCocoaStringClass(str) {
+    switch unsafeBitCast(_swift_classOfObjCHeapObject(str), to: UInt.self) {
     case unsafeBitCast(__StringStorage.self, to: UInt.self):
       self = .storage
     case unsafeBitCast(__SharedStringStorage.self, to: UInt.self):

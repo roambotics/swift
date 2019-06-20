@@ -761,28 +761,6 @@ private:
     return Size(size);
   }
 
-#ifndef NDEBUG
-  static bool areTypesReallyEqual(Type lhs, Type rhs) {
-    // Due to an oversight, escaping and non-escaping @convention(block)
-    // are mangled identically.
-    auto eraseEscapingBlock = [](Type t) -> Type {
-      return t.transform([](Type t) -> Type {
-        if (auto *fnType = t->getAs<FunctionType>()) {
-          if (fnType->getExtInfo().getRepresentation()
-                == FunctionTypeRepresentation::Block) {
-            return FunctionType::get(fnType->getParams(),
-                                    fnType->getResult(),
-                                    fnType->getExtInfo().withNoEscape(true));
-          }
-        }
-        return t;
-      });
-    };
-
-    return eraseEscapingBlock(lhs)->isEqual(eraseEscapingBlock(rhs));
-  }
-#endif
-
   StringRef getMangledName(DebugTypeInfo DbgTy) {
     if (DbgTy.IsMetadataType)
       return MetadataTypeDeclCache.find(DbgTy.getDecl()->getName().str())
@@ -825,14 +803,12 @@ private:
         Ty->dump();
         abort();
       } else if (!Reconstructed->isEqual(Ty)) {
-        if (!areTypesReallyEqual(Reconstructed, Ty)) {
-          llvm::errs() << "Incorrect reconstructed type for " << Result << "\n";
-          llvm::errs() << "Original type:\n";
-          Ty->dump();
-          llvm::errs() << "Reconstructed type:\n";
-          Reconstructed->dump();
-          abort();
-        }
+        llvm::errs() << "Incorrect reconstructed type for " << Result << "\n";
+        llvm::errs() << "Original type:\n";
+        Ty->dump();
+        llvm::errs() << "Reconstructed type:\n";
+        Reconstructed->dump();
+        abort();
       }
 #endif
     }
@@ -1368,8 +1344,6 @@ private:
       break;
 
     case TypeKind::OpaqueTypeArchetype:
-      // TODO
-      break;
     case TypeKind::PrimaryArchetype:
     case TypeKind::OpenedArchetype:
     case TypeKind::NestedArchetype: {
@@ -1881,10 +1855,21 @@ void IRGenDebugInfoImpl::setInlinedTrapLocation(IRBuilder &Builder,
                                                 const SILDebugScope *Scope) {
   if (Opts.DebugInfoFormat != IRGenDebugInfoFormat::CodeView)
     return;
-  auto DLInlinedAt = llvm::DebugLoc::get(LastDebugLoc.Line, LastDebugLoc.Column,
-                                         getOrCreateScope(LastScope));
+
+  // The @llvm.trap could be inlined into a chunk of code that was also inlined.
+  // If this is the case then simply using the LastScope's location would
+  // generate debug info that claimed Function A owned Block X and Block X
+  // thought it was owned by Function B. Therefore, we need to find the last
+  // inlined scope to point to.
+  const SILDebugScope *TheLastScope = LastScope;
+  while (TheLastScope->InlinedCallSite &&
+         TheLastScope->InlinedCallSite != TheLastScope) {
+    TheLastScope = TheLastScope->InlinedCallSite;
+  }
+  auto LastLocation = llvm::DebugLoc::get(
+      LastDebugLoc.Line, LastDebugLoc.Column, getOrCreateScope(TheLastScope));
   // FIXME: This location should point to stdlib instead of being artificial.
-  auto DL = llvm::DebugLoc::get(0, 0, getOrCreateScope(Scope), DLInlinedAt);
+  auto DL = llvm::DebugLoc::get(0, 0, getOrCreateScope(Scope), LastLocation);
   Builder.SetCurrentDebugLocation(DL);
 }
 
@@ -2123,10 +2108,6 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
     IRBuilder &Builder, ArrayRef<llvm::Value *> Storage, DebugTypeInfo DbgTy,
     const SILDebugScope *DS, ValueDecl *VarDecl, StringRef Name, unsigned ArgNo,
     IndirectionKind Indirection, ArtificialKind Artificial) {
-  // Self is always an artificial argument.
-  if (ArgNo > 0 && Name == IGM.Context.Id_self.str())
-    Artificial = ArtificialValue;
-
   // FIXME: Make this an assertion.
   // assert(DS && "variable has no scope");
   if (!DS)
@@ -2158,10 +2139,15 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
   assert(DITy && "could not determine debug type of variable");
 
   unsigned Line = Loc.Line;
+
+  // Self is always an artificial argument, so are variables without location.
+  if (!Line || (ArgNo > 0 && Name == IGM.Context.Id_self.str()))
+    Artificial = ArtificialValue;
+
   llvm::DINode::DIFlags Flags = llvm::DINode::FlagZero;
   if (Artificial || DITy->isArtificial() || DITy == InternalType)
     Flags |= llvm::DINode::FlagArtificial;
-
+  
   // This could be Opts.Optimize if we would also unique DIVariables here.
   bool Optimized = false;
   // Create the descriptor for the variable.
@@ -2182,11 +2168,6 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
     SmallVector<uint64_t, 3> Operands;
     if (Indirection)
       Operands.push_back(llvm::dwarf::DW_OP_deref);
-
-    // There are variables without storage, such as "struct { func foo() {}
-    // }". Emit them as constant 0.
-    if (isa<llvm::UndefValue>(Piece))
-      Piece = llvm::ConstantInt::get(IGM.Int64Ty, 0);
 
     if (IsPiece) {
       // Advance the offset and align it for the next piece.

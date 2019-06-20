@@ -4,6 +4,13 @@ set(swift_platform_sources
 set(swift_platform_gyb_sources
     tgmath.swift.gyb)
 
+set(darwin_depends)
+if(NOT BUILD_STANDALONE)
+  # This is overly conservative, but we have so few API notes files that
+  # haven't migrated to the Swift repo that it's probably fine in practice.
+  list(APPEND darwin_depends copy_apinotes)
+endif()
+
 add_swift_target_library(swiftDarwin ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_OVERLAY
     ${swift_platform_sources}
     POSIXError.swift
@@ -19,9 +26,7 @@ add_swift_target_library(swiftDarwin ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_
     LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
     TARGET_SDKS ALL_APPLE_PLATFORMS
 
-    # This is overly conservative, but we have so few API notes files that
-    # haven't migrated to the Swift repo that it's probably fine in practice.
-    DEPENDS copy_apinotes)
+    DEPENDS ${darwin_depends})
 
 add_swift_target_library(swiftGlibc ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_OVERLAY
     ${swift_platform_sources}
@@ -90,7 +95,11 @@ foreach(sdk ${SWIFT_SDKS})
       set(GLIBC_ARCH_INCLUDE_PATH "${SWIFT_SDK_${sdk}_ARCH_${arch}_PATH}${GLIBC_ARCH_INCLUDE_PATH}")
     endif()
 
-    set(glibc_modulemap_source "glibc.modulemap.gyb")
+    if(${sdk} STREQUAL ANDROID)
+      set(glibc_modulemap_source "bionic.modulemap.gyb")
+    else()
+      set(glibc_modulemap_source "glibc.modulemap.gyb")
+    endif()
     set(glibc_modulemap_out "${module_dir}/glibc.modulemap")
 
     # Configure the module map based on the target. Each platform needs to
@@ -129,9 +138,9 @@ foreach(sdk ${SWIFT_SDKS})
     #        It is not relocatable to the target platform itself.
     #        This affects any cross-comipled targets that use glibc.modulemap.
 
-    swift_install_in_component(sdk-overlay
-        FILES "${glibc_modulemap_out}"
-        DESTINATION "lib/swift/${arch_subdir}")
+    swift_install_in_component(FILES "${glibc_modulemap_out}"
+                               DESTINATION "lib/swift/${arch_subdir}"
+                               COMPONENT sdk-overlay)
 
   endforeach()
 endforeach()

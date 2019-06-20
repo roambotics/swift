@@ -74,6 +74,8 @@ namespace SourceKit {
   class Context;
   class NotificationCenter;
 
+  using TypeContextKind = swift::ide::CodeCompletionContext::TypeContextKind;
+
 class SwiftEditorDocument :
     public ThreadSafeRefCountedBase<SwiftEditorDocument> {
 
@@ -162,7 +164,7 @@ class SessionCache : public ThreadSafeRefCountedBase<SessionCache> {
   CompletionSink sink;
   std::vector<Completion *> sortedCompletions;
   CompletionKind completionKind;
-  bool completionHasExpectedTypes;
+  TypeContextKind typeContextKind;
   bool completionMayUseImplicitMemberExpr;
   FilterRules filterRules;
   llvm::sys::Mutex mtx;
@@ -171,11 +173,10 @@ public:
   SessionCache(CompletionSink &&sink,
                std::unique_ptr<llvm::MemoryBuffer> &&buffer,
                std::vector<std::string> &&args, CompletionKind completionKind,
-               bool hasExpectedTypes, bool mayUseImplicitMemberExpr,
+               TypeContextKind typeContextKind, bool mayUseImplicitMemberExpr,
                FilterRules filterRules)
       : buffer(std::move(buffer)), args(std::move(args)), sink(std::move(sink)),
-        completionKind(completionKind),
-        completionHasExpectedTypes(hasExpectedTypes),
+        completionKind(completionKind), typeContextKind(typeContextKind),
         completionMayUseImplicitMemberExpr(mayUseImplicitMemberExpr),
         filterRules(std::move(filterRules)) {}
   void setSortedCompletions(std::vector<Completion *> &&completions);
@@ -184,7 +185,7 @@ public:
   ArrayRef<std::string> getCompilerArgs();
   const FilterRules &getFilterRules();
   CompletionKind getCompletionKind();
-  bool getCompletionHasExpectedTypes();
+  TypeContextKind getCompletionTypeContextKind();
   bool getCompletionMayUseImplicitMemberExpr();
 };
 typedef RefPtr<SessionCache> SessionCacheRef;
@@ -489,26 +490,26 @@ public:
                      unsigned Length, bool Actionables,
                      bool CancelOnSubsequentRequest,
                      ArrayRef<const char *> Args,
-                 std::function<void(const CursorInfoData &)> Receiver) override;
+                 std::function<void(const RequestResult<CursorInfoData> &)> Receiver) override;
 
   void getNameInfo(StringRef Filename, unsigned Offset,
                    NameTranslatingInfo &Input,
                    ArrayRef<const char *> Args,
-                   std::function<void(const NameTranslatingInfo &)> Receiver) override;
+                   std::function<void(const RequestResult<NameTranslatingInfo> &)> Receiver) override;
 
   void getRangeInfo(StringRef Filename, unsigned Offset, unsigned Length,
                     bool CancelOnSubsequentRequest, ArrayRef<const char *> Args,
-                    std::function<void(const RangeInfo&)> Receiver) override;
+                    std::function<void(const RequestResult<RangeInfo> &)> Receiver) override;
 
   void getCursorInfoFromUSR(
       StringRef Filename, StringRef USR, bool CancelOnSubsequentRequest,
       ArrayRef<const char *> Args,
-      std::function<void(const CursorInfoData &)> Receiver) override;
+      std::function<void(const RequestResult<CursorInfoData> &)> Receiver) override;
 
   void findRelatedIdentifiersInFile(StringRef Filename, unsigned Offset,
                                     bool CancelOnSubsequentRequest,
                                     ArrayRef<const char *> Args,
-              std::function<void(const RelatedIdentsInfo &)> Receiver) override;
+              std::function<void(const RequestResult<RelatedIdentsInfo> &)> Receiver) override;
 
   void syntacticRename(llvm::MemoryBuffer *InputBuf,
                        ArrayRef<RenameLocations> RenameLocations,
@@ -526,7 +527,7 @@ public:
 
   void collectExpressionTypes(StringRef FileName, ArrayRef<const char *> Args,
                               ArrayRef<const char *> ExpectedProtocols,
-                              std::function<void(const ExpressionTypesInFile&)> Receiver) override;
+                              std::function<void(const RequestResult<ExpressionTypesInFile> &)> Receiver) override;
 
   void semanticRefactoring(StringRef Filename, SemanticRefactoringInfo Info,
                            ArrayRef<const char*> Args,
@@ -541,10 +542,10 @@ public:
       findUSRRange(StringRef DocumentName, StringRef USR) override;
 
   void findInterfaceDocument(StringRef ModuleName, ArrayRef<const char *> Args,
-               std::function<void(const InterfaceDocInfo &)> Receiver) override;
+               std::function<void(const RequestResult<InterfaceDocInfo> &)> Receiver) override;
 
   void findModuleGroups(StringRef ModuleName, ArrayRef<const char *> Args,
-               std::function<void(ArrayRef<StringRef>, StringRef Error)> Receiver) override;
+               std::function<void(const RequestResult<ArrayRef<StringRef>> &)> Receiver) override;
 
   void getExpressionContextInfo(llvm::MemoryBuffer *inputBuf, unsigned Offset,
                                 ArrayRef<const char *> Args,

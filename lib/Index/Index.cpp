@@ -334,6 +334,7 @@ private:
     // get label locations
     auto *MemberwiseInit = DeclRef->getDecl();
     std::vector<SourceLoc> LabelLocs;
+    ArrayRef<Identifier> Labels;
     auto NameLoc = DeclRef->getNameLoc();
     if (NameLoc.isCompound()) {
       size_t LabelIndex = 0;
@@ -341,12 +342,16 @@ private:
       while ((ArgLoc = NameLoc.getArgumentLabelLoc(LabelIndex++)).isValid()) {
         LabelLocs.push_back(ArgLoc);
       }
+      Labels = MemberwiseInit->getFullName().getArgumentNames();
     } else if (auto *CallParent = dyn_cast_or_null<CallExpr>(getParentExpr())) {
       LabelLocs = CallParent->getArgumentLabelLocs();
+      Labels = CallParent->getArgumentLabels();
     }
 
     if (LabelLocs.empty())
       return;
+
+    assert(Labels.size() == LabelLocs.size());
 
     // match labels to properties
     auto *TypeContext =
@@ -354,14 +359,23 @@ private:
     if (!TypeContext || !shouldIndex(TypeContext, false))
       return;
 
-    auto LabelIt = LabelLocs.begin();
-    for (auto Prop : TypeContext->getStoredProperties()) {
-      if (Prop->getParentInitializer() && Prop->isLet())
+    unsigned CurLabel = 0;
+    for (auto Member : TypeContext->getMembers()) {
+      auto Prop = dyn_cast<VarDecl>(Member);
+      if (!Prop)
         continue;
 
-      assert(LabelIt != LabelLocs.end());
+      if (!Prop->isMemberwiseInitialized(/*preferDeclaredProperties=*/true))
+        continue;
+
+      if (CurLabel == LabelLocs.size())
+        break;
+
+      if (Labels[CurLabel] != Prop->getName())
+        continue;
+
       IndexSymbol Info;
-      if (initIndexSymbol(Prop, *LabelIt++, /*IsRef=*/true, Info))
+      if (initIndexSymbol(Prop, LabelLocs[CurLabel++], /*IsRef=*/true, Info))
         continue;
       if (startEntity(Prop, Info, /*IsRef=*/true))
         finishCurrentEntity();
@@ -1230,17 +1244,24 @@ bool IndexSwiftASTWalker::initFuncDeclIndexSymbol(FuncDecl *D,
     Info.roles |= (SymbolRoleSet)SymbolRole::Dynamic;
   }
 
-  if (D->getAttrs().hasAttribute<IBActionAttr>()) {
-    // Relate with type of the first parameter using RelationIBTypeOf.
-    if (D->hasImplicitSelfDecl()) {
-      auto paramList = D->getParameters();
-      if (!paramList->getArray().empty()) {
-        auto param = paramList->get(0);
-        if (auto nominal = param->getType()->getAnyNominal()) {
-          addRelation(Info, (SymbolRoleSet) SymbolRole::RelationIBTypeOf, nominal);
-        }
-      }
+  if (D->hasImplicitSelfDecl()) {
+    // If this is an @IBAction or @IBSegueAction method, find the sender
+    // parameter (if present) and relate the method to its type.
+    ParamDecl *senderParam = nullptr;
+
+    auto paramList = D->getParameters();
+    if (D->getAttrs().hasAttribute<IBActionAttr>()) {
+      if (paramList->size() > 0)
+        senderParam = paramList->get(0);
+    } else if (D->getAttrs().hasAttribute<IBSegueActionAttr>()) {
+      if (paramList->size() > 1)
+        senderParam = paramList->get(1);
     }
+
+    if (senderParam)
+      if (auto nominal = senderParam->getType()->getAnyNominal())
+        addRelation(Info, (SymbolRoleSet) SymbolRole::RelationIBTypeOf,
+                    nominal);
   }
 
   if (auto Group = D->getGroupName())

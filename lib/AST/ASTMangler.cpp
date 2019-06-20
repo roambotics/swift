@@ -985,7 +985,7 @@ void ASTMangler::appendType(Type type, const ValueDecl *forDecl) {
       // Use the fully elaborated explicit mangling.
       appendOpaqueDeclName(opaqueDecl);
       bool isFirstArgList = true;
-      appendBoundGenericArgs(opaqueDecl->getInnermostDeclContext(),
+      appendBoundGenericArgs(opaqueDecl,
                              opaqueType->getSubstitutions(),
                              isFirstArgList);
       appendRetroactiveConformances(opaqueType->getSubstitutions(),
@@ -1168,7 +1168,9 @@ unsigned ASTMangler::appendBoundGenericArgs(DeclContext *dc,
   auto decl = dc->getInnermostDeclarationDeclContext();
   if (!decl) return 0;
 
-  // For an extension declaration, use the nominal type declaration instead.
+  // For a non-protocol extension declaration, use the nominal type declaration
+  // instead.
+  //
   // This is important when extending a nested type, because the generic
   // parameters will line up with the (semantic) nesting of the nominal type.
   if (auto ext = dyn_cast<ExtensionDecl>(decl))
@@ -1490,6 +1492,12 @@ ASTMangler::getSpecialManglingContext(const ValueDecl *decl,
       }
     }
   }
+
+  // Importer-synthesized types should always be mangled in the
+  // ClangImporterContext, even if an __attribute__((swift_name())) nests them
+  // inside a Swift type syntactically.
+  if (decl->getAttrs().hasAttribute<ClangImporterSynthesizedTypeAttr>())
+    return ASTMangler::ClangImporterContext;
 
   return None;
 }
@@ -1903,6 +1911,10 @@ void ASTMangler::appendFunctionType(AnyFunctionType *fn, bool isAutoClosure,
   // changes to better support thin functions.
   switch (fn->getRepresentation()) {
   case AnyFunctionType::Representation::Block:
+    // We distinguish escaping and non-escaping blocks, but only in the DWARF
+    // mangling, because the ABI is already set.
+    if (!fn->isNoEscape() && DWARFMangling)
+      return appendOperator("XL");
     return appendOperator("XB");
   case AnyFunctionType::Representation::Thin:
     return appendOperator("Xf");
@@ -2611,6 +2623,20 @@ void ASTMangler::appendConcreteProtocolConformance(
         auto conformanceAccessPath =
           CurGenericSignature->getConformanceAccessPath(type, proto);
         appendDependentProtocolConformance(conformanceAccessPath);
+      } else if (auto opaqueType = canType->getAs<OpaqueTypeArchetypeType>()) {
+        GenericSignature *opaqueSignature = opaqueType->getBoundSignature();
+        GenericTypeParamType *opaqueTypeParam = opaqueSignature->getGenericParams().back();
+        ConformanceAccessPath conformanceAccessPath =
+            opaqueSignature->getConformanceAccessPath(opaqueTypeParam, proto);
+
+        // Append the conformance access path with the signature of the opaque type.
+        CanGenericSignature savedSignature = CurGenericSignature;
+        CurGenericSignature = opaqueSignature->getCanonicalSignature();
+        appendDependentProtocolConformance(conformanceAccessPath);
+        CurGenericSignature = savedSignature;
+
+        appendType(canType);
+        appendOperator("HO");
       } else {
         auto conditionalConf = module->lookupConformance(canType, proto);
         appendConcreteProtocolConformance(conditionalConf->getConcrete());
@@ -2662,4 +2688,11 @@ void ASTMangler::appendOpParamForLayoutConstraint(LayoutConstraint layout) {
                           Index(layout->getAlignmentInBits()));
     break;
   }
+}
+
+std::string ASTMangler::mangleOpaqueTypeDescriptor(const OpaqueTypeDecl *decl) {
+  beginMangling();
+  appendOpaqueDeclName(decl);
+  appendOperator("MQ");
+  return finalize();
 }

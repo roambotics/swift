@@ -183,7 +183,7 @@ public:
 
   bool allowTopLevelCode() const;
 
-  const std::vector<Token> &getSplitTokens() { return SplitTokens; }
+  const std::vector<Token> &getSplitTokens() const { return SplitTokens; }
 
   void markSplitToken(tok Kind, StringRef Txt);
 
@@ -519,10 +519,15 @@ public:
     return consumeToken();
   }
 
-  SourceLoc consumeIdentifier(Identifier *Result = nullptr) {
+  SourceLoc consumeIdentifier(Identifier *Result = nullptr,
+                              bool allowDollarIdentifier = false) {
     assert(Tok.isAny(tok::identifier, tok::kw_self, tok::kw_Self));
     if (Result)
       *Result = Context.getIdentifier(Tok.getText());
+
+    if (Tok.getText()[0] == '$' && !allowDollarIdentifier)
+      diagnoseDollarIdentifier(Tok);
+
     return consumeToken();
   }
 
@@ -532,8 +537,25 @@ public:
     if (!Tok.is(tok::kw__)) {
       Tok.setKind(tok::identifier);
       Result = Context.getIdentifier(Tok.getText());
+
+      if (Tok.getText()[0] == '$')
+        diagnoseDollarIdentifier(Tok);
     }
     return consumeToken();
+  }
+
+  /// When we have a token that is an identifier starting with '$',
+  /// diagnose it if not permitted in this mode.
+  void diagnoseDollarIdentifier(const Token &tok) {
+    assert(tok.getText()[0] == '$');
+
+    if (tok.getText().size() == 1 ||
+        Context.LangOpts.EnableDollarIdentifiers ||
+        isInSILMode() || L->isSwiftInterface())
+      return;
+
+    diagnose(tok.getLoc(), diag::dollar_identifier_decl,
+             Context.getIdentifier(tok.getText()));
   }
 
   /// Retrieve the location just past the end of the previous
@@ -586,6 +608,8 @@ public:
   void skipUntilDeclStmtRBrace(tok T1, tok T2);
 
   void skipUntilDeclRBrace(tok T1, tok T2);
+  
+  void skipListUntilDeclRBrace(SourceLoc startLoc, tok T1, tok T2);
   
   /// Skip a single token, but match parentheses, braces, and square brackets.
   ///
@@ -690,15 +714,15 @@ public:
 
   /// Add the given Decl to the current scope.
   void addToScope(ValueDecl *D, bool diagnoseRedefinitions = true) {
-    if (Context.LangOpts.EnableASTScopeLookup)
+    if (Context.LangOpts.DisableParserLookup)
       return;
 
     getScopeInfo().addToScope(D, *this, diagnoseRedefinitions);
   }
 
   ValueDecl *lookupInScope(DeclName Name) {
-    if (Context.LangOpts.EnableASTScopeLookup)
-      return nullptr;
+    if (Context.LangOpts.DisableParserLookup)
+          return nullptr;
 
     return getScopeInfo().lookupValueName(Name);
   }
@@ -880,8 +904,7 @@ public:
   void setLocalDiscriminatorToParamList(ParameterList *PL);
 
   /// Parse the optional attributes before a declaration.
-  bool parseDeclAttributeList(DeclAttributes &Attributes,
-                              bool &FoundCodeCompletionToken);
+  ParserStatus parseDeclAttributeList(DeclAttributes &Attributes);
 
   /// Parse the optional modifiers before a declaration.
   bool parseDeclModifierList(DeclAttributes &Attributes, SourceLoc &StaticLoc,
@@ -917,7 +940,7 @@ public:
                                                         SourceLoc Loc);
 
   /// Parse a specific attribute.
-  bool parseDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc);
+  ParserStatus parseDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc);
 
   bool parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
                              DeclAttrKind DK);
@@ -989,6 +1012,7 @@ public:
   ParserResult<VarDecl> parseDeclVarGetSet(Pattern *pattern,
                                            ParseDeclOptions Flags,
                                            SourceLoc StaticLoc,
+                                           StaticSpellingKind StaticSpelling,
                                            SourceLoc VarLoc,
                                            bool hasInitializer,
                                            const DeclAttributes &Attributes,
@@ -1027,6 +1051,8 @@ public:
 
   ParserResult<PrecedenceGroupDecl>
   parseDeclPrecedenceGroup(ParseDeclOptions flags, DeclAttributes &attributes);
+
+  ParserResult<TypeRepr> parseDeclResultType(Diag<> MessageID);
 
   //===--------------------------------------------------------------------===//
   // Type Parsing

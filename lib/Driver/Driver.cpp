@@ -1319,14 +1319,14 @@ static bool isSDKTooOld(StringRef sdkPath, llvm::VersionTuple minVersion,
 /// the given target.
 static bool isSDKTooOld(StringRef sdkPath, const llvm::Triple &target) {
   if (target.isMacOSX()) {
-    return isSDKTooOld(sdkPath, llvm::VersionTuple(10, 14), "OSX");
+    return isSDKTooOld(sdkPath, llvm::VersionTuple(10, 15), "OSX");
 
   } else if (target.isiOS()) {
     // Includes both iOS and TVOS.
-    return isSDKTooOld(sdkPath, llvm::VersionTuple(12, 0), "Simulator", "OS");
+    return isSDKTooOld(sdkPath, llvm::VersionTuple(13, 0), "Simulator", "OS");
 
   } else if (target.isWatchOS()) {
-    return isSDKTooOld(sdkPath, llvm::VersionTuple(5, 0), "Simulator", "OS");
+    return isSDKTooOld(sdkPath, llvm::VersionTuple(6, 0), "Simulator", "OS");
 
   } else {
     return false;
@@ -1650,6 +1650,31 @@ void Driver::buildOutputInfo(const ToolChain &TC, const DerivedArgList &Args,
 
   }
 
+  if (TC.getTriple().isOSWindows()) {
+    if (const Arg *A = Args.getLastArg(options::OPT_libc)) {
+      OI.RuntimeVariant =
+          llvm::StringSwitch<Optional<OutputInfo::MSVCRuntime>>(A->getValue())
+              .Cases("MD", "MultiThreadedDLL", "shared-ucrt",
+                     OutputInfo::MSVCRuntime::MultiThreadedDLL)
+              .Cases("MDd", "MultiThreadedDebugDLL", "shared-debug-ucrt",
+                     OutputInfo::MSVCRuntime::MultiThreadedDebugDLL)
+              .Cases("MT", "MultiThreaded", "static-ucrt",
+                     OutputInfo::MSVCRuntime::MultiThreaded)
+              .Cases("MTd", "MultiThreadedDebug", "static-debug-ucrt",
+                     OutputInfo::MSVCRuntime::MultiThreadedDebug)
+              .Default(llvm::None);
+      if (!OI.RuntimeVariant)
+        Diags.diagnose({}, diag::error_invalid_arg_value, A->getSpelling(),
+                       A->getValue());
+    } else {
+      // NOTE: default to `/MD`.  This is different from `cl`'s default
+      // behaviour of `/MT` on the command line, however, Visual Studio 2015 and
+      // newer will default `/MD` as well.  Furthermore, this is far more useful
+      // of a mode since the `/MT` mode requires that everything is statically
+      // linked.
+      OI.RuntimeVariant = OutputInfo::MSVCRuntime::MultiThreadedDLL;
+    }
+  }
 }
 
 OutputInfo::Mode
@@ -3034,6 +3059,20 @@ void Driver::printHelp(bool ShowHidden) const {
   getOpts().PrintHelp(llvm::outs(), Name.c_str(), "Swift compiler",
                       IncludedFlagsBitmask, ExcludedFlagsBitmask,
                       /*ShowAllAliases*/false);
+
+  // These strings match the descriptions found in the corresponding swiftpm 
+  // help pages
+  if (driverKind == DriverKind::Interactive) {
+    llvm::outs() << "\nSEE ALSO - PACKAGE MANAGER COMMANDS: \n"
+        "\t\"swift build\" Build sources into binary products \n"
+        "\t\"swift package\" Perform operations on Swift packages \n"
+        "\t\"swift run\" Build and run an executable product \n"
+        "\t\"swift test\" Build and run tests \n";
+  } else {
+    llvm::outs() << "\nSEE ALSO: swift build, swift run, swift package, " 
+                    "swift test \n";
+  }
+
 }
 
 bool OutputInfo::mightHaveExplicitPrimaryInputs(

@@ -349,6 +349,7 @@ private:
     case Node::Kind::Directness:
     case Node::Kind::DynamicAttribute:
     case Node::Kind::EscapingAutoClosureType:
+    case Node::Kind::EscapingObjCBlock:
     case Node::Kind::NoEscapeFunctionType:
     case Node::Kind::ExplicitClosure:
     case Node::Kind::Extension:
@@ -415,6 +416,10 @@ private:
     case Node::Kind::ObjCMetadataUpdateFunction:
     case Node::Kind::ObjCResilientClassStub:
     case Node::Kind::OpaqueTypeDescriptor:
+    case Node::Kind::OpaqueTypeDescriptorAccessor:
+    case Node::Kind::OpaqueTypeDescriptorAccessorImpl:
+    case Node::Kind::OpaqueTypeDescriptorAccessorKey:
+    case Node::Kind::OpaqueTypeDescriptorAccessorVar:
     case Node::Kind::Owned:
     case Node::Kind::OwningAddressor:
     case Node::Kind::OwningMutableAddressor:
@@ -1733,6 +1738,22 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     Printer << "opaque type descriptor for ";
     print(Node->getChild(0));
     return nullptr;
+  case Node::Kind::OpaqueTypeDescriptorAccessor:
+    Printer << "opaque type descriptor accessor for ";
+    print(Node->getChild(0));
+    return nullptr;
+  case Node::Kind::OpaqueTypeDescriptorAccessorImpl:
+    Printer << "opaque type descriptor accessor impl for ";
+    print(Node->getChild(0));
+    return nullptr;
+  case Node::Kind::OpaqueTypeDescriptorAccessorKey:
+    Printer << "opaque type descriptor accessor key for ";
+    print(Node->getChild(0));
+    return nullptr;
+  case Node::Kind::OpaqueTypeDescriptorAccessorVar:
+    Printer << "opaque type descriptor accessor var for ";
+    print(Node->getChild(0));
+    return nullptr;
   case Node::Kind::CoroutineContinuationPrototype:
     Printer << "coroutine continuation prototype for ";
     print(Node->getChild(0));
@@ -1765,6 +1786,11 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
   }
   case Node::Kind::ObjCBlock: {
     Printer << "@convention(block) ";
+    printFunctionType(nullptr, Node);
+    return nullptr;
+  }
+  case Node::Kind::EscapingObjCBlock: {
+    Printer << "@escaping @convention(block) ";
     printFunctionType(nullptr, Node);
     return nullptr;
   }

@@ -117,6 +117,8 @@ namespace {
       return getStartLocImpl(E);
     }
     template <class T> static SourceRange getSourceRange(const T *E) {
+      if (E->getStartLoc().isInvalid() != E->getEndLoc().isInvalid())
+        return SourceRange();
       return { E->getStartLoc(), E->getEndLoc() };
     }
   };
@@ -813,6 +815,7 @@ static LiteralExpr *
 shallowCloneImpl(const InterpolatedStringLiteralExpr *E, ASTContext &Ctx,
                  llvm::function_ref<Type(const Expr *)> getType) {
   auto res = new (Ctx) InterpolatedStringLiteralExpr(E->getLoc(),
+                                                     E->getTrailingQuoteLoc(),
                                                      E->getLiteralCapacity(),
                                                      E->getInterpolationCount(),
                                                      E->getAppendingExpr());
@@ -1470,6 +1473,19 @@ ArrayExpr *ArrayExpr::create(ASTContext &C, SourceLoc LBracketLoc,
 }
 
 Type ArrayExpr::getElementType() {
+  auto init = getInitializer();
+  if (!init)
+    return Type();
+
+  auto *decl = cast<ConstructorDecl>(init.getDecl());
+  return decl->getMethodInterfaceType()
+      ->getAs<AnyFunctionType>()
+      ->getParams()[0]
+      .getPlainType()
+      .subst(init.getSubstitutions());
+}
+
+Type DictionaryExpr::getElementType() {
   auto init = getInitializer();
   if (!init)
     return Type();

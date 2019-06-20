@@ -358,7 +358,8 @@ BridgedProperty::outline(SILModule &M) {
     auto Loc = FirstInst->getLoc();
     SILValue FunRef(Builder.createFunctionRef(Loc, Fun));
     SILValue Apply(
-        Builder.createApply(Loc, FunRef, {FirstInst->getOperand(0)}, false));
+        Builder.createApply(Loc, FunRef, SubstitutionMap(),
+                            {FirstInst->getOperand(0)}));
     Builder.createBranch(Loc, NewTailBB);
     OldMergeBB->getArgument(0)->replaceAllUsesWith(Apply);
   }
@@ -491,7 +492,7 @@ static bool matchSwitch(SwitchInfo &SI, SILInstruction *Inst,
 
   // Check that we call the _unconditionallyBridgeFromObjectiveC witness.
   auto NativeType = Apply->getType().getASTType();
-  auto *BridgeFun = FunRef->getReferencedFunction();
+  auto *BridgeFun = FunRef->getInitiallyReferencedFunction();
   auto *SwiftModule = BridgeFun->getModule().getSwiftModule();
   auto bridgeWitness = getBridgeFromObjectiveC(NativeType, SwiftModule);
   if (BridgeFun->getName() != bridgeWitness.mangle())
@@ -779,7 +780,7 @@ BridgedArgument BridgedArgument::match(unsigned ArgIdx, SILValue Arg,
 
   // Make sure we are calling the actual bridge witness.
   auto NativeType = BridgedValue->getType().getASTType();
-  auto *BridgeFun = FunRef->getReferencedFunction();
+  auto *BridgeFun = FunRef->getInitiallyReferencedFunction();
   auto *SwiftModule = BridgeFun->getModule().getSwiftModule();
   auto bridgeWitness = getBridgeToObjectiveC(NativeType, SwiftModule);
   if (BridgeFun->getName() != bridgeWitness.mangle())
@@ -961,7 +962,7 @@ ObjCMethodCall::outline(SILModule &M) {
       }
       OrigSigIdx++;
     }
-    OutlinedCall = Builder.createApply(Loc, FunRef, Args, false);
+    OutlinedCall = Builder.createApply(Loc, FunRef, SubstitutionMap(), Args);
     if (!BridgedCall->use_empty() && !BridgedReturn)
       BridgedCall->replaceAllUsesWith(OutlinedCall);
   }

@@ -10,8 +10,23 @@
 //
 //===----------------------------------------------------------------------===//
 
+/// An enum that acts as a namespace for Swift overlays to vImage option sets and enums..
+public enum vImage {}
+
 /// An enum that acts as a namespace for Swift overlays to vDSP based functions.
 public enum vDSP {}
 
 /// An enum that acts as a namespace for Swift overlays to vForce based functions.
 public enum vForce {}
+
+extension vDSP {
+    @available(iOS 9999, OSX 9999, tvOS 9999, watchOS 9999, *)
+    public struct VectorizableFloat {
+        public typealias Scalar = Float
+    }
+  
+    @available(iOS 9999, OSX 9999, tvOS 9999, watchOS 9999, *)
+    public struct VectorizableDouble {
+        public typealias Scalar = Double
+    }
+}

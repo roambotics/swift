@@ -94,7 +94,7 @@ static bool contributesToParentTypeStorage(const AbstractStorageDecl *ASD) {
   return !ND->isResilient() && ASD->hasStorage() && !ASD->isStatic();
 }
 
-PrintOptions PrintOptions::printParseableInterfaceFile() {
+PrintOptions PrintOptions::printParseableInterfaceFile(bool preferTypeRepr) {
   PrintOptions result;
   result.PrintLongAttrsOnSeparateLines = true;
   result.TypeDefinitions = true;
@@ -107,7 +107,10 @@ PrintOptions PrintOptions::printParseableInterfaceFile() {
   result.FunctionDefinitions = true;
   result.CollapseSingleGetterProperty = false;
   result.VarInitializers = true;
-  result.PrintStableReferencesToOpaqueReturnTypes = true;
+  result.EnumRawValues = EnumRawValueMode::PrintObjCOnly;
+  result.OpaqueReturnTypePrinting =
+      OpaqueReturnTypePrintingMode::StableReference;
+  result.PreferTypeRepr = preferTypeRepr;
 
   // We should print __consuming, __owned, etc for the module interface file.
   result.SkipUnderscoredKeywords = false;
@@ -123,6 +126,10 @@ PrintOptions PrintOptions::printParseableInterfaceFile() {
 
   class ShouldPrintForParseableInterface : public ShouldPrintChecker {
     bool shouldPrint(const Decl *D, const PrintOptions &options) override {
+      // Skip anything that is marked `@_implementationOnly` itself.
+      if (D->getAttrs().hasAttribute<ImplementationOnlyAttr>())
+        return false;
+
       // Skip anything that isn't 'public' or '@usableFromInline'.
       if (auto *VD = dyn_cast<ValueDecl>(D)) {
         if (!isPublicOrUsableFromInline(VD)) {
@@ -378,16 +385,26 @@ ASTPrinter &operator<<(ASTPrinter &printer, tok keyword) {
 
 /// Determine whether to escape the given keyword in the given context.
 static bool escapeKeywordInContext(StringRef keyword, PrintNameContext context){
+
+  bool isKeyword = llvm::StringSwitch<bool>(keyword)
+#define KEYWORD(KW) \
+      .Case(#KW, true)
+#include "swift/Syntax/TokenKinds.def"
+      .Default(false);
+
   switch (context) {
   case PrintNameContext::Normal:
   case PrintNameContext::Attribute:
-    return true;
+    return isKeyword;
   case PrintNameContext::Keyword:
     return false;
 
   case PrintNameContext::ClassDynamicSelf:
   case PrintNameContext::GenericParameter:
-    return keyword != "Self";
+    return isKeyword && keyword != "Self";
+
+  case PrintNameContext::TypeMember:
+    return isKeyword || !canBeMemberName(keyword);
 
   case PrintNameContext::FunctionParameterExternal:
   case PrintNameContext::FunctionParameterLocal:
@@ -406,19 +423,13 @@ void ASTPrinter::printName(Identifier Name, PrintNameContext Context) {
     printNamePost(Context);
     return;
   }
-  bool IsKeyword = llvm::StringSwitch<bool>(Name.str())
-#define KEYWORD(KW) \
-      .Case(#KW, true)
-#include "swift/Syntax/TokenKinds.def"
-      .Default(false);
 
-  if (IsKeyword)
-    IsKeyword = escapeKeywordInContext(Name.str(), Context);
+  bool shouldEscapeKeyword = escapeKeywordInContext(Name.str(), Context);
 
-  if (IsKeyword)
+  if (shouldEscapeKeyword)
     *this << "`";
   *this << Name.str();
-  if (IsKeyword)
+  if (shouldEscapeKeyword)
     *this << "`";
 
   printNamePost(Context);
@@ -998,7 +1009,18 @@ void PrintAST::printAttributes(const Decl *D) {
 void PrintAST::printTypedPattern(const TypedPattern *TP) {
   printPattern(TP->getSubPattern());
   Printer << ": ";
-  printTypeLoc(TP->getTypeLoc());
+
+  // Make sure to check if the underlying var decl is an implicitly unwrapped
+  // optional.
+  bool isIUO = false;
+  if (auto *named = dyn_cast<NamedPattern>(TP->getSubPattern()))
+    if (auto decl = named->getDecl())
+      isIUO = decl->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>();
+
+  if (isIUO)
+    printTypeLocForImplicitlyUnwrappedOptional(TP->getTypeLoc());
+  else
+    printTypeLoc(TP->getTypeLoc());
 }
 
 /// Determines if we are required to print the name of a property declaration,
@@ -1028,6 +1050,14 @@ static bool mustPrintPropertyName(VarDecl *decl, PrintOptions opts) {
   return false;
 }
 
+/// Gets the print name context of a given decl, choosing between TypeMember
+/// and Normal, depending if this decl lives in a nominal type decl.
+static PrintNameContext getTypeMemberPrintNameContext(const Decl *d) {
+  return d->getDeclContext()->isTypeContext() ?
+      PrintNameContext::TypeMember :
+      PrintNameContext::Normal;
+}
+
 void PrintAST::printPattern(const Pattern *pattern) {
   switch (pattern->getKind()) {
   case PatternKind::Any:
@@ -1041,7 +1071,8 @@ void PrintAST::printPattern(const Pattern *pattern) {
       // FIXME: This always returns true now, because of the FIXMEs listed in
       //        mustPrintPropertyName.
       if (mustPrintPropertyName(decl, Options))
-        Printer.printName(named->getBoundName());
+        Printer.printName(named->getBoundName(),
+                          getTypeMemberPrintNameContext(decl));
       else
         Printer << "_";
     });
@@ -1254,7 +1285,6 @@ bestRequirementPrintLocation(ProtocolDecl *proto, const Requirement &req) {
 
 void PrintAST::printInheritedFromRequirementSignature(ProtocolDecl *proto,
                                                       Decl *attachingTo) {
-  assert(proto->isRequirementSignatureComputed());
   printGenericSignature(
       GenericSignature::get({proto->getProtocolSelfType()} ,
                             proto->getRequirementSignature()),
@@ -1267,7 +1297,6 @@ void PrintAST::printInheritedFromRequirementSignature(ProtocolDecl *proto,
 
 void PrintAST::printWhereClauseFromRequirementSignature(ProtocolDecl *proto,
                                                         Decl *attachingTo) {
-  assert(proto->isRequirementSignatureComputed());
   unsigned flags = PrintRequirements;
   if (isa<AssociatedTypeDecl>(attachingTo))
     flags |= SwapSelfAndDependentMemberType;
@@ -1605,7 +1634,9 @@ bool ShouldPrintChecker::shouldPrint(const Decl *D,
     auto Ext = cast<ExtensionDecl>(D);
     // If the extension doesn't add protocols or has no members that we should
     // print then skip printing it.
-    if (Ext->getLocalProtocols().empty()) {
+    SmallVector<TypeLoc, 8> ProtocolsToPrint;
+    getInheritedForPrinting(Ext, Options, ProtocolsToPrint);
+    if (ProtocolsToPrint.empty()) {
       bool HasMemberToPrint = false;
       for (auto Member : Ext->getMembers()) {
         if (shouldPrint(Member, Options)) {
@@ -1712,6 +1743,8 @@ void PrintAST::printMutatingModifiersIfNeeded(const AccessorDecl *accessor) {
 
 void PrintAST::printAccessors(const AbstractStorageDecl *ASD) {
   if (isa<VarDecl>(ASD) && !Options.PrintPropertyAccessors)
+    return;
+  if (isa<SubscriptDecl>(ASD) && !Options.PrintSubscriptAccessors)
     return;
 
   auto impl = ASD->getImplInfo();
@@ -1974,8 +2007,7 @@ void PrintAST::printGenericDeclGenericRequirements(GenericContext *decl) {
 
 void PrintAST::printInherited(const Decl *decl) {
   SmallVector<TypeLoc, 6> TypesToPrint;
-  getInheritedForPrinting(decl, [this](const Decl* D) { return shouldPrint(D); },
-                          TypesToPrint);
+  getInheritedForPrinting(decl, Options, TypesToPrint);
   if (TypesToPrint.empty())
     return;
 
@@ -2252,7 +2284,7 @@ void PrintAST::visitTypeAliasDecl(TypeAliasDecl *decl) {
   printContextIfNeeded(decl);
   recordDeclLoc(decl,
     [&]{
-      Printer.printName(decl->getName());
+      Printer.printName(decl->getName(), getTypeMemberPrintNameContext(decl));
     }, [&]{ // Signature
       printGenericDeclGenericParams(decl);
     });
@@ -2295,30 +2327,20 @@ void PrintAST::visitAssociatedTypeDecl(AssociatedTypeDecl *decl) {
     Printer << tok::kw_associatedtype << " ";
   recordDeclLoc(decl,
     [&]{
-      Printer.printName(decl->getName());
+      Printer.printName(decl->getName(), PrintNameContext::TypeMember);
     });
 
   auto proto = decl->getProtocol();
-  if (proto->isRequirementSignatureComputed()) {
-    printInheritedFromRequirementSignature(proto, decl);
-  } else {
-    printInherited(decl);
-  }
+  printInheritedFromRequirementSignature(proto, decl);
 
-  if (!decl->getDefaultDefinitionLoc().isNull()) {
+  if (decl->hasDefaultDefinitionType()) {
     Printer << " = ";
-    decl->getDefaultDefinitionLoc().getType().print(Printer, Options);
+    decl->getDefaultDefinitionType().print(Printer, Options);
   }
 
   // As with protocol's trailing where clauses, use the requirement signature
   // when available.
-  if (proto->isRequirementSignatureComputed()) {
-    printWhereClauseFromRequirementSignature(proto, decl);
-  } else {
-    if (auto trailingWhere = decl->getTrailingWhereClause()) {
-      printTrailingWhereClause(trailingWhere);
-    }
-  }
+  printWhereClauseFromRequirementSignature(proto, decl);
 }
 
 void PrintAST::visitEnumDecl(EnumDecl *decl) {
@@ -2336,7 +2358,7 @@ void PrintAST::visitEnumDecl(EnumDecl *decl) {
     printContextIfNeeded(decl);
     recordDeclLoc(decl,
       [&]{
-        Printer.printName(decl->getName());
+        Printer.printName(decl->getName(), getTypeMemberPrintNameContext(decl));
       }, [&]{ // Signature
         printGenericDeclGenericParams(decl);
       });
@@ -2364,7 +2386,7 @@ void PrintAST::visitStructDecl(StructDecl *decl) {
     printContextIfNeeded(decl);
     recordDeclLoc(decl,
       [&]{
-        Printer.printName(decl->getName());
+        Printer.printName(decl->getName(), getTypeMemberPrintNameContext(decl));
       }, [&]{ // Signature
         printGenericDeclGenericParams(decl);
       });
@@ -2392,7 +2414,7 @@ void PrintAST::visitClassDecl(ClassDecl *decl) {
     printContextIfNeeded(decl);
     recordDeclLoc(decl,
       [&]{
-        Printer.printName(decl->getName());
+        Printer.printName(decl->getName(), getTypeMemberPrintNameContext(decl));
       }, [&]{ // Signature
         printGenericDeclGenericParams(decl);
       });
@@ -2425,23 +2447,13 @@ void PrintAST::visitProtocolDecl(ProtocolDecl *decl) {
         Printer.printName(decl->getName());
       });
 
-    if (decl->isRequirementSignatureComputed()) {
-      printInheritedFromRequirementSignature(decl, decl);
-    } else {
-      printInherited(decl);
-    }
+    printInheritedFromRequirementSignature(decl, decl);
 
     // The trailing where clause is a syntactic thing, which isn't serialized
     // (etc.) and thus isn't available for printing things out of
     // already-compiled SIL modules. The requirement signature is available in
     // such cases, so let's go with that when we can.
-    if (decl->isRequirementSignatureComputed()) {
-      printWhereClauseFromRequirementSignature(decl, decl);
-    } else {
-      if (auto trailingWhere = decl->getTrailingWhereClause()) {
-        printTrailingWhereClause(trailingWhere);
-      }
-    }
+    printWhereClauseFromRequirementSignature(decl, decl);
   }
   if (Options.TypeDefinitions) {
     printMembersOfDecl(decl, false, true,
@@ -2525,13 +2537,22 @@ void PrintAST::visitVarDecl(VarDecl *decl) {
   printContextIfNeeded(decl);
   recordDeclLoc(decl,
     [&]{
-      Printer.printName(decl->getName());
+      Printer.printName(decl->getName(), getTypeMemberPrintNameContext(decl));
     });
   if (decl->hasInterfaceType()) {
     Printer << ": ";
     auto tyLoc = decl->getTypeLoc();
     if (!tyLoc.getTypeRepr())
       tyLoc = TypeLoc::withoutLoc(decl->getInterfaceType());
+
+    Printer.printDeclResultTypePre(decl, tyLoc);
+
+    // HACK: When printing result types for vars with opaque result types,
+    //       always print them using the `some` keyword instead of printing
+    //       the full stable reference.
+    llvm::SaveAndRestore<PrintOptions::OpaqueReturnTypePrintingMode>
+    x(Options.OpaqueReturnTypePrinting,
+      PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword);
 
     if (decl->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>())
       printTypeLocForImplicitlyUnwrappedOptional(tyLoc);
@@ -2593,6 +2614,7 @@ void PrintAST::printOneParameter(const ParamDecl *param,
 
   auto TheTypeLoc = param->getTypeLoc();
 
+  printAttributes(param);
   printArgName();
 
   if (!TheTypeLoc.getTypeRepr() && param->hasInterfaceType())
@@ -2781,7 +2803,8 @@ void PrintAST::visitFuncDecl(FuncDecl *decl) {
         if (!decl->hasName()) {
           Printer << "<anonymous>";
         } else {
-          Printer.printName(decl->getName());
+          Printer.printName(decl->getName(),
+                            getTypeMemberPrintNameContext(decl));
           if (decl->isOperator())
             Printer << " ";
         }
@@ -2803,7 +2826,17 @@ void PrintAST::visitFuncDecl(FuncDecl *decl) {
           ResultTyLoc = TypeLoc::withoutLoc(ResultTy);
       }
       Printer << " -> ";
+
+      Printer.printDeclResultTypePre(decl, ResultTyLoc);
       Printer.callPrintStructurePre(PrintStructureKind::FunctionReturnType);
+
+      // HACK: When printing result types for funcs with opaque result types,
+      //       always print them using the `some` keyword instead of printing
+      //       the full stable reference.
+      llvm::SaveAndRestore<PrintOptions::OpaqueReturnTypePrintingMode>
+      x(Options.OpaqueReturnTypePrinting,
+        PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword);
+
       if (decl->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>())
         printTypeLocForImplicitlyUnwrappedOptional(ResultTyLoc);
       else
@@ -2825,7 +2858,7 @@ void PrintAST::visitFuncDecl(FuncDecl *decl) {
 void PrintAST::printEnumElement(EnumElementDecl *elt) {
   recordDeclLoc(elt,
     [&]{
-      Printer.printName(elt->getName());
+      Printer.printName(elt->getName(), getTypeMemberPrintNameContext(elt));
     });
 
   if (auto *PL = elt->getParameterList()) {
@@ -2852,8 +2885,19 @@ void PrintAST::printEnumElement(EnumElementDecl *elt) {
     Options.ExcludeAttrList.pop_back();
   }
 
+  switch (Options.EnumRawValues) {
+  case PrintOptions::EnumRawValueMode::Skip:
+    return;
+  case PrintOptions::EnumRawValueMode::PrintObjCOnly:
+    if (!elt->isObjC())
+      return;
+    break;
+  case PrintOptions::EnumRawValueMode::Print:
+    break;
+  }
+
   auto *raw = elt->getRawValueExpr();
-  if (!Options.EnumRawValues || !raw || raw->isImplicit())
+  if (!raw || raw->isImplicit())
     return;
 
   // Print the explicit raw value expression.
@@ -2930,10 +2974,19 @@ void PrintAST::visitSubscriptDecl(SubscriptDecl *decl) {
   });
   Printer << " -> ";
 
-  Printer.callPrintStructurePre(PrintStructureKind::FunctionReturnType);
   TypeLoc elementTy = decl->getElementTypeLoc();
+  Printer.printDeclResultTypePre(decl, elementTy);
+  Printer.callPrintStructurePre(PrintStructureKind::FunctionReturnType);
   if (!elementTy.getTypeRepr())
     elementTy = TypeLoc::withoutLoc(decl->getElementInterfaceType());
+
+  // HACK: When printing result types for subscripts with opaque result types,
+  //       always print them using the `some` keyword instead of printing
+  //       the full stable reference.
+  llvm::SaveAndRestore<PrintOptions::OpaqueReturnTypePrintingMode>
+  x(Options.OpaqueReturnTypePrinting,
+    PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword);
+
   if (decl->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>())
     printTypeLocForImplicitlyUnwrappedOptional(elementTy);
   else
@@ -3402,7 +3455,25 @@ class TypePrinter : public TypeVisitor<TypePrinter> {
       return;
     }
 
-    if (T->hasSimpleTypeRepr()) {
+    bool isSimple = T->hasSimpleTypeRepr();
+    if (isSimple && T->is<OpaqueTypeArchetypeType>()) {
+      auto opaqueTy = T->castTo<OpaqueTypeArchetypeType>();
+      switch (Options.OpaqueReturnTypePrinting) {
+      case PrintOptions::OpaqueReturnTypePrintingMode::StableReference:
+      case PrintOptions::OpaqueReturnTypePrintingMode::Description:
+        isSimple = true;
+        break;
+      case PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword:
+        isSimple = false;
+        break;
+      case PrintOptions::OpaqueReturnTypePrintingMode::WithoutOpaqueKeyword: {
+        isSimple = opaqueTy->getExistentialType()->hasSimpleTypeRepr();
+        break;
+      }
+      }
+    }
+
+    if (isSimple) {
       visit(T);
     } else {
       Printer << "(";
@@ -4165,7 +4236,7 @@ public:
   }
   
   void visitNestedArchetypeType(NestedArchetypeType *T) {
-    visit(T->getParent());
+    printWithParensIfNotSimple(T->getParent());
     Printer << ".";
     printArchetypeCommon(T);
   }
@@ -4175,16 +4246,21 @@ public:
   }
   
   void visitOpaqueTypeArchetypeType(OpaqueTypeArchetypeType *T) {
-    // Print the type by referencing the opaque decl's synthetic name, if we
-    // were asked to.
-    OpaqueTypeDecl *decl = T->getDecl();
-    
-    if (Options.PrintStableReferencesToOpaqueReturnTypes) {
+    switch (Options.OpaqueReturnTypePrinting) {
+    case PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword:
+      Printer.printKeyword("some", Options, /*Suffix=*/" ");
+      LLVM_FALLTHROUGH;
+    case PrintOptions::OpaqueReturnTypePrintingMode::WithoutOpaqueKeyword: {
+      visit(T->getExistentialType());
+      return;
+    }
+    case PrintOptions::OpaqueReturnTypePrintingMode::StableReference: {
       // Print the source of the opaque return type as a mangled name.
       // We'll use type reconstruction while parsing the attribute to
       // turn this back into a reference to the naming decl for the opaque
       // type.
       Printer << "@_opaqueReturnTypeOf(";
+      OpaqueTypeDecl *decl = T->getDecl();
       
       Printer.printEscapedStringLiteral(
                                    decl->getOpaqueReturnTypeIdentifier().str());
@@ -4195,7 +4271,9 @@ public:
       
       Printer << u8") \U0001F9B8";
       printGenericArgs(T->getSubstitutions().getReplacementTypes());
-    } else {
+      return;
+    }
+    case PrintOptions::OpaqueReturnTypePrintingMode::Description: {
       // TODO(opaque): present opaque types with user-facing syntax. we should
       // probably print this as `some P` and record the fact that we printed that
       // so that diagnostics can add followup notes.
@@ -4209,6 +4287,8 @@ public:
                    [&] { Printer << ", "; });
         Printer << '>';
       }
+      return;
+    }
     }
   }
 
@@ -4640,8 +4720,7 @@ void swift::printEnumElementsAsCases(
 }
 
 void
-swift::getInheritedForPrinting(const Decl *decl,
-                               llvm::function_ref<bool(const Decl*)> shouldPrint,
+swift::getInheritedForPrinting(const Decl *decl, const PrintOptions &options,
                                llvm::SmallVectorImpl<TypeLoc> &Results) {
   ArrayRef<TypeLoc> inherited;
   if (auto td = dyn_cast<TypeDecl>(decl)) {
@@ -4653,11 +4732,11 @@ swift::getInheritedForPrinting(const Decl *decl,
   // Collect explicit inherited types.
   for (auto TL: inherited) {
     if (auto ty = TL.getType()) {
-      bool foundUnprintable = ty.findIf([shouldPrint](Type subTy) {
+      bool foundUnprintable = ty.findIf([&options](Type subTy) {
         if (auto aliasTy = dyn_cast<TypeAliasType>(subTy.getPointer()))
-          return !shouldPrint(aliasTy->getDecl());
+          return !options.shouldPrint(aliasTy->getDecl());
         if (auto NTD = subTy->getAnyNominal())
-          return !shouldPrint(NTD);
+          return !options.shouldPrint(NTD);
         return false;
       });
       if (foundUnprintable)
@@ -4670,7 +4749,7 @@ swift::getInheritedForPrinting(const Decl *decl,
   auto &ctx = decl->getASTContext();
   for (auto attr : decl->getAttrs().getAttributes<SynthesizedProtocolAttr>()) {
     if (auto *proto = ctx.getProtocol(attr->getProtocolKind())) {
-      if (!shouldPrint(proto))
+      if (!options.shouldPrint(proto))
         continue;
       if (attr->getProtocolKind() == KnownProtocolKind::RawRepresentable &&
           isa<EnumDecl>(decl) &&

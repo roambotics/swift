@@ -729,57 +729,77 @@ Type TypeBase::replaceCovariantResultType(Type newResultType,
   return FunctionType::get(inputType, resultType, fnType->getExtInfo());
 }
 
-SmallBitVector
-swift::computeDefaultMap(ArrayRef<AnyFunctionType::Param> params,
-                         const ValueDecl *paramOwner, bool skipCurriedSelf) {
-  SmallBitVector resultVector(params.size());
+ParameterListInfo::ParameterListInfo(
+    ArrayRef<AnyFunctionType::Param> params,
+    const ValueDecl *paramOwner,
+    bool skipCurriedSelf) {
+  defaultArguments.resize(params.size());
+  functionBuilderTypes.resize(params.size());
+
   // No parameter owner means no parameter list means no default arguments
   // - hand back the zeroed bitvector.
   //
   // FIXME: We ought to not request default argument info in this case.
   if (!paramOwner)
-    return resultVector;
+    return;
+
+  // If the decl has a curried self, but we're not allowed to skip it, return.
+  if (paramOwner->hasCurriedSelf() && !skipCurriedSelf)
+    return;
 
   // Find the corresponding parameter list.
   const ParameterList *paramList = nullptr;
   if (auto *func = dyn_cast<AbstractFunctionDecl>(paramOwner)) {
-    if (func->hasImplicitSelfDecl()) {
-      if (skipCurriedSelf)
-        paramList = func->getParameters();
-    } else if (!skipCurriedSelf)
-      paramList = func->getParameters();
+    paramList = func->getParameters();
   } else if (auto *subscript = dyn_cast<SubscriptDecl>(paramOwner)) {
-    if (skipCurriedSelf)
-      paramList = subscript->getIndices();
+    paramList = subscript->getIndices();
   } else if (auto *enumElement = dyn_cast<EnumElementDecl>(paramOwner)) {
-    if (skipCurriedSelf)
-      paramList = enumElement->getParameterList();
+    paramList = enumElement->getParameterList();
   }
 
   // No parameter list means no default arguments - hand back the zeroed
   // bitvector.
-  if (!paramList)
-    return resultVector;
+  if (!paramList) {
+    assert(!paramOwner->hasParameterList());
+    return;
+  }
 
   switch (params.size()) {
   case 0:
-    return resultVector;
+    return;
 
   default:
     // Arguments and parameters are not guaranteed to always line-up
     // perfectly, e.g. failure diagnostics tries to match argument type
     // to different "candidate" parameters.
     if (params.size() != paramList->size())
-      return resultVector;
+      return;
 
-    for (auto i : range(0, params.size())) {
-      if (paramList->get(i)->isDefaultArgument()) {
-        resultVector.set(i);
-      }
-    }
     break;
   }
-  return resultVector;
+
+  // Note which parameters have default arguments and/or function builders.
+  for (auto i : range(0, params.size())) {
+    auto param = paramList->get(i);
+    if (param->isDefaultArgument()) {
+      defaultArguments.set(i);
+    }
+
+    if (Type functionBuilderType = param->getFunctionBuilderType()) {
+      functionBuilderTypes[i] = functionBuilderType;
+    }
+  }
+}
+
+bool ParameterListInfo::hasDefaultArgument(unsigned paramIdx) const {
+  return paramIdx < defaultArguments.size() ? defaultArguments[paramIdx]
+      : false;
+}
+
+Type ParameterListInfo::getFunctionBuilderType(unsigned paramIdx) const {
+  return paramIdx < functionBuilderTypes.size()
+      ? functionBuilderTypes[paramIdx]
+      : Type();
 }
 
 /// Turn a param list into a symbolic and printable representation that does not
@@ -2293,6 +2313,13 @@ static bool matches(CanType t1, CanType t2, TypeMatchOptions matchMode,
     if (isABICompatibleEvenAddingOptional(t1, t2))
       return true;
 
+  if (matchMode.contains(TypeMatchFlags::AllowCompatibleOpaqueTypeArchetypes))
+    if (auto opaque1 = t1->getAs<OpaqueTypeArchetypeType>())
+      if (auto opaque2 = t2->getAs<OpaqueTypeArchetypeType>())
+        return opaque1->getBoundSignature() == opaque2->getBoundSignature() &&
+               opaque1->getInterfaceType()->getCanonicalType()->matches(
+                   opaque2->getInterfaceType()->getCanonicalType(), matchMode);
+
   return false;
 }
 
@@ -2378,6 +2405,24 @@ ArchetypeType *ArchetypeType::getRoot() const {
   return const_cast<ArchetypeType*>(parent);
 }
 
+Type ArchetypeType::getExistentialType() const {
+  // Opened types hold this directly.
+  if (auto opened = dyn_cast<OpenedArchetypeType>(this))
+    return opened->getOpenedExistentialType();
+  
+  // Otherwise, compute it from scratch.
+  SmallVector<Type, 4> constraintTypes;
+  
+  if (auto super = getSuperclass()) {
+    constraintTypes.push_back(super);
+  }
+  for (auto proto : getConformsTo()) {
+    constraintTypes.push_back(proto->getDeclaredType());
+  }
+  return ProtocolCompositionType::get(
+     const_cast<ArchetypeType*>(this)->getASTContext(), constraintTypes, false);
+}
+
 PrimaryArchetypeType::PrimaryArchetypeType(const ASTContext &Ctx,
                                      GenericEnvironment *GenericEnv,
                                      Type InterfaceType,
@@ -2447,20 +2492,69 @@ getArchetypeAndRootOpaqueArchetype(Type maybeOpaqueType) {
   return std::make_pair(archetype, opaqueRoot);
 }
 
-Type ReplaceOpaqueTypesWithUnderlyingTypes::operator()(
-                                     SubstitutableType *maybeOpaqueType) const {
+bool ReplaceOpaqueTypesWithUnderlyingTypes::shouldPerformSubstitution(
+    OpaqueTypeDecl *opaque) const {
+  return shouldPerformSubstitution(opaque, contextModule, contextExpansion);
+}
+
+bool ReplaceOpaqueTypesWithUnderlyingTypes::shouldPerformSubstitution(
+    OpaqueTypeDecl *opaque, ModuleDecl *contextModule,
+    ResilienceExpansion contextExpansion) {
+  auto namingDecl = opaque->getNamingDecl();
+
+  // Allow replacement of opaque result types of inlineable function regardless
+  // of resilience and in which context.
+  if (auto *afd = dyn_cast<AbstractFunctionDecl>(namingDecl)) {
+    if (afd->getResilienceExpansion() == ResilienceExpansion::Minimal) {
+      return true;
+    }
+  } else if (auto *asd = dyn_cast<AbstractStorageDecl>(namingDecl)) {
+    auto *getter = asd->getGetter();
+    if (getter &&
+        getter->getResilienceExpansion() == ResilienceExpansion::Minimal) {
+      return true;
+    }
+  }
+
+  // Allow replacement of opaque result types in the context of maximal
+  // resilient expansion if the context's and the opaque type's module are the
+  // same.
+  auto module = namingDecl->getModuleContext();
+  if (contextExpansion == ResilienceExpansion::Maximal &&
+      module == contextModule)
+    return true;
+
+  // Allow general replacement from non resilient modules. Otherwise, disallow.
+  return !module->isResilient();
+}
+
+static Type
+substOpaqueTypesWithUnderlyingTypes(Type ty, ModuleDecl *contextModule,
+                                    ResilienceExpansion contextExpansion) {
+  ReplaceOpaqueTypesWithUnderlyingTypes replacer(contextModule,
+                                                 contextExpansion);
+  return ty.subst(replacer, replacer, SubstFlags::SubstituteOpaqueArchetypes);
+}
+
+Type ReplaceOpaqueTypesWithUnderlyingTypes::
+operator()(SubstitutableType *maybeOpaqueType) const {
   auto archetypeAndRoot = getArchetypeAndRootOpaqueArchetype(maybeOpaqueType);
   if (!archetypeAndRoot)
     return maybeOpaqueType;
-  
+
   auto archetype = archetypeAndRoot->first;
   auto opaqueRoot = archetypeAndRoot->second;
+
+  if (!shouldPerformSubstitution(opaqueRoot->getDecl())) {
+    return maybeOpaqueType;
+  }
+
   auto subs = opaqueRoot->getDecl()->getUnderlyingTypeSubstitutions();
   // TODO: Check the resilience expansion, and handle opaque types with
   // unknown underlying types. For now, all opaque types are always
   // fragile.
   assert(subs.hasValue() && "resilient opaque types not yet supported");
-  
+
   // Apply the underlying type substitutions to the interface type of the
   // archetype in question. This will map the inner generic signature of the
   // opaque type to its outer signature.
@@ -2468,29 +2562,44 @@ Type ReplaceOpaqueTypesWithUnderlyingTypes::operator()(
   // Then apply the substitutions from the root opaque archetype, to specialize
   // for its type arguments.
   auto substTy = partialSubstTy.subst(opaqueRoot->getSubstitutions());
-  
+
   // If the type still contains opaque types, recur.
   if (substTy->hasOpaqueArchetype()) {
-    return substTy.substOpaqueTypesWithUnderlyingTypes();
+    return substOpaqueTypesWithUnderlyingTypes(substTy, contextModule,
+                                               contextExpansion);
   }
   return substTy;
 }
 
-Optional<ProtocolConformanceRef>
-ReplaceOpaqueTypesWithUnderlyingTypes::operator()(CanType maybeOpaqueType,
-                                                 Type replacementType,
-                                                 ProtocolDecl *protocol) const {
+static ProtocolConformanceRef
+substOpaqueTypesWithUnderlyingTypes(ProtocolConformanceRef ref, Type origType,
+                                    ModuleDecl *contextModule,
+                                    ResilienceExpansion contextExpansion) {
+  ReplaceOpaqueTypesWithUnderlyingTypes replacer(contextModule,
+                                                 contextExpansion);
+  return ref.subst(origType, replacer, replacer,
+                   SubstFlags::SubstituteOpaqueArchetypes);
+}
+
+Optional<ProtocolConformanceRef> ReplaceOpaqueTypesWithUnderlyingTypes::
+operator()(CanType maybeOpaqueType, Type replacementType,
+           ProtocolDecl *protocol) const {
   auto abstractRef = ProtocolConformanceRef(protocol);
 
   auto archetypeAndRoot = getArchetypeAndRootOpaqueArchetype(maybeOpaqueType);
   if (!archetypeAndRoot) {
-    assert(maybeOpaqueType->isTypeParameter()
-           || maybeOpaqueType->is<ArchetypeType>());
+    assert(maybeOpaqueType->isTypeParameter() ||
+           maybeOpaqueType->is<ArchetypeType>());
     return abstractRef;
   }
-  
+
   auto archetype = archetypeAndRoot->first;
   auto opaqueRoot = archetypeAndRoot->second;
+
+  if (!shouldPerformSubstitution(opaqueRoot->getDecl())) {
+    return abstractRef;
+  }
+
   auto subs = opaqueRoot->getDecl()->getUnderlyingTypeSubstitutions();
   assert(subs.hasValue());
 
@@ -2498,31 +2607,21 @@ ReplaceOpaqueTypesWithUnderlyingTypes::operator()(CanType maybeOpaqueType,
   // archetype in question. This will map the inner generic signature of the
   // opaque type to its outer signature.
   auto partialSubstTy = archetype->getInterfaceType().subst(*subs);
-  auto partialSubstRef = abstractRef.subst(archetype->getInterfaceType(),
-                                           *subs);
-  
+  auto partialSubstRef =
+      abstractRef.subst(archetype->getInterfaceType(), *subs);
+
   // Then apply the substitutions from the root opaque archetype, to specialize
   // for its type arguments.
   auto substTy = partialSubstTy.subst(opaqueRoot->getSubstitutions());
-  auto substRef = partialSubstRef.subst(partialSubstTy,
-                                        opaqueRoot->getSubstitutions());
-  
+  auto substRef =
+      partialSubstRef.subst(partialSubstTy, opaqueRoot->getSubstitutions());
+
   // If the type still contains opaque types, recur.
   if (substTy->hasOpaqueArchetype()) {
-    return substRef.substOpaqueTypesWithUnderlyingTypes(substTy);
+    return substOpaqueTypesWithUnderlyingTypes(substRef, substTy, contextModule,
+                                               contextExpansion);
   }
   return substRef;
-}
-
-Type Type::substOpaqueTypesWithUnderlyingTypes() const {
-  ReplaceOpaqueTypesWithUnderlyingTypes replacer;
-  return subst(replacer, replacer,
-               SubstFlags::SubstituteOpaqueArchetypes
-               // TODO(opaque): Currently lowered types always get opaque types
-               // substituted out of them. When we support opaque type resilience
-               // this won't be true anymore and we'll need to handle
-               // opaque type substitution in SILType::subst.
-               | SubstFlags::AllowLoweredTypes);
 }
 
 CanNestedArchetypeType NestedArchetypeType::getNew(
@@ -2614,11 +2713,9 @@ void ArchetypeType::populateNestedTypes() const {
   llvm::SmallPtrSet<Identifier, 4> knownNestedTypes;
   ProtocolType::visitAllProtocols(getConformsTo(),
                                   [&](ProtocolDecl *proto) -> bool {
-    for (auto member : proto->getMembers()) {
-      if (auto assocType = dyn_cast<AssociatedTypeDecl>(member)) {
-        if (knownNestedTypes.insert(assocType->getName()).second)
-          nestedTypes.push_back({ assocType->getName(), Type() });
-      }
+    for (auto assocType : proto->getAssociatedTypeMembers()) {
+      if (knownNestedTypes.insert(assocType->getName()).second)
+        nestedTypes.push_back({ assocType->getName(), Type() });
     }
 
     return false;
@@ -2801,6 +2898,22 @@ GenericFunctionType::substGenericArgs(SubstitutionMap subs) {
                            substFn->getResult(), getExtInfo());
 }
 
+FunctionType *GenericFunctionType::substGenericArgs(
+    llvm::function_ref<Type(Type)> substFn) const {
+  llvm::SmallVector<AnyFunctionType::Param, 4> params;
+  params.reserve(getNumParams());
+
+  llvm::transform(getParams(), std::back_inserter(params),
+                  [&](const AnyFunctionType::Param &param) {
+                    return param.withType(substFn(param.getPlainType()));
+                  });
+
+  auto resultTy = substFn(getResult());
+
+  // Build the resulting (non-generic) function type.
+  return FunctionType::get(params, resultTy, getExtInfo());
+}
+
 CanFunctionType
 CanGenericFunctionType::substGenericArgs(SubstitutionMap subs) const {
   return cast<FunctionType>(
@@ -2853,8 +2966,11 @@ static Type getMemberForBaseType(LookupConformanceFn lookupConformances,
   }
 
   // If the parent is a type variable or a member rooted in a type variable,
-  // we're done.
-  if (substBase->isTypeVariableOrMember())
+  // or if the parent is a type parameter, we're done. Also handle
+  // UnresolvedType here, which can come up in diagnostics.
+  if (substBase->isTypeVariableOrMember() ||
+      substBase->isTypeParameter() ||
+      substBase->is<UnresolvedType>())
     return getDependentMemberType(substBase);
 
   // Retrieve the member type with the given name.
@@ -2862,10 +2978,6 @@ static Type getMemberForBaseType(LookupConformanceFn lookupConformances,
   // Tuples don't have member types.
   if (substBase->is<TupleType>())
     return failed();
-
-  // If the parent is dependent, create a dependent member type.
-  if (substBase->isTypeParameter())
-    return getDependentMemberType(substBase);
 
   // If we know the associated type, look in the witness table.
   LazyResolver *resolver = substBase->getASTContext().getLazyResolver();

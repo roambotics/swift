@@ -1129,6 +1129,11 @@ void Remangler::mangleObjCBlock(Node *node) {
   mangleChildNodes(node); // argument tuple, result type
 }
 
+void Remangler::mangleEscapingObjCBlock(Node *node) {
+  // We shouldn't ever be remangling anything with a DWARF-only mangling.
+  Buffer << "<escaping block type>";
+}
+
 void Remangler::mangleCFunctionPointer(Node *node) {
   Buffer << 'c';
   mangleChildNodes(node); // argument tuple, result type
@@ -2036,6 +2041,18 @@ void Remangler::mangleOpaqueType(Node *node) {
   unreachable("unsupported");
 }
 void Remangler::mangleOpaqueTypeDescriptor(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueTypeDescriptorAccessor(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueTypeDescriptorAccessorImpl(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueTypeDescriptorAccessorKey(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueTypeDescriptorAccessorVar(Node *node) {
   unreachable("unsupported");
 }
 void Remangler::mangleAccessorFunctionReference(Node *node) {

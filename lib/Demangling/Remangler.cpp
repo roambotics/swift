@@ -1599,6 +1599,26 @@ void Remangler::mangleOpaqueTypeDescriptor(Node *node) {
   Buffer << "MQ";
 }
 
+void Remangler::mangleOpaqueTypeDescriptorAccessor(Node *node) {
+  mangleSingleChildNode(node);
+  Buffer << "Mg";
+}
+
+void Remangler::mangleOpaqueTypeDescriptorAccessorImpl(Node *node) {
+  mangleSingleChildNode(node);
+  Buffer << "Mh";
+}
+
+void Remangler::mangleOpaqueTypeDescriptorAccessorKey(Node *node) {
+  mangleSingleChildNode(node);
+  Buffer << "Mj";
+}
+
+void Remangler::mangleOpaqueTypeDescriptorAccessorVar(Node *node) {
+  mangleSingleChildNode(node);
+  Buffer << "Mk";
+}
+
 void Remangler::manglePropertyDescriptor(Node *node) {
   mangleSingleChildNode(node);
   Buffer << "MV";
@@ -1624,6 +1644,11 @@ void Remangler::mangleObjCAttribute(Node *node) {
 void Remangler::mangleObjCBlock(Node *node) {
   mangleChildNodesReversed(node);
   Buffer << "XB";
+}
+
+void Remangler::mangleEscapingObjCBlock(Node *node) {
+  mangleChildNodesReversed(node);
+  Buffer << "XL";
 }
 
 void Remangler::mangleOwningAddressor(Node *node) {
@@ -2341,6 +2366,9 @@ void Remangler::mangleOpaqueReturnTypeOf(Node *node) {
   Buffer << "QO";
 }
 void Remangler::mangleOpaqueType(Node *node) {
+  SubstitutionEntry entry;
+  if (trySubstitution(node, entry)) return;
+
   mangle(node->getChild(0));
   auto boundGenerics = node->getChild(2);
   for (unsigned i = 0; i < boundGenerics->getNumChildren(); ++i) {
@@ -2355,6 +2383,8 @@ void Remangler::mangleOpaqueType(Node *node) {
   }
   Buffer << "Qo";
   mangleIndex(node->getChild(1)->getIndex());
+
+  addSubstitution(entry);
 }
 void Remangler::mangleAccessorFunctionReference(Node *node) {
   unreachable("can't remangle");

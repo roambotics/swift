@@ -12,24 +12,26 @@
 
 #include "sourcekitd/sourcekitd.h"
 
-#include "TestOptions.h"
 #include "SourceKit/Support/Concurrency.h"
-#include "clang/Rewrite/Core/RewriteBuffer.h"
+#include "TestOptions.h"
 #include "swift/Demangling/ManglingMacros.h"
+#include "clang/Rewrite/Core/RewriteBuffer.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/Regex.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/Signals.h"
+#include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Regex.h"
+#include "llvm/Support/Signals.h"
+#include "llvm/Support/Threading.h"
+#include "llvm/Support/raw_ostream.h"
 #include <fstream>
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
-#include <unistd.h>
 #include <sys/param.h>
+#include <unistd.h>
 #elif defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -48,11 +50,31 @@ namespace {
 int STDOUT_FILENO = _fileno(stdout);
 const constexpr size_t MAXPATHLEN = MAX_PATH + 1;
 char *realpath(const char *path, char *resolved_path) {
-  DWORD dwLength = GetFullPathNameA(path, 0, nullptr, nullptr);
-  if (dwLength == 0)
+  wchar_t full_path[MAXPATHLEN] = {0};
+  llvm::SmallVector<llvm::UTF16, 50> utf16Path;
+  llvm::convertUTF8ToUTF16String(path, utf16Path);
+
+  HANDLE fileHandle = CreateFileW(
+      (LPCWSTR)utf16Path.data(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+
+  if (fileHandle == INVALID_HANDLE_VALUE)
     return nullptr;
-  if ((resolved_path = static_cast<char *>(malloc(dwLength + 1))))
-    GetFullPathNameA(path, dwLength, resolved_path, nullptr);
+  DWORD success = GetFinalPathNameByHandleW(fileHandle, full_path, MAX_PATH,
+                                            FILE_NAME_NORMALIZED);
+  CloseHandle(fileHandle);
+  if (!success) return nullptr;
+
+  std::string utf8Path;
+  llvm::ArrayRef<char> pathRef((const char *)full_path,
+                               (const char *)(full_path + MAX_PATH));
+  if (!llvm::convertUTF16ToUTF8String(pathRef, utf8Path))
+    return nullptr;
+
+  if (!resolved_path) {
+    resolved_path = static_cast<char *>(malloc(utf8Path.length() + 1));
+  }
+  std::copy(std::begin(utf8Path), std::end(utf8Path), resolved_path);
   return resolved_path;
 }
 }
@@ -190,18 +212,26 @@ static void printBufferedNotifications(bool syncWithService = true) {
   });
 }
 
-static int skt_main(int argc, const char **argv);
+struct skt_args {
+  int argc;
+  const char **argv;
+  int ret;
+};
+static void skt_main(skt_args *args);
 
 int main(int argc, const char **argv) {
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-    int ret = skt_main(argc, argv);
-    exit(ret);
+    skt_args args = {argc, argv, 0};
+    llvm::llvm_execute_on_thread((void (*)(void *))skt_main, &args);
+    exit(args.ret);
   });
 
   dispatch_main();
 }
 
-static int skt_main(int argc, const char **argv) {
+static void skt_main(skt_args *args) {
+  int argc = args->argc;
+  const char **argv = args->argv;
   llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
 
   sourcekitd_initialize();
@@ -240,14 +270,16 @@ static int skt_main(int argc, const char **argv) {
       break;
     if (int ret = handleTestInvocation(Args.slice(0, i), InitOpts)) {
       sourcekitd_shutdown();
-      return ret;
+      args->ret = ret;
+      return;
     }
-    Args = Args.slice(i+1);
+    Args = Args.slice(i + 1);
   }
 
   if (int ret = handleTestInvocation(Args, InitOpts)) {
     sourcekitd_shutdown();
-    return ret;
+    args->ret = ret;
+    return;
   }
 
   for (auto &info : asyncResponses) {
@@ -258,13 +290,15 @@ static int skt_main(int argc, const char **argv) {
     if (handleResponse(info.response, info.options, info.sourceFilename,
                        std::move(info.sourceBuffer), nullptr)) {
       sourcekitd_shutdown();
-      return 1;
+      args->ret = 1;
+      return;
     }
   }
   printBufferedNotifications();
 
   sourcekitd_shutdown();
-  return 0;
+  args->ret = 0;
+  return;
 }
 
 static inline const char *getInterfaceGenDocumentName() {
@@ -1282,6 +1316,13 @@ static void notification_receiver(sourcekitd_response_t resp) {
 
 static void printNameTranslationInfo(sourcekitd_variant_t Info,
                                      llvm::raw_ostream &OS) {
+  const char *InternalDiagnostic =
+      sourcekitd_variant_dictionary_get_string(Info, KeyInternalDiagnostic);
+  if (InternalDiagnostic) {
+    OS << "<empty name translation info; internal diagnostic: \""
+       << InternalDiagnostic << "\">\n";
+    return;
+  }
   sourcekitd_uid_t KindUID = sourcekitd_variant_dictionary_get_uid(Info,
                                                                    KeyNameKind);
   if (KindUID == nullptr) {
@@ -1341,6 +1382,13 @@ static void printNameTranslationInfo(sourcekitd_variant_t Info,
 
 static void printCursorInfo(sourcekitd_variant_t Info, StringRef FilenameIn,
                             llvm::raw_ostream &OS) {
+  const char *InternalDiagnostic =
+      sourcekitd_variant_dictionary_get_string(Info, KeyInternalDiagnostic);
+  if (InternalDiagnostic) {
+    OS << "<empty cursor info; internal diagnostic: \""
+       << InternalDiagnostic << "\">\n";
+    return;
+  }
   sourcekitd_uid_t KindUID = sourcekitd_variant_dictionary_get_uid(Info,
                                       sourcekitd_uid_get_from_cstr("key.kind"));
   if (KindUID == nullptr) {

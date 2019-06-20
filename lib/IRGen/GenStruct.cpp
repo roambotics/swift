@@ -626,7 +626,6 @@ public:
       TotalStride(Size(ClangLayout.getSize().getQuantity())),
       TotalAlignment(IGM.getCappedAlignment(
                                        Alignment(ClangLayout.getAlignment()))) {
-    SpareBits.reserve(TotalStride.getValue() * 8);
   }
 
   void collectRecordFields() {
@@ -879,19 +878,18 @@ void IRGenModule::emitStructDecl(StructDecl *st) {
   emitNestedTypeDecls(st->getMembers());
 }
 
-void IRGenModule::emitFuncDecl(FuncDecl *fd) {
-  // If there's an opaque return type for this function, emit its descriptor.
-  if (auto opaque = fd->getOpaqueResultTypeDecl()) {
-    if (!IRGen.hasLazyMetadata(opaque))
+void IRGenModule::maybeEmitOpaqueTypeDecl(OpaqueTypeDecl *opaque) {
+  if (IRGen.Opts.EnableAnonymousContextMangledNames) {
+    // If we're emitting anonymous context mangled names for debuggability,
+    // then emit all opaque type descriptors and make them runtime-discoverable
+    // so that remote ast/mirror can recover them.
+    addRuntimeResolvableType(opaque);
+    if (IRGen.hasLazyMetadata(opaque))
+      IRGen.noteUseOfOpaqueTypeDescriptor(opaque);
+    else
       emitOpaqueTypeDecl(opaque);
-  }
-}
-
-void IRGenModule::emitAbstractStorageDecl(AbstractStorageDecl *fd) {
-  // If there's an opaque return type for this function, emit its descriptor.
-  if (auto opaque = fd->getOpaqueResultTypeDecl()) {
-    if (!IRGen.hasLazyMetadata(opaque))
-      emitOpaqueTypeDecl(opaque);
+  } else if (!IRGen.hasLazyMetadata(opaque)) {
+    emitOpaqueTypeDecl(opaque);
   }
 }
 

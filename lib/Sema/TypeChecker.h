@@ -202,6 +202,7 @@ enum ContextualTypePurpose {
   CTP_Unused,           ///< No contextual type is specified.
   CTP_Initialization,   ///< Pattern binding initialization.
   CTP_ReturnStmt,       ///< Value specified to a 'return' statement.
+  CTP_ReturnSingleExpr, ///< Value implicitly returned from a function.
   CTP_YieldByValue,     ///< By-value yield operand.
   CTP_YieldByReference, ///< By-reference yield operand.
   CTP_ThrowStmt,        ///< Value specified to a 'throw' statement.
@@ -216,6 +217,8 @@ enum ContextualTypePurpose {
   CTP_DictionaryValue,  ///< DictionaryExpr values should have a specific type.
   CTP_CoerceOperand,    ///< CoerceExpr operand coerced to specific type.
   CTP_AssignSource,     ///< AssignExpr source operand coerced to result type.
+  CTP_SubscriptAssignSource, ///< AssignExpr source operand coerced to subscript
+                             ///< result type.
 
   CTP_CannotFail,       ///< Conversion can never fail. abort() if it does.
 };
@@ -487,29 +490,25 @@ enum class RequirementCheckResult {
 enum class ConformanceCheckFlags {
   /// Whether we're performing the check from within an expression.
   InExpression = 0x01,
-  /// Whether we will be using the conformance in the AST.
-  ///
-  /// This implies that the conformance will have to be complete.
-  Used = 0x02,
   /// Whether to suppress dependency tracking entirely.
   ///
   /// FIXME: This deals with some oddities with the
   /// _ObjectiveCBridgeable conformances.
-  SuppressDependencyTracking = 0x04,
+  SuppressDependencyTracking = 0x02,
   /// Whether to skip the check for any conditional conformances.
   ///
   /// When set, the caller takes responsibility for any
   /// conditional requirements required for the conformance to be
   /// correctly used. Otherwise (the default), all of the conditional
   /// requirements will be checked.
-  SkipConditionalRequirements = 0x08,
+  SkipConditionalRequirements = 0x04,
 
   /// Whether to require that the conditional requirements have been computed.
   ///
   /// When set, if the conditional requirements aren't available, they are just
   /// skipped, and the caller is responsible for detecting and handling this
   /// case (likely via another call to getConditionalRequirementsIfAvailable).
-  AllowUnavailableConditionalRequirements = 0x10,
+  AllowUnavailableConditionalRequirements = 0x08,
 };
 
 /// Options that control protocol conformance checking.
@@ -550,10 +549,6 @@ public:
   /// Declarations that need their conformances checked.
   llvm::SmallVector<Decl *, 8> ConformanceContexts;
 
-  /// The list of protocol conformances that were "used" and will need to be
-  /// completed before type checking is considered complete.
-  llvm::SetVector<NormalProtocolConformance *> UsedConformances;
-
   /// The list of protocol conformances whose requirements could not be
   /// fully checked and, therefore, should be checked again at the top
   /// level.
@@ -567,11 +562,6 @@ public:
   /// Track the index of the next declaration that needs to be finalized,
   /// from the \c DeclsToFinalize set.
   unsigned NextDeclToFinalize = 0;
-
-  /// The list of protocols that need their requirement signatures computed,
-  /// because they were first validated by validateDeclForNameLookup(),
-  /// which skips this step.
-  llvm::SetVector<ProtocolDecl *> DelayedRequirementSignatures;
 
   /// The list of types whose circularity checks were delayed.
   SmallVector<NominalTypeDecl*, 8> DelayedCircularityChecks;
@@ -668,6 +658,9 @@ private:
   /// when executing scripts.
   bool InImmediateMode = false;
 
+  /// Closure expressions that have already been prechecked.
+  llvm::SmallPtrSet<ClosureExpr *, 2> precheckedClosures;
+
   /// A helper to construct and typecheck call to super.init().
   ///
   /// \returns NULL if the constructed expression does not typecheck.
@@ -675,6 +668,7 @@ private:
 
   TypeChecker(ASTContext &Ctx);
   friend class ASTContext;
+  friend class constraints::ConstraintSystem;
 
 public:
   /// Create a new type checker instance for the given ASTContext, if it
@@ -1034,6 +1028,7 @@ public:
   bool typeCheckDestructorBodyUntil(DestructorDecl *DD,
                                     SourceLoc EndTypeCheckLoc);
 
+  bool typeCheckFunctionBuilderFuncBody(FuncDecl *FD, Type builderType);
   bool typeCheckClosureBody(ClosureExpr *closure);
 
   bool typeCheckTapBody(TapExpr *expr, DeclContext *DC);
@@ -1195,7 +1190,7 @@ public:
       ArrayRef<Requirement> requirements,
       TypeSubstitutionFn substitutions,
       LookupConformanceFn conformances,
-      ConformanceCheckOptions conformanceOptions = ConformanceCheckFlags::Used,
+      ConformanceCheckOptions conformanceOptions,
       GenericRequirementsCheckListener *listener = nullptr,
       SubstOptions options = None);
 
@@ -1478,7 +1473,7 @@ public:
   /// \returns true if any closures were found
   static bool contextualizeInitializer(Initializer *DC, Expr *init);
   static void contextualizeTopLevelCode(TopLevelContext &TLC,
-                                        ArrayRef<Decl*> topLevelDecls);
+                                        TopLevelCodeDecl *TLCD);
 
   /// Return the type-of-reference of the given value.
   ///
@@ -1660,11 +1655,6 @@ public:
                                            ConformanceCheckOptions options,
                                            SourceLoc ComplainLoc = SourceLoc());
 
-  /// Mark the given protocol conformance as "used" from the given declaration
-  /// context.
-  void markConformanceUsed(ProtocolConformanceRef conformance,
-                           DeclContext *dc) override final;
-
   /// Functor class suitable for use as a \c LookupConformanceFn to look up a
   /// conformance through a particular declaration context using the given
   /// type checker.
@@ -1684,21 +1674,14 @@ public:
   void checkConformance(NormalProtocolConformance *conformance);
 
   /// Check the requirement signature of the given conformance.
-  void checkConformanceRequirements(NormalProtocolConformance *conformance)
-         override ;
+  void checkConformanceRequirements(NormalProtocolConformance *conformance);
 
   /// Check all of the conformances in the given context.
   void checkConformancesInContext(DeclContext *dc,
                                   IterableDeclContext *idc);
 
   /// Check that the type of the given property conforms to NSCopying.
-  ///
-  /// Return true if there was an error.
-  bool checkConformanceToNSCopying(VarDecl *var);
-
-  /// Mark any _BridgedNSError/_BridgedStoredNSError/related
-  /// conformances in the given type as "used".
-  void useBridgedNSErrorConformances(DeclContext *dc, Type type);
+  Optional<ProtocolConformanceRef> checkConformanceToNSCopying(VarDecl *var);
 
   /// Derive an implicit declaration to satisfy a requirement of a derived
   /// protocol conformance.
@@ -2003,6 +1986,10 @@ public:
                                        const DeclContext *ReferenceDC,
                                        const UnavailabilityReason &Reason);
 
+  void diagnosePotentialOpaqueTypeUnavailability(SourceRange ReferenceRange,
+                                           const DeclContext *ReferenceDC,
+                                           const UnavailabilityReason &Reason);
+  
   /// Emits a diagnostic for a reference to a storage accessor that is
   /// potentially unavailable.
   void diagnosePotentialAccessorUnavailability(
@@ -2040,6 +2027,8 @@ public:
   void checkFunctionErrorHandling(AbstractFunctionDecl *D);
   void checkInitializerErrorHandling(Initializer *I, Expr *E);
   void checkEnumElementErrorHandling(EnumElementDecl *D);
+  void checkPropertyWrapperErrorHandling(PatternBindingDecl *binding,
+                                          Expr *expr);
 
   void addExprForDiagnosis(Expr *E1, Expr *Result) {
     DiagnosedExprs[E1] = Result;
@@ -2159,6 +2148,24 @@ bool isValidStringDynamicMemberLookup(SubscriptDecl *decl, DeclContext *DC,
 /// takes a single non-variadic parameter of `{Writable}KeyPath<T, U>` type.
 bool isValidKeyPathDynamicMemberLookup(SubscriptDecl *decl, TypeChecker &TC);
 
+/// Compute the wrapped value type for the given property that has attached
+/// property wrappers, when the backing storage is known to have the given type.
+///
+/// \param var A property that has attached property wrappers.
+/// \param backingStorageType The type of the backing storage property.
+/// \param limit How many levels of unwrapping to perform, where 0 means to return the
+/// \c backingStorageType directly and the maximum is the number of attached property wrappers
+/// (which will produce the original property type). If not specified, defaults to the maximum.
+Type computeWrappedValueType(VarDecl *var, Type backingStorageType,
+                             Optional<unsigned> limit = None);
+  
+/// Build a call to the init(initialValue:) initializers of the property wrappers, filling in the given
+/// \c value as the original value.
+Expr *buildPropertyWrapperInitialValueCall(VarDecl *var,
+                                           Type backingStorageType,
+                                           Expr *value,
+                                           bool ignoreAttributeArgs);
+  
 /// Whether an overriding declaration requires the 'override' keyword.
 enum class OverrideRequiresKeyword {
   /// The keyword is never required.
@@ -2186,6 +2193,51 @@ bool isOverrideBasedOnType(ValueDecl *decl, Type declTy,
 /// protocol. If \p type is not null, check specifically whether \p decl
 /// could fulfill a protocol requirement for it.
 bool isMemberOperator(FuncDecl *decl, Type type);
+
+/// Complain if @objc or dynamic is used without importing Foundation.
+void diagnoseAttrsRequiringFoundation(SourceFile &SF);
+
+/// Diagnose any Objective-C method overrides that aren't reflected
+/// as overrides in Swift.
+bool diagnoseUnintendedObjCMethodOverrides(SourceFile &sf);
+
+/// Diagnose all conflicts between members that have the same
+/// Objective-C selector in the same class.
+///
+/// \param sf The source file for which we are diagnosing conflicts.
+///
+/// \returns true if there were any conflicts diagnosed.
+bool diagnoseObjCMethodConflicts(SourceFile &sf);
+
+/// Diagnose any unsatisfied @objc optional requirements of
+/// protocols that conflict with methods.
+bool diagnoseObjCUnsatisfiedOptReqConflicts(SourceFile &sf);
+
+/// Retrieve information about the given Objective-C method for
+/// diagnostic purposes, to be used with OBJC_DIAG_SELECT in
+/// DiagnosticsSema.def.
+std::pair<unsigned, DeclName> getObjCMethodDiagInfo(
+                                AbstractFunctionDecl *method);
+
+/// Attach Fix-Its to the given diagnostic that updates the name of the
+/// given declaration to the desired target name.
+///
+/// \returns false if the name could not be fixed.
+bool fixDeclarationName(InFlightDiagnostic &diag, ValueDecl *decl,
+                        DeclName targetName);
+
+/// Fix the Objective-C name of the given declaration to match the provided
+/// Objective-C selector.
+///
+/// \param ignoreImpliedName When true, ignore the implied name of the
+/// given declaration, because it no longer applies.
+///
+/// For properties, the selector should be a zero-parameter selector of the
+/// given property's name.
+bool fixDeclarationObjCName(InFlightDiagnostic &diag, ValueDecl *decl,
+                            Optional<ObjCSelector> nameOpt,
+                            Optional<ObjCSelector> targetNameOpt,
+                            bool ignoreImpliedName = false);
 
 } // end namespace swift
 

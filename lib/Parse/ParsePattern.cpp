@@ -219,20 +219,18 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
     unsigned defaultArgIndex = defaultArgs ? defaultArgs->NextIndex++ : 0;
 
     // Attributes.
-    bool FoundCCToken = false;
-    if (paramContext != ParameterContextKind::EnumElement)
-      parseDeclAttributeList(param.Attrs, FoundCCToken);
-    if (FoundCCToken) {
-      if (CodeCompletion) {
-        CodeCompletion->completeDeclAttrKeyword(nullptr, isInSILMode(), true);
-      } else {
-        status |= makeParserCodeCompletionStatus();
+    if (paramContext != ParameterContextKind::EnumElement) {
+      auto AttrStatus = parseDeclAttributeList(param.Attrs);
+      if (AttrStatus.hasCodeCompletion()) {
+        if (CodeCompletion)
+          CodeCompletion->setAttrTargetDeclKind(DeclKind::Param);
+        status.setHasCodeCompletion();
       }
     }
     
-    // ('inout' | 'let' | 'var' | '__shared' | '__owned')?
+    // ('inout' | '__shared' | '__owned')?
     bool hasSpecifier = false;
-    while (Tok.isAny(tok::kw_inout, tok::kw_let, tok::kw_var) ||
+    while (Tok.is(tok::kw_inout) ||
            (Tok.is(tok::identifier) &&
             (Tok.getRawText().equals("__shared") ||
              Tok.getRawText().equals("__owned")))) {
@@ -254,10 +252,6 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
           // better fixits.
           param.SpecifierKind = VarDecl::Specifier::Owned;
           param.SpecifierLoc = consumeToken();
-        } else {
-          diagnose(Tok, diag::parameter_let_var_as_attr, Tok.getText())
-            .fixItRemove(Tok.getLoc());
-          consumeToken();
         }
         hasSpecifier = true;
       } else {
@@ -268,7 +262,14 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
         consumeToken();
       }
     }
-
+    
+    // If let or var is being used as an argument label, allow it but
+    // generate a warning.
+    if (!isClosure && Tok.isAny(tok::kw_let, tok::kw_var)) {
+      diagnose(Tok, diag::parameter_let_var_as_attr, Tok.getText())
+        .fixItReplace(Tok.getLoc(), "`" + Tok.getText().str() + "`");
+    }
+    
     if (startsParameterName(*this, isClosure)) {
       // identifier-or-none for the first name
       param.FirstNameLoc = consumeArgumentLabel(param.FirstName);
@@ -814,7 +815,7 @@ Parser::parseFunctionSignature(Identifier SimpleName,
     }
 
     ParserResult<TypeRepr> ResultType =
-      parseType(diag::expected_type_function_result);
+        parseDeclResultType(diag::expected_type_function_result);
     if (ResultType.hasCodeCompletion())
       return ResultType;
     retType = ResultType.getPtrOrNull();
@@ -857,7 +858,7 @@ ParserResult<Pattern> Parser::parseTypedPattern() {
     if (result.isNull())  // Recover by creating AnyPattern.
       result = makeParserErrorResult(new (Context) AnyPattern(colonLoc));
     
-    ParserResult<TypeRepr> Ty = parseType();
+    ParserResult<TypeRepr> Ty = parseDeclResultType(diag::expected_type);
     if (Ty.hasCodeCompletion())
       return makeParserCodeCompletionResult<Pattern>();
     if (!Ty.isNull()) {

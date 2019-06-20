@@ -658,11 +658,6 @@ class ConformanceChecker : public WitnessChecker {
          ValueDecl *requirement, bool isError,
          std::function<void(NormalProtocolConformance *)> fn);
 
-  void
-  addUsedConformances(ProtocolConformance *conformance,
-                      llvm::SmallPtrSetImpl<ProtocolConformance *> &visited);
-  void addUsedConformances(ProtocolConformance *conformance);
-
   ArrayRef<ValueDecl*> getLocalMissingWitness() {
     return GlobalMissingWitnesses.getArrayRef().
       slice(LocalMissingWitnessesStartIndex,
@@ -897,7 +892,6 @@ public:
 ///
 /// \returns the result of performing the match.
 RequirementMatch matchWitness(
-             TypeChecker &tc,
              DeclContext *dc, ValueDecl *req, ValueDecl *witness,
              llvm::function_ref<
                      std::tuple<Optional<RequirementMatch>, Type, Type>(void)>
@@ -937,16 +931,6 @@ Type adjustInferredAssociatedType(Type type, bool &noescapeToEscaping);
 llvm::TinyPtrVector<ValueDecl *> findWitnessedObjCRequirements(
                                      const ValueDecl *witness,
                                      bool anySingleRequirement = false);
-
-/// Mark any _ObjectiveCBridgeable conformances in the given type as "used".
-void useObjectiveCBridgeableConformances(
-                      DeclContext *dc, Type type);
-
-/// If this bound-generic type is bridged, mark any
-/// _ObjectiveCBridgeable conformances in the generic arguments of
-/// the given type as "used".
-void useObjectiveCBridgeableConformancesOfArgs(
-                      DeclContext *dc, BoundGenericType *bound);
 
 }
 

@@ -19,9 +19,11 @@
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/LazyResolver.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/Pattern.h"
+#include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/Types.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/SIL/SILArgument.h"
@@ -1773,6 +1775,15 @@ static CanAnyFunctionType getStoredPropertyInitializerInterfaceType(
   CanType resultTy =
     VD->getParentPattern()->getType()->mapTypeOutOfContext()
           ->getCanonicalType();
+
+  // If this is the backing storage for a property with an attached
+  // wrapper that was initialized with '=', the stored property initializer
+  // will be in terms of the original property's type.
+  if (auto originalProperty = VD->getOriginalWrappedProperty()) {
+    if (originalProperty->isPropertyWrapperInitializedWithInitialValue())
+      resultTy = originalProperty->getValueInterfaceType()->getCanonicalType();
+  }
+
   auto sig = TC.getEffectiveGenericSignature(DC);
 
   return CanAnyFunctionType::get(sig, {}, resultTy);
@@ -1889,6 +1900,10 @@ TypeConverter::getFunctionInterfaceTypeWithCaptures(CanAnyFunctionType funcType,
 
 CanAnyFunctionType TypeConverter::makeConstantInterfaceType(SILDeclRef c) {
   auto *vd = c.loc.dyn_cast<ValueDecl *>();
+
+  if (vd && !vd->hasInterfaceType()) {
+    Context.getLazyResolver()->resolveDeclSignature(vd);
+  }
 
   switch (c.kind) {
   case SILDeclRef::Kind::Func: {
@@ -2110,6 +2125,7 @@ CaptureInfo
 TypeConverter::getLoweredLocalCaptures(AnyFunctionRef fn) {
   // First, bail out if there are no local captures at all.
   if (!fn.getCaptureInfo().hasLocalCaptures() &&
+      !fn.getCaptureInfo().hasOpaqueValueCapture() &&
       !fn.getCaptureInfo().hasDynamicSelfCapture()) {
     CaptureInfo info;
     info.setGenericParamCaptures(
@@ -2132,7 +2148,8 @@ TypeConverter::getLoweredLocalCaptures(AnyFunctionRef fn) {
 
   bool capturesGenericParams = false;
   DynamicSelfType *capturesDynamicSelf = nullptr;
-  
+  OpaqueValueExpr *capturesOpaqueValue = nullptr;
+
   std::function<void (AnyFunctionRef)> collectFunctionCaptures
   = [&](AnyFunctionRef curFn) {
     if (!visitedFunctions.insert(curFn).second)
@@ -2142,6 +2159,8 @@ TypeConverter::getLoweredLocalCaptures(AnyFunctionRef fn) {
       capturesGenericParams = true;
     if (curFn.getCaptureInfo().hasDynamicSelfCapture())
       capturesDynamicSelf = curFn.getCaptureInfo().getDynamicSelfType();
+    if (curFn.getCaptureInfo().hasOpaqueValueCapture())
+      capturesOpaqueValue = curFn.getCaptureInfo().getOpaqueValue();
 
     SmallVector<CapturedValue, 4> localCaptures;
     curFn.getCaptureInfo().getLocalCaptures(localCaptures);
@@ -2256,6 +2275,11 @@ TypeConverter::getLoweredLocalCaptures(AnyFunctionRef fn) {
     resultingCaptures.push_back(capturePair.second);
   }
 
+  // If we captured an opaque value, add it.
+  if (capturesOpaqueValue) {
+    resultingCaptures.push_back(CapturedValue(capturesOpaqueValue, 0));
+  }
+
   // If we captured the dynamic 'Self' type and we have a 'self' value also,
   // add it as the final capture. Otherwise, add a fake hidden capture for
   // the dynamic 'Self' metatype.
@@ -2272,6 +2296,7 @@ TypeConverter::getLoweredLocalCaptures(AnyFunctionRef fn) {
   auto &cachedCaptures = inserted.first->second;
   cachedCaptures.setGenericParamCaptures(capturesGenericParams);
   cachedCaptures.setDynamicSelfType(capturesDynamicSelf);
+  cachedCaptures.setOpaqueValue(capturesOpaqueValue);
   cachedCaptures.setCaptures(Context.AllocateCopy(resultingCaptures));
   
   return cachedCaptures;
@@ -2401,6 +2426,9 @@ TypeConverter::checkFunctionForABIDifferences(SILFunctionType *fnTy1,
   if (fnTy1->getNumResults() != fnTy2->getNumResults())
     return ABIDifference::NeedsThunk;
 
+  if (fnTy1->getNumYields() != fnTy2->getNumYields())
+    return ABIDifference::NeedsThunk;
+
   // If we don't have a context but the other type does, we'll return
   // ABIDifference::ThinToThick below.
   if (fnTy1->getExtInfo().hasContext() &&
@@ -2415,8 +2443,22 @@ TypeConverter::checkFunctionForABIDifferences(SILFunctionType *fnTy1,
       return ABIDifference::NeedsThunk;
 
     if (checkForABIDifferences(result1.getSILStorageType(),
-                             result2.getSILStorageType(),
-              /*thunk iuos*/ fnTy1->getLanguage() == SILFunctionLanguage::Swift)
+                               result2.getSILStorageType(),
+             /*thunk iuos*/ fnTy1->getLanguage() == SILFunctionLanguage::Swift)
+        != ABIDifference::Trivial)
+      return ABIDifference::NeedsThunk;
+  }
+
+  for (unsigned i : indices(fnTy1->getYields())) {
+    auto yield1 = fnTy1->getYields()[i];
+    auto yield2 = fnTy2->getYields()[i];
+
+    if (yield1.getConvention() != yield2.getConvention())
+      return ABIDifference::NeedsThunk;
+
+    if (checkForABIDifferences(yield1.getSILStorageType(),
+                               yield2.getSILStorageType(),
+             /*thunk iuos*/ fnTy1->getLanguage() == SILFunctionLanguage::Swift)
         != ABIDifference::Trivial)
       return ABIDifference::NeedsThunk;
   }

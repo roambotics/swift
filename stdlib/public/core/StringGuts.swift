@@ -16,7 +16,7 @@ import SwiftShims
 // StringGuts is a parameterization over String's representations. It provides
 // functionality and guidance for efficiently working with Strings.
 //
-@_fixed_layout
+@frozen
 public // SPI(corelibs-foundation)
 struct _StringGuts {
   @usableFromInline
@@ -246,16 +246,12 @@ extension _StringGuts {
   internal func _foreignCopyUTF8(
     into mbp: UnsafeMutableBufferPointer<UInt8>
   ) -> Int? {
-    var ptr = mbp.baseAddress._unsafelyUnwrappedUnchecked
-    var numWritten = 0
-    for cu in String(self).utf8 {
-      guard numWritten < mbp.count else { return nil }
-      ptr.initialize(to: cu)
-      ptr += 1
-      numWritten += 1
-    }
-
-    return numWritten
+    #if _runtime(_ObjC)
+    // Currently, foreign  means NSString
+    return _cocoaStringCopyUTF8(_object.cocoaObject, into: mbp)
+    #else
+    fatalError("No foreign strings on Linux in this version of Swift")
+    #endif
   }
 
   @inline(__always)
