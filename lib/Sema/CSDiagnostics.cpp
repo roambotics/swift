@@ -835,6 +835,9 @@ bool MissingExplicitConversionFailure::diagnoseAsError() {
 
   auto fromType = getType(anchor)->getRValueType();
   Type toType = resolveType(ConvertingTo);
+  if (!toType->hasTypeRepr())
+    return false;
+
   bool useAs = TC.isExplicitlyConvertibleTo(fromType, toType, DC);
   bool useAsBang = !useAs && TC.checkedCastMaySucceed(fromType, toType, DC);
   if (!useAs && !useAsBang)
@@ -1972,6 +1975,14 @@ bool MissingCallFailure::diagnoseAsError() {
   return true;
 }
 
+bool MissingPropertyWrapperUnwrapFailure::diagnoseAsError() {
+  emitDiagnostic(getAnchor()->getLoc(),
+                 diag::extraneous_property_wrapper_unwrap, getPropertyName(),
+                 getFromType(), getToType())
+      .fixItInsert(getAnchor()->getLoc(), "$");
+  return true;
+}
+
 bool SubscriptMisuseFailure::diagnoseAsError() {
   auto &sourceMgr = getASTContext().SourceMgr;
 
@@ -2660,13 +2671,23 @@ bool ClosureParamDestructuringFailure::diagnoseAsError() {
   auto bodyStmts = closureBody->getElements();
 
   SourceLoc bodyLoc;
+  SourceLoc inLoc = closure->getInLoc();
+  // If location for `in` is unknown we can't proceed
+  // since we'll not be able to figure out source line
+  // to place the fix-it on.
+  if (inLoc.isInvalid())
+    return true;
+
   // If the body is empty let's put the cursor
   // right after "in", otherwise make it start
   // location of the first statement in the body.
   if (bodyStmts.empty())
-    bodyLoc = Lexer::getLocForEndOfToken(sourceMgr, closure->getInLoc());
+    bodyLoc = Lexer::getLocForEndOfToken(sourceMgr, inLoc);
   else
     bodyLoc = bodyStmts.front().getStartLoc();
+
+  if (bodyLoc.isInvalid())
+    return true;
 
   SmallString<64> fixIt;
   llvm::raw_svector_ostream OS(fixIt);
@@ -2674,7 +2695,7 @@ bool ClosureParamDestructuringFailure::diagnoseAsError() {
   // If this is multi-line closure we'd have to insert new lines
   // in the suggested 'let' to keep the structure of the code intact,
   // otherwise just use ';' to keep everything on the same line.
-  auto inLine = sourceMgr.getLineNumber(closure->getInLoc());
+  auto inLine = sourceMgr.getLineNumber(inLoc);
   auto bodyLine = sourceMgr.getLineNumber(bodyLoc);
   auto isMultiLineClosure = bodyLine > inLine;
   auto indent =

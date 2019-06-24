@@ -628,7 +628,7 @@ ERROR(sema_opening_import,Fatal,
       "opening import file for module %0: %1", (Identifier, StringRef))
 
 ERROR(serialization_load_failed,Fatal,
-      "failed to load module %0", (Identifier))
+      "failed to load module '%0'", (StringRef))
 ERROR(serialization_malformed_module,Fatal,
       "malformed compiled module: %0", (StringRef))
 ERROR(serialization_module_too_new,Fatal,
@@ -997,6 +997,10 @@ ERROR(missing_address_of,none,
 ERROR(missing_address_of_yield,none,
       "yielding mutable value of type %0 requires explicit '&'",
       (Type))
+ERROR(extraneous_property_wrapper_unwrap,none,
+      "property %0 will be unwrapped to value of type %1, use '$' to refer to "
+      "wrapper type %2",
+      (DeclName, Type, Type))
 ERROR(extraneous_address_of,none,
       "use of extraneous '&'",
       ())

@@ -107,9 +107,8 @@ struct MarkUninitializedFixup : SILFunctionTransform {
             Projections.push_back(PBI);
           }
         }
-        assert(!Projections.empty()
-               && "SILGen should never emit a "
-                  "mark_uninitialized by itself");
+        assert(!Projections.empty() && "SILGen should never emit a "
+                                       "mark_uninitialized by itself");
 
         // First replace all uses of the mark_uninitialized with the box.
         MUI->replaceAllUsesWith(Box);
@@ -120,7 +119,7 @@ struct MarkUninitializedFixup : SILFunctionTransform {
 
         // Then create the new mark_uninitialized and force all uses of the
         // project_box to go through the new mark_uninitialized.
-        SILBuilder B(std::next(PBI->getIterator()));
+        SILBuilderWithScope B(&*std::next(PBI->getIterator()));
         SILValue Undef = SILUndef::get(PBI->getType(), *PBI->getFunction());
         auto *NewMUI =
             B.createMarkUninitialized(PBI->getLoc(), Undef, MUI->getKind());
@@ -137,7 +136,6 @@ struct MarkUninitializedFixup : SILFunctionTransform {
           SILAnalysis::InvalidationKind::BranchesAndInstructions);
   }
 };
-
 } // end anonymous namespace
 
 SILTransform *swift::createMarkUninitializedFixup() {
