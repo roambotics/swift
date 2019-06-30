@@ -502,13 +502,6 @@ enum class ConformanceCheckFlags {
   /// correctly used. Otherwise (the default), all of the conditional
   /// requirements will be checked.
   SkipConditionalRequirements = 0x04,
-
-  /// Whether to require that the conditional requirements have been computed.
-  ///
-  /// When set, if the conditional requirements aren't available, they are just
-  /// skipped, and the caller is responsible for detecting and handling this
-  /// case (likely via another call to getConditionalRequirementsIfAvailable).
-  AllowUnavailableConditionalRequirements = 0x08,
 };
 
 /// Options that control protocol conformance checking.
@@ -575,25 +568,6 @@ public:
   /// A list of closures for the most recently type-checked function, which we
   /// will need to compute captures for.
   std::vector<AbstractClosureExpr *> ClosuresWithUncomputedCaptures;
-
-  /// Local functions that have been captured before their definitions.
-  ///
-  /// We need this to guard against functions that would transitively capture
-  /// variables before their definition, e.g.:
-  ///
-  /// func outer() {
-  ///   func first() {
-  ///     second()
-  ///   }
-  ///   second()
-  ///   var x
-  ///   func second() {
-  ///     use(x)
-  ///   }
-  /// }
-
-  llvm::SmallDenseMap<AnyFunctionRef, SmallVector<AnyFunctionRef, 4>, 4>
-    ForwardCapturedFuncs;
 
   /// A set of local functions from which C function pointers are derived.
   ///

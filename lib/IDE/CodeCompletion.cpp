@@ -338,44 +338,6 @@ std::string swift::ide::removeCodeCompletionTokens(
   return CleanFile;
 }
 
-namespace {
-class StmtFinder : public ASTWalker {
-  SourceManager &SM;
-  SourceLoc Loc;
-  StmtKind Kind;
-  Stmt *Found = nullptr;
-
-public:
-  StmtFinder(SourceManager &SM, SourceLoc Loc, StmtKind Kind)
-      : SM(SM), Loc(Loc), Kind(Kind) {}
-
-  std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
-    return { SM.rangeContainsTokenLoc(S->getSourceRange(), Loc), S };
-  }
-
-  Stmt *walkToStmtPost(Stmt *S) override {
-    if (S->getKind() == Kind) {
-      Found = S;
-      return nullptr;
-    }
-    return S;
-  }
-
-  Stmt *getFoundStmt() const {
-    return Found;
-  }
-};
-} // end anonymous namespace
-
-static Stmt *findNearestStmt(const DeclContext *DC, SourceLoc Loc,
-                             StmtKind Kind) {
-  auto &SM = DC->getASTContext().SourceMgr;
-  StmtFinder Finder(SM, Loc, Kind);
-  // FIXME(thread-safety): the walker is mutating the AST.
-  const_cast<DeclContext *>(DC)->walkContext(Finder);
-  return Finder.getFoundStmt();
-}
-
 CodeCompletionString::CodeCompletionString(ArrayRef<Chunk> Chunks) {
   std::uninitialized_copy(Chunks.begin(), Chunks.end(),
                           getTrailingObjects<Chunk>());
@@ -883,7 +845,12 @@ static CodeCompletionResult::ExpectedTypeRelation calculateTypeRelation(
   if (!Ty->hasTypeParameter() && !ExpectedTy->hasTypeParameter()) {
     if (Ty->isEqual(ExpectedTy))
       return CodeCompletionResult::ExpectedTypeRelation::Identical;
-    if (!ExpectedTy->isAny() && isConvertibleTo(Ty, ExpectedTy, *DC))
+    bool isAny = false;
+    isAny |= ExpectedTy->isAny();
+    isAny |= ExpectedTy->is<ArchetypeType>() &&
+             !ExpectedTy->castTo<ArchetypeType>()->hasRequirements();
+
+    if (!isAny && isConvertibleTo(Ty, ExpectedTy, /*openArchetypes=*/true, *DC))
       return CodeCompletionResult::ExpectedTypeRelation::Convertible;
   }
   if (auto FT = Ty->getAs<AnyFunctionType>()) {
@@ -1367,8 +1334,6 @@ public:
   void completeForEachSequenceBeginning(CodeCompletionExpr *E) override;
   void completePostfixExpr(Expr *E, bool hasSpace) override;
   void completePostfixExprParen(Expr *E, Expr *CodeCompletionE) override;
-  void completeExprSuper(SuperRefExpr *SRE) override;
-  void completeExprSuperDot(SuperRefExpr *SRE) override;
   void completeExprKeyPath(KeyPathExpr *KPE, SourceLoc DotLoc) override;
 
   void completeTypeDeclResultBeginning() override;
@@ -1377,8 +1342,7 @@ public:
   void completeTypeIdentifierWithoutDot(IdentTypeRepr *ITR) override;
 
   void completeCaseStmtKeyword() override;
-  void completeCaseStmtBeginning() override;
-  void completeCaseStmtDotPrefix() override;
+  void completeCaseStmtBeginning(CodeCompletionExpr *E) override;
   void completeDeclAttrBeginning(bool Sil, bool isIndependent) override;
   void completeDeclAttrParam(DeclAttrKind DK, int Index) override;
   void completeInPrecedenceGroup(SyntaxKind SK) override;
@@ -3295,6 +3259,9 @@ public:
   }
 
   void getPostfixKeywordCompletions(Type ExprType, Expr *ParsedExpr) {
+    if (IsSuperRefExpr)
+      return;
+
     if (!ExprType->getAs<ModuleType>()) {
       addKeyword(getTokenText(tok::kw_self), ExprType->getRValueType(),
                  SemanticContextKind::CurrentNominal,
@@ -3547,6 +3514,9 @@ public:
   }
 
   void getOperatorCompletions(Expr *LHS, ArrayRef<Expr *> leadingSequence) {
+    if (IsSuperRefExpr)
+      return;
+
     Expr *foldedExpr = typeCheckLeadingSequence(LHS, leadingSequence);
 
     std::vector<OperatorDecl *> operators = collectOperators();
@@ -3905,27 +3875,6 @@ public:
       Builder.addTextChunk(Name);
       Builder.addCallParameterColon();
       Builder.addTypeAnnotation("Argument name");
-    }
-  }
-
-  void getTypeContextEnumElementCompletions(SourceLoc Loc) {
-    llvm::SaveAndRestore<LookupKind> ChangeLookupKind(
-        Kind, LookupKind::EnumElement);
-    NeedLeadingDot = !HaveDot;
-
-    auto *Switch = cast_or_null<SwitchStmt>(
-        findNearestStmt(CurrDeclContext, Loc, StmtKind::Switch));
-    if (!Switch)
-      return;
-    auto Ty = Switch->getSubjectExpr()->getType();
-    if (!Ty)
-      return;
-    ExprType = Ty;
-    auto *TheEnumDecl = dyn_cast_or_null<EnumDecl>(Ty->getAnyNominal());
-    if (!TheEnumDecl)
-      return;
-    for (auto Element : TheEnumDecl->getAllElements()) {
-      foundDecl(Element, DeclVisibilityKind::MemberOfCurrentNominal, {});
     }
   }
 
@@ -4618,36 +4567,6 @@ void CodeCompletionCallbacksImpl::completePostfixExprParen(Expr *E,
   }
 }
 
-void CodeCompletionCallbacksImpl::completeExprSuper(SuperRefExpr *SRE) {
-  // Don't produce any results in an enum element.
-  if (InEnumElementRawValue)
-    return;
-
-  Kind = CompletionKind::SuperExpr;
-  if (ParseExprSelectorContext != ObjCSelectorContext::None) {
-    PreferFunctionReferencesToCalls = true;
-    CompleteExprSelectorContext = ParseExprSelectorContext;
-  }
-
-  ParsedExpr = SRE;
-  CurDeclContext = P.CurDeclContext;
-}
-
-void CodeCompletionCallbacksImpl::completeExprSuperDot(SuperRefExpr *SRE) {
-  // Don't produce any results in an enum element.
-  if (InEnumElementRawValue)
-    return;
-
-  Kind = CompletionKind::SuperExprDot;
-  if (ParseExprSelectorContext != ObjCSelectorContext::None) {
-    PreferFunctionReferencesToCalls = true;
-    CompleteExprSelectorContext = ParseExprSelectorContext;
-  }
-
-  ParsedExpr = SRE;
-  CurDeclContext = P.CurDeclContext;
-}
-
 void CodeCompletionCallbacksImpl::completeExprKeyPath(KeyPathExpr *KPE,
                                                       SourceLoc DotLoc) {
   Kind = (!KPE || KPE->isObjC()) ? CompletionKind::KeyPathExprObjC
@@ -4720,18 +4639,12 @@ void CodeCompletionCallbacksImpl::completeCaseStmtKeyword() {
   CurDeclContext = P.CurDeclContext;
 }
 
-void CodeCompletionCallbacksImpl::completeCaseStmtBeginning() {
+void CodeCompletionCallbacksImpl::completeCaseStmtBeginning(CodeCompletionExpr *E) {
   assert(!InEnumElementRawValue);
 
   Kind = CompletionKind::CaseStmtBeginning;
   CurDeclContext = P.CurDeclContext;
-}
-
-void CodeCompletionCallbacksImpl::completeCaseStmtDotPrefix() {
-  assert(!InEnumElementRawValue);
-
-  Kind = CompletionKind::CaseStmtDotPrefix;
-  CurDeclContext = P.CurDeclContext;
+  CodeCompleteTokenExpr = E;
 }
 
 void CodeCompletionCallbacksImpl::completeImportDecl(
@@ -5014,10 +4927,7 @@ void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink,
 
   case CompletionKind::PostfixExpr:
   case CompletionKind::PostfixExprParen:
-  case CompletionKind::SuperExpr:
-  case CompletionKind::SuperExprDot:
   case CompletionKind::CaseStmtBeginning:
-  case CompletionKind::CaseStmtDotPrefix:
   case CompletionKind::TypeIdentifierWithDot:
   case CompletionKind::TypeIdentifierWithoutDot:
     break;
@@ -5239,6 +5149,8 @@ void CodeCompletionCallbacksImpl::doneParsing() {
   }
   if (auto *DRE = dyn_cast_or_null<DeclRefExpr>(ParsedExpr)) {
     Lookup.setIsSelfRefExpr(DRE->getDecl()->getFullName() == Context.Id_self);
+  } else if (auto *SRE = dyn_cast_or_null<SuperRefExpr>(ParsedExpr)) {
+    Lookup.setIsSuperRefExpr();
   }
 
   if (isInsideObjCSelector())
@@ -5366,19 +5278,6 @@ void CodeCompletionCallbacksImpl::doneParsing() {
     break;
   }
 
-  case CompletionKind::SuperExpr: {
-    Lookup.setIsSuperRefExpr();
-    Lookup.getValueExprCompletions(*ExprType, ReferencedDecl.getDecl());
-    break;
-  }
-
-  case CompletionKind::SuperExprDot: {
-    Lookup.setIsSuperRefExpr();
-    Lookup.setHaveDot(SourceLoc());
-    Lookup.getValueExprCompletions(*ExprType, ReferencedDecl.getDecl());
-    break;
-  }
-
   case CompletionKind::KeyPathExprObjC: {
     if (DotLoc.isValid())
       Lookup.setHaveDot(DotLoc);
@@ -5417,16 +5316,11 @@ void CodeCompletionCallbacksImpl::doneParsing() {
   }
 
   case CompletionKind::CaseStmtBeginning: {
-    SourceLoc Loc = P.Context.SourceMgr.getCodeCompletionLoc();
-    Lookup.getValueCompletionsInDeclContext(Loc);
-    Lookup.getTypeContextEnumElementCompletions(Loc);
-    break;
-  }
-
-  case CompletionKind::CaseStmtDotPrefix: {
-    Lookup.setHaveDot(SourceLoc());
-    SourceLoc Loc = P.Context.SourceMgr.getCodeCompletionLoc();
-    Lookup.getTypeContextEnumElementCompletions(Loc);
+    ExprContextInfo ContextInfo(CurDeclContext, CodeCompleteTokenExpr);
+    Lookup.setExpectedTypes(ContextInfo.getPossibleTypes(),
+                            ContextInfo.isSingleExpressionBody());
+    Lookup.getUnresolvedMemberCompletions(ContextInfo.getPossibleTypes());
+    DoPostfixExprBeginning();
     break;
   }
 

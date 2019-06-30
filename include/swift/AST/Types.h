@@ -336,16 +336,14 @@ protected:
     NumProtocols : 16
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(TypeVariableType, TypeBase, 20+4+20,
-    /// The unique number assigned to this type variable.
-    ID : 20,
+  SWIFT_INLINE_BITFIELD_FULL(TypeVariableType, TypeBase, 4+32,
+    : NumPadBits,
 
     /// Type variable options.
     Options : 4,
 
-    ///  Index into the list of type variables, as used by the
-    ///  constraint graph.
-    GraphIndex : 20
+    /// The unique number assigned to this type variable.
+    ID : 32
   );
 
   SWIFT_INLINE_BITFIELD(SILFunctionType, TypeBase, NumSILExtInfoBits+3+1+2,
@@ -584,10 +582,6 @@ public:
   /// Erase the given opened existential type by replacing it with its
   /// existential type throughout the given type.
   Type eraseOpenedExistential(OpenedArchetypeType *opened);
-
-  /// Erase DynamicSelfType from the given type by replacing it with its
-  /// underlying type.
-  Type eraseDynamicSelfType();
 
   /// Given a declaration context, returns a function type with the 'self'
   /// type curried as the input if the declaration context describes a type.

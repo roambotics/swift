@@ -164,7 +164,8 @@ enum class DescriptiveDeclKind : uint8_t {
   Module,
   MissingMember,
   Requirement,
-  OpaqueType,
+  OpaqueResultType,
+  OpaqueVarType
 };
 
 /// Keeps track of stage of circularity checking for the given protocol.
@@ -433,7 +434,7 @@ protected:
     HasSingleExpressionBody : 1
   );
 
-  SWIFT_INLINE_BITFIELD(FuncDecl, AbstractFunctionDecl, 1+2+1+1+1+2,
+  SWIFT_INLINE_BITFIELD(FuncDecl, AbstractFunctionDecl, 1+2+1+1+2,
     /// Whether this function is a 'static' method.
     IsStatic : 1,
 
@@ -442,9 +443,6 @@ protected:
 
     /// Whether we are statically dispatched even if overridable
     ForcedStaticDispatch : 1,
-
-    /// Whether this function has a dynamic Self return type.
-    HasDynamicSelf : 1,
 
     /// Whether we've computed the 'self' access kind yet.
     SelfAccessComputed : 1,
@@ -510,7 +508,7 @@ protected:
     HasLazyConformances : 1
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(ProtocolDecl, NominalTypeDecl, 1+1+1+1+1+1+1+2+1+8+16,
+  SWIFT_INLINE_BITFIELD_FULL(ProtocolDecl, NominalTypeDecl, 1+1+1+1+1+1+1+2+1+1+8+16,
     /// Whether the \c RequiresClass bit is valid.
     RequiresClassValid : 1,
 
@@ -538,6 +536,9 @@ protected:
 
     /// Whether we've computed the inherited protocols list yet.
     InheritedProtocolsValid : 1,
+
+    /// Whether we have a lazy-loaded requirement signature.
+    HasLazyRequirementSignature : 1,
 
     : NumPadBits,
 
@@ -4122,6 +4123,10 @@ class ProtocolDecl final : public NominalTypeDecl {
 
   ArrayRef<ProtocolDecl *> getInheritedProtocolsSlow();
 
+  bool hasLazyRequirementSignature() const {
+    return Bits.ProtocolDecl.HasLazyRequirementSignature;
+  }
+
   friend class SuperclassDeclRequest;
   friend class SuperclassTypeRequest;
   friend class RequirementSignatureRequest;
@@ -4357,6 +4362,9 @@ public:
   }
 
   void setRequirementSignature(ArrayRef<Requirement> requirements);
+
+  void setLazyRequirementSignature(LazyMemberLoader *lazyLoader,
+                                   uint64_t requirementSignatureData);
 
 private:
   ArrayRef<Requirement> getCachedRequirementSignature() const;
@@ -4798,7 +4806,7 @@ enum class PropertyWrapperSynthesizedPropertyKind {
   /// wrapper type.
   Backing,
   /// A storage wrapper (e.g., `$foo`), which is a wrapper over the
-  /// wrapper instance's `wrapperValue` property.
+  /// wrapper instance's `projectedValue` property.
   StorageWrapper,
 };
 
@@ -5179,6 +5187,10 @@ public:
   /// generic type, the backing storage property will be the appropriate
   /// bound generic version.
   VarDecl *getPropertyWrapperBackingProperty() const;
+
+  /// Retreive the storage wrapper for a property that has an attached
+  /// property wrapper.
+  VarDecl *getPropertyWrapperStorageWrapper() const;
 
   /// Retrieve the backing storage property for a lazy property.
   VarDecl *getLazyStorageProperty() const;
@@ -5923,8 +5935,13 @@ public:
   /// True if the declaration is forced to be statically dispatched.
   bool hasForcedStaticDispatch() const;
 
-  /// Get the interface type of this decl and remove the Self context.
+  /// Get the type of this declaration without the Self clause.
+  /// Asserts if not in type context.
   Type getMethodInterfaceType() const;
+
+  /// Tests if this is a function returning a DynamicSelfType, or a
+  /// constructor.
+  bool hasDynamicSelfResult() const;
 
   using DeclContext::operator new;
   using Decl::getASTContext;
@@ -5973,7 +5990,6 @@ protected:
       StaticLoc.isValid() || StaticSpelling != StaticSpellingKind::None;
     Bits.FuncDecl.StaticSpelling = static_cast<unsigned>(StaticSpelling);
 
-    Bits.FuncDecl.HasDynamicSelf = false;
     Bits.FuncDecl.ForcedStaticDispatch = false;
     Bits.FuncDecl.SelfAccess =
       static_cast<unsigned>(SelfAccessKind::NonMutating);
@@ -6086,15 +6102,6 @@ public:
   /// This also allows the binary-operator-ness of a func decl to be determined
   /// prior to type checking.
   bool isBinaryOperator() const;
-  
-  /// Determine whether this function has a dynamic \c Self return
-  /// type.
-  bool hasDynamicSelf() const { return Bits.FuncDecl.HasDynamicSelf; }
-
-  /// Set whether this function has a dynamic \c Self return or not.
-  void setDynamicSelf(bool hasDynamicSelf) { 
-    Bits.FuncDecl.HasDynamicSelf = hasDynamicSelf;
-  }
 
   void getLocalCaptures(SmallVectorImpl<CapturedValue> &Result) const {
     return getCaptureInfo().getLocalCaptures(Result);

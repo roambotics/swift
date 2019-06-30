@@ -608,7 +608,7 @@ namespace {
     /// through the 'value' property.
     Wrapper,
     /// We're referencing the backing property for a property with a wrapper
-    /// through the 'wrapperValue' property.
+    /// through the 'projectedValue' property.
     WrapperStorage,
   };
 } // end anonymous namespace
@@ -712,7 +712,7 @@ static Expr *buildStorageReference(AccessorDecl *accessor,
     auto var =
       cast<VarDecl>(accessor->getStorage())->getOriginalWrappedProperty();
     storage = var->getPropertyWrapperBackingProperty();
-    underlyingVars.push_back( var->getAttachedPropertyWrapperTypeInfo(0).wrapperValueVar);
+    underlyingVars.push_back( var->getAttachedPropertyWrapperTypeInfo(0).projectedValueVar);
     semantics = AccessSemantics::DirectToStorage;
     selfAccessKind = SelfAccessorKind::Peer;
     break;
@@ -1618,10 +1618,38 @@ LazyStoragePropertyRequest::evaluate(Evaluator &evaluator,
 }
 
 /// Synthesize a computed property `$foo` for a property with an attached
-/// wrapper that has a `wrapperValue` property.
+/// wrapper that has a `projectedValue` property.
 static VarDecl *synthesizePropertyWrapperStorageWrapperProperty(
     ASTContext &ctx, VarDecl *var, Type wrapperType,
     VarDecl *wrapperVar) {
+  // If the original property has a @_projectedValueProperty attribute, use
+  // that to find the storage wrapper property.
+  if (auto attr = var->getAttrs().getAttribute<ProjectedValuePropertyAttr>()){
+    SmallVector<ValueDecl *, 2> declsFound;
+    auto projectionName = attr->ProjectionPropertyName;
+    auto dc = var->getDeclContext();
+    if (dc->isTypeContext()) {
+      dc->lookupQualified(dc->getSelfNominalTypeDecl(), projectionName,
+                          NL_QualifiedDefault, declsFound);
+    } else if (dc->isModuleScopeContext()) {
+      dc->lookupQualified(dc->getParentModule(), projectionName,
+                          NL_QualifiedDefault, declsFound);
+    } else {
+      llvm_unreachable("Property wrappers don't work in local contexts");
+    }
+
+    if (declsFound.size() == 1 && isa<VarDecl>(declsFound.front())) {
+      auto property = cast<VarDecl>(declsFound.front());
+      property->setOriginalWrappedProperty(var);
+      return property;
+    }
+
+    ctx.Diags.diagnose(attr->getLocation(),
+                       diag::property_wrapper_projection_value_missing,
+                       projectionName);
+    attr->setInvalid();
+  }
+
   // Compute the name of the storage type.
   SmallString<64> nameBuf;
   nameBuf = "$";
@@ -1629,6 +1657,9 @@ static VarDecl *synthesizePropertyWrapperStorageWrapperProperty(
   Identifier name = ctx.getIdentifier(nameBuf);
 
   // Determine the type of the property.
+  if (!wrapperVar->hasInterfaceType()) {
+    static_cast<TypeChecker &>(*ctx.getLazyResolver()).validateDecl(wrapperVar);
+  }
   Type propertyType = wrapperType->getTypeOfMember(
       var->getModuleContext(), wrapperVar,
       wrapperVar->getValueInterfaceType());
@@ -1656,14 +1687,10 @@ static VarDecl *synthesizePropertyWrapperStorageWrapperProperty(
   pbd->setStatic(var->isStatic());
 
   // Determine the access level for the property.
-  AccessLevel access =
-    std::min(AccessLevel::Internal, var->getFormalAccess());
-  property->overwriteAccess(access);
+  property->overwriteAccess(var->getFormalAccess());
 
   // Determine setter access.
-  AccessLevel setterAccess =
-    std::min(AccessLevel::Internal, var->getSetterFormalAccess());
-  property->overwriteSetterAccess(setterAccess);
+  property->overwriteSetterAccess(var->getSetterFormalAccess());
 
   // Add the accessors we need.
   bool hasSetter = wrapperVar->isSettable(nullptr) &&
@@ -1674,6 +1701,9 @@ static VarDecl *synthesizePropertyWrapperStorageWrapperProperty(
     property->overwriteImplInfo(StorageImplInfo::getImmutableComputed());
   addExpectedOpaqueAccessorsToStorage(property, ctx);
 
+  var->getAttrs().add(
+      new (ctx) ProjectedValuePropertyAttr(name, SourceLoc(), SourceRange(),
+                                            /*Implicit=*/true));
   return property;
 }
 
@@ -1709,10 +1739,7 @@ PropertyWrapperBackingPropertyInfoRequest::evaluate(Evaluator &evaluator,
   // Compute the name of the storage type.
   ASTContext &ctx = var->getASTContext();
   SmallString<64> nameBuf;
-  if (wrapperInfo.wrapperValueVar)
-    nameBuf = "$$";
-  else
-    nameBuf = "$";
+  nameBuf = "_";
   nameBuf += var->getName().str();
   Identifier name = ctx.getIdentifier(nameBuf);
 
@@ -1720,6 +1747,12 @@ PropertyWrapperBackingPropertyInfoRequest::evaluate(Evaluator &evaluator,
   auto dc = var->getDeclContext();
   Type storageInterfaceType = wrapperType;
   Type storageType = dc->mapTypeIntoContext(storageInterfaceType);
+
+  if (!var->hasInterfaceType()) {
+    auto &tc = *static_cast<TypeChecker *>(ctx.getLazyResolver());
+    tc.validateDecl(var);
+    assert(var->hasInterfaceType());
+  }
 
   // Make sure that the property type matches the value of the
   // wrapper type.
@@ -1771,9 +1804,6 @@ PropertyWrapperBackingPropertyInfoRequest::evaluate(Evaluator &evaluator,
   if (parentPBD->isInitialized(patternNumber) &&
       !parentPBD->isInitializerChecked(patternNumber)) {
     auto &tc = *static_cast<TypeChecker *>(ctx.getLazyResolver());
-    if (!var->hasType())
-      tc.validateDecl(var);
-
     tc.typeCheckPatternBinding(parentPBD, patternNumber);
   }
 
@@ -1794,12 +1824,12 @@ PropertyWrapperBackingPropertyInfoRequest::evaluate(Evaluator &evaluator,
     pbd->setInitializerChecked(0);
   }
 
-  // If there is a storage wrapper property (wrapperValue) in the wrapper,
+  // If there is a projection property (projectedValue) in the wrapper,
   // synthesize a computed property for '$foo'.
   VarDecl *storageVar = nullptr;
-  if (wrapperInfo.wrapperValueVar) {
+  if (wrapperInfo.projectedValueVar) {
     storageVar = synthesizePropertyWrapperStorageWrapperProperty(
-        ctx, var, storageInterfaceType, wrapperInfo.wrapperValueVar);
+        ctx, var, storageInterfaceType, wrapperInfo.projectedValueVar);
   }
 
   // Get the property wrapper information.
@@ -2194,18 +2224,18 @@ static void maybeAddMemberwiseDefaultArg(ParamDecl *arg, VarDecl *var,
   if (!var->getParentPattern()->getSingleVar())
     return;
 
-  // Determine whether this variable will be 'nil' initialized.
-  bool isNilInitialized =
-    (isa<OptionalType>(var->getValueInterfaceType().getPointer()) &&
-     !var->isParentInitialized()) ||
-    var->getAttrs().hasAttribute<LazyAttr>();
-
   // Whether we have explicit initialization.
   bool isExplicitlyInitialized = var->isParentInitialized();
 
-  // If this is neither nil-initialized nor explicitly initialized, don't add
-  // anything.
-  if (!isNilInitialized && !isExplicitlyInitialized)
+  // Whether we can default-initialize this property.
+  auto binding = var->getParentPatternBinding();
+  bool isDefaultInitializable =
+      var->getAttrs().hasAttribute<LazyAttr>() ||
+      (binding && binding->isDefaultInitializable());
+
+  // If this is neither explicitly initialized nor
+  // default-initializable, don't add anything.
+  if (!isExplicitlyInitialized && !isDefaultInitializable)
     return;
 
   // We can add a default value now.
@@ -2221,13 +2251,15 @@ static void maybeAddMemberwiseDefaultArg(ParamDecl *arg, VarDecl *var,
   // default arg. All lazy variables return a nil literal as well. *Note* that
   // the type will always be a sugared T? because we don't default init an
   // explicit Optional<T>.
+  bool isNilInitialized =
+    var->getAttrs().hasAttribute<LazyAttr>() ||
+    (!isExplicitlyInitialized && isDefaultInitializable &&
+     var->getValueInterfaceType()->getAnyNominal() == ctx.getOptionalDecl() &&
+     !var->getAttachedPropertyWrapperTypeInfo(0).defaultInit);
   if (isNilInitialized) {
     arg->setDefaultArgumentKind(DefaultArgumentKind::NilLiteral);
     return;
   }
-
- // Explicitly initialize.
- assert(isExplicitlyInitialized);
 
   // If there's a backing storage property, the memberwise initializer
   // will be in terms of that.

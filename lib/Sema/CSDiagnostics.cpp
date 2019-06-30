@@ -304,8 +304,7 @@ ProtocolConformance *RequirementFailure::getConformanceForConditionalReq(
     return nullptr;
   }
 
-  auto *typeReqLoc = cs.getConstraintLocator(getRawAnchor(), path.drop_back(),
-                                             /*summaryFlags=*/0);
+  auto *typeReqLoc = getConstraintLocator(getRawAnchor(), path.drop_back());
 
   auto result = llvm::find_if(
       cs.CheckedConformances,
@@ -1926,8 +1925,7 @@ bool MissingCallFailure::diagnoseAsError() {
 
     case ConstraintLocator::AutoclosureResult: {
       auto &cs = getConstraintSystem();
-      auto loc = cs.getConstraintLocator(getRawAnchor(), path.drop_back(),
-                                         /*summaryFlags=*/0);
+      auto loc = getConstraintLocator(getRawAnchor(), path.drop_back());
       AutoClosureForwardingFailure failure(cs, loc);
       return failure.diagnoseAsError();
     }
@@ -1975,11 +1973,39 @@ bool MissingCallFailure::diagnoseAsError() {
   return true;
 }
 
+bool ExtraneousPropertyWrapperUnwrapFailure::diagnoseAsError() {
+  auto loc = getAnchor()->getLoc();
+  auto newPrefix = usingStorageWrapper() ? "$" : "_";
+
+  if (auto *member = getReferencedMember()) {
+    emitDiagnostic(loc, diag::incorrect_property_wrapper_reference_member,
+                   member->getDescriptiveKind(), member->getFullName(), false,
+                   getToType())
+        .fixItInsert(loc, newPrefix);
+    return true;
+  }
+
+  emitDiagnostic(loc, diag::incorrect_property_wrapper_reference,
+                 getPropertyName(), getFromType(), getToType(), false)
+      .fixItInsert(loc, newPrefix);
+  return true;
+}
+
 bool MissingPropertyWrapperUnwrapFailure::diagnoseAsError() {
-  emitDiagnostic(getAnchor()->getLoc(),
-                 diag::extraneous_property_wrapper_unwrap, getPropertyName(),
-                 getFromType(), getToType())
-      .fixItInsert(getAnchor()->getLoc(), "$");
+  auto loc = getAnchor()->getLoc();
+  auto endLoc = getAnchor()->getLoc().getAdvancedLoc(1);
+
+  if (auto *member = getReferencedMember()) {
+    emitDiagnostic(loc, diag::incorrect_property_wrapper_reference_member,
+                   member->getDescriptiveKind(), member->getFullName(), true,
+                   getToType())
+        .fixItRemoveChars(loc, endLoc);
+    return true;
+  }
+
+  emitDiagnostic(loc, diag::incorrect_property_wrapper_reference,
+                 getPropertyName(), getFromType(), getToType(), true)
+      .fixItRemoveChars(loc, endLoc);
   return true;
 }
 
@@ -2000,26 +2026,27 @@ bool SubscriptMisuseFailure::diagnoseAsError() {
 
   diag.highlight(memberRange).highlight(nameLoc.getSourceRange());
 
-  auto *parentExpr = findParentExpr(memberExpr);
-  assert(parentExpr && "Couldn't find a parent expression for a member call?!");
+  if (auto *parentExpr = dyn_cast_or_null<ApplyExpr>(findParentExpr(memberExpr))) {
+    auto *argExpr = parentExpr->getArg();
 
-  auto *argExpr = cast<ApplyExpr>(parentExpr)->getArg();
+    auto toCharSourceRange = Lexer::getCharSourceRangeFromSourceRange;
+    auto lastArgSymbol = toCharSourceRange(sourceMgr, argExpr->getEndLoc());
 
-  auto toCharSourceRange = Lexer::getCharSourceRangeFromSourceRange;
-  auto lastArgSymbol = toCharSourceRange(sourceMgr, argExpr->getEndLoc());
+    diag.fixItReplace(SourceRange(argExpr->getStartLoc()),
+                      getTokenText(tok::l_square));
+    diag.fixItRemove(nameLoc.getSourceRange());
+    diag.fixItRemove(SourceRange(memberExpr->getDotLoc()));
 
-  diag.fixItReplace(SourceRange(argExpr->getStartLoc()),
-                    getTokenText(tok::l_square));
-  diag.fixItRemove(nameLoc.getSourceRange());
-  diag.fixItRemove(SourceRange(memberExpr->getDotLoc()));
-
-  if (sourceMgr.extractText(lastArgSymbol) == getTokenText(tok::r_paren))
-    diag.fixItReplace(SourceRange(argExpr->getEndLoc()),
-                      getTokenText(tok::r_square));
-  else
-    diag.fixItInsertAfter(argExpr->getEndLoc(), getTokenText(tok::r_square));
-
+    if (sourceMgr.extractText(lastArgSymbol) == getTokenText(tok::r_paren))
+      diag.fixItReplace(SourceRange(argExpr->getEndLoc()),
+                        getTokenText(tok::r_square));
+    else
+      diag.fixItInsertAfter(argExpr->getEndLoc(), getTokenText(tok::r_square));
+  } else {
+    diag.fixItReplace(SourceRange(memberExpr->getDotLoc(), memberExpr->getLoc()), "[<#index#>]");
+  }
   diag.flush();
+
   if (auto overload = getOverloadChoiceIfAvailable(getLocator())) {
     emitDiagnostic(overload->choice.getDecl(), diag::kind_declared_here,
                    DescriptiveDeclKind::Subscript);

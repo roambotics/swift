@@ -2510,6 +2510,17 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
         S.addTypeRef(theAttr->getTypeLoc().getType()));
       return;
     }
+
+    case DAK_ProjectedValueProperty: {
+      auto abbrCode =
+          S.DeclTypeAbbrCodes[ProjectedValuePropertyDeclAttrLayout::Code];
+      auto theAttr = cast<ProjectedValuePropertyAttr>(DA);
+      ProjectedValuePropertyDeclAttrLayout::emitRecord(
+        S.Out, S.ScratchRecord, abbrCode, theAttr->isImplicit(),
+        S.addDeclBaseNameRef(theAttr->ProjectionPropertyName));
+      break;
+    }
+
     }
   }
 
@@ -3269,11 +3280,27 @@ public:
 
     auto contextID = S.addDeclContextRef(proto->getDeclContext());
 
-    SmallVector<DeclID, 8> inherited;
+    SmallVector<TypeID, 4> inheritedAndDependencyTypes;
+    llvm::SmallSetVector<Type, 4> dependencyTypes;
+
     for (auto element : proto->getInherited()) {
       assert(!element.getType()->hasArchetype());
-      inherited.push_back(S.addTypeRef(element.getType()));
+      inheritedAndDependencyTypes.push_back(S.addTypeRef(element.getType()));
+      if (element.getType()->is<ProtocolType>())
+        dependencyTypes.insert(element.getType());
     }
+
+    for (Requirement req : proto->getRequirementSignature()) {
+      // Requirements can be cyclic, so for now filter out any requirements
+      // from elsewhere in the module. This isn't perfect---something else in
+      // the module could very well fail to compile for its own reasons---but
+      // it's better than nothing.
+      collectDependenciesFromRequirement(dependencyTypes, req,
+                                         /*excluding*/S.M);
+    }
+
+    for (Type ty : dependencyTypes)
+      inheritedAndDependencyTypes.push_back(S.addTypeRef(ty));
 
     uint8_t rawAccessLevel = getRawStableAccessLevel(proto->getFormalAccess());
 
@@ -3287,10 +3314,8 @@ public:
                                proto->isObjC(),
                                proto->existentialTypeSupported(
                                  /*resolver=*/nullptr),
-                               S.addGenericEnvironmentRef(
-                                                proto->getGenericEnvironment()),
-                               rawAccessLevel,
-                               inherited);
+                               rawAccessLevel, proto->getInherited().size(),
+                               inheritedAndDependencyTypes);
 
     const_cast<ProtocolDecl*>(proto)->createGenericParamsIfMissing();
     writeGenericParams(proto->getGenericParams());
@@ -3426,7 +3451,6 @@ public:
                            fn->isObjC(),
                            uint8_t(
                              getStableSelfAccessKind(fn->getSelfAccessKind())),
-                           fn->hasDynamicSelf(),
                            fn->hasForcedStaticDispatch(),
                            fn->hasThrows(),
                            S.addGenericEnvironmentRef(
@@ -3503,7 +3527,6 @@ public:
                                fn->isObjC(),
                                uint8_t(getStableSelfAccessKind(
                                                   fn->getSelfAccessKind())),
-                               fn->hasDynamicSelf(),
                                fn->hasForcedStaticDispatch(),
                                fn->hasThrows(),
                                S.addGenericEnvironmentRef(
