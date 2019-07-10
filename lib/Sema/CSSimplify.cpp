@@ -2078,40 +2078,75 @@ static ConstraintFix *fixRequirementFailure(ConstraintSystem &cs, Type type1,
 }
 
 static ConstraintFix *fixPropertyWrapperFailure(
-    ConstraintSystem &cs, Type baseTy, Expr *anchor, ConstraintLocator *locator,
+    ConstraintSystem &cs, Type baseTy, ConstraintLocator *locator,
     llvm::function_ref<bool(ResolvedOverloadSetListItem *, VarDecl *, Type)>
         attemptFix,
     Optional<Type> toType = None) {
-  auto resolvedOverload = cs.findSelectedOverloadFor(anchor);
+
+  Expr *baseExpr = nullptr;
+  if (auto *anchor = locator->getAnchor()) {
+    if (auto *UDE = dyn_cast<UnresolvedDotExpr>(anchor))
+      baseExpr = UDE->getBase();
+    else if (auto *SE = dyn_cast<SubscriptExpr>(anchor))
+      baseExpr = SE->getBase();
+    else if (auto *MRE = dyn_cast<MemberRefExpr>(anchor))
+      baseExpr = MRE->getBase();
+    else if (auto *anchor = simplifyLocatorToAnchor(cs, locator))
+      baseExpr = anchor;
+  }
+
+  if (!baseExpr)
+    return nullptr;
+
+  auto resolvedOverload = cs.findSelectedOverloadFor(baseExpr);
   if (!resolvedOverload)
     return nullptr;
 
-  if (auto storageWrapper =
-          cs.getStorageWrapperInformation(resolvedOverload)) {
-    if (attemptFix(resolvedOverload, storageWrapper->first,
-                    storageWrapper->second))
-      return UsePropertyWrapper::create(
-          cs, storageWrapper->first,
-          /*usingStorageWrapper=*/true, baseTy,
-          toType.getValueOr(storageWrapper->second), locator);
+  enum class Fix : uint8_t {
+    StorageWrapper,
+    PropertyWrapper,
+    WrappedValue,
+  };
+
+  auto applyFix = [&](Fix fix, VarDecl *decl, Type type) -> ConstraintFix * {
+    if (!decl->hasValidSignature() || !type)
+      return nullptr;
+
+    if (!attemptFix(resolvedOverload, decl, type))
+      return nullptr;
+
+    switch (fix) {
+    case Fix::StorageWrapper:
+    case Fix::PropertyWrapper:
+      return UsePropertyWrapper::create(cs, decl, fix == Fix::StorageWrapper,
+                                        baseTy, toType.getValueOr(type),
+                                        locator);
+
+    case Fix::WrappedValue:
+      return UseWrappedValue::create(cs, decl, baseTy, toType.getValueOr(type),
+                                     locator);
+    }
+  };
+
+  if (auto storageWrapper = cs.getStorageWrapperInformation(resolvedOverload)) {
+    if (auto *fix = applyFix(Fix::StorageWrapper, storageWrapper->first,
+                             storageWrapper->second))
+      return fix;
   }
 
   if (auto wrapper = cs.getPropertyWrapperInformation(resolvedOverload)) {
-    if (attemptFix(resolvedOverload, wrapper->first, wrapper->second))
-      return UsePropertyWrapper::create(
-          cs, wrapper->first,
-          /*usingStorageWrappeer=*/false, baseTy,
-          toType.getValueOr(wrapper->second), locator);
+    if (auto *fix =
+            applyFix(Fix::PropertyWrapper, wrapper->first, wrapper->second))
+      return fix;
   }
 
   if (auto wrappedProperty =
           cs.getWrappedPropertyInformation(resolvedOverload)) {
-    if (attemptFix(resolvedOverload, wrappedProperty->first,
-                    wrappedProperty->second))
-      return UseWrappedValue::create(
-          cs, wrappedProperty->first, baseTy,
-          toType.getValueOr(wrappedProperty->second), locator);
+    if (auto *fix = applyFix(Fix::WrappedValue, wrappedProperty->first,
+                             wrappedProperty->second))
+      return fix;
   }
+
   return nullptr;
 }
 
@@ -2235,15 +2270,18 @@ bool ConstraintSystem::repairFailures(
     if (elt.getKind() != ConstraintLocator::ApplyArgToParam)
       break;
 
-    auto anchor = simplifyLocatorToAnchor(*this, loc);
-
     if (auto *fix = fixPropertyWrapperFailure(
-            *this, lhs, anchor, loc,
+            *this, lhs, loc,
             [&](ResolvedOverloadSetListItem *overload, VarDecl *decl,
                 Type newBase) {
-              return matchTypes(newBase, rhs, ConstraintKind::Subtype,
-                                TypeMatchFlags::TMF_ApplyingFix,
-                                overload->Locator)
+              // FIXME: There is currently no easy way to avoid attempting
+              // fixes, matchTypes do not propagate `TMF_ApplyingFix` flag.
+              llvm::SaveAndRestore<ConstraintSystemOptions> options(
+                  Options, Options - ConstraintSystemFlags::AllowFixes);
+
+              TypeMatchOptions flags;
+              return matchTypes(newBase, rhs, ConstraintKind::Subtype, flags,
+                                getConstraintLocator(locator))
                   .isSuccess();
             },
             rhs)) {
@@ -3968,6 +4006,19 @@ bool swift::hasDynamicMemberLookupAttribute(Type type) {
   return ::hasDynamicMemberLookupAttribute(type, DynamicMemberLookupCache);
 }
 
+static bool isForKeyPathSubscript(ConstraintSystem &cs,
+                                  ConstraintLocator *locator) {
+  if (!locator || !locator->getAnchor())
+    return false;
+
+  if (auto *SE = dyn_cast<SubscriptExpr>(locator->getAnchor())) {
+    auto *indexExpr = dyn_cast<TupleExpr>(SE->getIndex());
+    return indexExpr && indexExpr->getNumElements() == 1 &&
+           indexExpr->getElementName(0) == cs.getASTContext().Id_keyPath;
+  }
+  return false;
+}
+
 /// Given a ValueMember, UnresolvedValueMember, or TypeMember constraint,
 /// perform a lookup into the specified base type to find a candidate list.
 /// The list returned includes the viable candidates as well as the unviable
@@ -3999,14 +4050,7 @@ performMemberLookup(ConstraintKind constraintKind, DeclName memberName,
   MemberLookupResult result;
   result.OverallResult = MemberLookupResult::HasResults;
 
-  // If we're looking for a subscript, consider key path operations.
-  //
-  // TODO: This logic needs to be refactored to make sure that implicit
-  // keypath result is only introduced when it makes sense e.g. if there
-  // is a single argument with `keypath:` label or `\.` syntax is used.
-  if (memberName.isSimpleName() &&
-      memberName.getBaseName().getKind() == DeclBaseName::Kind::Subscript &&
-      !(memberLocator && memberLocator->isForKeyPathDynamicMemberLookup())) {
+  if (isForKeyPathSubscript(*this, memberLocator)) {
     if (baseTy->isAnyObject()) {
       result.addUnviable(
           OverloadChoice(baseTy, OverloadChoiceKind::KeyPathApplication),
@@ -4214,9 +4258,9 @@ performMemberLookup(ConstraintKind constraintKind, DeclName memberName,
 
     // See if we have an instance method, instance member or static method,
     // and check if it can be accessed on our base type.
+
     if (decl->isInstanceMember()) {
-      if ((isa<FuncDecl>(decl) && !hasInstanceMethods) ||
-          (!isa<FuncDecl>(decl) && !hasInstanceMembers)) {
+      if (baseObjTy->is<AnyMetatypeType>()) {
         // `AnyObject` has special semantics, so let's just let it be.
         // Otherwise adjust base type and reference kind to make it
         // look as if lookup was done on the instance, that helps
@@ -4225,8 +4269,20 @@ performMemberLookup(ConstraintKind constraintKind, DeclName memberName,
                           ? candidate
                           : OverloadChoice(instanceTy, decl,
                                            FunctionRefKind::SingleApply);
+        // If this is an instance member referenced from metatype
+        // let's add unviable result to the set because it could be
+        // either curried reference or an  invalid call.
+        //
+        // New candidate shouldn't affect performance because such
+        // choice would only be attempted when solver is in diagnostic mode.
         result.addUnviable(choice, MemberLookupResult::UR_InstanceMemberOnType);
-        return;
+
+        bool invalidMethodRef = isa<FuncDecl>(decl) && !hasInstanceMethods;
+        bool invalidMemberRef = !isa<FuncDecl>(decl) && !hasInstanceMembers;
+        // If this is definitely an invalid way to reference a method or member
+        // on the metatype, let's stop here.
+        if (invalidMethodRef || invalidMemberRef)
+          return;
       }
 
     // If the underlying type of a typealias is fully concrete, it is legal
@@ -4694,7 +4750,8 @@ fixMemberRef(ConstraintSystem &cs, Type baseTy,
 
     case MemberLookupResult::UR_Inaccessible:
       assert(choice.isDecl());
-      return AllowInaccessibleMember::create(cs, choice.getDecl(), locator);
+      return AllowInaccessibleMember::create(cs, baseTy, choice.getDecl(),
+                                             memberName, locator);
 
     case MemberLookupResult::UR_UnavailableInExistential: {
       return choice.isDecl()
@@ -4704,7 +4761,13 @@ fixMemberRef(ConstraintSystem &cs, Type baseTy,
     }
 
     case MemberLookupResult::UR_MutatingMemberOnRValue:
-    case MemberLookupResult::UR_MutatingGetterOnRValue:
+    case MemberLookupResult::UR_MutatingGetterOnRValue: {
+      return choice.isDecl()
+                 ? AllowMutatingMemberOnRValueBase::create(
+                       cs, baseTy, choice.getDecl(), memberName, locator)
+                 : nullptr;
+    }
+
     case MemberLookupResult::UR_LabelMismatch:
     // TODO(diagnostics): Add a new fix that is suggests to
     // add `subscript(dynamicMember: {Writable}KeyPath<T, U>)`
@@ -4739,17 +4802,21 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyMemberConstraint(
       performMemberLookup(kind, member, baseTy, functionRefKind, locator,
                           /*includeInaccessibleMembers*/ shouldAttemptFixes());
 
-  switch (result.OverallResult) {
-  case MemberLookupResult::Unsolved:
+  auto formUnsolved = [&] {
     // If requested, generate a constraint.
     if (flags.contains(TMF_GenerateConstraints)) {
-      addUnsolvedConstraint(
-        Constraint::createMemberOrOuterDisjunction(*this, kind, baseTy, memberTy, member, useDC,
-                                                   functionRefKind, outerAlternatives, locator));
+      addUnsolvedConstraint(Constraint::createMemberOrOuterDisjunction(
+          *this, kind, baseTy, memberTy, member, useDC, functionRefKind,
+          outerAlternatives, locator));
       return SolutionKind::Solved;
     }
 
     return SolutionKind::Unsolved;
+  };
+
+  switch (result.OverallResult) {
+  case MemberLookupResult::Unsolved:
+    return formUnsolved();
 
   case MemberLookupResult::ErrorAlreadyDiagnosed:
     return SolutionKind::Error;
@@ -4762,6 +4829,18 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyMemberConstraint(
   SmallVector<Constraint *, 4> candidates;
   // If we found viable candidates, then we're done!
   if (!result.ViableCandidates.empty()) {
+    // If only possible choice to refer to member is via keypath
+    // dynamic member dispatch, let's delay solving this constraint
+    // until constraint generation phase is complete, because
+    // subscript dispatch relies on presence of function application.
+    if (result.ViableCandidates.size() == 1) {
+      auto &choice = result.ViableCandidates.front();
+      if (!solverState && choice.isKeyPathDynamicMemberLookup() &&
+          member.getBaseName().isSubscript()) {
+        return formUnsolved();
+      }
+    }
+
     generateConstraints(
         candidates, memberTy, result.ViableCandidates, useDC, locator,
         result.getFavoredIndex(), /*requiresFix=*/false,
@@ -4868,19 +4947,15 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyMemberConstraint(
     // Check if any property wrappers on the base of the member lookup have
     // matching members that we can fall back to, or if the type wraps any
     // properties that have matching members.
-    if (auto dotExpr =
-            dyn_cast_or_null<UnresolvedDotExpr>(locator->getAnchor())) {
-      auto baseExpr = dotExpr->getBase();
-      if (auto *fix = fixPropertyWrapperFailure(
-              *this, baseTy, baseExpr, locator,
-              [&](ResolvedOverloadSetListItem *overload, VarDecl *decl,
-                  Type newBase) {
-                return solveWithNewBaseOrName(newBase, member,
-                                              /*allowFixes=*/false) ==
-                       SolutionKind::Solved;
-              })) {
-        return recordFix(fix) ? SolutionKind::Error : SolutionKind::Solved;
-      }
+    if (auto *fix = fixPropertyWrapperFailure(
+            *this, baseTy, locator,
+            [&](ResolvedOverloadSetListItem *overload, VarDecl *decl,
+                Type newBase) {
+              return solveWithNewBaseOrName(newBase, member,
+                                            /*allowFixes=*/false) ==
+                     SolutionKind::Solved;
+            })) {
+      return recordFix(fix) ? SolutionKind::Error : SolutionKind::Solved;
     }
 
     if (auto *funcType = baseTy->getAs<FunctionType>()) {
@@ -5838,7 +5913,11 @@ retry_after_fail:
     }
 
     // FIXME: Could also rewrite fnType to include this result type.
-    addConstraint(ConstraintKind::Bind, argFnType->getResult(),
+    // Introduction of `Bind` constraint here could result in the disconnect
+    // in the constraint system with unintended consequences because e.g.
+    // in case of key path application it could disconnect one of the
+    // components like subscript from the rest of the context.
+    addConstraint(ConstraintKind::Equal, argFnType->getResult(),
                   commonResultType, locator);
   }
 
@@ -6856,6 +6935,7 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyFixConstraint(
   case FixKind::AllowInvalidRefInKeyPath:
   case FixKind::ExplicitlySpecifyGenericArguments:
   case FixKind::GenericArgumentsMismatch:
+  case FixKind::AllowMutatingMemberOnRValueBase:
     llvm_unreachable("handled elsewhere");
   }
 

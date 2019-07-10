@@ -428,7 +428,7 @@ namespace {
                         ConformanceCheckFlags::InExpression);
             if (conformance && conformance->isConcrete()) {
               if (auto witness =
-                      conformance->getConcrete()->getWitnessDecl(decl, &tc)) {
+                      conformance->getConcrete()->getWitnessDecl(decl)) {
                 // Hack up an AST that we can type-check (independently) to get
                 // it into the right form.
                 // FIXME: the hop through 'getDecl()' is because
@@ -1068,6 +1068,10 @@ namespace {
     /// \param locator The locator for the original expression.
     Expr *finishApply(ApplyExpr *apply, Type openedType,
                       ConstraintLocatorBuilder locator);
+
+    // Resolve @dynamicCallable applications.
+    Expr *finishApplyDynamicCallable(const Solution &solution, ApplyExpr *apply,
+                                     ConstraintLocatorBuilder locator);
 
   private:
     /// Simplify the given type by substituting all occurrences of
@@ -1975,9 +1979,6 @@ namespace {
     }
 
     Expr *handleStringLiteralExpr(LiteralExpr *expr) {
-      if (cs.getType(expr) && !cs.getType(expr)->hasTypeVariable())
-        return expr;
-      
       auto stringLiteral = dyn_cast<StringLiteralExpr>(expr);
       auto magicLiteral = dyn_cast<MagicIdentifierLiteralExpr>(expr);
       assert(bool(stringLiteral) != bool(magicLiteral) &&
@@ -5795,8 +5796,6 @@ maybeDiagnoseUnsupportedFunctionConversion(ConstraintSystem &cs, Expr *expr,
       } else if (fn->getGenericParams()) {
         tc.diagnose(expr->getLoc(),
                     diag::c_function_pointer_from_generic_function);
-      } else {
-        tc.maybeDiagnoseCaptures(expr, fn);
       }
     };
     
@@ -5817,10 +5816,8 @@ maybeDiagnoseUnsupportedFunctionConversion(ConstraintSystem &cs, Expr *expr,
       semanticExpr = capture->getClosureBody();
     
     // Can convert a literal closure that doesn't capture context.
-    if (auto closure = dyn_cast<ClosureExpr>(semanticExpr)) {
-      tc.maybeDiagnoseCaptures(expr, closure);
+    if (auto closure = dyn_cast<ClosureExpr>(semanticExpr))
       return;
-    }
     
     tc.diagnose(expr->getLoc(),
                 diag::invalid_c_function_pointer_conversion_expr);
@@ -6795,10 +6792,10 @@ Expr *ExprRewriter::convertLiteralInPlace(Expr *literal,
 }
 
 // Resolve @dynamicCallable applications.
-static Expr *finishApplyDynamicCallable(ConstraintSystem &cs,
-                                        const Solution &solution,
-                                        ApplyExpr *apply,
-                                        ConstraintLocatorBuilder locator) {
+Expr *
+ExprRewriter::finishApplyDynamicCallable(const Solution &solution,
+                                         ApplyExpr *apply,
+                                         ConstraintLocatorBuilder locator) {
   auto &ctx = cs.getASTContext();
   auto *fn = apply->getFn();
 
@@ -6810,12 +6807,14 @@ static Expr *finishApplyDynamicCallable(ConstraintSystem &cs,
   auto loc = locator.withPathElement(ConstraintLocator::ApplyFunction);
   auto selected = solution.getOverloadChoice(cs.getConstraintLocator(loc));
   auto *method = dyn_cast<FuncDecl>(selected.choice.getDecl());
-  auto methodType = selected.openedType->castTo<AnyFunctionType>();
+  auto methodType = simplifyType(selected.openedType)->castTo<AnyFunctionType>();
   assert(method->getName() == ctx.Id_dynamicallyCall &&
          "Expected 'dynamicallyCall' method");
-  assert(methodType->getParams().size() == 1 &&
+  auto params = methodType->getParams();
+  assert(params.size() == 1 &&
          "Expected 'dynamicallyCall' method with one parameter");
-  auto argumentLabel = methodType->getParams()[0].getLabel();
+  auto argumentType = params[0].getParameterType();
+  auto argumentLabel = params[0].getLabel();
   assert((argumentLabel == ctx.Id_withArguments ||
           argumentLabel == ctx.Id_withKeywordArguments) &&
          "Expected 'dynamicallyCall' method argument label 'withArguments' or "
@@ -6825,11 +6824,15 @@ static Expr *finishApplyDynamicCallable(ConstraintSystem &cs,
   // `withKeywordArguments` method.
   bool useKwargsMethod = argumentLabel == ctx.Id_withKeywordArguments;
 
-  // Construct expression referencing the `dynamicallyCall` method.
-  Expr *member =
-    new (ctx) MemberRefExpr(fn, fn->getEndLoc(), ConcreteDeclRef(method),
-                            DeclNameLoc(method->getNameLoc()),
-                            /*Implicit*/ true);
+  // Construct expression referencing the `dynamicallyCall` method.	
+  bool isDynamic =
+      selected.choice.getKind() == OverloadChoiceKind::DeclViaDynamic;
+  auto member = buildMemberRef(fn, selected.openedFullType,
+                               SourceLoc(), selected.choice,
+                               DeclNameLoc(method->getNameLoc()),
+                               selected.openedType, loc, loc, /*implicit*/ true,
+                               selected.choice.getFunctionRefKind(),
+                               AccessSemantics::Ordinary, isDynamic);
 
   // Construct argument to the method (either an array or dictionary
   // expression).
@@ -6837,7 +6840,17 @@ static Expr *finishApplyDynamicCallable(ConstraintSystem &cs,
   if (!useKwargsMethod) {
     argument = ArrayExpr::create(ctx, SourceLoc(), arg->getElements(),
                                  {}, SourceLoc());
+    cs.setType(argument, argumentType);
+    finishArrayExpr(cast<ArrayExpr>(argument));
   } else {
+    auto dictLitProto =
+        ctx.getProtocol(KnownProtocolKind::ExpressibleByDictionaryLiteral);
+    auto conformance =
+        cs.TC.conformsToProtocol(argumentType, dictLitProto, cs.DC,
+                                 ConformanceCheckFlags::InExpression);
+    auto keyType = conformance->getTypeWitnessByName(argumentType, ctx.Id_Key);
+    auto valueType = conformance->getTypeWitnessByName(argumentType,
+                                                       ctx.Id_Value);
     SmallVector<Identifier, 4> names;
     SmallVector<Expr *, 4> dictElements;
     for (unsigned i = 0, n = arg->getNumElements(); i < n; i++) {
@@ -6845,19 +6858,28 @@ static Expr *finishApplyDynamicCallable(ConstraintSystem &cs,
         new (ctx) StringLiteralExpr(arg->getElementName(i).get(),
                                     arg->getElementNameLoc(i),
                                     /*Implicit*/ true);
+      cs.setType(labelExpr, keyType);
+      handleStringLiteralExpr(cast<LiteralExpr>(labelExpr));
+
       Expr *pair =
         TupleExpr::createImplicit(ctx, { labelExpr, arg->getElement(i) }, {});
+      auto eltTypes = { TupleTypeElt(keyType), TupleTypeElt(valueType) };
+      cs.setType(pair, TupleType::get(eltTypes, ctx));
       dictElements.push_back(pair);
     }
     argument = DictionaryExpr::create(ctx, SourceLoc(), dictElements, {},
                                       SourceLoc());
+    cs.setType(argument, argumentType);
+    finishDictionaryExpr(cast<DictionaryExpr>(argument));
   }
   argument->setImplicit();
 
   // Construct call to the `dynamicallyCall` method.
-  Expr *result = CallExpr::createImplicit(ctx, member, argument,
-                                          { argumentLabel });
-  cs.TC.typeCheckExpression(result, cs.DC);
+  auto result = CallExpr::createImplicit(ctx, member, argument,
+                                         { argumentLabel });
+  cs.setType(result->getArg(), AnyFunctionType::composeInput(ctx, params,
+                                                             false));
+  cs.setType(result, methodType->getResult());
   cs.cacheExprTypes(result);
   return result;
 }
@@ -7155,7 +7177,7 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
 
   // Handle @dynamicCallable applications.
   // At this point, all other ApplyExpr cases have been handled.
-  return finishApplyDynamicCallable(cs, solution, apply, locator);
+  return finishApplyDynamicCallable(solution, apply, locator);
 }
 
 

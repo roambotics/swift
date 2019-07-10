@@ -436,7 +436,7 @@ namespace {
       }
       assert(props.isFixedABI() && "unsupported combination for now");
       if (props.isTrivial()) {
-        return asImpl().handleTrivial(type);
+        return asImpl().handleTrivial(type, props);
       }
       return asImpl().handleNonTrivialAggregate(type, props);
     }
@@ -1532,8 +1532,10 @@ TypeConverter::getTypeLowering(AbstractionPattern origType,
 
   if (prev == nullptr)
     insert(key, lowering);
-  else
+  else {
     prev->NextExpansion = lowering;
+    assert(prev->isResilient() == lowering->isResilient());
+  }
 
   return *lowering;
 }
@@ -1680,9 +1682,10 @@ TypeConverter::getTypeLoweringForLoweredType(TypeKey key,
                        forExpansion,
                        key.isDependent()).visit(key.SubstType);
 
-  if (prev)
+  if (prev) {
     prev->NextExpansion = lowering;
-  else
+    assert(prev->isResilient() == lowering->isResilient());
+  } else
     insert(key, lowering);
   return *lowering;
 }
@@ -2686,4 +2689,23 @@ unsigned TypeConverter::countNumberOfFields(SILType Ty,
   countNumberOfInnerFields(fieldsCount, M, Ty, expansion);
   TypeFields[key] = fieldsCount;
   return std::max(fieldsCount, 1U);
+}
+
+void TypeLowering::print(llvm::raw_ostream &os) const {
+  auto BOOL = [&](bool b) -> StringRef {
+    if (b)
+      return "true";
+    return "false";
+  };
+  os << "Type Lowering for lowered type: " << LoweredType << ".\n"
+     << "Expansion: " << ResilienceExpansion(ForExpansion) << "\n"
+     << "isTrivial: " << BOOL(Properties.isTrivial()) << ".\n"
+     << "isFixedABI: " << BOOL(Properties.isFixedABI()) << ".\n"
+     << "isAddressOnly: " << BOOL(Properties.isAddressOnly()) << ".\n"
+     << "isResilient: " << BOOL(Properties.isResilient()) << ".\n"
+     << "\n";
+}
+
+void TypeLowering::dump() const {
+  print(llvm::dbgs());
 }

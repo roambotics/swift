@@ -1835,6 +1835,7 @@ public:
 
   void failed(StringRef ErrDescription) override;
 
+  void setCompletionKind(UIdent kind) override;
   bool handleResult(const CodeCompletionInfo &Info) override;
 };
 } // end anonymous namespace
@@ -1851,6 +1852,11 @@ static sourcekitd_response_t codeComplete(llvm::MemoryBuffer *InputBuf,
 
 void SKCodeCompletionConsumer::failed(StringRef ErrDescription) {
   ErrorDescription = ErrDescription;
+}
+
+void SKCodeCompletionConsumer::setCompletionKind(UIdent kind) {
+  assert(kind.isValid());
+  RespBuilder.getDictionary().set(KeyKind, kind);
 }
 
 bool SKCodeCompletionConsumer::handleResult(const CodeCompletionInfo &R) {
@@ -2651,8 +2657,7 @@ void serializeSyntaxTreeAsByteTree(
     ResponseBuilder::Dictionary &Dict) {
   auto StartClock = clock();
   // Serialize the syntax tree as a ByteTree
-  swift::ExponentialGrowthAppendingBinaryByteStream Stream(
-      llvm::support::endianness::little);
+  auto Stream = swift::ExponentialGrowthAppendingBinaryByteStream();
   Stream.reserve(32 * 1024);
   std::map<void *, void *> UserInfo;
   UserInfo[swift::byteTree::UserInfoKeyReusedNodeIds] = &ReusedNodeIds;

@@ -870,6 +870,22 @@ struct SR_10899_Usage {
   @SR_10899_Wrapper var thing: Bool // expected-error{{property type 'Bool' does not match that of the 'wrappedValue' property of its wrapper type 'SR_10899_Wrapper'}}
 }
 
+// SR-11061 / rdar://problem/52593304 assertion with DeclContext mismatches
+class SomeValue {
+	@SomeA(closure: { $0 }) var some: Int = 100
+}
+
+@propertyWrapper
+struct SomeA<T> {
+	var wrappedValue: T
+	let closure: (T) -> (T)
+
+	init(initialValue: T, closure: @escaping (T) -> (T)) {
+		self.wrappedValue = initialValue
+		self.closure = closure
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Property wrapper composition
 // ---------------------------------------------------------------------------
@@ -932,13 +948,28 @@ struct TestComposition {
 // Missing Property Wrapper Unwrap Diagnostics
 // ---------------------------------------------------------------------------
 @propertyWrapper
-struct Foo<T> {
+struct Foo<T> { // expected-note {{arguments to generic parameter 'T' ('W' and 'Int') are expected to be equal}}
   var wrappedValue: T
 
   var prop: Int = 42
 
   func foo() {}
   func bar(x: Int) {}
+
+  subscript(q: String) -> Int {
+    get { return 42 }
+    set { }
+  }
+
+  subscript(x x: Int) -> Int {
+    get { return 42 }
+    set { }
+  }
+
+  subscript(q q: String, a: Int) -> Bool {
+    get { return false }
+    set { }
+  }
 }
 
 @propertyWrapper
@@ -987,6 +1018,7 @@ struct MissingPropertyWrapperUnwrap {
   func b(_: Foo<Int>) {}
   func c(_: V) {}
   func d(_: W) {}
+  func e(_: Foo<W>) {}
 
   func baz() {
     self.x.foo() // expected-error {{referencing instance method 'foo()' requires wrapper 'Foo<Int>'}}{{10-10=_}}
@@ -1005,9 +1037,29 @@ struct MissingPropertyWrapperUnwrap {
     
     a(self.w) // expected-error {{cannot convert value 'w' of type 'W' to expected type 'Foo<W>', use wrapper instead}}{{12-12=_}}
     b(self.x) // expected-error {{cannot convert value 'x' of type 'Int' to expected type 'Foo<Int>', use wrapper instead}}{{12-12=_}}
-    b(self.w) // expected-error {{cannot convert value 'w' of type 'W' to expected type 'Foo<Int>', use wrapper instead}}{{12-12=_}}
+    b(self.w) // expected-error {{cannot convert value of type 'W' to expected argument type 'Foo<Int>'}}
+    e(self.w) // expected-error {{cannot convert value 'w' of type 'W' to expected type 'Foo<W>', use wrapper instead}}{{12-12=_}}
+    b(self._w) // expected-error {{cannot convert value of type 'Foo<W>' to expected argument type 'Foo<Int>'}}
+
     c(self.usesProjectedValue) // expected-error {{cannot convert value 'usesProjectedValue' of type 'W' to expected type 'V', use wrapper instead}}{{12-12=$}}
     d(self.$usesProjectedValue) // expected-error {{cannot convert value '$usesProjectedValue' of type 'V' to expected type 'W', use wrapped value instead}}{{12-13=}}
     d(self._usesProjectedValue) // expected-error {{cannot convert value '_usesProjectedValue' of type 'Baz<W>' to expected type 'W', use wrapped value instead}}{{12-13=}}
+
+    self.x["ultimate question"] // expected-error {{referencing subscript 'subscript(_:)' requires wrapper 'Foo<Int>'}} {{10-10=_}}
+    self.x["ultimate question"] = 42 // expected-error {{referencing subscript 'subscript(_:)' requires wrapper 'Foo<Int>'}} {{10-10=_}}
+
+    self.x[x: 42] // expected-error {{referencing subscript 'subscript(x:)' requires wrapper 'Foo<Int>'}} {{10-10=_}}
+    self.x[x: 42] = 0 // expected-error {{referencing subscript 'subscript(x:)' requires wrapper 'Foo<Int>'}} {{10-10=_}}
+
+    self.x[q: "ultimate question", 42] // expected-error {{referencing subscript 'subscript(q:_:)' requires wrapper 'Foo<Int>'}} {{10-10=_}}
+    self.x[q: "ultimate question", 42] = true // expected-error {{referencing subscript 'subscript(q:_:)' requires wrapper 'Foo<Int>'}} {{10-10=_}}
+  }
+}
+
+struct InvalidPropertyDelegateUse {
+  @Foo var x: Int = 42 // expected-error {{extra argument 'initialValue' in call}}
+
+  func test() {
+    self.x.foo() // expected-error {{value of type 'Int' has no member 'foo'}}
   }
 }

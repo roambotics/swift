@@ -2535,6 +2535,12 @@ public:
           if (!var->hasType())
             var->markInvalid();
         };
+        
+        // Properties with an opaque return type need an initializer to
+        // determine their underlying type.
+        if (var->getOpaqueResultTypeDecl()) {
+          TC.diagnose(var->getLoc(), diag::opaque_type_var_no_init);
+        }
 
         // Non-member observing properties need an initializer.
         if (var->getWriteImpl() == WriteImplKind::StoredWithObservers &&
@@ -2593,8 +2599,9 @@ public:
       if (!PBD->isInitialized(i))
         continue;
 
-      if (!PBD->isInitializerChecked(i))
+      if (!PBD->isInitializerChecked(i)) {
         TC.typeCheckPatternBinding(PBD, i);
+      }
 
       if (!PBD->isInvalid()) {
         auto &entry = PBD->getPatternList()[i];
@@ -2829,6 +2836,8 @@ public:
     for (Decl *Member : SD->getMembers())
       visit(Member);
 
+    TC.checkPatternBindingCaptures(SD);
+
     TC.checkDeclAttributes(SD);
 
     checkInheritanceClause(SD);
@@ -2954,6 +2963,8 @@ public:
     for (Decl *Member : CD->getMembers()) {
       visit(Member);
     }
+
+    TC.checkPatternBindingCaptures(CD);
 
     // If this class requires all of its stored properties to have
     // in-class initializers, diagnose this now.
@@ -3131,7 +3142,7 @@ public:
     }
 
     // Explicitly calculate this bit.
-    (void) PD->existentialTypeSupported(&TC);
+    (void) PD->existentialTypeSupported();
 
     // Explicity compute the requirement signature to detect errors.
     (void) PD->getRequirementSignature();
@@ -5101,7 +5112,7 @@ void TypeChecker::maybeDiagnoseClassWithoutInitializers(ClassDecl *classDecl) {
   // Some heuristics to skip emitting a diagnostic if the class is already
   // irreperably busted.
   if (classDecl->isInvalid() ||
-      classDecl->inheritsSuperclassInitializers(nullptr))
+      classDecl->inheritsSuperclassInitializers())
     return;
 
   auto *superclassDecl = classDecl->getSuperclassDecl();
@@ -5644,10 +5655,6 @@ void TypeChecker::defineDefaultConstructor(NominalTypeDecl *decl) {
   stmts.push_back(new (Context) ReturnStmt(decl->getLoc(), nullptr));
   ctor->setBody(BraceStmt::create(Context, SourceLoc(), stmts, SourceLoc()));
   ctor->setBodyTypeCheckedIfPresent();
-
-  // FIXME: This is still needed so that DI can check captures for
-  // initializer expressions. Rethink that completely.
-  Context.addSynthesizedDecl(ctor);
 }
 
 static void validateAttributes(TypeChecker &TC, Decl *D) {

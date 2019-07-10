@@ -520,7 +520,30 @@ ParserResult<TypeRepr> Parser::parseDeclResultType(Diag<> MessageID) {
     consumeToken(tok::code_complete);
     return makeParserCodeCompletionStatus();
   }
-  return parseType(MessageID);
+
+  auto result = parseType(MessageID);
+
+  if (!result.isParseError() && Tok.is(tok::r_square)) {
+    auto diag = diagnose(Tok, diag::extra_rbracket);
+    diag.fixItInsert(result.get()->getStartLoc(), getTokenText(tok::l_square));
+    consumeToken();
+    return makeParserErrorResult(new (Context) ErrorTypeRepr(Tok.getLoc()));
+  } else if (!result.isParseError() && Tok.is(tok::colon)) {
+    auto colonTok = consumeToken();
+    auto secondType = parseType(diag::expected_dictionary_value_type);
+
+    auto diag = diagnose(colonTok, diag::extra_colon);
+    diag.fixItInsert(result.get()->getStartLoc(), getTokenText(tok::l_square));
+    if (!secondType.isParseError()) {
+      if (Tok.is(tok::r_square)) {
+        consumeToken();
+      } else {
+        diag.fixItInsertAfter(secondType.get()->getEndLoc(), getTokenText(tok::r_square));
+      }
+    }
+    return makeParserErrorResult(new (Context) ErrorTypeRepr(Tok.getLoc()));
+  }
+  return result;
 }
 
 ParserStatus Parser::parseGenericArguments(SmallVectorImpl<TypeRepr *> &Args,
@@ -697,9 +720,7 @@ Parser::parseTypeSimpleOrComposition(Diag<> MessageID,
   // This is only semantically allowed in certain contexts, but we parse it
   // generally for diagnostics and recovery.
   SourceLoc opaqueLoc;
-  if (Context.LangOpts.EnableOpaqueResultTypes
-      && Tok.is(tok::identifier)
-      && Tok.getRawText() == "some") {
+  if (Tok.is(tok::identifier) && Tok.getRawText() == "some") {
     // Treat some as a keyword.
     TokReceiver->registerTokenKindChange(Tok.getLoc(), tok::contextual_keyword);
     opaqueLoc = consumeToken();
@@ -765,9 +786,7 @@ Parser::parseTypeSimpleOrComposition(Diag<> MessageID,
     }
     
     // Diagnose invalid `some` after an ampersand.
-    if (Context.LangOpts.EnableOpaqueResultTypes
-        && Tok.is(tok::identifier)
-        && Tok.getRawText() == "some") {
+    if (Tok.is(tok::identifier) && Tok.getRawText() == "some") {
       auto badLoc = consumeToken();
       
       // TODO: Fixit to move to beginning of composition.

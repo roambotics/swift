@@ -105,6 +105,20 @@ Expr *FailureDiagnostic::getArgumentExprFor(Expr *anchor) const {
   return nullptr;
 }
 
+Expr *FailureDiagnostic::getBaseExprFor(Expr *anchor) const {
+  if (!anchor)
+    return nullptr;
+
+  if (auto *UDE = dyn_cast<UnresolvedDotExpr>(anchor))
+    return UDE->getBase();
+  else if (auto *SE = dyn_cast<SubscriptExpr>(anchor))
+    return SE->getBase();
+  else if (auto *MRE = dyn_cast<MemberRefExpr>(anchor))
+    return MRE->getBase();
+
+  return nullptr;
+}
+
 Optional<SelectedOverload> FailureDiagnostic::getChoiceFor(Expr *expr) const {
   auto &cs = getConstraintSystem();
   return getOverloadChoiceIfAvailable(cs.getCalleeLocator(expr));
@@ -886,7 +900,7 @@ bool MemberAccessOnOptionalBaseFailure::diagnoseAsError() {
     return false;
 
   auto *anchor = getAnchor();
-  auto type = getType(anchor)->getRValueType();
+  auto baseType = getType(anchor)->getRValueType();
   bool resultIsOptional = ResultTypeIsOptional;
 
   // If we've resolved the member overload to one that returns an optional
@@ -897,8 +911,27 @@ bool MemberAccessOnOptionalBaseFailure::diagnoseAsError() {
   if (overload && overload->ImpliedType->getOptionalObjectType())
     resultIsOptional = true;
 
-  return diagnoseBaseUnwrapForMemberAccess(anchor, type, Member,
-                                           resultIsOptional, SourceRange());
+  auto unwrappedBaseType = baseType->getOptionalObjectType();
+  if (!unwrappedBaseType)
+    return false;
+
+  emitDiagnostic(anchor->getLoc(), diag::optional_base_not_unwrapped,
+                 baseType, Member, unwrappedBaseType);
+
+  // FIXME: It would be nice to immediately offer "base?.member ?? defaultValue"
+  // for non-optional results where that would be appropriate. For the moment
+  // always offering "?" means that if the user chooses chaining, we'll end up
+  // in MissingOptionalUnwrapFailure:diagnose() to offer a default value during
+  // the next compile.
+  emitDiagnostic(anchor->getLoc(), diag::optional_base_chain, Member)
+      .fixItInsertAfter(anchor->getEndLoc(), "?");
+
+  if (!resultIsOptional) {
+    emitDiagnostic(anchor->getLoc(), diag::unwrap_with_force_value)
+      .fixItInsertAfter(anchor->getEndLoc(), "!");
+  }
+
+  return true;
 }
 
 void MissingOptionalUnwrapFailure::offerDefaultValueUnwrapFixIt(
@@ -1465,13 +1498,11 @@ bool AssignmentFailure::diagnoseAsError() {
   }
 
   if (auto IE = dyn_cast<IfExpr>(immInfo.first)) {
-    if (isLoadedLValue(IE)) {
-      emitDiagnostic(Loc, DeclDiagnostic,
-                     "result of conditional operator '? :' is never mutable")
-          .highlight(IE->getQuestionLoc())
-          .highlight(IE->getColonLoc());
-      return true;
-    }
+    emitDiagnostic(Loc, DeclDiagnostic,
+                   "result of conditional operator '? :' is never mutable")
+        .highlight(IE->getQuestionLoc())
+        .highlight(IE->getColonLoc());
+    return true;
   }
 
   emitDiagnostic(Loc, TypeDiagnostic, getType(destExpr))
@@ -2134,9 +2165,15 @@ bool MissingMemberFailure::diagnoseAsError() {
   };
 
   if (getName().getBaseName().getKind() == DeclBaseName::Kind::Subscript) {
-    emitDiagnostic(anchor->getLoc(), diag::could_not_find_value_subscript,
-                   baseType)
+    auto loc = anchor->getLoc();
+    if (auto *metatype = baseType->getAs<MetatypeType>()) {
+      emitDiagnostic(loc, diag::could_not_find_type_member,
+                     metatype->getInstanceType(), getName())
         .highlight(baseExpr->getSourceRange());
+    } else {
+      emitDiagnostic(loc, diag::could_not_find_value_subscript, baseType)
+        .highlight(baseExpr->getSourceRange());
+    }
   } else if (getName().getBaseName() == "deinit") {
     // Specialised diagnostic if trying to access deinitialisers
     emitDiagnostic(anchor->getLoc(), diag::destructor_not_accessible)
@@ -2382,10 +2419,13 @@ bool AllowTypeOrInstanceMemberFailure::diagnoseAsError() {
       return true;
     }
 
-    if (isa<TypeExpr>(getRawAnchor())) {
-      emitDiagnostic(loc, diag::instance_member_use_on_type, instanceTy, Name)
-          .highlight(getRawAnchor()->getSourceRange());
-      return true;
+    if (auto *UDE = dyn_cast<UnresolvedDotExpr>(getRawAnchor())) {
+      auto *baseExpr = UDE->getBase();
+      if (isa<TypeExpr>(baseExpr)) {
+        emitDiagnostic(loc, diag::instance_member_use_on_type, instanceTy, Name)
+            .highlight(baseExpr->getSourceRange());
+        return true;
+      }
     }
 
     // Just emit a generic "instance member cannot be used" error
@@ -3430,4 +3470,26 @@ bool SkipUnhandledConstructInFunctionBuilderFailure::diagnoseAsError() {
 bool SkipUnhandledConstructInFunctionBuilderFailure::diagnoseAsNote() {
   diagnosePrimary(/*asNote=*/true);
   return true;
+}
+
+bool MutatingMemberRefOnImmutableBase::diagnoseAsError() {
+  auto *anchor = getRawAnchor();
+  auto baseExpr = getBaseExprFor(anchor);
+  if (!baseExpr)
+    return false;
+
+  auto diagIDsubelt = diag::cannot_pass_rvalue_mutating_subelement;
+  auto diagIDmember = diag::cannot_pass_rvalue_mutating;
+
+  if (auto *storage = dyn_cast<AbstractStorageDecl>(Member)) {
+    if (storage->isGetterMutating()) {
+      diagIDsubelt = diag::cannot_pass_rvalue_mutating_getter_subelement;
+      diagIDmember = diag::cannot_pass_rvalue_mutating_getter;
+    }
+  }
+
+  auto &cs = getConstraintSystem();
+  AssignmentFailure failure(baseExpr, cs, anchor->getLoc(), diagIDsubelt,
+                            diagIDmember);
+  return failure.diagnoseAsError();
 }

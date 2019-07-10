@@ -1121,11 +1121,6 @@ ERROR(c_function_pointer_from_method,none,
 ERROR(c_function_pointer_from_generic_function,none,
       "a C function pointer cannot be formed from a reference to a generic "
       "function", ())
-ERROR(c_function_pointer_from_function_with_context,none,
-      "a C function pointer cannot be formed from a "
-      "%select{local function|closure}0 that captures "
-      "%select{context|generic parameters|dynamic Self type|<<error>}1",
-      (bool, unsigned))
 ERROR(invalid_autoclosure_forwarding,none,
       "add () to forward @autoclosure parameter", ())
 
@@ -2595,6 +2590,8 @@ ERROR(dynamic_self_invalid_subscript,none,
       "covariant 'Self' can only appear at the top level of subscript element type", ())
 ERROR(dynamic_self_invalid_method,none,
       "covariant 'Self' can only appear at the top level of method result type", ())
+ERROR(dynamic_self_stored_property_init,none,
+      "covariant 'Self' type cannot be referenced from a stored property initializer", ())
 
 //------------------------------------------------------------------------------
 // MARK: Type Check Attributes
@@ -3335,6 +3332,9 @@ ERROR(trailing_closure_requires_parens,none,
       "trailing closure requires parentheses for disambiguation in this"
       " context", ())
 
+ERROR(opaque_type_var_no_init,none,
+      "property declares an opaque return type, but has no initializer "
+      "expression from which to infer an underlying type", ())
 ERROR(opaque_type_no_underlying_type_candidates,none,
       "function declares an opaque return type, but has no return statements "
       "in its body from which to infer an underlying type", ())
@@ -3346,6 +3346,9 @@ NOTE(opaque_type_underlying_type_candidate_here,none,
 ERROR(opaque_type_self_referential_underlying_type,none,
       "function opaque return type was inferred as %0, which defines the "
       "opaque type in terms of itself", (Type))
+ERROR(opaque_type_var_no_underlying_type,none,
+      "property declares an opaque return type, but cannot infer the "
+      "underlying type from its initializer expression", ())
 
 //------------------------------------------------------------------------------
 // MARK: Type Check Patterns
@@ -4448,6 +4451,9 @@ ERROR(property_wrapper_type_requirement_not_accessible,none,
       "more restrictive access than its enclosing property wrapper type %3 "
       "(which is %select{private|fileprivate|internal|public|open}4)",
       (AccessLevel, DescriptiveDeclKind, DeclName, Type, AccessLevel))
+ERROR(property_wrapper_ambiguous_enclosing_self_subscript, none,
+      "property wrapper type %0 has multiple enclosing-self subscripts %1",
+      (Type, DeclName))
 
 ERROR(property_wrapper_attribute_not_on_property, none,
       "property wrapper attribute %0 can only be applied to a property",

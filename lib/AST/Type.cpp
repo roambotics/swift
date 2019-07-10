@@ -1233,16 +1233,23 @@ CanType TypeBase::getCanonicalType(GenericSignature *sig) {
 }
 
 TypeBase *TypeBase::reconstituteSugar(bool Recursive) {
-  auto Func = [](Type Ty) -> Type {
+  auto Func = [Recursive](Type Ty) -> Type {
     if (auto boundGeneric = dyn_cast<BoundGenericType>(Ty.getPointer())) {
+
+      auto getGenericArg = [&](unsigned i) -> Type {
+        auto arg = boundGeneric->getGenericArgs()[i];
+        if (Recursive)
+          arg = arg->reconstituteSugar(Recursive);
+        return arg;
+      };
+
       auto &ctx = boundGeneric->getASTContext();
       if (boundGeneric->getDecl() == ctx.getArrayDecl())
-        return ArraySliceType::get(boundGeneric->getGenericArgs()[0]);
+        return ArraySliceType::get(getGenericArg(0));
       if (boundGeneric->getDecl() == ctx.getDictionaryDecl())
-        return DictionaryType::get(boundGeneric->getGenericArgs()[0],
-                                   boundGeneric->getGenericArgs()[1]);
+        return DictionaryType::get(getGenericArg(0), getGenericArg(1));
       if (boundGeneric->getDecl() == ctx.getOptionalDecl())
-        return OptionalType::get(boundGeneric->getGenericArgs()[0]);
+        return OptionalType::get(getGenericArg(0));
     }
     return Ty;
   };
@@ -3017,7 +3024,6 @@ static Type getMemberForBaseType(LookupConformanceFn lookupConformances,
     return failed();
 
   // If we know the associated type, look in the witness table.
-  LazyResolver *resolver = substBase->getASTContext().getLazyResolver();
   if (assocType) {
     auto proto = assocType->getProtocol();
     Optional<ProtocolConformanceRef> conformance
@@ -3029,7 +3035,7 @@ static Type getMemberForBaseType(LookupConformanceFn lookupConformances,
 
     // Retrieve the type witness.
     auto witness =
-      conformance->getConcrete()->getTypeWitness(assocType, resolver, options);
+      conformance->getConcrete()->getTypeWitness(assocType, options);
     if (!witness)
       return failed();
 
@@ -3091,9 +3097,7 @@ LookUpConformanceInSignature::operator()(CanType dependentType,
                                conformedProtocol);
 }
 
-Type DependentMemberType::substBaseType(ModuleDecl *module,
-                                        Type substBase,
-                                        LazyResolver *resolver) {
+Type DependentMemberType::substBaseType(ModuleDecl *module, Type substBase) {
   return substBaseType(substBase, LookUpConformanceInModule(module));
 }
 

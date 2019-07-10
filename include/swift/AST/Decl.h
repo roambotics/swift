@@ -70,7 +70,6 @@ namespace swift {
   class GenericSignature;
   class GenericTypeParamDecl;
   class GenericTypeParamType;
-  class LazyResolver;
   class ModuleDecl;
   class EnumCaseDecl;
   class EnumElementDecl;
@@ -1932,6 +1931,9 @@ class PatternBindingEntry {
   /// The initializer context used for this pattern binding entry.
   llvm::PointerIntPair<DeclContext *, 1, bool> InitContextAndIsText;
 
+  /// Values captured by this initializer.
+  CaptureInfo Captures;
+
   friend class PatternBindingInitializer;
 
 public:
@@ -2025,6 +2027,9 @@ public:
   /// \param omitAccessors Whether the computation should omit the accessors
   /// from the source range.
   SourceRange getSourceRange(bool omitAccessors = false) const;
+
+  const CaptureInfo &getCaptureInfo() const { return Captures; }
+  void setCaptureInfo(const CaptureInfo &captures) { Captures = captures; }
 };
 
 /// This decl contains a pattern and optional initializer for a set
@@ -2121,6 +2126,18 @@ public:
   }
   
   void setPattern(unsigned i, Pattern *Pat, DeclContext *InitContext);
+
+  DeclContext *getInitContext(unsigned i) const {
+    return getPatternList()[i].getInitContext();
+  }
+
+  const CaptureInfo &getCaptureInfo(unsigned i) const {
+    return getPatternList()[i].getCaptureInfo();
+  }
+
+  void setCaptureInfo(unsigned i, const CaptureInfo &captures) {
+    getMutablePatternList()[i].setCaptureInfo(captures);
+  }
 
   /// Given that this PBD is the parent pattern for the specified VarDecl,
   /// return the entry of the VarDecl in our PatternList.  For example, in:
@@ -2855,7 +2872,13 @@ public:
     assert(!NamingDecl && "already have naming decl");
     NamingDecl = D;
   }
-  
+
+  /// Is this opaque type the opaque return type of the given function?
+  ///
+  /// This is more complex than just checking `getNamingDecl` because the
+  /// function could also be the getter of a storage declaration.
+  bool isOpaqueReturnTypeOfFunction(const AbstractFunctionDecl *func) const;
+
   GenericSignature *getOpaqueInterfaceGenericSignature() const {
     return OpaqueInterfaceGenericSignature;
   }
@@ -3932,10 +3955,7 @@ public:
 
   /// Determine whether this class inherits the convenience initializers
   /// from its superclass.
-  ///
-  /// \param resolver Used to resolve the signatures of initializers, which is
-  /// required for name lookup.
-  bool inheritsSuperclassInitializers(LazyResolver *resolver);
+  bool inheritsSuperclassInitializers();
 
   /// Marks that this class inherits convenience initializers from its
   /// superclass.
@@ -4119,7 +4139,7 @@ class ProtocolDecl final : public NominalTypeDecl {
 
   bool existentialConformsToSelfSlow();
 
-  bool existentialTypeSupportedSlow(LazyResolver *resolver);
+  bool existentialTypeSupportedSlow();
 
   ArrayRef<ProtocolDecl *> getInheritedProtocolsSlow();
 
@@ -4245,12 +4265,12 @@ public:
   /// conforming to this protocol. This is only permitted if the types of
   /// all the members do not contain any associated types, and do not
   /// contain 'Self' in 'parameter' or 'other' position.
-  bool existentialTypeSupported(LazyResolver *resolver) const {
+  bool existentialTypeSupported() const {
     if (Bits.ProtocolDecl.ExistentialTypeSupportedValid)
       return Bits.ProtocolDecl.ExistentialTypeSupported;
 
     return const_cast<ProtocolDecl *>(this)
-             ->existentialTypeSupportedSlow(resolver);
+             ->existentialTypeSupportedSlow();
   }
 
   /// Explicitly set the existentialTypeSupported flag, without computing
@@ -5847,8 +5867,8 @@ public:
   /// Retrieve the source range of the function declaration name + patterns.
   SourceRange getSignatureSourceRange() const;
 
-  CaptureInfo &getCaptureInfo() { return Captures; }
   const CaptureInfo &getCaptureInfo() const { return Captures; }
+  void setCaptureInfo(const CaptureInfo &captures) { Captures = captures; }
 
   /// Retrieve the Objective-C selector that names this method.
   ObjCSelector getObjCSelector(DeclName preferredName = DeclName(),
