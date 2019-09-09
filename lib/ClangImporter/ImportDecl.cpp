@@ -30,6 +30,7 @@
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/PrettyStackTrace.h"
@@ -1726,7 +1727,7 @@ buildSubscriptGetterDecl(ClangImporter::Implementation &Impl,
                      TypeLoc::withoutLoc(elementTy), dc,
                      getter->getClangNode());
 
-  thunk->setGenericEnvironment(dc->getGenericEnvironmentOfContext());
+  thunk->setGenericSignature(dc->getGenericSignatureOfContext());
   thunk->computeType();
   thunk->setValidationToChecked();
 
@@ -1781,7 +1782,7 @@ buildSubscriptSetterDecl(ClangImporter::Implementation &Impl,
                      valueIndicesPL,
                      TypeLoc::withoutLoc(TupleType::getEmpty(C)), dc,
                      setter->getClangNode());
-  thunk->setGenericEnvironment(dc->getGenericEnvironmentOfContext());
+  thunk->setGenericSignature(dc->getGenericSignatureOfContext());
   thunk->computeType();
   thunk->setValidationToChecked();
 
@@ -2941,7 +2942,7 @@ namespace {
                          AccessLevel::Public, loc, SourceLoc(),
                          C.Id_ErrorType, loc,
                          /*genericparams=*/nullptr, enumDecl);
-          alias->setUnderlyingType(Impl.getSugaredTypeReference(errorWrapper));
+          alias->setUnderlyingType(errorWrapper->getDeclaredInterfaceType());
           enumDecl->addMember(alias);
 
           // Add the 'Code' enum to the error wrapper.
@@ -3750,7 +3751,7 @@ namespace {
                                     nameLoc, bodyParams, resultTy,
                                     /*throws*/ false, dc, decl);
 
-      result->setGenericEnvironment(dc->getGenericEnvironmentOfContext());
+      result->setGenericSignature(dc->getGenericSignatureOfContext());
 
       if (!dc->isModuleScopeContext()) {
         if (selfIsInOut)
@@ -4338,7 +4339,7 @@ namespace {
       // Record the return type.
       result->getBodyResultTypeLoc().setType(resultTy);
 
-      result->setGenericEnvironment(dc->getGenericEnvironmentOfContext());
+      result->setGenericSignature(dc->getGenericSignatureOfContext());
 
       // Optional methods in protocols.
       if (decl->getImplementationControl() == clang::ObjCMethodDecl::Optional &&
@@ -4546,17 +4547,14 @@ namespace {
                       Impl.SwiftContext, loc,
                       nullptr,
                       { }, dc, nullptr, decl);
-      Impl.SwiftContext
-          .evaluator
-          .cacheOutput(ExtendedTypeRequest{result},
-                       objcClass->getDeclaredType());
+      Impl.SwiftContext.evaluator.cacheOutput(ExtendedTypeRequest{result},
+                                              objcClass->getDeclaredType());
+      Impl.SwiftContext.evaluator.cacheOutput(ExtendedNominalRequest{result},
+                                              std::move(objcClass));
       
       // Determine the type and generic args of the extension.
       if (objcClass->getGenericParams()) {
-        result->createGenericParamsIfMissing(objcClass);
-
-        auto *env = objcClass->getGenericEnvironment();
-        result->setGenericEnvironment(env);
+        result->setGenericSignature(objcClass->getGenericSignature());
       }
 
       // Create the extension declaration and record it.
@@ -4828,10 +4826,11 @@ namespace {
       if (auto gpImportResult = importObjCGenericParams(decl, dc)) {
         auto genericParams = *gpImportResult;
         if (genericParams) {
-          result->setGenericParams(genericParams);
+          result->getASTContext().evaluator.cacheOutput(
+                GenericParamListRequest{result}, std::move(genericParams));
 
-          auto *env = Impl.buildGenericEnvironment(genericParams, dc);
-          result->setGenericEnvironment(env);
+          auto *sig = Impl.buildGenericSignature(genericParams, dc);
+          result->setGenericSignature(sig);
         }
       } else {
         return nullptr;
@@ -5155,12 +5154,15 @@ namespace {
                     /*genericparams=*/nullptr, dc);
 
       if (auto *GTD = dyn_cast<GenericTypeDecl>(typeDecl)) {
-        typealias->setGenericEnvironment(GTD->getGenericEnvironment());
-        if (GTD->isGeneric())
-          typealias->setGenericParams(GTD->getGenericParams()->clone(typealias));
+        typealias->setGenericSignature(GTD->getGenericSignature());
+        if (GTD->isGeneric()) {
+          typealias->getASTContext().evaluator.cacheOutput(
+                GenericParamListRequest{typealias},
+                std::move(GTD->getGenericParams()->clone(typealias)));
+        }
       }
 
-      typealias->setUnderlyingType(Impl.getSugaredTypeReference(typeDecl));
+      typealias->setUnderlyingType(typeDecl->getDeclaredInterfaceType());
       return typealias;
     }
 
@@ -5387,12 +5389,15 @@ Decl *SwiftDeclConverter::importCompatibilityTypeAlias(
 
   auto *GTD = dyn_cast<GenericTypeDecl>(typeDecl);
   if (GTD && !isa<ProtocolDecl>(GTD)) {
-    alias->setGenericEnvironment(GTD->getGenericEnvironment());
-    if (GTD->isGeneric())
-      alias->setGenericParams(GTD->getGenericParams()->clone(alias));
+    alias->setGenericSignature(GTD->getGenericSignature());
+    if (GTD->isGeneric()) {
+      alias->getASTContext().evaluator.cacheOutput(
+            GenericParamListRequest{alias},
+            std::move(GTD->getGenericParams()->clone(alias)));
+    }
   }
 
-  alias->setUnderlyingType(Impl.getSugaredTypeReference(typeDecl));
+  alias->setUnderlyingType(typeDecl->getDeclaredInterfaceType());
 
   // Record that this is the official version of this declaration.
   Impl.ImportedDecls[{decl->getCanonicalDecl(), getVersion()}] = alias;
@@ -6344,7 +6349,7 @@ ConstructorDecl *SwiftDeclConverter::importConstructor(
   addObjCAttribute(result, selector);
 
   // Calculate the function type of the result.
-  result->setGenericEnvironment(dc->getGenericEnvironmentOfContext());
+  result->setGenericSignature(dc->getGenericSignatureOfContext());
   result->computeType();
 
   Impl.recordImplicitUnwrapForDecl(result,
@@ -6775,7 +6780,7 @@ SwiftDeclConverter::importSubscript(Decl *decl,
   if (setterObjCMethod)
     Impl.importAttributes(setterObjCMethod, setterThunk);
 
-  subscript->setGenericEnvironment(dc->getGenericEnvironmentOfContext());
+  subscript->setGenericSignature(dc->getGenericSignatureOfContext());
 
   subscript->setIsSetterMutating(false);
   makeComputed(subscript, getterThunk, setterThunk);
@@ -8040,12 +8045,6 @@ GenericSignature *ClangImporter::Implementation::buildGenericSignature(
       nullptr);
 }
 
-// Calculate the generic environment from an imported generic param list.
-GenericEnvironment *ClangImporter::Implementation::buildGenericEnvironment(
-    GenericParamList *genericParams, DeclContext *dc) {
-  return buildGenericSignature(genericParams, dc)->createGenericEnvironment();
-}
-
 DeclContext *
 ClangImporter::Implementation::importDeclContextOf(
   const clang::Decl *decl,
@@ -8127,12 +8126,13 @@ ClangImporter::Implementation::importDeclContextOf(
                                    getClangModuleForDecl(decl), nullptr);
   SwiftContext.evaluator.cacheOutput(ExtendedTypeRequest{ext},
                                      nominal->getDeclaredType());
+  SwiftContext.evaluator.cacheOutput(ExtendedNominalRequest{ext},
+                                     std::move(nominal));
   ext->setValidationToChecked();
   ext->setMemberLoader(this, reinterpret_cast<uintptr_t>(declSubmodule));
 
   if (auto protoDecl = ext->getExtendedProtocolDecl()) {
-    ext->createGenericParamsIfMissing(protoDecl);
-    ext->setGenericEnvironment(protoDecl->getGenericEnvironment());
+    ext->setGenericSignature(protoDecl->getGenericSignature());
   }
 
   // Add the extension to the nominal type.

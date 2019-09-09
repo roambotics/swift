@@ -1738,8 +1738,16 @@ void ClangImporter::Implementation::handleDeferredImports()
     ImportedHeaderExports.push_back(R.getSubmodule(ID));
   }
   PCHImportedSubmodules.clear();
-  for (const clang::Module *M : ImportedHeaderExports)
-    (void)finishLoadingClangModule(M, /*preferOverlay=*/true);
+
+  // Avoid a for-in loop because in unusual situations we can end up pulling in
+  // another bridging header while we finish loading the modules that are
+  // already here. This is a brittle situation but it's outside what's
+  // officially supported with bridging headers: app targets and unit tests
+  // only. Unfortunately that's not enforced.
+  for (size_t i = 0; i < ImportedHeaderExports.size(); ++i) {
+    (void)finishLoadingClangModule(ImportedHeaderExports[i],
+                                   /*preferOverlay=*/true);
+  }
 }
 
 ModuleDecl *ClangImporter::getImportedHeaderModule() const {
@@ -2159,26 +2167,9 @@ static bool isVisibleFromModule(const ClangModuleUnit *ModuleFilter,
   if (!Wrapper)
     return false;
 
-  auto ClangNode = VD->getClangNode();
-  if (!ClangNode) {
-    // If we synthesized a ValueDecl, it won't have a Clang node. Find the
-    // associated declaration that /does/ have a Clang node, and use that.
-    auto *SynthesizedTypeAttr =
-        VD->getAttrs().getAttribute<ClangImporterSynthesizedTypeAttr>();
-    assert(SynthesizedTypeAttr);
-
-    switch (SynthesizedTypeAttr->getKind()) {
-    case ClangImporterSynthesizedTypeAttr::Kind::NSErrorWrapper:
-    case ClangImporterSynthesizedTypeAttr::Kind::NSErrorWrapperAnon: {
-      ASTContext &Ctx = ContainingUnit->getASTContext();
-      auto *Importer = static_cast<ClangImporter *>(Ctx.getClangModuleLoader());
-      auto WrapperStruct = cast<StructDecl>(VD);
-      auto *CodeEnum = Importer->lookupErrorCodeEnum(WrapperStruct);
-      ClangNode = CodeEnum->getClangNode();
-      break;
-    }
-    }
-  }
+  ASTContext &Ctx = ContainingUnit->getASTContext();
+  auto *Importer = static_cast<ClangImporter *>(Ctx.getClangModuleLoader());
+  auto ClangNode = Importer->getEffectiveClangNode(VD);
 
   // Macros can be "redeclared" by putting an equivalent definition in two
   // different modules. (We don't actually check the equivalence.)
@@ -2485,8 +2476,19 @@ void ClangImporter::lookupValue(DeclName name, VisibleDeclConsumer &consumer) {
   });
 }
 
-EnumDecl *ClangImporter::lookupErrorCodeEnum(const StructDecl *errorWrapper) const {
-  return Impl.lookupErrorCodeEnum(errorWrapper);
+ClangNode ClangImporter::getEffectiveClangNode(const Decl *decl) const {
+  // Directly...
+  if (auto clangNode = decl->getClangNode())
+    return clangNode;
+
+  // Or via the nested "Code" enum.
+  if (auto *errorWrapper = dyn_cast<StructDecl>(decl)) {
+    if (auto *code = Impl.lookupErrorCodeEnum(errorWrapper))
+      if (auto clangNode = code->getClangNode())
+        return clangNode;
+  }
+
+  return ClangNode();
 }
 
 void ClangImporter::lookupTypeDecl(

@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 #include "TypeChecker.h"
 #include "TypeCheckType.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/GenericSignatureBuilder.h"
@@ -206,8 +207,8 @@ Type TypeChecker::getOrCreateOpaqueResultType(TypeResolution resolution,
                                                  interfaceSignature,
                                                  returnTypeParam);
   opaqueDecl->copyFormalAccessFrom(originatingDecl);
-  if (auto originatingEnv = originatingDC->getGenericEnvironmentOfContext()) {
-    opaqueDecl->setGenericEnvironment(originatingEnv);
+  if (auto originatingSig = originatingDC->getGenericSignatureOfContext()) {
+    opaqueDecl->setGenericSignature(originatingSig);
   }
 
   originatingDecl->setOpaqueResultTypeDecl(opaqueDecl);
@@ -456,8 +457,8 @@ void TypeChecker::validateGenericFuncOrSubscriptSignature(
     gpList->setDepth(genCtx->getGenericContextDepth());
   } else {
     // Inherit the signature of the surrounding environment.
-    genCtx->setGenericEnvironment(
-        decl->getDeclContext()->getGenericEnvironmentOfContext());
+    genCtx->setGenericSignature(
+        decl->getDeclContext()->getGenericSignatureOfContext());
   }
 
   // Accessors can always use the generic context of their storage
@@ -469,10 +470,7 @@ void TypeChecker::validateGenericFuncOrSubscriptSignature(
   if (auto accessor = dyn_cast<AccessorDecl>(decl)) {
     auto subscr = dyn_cast<SubscriptDecl>(accessor->getStorage());
     if (gpList && subscr) {
-      auto env = subscr->getGenericEnvironment();
-      assert(subscr->getGenericSignature() && env &&
-             "accessor has generics but subscript is not generic");
-      genCtx->setGenericEnvironment(env);
+      genCtx->setGenericSignature(subscr->getGenericSignature());
     }
     // We've inherited all of the type information already.
     accessor->computeType();
@@ -554,7 +552,7 @@ void TypeChecker::validateGenericFuncOrSubscriptSignature(
       llvm::errs() << "\n";
     }
 
-    genCtx->setGenericEnvironment(sig->createGenericEnvironment());
+    genCtx->setGenericSignature(sig);
   }
 
   auto resolution = TypeResolution::forInterface(genCtx, sig);
@@ -587,7 +585,7 @@ void TypeChecker::validateGenericFuncOrSubscriptSignature(
 /// Generic types
 ///
 
-GenericEnvironment *TypeChecker::checkGenericEnvironment(
+GenericSignature *TypeChecker::checkGenericSignature(
                       GenericParamList *genericParams,
                       DeclContext *dc,
                       GenericSignature *parentSig,
@@ -626,9 +624,7 @@ GenericEnvironment *TypeChecker::checkGenericEnvironment(
     llvm::errs() << "\n";
   }
 
-
-  // Form the generic environment.
-  return sig->createGenericEnvironment();
+  return sig;
 }
 
 void TypeChecker::validateGenericTypeSignature(GenericTypeDecl *typeDecl) {
@@ -668,18 +664,17 @@ void TypeChecker::validateGenericTypeSignature(GenericTypeDecl *typeDecl) {
   auto *dc = typeDecl->getDeclContext();
 
   if (!gp) {
-    typeDecl->setGenericEnvironment(
-                  dc->getGenericEnvironmentOfContext());
+    typeDecl->setGenericSignature(dc->getGenericSignatureOfContext());
     return;
   }
 
   gp->setDepth(typeDecl->getGenericContextDepth());
 
-  auto *env = TypeChecker::checkGenericEnvironment(
+  auto *sig = TypeChecker::checkGenericSignature(
                   gp, dc,
                   dc->getGenericSignatureOfContext(),
                   /*allowConcreteGenericParams=*/false);
-  typeDecl->setGenericEnvironment(env);
+  typeDecl->setGenericSignature(sig);
 }
 
 ///

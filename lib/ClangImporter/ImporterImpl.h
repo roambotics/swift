@@ -802,10 +802,6 @@ public:
   GenericSignature *buildGenericSignature(GenericParamList *genericParams,
                                           DeclContext *dc);
 
-  /// Utility function for building simple generic environments.
-  GenericEnvironment *buildGenericEnvironment(GenericParamList *genericParams,
-                                              DeclContext *dc);
-
   /// Import the given Clang declaration context into Swift.
   ///
   /// Usually one will use \c importDeclContextOf instead.
@@ -949,9 +945,6 @@ public:
 
   /// Retrieve the NSCopying protocol type.
   Type getNSCopyingType();
-
-  /// Retrieve a sugared referenece to the given (imported) type.
-  Type getSugaredTypeReference(TypeDecl *type);
 
   /// Determines whether the given type matches an implicit type
   /// bound of "Hashable", which is used to validate NSDictionary/NSSet.
@@ -1243,12 +1236,6 @@ public:
   /// Returns the default definition type for \p ATD.
   Type loadAssociatedTypeDefault(const AssociatedTypeDecl *ATD,
                                  uint64_t contextData) override {
-    llvm_unreachable("unimplemented for ClangImporter");
-  }
-  
-  /// Returns the generic environment.
-  virtual GenericEnvironment *loadGenericEnvironment(const DeclContext *decl,
-                                                     uint64_t contextData) override {
     llvm_unreachable("unimplemented for ClangImporter");
   }
 

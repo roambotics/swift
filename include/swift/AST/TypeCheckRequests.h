@@ -57,10 +57,6 @@ class InheritedTypeRequest :
                               TypeResolutionStage),
                          CacheKind::SeparatelyCached>
 {
-  /// Retrieve the TypeLoc for this inherited type.
-  TypeLoc &getTypeLoc(llvm::PointerUnion<TypeDecl *, ExtensionDecl *> decl,
-                      unsigned index) const;
-
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -138,10 +134,10 @@ public:
 
 /// Request to determine the set of declarations that were are overridden
 /// by the given declaration.
-class OverriddenDeclsRequest
-  : public SimpleRequest<OverriddenDeclsRequest,
-                         llvm::TinyPtrVector<ValueDecl *>(ValueDecl *),
-                         CacheKind::SeparatelyCached> {
+class OverriddenDeclsRequest :
+  public SimpleRequest<OverriddenDeclsRequest,
+                       llvm::TinyPtrVector<ValueDecl *>(ValueDecl *),
+                       CacheKind::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -183,7 +179,7 @@ public:
 void simple_display(llvm::raw_ostream &out, CtorInitializerKind initKind);
 
 /// Computes the kind of initializer for a given \c ConstructorDecl
-class InitKindRequest:
+class InitKindRequest :
     public SimpleRequest<InitKindRequest,
                          CtorInitializerKind(ConstructorDecl *),
                          CacheKind::Cached> {
@@ -203,7 +199,7 @@ public:
 };
 
 /// Determine whether the given protocol declaration is class-bounded.
-class ProtocolRequiresClassRequest:
+class ProtocolRequiresClassRequest :
     public SimpleRequest<ProtocolRequiresClassRequest,
                          bool(ProtocolDecl *),
                          CacheKind::SeparatelyCached> {
@@ -229,7 +225,7 @@ public:
 
 /// Determine whether an existential conforming to a protocol can be matched
 /// with a generic type parameter constrained to that protocol.
-class ExistentialConformsToSelfRequest:
+class ExistentialConformsToSelfRequest :
     public SimpleRequest<ExistentialConformsToSelfRequest,
                          bool(ProtocolDecl *),
                          CacheKind::SeparatelyCached> {
@@ -255,7 +251,7 @@ public:
 
 /// Determine whether we are allowed to refer to an existential type conforming
 /// to this protocol.
-class ExistentialTypeSupportedRequest:
+class ExistentialTypeSupportedRequest :
     public SimpleRequest<ExistentialTypeSupportedRequest,
                          bool(ProtocolDecl *),
                          CacheKind::SeparatelyCached> {
@@ -374,10 +370,10 @@ struct WhereClauseOwner {
   WhereClauseOwner(Decl *decl);
 
   WhereClauseOwner(DeclContext *dc, GenericParamList *genericParams)
-    : dc(dc), source(genericParams) { }
+      : dc(dc), source(genericParams) {}
 
   WhereClauseOwner(DeclContext *dc, SpecializeAttr *attr)
-    : dc(dc), source(attr) { }
+      : dc(dc), source(attr) {}
 
   SourceLoc getLoc() const;
 
@@ -396,6 +392,19 @@ struct WhereClauseOwner {
                          const WhereClauseOwner &rhs) {
     return !(lhs == rhs);
   }
+
+public:
+  /// Retrieve the array of requirements.
+  MutableArrayRef<RequirementRepr> getRequirements() const;
+
+  /// Visit each of the requirements,
+  ///
+  /// \returns true after short-circuiting if the callback returned \c true
+  /// for any of the requirements.
+  bool
+  visitRequirements(TypeResolutionStage stage,
+                    llvm::function_ref<bool(Requirement, RequirementRepr *)>
+                        callback) const &&;
 };
 
 void simple_display(llvm::raw_ostream &out, const WhereClauseOwner &owner);
@@ -408,17 +417,6 @@ class RequirementRequest :
                          CacheKind::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
-
-  /// Retrieve the array of requirements from the given owner.
-  static MutableArrayRef<RequirementRepr> getRequirements(WhereClauseOwner);
-
-  /// Visit each of the requirements in the given owner,
-  ///
-  /// \returns true after short-circuiting if the callback returned \c true
-  /// for any of the requirements.
-  static bool visitRequirements(
-      WhereClauseOwner, TypeResolutionStage stage,
-      llvm::function_ref<bool(Requirement, RequirementRepr*)> callback);
 
 private:
   friend SimpleRequest;
@@ -505,20 +503,6 @@ public:
   bool isCached() const { return true; }
   Optional<Type> getCachedResult() const;
   void cacheResult(Type value) const;
-
-private:
-  KnownProtocolKind getKnownProtocolKind() const {
-    return std::get<0>(getStorage());
-  }
-  const DeclContext *getDeclContext() const {
-    return std::get<1>(getStorage());
-  }
-
-  static const char *getTypeName(KnownProtocolKind);
-  static bool getPerformLocalLookup(KnownProtocolKind);
-  TypeChecker &getTypeChecker() const;
-  SourceFile *getSourceFile() const;
-  Type &getCache() const;
 };
 
 /// Retrieve information about a property wrapper type.
@@ -1195,12 +1179,12 @@ void simple_display(llvm::raw_ostream &out, const TypeRepr *TyR);
 #undef SWIFT_TYPEID_HEADER
 
 // Set up reporting of evaluated requests.
-#define SWIFT_REQUEST(Zone, RequestType)                         \
-template<>                                                       \
-inline void reportEvaluatedRequest(UnifiedStatsReporter &stats,  \
-                            const RequestType &request) {        \
-  ++stats.getFrontendCounters().RequestType;                     \
-}
+#define SWIFT_REQUEST(Zone, RequestType, Sig, Caching, LocOptions)             \
+  template<>                                                                   \
+  inline void reportEvaluatedRequest(UnifiedStatsReporter &stats,              \
+                              const RequestType &request) {                    \
+    ++stats.getFrontendCounters().RequestType;                                 \
+  }
 #include "swift/AST/TypeCheckerTypeIDZone.def"
 #undef SWIFT_REQUEST
 
