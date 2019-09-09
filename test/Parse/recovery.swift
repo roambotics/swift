@@ -489,7 +489,7 @@ struct ErrorInFunctionSignatureResultArrayType1 {
 
 struct ErrorInFunctionSignatureResultArrayType2 {
   func foo() -> Int[0 { // expected-error {{expected ']' in array type}} expected-note {{to match this opening '['}}
-    return [0]  // expected-error {{cannot convert return expression of type '[Int]' to return type 'Int'}}
+    return [0]
   }
 }
 
@@ -756,11 +756,11 @@ let curlyQuotes2 = “hello world!"
 
 
 // <rdar://problem/21196171> compiler should recover better from "unicode Specials" characters
-let ￼tryx  = 123        // expected-error 2 {{invalid character in source file}}  {{5-8= }}
+let ￼tryx  = 123        // expected-error {{invalid character in source file}}  {{5-8= }}
 
 
 // <rdar://problem/21369926> Malformed Swift Enums crash playground service
-enum Rank: Int {  // expected-error {{'Rank' declares raw type 'Int', but does not conform to RawRepresentable and conformance could not be synthesized}}
+enum Rank: Int {  // expected-error {{'Rank' declares raw type 'Int', but does not conform to RawRepresentable and conformance could not be synthesized}} expected-note {{do you want to add protocol stubs?}}
   case Ace = 1
   case Two = 2.1  // expected-error {{cannot convert value of type 'Double' to raw type 'Int'}}
 }
@@ -843,3 +843,8 @@ func postfixDot(a : String) {
 func f() {
   _ = ClassWithStaticDecls.  // expected-error {{expected member name following '.'}}
 }
+
+
+// <rdar://problem/22478168> | SR-11006
+// expected-error@+1 {{expected '=' instead of '==' to assign default value for parameter}} {{21-23==}}
+func SR11006(a: Int == 0) {}

@@ -43,7 +43,6 @@ namespace swift {
   class CodeCompletionCallbacksFactory;
   class Decl;
   class DeclContext;
-  class DelayedParsingCallbacks;
   class DiagnosticConsumer;
   class DiagnosticEngine;
   class Evaluator;
@@ -114,14 +113,10 @@ namespace swift {
   /// \param PersistentState if non-null the same PersistentState object can
   /// be used to resume parsing or parse delayed function bodies.
   ///
-  /// \param DelayedParseCB if non-null enables delayed parsing for function
-  /// bodies.
-  ///
   /// \return true if the parser found code with side effects.
   bool parseIntoSourceFile(SourceFile &SF, unsigned BufferID, bool *Done,
                            SILParserState *SIL = nullptr,
                            PersistentParserState *PersistentState = nullptr,
-                           DelayedParsingCallbacks *DelayedParseCB = nullptr,
                            bool DelayBodyParsing = true);
 
   /// Parse a single buffer into the given source file, until the full source
@@ -129,8 +124,7 @@ namespace swift {
   ///
   /// \return true if the parser found code with side effects.
   bool parseIntoSourceFileFull(SourceFile &SF, unsigned BufferID,
-                             PersistentParserState *PersistentState = nullptr,
-                             DelayedParsingCallbacks *DelayedParseCB = nullptr,
+                               PersistentParserState *PersistentState = nullptr,
                                bool DelayBodyParsing = true);
 
   /// Finish the parsing by going over the nodes that were delayed
@@ -389,12 +383,30 @@ namespace swift {
   /// The ASTContext will automatically call these upon construction.
   void registerNameLookupRequestFunctions(Evaluator &evaluator);
 
+  /// Register Parse-level request functions with the evaluator.
+  ///
+  /// Clients that form an ASTContext and will perform any parsing queries
+  /// using Parse-level logic should call these functions after forming the
+  /// ASTContext.
+  void registerParseRequestFunctions(Evaluator &evaluator);
+
   /// Register Sema-level request functions with the evaluator.
   ///
   /// Clients that form an ASTContext and will perform any semantic queries
   /// using Sema-level logic should call these functions after forming the
   /// ASTContext.
   void registerTypeCheckerRequestFunctions(Evaluator &evaluator);
+
+  /// Register IDE-level request functions with the evaluator.
+  ///
+  /// The ASTContext will automatically call these upon construction.
+  void registerIDERequestFunctions(Evaluator &evaluator);
+
+  /// Register type check request functions for IDE's usage with the evaluator.
+  ///
+  /// The ASTContext will automatically call these upon construction.
+  /// Calling registerIDERequestFunctions will invoke this function as well.
+  void registerIDETypeCheckRequestFunctions(Evaluator &evaluator);
 
 } // end namespace swift
 

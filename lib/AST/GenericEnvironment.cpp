@@ -124,7 +124,7 @@ Type GenericEnvironment::mapTypeIntoContext(GenericEnvironment *env,
 Type MapTypeOutOfContext::operator()(SubstitutableType *type) const {
   auto archetype = cast<ArchetypeType>(type);
   if (isa<OpaqueTypeArchetypeType>(archetype->getRoot()))
-    return type;
+    return Type();
   
   return archetype->getInterfaceType();
 }
@@ -180,8 +180,7 @@ Type GenericEnvironment::mapTypeIntoContext(
 
   Type result = type.subst(QueryInterfaceTypeSubstitutions(this),
                            lookupConformance,
-                           (SubstFlags::AllowLoweredTypes|
-                            SubstFlags::UseErrorType));
+                           SubstFlags::AllowLoweredTypes);
   assert((!result->hasTypeParameter() || result->hasError()) &&
          "not fully substituted");
   return result;

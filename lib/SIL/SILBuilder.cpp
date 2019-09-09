@@ -280,6 +280,9 @@ static bool couldReduceStrongRefcount(SILInstruction *Inst) {
 #define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
   case SILInstructionKind::Store##Name##Inst: \
   ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, "...")
+#define UNCHECKED_REF_STORAGE(Name, ...)                                       \
+  case SILInstructionKind::Copy##Name##ValueInst:                              \
+    return false;
 #include "swift/AST/ReferenceStorage.def"
   case SILInstructionKind::LoadInst:
   case SILInstructionKind::StoreInst:
@@ -519,17 +522,17 @@ void SILBuilder::emitDestructureValueOperation(
   // Otherwise, we want to destructure add the destructure and return.
   if (getFunction().hasOwnership()) {
     auto *i = emitDestructureValueOperation(loc, v);
-    copy(i->getResults(), std::back_inserter(results));
+    llvm::copy(i->getResults(), std::back_inserter(results));
     return;
   }
 
   // In non qualified ownership SIL, drop back to using projection code.
   SmallVector<Projection, 16> projections;
   Projection::getFirstLevelProjections(v->getType(), getModule(), projections);
-  transform(projections, std::back_inserter(results),
-            [&](const Projection &p) -> SILValue {
-              return p.createObjectProjection(*this, loc, v).get();
-            });
+  llvm::transform(projections, std::back_inserter(results),
+                  [&](const Projection &p) -> SILValue {
+                    return p.createObjectProjection(*this, loc, v).get();
+                  });
 }
 
 // TODO: Can we put this on type lowering? It would take a little bit of work
@@ -547,10 +550,10 @@ void SILBuilder::emitDestructureAddressOperation(
 
   SmallVector<Projection, 16> projections;
   Projection::getFirstLevelProjections(v->getType(), getModule(), projections);
-  transform(projections, std::back_inserter(results),
-            [&](const Projection &p) -> SILValue {
-              return p.createAddressProjection(*this, loc, v).get();
-            });
+  llvm::transform(projections, std::back_inserter(results),
+                  [&](const Projection &p) -> SILValue {
+                    return p.createAddressProjection(*this, loc, v).get();
+                  });
 }
 
 void SILBuilder::emitDestructureValueOperation(

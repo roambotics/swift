@@ -18,7 +18,7 @@
 #ifndef SWIFT_SERIALIZATION_SILFORMAT_H
 #define SWIFT_SERIALIZATION_SILFORMAT_H
 
-#include "swift/Serialization/ModuleFormat.h"
+#include "ModuleFormat.h"
 
 namespace swift {
 namespace serialization {
@@ -290,9 +290,10 @@ namespace sil_block {
                      BCFixed<1>,  // has qualified ownership
                      BCFixed<1>,  // must be weakly referenced
                      BCFixed<1>,  // is dynamically replacable
+                     BCFixed<1>,  // exact self class
                      TypeIDField, // SILFunctionType
                      DeclIDField,  // SILFunction name or 0 (replaced function)
-                     GenericEnvironmentIDField,
+                     GenericSignatureIDField,
                      DeclIDField, // ClangNode owner
                      BCArray<IdentifierIDField> // Semantics Attribute
                      // followed by specialize attributes
@@ -302,7 +303,8 @@ namespace sil_block {
   using SILSpecializeAttrLayout =
       BCRecordLayout<SIL_SPECIALIZE_ATTR,
                      BCFixed<1>, // exported
-                     BCFixed<1> // specialization kind
+                     BCFixed<1>, // specialization kind
+                     GenericSignatureIDField // specialized signature
                      >;
 
   // Has an optional argument list where each argument is a typed valueref.
@@ -394,6 +396,7 @@ namespace sil_block {
   using SILOneTypeLayout = BCRecordLayout<
     SIL_ONE_TYPE,
     SILInstOpCodeField,
+    BCFixed<2>,          // Optional attributes
     TypeIDField,
     SILTypeCategoryField
   >;

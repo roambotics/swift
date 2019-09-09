@@ -1370,15 +1370,18 @@ class AllocStackInst final
   friend TrailingObjects;
   friend SILBuilder;
 
+  bool dynamicLifetime = false;
+
   AllocStackInst(SILDebugLocation Loc, SILType elementType,
                  ArrayRef<SILValue> TypeDependentOperands,
                  SILFunction &F,
-                 Optional<SILDebugVariable> Var);
+                 Optional<SILDebugVariable> Var, bool hasDynamicLifetime);
 
   static AllocStackInst *create(SILDebugLocation Loc, SILType elementType,
                                 SILFunction &F,
                                 SILOpenedArchetypesState &OpenedArchetypes,
-                                Optional<SILDebugVariable> Var);
+                                Optional<SILDebugVariable> Var,
+                                bool hasDynamicLifetime);
 
   size_t numTrailingObjects(OverloadToken<Operand>) const {
     return SILInstruction::Bits.AllocStackInst.NumOperands;
@@ -1392,6 +1395,9 @@ public:
       Operands[i].~Operand();
     }
   }
+
+  void setDynamicLifetime() { dynamicLifetime = true; }
+  bool hasDynamicLifetime() const { return dynamicLifetime; }
 
   /// Return the underlying variable declaration associated with this
   /// allocation, or null if this is a temporary allocation.
@@ -1616,19 +1622,25 @@ class AllocBoxInst final
 
   TailAllocatedDebugVariable VarInfo;
 
+  bool dynamicLifetime = false;
+
   AllocBoxInst(SILDebugLocation DebugLoc, CanSILBoxType BoxType,
                ArrayRef<SILValue> TypeDependentOperands, SILFunction &F,
-               Optional<SILDebugVariable> Var);
+               Optional<SILDebugVariable> Var, bool hasDynamicLifetime);
 
   static AllocBoxInst *create(SILDebugLocation Loc, CanSILBoxType boxType,
                               SILFunction &F,
                               SILOpenedArchetypesState &OpenedArchetypes,
-                              Optional<SILDebugVariable> Var);
+                              Optional<SILDebugVariable> Var,
+                              bool hasDynamicLifetime);
 
 public:
   CanSILBoxType getBoxType() const {
     return getType().castTo<SILBoxType>();
   }
+
+  void setDynamicLifetime() { dynamicLifetime = true; }
+  bool hasDynamicLifetime() const { return dynamicLifetime; }
 
   // Return the type of the memory stored in the alloc_box.
   SILType getAddressType() const {
@@ -3228,6 +3240,9 @@ public:
     return LoadOwnershipQualifier(
       SILInstruction::Bits.LoadInst.OwnershipQualifier);
   }
+  void setOwnershipQualifier(LoadOwnershipQualifier qualifier) {
+    SILInstruction::Bits.LoadInst.OwnershipQualifier = unsigned(qualifier);
+  }
 };
 
 // *NOTE* When serializing, we can only represent up to 4 values here. If more
@@ -3266,6 +3281,9 @@ public:
   StoreOwnershipQualifier getOwnershipQualifier() const {
     return StoreOwnershipQualifier(
       SILInstruction::Bits.StoreInst.OwnershipQualifier);
+  }
+  void setOwnershipQualifier(StoreOwnershipQualifier qualifier) {
+    SILInstruction::Bits.StoreInst.OwnershipQualifier = unsigned(qualifier);
   }
 };
 
@@ -3389,8 +3407,7 @@ public:
       return bbi->getOperand();
     if (auto *lbi = dyn_cast<LoadBorrowInst>(v))
       return lbi->getOperand();
-    llvm::errs() << "Can not end borrow for value: " << v;
-    llvm_unreachable("standard error assertion");
+    return SILValue();
   }
 
   /// Return the set of guaranteed values that have scopes ended by this
@@ -4824,11 +4841,10 @@ public:
 
     StructDecl *S = getStructDecl();
 
-    NominalTypeDecl::StoredPropertyRange Range = S->getStoredProperties();
-    unsigned Index = 0;
-    for (auto I = Range.begin(), E = Range.end(); I != E; ++I, ++Index)
-      if (V == *I)
-        return &getAllOperands()[Index];
+    auto Props = S->getStoredProperties();
+    for (unsigned I = 0, E = Props.size(); I < E; ++I)
+      if (V == Props[I])
+        return &getAllOperands()[I];
 
     // Did not find a matching VarDecl, return nullptr.
     return nullptr;
@@ -6458,15 +6474,25 @@ class CopyValueInst
       : UnaryInstructionBase(DebugLoc, operand, operand->getType()) {}
 };
 
-#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
-class Copy##Name##ValueInst \
-    : public UnaryInstructionBase<SILInstructionKind::Copy##Name##ValueInst, \
-                                  SingleValueInstruction> { \
-  friend class SILBuilder; \
-  Copy##Name##ValueInst(SILDebugLocation DebugLoc, SILValue operand, \
-                        SILType type) \
-      : UnaryInstructionBase(DebugLoc, operand, type) {} \
-};
+#define UNCHECKED_REF_STORAGE(Name, ...)                                       \
+  class Copy##Name##ValueInst                                                  \
+      : public UnaryInstructionBase<SILInstructionKind::Copy##Name##ValueInst, \
+                                    SingleValueInstruction> {                  \
+    friend class SILBuilder;                                                   \
+    Copy##Name##ValueInst(SILDebugLocation DebugLoc, SILValue operand,         \
+                          SILType type)                                        \
+        : UnaryInstructionBase(DebugLoc, operand, type) {}                     \
+  };
+
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)            \
+  class Copy##Name##ValueInst                                                  \
+      : public UnaryInstructionBase<SILInstructionKind::Copy##Name##ValueInst, \
+                                    SingleValueInstruction> {                  \
+    friend class SILBuilder;                                                   \
+    Copy##Name##ValueInst(SILDebugLocation DebugLoc, SILValue operand,         \
+                          SILType type)                                        \
+        : UnaryInstructionBase(DebugLoc, operand, type) {}                     \
+  };
 #include "swift/AST/ReferenceStorage.def"
 
 class DestroyValueInst
@@ -6715,14 +6741,28 @@ class ProjectExistentialBoxInst
 //===----------------------------------------------------------------------===//
 
 /// Trigger a runtime failure if the given Int1 value is true.
-class CondFailInst
+///
+/// Optionally cond_fail has a static failure message, which is displayed in the debugger in case the failure
+/// is triggered.
+class CondFailInst final
     : public UnaryInstructionBase<SILInstructionKind::CondFailInst,
-                                  NonValueInstruction>
+                                  NonValueInstruction>,
+      private llvm::TrailingObjects<CondFailInst, char>
 {
+  friend TrailingObjects;
   friend SILBuilder;
 
-  CondFailInst(SILDebugLocation DebugLoc, SILValue Operand)
-      : UnaryInstructionBase(DebugLoc, Operand) {}
+  unsigned MessageSize;
+
+  CondFailInst(SILDebugLocation DebugLoc, SILValue Operand, StringRef Message);
+
+  static CondFailInst *create(SILDebugLocation DebugLoc, SILValue Operand,
+                              StringRef Message, SILModule &M);
+
+public:
+  StringRef getMessage() const {
+    return {getTrailingObjects<char>(), MessageSize};
+  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -7816,12 +7856,12 @@ bool ApplyInstBase<Impl, Base, false>::isCalleeDynamicallyReplaceable() const {
   SILValue Callee = getCalleeOrigin();
 
   while (true) {
-    if (auto *FRI = dyn_cast<FunctionRefInst>(Callee))
+    if (isa<FunctionRefInst>(Callee))
       return false;
 
-    if (auto *FRI = dyn_cast<DynamicFunctionRefInst>(Callee))
+    if (isa<DynamicFunctionRefInst>(Callee))
       return true;
-    if (auto *FRI = dyn_cast<PreviousDynamicFunctionRefInst>(Callee))
+    if (isa<PreviousDynamicFunctionRefInst>(Callee))
       return true;
 
     if (auto *PAI = dyn_cast<PartialApplyInst>(Callee)) {

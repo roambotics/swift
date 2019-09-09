@@ -821,23 +821,15 @@ namespace {
 
     /// Retrieve the 'Code' type for a bridged NSError, or nullptr if
     /// this is not a bridged NSError type.
-    static TypeDecl *getBridgedNSErrorCode(TypeDecl *decl) {
-      auto nominal = dyn_cast<NominalTypeDecl>(decl);
-      if (!nominal) return nullptr;
+    TypeDecl *getBridgedNSErrorCode(TypeDecl *decl) {
+      auto errorWrapper = dyn_cast<StructDecl>(decl);
+      if (!errorWrapper) return nullptr;
 
-      const DeclAttributes &allAttrs = decl->getAttrs();
+      const DeclAttributes &allAttrs = errorWrapper->getAttrs();
       for (auto attr : allAttrs.getAttributes<SynthesizedProtocolAttr>()) {
         if (attr->getProtocolKind() ==
             KnownProtocolKind::BridgedStoredNSError) {
-          auto &ctx = nominal->getASTContext();
-          auto flags = OptionSet<NominalTypeDecl::LookupDirectFlags>();
-          flags |= NominalTypeDecl::LookupDirectFlags::IgnoreNewExtensions;
-          auto lookup = nominal->lookupDirect(ctx.Id_Code, flags);
-          for (auto found : lookup) {
-            if (auto codeDecl = dyn_cast<TypeDecl>(found))
-              return codeDecl;
-          }
-          llvm_unreachable("couldn't find 'Code' within bridged error type");
+          return Impl.lookupErrorCodeEnum(errorWrapper);
         }
       }
 
@@ -1735,7 +1727,7 @@ ParameterList *ClangImporter::Implementation::importFunctionParameterList(
     // imported header unit.
     auto paramInfo = createDeclWithClangNode<ParamDecl>(
         param, AccessLevel::Private,
-        VarDecl::Specifier::Default, SourceLoc(), SourceLoc(), name,
+        ParamDecl::Specifier::Default, SourceLoc(), SourceLoc(), name,
         importSourceLoc(param->getLocation()), bodyName,
         ImportedHeaderUnit);
 
@@ -1752,7 +1744,7 @@ ParameterList *ClangImporter::Implementation::importFunctionParameterList(
         BoundGenericType::get(SwiftContext.getArrayDecl(), Type(),
                               {SwiftContext.TheAnyType});
     auto name = SwiftContext.getIdentifier("varargs");
-    auto param = new (SwiftContext) ParamDecl(VarDecl::Specifier::Default,
+    auto param = new (SwiftContext) ParamDecl(ParamDecl::Specifier::Default,
                                               SourceLoc(), SourceLoc(),
                                               Identifier(), SourceLoc(),
                                               name,
@@ -2052,7 +2044,7 @@ ImportedType ClangImporter::Implementation::importMethodType(
     // It doesn't actually matter which DeclContext we use, so just
     // use the imported header unit.
     auto type = TupleType::getEmpty(SwiftContext);
-    auto var = new (SwiftContext) ParamDecl(VarDecl::Specifier::Default, SourceLoc(),
+    auto var = new (SwiftContext) ParamDecl(ParamDecl::Specifier::Default, SourceLoc(),
                                             SourceLoc(), argName,
                                             SourceLoc(), argName,
                                             ImportedHeaderUnit);
@@ -2175,7 +2167,7 @@ ImportedType ClangImporter::Implementation::importMethodType(
     // Set up the parameter info.
     auto paramInfo
       = createDeclWithClangNode<ParamDecl>(param, AccessLevel::Private,
-                                           VarDecl::Specifier::Default,
+                                           ParamDecl::Specifier::Default,
                                            SourceLoc(), SourceLoc(), name,
                                            importSourceLoc(param->getLocation()),
                                            bodyName,
@@ -2287,7 +2279,7 @@ ImportedType ClangImporter::Implementation::importAccessorMethodType(
     Identifier argLabel = functionName.getDeclName().getArgumentNames().front();
     auto paramInfo
       = createDeclWithClangNode<ParamDecl>(param, AccessLevel::Private,
-                                           VarDecl::Specifier::Default,
+                                           ParamDecl::Specifier::Default,
                                            /*let loc*/SourceLoc(),
                                            /*label loc*/SourceLoc(),
                                            argLabel, nameLoc, bodyName,
@@ -2372,8 +2364,8 @@ Type ClangImporter::Implementation::getNamedSwiftType(ModuleDecl *module,
 
   assert(!decl->hasClangNode() && "picked up the original type?");
 
-  if (auto *typeResolver = getTypeResolver())
-    typeResolver->resolveDeclSignature(decl);
+  if (auto *lazyResolver = SwiftContext.getLazyResolver())
+    lazyResolver->resolveDeclSignature(decl);
 
   if (auto *nominalDecl = dyn_cast<NominalTypeDecl>(decl))
     return nominalDecl->getDeclaredType();

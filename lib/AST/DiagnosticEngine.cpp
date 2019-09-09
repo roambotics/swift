@@ -99,6 +99,15 @@ static constexpr const char * const diagnosticStrings[] = {
     "<not a diagnostic>",
 };
 
+static constexpr const char *const debugDiagnosticStrings[] = {
+#define ERROR(ID, Options, Text, Signature) Text " [" #ID "]",
+#define WARNING(ID, Options, Text, Signature) Text " [" #ID "]",
+#define NOTE(ID, Options, Text, Signature) Text " [" #ID "]",
+#define REMARK(ID, Options, Text, Signature) Text " [" #ID "]",
+#include "swift/AST/DiagnosticsAll.def"
+    "<not a diagnostic>",
+};
+
 DiagnosticState::DiagnosticState() {
   // Initialize our per-diagnostic state to default
   perDiagnosticBehavior.resize(LocalDiagID::NumDiags, Behavior::Unspecified);
@@ -440,8 +449,14 @@ static void formatDiagnosticArgument(StringRef Modifier,
     break;
 
   case DiagnosticArgumentKind::String:
-    assert(Modifier.empty() && "Improper modifier for string argument");
-    Out << Arg.getAsString();
+    if (Modifier == "select") {
+      formatSelectionArgument(ModifierArguments, Args,
+                              Arg.getAsString().empty() ? 0 : 1, FormatOpts,
+                              Out);
+    } else {
+      assert(Modifier.empty() && "Improper modifier for string argument");
+      Out << Arg.getAsString();
+    }
     break;
 
   case DiagnosticArgumentKind::Identifier:
@@ -468,6 +483,13 @@ static void formatDiagnosticArgument(StringRef Modifier,
     
     // Strip extraneous parentheses; they add no value.
     auto type = Arg.getAsType()->getWithoutParens();
+
+    // If a type has an unresolved type, print it with syntax sugar removed for
+    // clarity. For example, print `Array<_>` instead of `[_]`.
+    if (type->hasUnresolvedType()) {
+      type = type->getWithoutSyntaxSugar();
+    }
+
     bool isAmbiguous = typeSpellingIsAmbiguous(type, Args);
 
     if (isAmbiguous && isa<OpaqueTypeArchetypeType>(type.getPointer())) {
@@ -747,6 +769,7 @@ void DiagnosticEngine::flushActiveDiagnostic() {
   if (TransactionCount == 0) {
     emitDiagnostic(*ActiveDiagnostic);
   } else {
+    onTentativeDiagnosticFlush(*ActiveDiagnostic);
     TentativeDiagnostics.emplace_back(std::move(*ActiveDiagnostic));
   }
   ActiveDiagnostic.reset();
@@ -885,14 +908,18 @@ void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
   Info.Ranges = diagnostic.getRanges();
   Info.FixIts = diagnostic.getFixIts();
   for (auto &Consumer : Consumers) {
-    Consumer->handleDiagnostic(SourceMgr, loc, toDiagnosticKind(behavior),
-                               diagnosticStringFor(Info.ID),
-                               diagnostic.getArgs(), Info,
-                               getDefaultDiagnosticLoc());
+    Consumer->handleDiagnostic(
+        SourceMgr, loc, toDiagnosticKind(behavior),
+        diagnosticStringFor(Info.ID, getPrintDiagnosticNames()),
+        diagnostic.getArgs(), Info, getDefaultDiagnosticLoc());
   }
 }
 
-const char *DiagnosticEngine::diagnosticStringFor(const DiagID id) {
+const char *DiagnosticEngine::diagnosticStringFor(const DiagID id,
+                                                  bool printDiagnosticName) {
+  if (printDiagnosticName) {
+    return debugDiagnosticStrings[(unsigned)id];
+  }
   return diagnosticStrings[(unsigned)id];
 }
 
@@ -923,6 +950,10 @@ DiagnosticSuppression::~DiagnosticSuppression() {
     diags.addConsumer(*consumer);
 }
 
+bool DiagnosticSuppression::isEnabled(const DiagnosticEngine &diags) {
+  return diags.getConsumers().empty();
+}
+
 BufferIndirectlyCausingDiagnosticRAII::BufferIndirectlyCausingDiagnosticRAII(
     const SourceFile &SF)
     : Diags(SF.getASTContext().Diags) {
@@ -932,4 +963,18 @@ BufferIndirectlyCausingDiagnosticRAII::BufferIndirectlyCausingDiagnosticRAII(
   auto loc = SF.getASTContext().SourceMgr.getLocForBufferStart(*id);
   if (loc.isValid())
     Diags.setBufferIndirectlyCausingDiagnosticToInput(loc);
+}
+
+void DiagnosticEngine::onTentativeDiagnosticFlush(Diagnostic &diagnostic) {
+  for (auto &argument : diagnostic.Args) {
+    if (argument.getKind() != DiagnosticArgumentKind::String)
+      continue;
+
+    auto content = argument.getAsString();
+    if (content.empty())
+      continue;
+
+    auto I = TransactionStrings.insert(std::make_pair(content, char())).first;
+    argument = DiagnosticArgument(StringRef(I->getKeyData()));
+  }
 }
