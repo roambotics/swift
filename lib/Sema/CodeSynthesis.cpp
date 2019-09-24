@@ -29,6 +29,7 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Defer.h"
 #include "swift/ClangImporter/ClangModule.h"
@@ -539,7 +540,7 @@ synthesizeDesignatedInitOverride(AbstractFunctionDecl *fn, void *context) {
 
   auto *superclassCtor = (ConstructorDecl *) context;
 
-  if (!superclassCtor->hasValidSignature())
+  if (!superclassCtor->hasInterfaceType())
     ctx.getLazyResolver()->resolveDeclSignature(superclassCtor);
 
   // Reference to super.init.
@@ -855,9 +856,9 @@ static void addImplicitConstructorsToStruct(StructDecl *decl, ASTContext &ctx) {
       if (!var->isMemberwiseInitialized(/*preferDeclaredProperties=*/true))
         continue;
 
-      if (!var->hasValidSignature())
+      if (!var->hasInterfaceType())
         ctx.getLazyResolver()->resolveDeclSignature(var);
-      if (!var->hasValidSignature())
+      if (!var->hasInterfaceType())
         return;
     }
   }
@@ -922,9 +923,9 @@ static void addImplicitConstructorsToClass(ClassDecl *decl, ASTContext &ctx) {
   if (!decl->hasClangNode()) {
     for (auto member : decl->getMembers()) {
       if (auto ctor = dyn_cast<ConstructorDecl>(member)) {
-        if (!ctor->hasValidSignature())
+        if (!ctor->hasInterfaceType())
           ctx.getLazyResolver()->resolveDeclSignature(ctor);
-        if (!ctor->hasValidSignature())
+        if (!ctor->hasInterfaceType())
           return;
       }
     }
@@ -1078,11 +1079,6 @@ static void addImplicitConstructorsToClass(ClassDecl *decl, ASTContext &ctx) {
                     ? DesignatedInitKind::Chaining
                     : DesignatedInitKind::Stub;
 
-      // We have a designated initializer. Create an override of it.
-      // FIXME: Validation makes sure we get a generic signature here.
-      if (!decl->hasValidSignature())
-        ctx.getLazyResolver()->resolveDeclSignature(decl);
-
       if (auto ctor = createDesignatedInitOverride(
                         decl, superclassCtor, kind, ctx)) {
         decl->addMember(ctor);
@@ -1125,7 +1121,7 @@ void TypeChecker::addImplicitConstructors(NominalTypeDecl *decl) {
   if (decl->isInvalid())
     return;
 
-  // Don't add implicit constructors in parseable interfaces.
+  // Don't add implicit constructors in module interfaces.
   if (auto *SF = decl->getParentSourceFile()) {
     if (SF->Kind == SourceFileKind::Interface) {
       decl->setAddedImplicitInitializers();

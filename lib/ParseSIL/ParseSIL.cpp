@@ -16,6 +16,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Timer.h"
@@ -1219,8 +1220,7 @@ static ValueDecl *lookupMember(Parser &P, Type Ty, DeclBaseName Name,
       Lookup.append(found.begin(), found.end());
     }
   } else if (auto moduleTy = CheckTy->getAs<ModuleType>()) {
-    moduleTy->getModule()->lookupValue({ }, Name, NLKind::QualifiedLookup,
-                                       Lookup);
+    moduleTy->getModule()->lookupValue(Name, NLKind::QualifiedLookup, Lookup);
   } else {
     P.diagnose(Loc, diag::sil_member_lookup_bad_type, Name, Ty);
     return nullptr;
@@ -3115,7 +3115,7 @@ bool SILParser::parseSILInstruction(SILBuilder &B) {
     SmallVector<SILType, 4> operandTypes;
     {
       Scope genericsScope(&P, ScopeKind::Generics);
-      generics = P.maybeParseGenericParams().getPtrOrNull();
+      generics = P.parseSILGenericParams().getPtrOrNull();
       patternEnv = handleSILGenericParams(P.Context, generics, &P.SF);
       
       if (P.parseToken(tok::l_paren, diag::expected_tok_in_sil_instr, "("))
@@ -4525,7 +4525,7 @@ bool SILParser::parseSILInstruction(SILBuilder &B) {
     SmallVector<ValueDecl*, 4> CurModuleResults;
     // Perform a module level lookup on the first component of the
     // fully-qualified name.
-    P.SF.getParentModule()->lookupValue(ModuleDecl::AccessPathTy(), ProtocolName,
+    P.SF.getParentModule()->lookupValue(ProtocolName,
                                         NLKind::UnqualifiedLookup,
                                         CurModuleResults);
     assert(CurModuleResults.size() == 1);
@@ -5617,7 +5617,7 @@ static Optional<VarDecl *> lookupGlobalDecl(Identifier GlobalName,
 
   SmallVector<ValueDecl *, 4> CurModuleResults;
   P.SF.getParentModule()->lookupValue(
-      {}, P.Context.getIdentifier(GlobalDeclName), NLKind::UnqualifiedLookup,
+      P.Context.getIdentifier(GlobalDeclName), NLKind::UnqualifiedLookup,
       CurModuleResults);
   // Bail-out on clang-imported globals.
   if (CurModuleResults.empty())
@@ -5720,7 +5720,7 @@ bool SILParserTUState::parseSILProperty(Parser &P) {
   GenericEnvironment *patternEnv;
   Scope toplevelScope(&P, ScopeKind::TopLevel);
   Scope genericsScope(&P, ScopeKind::Generics);
-  generics = P.maybeParseGenericParams().getPtrOrNull();
+  generics = P.parseSILGenericParams().getPtrOrNull();
   patternEnv = handleSILGenericParams(P.Context, generics, &P.SF);
   
   if (patternEnv) {
@@ -6033,7 +6033,7 @@ Optional<ProtocolConformanceRef> SILParser::parseProtocolConformance(
   // Make sure we don't leave it uninitialized in the caller
   genericEnv = nullptr;
 
-  auto *genericParams = P.maybeParseGenericParams().getPtrOrNull();
+  auto *genericParams = P.parseSILGenericParams().getPtrOrNull();
   if (genericParams) {
     genericEnv = handleSILGenericParams(P.Context, genericParams, &P.SF);
   }

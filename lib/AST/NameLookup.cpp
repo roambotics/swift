@@ -28,6 +28,7 @@
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/ReferencedNameTracker.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/STLExtras.h"
@@ -193,6 +194,27 @@ static void recordShadowedDeclsAfterSignatureMatch(
     auto firstDecl = decls[firstIdx];
     auto firstModule = firstDecl->getModuleContext();
     auto name = firstDecl->getBaseName();
+
+    auto isShadowed = [&](ArrayRef<ModuleDecl::AccessPathTy> paths) {
+      for (auto path : paths) {
+        if (ModuleDecl::matchesAccessPath(path, name))
+          return false;
+      }
+
+      return true;
+    };
+
+    auto isScopedImport = [&](ArrayRef<ModuleDecl::AccessPathTy> paths) {
+      for (auto path : paths) {
+        if (path.empty())
+          continue;
+        if (ModuleDecl::matchesAccessPath(path, name))
+          return true;
+      }
+
+      return false;
+    };
+
     for (unsigned secondIdx : range(firstIdx + 1, decls.size())) {
       // Determine whether one module takes precedence over another.
       auto secondDecl = decls[secondIdx];
@@ -206,22 +228,28 @@ static void recordShadowedDeclsAfterSignatureMatch(
       if (firstModule != secondModule &&
           firstDecl->getDeclContext()->isModuleScopeContext() &&
           secondDecl->getDeclContext()->isModuleScopeContext()) {
-        // First, scoped imports shadow unscoped imports.
-        bool firstScoped = imports.isScopedImport(firstModule, name, dc);
-        bool secondScoped = imports.isScopedImport(secondModule, name, dc);
-        if (!firstScoped && secondScoped) {
+        auto firstPaths = imports.getAllAccessPathsNotShadowedBy(
+          firstModule, secondModule, dc);
+        auto secondPaths = imports.getAllAccessPathsNotShadowedBy(
+          secondModule, firstModule, dc);
+
+        // Check if one module shadows the other.
+        if (isShadowed(firstPaths)) {
           shadowed.insert(firstDecl);
           break;
-        } else if (firstScoped && !secondScoped) {
+        } else if (isShadowed(secondPaths)) {
           shadowed.insert(secondDecl);
           continue;
         }
 
-        // Now check if one module shadows the other.
-        if (imports.isShadowedBy(firstModule, secondModule, name, dc)) {
+        // We might be in a situation where neither module shadows the
+        // other, but one declaration is visible via a scoped import.
+        bool firstScoped = isScopedImport(firstPaths);
+        bool secondScoped = isScopedImport(secondPaths);
+        if (!firstScoped && secondScoped) {
           shadowed.insert(firstDecl);
           break;
-        } else if (imports.isShadowedBy(secondModule, firstModule, name, dc)) {
+        } else if (firstScoped && !secondScoped) {
           shadowed.insert(secondDecl);
           continue;
         }
@@ -278,10 +306,16 @@ static void recordShadowedDeclsAfterSignatureMatch(
       if (firstModule != secondModule &&
           !firstDecl->getDeclContext()->isModuleScopeContext() &&
           !secondDecl->getDeclContext()->isModuleScopeContext()) {
-        if (imports.isShadowedBy(firstModule, secondModule, dc)) {
+        auto firstPaths = imports.getAllAccessPathsNotShadowedBy(
+          firstModule, secondModule, dc);
+        auto secondPaths = imports.getAllAccessPathsNotShadowedBy(
+          secondModule, firstModule, dc);
+
+        // Check if one module shadows the other.
+        if (isShadowed(firstPaths)) {
           shadowed.insert(firstDecl);
           break;
-        } else if (imports.isShadowedBy(secondModule, firstModule, dc)) {
+        } else if (isShadowed(secondPaths)) {
           shadowed.insert(secondDecl);
           continue;
         }
@@ -436,7 +470,7 @@ static void recordShadowedDecls(ArrayRef<ValueDecl *> decls,
       // If the decl is currently being validated, this is likely a recursive
       // reference and we'll want to skip ahead so as to avoid having its type
       // attempt to desugar itself.
-      if (!decl->hasValidSignature())
+      if (!decl->hasInterfaceType())
         continue;
 
       // FIXME: the canonical type makes a poor signature, because we don't
@@ -1133,6 +1167,7 @@ maybeFilterOutAttrImplements(TinyPtrVector<ValueDecl *> decls,
       result.push_back(V);
     } else {
       auto A = V->getAttrs().getAttribute<ImplementsAttr>();
+      (void)A;
       assert(A && A->getMemberName().matchesRef(name));
     }
   }
@@ -1779,7 +1814,7 @@ resolveTypeDeclsToNominal(Evaluator &evaluator,
       // Recognize Swift.AnyObject directly.
       if (typealias->getName().is("AnyObject")) {
         // TypeRepr version: Builtin.AnyObject
-        if (auto typeRepr = typealias->getUnderlyingTypeLoc().getTypeRepr()) {
+        if (auto typeRepr = typealias->getUnderlyingTypeRepr()) {
           if (auto compound = dyn_cast<CompoundIdentTypeRepr>(typeRepr)) {
             auto components = compound->getComponents();
             if (components.size() == 2 &&
@@ -1791,9 +1826,10 @@ resolveTypeDeclsToNominal(Evaluator &evaluator,
         }
 
         // Type version: an empty class-bound existential.
-        if (auto type = typealias->getUnderlyingTypeLoc().getType()) {
-          if (type->isAnyObject())
-            anyObject = true;
+        if (typealias->hasInterfaceType()) {
+          if (auto type = typealias->getUnderlyingType())
+            if (type->isAnyObject())
+              anyObject = true;
         }
       }
 
@@ -2057,7 +2093,7 @@ DirectlyReferencedTypeDecls UnderlyingTypeDeclsReferencedRequest::evaluate(
     Evaluator &evaluator,
     TypeAliasDecl *typealias) const {
   // Prefer syntactic information when we have it.
-  if (auto typeRepr = typealias->getUnderlyingTypeLoc().getTypeRepr()) {
+  if (auto typeRepr = typealias->getUnderlyingTypeRepr()) {
     return directReferencesForTypeRepr(evaluator, typealias->getASTContext(),
                                        typeRepr, typealias);
   }
@@ -2065,7 +2101,7 @@ DirectlyReferencedTypeDecls UnderlyingTypeDeclsReferencedRequest::evaluate(
   // Fall back to semantic types.
   // FIXME: In the long run, we shouldn't need this. Non-syntactic results
   // should be cached.
-  if (auto type = typealias->getUnderlyingTypeLoc().getType()) {
+  if (auto type = typealias->getUnderlyingType()) {
     return directReferencesForType(type);
   }
 

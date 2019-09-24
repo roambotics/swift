@@ -592,6 +592,12 @@ class ASTScope {
 public:
   ASTScope(SourceFile *);
 
+  void
+  buildEnoughOfTreeForTopLevelExpressionsButDontRequestGenericsOrExtendedNominals();
+
+  /// Flesh out the tree for dumping
+  void buildFullyExpandedTree();
+
   /// \return the scopes traversed
   static llvm::SmallVector<const ast_scope::ASTScopeImpl *, 0>
   unqualifiedLookup(SourceFile *, DeclName, SourceLoc,

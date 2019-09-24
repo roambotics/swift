@@ -29,6 +29,7 @@
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/RawComment.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeVisitor.h"
 #include "swift/Basic/Dwarf.h"
@@ -719,7 +720,7 @@ void Serializer::writeBlockInfoBlock() {
   BLOCK_RECORD(input_block, SEARCH_PATH);
   BLOCK_RECORD(input_block, FILE_DEPENDENCY);
   BLOCK_RECORD(input_block, DEPENDENCY_DIRECTORY);
-  BLOCK_RECORD(input_block, PARSEABLE_INTERFACE_PATH);
+  BLOCK_RECORD(input_block, MODULE_INTERFACE_PATH);
 
   BLOCK(DECLS_AND_TYPES_BLOCK);
 #define RECORD(X) BLOCK_RECORD(decls_block, X);
@@ -941,7 +942,7 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
   input_block::SearchPathLayout SearchPath(Out);
   input_block::FileDependencyLayout FileDependency(Out);
   input_block::DependencyDirectoryLayout DependencyDirectory(Out);
-  input_block::ParseableInterfaceLayout ParseableInterface(Out);
+  input_block::ModuleInterfaceLayout ModuleInterface(Out);
 
   if (options.SerializeOptionsForDebugging) {
     const SearchPathOptions &searchPathOpts = M->getASTContext().SearchPathOpts;
@@ -974,8 +975,8 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
                         llvm::sys::path::filename(dep.getPath()));
   }
 
-  if (!options.ParseableInterface.empty())
-    ParseableInterface.emit(ScratchRecord, options.ParseableInterface);
+  if (!options.ModuleInterface.empty())
+    ModuleInterface.emit(ScratchRecord, options.ModuleInterface);
 
   ModuleDecl::ImportFilter allImportFilter;
   allImportFilter |= ModuleDecl::ImportFilterKind::Public;
@@ -2568,7 +2569,7 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
     using namespace decls_block;
     // Only serialize the text for an inlinable function body if we're emitting
     // a partial module. It's not needed in the final module file, but it's
-    // needed in partial modules so you can emit a parseable interface after
+    // needed in partial modules so you can emit a module interface after
     // merging them.
     if (!S.SF) return;
 
@@ -2797,7 +2798,7 @@ public:
 
     auto contextID = S.addDeclContextRef(typeAlias->getDeclContext());
 
-    auto underlying = typeAlias->getUnderlyingTypeLoc().getType();
+    auto underlying = typeAlias->getUnderlyingType();
 
     llvm::SmallSetVector<Type, 4> dependencies;
     collectDependenciesFromType(dependencies, underlying->getCanonicalType(),
@@ -3261,7 +3262,7 @@ public:
     //
     // FIXME: Once accessor synthesis and getInterfaceType() itself are
     // request-ified this goes away.
-    if (!fn->hasValidSignature()) {
+    if (!fn->hasInterfaceType()) {
       assert(fn->isImplicit());
       S.M->getASTContext().getLazyResolver()->resolveDeclSignature(
           const_cast<AccessorDecl *>(fn));
@@ -3653,8 +3654,7 @@ static TypeAliasDecl *findTypeAliasForBuiltin(ASTContext &Ctx, Type T) {
   StringRef TypeName = FullName.substr(8);
 
   SmallVector<ValueDecl*, 4> CurModuleResults;
-  Ctx.TheBuiltinModule->lookupValue(ModuleDecl::AccessPathTy(),
-                                    Ctx.getIdentifier(TypeName),
+  Ctx.TheBuiltinModule->lookupValue(Ctx.getIdentifier(TypeName),
                                     NLKind::QualifiedLookup,
                                     CurModuleResults);
   assert(CurModuleResults.size() == 1);
@@ -3718,7 +3718,7 @@ public:
   void visitTypeAliasType(const TypeAliasType *alias) {
     using namespace decls_block;
     const TypeAliasDecl *typeAlias = alias->getDecl();
-    auto underlyingType = typeAlias->getUnderlyingTypeLoc().getType();
+    auto underlyingType = typeAlias->getUnderlyingType();
 
     unsigned abbrCode = S.DeclTypeAbbrCodes[TypeAliasTypeLayout::Code];
     TypeAliasTypeLayout::emitRecord(

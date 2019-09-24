@@ -1927,7 +1927,7 @@ namespace {
       }
 
       tc.validateDecl(maxFloatTypeDecl);
-      auto maxType = maxFloatTypeDecl->getUnderlyingTypeLoc().getType();
+      auto maxType = maxFloatTypeDecl->getUnderlyingType();
 
       DeclName initName(tc.Context, DeclBaseName::createConstructor(),
                         { tc.Context.Id_floatLiteral });
@@ -4243,11 +4243,11 @@ namespace {
 
         auto locator = cs.getConstraintLocator(
             E, LocatorPathElt::KeyPathComponent(i));
-        if (kind == KeyPathExpr::Component::Kind::UnresolvedSubscript) {
-          locator =
-            cs.getConstraintLocator(locator,
-                                    ConstraintLocator::SubscriptMember);
-        }
+
+        // Adjust the locator such that it includes any additional elements to
+        // point to the component's callee, e.g a SubscriptMember for a
+        // subscript component.
+        locator = cs.getCalleeLocator(locator);
 
         bool isDynamicMember = false;
         // If this is an unresolved link, make sure we resolved it.
@@ -5384,10 +5384,11 @@ Expr *ExprRewriter::coerceCallArguments(
   auto params = funcType->getParams();
 
   // Local function to produce a locator to refer to the given parameter.
-  auto getArgLocator = [&](unsigned argIdx, unsigned paramIdx)
-                         -> ConstraintLocatorBuilder {
+  auto getArgLocator =
+      [&](unsigned argIdx, unsigned paramIdx,
+          ParameterTypeFlags flags) -> ConstraintLocatorBuilder {
     return locator.withPathElement(
-             LocatorPathElt::ApplyArgToParam(argIdx, paramIdx));
+        LocatorPathElt::ApplyArgToParam(argIdx, paramIdx, flags));
   };
 
   bool matchCanFail =
@@ -5499,8 +5500,9 @@ Expr *ExprRewriter::coerceCallArguments(
         }
 
         // Convert the argument.
-        auto convertedArg = coerceToType(arg, param.getPlainType(),
-                                         getArgLocator(argIdx, paramIdx));
+        auto convertedArg = coerceToType(
+            arg, param.getPlainType(),
+            getArgLocator(argIdx, paramIdx, param.getParameterFlags()));
         if (!convertedArg)
           return nullptr;
 
@@ -5620,8 +5622,9 @@ Expr *ExprRewriter::coerceCallArguments(
       convertedArg = cs.TC.buildAutoClosureExpr(dc, arg, closureType);
       cs.cacheExprTypes(convertedArg);
     } else {
-      convertedArg =
-          coerceToType(arg, paramType, getArgLocator(argIdx, paramIdx));
+      convertedArg = coerceToType(
+          arg, paramType,
+          getArgLocator(argIdx, paramIdx, param.getParameterFlags()));
     }
 
     if (!convertedArg)
@@ -7577,7 +7580,8 @@ bool ConstraintSystem::applySolutionFixes(Expr *E, const Solution &solution) {
           auto *transformedExpr = result->second.second;
           // Since this closure has been transformed into something
           // else let's look inside transformed expression instead.
-          return {true, transformedExpr};
+          transformedExpr->walk(*this);
+          return {false, E};
         }
       }
 

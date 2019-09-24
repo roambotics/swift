@@ -192,6 +192,21 @@ enum class FixKind : uint8_t {
   /// Allow a single tuple parameter to be matched with N arguments
   /// by forming all of the given arguments into a single tuple.
   AllowTupleSplatForSingleParameter,
+
+  /// Allow a single argument type mismatch. This is the most generic
+  /// failure related to argument-to-parameter conversions.
+  AllowArgumentTypeMismatch,
+
+  /// Explicitly construct type conforming to `RawRepresentable` protocol
+  /// via forming `Foo(rawValue:)` instead of using its `RawValue` directly.
+  ExplicitlyConstructRawRepresentable,
+
+  /// Use raw value type associated with raw representative accessible
+  /// using `.rawValue` member.
+  UseValueTypeOfRawRepresentative,
+  /// If an array was passed to a variadic argument, give a specific diagnostic
+  /// and offer to drop the brackets if it's a literal.
+  ExpandArrayIntoVarargs,
 };
 
 class ConstraintFix {
@@ -989,13 +1004,12 @@ class AddMissingArguments final
 
   using Param = AnyFunctionType::Param;
 
-  FunctionType *Fn;
   unsigned NumSynthesized;
 
-  AddMissingArguments(ConstraintSystem &cs, FunctionType *funcType,
-                      llvm::ArrayRef<AnyFunctionType::Param> synthesizedArgs,
+  AddMissingArguments(ConstraintSystem &cs,
+                      llvm::ArrayRef<Param> synthesizedArgs,
                       ConstraintLocator *locator)
-      : ConstraintFix(cs, FixKind::AddMissingArguments, locator), Fn(funcType),
+      : ConstraintFix(cs, FixKind::AddMissingArguments, locator),
         NumSynthesized(synthesizedArgs.size()) {
     std::uninitialized_copy(synthesizedArgs.begin(), synthesizedArgs.end(),
                             getSynthesizedArgumentsBuf().begin());
@@ -1010,7 +1024,7 @@ public:
 
   bool diagnose(Expr *root, bool asNote = false) const override;
 
-  static AddMissingArguments *create(ConstraintSystem &cs, FunctionType *fnType,
+  static AddMissingArguments *create(ConstraintSystem &cs,
                                      llvm::ArrayRef<Param> synthesizedArgs,
                                      ConstraintLocator *locator);
 
@@ -1288,6 +1302,23 @@ public:
                                       ConstraintLocator *locator);
 };
 
+class IgnoreAssignmentDestinationType final : public ContextualMismatch {
+  IgnoreAssignmentDestinationType(ConstraintSystem &cs, Type sourceTy,
+                                  Type destTy, ConstraintLocator *locator)
+      : ContextualMismatch(cs, sourceTy, destTy, locator) {}
+
+public:
+  std::string getName() const override {
+    return "ignore type of the assignment destination";
+  }
+
+  bool diagnose(Expr *root, bool asNote = false) const override;
+
+  static IgnoreAssignmentDestinationType *create(ConstraintSystem &cs,
+                                                 Type sourceTy, Type destTy,
+                                                 ConstraintLocator *locator);
+};
+
 /// If this is an argument-to-parameter conversion which is associated with
 /// `inout` parameter, subtyping is not permitted, types have to
 /// be identical.
@@ -1306,6 +1337,81 @@ public:
   static AllowInOutConversion *create(ConstraintSystem &cs, Type argType,
                                       Type paramType,
                                       ConstraintLocator *locator);
+};
+
+class AllowArgumentMismatch : public ContextualMismatch {
+protected:
+  AllowArgumentMismatch(ConstraintSystem &cs, Type argType, Type paramType,
+                        ConstraintLocator *locator)
+      : AllowArgumentMismatch(cs, FixKind::AllowArgumentTypeMismatch, argType,
+                              paramType, locator) {}
+
+  AllowArgumentMismatch(ConstraintSystem &cs, FixKind kind, Type argType,
+                        Type paramType, ConstraintLocator *locator)
+      : ContextualMismatch(cs, kind, argType, paramType, locator) {}
+
+public:
+  std::string getName() const override {
+    return "allow argument to parameter type conversion mismatch";
+  }
+
+  bool diagnose(Expr *root, bool asNote = false) const override;
+
+  static AllowArgumentMismatch *create(ConstraintSystem &cs, Type argType,
+                                       Type paramType,
+                                       ConstraintLocator *locator);
+};
+
+class ExpandArrayIntoVarargs final : public AllowArgumentMismatch {
+
+  ExpandArrayIntoVarargs(ConstraintSystem &cs, Type argType, Type paramType,
+                         ConstraintLocator *locator)
+      : AllowArgumentMismatch(cs, FixKind::ExpandArrayIntoVarargs, argType,
+                              paramType, locator) {}
+
+public:
+  std::string getName() const override {
+    return "cannot pass Array elements as variadic arguments";
+  }
+
+  bool diagnose(Expr *root, bool asNote = false) const override;
+
+  static ExpandArrayIntoVarargs *attempt(ConstraintSystem &cs, Type argType,
+                                         Type paramType,
+                                         ConstraintLocatorBuilder locator);
+};
+
+class ExplicitlyConstructRawRepresentable final : public AllowArgumentMismatch {
+  ExplicitlyConstructRawRepresentable(ConstraintSystem &cs, Type argType,
+                                      Type paramType,
+                                      ConstraintLocator *locator)
+      : AllowArgumentMismatch(cs, FixKind::ExplicitlyConstructRawRepresentable,
+                              argType, paramType, locator) {}
+
+public:
+  std::string getName() const override {
+    return "explicitly construct a raw representable type";
+  }
+
+  static ExplicitlyConstructRawRepresentable *
+  attempt(ConstraintSystem &cs, Type argType, Type paramType,
+          ConstraintLocatorBuilder locator);
+};
+
+class UseValueTypeOfRawRepresentative final : public AllowArgumentMismatch {
+  UseValueTypeOfRawRepresentative(ConstraintSystem &cs, Type argType,
+                                  Type paramType, ConstraintLocator *locator)
+      : AllowArgumentMismatch(cs, FixKind::UseValueTypeOfRawRepresentative,
+                              argType, paramType, locator) {}
+
+public:
+  std::string getName() const override {
+    return "use `.rawValue` of a raw representable type";
+  }
+
+  static UseValueTypeOfRawRepresentative *
+  attempt(ConstraintSystem &cs, Type argType, Type paramType,
+          ConstraintLocatorBuilder locator);
 };
 
 } // end namespace constraints

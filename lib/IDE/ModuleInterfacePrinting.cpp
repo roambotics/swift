@@ -20,6 +20,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/PrintOptions.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/Basic/PrimitiveParsing.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/ClangImporter/ClangModule.h"
@@ -74,8 +75,9 @@ private:
   void printTypePost(const TypeLoc &TL) override {
     return OtherPrinter.printTypePost(TL);
   }
-  void printTypeRef(Type T, const TypeDecl *TD, Identifier Name) override {
-    return OtherPrinter.printTypeRef(T, TD, Name);
+  void printTypeRef(Type T, const TypeDecl *TD, Identifier Name,
+                    PrintNameContext NameContext) override {
+    return OtherPrinter.printTypeRef(T, TD, Name, NameContext);
   }
   void printModuleRef(ModuleEntity Mod, Identifier Name) override {
     return OtherPrinter.printModuleRef(Mod, Name);

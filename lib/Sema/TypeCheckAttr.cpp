@@ -28,6 +28,7 @@
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PropertyWrappers.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
 #include "swift/Parse/Lexer.h"
@@ -1070,7 +1071,7 @@ bool swift::isValidDynamicCallableMethod(FuncDecl *decl, DeclContext *DC,
   //    `ExpressibleByStringLiteral`.
   //    `D.Value` and the return type can be arbitrary.
 
-  TC.validateDeclForNameLookup(decl);
+  TC.validateDecl(decl);
   auto paramList = decl->getParameters();
   if (paramList->size() != 1 || paramList->get(0)->isVariadic()) return false;
   auto argType = paramList->get(0)->getType();
@@ -1150,7 +1151,7 @@ static bool hasSingleNonVariadicParam(SubscriptDecl *decl,
     return false;
 
   auto *index = indices->get(0);
-  if (index->isVariadic() || !index->hasValidSignature())
+  if (index->isVariadic() || !index->hasInterfaceType())
     return false;
 
   if (ignoreLabel) {
@@ -1241,7 +1242,7 @@ visitDynamicMemberLookupAttr(DynamicMemberLookupAttr *attr) {
     auto oneCandidate = candidates.front().getValueDecl();
     candidates.filter([&](LookupResultEntry entry, bool isOuter) -> bool {
       auto cand = cast<SubscriptDecl>(entry.getValueDecl());
-      TC.validateDeclForNameLookup(cand);
+      TC.validateDecl(cand);
       return isValidDynamicMemberLookupSubscript(cand, decl, TC);
     });
 
@@ -1264,7 +1265,7 @@ visitDynamicMemberLookupAttr(DynamicMemberLookupAttr *attr) {
   // Validate the candidates while ignoring the label.
   newCandidates.filter([&](const LookupResultEntry entry, bool isOuter) {
     auto cand = cast<SubscriptDecl>(entry.getValueDecl());
-    TC.validateDeclForNameLookup(cand);
+    TC.validateDecl(cand);
     return isValidDynamicMemberLookupSubscript(cand, decl, TC,
                                                /*ignoreLabel*/ true);
   });

@@ -33,6 +33,7 @@
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/Timer.h"
@@ -351,6 +352,15 @@ void swift::performTypeChecking(SourceFile &SF, TopLevelContext &TLC,
   if (SF.ASTStage == SourceFile::TypeChecked)
     return;
 
+  // Eagerly build the top-level scopes tree before type checking
+  // because type-checking expressions mutates the AST and that throws off the
+  // scope-based lookups. Only the top-level scopes because extensions have not
+  // been bound yet.
+  if (SF.getASTContext().LangOpts.EnableASTScopeLookup &&
+      SF.isSuitableForASTScopes())
+    SF.getScope()
+        .buildEnoughOfTreeForTopLevelExpressionsButDontRequestGenericsOrExtendedNominals();
+
   auto &Ctx = SF.getASTContext();
   BufferIndirectlyCausingDiagnosticRAII cpr(SF);
 
@@ -590,7 +600,7 @@ bool swift::performTypeLocChecking(ASTContext &Ctx, TypeLoc &T,
   if (!ProduceDiagnostics)
     suppression.emplace(Ctx.Diags);
   TypeChecker &TC = createTypeChecker(Ctx);
-  return TC.validateType(T, resolution, options);
+  return TypeChecker::validateType(TC.Context, T, resolution, options);
 }
 
 /// Expose TypeChecker's handling of GenericParamList to SIL parsing.
@@ -606,10 +616,14 @@ void swift::typeCheckCompletionDecl(Decl *D) {
   DiagnosticSuppression suppression(Ctx.Diags);
   TypeChecker &TC = createTypeChecker(Ctx);
 
-  if (auto ext = dyn_cast<ExtensionDecl>(D))
-    TC.validateExtension(ext);
-  else
+  if (auto ext = dyn_cast<ExtensionDecl>(D)) {
+    if (auto *nominal = ext->getExtendedNominal()) {
+      // Validate the nominal type declaration being extended.
+      TC.validateDecl(nominal);
+    }
+  } else {
     TC.validateDecl(cast<ValueDecl>(D));
+  }
 }
 
 void swift::typeCheckPatternBinding(PatternBindingDecl *PBD,

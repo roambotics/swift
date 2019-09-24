@@ -23,6 +23,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ReferenceCounting.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/Basic/ClusteredBitVector.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/OptimizationMode.h"
@@ -725,6 +726,7 @@ public:
                                                ReferenceCounting style) const;
 
   llvm::Type *getFixedBufferTy();
+  llvm::PointerType *getExistentialPtrTy(unsigned numTables);
   llvm::Type *getValueWitnessTy(ValueWitness index);
   Signature getValueWitnessSignature(ValueWitness index);
 

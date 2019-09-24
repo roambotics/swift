@@ -25,6 +25,7 @@
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/ResilienceExpansion.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/Timer.h"
@@ -86,7 +87,7 @@ getBridgingFn(Optional<SILDeclRef> &cacheSlot,
     }
 
     SmallVector<ValueDecl *, 2> decls;
-    mod->lookupValue(/*AccessPath=*/{}, ctx.getIdentifier(functionName),
+    mod->lookupValue(ctx.getIdentifier(functionName),
                      NLKind::QualifiedLookup, decls);
     if (decls.empty()) {
       SGM.diagnose(SourceLoc(), diag::bridging_function_missing,
@@ -856,7 +857,7 @@ void SILGenModule::emitConstructor(ConstructorDecl *decl) {
           });
 
       // Constructors may not have bodies if they've been imported, or if they've
-      // been parsed from a parseable interface.
+      // been parsed from a module interface.
       if (decl->hasBody()) {
         SILDeclRef initConstant(decl, SILDeclRef::Kind::Initializer);
         emitOrDelayFunction(

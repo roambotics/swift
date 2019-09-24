@@ -309,7 +309,7 @@ std::error_code SerializedModuleLoader::findModuleFilesInDirectory(
     StringRef ModuleDocFilename,
     std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
     std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer) {
-  if (LoadMode == ModuleLoadingMode::OnlyParseable)
+  if (LoadMode == ModuleLoadingMode::OnlyInterface)
     return std::make_error_code(std::errc::not_supported);
 
   llvm::SmallString<256> ModulePath{DirPath};
@@ -946,12 +946,8 @@ bool SerializedASTFile::isSystemModule() const {
   return false;
 }
 
-void SerializedASTFile::lookupValue(ModuleDecl::AccessPathTy accessPath,
-                                    DeclName name, NLKind lookupKind,
+void SerializedASTFile::lookupValue(DeclName name, NLKind lookupKind,
                                     SmallVectorImpl<ValueDecl*> &results) const{
-  if (!ModuleDecl::matchesAccessPath(accessPath, name))
-    return;
-  
   File.lookupValue(name, results);
 }
 

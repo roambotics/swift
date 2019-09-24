@@ -22,6 +22,7 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
+#include "swift/AST/FileUnit.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/GenericSignature.h"
@@ -36,6 +37,7 @@
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/RawComment.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/SILLayout.h"
 #include "swift/AST/TypeCheckRequests.h"
@@ -98,9 +100,10 @@ using AssociativityCacheType =
                  Associativity>;
 
 #define FOR_KNOWN_FOUNDATION_TYPES(MACRO) \
-  MACRO(NSError) \
-  MACRO(NSNumber) \
-  MACRO(NSValue)
+  MACRO(NSCopying, ProtocolDecl) \
+  MACRO(NSError, ClassDecl) \
+  MACRO(NSNumber, ClassDecl) \
+  MACRO(NSValue, ClassDecl)
 
 struct OverrideSignatureKey {
   GenericSignature *baseMethodSig;
@@ -217,9 +220,9 @@ struct ASTContext::Implementation {
   /// The declaration of ObjectiveC.ObjCBool.
   StructDecl *ObjCBoolDecl = nullptr;
 
-#define CACHE_FOUNDATION_DECL(NAME) \
+#define CACHE_FOUNDATION_DECL(NAME, DECLTYPE) \
   /** The declaration of Foundation.NAME. */ \
-  ClassDecl *NAME##Decl = nullptr;
+  DECLTYPE *NAME##Decl = nullptr;
 FOR_KNOWN_FOUNDATION_TYPES(CACHE_FOUNDATION_DECL)
 #undef CACHE_FOUNDATION_DECL
 
@@ -654,7 +657,7 @@ void ASTContext::lookupInSwiftModule(
 
   // Find all of the declarations with this name in the Swift module.
   auto identifier = getIdentifier(name);
-  M->lookupValue({ }, identifier, NLKind::UnqualifiedLookup, results);
+  M->lookupValue(identifier, NLKind::UnqualifiedLookup, results);
 }
 
 FuncDecl *ASTContext::getPlusFunctionOnRangeReplaceableCollection() const {
@@ -832,7 +835,7 @@ StructDecl *ASTContext::getObjCBoolDecl() const {
     SmallVector<ValueDecl *, 1> results;
     auto *Context = const_cast<ASTContext *>(this);
     if (ModuleDecl *M = Context->getModuleByName(Id_ObjectiveC.str())) {
-      M->lookupValue({ }, getIdentifier("ObjCBool"), NLKind::UnqualifiedLookup,
+      M->lookupValue(getIdentifier("ObjCBool"), NLKind::UnqualifiedLookup,
                      results);
       for (auto result : results) {
         if (auto structDecl = dyn_cast<StructDecl>(result)) {
@@ -848,18 +851,18 @@ StructDecl *ASTContext::getObjCBoolDecl() const {
   return getImpl().ObjCBoolDecl;
 }
 
-#define GET_FOUNDATION_DECL(NAME) \
-ClassDecl *ASTContext::get##NAME##Decl() const { \
+#define GET_FOUNDATION_DECL(NAME, DECLTYPE) \
+DECLTYPE *ASTContext::get##NAME##Decl() const { \
   if (!getImpl().NAME##Decl) { \
     if (ModuleDecl *M = getLoadedModule(Id_Foundation)) { \
       /* Note: lookupQualified() will search both the Foundation module \
        * and the Clang Foundation module it imports. */ \
       SmallVector<ValueDecl *, 1> decls; \
       M->lookupQualified(M, getIdentifier(#NAME), NL_OnlyTypes, decls); \
-      if (decls.size() == 1 && isa<ClassDecl>(decls[0])) { \
-        auto classDecl = cast<ClassDecl>(decls[0]); \
-        if (classDecl->getGenericParams() == nullptr) { \
-          getImpl().NAME##Decl = classDecl; \
+      if (decls.size() == 1 && isa<DECLTYPE>(decls[0])) { \
+        auto decl = cast<DECLTYPE>(decls[0]); \
+        if (isa<ProtocolDecl>(decl) || decl->getGenericParams() == nullptr) { \
+          getImpl().NAME##Decl = decl; \
         } \
       } \
     } \
@@ -899,7 +902,7 @@ ProtocolDecl *ASTContext::getProtocol(KnownProtocolKind kind) const {
 
   if (!M)
     return nullptr;
-  M->lookupValue({ }, getIdentifier(getProtocolName(kind)),
+  M->lookupValue(getIdentifier(getProtocolName(kind)),
                  NLKind::UnqualifiedLookup, results);
 
   for (auto result : results) {
@@ -3959,7 +3962,7 @@ static NominalTypeDecl *findUnderlyingTypeInModule(ASTContext &ctx,
                                                    ModuleDecl *module) {
   // Find all of the declarations with this name in the Swift module.
   SmallVector<ValueDecl *, 1> results;
-  module->lookupValue({ }, name, NLKind::UnqualifiedLookup, results);
+  module->lookupValue(name, NLKind::UnqualifiedLookup, results);
   for (auto result : results) {
     if (auto nominal = dyn_cast<NominalTypeDecl>(result))
       return nominal;
@@ -4477,6 +4480,7 @@ bool ASTContext::overrideGenericSignatureReqsSatisfied(
   case OverrideGenericSignatureReqCheck::DerivedReqSatisfiedByBase:
     return derivedSig->requirementsNotSatisfiedBy(sig).empty();
   }
+  llvm_unreachable("Unhandled OverrideGenericSignatureReqCheck in switch");
 }
 
 SILLayout *SILLayout::get(ASTContext &C,

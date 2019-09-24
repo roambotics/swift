@@ -184,8 +184,10 @@ public:
 
     case TypeParameterRequirement:
     case ConditionalRequirement:
-    case ApplyArgToParam:
       return 2;
+
+    case ApplyArgToParam:
+      return 3;
     }
 
     llvm_unreachable("Unhandled PathElementKind in switch.");
@@ -282,12 +284,12 @@ public:
     uint64_t storedKind : 3;
 
     /// Encode a path element kind and a value into the storage format.
-    static uint64_t encodeStorage(PathElementKind kind, unsigned value) {
-      return ((uint64_t)value << 8) | kind;
+    static uint64_t encodeStorage(PathElementKind kind, uint64_t value) {
+      return (value << 8) | kind;
     }
 
     /// Decode a storage value into path element kind and value.
-    static std::pair<PathElementKind, unsigned>
+    static std::pair<PathElementKind, uint64_t>
     decodeStorage(uint64_t storage) {
       return { (PathElementKind)((unsigned)storage & 0xFF), storage >> 8 };
     }
@@ -321,6 +323,17 @@ public:
              "Path element kind does not require 2 values");
       assert(value0 == getValue(0) && "value0 truncated");
       assert(value1 == getValue(1) && "value1 truncated");
+    }
+
+    PathElement(PathElementKind kind, uint64_t value0, uint64_t value1,
+                uint64_t value2)
+        : storage(encodeStorage(kind, value0 << 32 | value1 << 16 | value2)),
+          storedKind(StoredKindAndValue) {
+      assert(numNumericValuesInPathElement(kind) == 3 &&
+             "Path element kind does not require 3 values");
+      assert(value0 == getValue(0) && "value0 truncated");
+      assert(value1 == getValue(1) && "value1 truncated");
+      assert(value2 == getValue(2) && "value2 truncated");
     }
 
     /// Store a path element with an associated pointer, accessible using
@@ -359,6 +372,7 @@ public:
     class GenericParameter;
     class OpenedGeneric;
     class KeyPathDynamicMember;
+    class UnresolvedMember;
 
     PathElement(PathElementKind kind)
       : storage(encodeStorage(kind, 0)), storedKind(StoredKindAndValue)
@@ -501,6 +515,27 @@ public:
 
   /// Determine whether this locator points to the contextual type.
   bool isForContextualType() const;
+
+  /// Attempts to cast the first path element of the locator to a specific
+  /// \c LocatorPathElt subclass, returning \c None if either unsuccessful or
+  /// the locator has no path elements.
+  template <class T>
+  Optional<T> getFirstElementAs() const {
+    auto path = getPath();
+    if (path.empty())
+      return None;
+
+    return path[0].getAs<T>();
+  }
+
+  /// Casts the first path element of the locator to a specific
+  /// \c LocatorPathElt subclass, asserting that it has at least one element.
+  template <class T>
+  T castFirstElementTo() const {
+    auto path = getPath();
+    assert(!path.empty() && "Expected at least one path element!");
+    return path[0].castTo<T>();
+  }
 
   /// Check whether the last element in the path of this locator
   /// is of a given kind.
@@ -673,11 +708,15 @@ dyn_cast(const LocatorPathElt &) = delete; // Use LocatorPathElt::getAs instead.
 
 class LocatorPathElt::ApplyArgToParam final : public LocatorPathElt {
 public:
-  ApplyArgToParam(unsigned argIdx, unsigned paramIdx)
-      : LocatorPathElt(ConstraintLocator::ApplyArgToParam, argIdx, paramIdx) {}
+  ApplyArgToParam(unsigned argIdx, unsigned paramIdx, ParameterTypeFlags flags)
+      : LocatorPathElt(ConstraintLocator::ApplyArgToParam, argIdx, paramIdx,
+                       flags.toRaw()) {}
 
   unsigned getArgIdx() const { return getValue(0); }
   unsigned getParamIdx() const { return getValue(1); }
+  ParameterTypeFlags getParameterFlags() const {
+    return ParameterTypeFlags::fromRaw(getValue(2));
+  }
 
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::ApplyArgToParam;
@@ -886,6 +925,15 @@ public:
 
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::KeyPathDynamicMember;
+  }
+};
+
+class LocatorPathElt::UnresolvedMember final : public LocatorPathElt {
+public:
+  UnresolvedMember() : LocatorPathElt(PathElementKind::UnresolvedMember, 0) {}
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == ConstraintLocator::UnresolvedMember;
   }
 };
 
