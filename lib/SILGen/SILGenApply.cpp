@@ -4430,14 +4430,14 @@ RValue SILGenFunction::emitApply(ResultPlanPtr &&resultPlan,
   }
 
   // Emit the raw application.
-  GenericSignature *genericSig =
+  GenericSignature genericSig =
     fn.getType().castTo<SILFunctionType>()->getGenericSignature();
 
   // When calling a closure that's defined in a generic context but does not
   // capture any generic parameters, we will have substitutions, but the
   // function type won't have a generic signature. Drop the substitutions in
   // this case.
-  if (genericSig == nullptr) {
+  if (genericSig.isNull()) {
     subs = SubstitutionMap();
 
   // Otherwise, the substitutions should match the generic signature.
@@ -5004,30 +5004,6 @@ RValue SILGenFunction::emitApplyMethod(SILLocation loc, ConcreteDeclRef declRef,
   emission.addCallSite(loc, std::move(args), resultType, /*throws*/ false);
 
   return emission.apply(C);
-}
-
-RValue SILGenFunction::emitApplyPropertyWrapperAllocator(SILLocation loc,
-                                                          SubstitutionMap subs,
-                                                          SILDeclRef ctorRef,
-                                                          Type wrapperTy,
-                                                    CanAnyFunctionType funcTy) {
-  Callee callee = Callee::forDirect(*this, ctorRef, subs, loc);
-
-  MetatypeType *MTty = MetatypeType::get(wrapperTy);
-  auto metatypeVal = B.createMetatype(loc, getLoweredType(MTty));
-  ManagedValue mtManagedVal = ManagedValue::forUnmanaged(metatypeVal);
-  RValue metatypeRVal(*this, loc, MTty->getCanonicalType(), mtManagedVal);
-
-  ArgumentSource ArgSrc(loc, std::move(metatypeRVal));
-  FormalEvaluationScope writebacks(*this);
-  CallEmission emission(*this, std::move(callee), std::move(writebacks));
-
-  AnyFunctionType::Param selfParam((Type(MTty)), Identifier(),
-                                   ParameterTypeFlags());
-  emission.addSelfParam(loc, std::move(ArgSrc), selfParam, funcTy.getResult());
-
-  RValue RV = emission.apply();
-  return RV;
 }
 
 /// Emit a literal that applies the various initializers.

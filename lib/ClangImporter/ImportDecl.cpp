@@ -1106,8 +1106,6 @@ makeBitFieldAccessors(ClangImporter::Implementation &Impl,
   auto recordType = Ctx.getRecordType(structDecl);
   auto recordPointerType = Ctx.getPointerType(recordType);
   auto fieldType = fieldDecl->getType();
-  auto fieldNameInfo = clang::DeclarationNameInfo(fieldDecl->getDeclName(),
-                                                  clang::SourceLocation());
 
   auto cGetterName = getAccessorDeclarationName(Ctx, importedStructDecl,
                                                 importedFieldDecl, "getter");
@@ -1179,14 +1177,14 @@ makeBitFieldAccessors(ClangImporter::Implementation &Impl,
                                                         recordType,
                                                         clang::VK_RValue,
                                                         clang::SourceLocation());
-    auto cGetterExpr = new (Ctx) clang::MemberExpr(cGetterSelfExpr,
-                                                   /*isarrow=*/ false,
-                                                   clang::SourceLocation(),
-                                                   fieldDecl,
-                                                   fieldNameInfo,
-                                                   fieldType,
-                                                   clang::VK_RValue,
-                                                   clang::OK_BitField);
+    auto cGetterExpr = clang::MemberExpr::CreateImplicit(Ctx,
+                                                         cGetterSelfExpr,
+                                                         /*isarrow=*/ false,
+                                                         fieldDecl,
+                                                         fieldType,
+                                                         clang::VK_RValue,
+                                                         clang::OK_BitField);
+
     
     auto cGetterBody = clang::ReturnStmt::Create(Ctx, clang::SourceLocation(),
                                                    cGetterExpr,
@@ -1224,14 +1222,13 @@ makeBitFieldAccessors(ClangImporter::Implementation &Impl,
                                                         clang::VK_RValue,
                                                         clang::SourceLocation());
     
-    auto cSetterMemberExpr = new (Ctx) clang::MemberExpr(cSetterSelfExpr,
-                                                         /*isarrow=*/ true,
-                                                         clang::SourceLocation(),
-                                                         fieldDecl,
-                                                         fieldNameInfo,
-                                                         fieldType,
-                                                         clang::VK_LValue,
-                                                         clang::OK_BitField);
+    auto cSetterMemberExpr = clang::MemberExpr::CreateImplicit(Ctx,
+                                                               cSetterSelfExpr,
+                                                               /*isarrow=*/true,
+                                                               fieldDecl,
+                                                               fieldType,
+                                                               clang::VK_LValue,
+                                                               clang::OK_BitField);
     
     auto cSetterValueExpr = new (Ctx) clang::DeclRefExpr(Ctx, cSetterValue, false,
                                                          fieldType,
@@ -3724,7 +3721,7 @@ namespace {
       } else {
         // Import the function type. If we have parameters, make sure their
         // names get into the resulting function type.
-        importedType = Impl.importFunctionType(
+        importedType = Impl.importFunctionParamsAndReturnType(
             dc, decl, {decl->param_begin(), decl->param_size()},
             decl->isVariadic(), isInSystemModule(dc), name, bodyParams);
 
@@ -4288,10 +4285,11 @@ namespace {
             prop->getSetterMethodDecl() != decl)
           return nullptr;
         importedType =
-            Impl.importAccessorMethodType(dc, prop, decl, isInSystemModule(dc),
-                                          importedName, &bodyParams);
+            Impl.importAccessorParamsAndReturnType(dc, prop, decl,
+                                                   isInSystemModule(dc),
+                                                   importedName, &bodyParams);
       } else {
-        importedType = Impl.importMethodType(
+        importedType = Impl.importMethodParamsAndReturnType(
             dc, decl, decl->parameters(), decl->isVariadic(),
             isInSystemModule(dc), &bodyParams, importedName,
             errorConvention, kind);
@@ -4696,9 +4694,6 @@ namespace {
           /*TrailingWhere=*/nullptr);
       result->computeType();
 
-      // FIXME: Kind of awkward that we have to do this here
-      result->getGenericParams()->getParams()[0]->setDepth(0);
-
       addObjCAttribute(result, Impl.importIdentifier(decl->getIdentifier()));
 
       if (declaredNative)
@@ -4840,7 +4835,7 @@ namespace {
           result->getASTContext().evaluator.cacheOutput(
                 GenericParamListRequest{result}, std::move(genericParams));
 
-          auto *sig = Impl.buildGenericSignature(genericParams, dc);
+          auto sig = Impl.buildGenericSignature(genericParams, dc);
           result->setGenericSignature(sig);
         }
       } else {
@@ -6252,7 +6247,7 @@ ConstructorDecl *SwiftDeclConverter::importConstructor(
   // Import the type that this method will have.
   Optional<ForeignErrorConvention> errorConvention;
   ParameterList *bodyParams;
-  auto importedType = Impl.importMethodType(
+  auto importedType = Impl.importMethodParamsAndReturnType(
       dc, objcMethod, args, variadic, isInSystemModule(dc), &bodyParams,
       importedName, errorConvention, SpecialMethodKind::Constructor);
   if (!importedType)
@@ -8022,7 +8017,7 @@ DeclContext *ClangImporter::Implementation::importDeclContextImpl(
   return nullptr;
 }
 
-GenericSignature *ClangImporter::Implementation::buildGenericSignature(
+GenericSignature ClangImporter::Implementation::buildGenericSignature(
     GenericParamList *genericParams, DeclContext *dc) {
   SmallVector<GenericTypeParamType *, 2> genericParamTypes;
   for (auto param : *genericParams) {
@@ -8057,7 +8052,7 @@ GenericSignature *ClangImporter::Implementation::buildGenericSignature(
       SwiftContext.evaluator,
       AbstractGenericSignatureRequest{
         nullptr, std::move(genericParamTypes), std::move(requirements)},
-      nullptr);
+      GenericSignature());
 }
 
 DeclContext *
@@ -8189,10 +8184,12 @@ ClangImporter::Implementation::createConstant(Identifier name, DeclContext *dc,
   case clang::APValue::Array:
   case clang::APValue::ComplexFloat:
   case clang::APValue::ComplexInt:
+  case clang::APValue::FixedPoint:
+  case clang::APValue::Indeterminate:
   case clang::APValue::LValue:
   case clang::APValue::MemberPointer:
+  case clang::APValue::None:
   case clang::APValue::Struct:
-  case clang::APValue::Uninitialized:
   case clang::APValue::Union:
   case clang::APValue::Vector:
     llvm_unreachable("Unhandled APValue kind");

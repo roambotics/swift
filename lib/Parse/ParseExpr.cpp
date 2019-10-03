@@ -16,6 +16,7 @@
 
 #include "swift/Parse/Parser.h"
 #include "swift/AST/DiagnosticsParse.h"
+#include "swift/AST/TypeRepr.h"
 #include "swift/Basic/EditorPlaceholder.h"
 #include "swift/Parse/CodeCompletionCallbacks.h"
 #include "swift/Parse/ParsedSyntaxRecorder.h"
@@ -1080,7 +1081,7 @@ Parser::parseExprPostfixSuffix(ParserResult<Expr> Result, bool isExprBasic,
       if (canParseAsGenericArgumentList()) {
         SmallVector<TypeRepr *, 8> args;
         SourceLoc LAngleLoc, RAngleLoc;
-        auto argStat = parseGenericArgumentsAST(args, LAngleLoc, RAngleLoc);
+        auto argStat = parseGenericArguments(args, LAngleLoc, RAngleLoc);
         if (argStat.isError())
           diagnose(LAngleLoc, diag::while_parsing_as_left_angle_bracket);
 
@@ -1497,8 +1498,8 @@ ParserResult<Expr> Parser::parseExprPrimary(Diag<> ID, bool isExprBasic) {
           ParsedSyntaxRecorder::makeIdentifierPattern(
                                   SyntaxContext->popToken(), *SyntaxContext);
       ParsedExprSyntax ExprNode =
-          ParsedSyntaxRecorder::deferUnresolvedPatternExpr(std::move(PatternNode),
-                                                           *SyntaxContext);
+          ParsedSyntaxRecorder::makeUnresolvedPatternExpr(std::move(PatternNode),
+                                                          *SyntaxContext);
       SyntaxContext->addSyntax(std::move(ExprNode));
       return makeParserResult(new (Context) UnresolvedPatternExpr(pattern));
     }
@@ -2208,7 +2209,7 @@ Expr *Parser::parseExprIdentifier() {
   if (canParseAsGenericArgumentList()) {
     SyntaxContext->createNodeInPlace(SyntaxKind::IdentifierExpr);
     SyntaxContext->setCreateSyntax(SyntaxKind::SpecializeExpr);
-    auto argStat = parseGenericArgumentsAST(args, LAngleLoc, RAngleLoc);
+    auto argStat = parseGenericArguments(args, LAngleLoc, RAngleLoc);
     if (argStat.isError())
       diagnose(LAngleLoc, diag::while_parsing_as_left_angle_bracket);
     

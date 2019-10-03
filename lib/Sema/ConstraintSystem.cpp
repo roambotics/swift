@@ -597,7 +597,7 @@ static void checkNestedTypeConstraints(ConstraintSystem &cs, Type type,
                                                    extension);
     }
 
-    if (auto *signature = decl->getGenericSignature()) {
+    if (auto signature = decl->getGenericSignature()) {
       cs.openGenericRequirements(
           extension, signature, /*skipProtocolSelfConstraint*/ true, locator,
           [&](Type type) {
@@ -622,7 +622,7 @@ static void checkNestedTypeConstraints(ConstraintSystem &cs, Type type,
 
 Type ConstraintSystem::openUnboundGenericType(
     Type type, ConstraintLocatorBuilder locator) {
-  assert(!type->hasTypeParameter());
+  assert(!type->getCanonicalType()->hasTypeParameter());
 
   checkNestedTypeConstraints(*this, type, locator);
 
@@ -675,7 +675,7 @@ FunctionType *ConstraintSystem::openFunctionType(
        OpenedTypeMap &replacements,
        DeclContext *outerDC) {
   if (auto *genericFn = funcType->getAs<GenericFunctionType>()) {
-    auto *signature = genericFn->getGenericSignature();
+    auto signature = genericFn->getGenericSignature();
 
     openGenericParameters(outerDC, signature, replacements, locator);
 
@@ -1082,7 +1082,7 @@ static void bindArchetypesFromContext(
     }
 
     // If it's not generic, there's nothing to do.
-    auto *genericSig = parentDC->getGenericSignatureOfContext();
+    auto genericSig = parentDC->getGenericSignatureOfContext();
     if (!genericSig)
       break;
 
@@ -1097,10 +1097,10 @@ static void bindArchetypesFromContext(
 
 void ConstraintSystem::openGeneric(
        DeclContext *outerDC,
-       GenericSignature *sig,
+       GenericSignature sig,
        ConstraintLocatorBuilder locator,
        OpenedTypeMap &replacements) {
-  if (sig == nullptr)
+  if (!sig)
     return;
 
   openGenericParameters(outerDC, sig, replacements, locator);
@@ -1112,7 +1112,7 @@ void ConstraintSystem::openGeneric(
 }
 
 void ConstraintSystem::openGenericParameters(DeclContext *outerDC,
-                                             GenericSignature *sig,
+                                             GenericSignature sig,
                                              OpenedTypeMap &replacements,
                                              ConstraintLocatorBuilder locator) {
   assert(sig);
@@ -1137,7 +1137,7 @@ void ConstraintSystem::openGenericParameters(DeclContext *outerDC,
 }
 
 void ConstraintSystem::openGenericRequirements(
-    DeclContext *outerDC, GenericSignature *signature,
+    DeclContext *outerDC, GenericSignature signature,
     bool skipProtocolSelfConstraint, ConstraintLocatorBuilder locator,
     llvm::function_ref<Type(Type)> substFn) {
   auto requirements = signature->getRequirements();
@@ -1206,8 +1206,8 @@ static void addSelfConstraint(ConstraintSystem &cs, Type objectTy, Type selfTy,
 /// Determine whether the given locator is for a witness or requirement.
 static bool isRequirementOrWitness(const ConstraintLocatorBuilder &locator) {
   if (auto last = locator.last()) {
-    return last->getKind() == ConstraintLocator::Requirement ||
-    last->getKind() == ConstraintLocator::Witness;
+    return last->getKind() == ConstraintLocator::ProtocolRequirement ||
+           last->getKind() == ConstraintLocator::Witness;
   }
 
   return false;
@@ -1312,7 +1312,7 @@ ConstraintSystem::getTypeOfMemberReference(
 
     // If the storage is generic, add a generic signature.
     FunctionType::Param selfParam(selfTy, Identifier(), selfFlags);
-    if (auto *sig = innerDC->getGenericSignatureOfContext()) {
+    if (auto sig = innerDC->getGenericSignatureOfContext()) {
       funcType = GenericFunctionType::get(sig, {selfParam}, refType);
     } else {
       funcType = FunctionType::get({selfParam}, refType);
@@ -1463,7 +1463,6 @@ Type ConstraintSystem::getEffectiveOverloadType(const OverloadChoice &overload,
   // Retrieve the interface type.
   auto type = decl->getInterfaceType();
   if (!type) {
-    decl->getASTContext().getLazyResolver()->resolveDeclSignature(decl);
     type = decl->getInterfaceType();
     if (!type) {
       return Type();
@@ -2913,11 +2912,12 @@ void constraints::simplifyLocator(Expr *&anchor,
 
       // Extract subexpression in parentheses.
       if (auto parenExpr = dyn_cast<ParenExpr>(anchor)) {
-        assert(elt.getArgIdx() == 0);
-
-        anchor = parenExpr->getSubExpr();
-        path = path.slice(1);
-        continue;
+        // This simplication request could be for a synthesized argument.
+        if (elt.getArgIdx() == 0) {
+          anchor = parenExpr->getSubExpr();
+          path = path.slice(1);
+          continue;
+        }
       }
       break;
     }

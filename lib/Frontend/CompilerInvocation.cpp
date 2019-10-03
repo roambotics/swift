@@ -763,6 +763,9 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
   if (Args.hasArg(OPT_sil_merge_partial_modules))
     Opts.MergePartialModules = true;
 
+  if (Args.hasArg(OPT_experimental_skip_non_inlinable_function_bodies))
+    Opts.SkipNonInlinableFunctionBodies = true;
+
   // Parse the optimization level.
   // Default to Onone settings if no option is passed.
   Opts.OptMode = OptimizationMode::NoOptimization;
@@ -939,6 +942,8 @@ static bool ParseTBDGenArgs(TBDGenOptions &Opts, ArgList &Args,
   if (const Arg *A = Args.getLastArg(OPT_tbd_install_name)) {
     Opts.InstallName = A->getValue();
   }
+
+  Opts.IsInstallAPI = Args.hasArg(OPT_tbd_is_installapi);
 
   if (const Arg *A = Args.getLastArg(OPT_tbd_compatibility_version)) {
     if (auto vers = version::Version::parseVersionString(

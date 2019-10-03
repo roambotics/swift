@@ -21,15 +21,20 @@
 #include "swift/Basic/TypeID.h"
 namespace swift {
 
+class AbstractFunctionDecl;
+class BraceStmt;
 class CustomAttr;
 class Decl;
+class EnumDecl;
 class GenericParamList;
 class GenericSignature;
 class GenericTypeParamType;
+class InfixOperatorDecl;
 class IterableDeclContext;
 class ModuleDecl;
 class NominalTypeDecl;
 class OperatorDecl;
+class PrecedenceGroupDecl;
 struct PropertyWrapperBackingPropertyInfo;
 struct PropertyWrapperTypeInfo;
 enum class CtorInitializerKind;

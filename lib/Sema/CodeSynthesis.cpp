@@ -213,7 +213,6 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
 
       accessLevel = std::min(accessLevel, var->getFormalAccess());
 
-      ctx.getLazyResolver()->resolveDeclSignature(var);
       auto varInterfaceType = var->getValueInterfaceType();
 
       if (var->getAttrs().hasAttribute<LazyAttr>()) {
@@ -357,7 +356,7 @@ synthesizeStubBody(AbstractFunctionDecl *fn, void *) {
            /*isTypeChecked=*/true };
 }
 
-static std::tuple<GenericSignature *, GenericParamList *, SubstitutionMap>
+static std::tuple<GenericSignature, GenericParamList *, SubstitutionMap>
 configureGenericDesignatedInitOverride(ASTContext &ctx,
                                        ClassDecl *classDecl,
                                        Type superclassTy,
@@ -368,7 +367,7 @@ configureGenericDesignatedInitOverride(ASTContext &ctx,
   auto subMap = superclassTy->getContextSubstitutionMap(
       moduleDecl, superclassDecl);
 
-  GenericSignature *genericSig;
+  GenericSignature genericSig;
 
   // Inheriting initializers that have their own generic parameters
   auto *genericParams = superclassCtor->getGenericParams();
@@ -379,7 +378,7 @@ configureGenericDesignatedInitOverride(ASTContext &ctx,
     // but change the depth of the generic parameters to be one greater
     // than the depth of the subclass.
     unsigned depth = 0;
-    if (auto *genericSig = classDecl->getGenericSignature())
+    if (auto genericSig = classDecl->getGenericSignature())
       depth = genericSig->getGenericParams().back()->getDepth() + 1;
 
     for (auto *param : genericParams->getParams()) {
@@ -409,10 +408,10 @@ configureGenericDesignatedInitOverride(ASTContext &ctx,
           newParam->getDeclaredInterfaceType()->castTo<GenericTypeParamType>());
     }
 
-    auto *superclassSig = superclassCtor->getGenericSignature();
+    auto superclassSig = superclassCtor->getGenericSignature();
 
     unsigned superclassDepth = 0;
-    if (auto *genericSig = superclassDecl->getGenericSignature())
+    if (auto genericSig = superclassDecl->getGenericSignature())
       superclassDepth = genericSig->getGenericParams().back()->getDepth() + 1;
 
     // We're going to be substituting the requirements of the base class
@@ -449,11 +448,11 @@ configureGenericDesignatedInitOverride(ASTContext &ctx,
     genericSig = evaluateOrDefault(
         ctx.evaluator,
         AbstractGenericSignatureRequest{
-          classDecl->getGenericSignature(),
+          classDecl->getGenericSignature().getPointer(),
           std::move(newParamTypes),
           std::move(requirements)
         },
-        nullptr);
+        GenericSignature());
   } else {
     genericSig = classDecl->getGenericSignature();
   }
@@ -539,9 +538,6 @@ synthesizeDesignatedInitOverride(AbstractFunctionDecl *fn, void *context) {
   auto &ctx = ctor->getASTContext();
 
   auto *superclassCtor = (ConstructorDecl *) context;
-
-  if (!superclassCtor->hasInterfaceType())
-    ctx.getLazyResolver()->resolveDeclSignature(superclassCtor);
 
   // Reference to super.init.
   auto *selfDecl = ctor->getImplicitSelfDecl();
@@ -640,7 +636,7 @@ createDesignatedInitOverride(ClassDecl *classDecl,
     return nullptr;
   }
 
-  GenericSignature *genericSig;
+  GenericSignature genericSig;
   GenericParamList *genericParams;
   SubstitutionMap subMap;
 
@@ -856,9 +852,7 @@ static void addImplicitConstructorsToStruct(StructDecl *decl, ASTContext &ctx) {
       if (!var->isMemberwiseInitialized(/*preferDeclaredProperties=*/true))
         continue;
 
-      if (!var->hasInterfaceType())
-        ctx.getLazyResolver()->resolveDeclSignature(var);
-      if (!var->hasInterfaceType())
+      if (!var->getInterfaceType())
         return;
     }
   }
@@ -923,9 +917,7 @@ static void addImplicitConstructorsToClass(ClassDecl *decl, ASTContext &ctx) {
   if (!decl->hasClangNode()) {
     for (auto member : decl->getMembers()) {
       if (auto ctor = dyn_cast<ConstructorDecl>(member)) {
-        if (!ctor->hasInterfaceType())
-          ctx.getLazyResolver()->resolveDeclSignature(ctor);
-        if (!ctor->hasInterfaceType())
+        if (!ctor->getInterfaceType())
           return;
       }
     }

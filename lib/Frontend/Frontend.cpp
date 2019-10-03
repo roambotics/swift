@@ -129,6 +129,7 @@ SerializationOptions CompilerInvocation::computeSerializationOptions(
   SerializationOptions serializationOpts;
   serializationOpts.OutputPath = outs.ModuleOutputPath.c_str();
   serializationOpts.DocOutputPath = outs.ModuleDocOutputPath.c_str();
+  serializationOpts.SourceInfoOutputPath = outs.ModuleSourceInfoOutputPath.c_str();
   serializationOpts.GroupInfoPath = opts.GroupInfoPath.c_str();
   if (opts.SerializeBridgingHeader && !outs.ModuleOutputPath.empty())
     serializationOpts.ImportedHeader = opts.ImplicitObjCHeaderPath;
@@ -252,9 +253,6 @@ static bool loadAndValidateVFSOverlay(
     const llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &BaseFS,
     const llvm::IntrusiveRefCntPtr<llvm::vfs::OverlayFileSystem> &OverlayFS,
     DiagnosticEngine &Diag) {
-  // FIXME: It should be possible to allow chained lookup of later VFS overlays
-  // through the mapping defined by earlier overlays.
-  // See rdar://problem/39440687
   auto Buffer = BaseFS->getBufferForFile(File);
   if (!Buffer) {
     Diag.diagnose(SourceLoc(), diag::cannot_open_file, File,
@@ -884,6 +882,9 @@ OptionSet<TypeCheckingFlags> CompilerInstance::computeTypeCheckingOptions() {
   }
   if (options.DebugTimeExpressionTypeChecking) {
     TypeCheckOptions |= TypeCheckingFlags::DebugTimeExpressions;
+  }
+  if (options.SkipNonInlinableFunctionBodies) {
+    TypeCheckOptions |= TypeCheckingFlags::SkipNonInlinableFunctionBodies;
   }
   return TypeCheckOptions;
 }

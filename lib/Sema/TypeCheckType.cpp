@@ -64,7 +64,7 @@ TypeResolution TypeResolution::forInterface(DeclContext *dc,
 }
 
 TypeResolution TypeResolution::forInterface(DeclContext *dc,
-                                            GenericSignature *genericSig,
+                                            GenericSignature genericSig,
                                             LazyResolver *resolver) {
   TypeResolution result(dc, TypeResolutionStage::Interface);
   result.Resolver = resolver;
@@ -98,7 +98,7 @@ GenericSignatureBuilder *TypeResolution::getGenericSignatureBuilder() const {
   return complete.builder;
 }
 
-GenericSignature *TypeResolution::getGenericSignature() const {
+GenericSignature TypeResolution::getGenericSignature() const {
   switch (stage) {
   case TypeResolutionStage::Contextual:
     return dc->getGenericSignatureOfContext();
@@ -223,10 +223,7 @@ Type TypeResolution::resolveDependentMemberType(
   // or it's a typealias declared in protocol or protocol extension.
   // Substitute the base type into it.
   auto concrete = ref->getBoundDecl();
-  auto lazyResolver = ctx.getLazyResolver();
-  if (lazyResolver)
-    lazyResolver->resolveDeclSignature(concrete);
-  if (!concrete->hasInterfaceType()) {
+  if (!concrete->getInterfaceType()) {
     ctx.Diags.diagnose(ref->getIdLoc(), diag::recursive_decl_reference,
                        concrete->getDescriptiveKind(), concrete->getName());
     concrete->diagnose(diag::kind_declared_here,
@@ -388,46 +385,6 @@ Type TypeChecker::getOptionalType(SourceLoc loc, Type elementType) {
   return OptionalType::get(elementType);
 }
 
-static Type getPointerType(TypeChecker &tc, SourceLoc loc, Type pointeeType,
-                           PointerTypeKind kind) {
-  auto pointerDecl = [&] {
-    switch (kind) {
-    case PTK_UnsafeMutableRawPointer:
-    case PTK_UnsafeRawPointer:
-      llvm_unreachable("these pointer types don't take arguments");
-    case PTK_UnsafePointer:
-      return tc.Context.getUnsafePointerDecl();
-    case PTK_UnsafeMutablePointer:
-      return tc.Context.getUnsafeMutablePointerDecl();
-    case PTK_AutoreleasingUnsafeMutablePointer:
-      return tc.Context.getAutoreleasingUnsafeMutablePointerDecl();
-    }
-    llvm_unreachable("bad kind");
-  }();
-  if (!pointerDecl) {
-    tc.diagnose(loc, diag::pointer_type_not_found,
-                kind == PTK_UnsafePointer ? 0 :
-                kind == PTK_UnsafeMutablePointer ? 1 : 2);
-    return Type();
-  }
-
-  tc.validateDecl(pointerDecl);
-  if (pointerDecl->isInvalid())
-    return Type();
-
-  // TODO: validate generic signature?
-
-  return BoundGenericType::get(pointerDecl, nullptr, pointeeType);
-}
-
-Type TypeChecker::getUnsafePointerType(SourceLoc loc, Type pointeeType) {
-  return getPointerType(*this, loc, pointeeType, PTK_UnsafePointer);
-}
-
-Type TypeChecker::getUnsafeMutablePointerType(SourceLoc loc, Type pointeeType) {
-  return getPointerType(*this, loc, pointeeType, PTK_UnsafeMutablePointer);
-}
-
 Type TypeChecker::getStringType(DeclContext *dc) {
   if (auto typeDecl = Context.getStringDecl())
     return typeDecl->getDeclaredInterfaceType();
@@ -536,9 +493,8 @@ Type TypeChecker::resolveTypeInContext(TypeDecl *typeDecl, DeclContext *foundDC,
                     dyn_cast<TypeAliasDecl>(unboundGeneric->getAnyGeneric())) {
               if (ugAliasDecl == aliasDecl) {
                 if (resolution.getStage() == TypeResolutionStage::Structural &&
-                    !aliasDecl->hasInterfaceType()) {
-                  return resolution.mapTypeIntoContext(
-                      aliasDecl->getStructuralType());
+                    aliasDecl->getUnderlyingTypeRepr() != nullptr) {
+                  return aliasDecl->getStructuralType();
                 }
                 return resolution.mapTypeIntoContext(
                     aliasDecl->getDeclaredInterfaceType());
@@ -552,9 +508,8 @@ Type TypeChecker::resolveTypeInContext(TypeDecl *typeDecl, DeclContext *foundDC,
                   dyn_cast<TypeAliasType>(extendedType.getPointer())) {
             if (aliasType->getDecl() == aliasDecl) {
               if (resolution.getStage() == TypeResolutionStage::Structural &&
-                  !aliasDecl->hasInterfaceType()) {
-                return resolution.mapTypeIntoContext(
-                    aliasDecl->getStructuralType());
+                  aliasDecl->getUnderlyingTypeRepr() != nullptr) {
+                return aliasDecl->getStructuralType();
               }
               return resolution.mapTypeIntoContext(
                   aliasDecl->getDeclaredInterfaceType());
@@ -579,8 +534,8 @@ Type TypeChecker::resolveTypeInContext(TypeDecl *typeDecl, DeclContext *foundDC,
 
       // Otherwise, return the appropriate type.
       if (resolution.getStage() == TypeResolutionStage::Structural &&
-          !aliasDecl->hasInterfaceType()) {
-        return resolution.mapTypeIntoContext(aliasDecl->getStructuralType());
+          aliasDecl->getUnderlyingTypeRepr() != nullptr) {
+        return aliasDecl->getStructuralType();
       }
       return resolution.mapTypeIntoContext(
           aliasDecl->getDeclaredInterfaceType());
@@ -645,7 +600,7 @@ Type TypeChecker::resolveTypeInContext(TypeDecl *typeDecl, DeclContext *foundDC,
         // extension.
         //
         // Get the superclass of the 'Self' type parameter.
-        auto *sig = foundDC->getGenericSignatureOfContext();
+        auto sig = foundDC->getGenericSignatureOfContext();
         if (!sig)
           return ErrorType::get(ctx);
         auto superclassType = sig->getSuperclassBound(selfType);
@@ -816,7 +771,7 @@ Type TypeChecker::applyUnboundGenericArguments(
          "invalid arguments, use applyGenericArguments for diagnostic emitting");
 
   auto genericSig = decl->getGenericSignature();
-  assert(genericSig != nullptr);
+  assert(!genericSig.isNull());
 
   TypeSubstitutionMap subs;
 
@@ -984,7 +939,6 @@ static Type resolveTypeDecl(TypeDecl *typeDecl, SourceLoc loc,
 
   ASTContext &ctx = typeDecl->getASTContext();
   auto &diags = ctx.Diags;
-  auto lazyResolver = ctx.getLazyResolver();
 
   // Hack: Don't validate nested typealiases if we only need the structural
   // type.
@@ -999,12 +953,8 @@ static Type resolveTypeDecl(TypeDecl *typeDecl, SourceLoc loc,
   if ((!options.is(TypeResolverContext::ExtensionBinding) ||
        !isa<NominalTypeDecl>(typeDecl)) &&
       !prevalidatingAlias(typeDecl, resolution)) {
-    // Validate the declaration.
-    if (lazyResolver && !typeDecl->hasInterfaceType())
-      lazyResolver->resolveDeclSignature(typeDecl);
-
     // If we were not able to validate recursively, bail out.
-    if (!typeDecl->hasInterfaceType()) {
+    if (!typeDecl->getInterfaceType()) {
       diags.diagnose(loc, diag::recursive_decl_reference,
                      typeDecl->getDescriptiveKind(), typeDecl->getName());
       typeDecl->diagnose(diag::kind_declared_here, DescriptiveDeclKind::Type);
@@ -1639,13 +1589,10 @@ static bool diagnoseAvailability(IdentTypeRepr *IdType,
     DeclAvailabilityFlag::ContinueOnPotentialUnavailability;
   if (AllowPotentiallyUnavailableProtocol)
     flags |= DeclAvailabilityFlag::AllowPotentiallyUnavailableProtocol;
-  ASTContext &ctx = DC->getASTContext();
   auto componentRange = IdType->getComponentRange();
   for (auto comp : componentRange) {
     if (auto *typeDecl = comp->getBoundDecl()) {
-      assert(ctx.getLazyResolver() && "Must have a type checker!");
-      TypeChecker &tc = static_cast<TypeChecker &>(*ctx.getLazyResolver());
-      if (diagnoseDeclAvailability(typeDecl, tc, DC, comp->getIdLoc(), flags)) {
+      if (diagnoseDeclAvailability(typeDecl, DC, comp->getIdLoc(), flags)) {
         return true;
       }
     }
@@ -3086,10 +3033,6 @@ Type TypeResolver::resolveDictionaryType(DictionaryTypeRepr *repr,
 
   if (auto dictTy = TypeChecker::getDictionaryType(repr->getBrackets().Start,
                                                    keyTy, valueTy)) {
-    // Check the requirements on the generic arguments.
-    if (auto lazyResolver = Context.getLazyResolver())
-      lazyResolver->resolveDeclSignature(dictDecl);
-
     auto unboundTy = dictDecl->getDeclaredType()->castTo<UnboundGenericType>();
 
     Type args[] = {keyTy, valueTy};

@@ -529,7 +529,7 @@ LocalDeclContextID Serializer::addLocalDeclContextRef(const DeclContext *DC) {
 }
 
 GenericSignatureID
-Serializer::addGenericSignatureRef(const GenericSignature *sig) {
+Serializer::addGenericSignatureRef(GenericSignature sig) {
   if (!sig)
     return 0;
   return GenericSignaturesToSerialize.addRef(sig);
@@ -1170,7 +1170,7 @@ void Serializer::writeGenericRequirements(ArrayRef<Requirement> requirements,
   }
 }
 
-void Serializer::writeASTBlockEntity(const GenericSignature *sig) {
+void Serializer::writeASTBlockEntity(GenericSignature sig) {
   using namespace decls_block;
 
   assert(sig);
@@ -3264,8 +3264,8 @@ public:
     // request-ified this goes away.
     if (!fn->hasInterfaceType()) {
       assert(fn->isImplicit());
-      S.M->getASTContext().getLazyResolver()->resolveDeclSignature(
-          const_cast<AccessorDecl *>(fn));
+      // FIXME: Remove this one
+      (void)fn->getInterfaceType();
     }
 
     using namespace decls_block;
@@ -3342,7 +3342,7 @@ public:
     if (elem->getParentEnum()->isObjC()) {
       // Currently ObjC enums always have integer raw values.
       rawValueKind = EnumElementRawValueKind::IntegerLiteral;
-      auto ILE = cast<IntegerLiteralExpr>(elem->getRawValueExpr());
+      auto ILE = cast<IntegerLiteralExpr>(elem->getStructuralRawValueExpr());
       RawValueText = ILE->getDigitsText();
       isNegative = ILE->isNegative();
       isRawValueImplicit = ILE->isImplicit();
@@ -3896,7 +3896,7 @@ public:
     using namespace decls_block;
     assert(!fnTy->isNoEscape());
 
-    auto *genericSig = fnTy->getGenericSignature();
+    auto genericSig = fnTy->getGenericSignature();
     unsigned abbrCode = S.DeclTypeAbbrCodes[GenericFunctionTypeLayout::Code];
     GenericFunctionTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
         S.addTypeRef(fnTy->getResult()),
@@ -4602,8 +4602,15 @@ void Serializer::writeAST(ModuleOrSourceFile DC,
     nextFile->getOpaqueReturnTypeDecls(opaqueReturnTypeDecls);
 
     for (auto TD : localTypeDecls) {
+
+      // FIXME: We should delay parsing function bodies so these type decls
+      //        don't even get added to the file.
+      if (TD->getDeclContext()->getInnermostSkippedFunctionContext())
+        continue;
+
       hasLocalTypes = true;
       Mangle::ASTMangler Mangler;
+
       std::string MangledName =
           evaluateOrDefault(M->getASTContext().evaluator,
                             MangleLocalTypeDeclRequest { TD },
@@ -4738,6 +4745,7 @@ void swift::serializeToBuffers(
   ModuleOrSourceFile DC, const SerializationOptions &options,
   std::unique_ptr<llvm::MemoryBuffer> *moduleBuffer,
   std::unique_ptr<llvm::MemoryBuffer> *moduleDocBuffer,
+  std::unique_ptr<llvm::MemoryBuffer> *moduleSourceInfoBuffer,
   const SILModule *M) {
 
   assert(!StringRef::withNullAsEmpty(options.OutputPath).empty());
@@ -4774,6 +4782,22 @@ void swift::serializeToBuffers(
       *moduleDocBuffer = llvm::make_unique<llvm::SmallVectorMemoryBuffer>(
                            std::move(buf), options.DocOutputPath);
   }
+
+  if (!StringRef::withNullAsEmpty(options.SourceInfoOutputPath).empty()) {
+    SharedTimer timer("Serialization, swiftsourceinfo, to buffer");
+    llvm::SmallString<1024> buf;
+    llvm::raw_svector_ostream stream(buf);
+    writeSourceInfoToStream(stream, DC);
+    (void)withOutputFile(getContext(DC).Diags,
+                         options.SourceInfoOutputPath,
+                         [&](raw_ostream &out) {
+      out << stream.str();
+      return false;
+    });
+    if (moduleSourceInfoBuffer)
+      *moduleSourceInfoBuffer = llvm::make_unique<llvm::SmallVectorMemoryBuffer>(
+        std::move(buf), options.SourceInfoOutputPath);
+  }
 }
 
 void swift::serialize(ModuleOrSourceFile DC,
@@ -4804,6 +4828,16 @@ void swift::serialize(ModuleOrSourceFile DC,
                          [&](raw_ostream &out) {
       SharedTimer timer("Serialization, swiftdoc");
       writeDocToStream(out, DC, options.GroupInfoPath);
+      return false;
+    });
+  }
+
+  if (!StringRef::withNullAsEmpty(options.SourceInfoOutputPath).empty()) {
+    (void)withOutputFile(getContext(DC).Diags,
+                         options.SourceInfoOutputPath,
+                         [&](raw_ostream &out) {
+      SharedTimer timer("Serialization, swiftsourceinfo");
+      writeSourceInfoToStream(out, DC);
       return false;
     });
   }
