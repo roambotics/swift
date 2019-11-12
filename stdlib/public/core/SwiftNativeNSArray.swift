@@ -64,29 +64,32 @@ internal class __SwiftNativeNSArrayWithContiguousStorage
 private let NSNotFound: Int = .max
 
 // Implement the APIs required by NSArray 
-extension __SwiftNativeNSArrayWithContiguousStorage: _NSArrayCore {
+extension __SwiftNativeNSArrayWithContiguousStorage {
   @objc internal var count: Int {
     return withUnsafeBufferOfObjects { $0.count }
   }
 
   @inline(__always)
-  @nonobjc private func _objectAt(_ index: Int) -> AnyObject {
+  @_effects(readonly)
+  @nonobjc private func _objectAt(_ index: Int) -> Unmanaged<AnyObject> {
     return withUnsafeBufferOfObjects {
       objects in
       _precondition(
         _isValidArraySubscript(index, count: objects.count),
         "Array index out of range")
-      return objects[index]
+      return Unmanaged.passUnretained(objects[index])
     }
   }
   
   @objc(objectAtIndexedSubscript:)
-  dynamic internal func objectAtSubscript(_ index: Int) -> AnyObject {
+  @_effects(readonly)
+  dynamic internal func objectAtSubscript(_ index: Int) -> Unmanaged<AnyObject> {
     return _objectAt(index)
   }
   
   @objc(objectAtIndex:)
-  dynamic internal func objectAt(_ index: Int) -> AnyObject {
+  @_effects(readonly)
+  dynamic internal func objectAt(_ index: Int) -> Unmanaged<AnyObject> {
     return _objectAt(index)
   }
 
@@ -146,7 +149,7 @@ extension __SwiftNativeNSArrayWithContiguousStorage: _NSArrayCore {
 @_fixed_layout
 @usableFromInline
 @objc internal final class _SwiftNSMutableArray :
-  _SwiftNativeNSMutableArray, _NSArrayCore
+  _SwiftNativeNSMutableArray
 {
   internal var contents: [AnyObject]
 
@@ -160,15 +163,17 @@ extension __SwiftNativeNSArrayWithContiguousStorage: _NSArrayCore {
   }
   
   @objc(objectAtIndexedSubscript:)
-  dynamic internal func objectAtSubscript(_ index: Int) -> AnyObject {
+  @_effects(readonly)
+  dynamic internal func objectAtSubscript(_ index: Int) -> Unmanaged<AnyObject> {
     //TODO: exception instead of precondition, once that's possible
-    return contents[index]
+    return Unmanaged.passUnretained(contents[index])
   }
 
   @objc(objectAtIndex:)
-  dynamic internal func objectAt(_ index: Int) -> AnyObject {
+  @_effects(readonly)
+  dynamic internal func objectAt(_ index: Int) -> Unmanaged<AnyObject> {
     //TODO: exception instead of precondition, once that's possible
-    return contents[index]
+    return Unmanaged.passUnretained(contents[index])
   }
 
   @objc internal func getObjects(
@@ -241,7 +246,9 @@ extension __SwiftNativeNSArrayWithContiguousStorage: _NSArrayCore {
   
   @objc(removeLastObject)
   dynamic internal func removeLastObject() {
-    contents.removeLast()
+    if !contents.isEmpty {
+      contents.removeLast()
+    }
   }
   
   @objc(replaceObjectAtIndex:withObject:)
@@ -254,7 +261,7 @@ extension __SwiftNativeNSArrayWithContiguousStorage: _NSArrayCore {
   
   @objc(exchangeObjectAtIndex:withObjectAtIndex:)
   dynamic internal func exchange(at index: Int, with index2: Int) {
-    swap(&contents[index], &contents[index2])
+    contents.swapAt(index, index2)
   }
   
   @objc(replaceObjectsInRange:withObjects:count:)
@@ -263,7 +270,13 @@ extension __SwiftNativeNSArrayWithContiguousStorage: _NSArrayCore {
                                count: Int) {
     let range = range.location ..< range.location + range.length
     let buf = UnsafeBufferPointer(start: objects, count: count)
-    contents.replaceSubrange(range, with: buf)
+    if range == contents.startIndex..<contents.endIndex {
+      contents = Array(buf)
+    } else {
+      // We make an Array here to make sure that something is holding onto the
+      // objects in `buf`, since replaceSubrange could release them
+      contents.replaceSubrange(range, with: Array(buf))
+    }
   }
   
   @objc(insertObjects:count:atIndex:)

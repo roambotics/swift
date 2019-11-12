@@ -86,12 +86,66 @@ void ConstraintLocator::Profile(llvm::FoldingSetNodeID &id, Expr *anchor,
     case KeyPathRoot:
     case KeyPathValue:
     case KeyPathComponentResult:
+    case Condition:
       auto numValues = numNumericValuesInPathElement(elt.getKind());
       for (unsigned i = 0; i < numValues; ++i)
         id.AddInteger(elt.getValue(i));
       break;
     }
   }
+}
+
+unsigned LocatorPathElt::getNewSummaryFlags() const {
+  switch (getKind()) {
+  case ConstraintLocator::ApplyArgument:
+  case ConstraintLocator::ApplyFunction:
+  case ConstraintLocator::SequenceElementType:
+  case ConstraintLocator::ClosureResult:
+  case ConstraintLocator::ConstructorMember:
+  case ConstraintLocator::InstanceType:
+  case ConstraintLocator::AutoclosureResult:
+  case ConstraintLocator::OptionalPayload:
+  case ConstraintLocator::Member:
+  case ConstraintLocator::MemberRefBase:
+  case ConstraintLocator::UnresolvedMember:
+  case ConstraintLocator::ParentType:
+  case ConstraintLocator::ExistentialSuperclassType:
+  case ConstraintLocator::LValueConversion:
+  case ConstraintLocator::RValueAdjustment:
+  case ConstraintLocator::SubscriptMember:
+  case ConstraintLocator::OpenedGeneric:
+  case ConstraintLocator::GenericParameter:
+  case ConstraintLocator::GenericArgument:
+  case ConstraintLocator::NamedTupleElement:
+  case ConstraintLocator::TupleElement:
+  case ConstraintLocator::ProtocolRequirement:
+  case ConstraintLocator::Witness:
+  case ConstraintLocator::KeyPathComponent:
+  case ConstraintLocator::ConditionalRequirement:
+  case ConstraintLocator::TypeParameterRequirement:
+  case ConstraintLocator::ImplicitlyUnwrappedDisjunctionChoice:
+  case ConstraintLocator::DynamicLookupResult:
+  case ConstraintLocator::ContextualType:
+  case ConstraintLocator::SynthesizedArgument:
+  case ConstraintLocator::KeyPathDynamicMember:
+  case ConstraintLocator::KeyPathType:
+  case ConstraintLocator::KeyPathRoot:
+  case ConstraintLocator::KeyPathValue:
+  case ConstraintLocator::KeyPathComponentResult:
+  case ConstraintLocator::Condition:
+    return 0;
+
+  case ConstraintLocator::FunctionArgument:
+  case ConstraintLocator::FunctionResult:
+    return IsFunctionConversion;
+
+  case ConstraintLocator::ApplyArgToParam: {
+    auto flags = castTo<LocatorPathElt::ApplyArgToParam>().getParameterFlags();
+    return flags.isNonEphemeral() ? IsNonEphemeralParam : 0;
+  }
+  }
+
+  llvm_unreachable("Unhandled PathElementKind in switch.");
 }
 
 bool LocatorPathElt::isResultOfSingleExprFunction() const {
@@ -190,21 +244,23 @@ bool ConstraintLocator::isForContextualType() const {
 }
 
 GenericTypeParamType *ConstraintLocator::getGenericParameter() const {
-  return castLastElementTo<LocatorPathElt::GenericParameter>().getType();
+  // Check whether we have a path that terminates at a generic parameter.
+  return isForGenericParameter() ?
+      castLastElementTo<LocatorPathElt::GenericParameter>().getType() : nullptr;
 }
 
-void ConstraintLocator::dump(SourceManager *sm) {
+void ConstraintLocator::dump(SourceManager *sm) const {
   dump(sm, llvm::errs());
   llvm::errs() << "\n";
 }
 
-void ConstraintLocator::dump(ConstraintSystem *CS) {
-  dump(&CS->TC.Context.SourceMgr, llvm::errs());
+void ConstraintLocator::dump(ConstraintSystem *CS) const {
+  dump(&CS->getASTContext().SourceMgr, llvm::errs());
   llvm::errs() << "\n";
 }
 
 
-void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) {
+void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) const {
   out << "locator@" << (void*) this << " [";
 
   if (anchor) {
@@ -258,6 +314,8 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) {
       auto argElt = elt.castTo<LocatorPathElt::ApplyArgToParam>();
       out << "comparing call argument #" << llvm::utostr(argElt.getArgIdx())
           << " to parameter #" << llvm::utostr(argElt.getParamIdx());
+      if (argElt.getParameterFlags().isNonEphemeral())
+        out << " (non-ephemeral)";
       break;
     }
     case ClosureResult:
@@ -407,6 +465,10 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) {
 
     case KeyPathComponentResult:
       out << "key path component result";
+      break;
+
+    case Condition:
+      out << "condition expression";
       break;
     }
   }

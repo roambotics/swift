@@ -228,8 +228,9 @@ createAllocas(llvm::SmallVector<AllocStackInst *, 4> &NewAllocations) {
            "this point.");
     SILModule &M = AI->getModule();
     for (auto *D : SD->getStoredProperties())
-      NewAllocations.push_back(
-          B.createAllocStack(Loc, Type.getFieldType(D, M), {}));
+      NewAllocations.push_back(B.createAllocStack(
+          Loc, Type.getFieldType(D, M, TypeExpansionContext(B.getFunction())),
+          {}));
   }
 }
 
@@ -286,7 +287,7 @@ void SROAMemoryUseAnalyzer::chopUpAlloca(std::vector<AllocStackInst *> &Worklist
     if (auto *DSI = dyn_cast<DeallocStackInst>(User)) {
       LLVM_DEBUG(llvm::dbgs() << "        Found DeallocStackInst!\n");
       // Create the allocations in reverse order.
-      for (auto *NewAI : swift::reversed(NewAllocations))
+      for (auto *NewAI : llvm::reverse(NewAllocations))
         B.createDeallocStack(DSI->getLoc(), SILValue(NewAI));
       ToRemove.push_back(DSI);
     }

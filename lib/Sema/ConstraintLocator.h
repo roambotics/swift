@@ -18,6 +18,7 @@
 #ifndef SWIFT_SEMA_CONSTRAINTLOCATOR_H
 #define SWIFT_SEMA_CONSTRAINTLOCATOR_H
 
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
@@ -89,6 +90,7 @@ public:
     case KeyPathRoot:
     case KeyPathValue:
     case KeyPathComponentResult:
+    case Condition:
       return 0;
 
     case ContextualType:
@@ -122,55 +124,11 @@ public:
     /// Does this path involve a function conversion, i.e. a
     /// FunctionArgument or FunctionResult node?
     IsFunctionConversion = 0x1,
+
+    /// Does this path involve an argument being applied to a non-ephemeral
+    /// parameter?
+    IsNonEphemeralParam = 0x2,
   };
-
-  static unsigned getSummaryFlagsForPathElement(PathElementKind kind) {
-    switch (kind) {
-    case ApplyArgument:
-    case ApplyFunction:
-    case ApplyArgToParam:
-    case SequenceElementType:
-    case ClosureResult:
-    case ConstructorMember:
-    case InstanceType:
-    case AutoclosureResult:
-    case OptionalPayload:
-    case Member:
-    case MemberRefBase:
-    case UnresolvedMember:
-    case ParentType:
-    case ExistentialSuperclassType:
-    case LValueConversion:
-    case RValueAdjustment:
-    case SubscriptMember:
-    case OpenedGeneric:
-    case GenericParameter:
-    case GenericArgument:
-    case NamedTupleElement:
-    case TupleElement:
-    case ProtocolRequirement:
-    case Witness:
-    case KeyPathComponent:
-    case ConditionalRequirement:
-    case TypeParameterRequirement:
-    case ImplicitlyUnwrappedDisjunctionChoice:
-    case DynamicLookupResult:
-    case ContextualType:
-    case SynthesizedArgument:
-    case KeyPathDynamicMember:
-    case KeyPathType:
-    case KeyPathRoot:
-    case KeyPathValue:
-    case KeyPathComponentResult:
-      return 0;
-
-    case FunctionArgument:
-    case FunctionResult:
-      return IsFunctionConversion;
-    }
-
-    llvm_unreachable("Unhandled PathElementKind in switch.");
-  }
 
   /// One element in the path of a locator, which can include both
   /// a kind (PathElementKind) and a value used to describe specific
@@ -329,9 +287,7 @@ public:
     bool is() const { return isa<T>(this); }
 
     /// Return the summary flags for this particular element.
-    unsigned getNewSummaryFlags() const {
-      return getSummaryFlagsForPathElement(getKind());
-    }
+    unsigned getNewSummaryFlags() const;
 
     bool isConditionalRequirement() const {
       return getKind() == PathElementKind::ConditionalRequirement;
@@ -378,6 +334,12 @@ public:
   /// conversion.
   bool isFunctionConversion() const {
     return (getSummaryFlags() & IsFunctionConversion);
+  }
+
+  /// Checks whether this locator is describing an argument application for a
+  /// non-ephemeral parameter.
+  bool isNonEphemeralParameterApplication() const {
+    return (getSummaryFlags() & IsNonEphemeralParam);
   }
 
   /// Determine whether given locator points to the subscript reference
@@ -540,14 +502,10 @@ public:
   }
   
   /// Produce a debugging dump of this locator.
-  LLVM_ATTRIBUTE_DEPRECATED(
-      void dump(SourceManager *SM) LLVM_ATTRIBUTE_USED,
-      "only for use within the debugger");
-  LLVM_ATTRIBUTE_DEPRECATED(
-      void dump(ConstraintSystem *CS) LLVM_ATTRIBUTE_USED,
-      "only for use within the debugger");
+  SWIFT_DEBUG_DUMPER(dump(SourceManager *SM));
+  SWIFT_DEBUG_DUMPER(dump(ConstraintSystem *CS));
 
-  void dump(SourceManager *SM, raw_ostream &OS) LLVM_ATTRIBUTE_USED;
+  void dump(SourceManager *SM, raw_ostream &OS) const LLVM_ATTRIBUTE_USED;
 
 private:
   /// Initialize a constraint locator with an anchor and a path.
@@ -913,6 +871,12 @@ public:
       return last->getKind() == ConstraintLocator::AutoclosureResult;
 
     return false;
+  }
+
+  /// Checks whether this locator is describing an argument application for a
+  /// non-ephemeral parameter.
+  bool isNonEphemeralParameterApplication() const {
+    return (getSummaryFlags() & ConstraintLocator::IsNonEphemeralParam);
   }
 
   /// Retrieve the base constraint locator, on which this builder's

@@ -39,6 +39,7 @@
 #ifndef SWIFT_SYNTAX_SYNTAXDATA_H
 #define SWIFT_SYNTAX_SYNTAXDATA_H
 
+#include "swift/Basic/Debug.h"
 #include "swift/Syntax/AtomicCache.h"
 #include "swift/Syntax/RawSyntax.h"
 #include "swift/Syntax/References.h"
@@ -148,10 +149,6 @@ public:
   /// Get the first non-missing token node in this tree. Return nullptr if this
   /// node does not contain non-missing tokens.
   RC<SyntaxData> getFirstToken() const;
-
-  /// Get the last non-missing token node in this tree. Return nullptr if this
-  /// node does not contain non-missing tokens.
-  RC<SyntaxData> getLastToken() const;
 
   ~SyntaxData() {
     for (auto &I : getChildren())
@@ -292,8 +289,7 @@ public:
   /// standard error.
   void dump(llvm::raw_ostream &OS) const;
 
-  LLVM_ATTRIBUTE_DEPRECATED(void dump() const LLVM_ATTRIBUTE_USED,
-                            "Only meant for use in the debugger");
+  SWIFT_DEBUG_DUMP;
 };
 
 } // end namespace syntax

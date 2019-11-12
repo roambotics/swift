@@ -42,13 +42,15 @@ static SILValue emitConstructorMetatypeArg(SILGenFunction &SGF,
   auto *DC = ctor->getInnermostDeclContext();
   auto &AC = SGF.getASTContext();
   auto VD =
-      new (AC) ParamDecl(ParamDecl::Specifier::Default, SourceLoc(), SourceLoc(),
+      new (AC) ParamDecl(SourceLoc(), SourceLoc(),
                          AC.getIdentifier("$metatype"), SourceLoc(),
                          AC.getIdentifier("$metatype"), DC);
+  VD->setSpecifier(ParamSpecifier::Default);
   VD->setInterfaceType(metatype);
 
   SGF.AllocatorMetatype = SGF.F.begin()->createFunctionArgument(
-      SGF.getLoweredType(DC->mapTypeIntoContext(metatype)), VD);
+      SGF.getLoweredTypeForFunctionArgument(DC->mapTypeIntoContext(metatype)),
+      VD);
 
   return SGF.AllocatorMetatype;
 }
@@ -69,15 +71,15 @@ static RValue emitImplicitValueConstructorArg(SILGenFunction &SGF,
   }
 
   auto &AC = SGF.getASTContext();
-  auto VD = new (AC) ParamDecl(ParamDecl::Specifier::Default, SourceLoc(), SourceLoc(),
+  auto VD = new (AC) ParamDecl(SourceLoc(), SourceLoc(),
                                AC.getIdentifier("$implicit_value"),
                                SourceLoc(),
                                AC.getIdentifier("$implicit_value"),
                                DC);
+  VD->setSpecifier(ParamSpecifier::Default);
   VD->setInterfaceType(interfaceType);
 
-  auto argType = SGF.SGM.Types.getLoweredType(type,
-                                              ResilienceExpansion::Minimal);
+  auto argType = SGF.getLoweredTypeForFunctionArgument(type);
   auto *arg = SGF.F.begin()->createFunctionArgument(argType, VD);
   ManagedValue mvArg;
   if (arg->getArgumentConvention().isOwnedConvention()) {
@@ -127,20 +129,21 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
   auto *paramList = ctor->getParameters();
   auto *selfDecl = ctor->getImplicitSelfDecl();
   auto selfIfaceTy = selfDecl->getInterfaceType();
-  SILType selfTy = SGF.getLoweredType(selfDecl->getType());
+  SILType selfTy = SGF.getLoweredTypeForFunctionArgument(selfDecl->getType());
 
   // Emit the indirect return argument, if any.
   SILValue resultSlot;
   if (SILModuleConventions::isReturnedIndirectlyInSIL(selfTy, SGF.SGM.M)) {
     auto &AC = SGF.getASTContext();
-    auto VD = new (AC) ParamDecl(ParamDecl::Specifier::InOut,
-                                 SourceLoc(), SourceLoc(),
+    auto VD = new (AC) ParamDecl(SourceLoc(), SourceLoc(),
                                  AC.getIdentifier("$return_value"),
                                  SourceLoc(),
                                  AC.getIdentifier("$return_value"),
                                  ctor);
+    VD->setSpecifier(ParamSpecifier::InOut);
     VD->setInterfaceType(selfIfaceTy);
-    resultSlot = SGF.F.begin()->createFunctionArgument(selfTy.getAddressType(), VD);
+    resultSlot =
+        SGF.F.begin()->createFunctionArgument(selfTy.getAddressType(), VD);
   }
 
   // Emit the elementwise arguments.
@@ -162,7 +165,8 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
   if (resultSlot) {
     auto elti = elements.begin(), eltEnd = elements.end();
     for (VarDecl *field : decl->getStoredProperties()) {
-      auto fieldTy = selfTy.getFieldType(field, SGF.SGM.M);
+      auto fieldTy =
+          selfTy.getFieldType(field, SGF.SGM.M, SGF.getTypeExpansionContext());
       SILValue slot =
         SGF.B.createStructElementAddr(Loc, resultSlot, field,
                                       fieldTy.getAddressType());
@@ -199,7 +203,8 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
 
   auto elti = elements.begin(), eltEnd = elements.end();
   for (VarDecl *field : decl->getStoredProperties()) {
-    auto fieldTy = selfTy.getFieldType(field, SGF.SGM.M);
+    auto fieldTy =
+        selfTy.getFieldType(field, SGF.SGM.M, SGF.getTypeExpansionContext());
     SILValue v;
 
     // If it's memberwise initialized, do so now.
@@ -414,8 +419,8 @@ void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
 void SILGenFunction::emitEnumConstructor(EnumElementDecl *element) {
   Type enumIfaceTy = element->getParentEnum()->getDeclaredInterfaceType();
   Type enumTy = F.mapTypeIntoContext(enumIfaceTy);
-  auto &enumTI = SGM.Types.getTypeLowering(enumTy,
-                                           ResilienceExpansion::Minimal);
+  auto &enumTI =
+      SGM.Types.getTypeLowering(enumTy, TypeExpansionContext::minimal());
 
   RegularLocation Loc(element);
   CleanupLocation CleanupLoc(element);
@@ -425,12 +430,12 @@ void SILGenFunction::emitEnumConstructor(EnumElementDecl *element) {
   std::unique_ptr<Initialization> dest;
   if (enumTI.isAddressOnly() && silConv.useLoweredAddresses()) {
     auto &AC = getASTContext();
-    auto VD = new (AC) ParamDecl(ParamDecl::Specifier::InOut,
-                                 SourceLoc(), SourceLoc(),
+    auto VD = new (AC) ParamDecl(SourceLoc(), SourceLoc(),
                                  AC.getIdentifier("$return_value"),
                                  SourceLoc(),
                                  AC.getIdentifier("$return_value"),
-                                 element->getDeclContext());
+                                 element->getDeclContext());  
+    VD->setSpecifier(ParamSpecifier::InOut);
     VD->setInterfaceType(enumIfaceTy);
     auto resultSlot =
         F.begin()->createFunctionArgument(enumTI.getLoweredType(), VD);
@@ -912,12 +917,13 @@ void SILGenFunction::emitMemberInitializers(DeclContext *dc,
     if (auto pbd = dyn_cast<PatternBindingDecl>(member)) {
       if (pbd->isStatic()) continue;
 
-      for (auto entry : pbd->getPatternList()) {
-        auto init = entry.getExecutableInit();
+      for (auto i : range(pbd->getNumPatternEntries())) {
+        auto init = pbd->getExecutableInit(i);
         if (!init) continue;
 
+        auto *varPattern = pbd->getPattern(i);
         // Cleanup after this initialization.
-        FullExpr scope(Cleanups, entry.getPattern());
+        FullExpr scope(Cleanups, varPattern);
 
         // We want a substitution list written in terms of the generic
         // signature of the type, with replacement archetypes from the
@@ -946,13 +952,13 @@ void SILGenFunction::emitMemberInitializers(DeclContext *dc,
         // Get the type of the initialization result, in terms
         // of the constructor context's archetypes.
         CanType resultType = getInitializationTypeInContext(
-            pbd->getDeclContext(), dc, entry.getPattern())->getCanonicalType();
+            pbd->getDeclContext(), dc, varPattern)->getCanonicalType();
         AbstractionPattern origResultType(resultType);
 
         // FIXME: Can emitMemberInit() share code with
         // InitializationForPattern in SILGenDecl.cpp?
         RValue result = emitApplyOfStoredPropertyInitializer(
-                                  init, entry, subs,
+                                  init, pbd->getAnchoringVarDecl(i), subs,
                                   resultType, origResultType,
                                   SGFContext());
 
@@ -968,7 +974,7 @@ void SILGenFunction::emitMemberInitializers(DeclContext *dc,
           }
         }
 
-        emitMemberInit(*this, selfDecl, entry.getPattern(), std::move(result));
+        emitMemberInit(*this, selfDecl, varPattern, std::move(result));
       }
     }
   }

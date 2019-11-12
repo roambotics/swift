@@ -185,7 +185,7 @@ void GenericParamList::print(llvm::raw_ostream &OS) const {
   OS << '>';
 }
 
-void GenericParamList::dump() {
+void GenericParamList::dump() const {
   print(llvm::errs());
   llvm::errs() << '\n';
 }
@@ -725,7 +725,7 @@ namespace {
 
       if (auto *var = dyn_cast<VarDecl>(VD)) {
         PrintWithColorRAII(OS, TypeColor) << " type='";
-        if (var->hasType())
+        if (auto varTy = var->hasInterfaceType())
           var->getType().print(PrintWithColorRAII(OS, TypeColor).getOS());
         else
           PrintWithColorRAII(OS, TypeColor) << "<null type>";
@@ -895,20 +895,20 @@ namespace {
     void visitPatternBindingDecl(PatternBindingDecl *PBD) {
       printCommon(PBD, "pattern_binding_decl");
 
-      for (auto entry : PBD->getPatternList()) {
+      for (auto idx : range(PBD->getNumPatternEntries())) {
         OS << '\n';
-        printRec(entry.getPattern());
-        if (entry.getOriginalInit()) {
+        printRec(PBD->getPattern(idx));
+        if (PBD->getOriginalInit(idx)) {
           OS << '\n';
           OS.indent(Indent + 2);
           OS << "Original init:\n";
-          printRec(entry.getOriginalInit());
+          printRec(PBD->getOriginalInit(idx));
         }
-        if (entry.getInit()) {
+        if (PBD->getInit(idx)) {
           OS << '\n';
           OS.indent(Indent + 2);
           OS << "Processed init:\n";
-          printRec(entry.getInit());
+          printRec(PBD->getInit(idx));
         }
       }
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
@@ -954,32 +954,32 @@ namespace {
         PrintWithColorRAII(OS, IdentifierColor)
           << " apiName=" << P->getArgumentName();
 
-      if (P->hasType()) {
+      if (P->hasInterfaceType()) {
         PrintWithColorRAII(OS, TypeColor) << " type='";
         P->getType().print(PrintWithColorRAII(OS, TypeColor).getOS());
         PrintWithColorRAII(OS, TypeColor) << "'";
-      }
 
-      if (P->hasInterfaceType()) {
         PrintWithColorRAII(OS, InterfaceTypeColor) << " interface type='";
         P->getInterfaceType().print(
             PrintWithColorRAII(OS, InterfaceTypeColor).getOS());
         PrintWithColorRAII(OS, InterfaceTypeColor) << "'";
       }
 
-      switch (P->getSpecifier()) {
-      case ParamDecl::Specifier::Default:
-        /* nothing */
-        break;
-      case ParamDecl::Specifier::InOut:
-        OS << " inout";
-        break;
-      case ParamDecl::Specifier::Shared:
-        OS << " shared";
-        break;
-      case ParamDecl::Specifier::Owned:
-        OS << " owned";
-        break;
+      if (auto specifier = P->getCachedSpecifier()) {
+        switch (*specifier) {
+        case ParamDecl::Specifier::Default:
+          /* nothing */
+          break;
+        case ParamDecl::Specifier::InOut:
+          OS << " inout";
+          break;
+        case ParamDecl::Specifier::Shared:
+          OS << " shared";
+          break;
+        case ParamDecl::Specifier::Owned:
+          OS << " owned";
+          break;
+        }
       }
 
       if (P->isVariadic())
@@ -987,6 +987,9 @@ namespace {
 
       if (P->isAutoClosure())
         OS << " autoclosure";
+
+      if (P->isNonEphemeral())
+        OS << " nonEphemeral";
 
       if (P->getDefaultArgumentKind() != DefaultArgumentKind::None) {
         printField("default_arg",
@@ -2956,13 +2959,6 @@ public:
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
-  void visitImplicitlyUnwrappedOptionalTypeRepr(
-      ImplicitlyUnwrappedOptionalTypeRepr *T) {
-    printCommon("implicitly_unwrapped_optional");
-    OS << "\n";
-    printRec(T->getBase());
-  }
-
   void visitCompositionTypeRepr(CompositionTypeRepr *T) {
     printCommon("type_composite");
     for (auto elem : T->getTypes()) {
@@ -3313,6 +3309,7 @@ namespace {
     void dumpParameterFlags(ParameterTypeFlags paramFlags) {
       printFlag(paramFlags.isVariadic(), "vararg");
       printFlag(paramFlags.isAutoClosure(), "autoclosure");
+      printFlag(paramFlags.isNonEphemeral(), "nonEphemeral");
       switch (paramFlags.getValueOwnership()) {
       case ValueOwnership::Default: break;
       case ValueOwnership::Owned: printFlag("owned"); break;

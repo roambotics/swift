@@ -512,8 +512,8 @@ public:
       if (auto *DC = dyn_cast<DeclContext>(D)) {
         if (D->getDeclContext() != DC->getParent()) {
           Out << "Decl's DeclContext not in sync with DeclContext's parent\n";
-          D->getDeclContext()->dumpContext();
-          DC->getParent()->dumpContext();
+          D->getDeclContext()->printContext(Out);
+          DC->getParent()->printContext(Out);
           abort();
         }
       }
@@ -1652,7 +1652,7 @@ public:
 
       if (E->getConformance().getRequirement() != hashableDecl) {
         Out << "conformance on AnyHashableErasureExpr was not for Hashable\n";
-        E->getConformance().dump();
+        E->getConformance().dump(Out);
         abort();
       }
 
@@ -2357,8 +2357,8 @@ public:
 
     void verifyChecked(PatternBindingDecl *binding) {
       // Look at all of the VarDecls being bound.
-      for (auto entry : binding->getPatternList())
-        if (auto *P = entry.getPattern())
+      for (auto idx : range(binding->getNumPatternEntries()))
+        if (auto *P = binding->getPattern(idx))
           P->forEachVariable([&](VarDecl *VD) {
             // ParamDecls never get PBD's.
             assert(!isa<ParamDecl>(VD) && "ParamDecl has a PatternBindingDecl?");
@@ -2645,7 +2645,8 @@ public:
 
           // Make sure that the replacement type only uses archetypes allowed
           // in the context where the normal conformance exists.
-          auto replacementType = normal->getTypeWitness(assocType);
+          auto replacementType =
+              normal->getTypeWitnessUncached(assocType).getWitnessType();
           Verifier(M, normal->getDeclContext())
             .verifyChecked(replacementType);
           continue;
@@ -2677,7 +2678,7 @@ public:
           }
 
           // Check the witness substitutions.
-          const auto &witness = normal->getWitness(req);
+          const auto &witness = normal->getWitnessUncached(req);
 
           if (auto *genericEnv = witness.getSyntheticEnvironment())
             Generics.push_back(genericEnv->getGenericSignature());
@@ -2969,15 +2970,8 @@ public:
     void verifyChecked(AbstractFunctionDecl *AFD) {
       PrettyStackTraceDecl debugStack("verifying AbstractFunctionDecl", AFD);
 
-      if (!AFD->hasInterfaceType()) {
-        if (isa<AccessorDecl>(AFD) && AFD->isImplicit())
-          return;
-
-        Out << "All functions except implicit accessors should be "
-               "validated by now\n";
-        AFD->dump(Out);
-        abort();
-      }
+      if (!AFD->hasInterfaceType())
+        return;
 
       // If this function is generic or is within a generic context, it should
       // have an interface type.
@@ -3189,12 +3183,6 @@ public:
 
     void verifyParsed(AccessorDecl *FD) {
       PrettyStackTraceDecl debugStack("verifying AccessorDecl", FD);
-
-      auto storage = FD->getStorage();
-      if (storage->isStatic() != FD->isStatic()) {
-        Out << "accessor static-ness must match static-ness of storage\n";
-        abort();
-      }
 
       verifyParsedBase(FD);
     }
@@ -3645,17 +3633,7 @@ public:
     void checkErrors(Stmt *S) {}
     void checkErrors(Pattern *P) {}
     void checkErrors(Decl *D) {}
-    void checkErrors(ValueDecl *D) {
-      PrettyStackTraceDecl debugStack("verifying errors", D);
-
-      if (!D->hasInterfaceType())
-        return;
-      if (D->getInterfaceType()->hasError() && !D->isInvalid()) {
-        Out << "Valid decl has error type!\n";
-        D->dump(Out);
-        abort();
-      }
-    }
+    void checkErrors(ValueDecl *D) {}
   };
 } // end anonymous namespace
 

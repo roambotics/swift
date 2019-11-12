@@ -13,6 +13,7 @@
 #ifndef SWIFT_PARSE_PARSEDRAWSYNTAXNODE_H
 #define SWIFT_PARSE_PARSEDRAWSYNTAXNODE_H
 
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Parse/ParsedTrivia.h"
 #include "swift/Parse/Token.h"
@@ -52,6 +53,7 @@ class ParsedRawSyntaxNode {
   };
   struct DeferredLayoutNode {
     MutableArrayRef<ParsedRawSyntaxNode> Children;
+    CharSourceRange Range;
   };
   struct DeferredTokenNode {
     const ParsedTriviaPiece *TriviaPieces;
@@ -72,9 +74,9 @@ class ParsedRawSyntaxNode {
   /// Primary used for capturing a deferred missing token.
   bool IsMissing = false;
 
-  ParsedRawSyntaxNode(syntax::SyntaxKind k,
+  ParsedRawSyntaxNode(syntax::SyntaxKind k, CharSourceRange r,
                       MutableArrayRef<ParsedRawSyntaxNode> deferredNodes)
-    : DeferredLayout({deferredNodes}),
+    : DeferredLayout({deferredNodes, r}),
       SynKind(uint16_t(k)), TokKind(uint16_t(tok::unknown)),
       DK(DataKind::DeferredLayout) {
     assert(getKind() == k && "Syntax kind with too large value!");
@@ -187,7 +189,7 @@ public:
     TokKind = uint16_t(tok::unknown);
     DK = DataKind::Null;
     IsMissing = false;
- }
+  }
 
   ParsedRawSyntaxNode unsafeCopy() const {
     ParsedRawSyntaxNode copy;
@@ -211,19 +213,17 @@ public:
     return copy;
   }
 
-  CharSourceRange getDeferredRange(bool includeTrivia) const {
-    switch (DK) { 
+  CharSourceRange getDeferredRange() const {
+    switch (DK) {
     case DataKind::DeferredLayout:
-      return getDeferredLayoutRange(includeTrivia);
+      return getDeferredLayoutRange();
     case DataKind::DeferredToken:
-      return includeTrivia
-        ? getDeferredTokenRangeWithTrivia()
-        : getDeferredTokenRange();
+      return getDeferredTokenRangeWithTrivia();
     default:
       llvm_unreachable("node not deferred");
     }
   }
-  
+
   // Recorded Data ===========================================================//
 
   CharSourceRange getRecordedRange() const {
@@ -243,29 +243,20 @@ public:
 
   // Deferred Layout Data ====================================================//
 
-  CharSourceRange getDeferredLayoutRange(bool includeTrivia) const {
+  CharSourceRange getDeferredLayoutRange() const {
     assert(DK == DataKind::DeferredLayout);
-    auto HasValidRange = [includeTrivia](const ParsedRawSyntaxNode &Child) {
-      return !Child.isNull() && !Child.isMissing() &&
-        Child.getDeferredRange(includeTrivia).isValid();
-    };
-    auto first = llvm::find_if(getDeferredChildren(), HasValidRange);
-    if (first == getDeferredChildren().end())
-      return CharSourceRange();
-    auto last = llvm::find_if(llvm::reverse(getDeferredChildren()),
-                              HasValidRange);
-    auto firstRange = first->getDeferredRange(includeTrivia);
-    firstRange.widen(last->getDeferredRange(includeTrivia));
-    return firstRange;
+    return DeferredLayout.Range;
   }
   ArrayRef<ParsedRawSyntaxNode> getDeferredChildren() const {
     assert(DK == DataKind::DeferredLayout);
     return DeferredLayout.Children;
   }
+
   MutableArrayRef<ParsedRawSyntaxNode> getDeferredChildren() {
     assert(DK == DataKind::DeferredLayout);
     return DeferredLayout.Children;
   }
+
   ParsedRawSyntaxNode copyDeferred() const {
     ParsedRawSyntaxNode copy;
     switch (DK) {
@@ -337,9 +328,7 @@ public:
   }
 
   /// Dump this piece of syntax recursively for debugging or testing.
-  LLVM_ATTRIBUTE_DEPRECATED(
-    void dump() const LLVM_ATTRIBUTE_USED,
-    "only for use within the debugger");
+  SWIFT_DEBUG_DUMP;
 
   /// Dump this piece of syntax recursively.
   void dump(raw_ostream &OS, unsigned Indent = 0) const;

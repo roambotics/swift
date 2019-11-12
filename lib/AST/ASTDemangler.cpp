@@ -259,8 +259,7 @@ Type ASTBuilder::resolveOpaqueType(NodePointer opaqueDescriptor,
     if (!parentModule)
       return Type();
 
-    auto opaqueDecl = parentModule->lookupOpaqueResultType(mangledName,
-                                                           Resolver);
+    auto opaqueDecl = parentModule->lookupOpaqueResultType(mangledName);
     if (!opaqueDecl)
       return Type();
     // TODO: multiple opaque types
@@ -506,10 +505,10 @@ Type ASTBuilder::createImplFunctionType(
     auto conv = getResultConvention(errorResult->getConvention());
     funcErrorResult.emplace(type, conv);
   }
-
   return SILFunctionType::get(genericSig, einfo, funcCoroutineKind,
                               funcCalleeConvention, funcParams, funcYields,
-                              funcResults, funcErrorResult, Ctx);
+                              funcResults, funcErrorResult,
+                              SubstitutionMap(), false, Ctx);
 }
 
 Type ASTBuilder::createProtocolCompositionType(

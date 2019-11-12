@@ -412,7 +412,7 @@ void NodeFactory::clear() {
   assert(!isBorrowed);
   if (CurrentSlab) {
 #ifdef NODE_FACTORY_DEBUGGING
-    std::cerr << indent() << "## clear: allocated memory = " << allocatedMemory  << "\n";
+    fprintf(stderr, "%s## clear: allocated memory = %zu\n", indent().c_str(), allocatedMemory);
 #endif
 
     freeSlabs(CurrentSlab->Previous);
@@ -2339,7 +2339,7 @@ std::string Demangler::demangleBridgedMethodParams() {
 
   while (!nextIf('_')) {
     auto c = nextChar();
-    if (!c && c != 'n' && c != 'b')
+    if (c != 'n' && c != 'b')
       return std::string();
     Str.push_back(c);
   }

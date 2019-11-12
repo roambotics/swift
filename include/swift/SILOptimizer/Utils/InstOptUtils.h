@@ -38,13 +38,12 @@ template <class T> class NullablePtr;
 /// Transform a Use Range (Operand*) into a User Range (SILInstruction*)
 using UserTransform = std::function<SILInstruction *(Operand *)>;
 using ValueBaseUserRange =
-    TransformRange<IteratorRange<ValueBase::use_iterator>, UserTransform>;
+    TransformRange<iterator_range<ValueBase::use_iterator>, UserTransform>;
 
 inline ValueBaseUserRange
 makeUserRange(iterator_range<ValueBase::use_iterator> range) {
   auto toUser = [](Operand *operand) { return operand->getUser(); };
-  return makeTransformRange(makeIteratorRange(range.begin(), range.end()),
-                            UserTransform(toUser));
+  return makeTransformRange(range, UserTransform(toUser));
 }
 
 using DeadInstructionSet = llvm::SmallSetVector<SILInstruction *, 8>;
@@ -316,6 +315,10 @@ void replaceLoadSequence(SILInstruction *inst, SILValue value);
 /// Do we have enough information to determine all callees that could
 /// be reached by calling the function represented by Decl?
 bool calleesAreStaticallyKnowable(SILModule &module, SILDeclRef decl);
+
+/// Do we have enough information to determine all callees that could
+/// be reached by calling the function represented by Decl?
+bool calleesAreStaticallyKnowable(SILModule &module, AbstractFunctionDecl *afd);
 
 // Attempt to get the instance for , whose static type is the same as
 // its exact dynamic type, returning a null SILValue() if we cannot find it.

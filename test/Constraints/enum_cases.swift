@@ -27,8 +27,7 @@ let _ = arr.map(E.tuple) // expected-error {{cannot invoke 'map' with an argumen
 
 let _ = arr.map(G_E<String>.foo) // Ok
 let _ = arr.map(G_E<String>.bar) // Ok
-let _ = arr.map(G_E<String>.two) // expected-error {{cannot invoke 'map' with an argument list of type '(@escaping (String, String) -> G_E<String>)'}}
-// expected-note@-1{{expected an argument list of type '((Self.Element) throws -> T)'}}
+let _ = arr.map(G_E<String>.two) // expected-error {{cannot convert value of type '(String, String) -> G_E<String>' to expected argument type '(String) throws -> G_E<String>'}}
 let _ = arr.map(G_E<Int>.tuple) // expected-error {{cannot invoke 'map' with an argument list of type '(@escaping ((x: Int, y: Int)) -> G_E<Int>)'}}
 // expected-note@-1{{expected an argument list of type '((Self.Element) throws -> T)'}}
 
@@ -104,7 +103,8 @@ enum E_32551313<L, R> {
 
 struct Foo_32551313 {
   static func bar() -> E_32551313<(String, Foo_32551313?), (String, String)>? {
-    return E_32551313.Left("", Foo_32551313()) // expected-error {{extra argument in call}}
+    return E_32551313.Left("", Foo_32551313()) // expected-error {{enum case 'Left' expects a single parameter of type 'L' [with L = (String, Foo_32551313?)]}}
+    // expected-note@-1 {{did you mean to pass a tuple?}} {{28-28=(}} {{46-46=)}}
   }
 }
 

@@ -65,6 +65,7 @@ namespace swift {
   class SyntaxParsingCache;
   class Token;
   class TopLevelContext;
+  class TypeChecker;
   struct TypeLoc;
   class UnifiedStatsReporter;
   enum class SourceFileKind;
@@ -131,11 +132,9 @@ namespace swift {
                                PersistentParserState *PersistentState = nullptr,
                                bool DelayBodyParsing = true);
 
-  /// Finish the parsing by going over the nodes that were delayed
-  /// during the first parsing pass.
-  void performDelayedParsing(DeclContext *DC,
-                             PersistentParserState &PersistentState,
-                             CodeCompletionCallbacksFactory *Factory);
+  /// Finish the code completion.
+  void performCodeCompletionSecondPass(PersistentParserState &PersistentState,
+                                       CodeCompletionCallbacksFactory &Factory);
 
   /// Lex and return a vector of tokens for the given buffer.
   std::vector<Token> tokenize(const LangOptions &LangOpts,
@@ -193,6 +192,15 @@ namespace swift {
     /// interface without a full compilation.
     SkipNonInlinableFunctionBodies = 1 << 4,
   };
+
+  /// Creates a type checker instance on the given AST context, if it
+  /// doesn't already have one.
+  ///
+  /// \returns a reference to the type checker instance.
+  TypeChecker &createTypeChecker(ASTContext &Ctx);
+
+  /// Bind all 'extension' visible from \p SF to the extended nominal.
+  void bindExtensions(SourceFile &SF);
 
   /// Once parsing and name-binding are complete, this walks the AST to resolve
   /// types and diagnose problems therein.

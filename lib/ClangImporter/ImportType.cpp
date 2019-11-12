@@ -762,8 +762,8 @@ namespace {
         LLVM_FALLTHROUGH;
       default:
         if (!underlyingResult.AbstractType->isEqual(mappedType)) {
-          underlyingResult.AbstractType->dump();
-          mappedType->dump();
+          underlyingResult.AbstractType->dump(llvm::errs());
+          mappedType->dump(llvm::errs());
         }
         assert(underlyingResult.AbstractType->isEqual(mappedType) &&
                "typedef without special typedef kind was mapped "
@@ -1720,11 +1720,10 @@ ParameterList *ClangImporter::Implementation::importFunctionParameterList(
     // It doesn't actually matter which DeclContext we use, so just use the
     // imported header unit.
     auto paramInfo = createDeclWithClangNode<ParamDecl>(
-        param, AccessLevel::Private,
-        ParamDecl::Specifier::Default, SourceLoc(), SourceLoc(), name,
+        param, AccessLevel::Private, SourceLoc(), SourceLoc(), name,
         importSourceLoc(param->getLocation()), bodyName,
         ImportedHeaderUnit);
-
+    paramInfo->setSpecifier(ParamSpecifier::Default);
     paramInfo->setInterfaceType(swiftParamTy);
     recordImplicitUnwrapForDecl(paramInfo,
                                 importedType.isImplicitlyUnwrapped());
@@ -1738,11 +1737,11 @@ ParameterList *ClangImporter::Implementation::importFunctionParameterList(
         BoundGenericType::get(SwiftContext.getArrayDecl(), Type(),
                               {SwiftContext.TheAnyType});
     auto name = SwiftContext.getIdentifier("varargs");
-    auto param = new (SwiftContext) ParamDecl(ParamDecl::Specifier::Default,
-                                              SourceLoc(), SourceLoc(),
+    auto param = new (SwiftContext) ParamDecl(SourceLoc(), SourceLoc(),
                                               Identifier(), SourceLoc(),
                                               name,
                                               ImportedHeaderUnit);
+    param->setSpecifier(ParamSpecifier::Default);
     param->setInterfaceType(paramTy);
 
     param->setVariadic();
@@ -1763,13 +1762,12 @@ static bool isObjCMethodResultAudited(const clang::Decl *decl) {
 
 DefaultArgumentKind ClangImporter::Implementation::inferDefaultArgument(
     clang::QualType type, OptionalTypeKind clangOptionality,
-    DeclBaseName baseName, unsigned numParams, StringRef argumentLabel,
-    bool isFirstParameter, bool isLastParameter, NameImporter &nameImporter) {
+    DeclBaseName baseName, StringRef argumentLabel, bool isFirstParameter,
+    bool isLastParameter, NameImporter &nameImporter) {
   auto baseNameStr = baseName.userFacingName();
 
-  // Don't introduce a default argument for setters with only a single
-  // parameter.
-  if (numParams == 1 && camel_case::getFirstWord(baseNameStr) == "set")
+  // Don't introduce a default argument for the first parameter of setters.
+  if (isFirstParameter && camel_case::getFirstWord(baseNameStr) == "set")
     return DefaultArgumentKind::None;
 
   // Some nullable parameters default to 'nil'.
@@ -1790,16 +1788,12 @@ DefaultArgumentKind ClangImporter::Implementation::inferDefaultArgument(
     }
   }
 
-  // Don't introduce an empty options default arguments for setters.
-  if (isFirstParameter && camel_case::getFirstWord(baseNameStr) == "set")
-    return DefaultArgumentKind::None;
-
   // Option sets default to "[]" if they have "Options" in their name.
   if (const clang::EnumType *enumTy = type->getAs<clang::EnumType>()) {
     const clang::EnumDecl *enumDef = enumTy->getDecl()->getDefinition();
     if (enumDef && nameImporter.getEnumKind(enumDef) == EnumKind::Options) {
       auto enumName = enumDef->getName();
-      for (auto word : reversed(camel_case::getWords(enumName))) {
+      for (auto word : llvm::reverse(camel_case::getWords(enumName))) {
         if (camel_case::sameWordIgnoreFirstCase(word, "options"))
           return DefaultArgumentKind::EmptyArray;
       }
@@ -1821,7 +1815,7 @@ DefaultArgumentKind ClangImporter::Implementation::inferDefaultArgument(
           emptyDictionaryKind = DefaultArgumentKind::NilLiteral;
 
         bool sawInfo = false;
-        for (auto word : reversed(camel_case::getWords(searchStr))) {
+        for (auto word : llvm::reverse(camel_case::getWords(searchStr))) {
           if (camel_case::sameWordIgnoreFirstCase(word, "options"))
             return emptyDictionaryKind;
 
@@ -2038,10 +2032,11 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
     // It doesn't actually matter which DeclContext we use, so just
     // use the imported header unit.
     auto type = TupleType::getEmpty(SwiftContext);
-    auto var = new (SwiftContext) ParamDecl(ParamDecl::Specifier::Default, SourceLoc(),
+    auto var = new (SwiftContext) ParamDecl(SourceLoc(),
                                             SourceLoc(), argName,
                                             SourceLoc(), argName,
                                             ImportedHeaderUnit);
+    var->setSpecifier(ParamSpecifier::Default);
     var->setInterfaceType(type);
     swiftParams.push_back(var);
   };
@@ -2087,7 +2082,7 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
     bool paramIsIUO;
     if (kind == SpecialMethodKind::NSDictionarySubscriptGetter &&
         paramTy->isObjCIdType()) {
-      swiftParamTy = SwiftContext.getNSCopyingDecl()->getDeclaredType();
+      swiftParamTy = SwiftContext.getNSCopyingType();
       if (optionalityOfParam != OTK_None)
         swiftParamTy = OptionalType::get(swiftParamTy);
 
@@ -2157,11 +2152,11 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
     // Set up the parameter info.
     auto paramInfo
       = createDeclWithClangNode<ParamDecl>(param, AccessLevel::Private,
-                                           ParamDecl::Specifier::Default,
                                            SourceLoc(), SourceLoc(), name,
                                            importSourceLoc(param->getLocation()),
                                            bodyName,
                                            ImportedHeaderUnit);
+    paramInfo->setSpecifier(ParamSpecifier::Default);
     paramInfo->setInterfaceType(swiftParamTy);
     recordImplicitUnwrapForDecl(paramInfo, paramIsIUO);
 
@@ -2175,8 +2170,7 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
 
       auto defaultArg = inferDefaultArgument(
           param->getType(), optionalityOfParam,
-          importedName.getDeclName().getBaseName(), numEffectiveParams,
-          name.empty() ? StringRef() : name.str(), paramIndex == 0,
+          importedName.getDeclName().getBaseName(), name.str(), paramIndex == 0,
           isLastParameter, getNameImporter());
       if (defaultArg != DefaultArgumentKind::None)
         paramInfo->setDefaultArgumentKind(defaultArg);
@@ -2194,14 +2188,20 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
   if (importedName.hasCustomName() && argNames.size() != swiftParams.size()) {
     // Note carefully: we're emitting a warning in the /Clang/ buffer.
     auto &srcMgr = getClangASTContext().getSourceManager();
-    auto &rawDiagClient = Instance->getDiagnosticClient();
-    auto &diagClient = static_cast<ClangDiagnosticConsumer &>(rawDiagClient);
+    ClangSourceBufferImporter &bufferImporter =
+        getBufferImporterForDiagnostics();
     SourceLoc methodLoc =
-        diagClient.resolveSourceLocation(srcMgr, clangDecl->getLocation());
+        bufferImporter.resolveSourceLocation(srcMgr, clangDecl->getLocation());
     if (methodLoc.isValid()) {
       SwiftContext.Diags.diagnose(methodLoc, diag::invalid_swift_name_method,
                                   swiftParams.size() < argNames.size(),
                                   swiftParams.size(), argNames.size());
+      ModuleDecl *parentModule = dc->getParentModule();
+      if (parentModule != ImportedHeaderUnit->getParentModule()) {
+        SwiftContext.Diags.diagnose(
+            methodLoc, diag::unresolvable_clang_decl_is_a_framework_bug,
+            parentModule->getName().str());
+      }
     }
     return {Type(), false};
   }
@@ -2269,11 +2269,11 @@ ImportedType ClangImporter::Implementation::importAccessorParamsAndReturnType(
     Identifier argLabel = functionName.getDeclName().getArgumentNames().front();
     auto paramInfo
       = createDeclWithClangNode<ParamDecl>(param, AccessLevel::Private,
-                                           ParamDecl::Specifier::Default,
                                            /*let loc*/SourceLoc(),
                                            /*label loc*/SourceLoc(),
                                            argLabel, nameLoc, bodyName,
                                            /*dummy DC*/ImportedHeaderUnit);
+    paramInfo->setSpecifier(ParamSpecifier::Default);
     paramInfo->setInterfaceType(propertyTy);
 
     *params = ParameterList::create(SwiftContext, paramInfo);

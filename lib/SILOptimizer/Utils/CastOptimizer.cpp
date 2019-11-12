@@ -74,7 +74,7 @@ static SubstitutionMap lookupBridgeToObjCProtocolSubs(SILModule &mod,
                                                       CanType target) {
   auto bridgedProto =
       mod.getASTContext().getProtocol(KnownProtocolKind::ObjectiveCBridgeable);
-  auto conf = *mod.getSwiftModule()->lookupConformance(target, bridgedProto);
+  auto conf = mod.getSwiftModule()->lookupConformance(target, bridgedProto);
   return SubstitutionMap::getProtocolSubstitutions(conf.getRequirement(),
                                                    target, conf);
 }
@@ -628,7 +628,8 @@ CastOptimizer::optimizeBridgedSwiftToObjCCast(SILDynamicCastInst dynamicCast) {
     std::tie(bridgedFunc, subMap) = result.getValue();
   }
 
-  SILType SubstFnTy = bridgedFunc->getLoweredType().substGenericArgs(M, subMap);
+  SILType SubstFnTy = bridgedFunc->getLoweredType().substGenericArgs(
+      M, subMap, TypeExpansionContext(*F));
   SILFunctionConventions substConv(SubstFnTy.castTo<SILFunctionType>(), M);
 
   // Check that this is a case that the authors of this code thought it could
@@ -1227,7 +1228,7 @@ CastOptimizer::optimizeCheckedCastBranchInst(CheckedCastBranchInst *Inst) {
     auto *fBlock = dynamicCast.getFailureBlock();
     if (B.hasOwnership()) {
       fBlock->replacePhiArgumentAndReplaceAllUses(0, mi->getType(),
-                                                  ValueOwnershipKind::Any);
+                                                  ValueOwnershipKind::None);
     }
     return B.createCheckedCastBranch(
         dynamicCast.getLocation(), false /*isExact*/, mi,
@@ -1522,12 +1523,12 @@ static bool optimizeStaticallyKnownProtocolConformance(
     // everything is completely static (`X<Int>() as? P`), in which case a
     // valid conformance will be returned.
     auto Conformance = SM->conformsToProtocol(SourceType, Proto);
-    if (!Conformance)
+    if (Conformance.isInvalid())
       return false;
 
     SILBuilderWithScope B(Inst);
     SmallVector<ProtocolConformanceRef, 1> NewConformances;
-    NewConformances.push_back(Conformance.getValue());
+    NewConformances.push_back(Conformance);
     ArrayRef<ProtocolConformanceRef> Conformances =
         Ctx.AllocateCopy(NewConformances);
 

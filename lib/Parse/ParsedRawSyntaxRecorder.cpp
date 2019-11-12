@@ -75,6 +75,9 @@ getRecordedNode(ParsedRawSyntaxNode node, ParsedRawSyntaxRecorder &rec) {
 ParsedRawSyntaxNode
 ParsedRawSyntaxRecorder::recordRawSyntax(SyntaxKind kind,
                                          MutableArrayRef<ParsedRawSyntaxNode> elements) {
+#ifndef NDEBUG
+  ParsedRawSyntaxRecorder::verifyElementRanges(elements);
+#endif
   CharSourceRange range;
   SmallVector<OpaqueSyntaxNode, 16> subnodes;
   if (!elements.empty()) {
@@ -138,7 +141,7 @@ void ParsedRawSyntaxRecorder::verifyElementRanges(ArrayRef<ParsedRawSyntaxNode> 
       continue;
     CharSourceRange range = elem.isRecorded()
       ? elem.getRecordedRange()
-      : elem.getDeferredRange(/*includeTrivia=*/true);
+      : elem.getDeferredRange();
     if (range.isValid()) {
       assert((prevEndLoc.isInvalid() || range.getStart() == prevEndLoc)
              && "Non-contiguous child ranges?");

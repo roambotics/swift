@@ -129,7 +129,7 @@ func rdar16786220(inout let c: Int) -> () { // expected-warning {{'let' in this 
   c = 42
 }
 
-func multipleSpecifiers(a: inout __owned Int) {} // expected-error {{parameter must not have multiple '__owned', 'inout', or '__shared' specifiers}} {{34-42=}}
+func multipleSpecifiers(a: inout __owned Int) {} // expected-error {{parameter must not have multiple '__owned', 'inout', or '__shared' specifiers}} {{28-34=}}
 
 // <rdar://problem/17763388> ambiguous operator emits same candidate multiple times
 infix operator !!!
@@ -179,4 +179,22 @@ parentheticalInout(&value)
 func parentheticalInout2(_ fn: (((inout Int)), Int) -> ()) {
   var value = 0
   fn(&value, 0)
+}
+
+// SR-11724
+// FIXME: None of these diagnostics is particularly good.
+func bogusDestructuring() {
+  struct Bar {}
+
+  struct Foo {
+    func registerCallback(_ callback: @escaping ([Bar]) -> Void) {} // expected-note {{found this candidate}}
+    func registerCallback(_ callback: @escaping ([String: Bar]) -> Void) {} // expected-note {{found this candidate}}
+    func registerCallback(_ callback: @escaping (Bar?) -> Void) {} // expected-note {{found this candidate}}
+  }
+
+  Foo().registerCallback { ([Bar]) in } // expected-warning {{unnamed parameters must be written with the empty name '_'}} {{29-29=_: }}
+  Foo().registerCallback { ([String: Bar]) in }// expected-warning {{unnamed parameters must be written with the empty name '_'}} {{29-29=_: }}
+  Foo().registerCallback { (Bar?) in } // expected-error {{ambiguous use of 'registerCallback'}}
+  // expected-error@-1 {{expected parameter name followed by ':'}}
+  // expected-error@-2 {{expected ',' separator}}
 }
