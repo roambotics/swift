@@ -238,13 +238,12 @@ Differentiation is the process of computing derivatives. See the
 ["Math Introduction"](#math-introduction) section below for more details.
 
 Derivatives are a fundamental tool in calculus and have applications in many
-domains, notably deep learning. Numerical computing in Swift Swift is an
-expressive, high-performance language that is a great fit for numerical
-applications. Recent proposals have paved the way for low-level numerical
-computing in Swift: [AdditiveArithmetic][SE-0233], SIMD [[1][SE-0229]]
-[[2][SE-0251]], [generic math functions][SE-0246]. However, high-level numerical
-computing applications, including machine learning and artificial intelligence,
-require more work.
+domains, notably deep learning. Numerical computing in Swift is an expressive,
+high-performance language that is a great fit for numerical applications. Recent
+proposals have paved the way for low-level numerical computing in Swift:
+[AdditiveArithmetic][SE-0233], SIMD [[1][SE-0229]] [[2][SE-0251]], [generic math
+functions][SE-0246]. However, high-level numerical computing applications,
+including machine learning and artificial intelligence, require more work.
 
 We believe that first-class differentiable programming is a big step towards
 high-level numerical computing support and will make Swift a real contender in
@@ -1828,14 +1827,11 @@ The `@differentiable` attribute requires the function type it is attached to
 have differentiable parameters and results. Each parameter and result must
 conform to the `Differentiable` protocol (or `Differentiable &
 AdditiveArithmetic` when the attribute is `@differentiable(linear)`) unless it
-is marked with `@nondiff`.
+is marked with `@noDerivative`.
 
 <p align="center">
   <img src="assets/DifferentiableProgramming/differentiable-function-subtyping.png">
 </p>
-
-_Note: `@nondiff` stands for "not being differentiated", and will likely be
-unified with `@noDerivative`._
 
 #### Type conversion
 
@@ -1900,13 +1896,13 @@ let f2: (Float) -> Float = f1
 ```
 
 A `@differentiable` function can also be converted to a function which is
-identical except that more of its parameters are marked with `@nondiff`.
+identical except that more of its parameters are marked with `@noDerivative`.
 
 ```swift
 func addOne(_ x: Float) -> Float { x + 1 }
 let f0: @differentiable (Float, Float, Float) -> Float = addOne
-let f1: @differentiable (@nondiff Float, Float, Float) -> Float = f0
-let f2: @differentiable (@nondiff Float, Float, @nondiff Float) -> Float = f1
+let f1: @differentiable (@noDerivative Float, Float, Float) -> Float = f0
+let f2: @differentiable (@noDerivative Float, Float, @noDerivative Float) -> Float = f1
 ```
 
 #### Implied generic constraints
@@ -1976,19 +1972,19 @@ Neural network trainer objects that store loss functions, e.g.
 Like function declarations with a `@differentiable` attribute, differentiable
 function values can also be differentiable with respect to a subset of
 parameters. This is expressed as part of type information, in `@differentiable`
-and `@differentiable(linear)` function types, using a `@nondiff` attribute at
+and `@differentiable(linear)` function types, using a `@noDerivative` attribute at
 each parameter that is not being differentiated with respect to.
 
 By default, all parameters are being differentiated with respect to. When a
-`@nondiff` attribute is specified for a parameter in a `@differentiable`
+`@noDerivative` attribute is specified for a parameter in a `@differentiable`
 function type, values of this function type are not differentiable (or linear)
 with respect to the parameter.
 
 ```swift
 let f0: @differentiable (Float, Float) -> Float = { $0 * $1 }
 let f1: @differentiable(linear) (Float, Float) -> Float = { $0 + $1 }
-let f2: @differentiable(linear) (Float, @nondiff Float) -> Float = { $0 * $1 }
-let f3: @differentiable (@nondiff Int, Float, @nondiff Int) -> Float = {
+let f2: @differentiable(linear) (Float, @noDerivative Float) -> Float = { $0 * $1 }
+let f3: @differentiable (@noDerivative Int, Float, @noDerivative Int) -> Float = {
   $0 ? Float($1) + $2 : 0
 }
 ```
@@ -1996,13 +1992,13 @@ let f3: @differentiable (@nondiff Int, Float, @nondiff Int) -> Float = {
 Differentiability of parameters in a function type is important for type
 conversions and is part of the subtyping rule: Any `@differentiable` or
 `@differentiable(linear)` function type is a subtype of the same function type
-with more `@nondiff` parameters than there originally are.
+with more `@noDerivative` parameters than there originally are.
 
 ```swift
 let f0: @differentiable (Float, Float) -> Float = { $0 * $1 }
-_ = f0 as @differentiable (Float, @nondiff Float) -> Float
-_ = f0 as @differentiable (@nondiff Float, Float) -> Float
-_ = f0 as @differentiable (@nondiff Float, @nondiff Float) -> Float
+_ = f0 as @differentiable (Float, @noDerivative Float) -> Float
+_ = f0 as @differentiable (@noDerivative Float, Float) -> Float
+_ = f0 as @differentiable (@noDerivative Float, @noDerivative Float) -> Float
 ```
 
 ### Differentiable operators

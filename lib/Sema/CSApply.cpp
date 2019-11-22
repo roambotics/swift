@@ -20,6 +20,7 @@
 #include "CodeSynthesis.h"
 #include "CSDiagnostics.h"
 #include "MiscDiagnostics.h"
+#include "SolutionResult.h"
 #include "TypeCheckProtocol.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
@@ -408,6 +409,7 @@ namespace {
                        ConstraintLocatorBuilder locator, bool implicit,
                        FunctionRefKind functionRefKind,
                        AccessSemantics semantics) {
+      assert(choice.getKind() != OverloadChoiceKind::DeclViaDynamic);
       auto *decl = choice.getDecl();
 
       // Determine the declaration selected for this overloaded reference.
@@ -485,8 +487,7 @@ namespace {
 
         return buildMemberRef(base, openedType, SourceLoc(), choice, loc,
                               openedFnType->getResult(), locator, locator,
-                              implicit, functionRefKind, semantics,
-                              /*isDynamic=*/false);
+                              implicit, functionRefKind, semantics);
       }
 
       auto type = solution.simplifyType(openedType);
@@ -759,7 +760,7 @@ namespace {
                          Type openedType, ConstraintLocatorBuilder locator,
                          ConstraintLocatorBuilder memberLocator, bool Implicit,
                          FunctionRefKind functionRefKind,
-                         AccessSemantics semantics, bool isDynamic) {
+                         AccessSemantics semantics) {
       ValueDecl *member = choice.getDecl();
 
       auto &context = cs.getASTContext();
@@ -859,6 +860,7 @@ namespace {
           semantics = getImplicitMemberReferenceAccessSemantics(base, VD, dc);
       }
 
+      auto isDynamic = choice.getKind() == OverloadChoiceKind::DeclViaDynamic;
       if (baseIsInstance) {
         // Convert the base to the appropriate container type, turning it
         // into an lvalue if required.
@@ -2345,14 +2347,11 @@ namespace {
       auto memberLocator = cs.getConstraintLocator(expr,
                                                    ConstraintLocator::Member);
       auto selected = solution.getOverloadChoice(memberLocator);
-      bool isDynamic
-        = selected.choice.getKind() == OverloadChoiceKind::DeclViaDynamic;
       return buildMemberRef(
           expr->getBase(), selected.openedFullType, expr->getDotLoc(),
           selected.choice, expr->getNameLoc(), selected.openedType,
           cs.getConstraintLocator(expr), memberLocator, expr->isImplicit(),
-          selected.choice.getFunctionRefKind(), expr->getAccessSemantics(),
-          isDynamic);
+          selected.choice.getFunctionRefKind(), expr->getAccessSemantics());
     }
 
     Expr *visitDynamicMemberRefExpr(DynamicMemberRefExpr *expr) {
@@ -2392,15 +2391,12 @@ namespace {
       cs.cacheExprTypes(base);
 
       // Build the member reference.
-      bool isDynamic
-        = selected.choice.getKind() == OverloadChoiceKind::DeclViaDynamic;
       auto *exprLoc = cs.getConstraintLocator(expr);
       auto result = buildMemberRef(
           base, selected.openedFullType, expr->getDotLoc(), selected.choice,
           expr->getNameLoc(), selected.openedType,
           exprLoc, memberLocator, expr->isImplicit(),
-          selected.choice.getFunctionRefKind(), AccessSemantics::Ordinary,
-          isDynamic);
+          selected.choice.getFunctionRefKind(), AccessSemantics::Ordinary);
       if (!result)
         return nullptr;
 
@@ -2537,7 +2533,7 @@ namespace {
                            ConstraintLocator *ctorLocator,
                            OverloadChoice choice,
                            FunctionRefKind functionRefKind, Type openedType) {
-
+      assert(choice.getKind() != OverloadChoiceKind::DeclViaDynamic);
       auto *ctor = cast<ConstructorDecl>(choice.getDecl());
 
       // If the subexpression is a metatype, build a direct reference to the
@@ -2546,8 +2542,7 @@ namespace {
         return buildMemberRef(
             base, openedType, dotLoc, choice, nameLoc, cs.getType(expr),
             ConstraintLocatorBuilder(cs.getConstraintLocator(expr)),
-            ctorLocator, implicit, functionRefKind, AccessSemantics::Ordinary,
-            /*isDynamic=*/false);
+            ctorLocator, implicit, functionRefKind, AccessSemantics::Ordinary);
       }
 
       // The subexpression must be either 'self' or 'super'.
@@ -2671,15 +2666,12 @@ namespace {
 
       case OverloadChoiceKind::Decl:
       case OverloadChoiceKind::DeclViaUnwrappedOptional:
-      case OverloadChoiceKind::DeclViaDynamic: {
-        bool isDynamic
-          = selected.choice.getKind() == OverloadChoiceKind::DeclViaDynamic;
+      case OverloadChoiceKind::DeclViaDynamic:
         return buildMemberRef(base, selected.openedFullType, dotLoc,
                               selected.choice, nameLoc, selected.openedType,
                               cs.getConstraintLocator(expr), memberLocator,
                               implicit, selected.choice.getFunctionRefKind(),
-                              AccessSemantics::Ordinary, isDynamic);
-      }
+                              AccessSemantics::Ordinary);
 
       case OverloadChoiceKind::TupleIndex: {
         Type toType = simplifyType(cs.getType(expr));
@@ -3179,7 +3171,7 @@ namespace {
           castKind == CheckedCastKind::SetDowncast) {
         auto toOptType = OptionalType::get(toType);
         ConditionalCheckedCastExpr *cast = new (ctx) ConditionalCheckedCastExpr(
-            sub, expr->getLoc(), SourceLoc(), TypeLoc::withoutLoc(toType));
+            sub, expr->getLoc(), SourceLoc(), expr->getCastTypeLoc());
         cs.setType(cast, toOptType);
         cs.setType(cast->getCastTypeLoc(), toType);
         if (expr->isImplicit())
@@ -4493,10 +4485,6 @@ namespace {
       outerClosure->setType(outerClosureTy);
       cs.cacheType(outerClosure);
 
-      // The inner closure at least will definitely have a capture.
-      cs.getTypeChecker().ClosuresWithUncomputedCaptures.push_back(outerClosure);
-      cs.getTypeChecker().ClosuresWithUncomputedCaptures.push_back(closure);
-
       // let outerApply = "\( outerClosure )( \(E) )"
       auto outerApply = CallExpr::createImplicit(ctx, outerClosure, {E}, {});
       outerApply->setType(closureTy);
@@ -4590,9 +4578,6 @@ namespace {
                               /*applyExpr*/ nullptr, labels,
                               /*hasTrailingClosure*/ false, locator);
 
-      auto component = KeyPathExpr::Component::forSubscriptWithPrebuiltIndexExpr(
-          ref, newIndexExpr, labels, resolvedTy, componentLoc, {});
-
       // We need to be able to hash the captured index values in order for
       // KeyPath itself to be hashable, so check that all of the subscript
       // index components are hashable and collect their conformances here.
@@ -4602,7 +4587,10 @@ namespace {
           cs.getASTContext().getProtocol(KnownProtocolKind::Hashable);
 
       auto fnType = overload.openedType->castTo<FunctionType>();
-      for (const auto &param : fnType->getParams()) {
+      SmallVector<Identifier, 4> newLabels;
+      for (auto &param : fnType->getParams()) {
+        newLabels.push_back(param.getLabel());
+
         auto indexType = simplifyType(param.getPlainType());
         // Index type conformance to Hashable protocol has been
         // verified by the solver, we just need to get it again
@@ -4615,8 +4603,10 @@ namespace {
         conformances.push_back(hashableConformance);
       }
 
-      component.setSubscriptIndexHashableConformances(conformances);
-      return component;
+      return KeyPathExpr::Component::forSubscriptWithPrebuiltIndexExpr(
+          ref, newIndexExpr, cs.getASTContext().AllocateCopy(newLabels),
+          resolvedTy, componentLoc,
+          cs.getASTContext().AllocateCopy(conformances));
     }
 
     Expr *visitKeyPathDotExpr(KeyPathDotExpr *E) {
@@ -5408,8 +5398,7 @@ Expr *ExprRewriter::coerceCallArguments(Expr *arg, AnyFunctionType *funcType,
           arg, closureType->getResult(),
           locator.withPathElement(ConstraintLocator::AutoclosureResult));
 
-      convertedArg = TypeChecker::buildAutoClosureExpr(dc, arg, closureType);
-      cs.cacheExprTypes(convertedArg);
+      convertedArg = cs.buildAutoClosureExpr(arg, closureType);
     } else {
       convertedArg = coerceToType(
           arg, paramType,
@@ -6619,12 +6608,11 @@ static Expr *finishApplyCallAsFunctionMethod(
   auto *fn = apply->getFn();
   auto choice = selected.choice;
   // Create direct reference to `callAsFunction` method.
-  bool isDynamic = choice.getKind() == OverloadChoiceKind::DeclViaDynamic;
   auto *declRef = rewriter.buildMemberRef(
       fn, selected.openedFullType, /*dotLoc*/ SourceLoc(), choice,
       DeclNameLoc(fn->getEndLoc()), selected.openedType, applyFunctionLoc,
       applyFunctionLoc, /*implicit*/ true, choice.getFunctionRefKind(),
-      AccessSemantics::Ordinary, isDynamic);
+      AccessSemantics::Ordinary);
   if (!declRef)
     return nullptr;
   declRef->setImplicit(apply->isImplicit());
@@ -6670,14 +6658,12 @@ ExprRewriter::finishApplyDynamicCallable(ApplyExpr *apply,
   bool useKwargsMethod = argumentLabel == ctx.Id_withKeywordArguments;
 
   // Construct expression referencing the `dynamicallyCall` method.
-  bool isDynamic =
-      selected.choice.getKind() == OverloadChoiceKind::DeclViaDynamic;
   auto member = buildMemberRef(fn, selected.openedFullType,
                                SourceLoc(), selected.choice,
                                DeclNameLoc(method->getNameLoc()),
                                selected.openedType, loc, loc, /*implicit*/ true,
                                selected.choice.getFunctionRefKind(),
-                               AccessSemantics::Ordinary, isDynamic);
+                               AccessSemantics::Ordinary);
 
   // Construct argument to the method (either an array or dictionary
   // expression).
@@ -7024,7 +7010,6 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, ConcreteDeclRef callee,
 
   // Consider the constructor decl reference expr 'implicit', but the
   // constructor call expr itself has the apply's 'implicitness'.
-  bool isDynamic = choice.getKind() == OverloadChoiceKind::DeclViaDynamic;
   auto ctorRef = resolveConcreteDeclRef(choice.getDecl(), ctorLocator);
   Expr *declRef = buildMemberRef(fn, selected->openedFullType,
                                  /*dotLoc=*/SourceLoc(), choice,
@@ -7032,7 +7017,7 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, ConcreteDeclRef callee,
                                  selected->openedType, locator, ctorLocator,
                                  /*Implicit=*/true,
                                  choice.getFunctionRefKind(),
-                                 AccessSemantics::Ordinary, isDynamic);
+                                 AccessSemantics::Ordinary);
   if (!declRef)
     return nullptr;
   declRef->setImplicit(apply->isImplicit());
@@ -7266,12 +7251,6 @@ namespace {
           ClosuresToTypeCheck.push_back(closure);
         }
 
-        // Don't try to register captures if constraint system is used to
-        // produce diagnostics for one of the sub-expressions.
-        if (!cs.Options.contains(
-                ConstraintSystemFlags::SubExpressionDiagnostics))
-          cs.getTypeChecker().ClosuresWithUncomputedCaptures.push_back(closure);
-
         return { false, closure };
       }
 
@@ -7305,93 +7284,81 @@ Expr *ConstraintSystem::coerceToRValue(Expr *expr) {
       [&](Expr *expr, Type type) { setType(expr, type); });
 }
 
-/// Emit the fixes computed as part of the solution, returning true if we were
-/// able to emit an error message, or false if none of the fixits worked out.
-bool ConstraintSystem::applySolutionFixes(Expr *E, const Solution &solution) {
-  // First transfer all of the deduced information back
-  // to the constraint system.
-  applySolution(solution);
-
-  class DiagnosticWalker : public ASTWalker {
-    Expr *root;
-    const Solution &solution;
-    llvm::SmallDenseMap<Expr *, SmallVector<ConstraintFix *, 4>> fixesPerExpr;
-
-    /// Determines whether any error have been diagnosed while
-    /// trying to apply fixes associated with a given solution.
-    bool DiagnosedAnyErrors = false;
+namespace {
+  /// Function object to compare source locations, putting invalid
+  /// locations at the end.
+  class CompareExprSourceLocs {
+    SourceManager &sourceMgr;
 
   public:
-    DiagnosticWalker(Expr *expr, const Solution &solution)
-        : root(expr), solution(solution) {
-      for (auto *fix : solution.Fixes)
-        fixesPerExpr[fix->getAnchor()].push_back(fix);
-    }
+    explicit CompareExprSourceLocs(SourceManager &sourceMgr)
+      : sourceMgr(sourceMgr) { }
 
-    std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
-      // Diagnose root expression last.
-      if (E == root)
-        return {true, E};
-
-      if (auto *closure = dyn_cast<ClosureExpr>(E)) {
-        auto result = solution.builderTransformedClosures.find(closure);
-        if (result != solution.builderTransformedClosures.end()) {
-          auto *transformedExpr = result->second.singleExpr;
-          // Since this closure has been transformed into something
-          // else let's look inside transformed expression instead.
-          transformedExpr->walk(*this);
-          return {false, E};
-        }
+    bool operator()(Expr *lhs, Expr *rhs) const {
+      if (static_cast<bool>(lhs) != static_cast<bool>(rhs)) {
+        return static_cast<bool>(lhs);
       }
 
-      diagnose(E);
-      return {true, E};
-    }
+      auto lhsLoc = lhs->getLoc();
+      auto rhsLoc = rhs->getLoc();
+      if (lhsLoc.isValid() != rhsLoc.isValid())
+        return lhsLoc.isValid();
 
-    Expr *walkToExprPost(Expr *E) override {
-      if (E == root)
-        diagnose(E);
-      return E;
-    }
-
-    std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
-      return {true, S};
-    }
-
-    bool hadErrors() const { return DiagnosedAnyErrors; }
-
-  private:
-    void diagnose(Expr *E) {
-      auto fixes = fixesPerExpr.find(E);
-      if (fixes == fixesPerExpr.end())
-        return;
-
-      // Coalesce fixes with the same locator to avoid duplicating notes.
-      llvm::SmallMapVector<ConstraintLocator *,
-          llvm::SmallVector<ConstraintFix *, 4>, 4> aggregatedFixes;
-      for (auto *fix : fixes->second)
-        aggregatedFixes[fix->getLocator()].push_back(fix);
-
-      for (auto fixesPerLocator : aggregatedFixes) {
-        auto fixes = fixesPerLocator.second;
-        auto *primaryFix = fixes[0];
-        ArrayRef<ConstraintFix *> secondaryFixes{fixes.begin() + 1, fixes.end()};
-
-        auto *coalescedFix = primaryFix->coalescedWith(secondaryFixes);
-        auto diagnosed = coalescedFix->diagnose();
-        if (coalescedFix->isWarning()) {
-          assert(diagnosed && "warnings should always be diagnosed");
-          (void)diagnosed;
-        } else {
-          DiagnosedAnyErrors |= diagnosed;
-        }
-      }
+      return sourceMgr.isBeforeInBuffer(lhsLoc, rhsLoc);
     }
   };
 
-  DiagnosticWalker diagnostics(E, solution);
-  E->walk(diagnostics);
-  return diagnostics.hadErrors();
+}
+
+/// Emit the fixes computed as part of the solution, returning true if we were
+/// able to emit an error message, or false if none of the fixits worked out.
+bool ConstraintSystem::applySolutionFixes(const Solution &solution) {
+  /// Collect the fixes on a per-expression basis.
+  llvm::SmallDenseMap<Expr *, SmallVector<ConstraintFix *, 4>> fixesPerExpr;
+  for (auto *fix : solution.Fixes) {
+    fixesPerExpr[fix->getAnchor()].push_back(fix);
+  }
+
+  // Collect all of the expressions that have fixes, and sort them by
+  // source ordering.
+  SmallVector<Expr *, 4> exprsWithFixes;
+  for (const auto &fix : fixesPerExpr) {
+    exprsWithFixes.push_back(fix.getFirst());
+  }
+  std::sort(exprsWithFixes.begin(), exprsWithFixes.end(),
+            CompareExprSourceLocs(Context.SourceMgr));
+
+  // Walk over each of the expressions, diagnosing fixes.
+  bool diagnosedAnyErrors = false;
+
+  for (auto expr : exprsWithFixes) {
+    // Coalesce fixes with the same locator to avoid duplicating notes.
+    auto fixes = fixesPerExpr[expr];
+
+    using ConstraintFixVector = llvm::SmallVector<ConstraintFix *, 4>;
+    llvm::SmallMapVector<ConstraintLocator *,
+        llvm::SmallMapVector<FixKind, ConstraintFixVector, 4>, 4> aggregatedFixes;
+    for (auto *fix : fixes)
+      aggregatedFixes[fix->getLocator()][fix->getKind()].push_back(fix);
+
+    for (auto fixesPerLocator : aggregatedFixes) {
+      for (auto fixesPerKind : fixesPerLocator.second) {
+        auto fixes = fixesPerKind.second;
+        auto *primaryFix = fixes[0];
+        ArrayRef<ConstraintFix *> secondaryFixes{fixes.begin() + 1, fixes.end()};
+
+        auto diagnosed = primaryFix->coalesceAndDiagnose(secondaryFixes);
+        if (primaryFix->isWarning()) {
+          assert(diagnosed && "warnings should always be diagnosed");
+          (void)diagnosed;
+        } else {
+          diagnosedAnyErrors |= diagnosed;
+        }
+      }
+    }
+  }
+
+  return diagnosedAnyErrors;
 }
 
 /// Apply a given solution to the expression, producing a fully
@@ -7400,18 +7367,13 @@ Expr *ConstraintSystem::applySolution(Solution &solution, Expr *expr,
                                       Type convertType,
                                       bool discardedExpr,
                                       bool skipClosures) {
-  // Add the node types back.
-  for (auto &nodeType : solution.addedNodeTypes) {
-    setType(nodeType.first, nodeType.second);
-  }
-
   // If any fixes needed to be applied to arrive at this solution, resolve
   // them to specific expressions.
   if (!solution.Fixes.empty()) {
     if (shouldSuppressDiagnostics())
       return nullptr;
 
-    bool diagnosedErrorsViaFixes = applySolutionFixes(expr, solution);
+    bool diagnosedErrorsViaFixes = applySolutionFixes(solution);
     // If all of the available fixes would result in a warning,
     // we can go ahead and apply this solution to AST.
     if (!llvm::all_of(solution.Fixes, [](const ConstraintFix *fix) {
@@ -7547,4 +7509,51 @@ void Solution::setExprTypes(Expr *expr) const {
 
   SetExprTypes SET(*this);
   expr->walk(SET);
+}
+
+/// MARK: SolutionResult implementation.
+
+SolutionResult SolutionResult::forSolved(Solution &&solution) {
+  SolutionResult result(Kind::Success);
+  result.solutions = new Solution(std::move(solution));
+  result.numSolutions = 1;
+  return result;
+}
+
+SolutionResult SolutionResult::forAmbiguous(
+    MutableArrayRef<Solution> solutions) {
+  assert(solutions.size() > 1 && "Not actually ambiguous");
+  SolutionResult result(Kind::Ambiguous);
+  result.solutions =
+      (Solution *)malloc(sizeof(Solution) * solutions.size());
+  result.numSolutions = solutions.size();
+  std::uninitialized_copy(std::make_move_iterator(solutions.begin()),
+                          std::make_move_iterator(solutions.end()),
+                          result.solutions);
+  return result;
+}
+
+SolutionResult::~SolutionResult() {
+  assert((!requiresDiagnostic() || emittedDiagnostic) &&
+         "SolutionResult was destroyed without emitting a diagnostic");
+
+  for (unsigned i : range(numSolutions)) {
+    solutions[i].~Solution();
+  }
+  free(solutions);
+}
+
+const Solution &SolutionResult::getSolution() const {
+  assert(numSolutions == 1 && "Wrong number of solutions");
+  return solutions[0];
+}
+
+Solution &&SolutionResult::takeSolution() && {
+  assert(numSolutions == 1 && "Wrong number of solutions");
+  return std::move(solutions[0]);
+}
+
+ArrayRef<Solution> SolutionResult::getAmbiguousSolutions() const {
+  assert(getKind() == Ambiguous);
+  return makeArrayRef(solutions, numSolutions);
 }
