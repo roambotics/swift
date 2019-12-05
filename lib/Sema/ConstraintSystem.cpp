@@ -109,7 +109,7 @@ bool ConstraintSystem::hasFreeTypeVariables() {
 
 void ConstraintSystem::addTypeVariable(TypeVariableType *typeVar) {
   TypeVariables.insert(typeVar);
-  
+
   // Notify the constraint graph.
   (void)CG[typeVar];
 }
@@ -413,6 +413,25 @@ ConstraintLocator *ConstraintSystem::getConstraintLocator(
   return getConstraintLocator(anchor, path, builder.getSummaryFlags());
 }
 
+ConstraintLocator *ConstraintSystem::getConstraintLocator(
+    ConstraintLocator *locator,
+    ArrayRef<ConstraintLocator::PathElement> newElts) {
+  auto oldPath = locator->getPath();
+  SmallVector<ConstraintLocator::PathElement, 4> newPath;
+  newPath.append(oldPath.begin(), oldPath.end());
+  newPath.append(newElts.begin(), newElts.end());
+  return getConstraintLocator(locator->getAnchor(), newPath);
+}
+
+ConstraintLocator *ConstraintSystem::getConstraintLocator(
+    const ConstraintLocatorBuilder &builder,
+    ArrayRef<ConstraintLocator::PathElement> newElts) {
+  SmallVector<ConstraintLocator::PathElement, 4> newPath;
+  auto *anchor = builder.getLocatorParts(newPath);
+  newPath.append(newElts.begin(), newElts.end());
+  return getConstraintLocator(anchor, newPath);
+}
+
 ConstraintLocator *
 ConstraintSystem::getCalleeLocator(ConstraintLocator *locator,
                                    bool lookThroughApply) {
@@ -459,16 +478,28 @@ ConstraintSystem::getCalleeLocator(ConstraintLocator *locator,
   if (lookThroughApply) {
     if (auto *applyExpr = dyn_cast<ApplyExpr>(anchor)) {
       auto *fnExpr = applyExpr->getFn();
+
+      // FIXME: We should probably assert that we don't get a type variable
+      // here to make sure we only retrieve callee locators for resolved calls,
+      // ensuring that callee locators don't change after binding a type.
+      // Unfortunately CSDiag currently calls into getCalleeLocator, so all bets
+      // are off. Once we remove that legacy diagnostic logic, we should be able
+      // to assert here.
+      auto fnTy = getFixedTypeRecursive(getType(fnExpr), /*wantRValue*/ true);
+
       // For an apply of a metatype, we have a short-form constructor. Unlike
       // other locators to callees, these are anchored on the apply expression
       // rather than the function expr.
-      auto fnTy = getFixedTypeRecursive(getType(fnExpr), /*wantRValue*/ true);
       if (fnTy->is<AnyMetatypeType>()) {
         auto *fnLocator =
             getConstraintLocator(applyExpr, ConstraintLocator::ApplyFunction);
         return getConstraintLocator(fnLocator,
                                     ConstraintLocator::ConstructorMember);
       }
+
+      // Handle an apply of a nominal type which supports callAsFunction.
+      if (fnTy->isCallableNominalType(DC))
+        return getConstraintLocator(anchor, ConstraintLocator::ApplyFunction);
 
       // Otherwise fall through and look for locators anchored on the function
       // expr. For CallExprs, this can look through things like parens and
@@ -575,7 +606,7 @@ Type ConstraintSystem::openUnboundGenericType(UnboundGenericType *unbound,
                     locator);
     }
   }
-        
+
   // Map the generic parameters to their corresponding type variables.
   llvm::SmallVector<Type, 2> arguments;
   for (auto gp : unboundDecl->getInnermostGenericParamTypes()) {
@@ -834,7 +865,7 @@ static bool doesStorageProduceLValue(AbstractStorageDecl *storage,
   // Unsettable storage decls always produce rvalues.
   if (!storage->isSettable(useDC, base))
     return false;
-  
+
   if (!storage->isSetterAccessibleFrom(useDC))
     return false;
 
@@ -934,7 +965,7 @@ void ConstraintSystem::recordOpenedTypes(
                       }) == OpenedTypes.end() &&
          "already registered opened types for this locator");
 #endif
-  
+
   OpenedType* openedTypes
     = Allocator.Allocate<OpenedType>(replacements.size());
   std::copy(replacements.begin(), replacements.end(), openedTypes);
@@ -1218,11 +1249,11 @@ void ConstraintSystem::openGenericRequirements(
       break;
     }
 
-    addConstraint(
-        *openedReq,
-        locator.withPathElement(LocatorPathElt::OpenedGeneric(signature))
-            .withPathElement(
-                LocatorPathElt::TypeParameterRequirement(pos, kind)));
+    auto openedGenericLoc =
+        locator.withPathElement(LocatorPathElt::OpenedGeneric(signature));
+    addConstraint(*openedReq,
+                  openedGenericLoc.withPathElement(
+                      LocatorPathElt::TypeParameterRequirement(pos, kind)));
   }
 }
 
@@ -1664,7 +1695,7 @@ static std::pair<Type, Type> getTypeOfReferenceWithSpecialTypeCheckingSemantics(
 
     FunctionType::Param inputArg(input,
                                  CS.getASTContext().getIdentifier("of"));
-    
+
     CS.addConstraint(ConstraintKind::DynamicTypeOf, output, input,
         CS.getConstraintLocator(locator, ConstraintLocator::RValueAdjustment));
     auto refType = FunctionType::get({inputArg}, output);
@@ -1691,18 +1722,19 @@ static std::pair<Type, Type> getTypeOfReferenceWithSpecialTypeCheckingSemantics(
         FunctionType::ExtInfo(FunctionType::Representation::Swift,
                               /*noescape*/ true,
                               /*throws*/ true,
-                              DifferentiabilityKind::NonDifferentiable));
+                              DifferentiabilityKind::NonDifferentiable,
+                              /*clangFunctionType*/ nullptr));
     FunctionType::Param args[] = {
       FunctionType::Param(noescapeClosure),
       FunctionType::Param(bodyClosure, CS.getASTContext().getIdentifier("do")),
     };
 
-    auto refType = FunctionType::get(
-        args, result,
-        FunctionType::ExtInfo(FunctionType::Representation::Swift,
-                              /*noescape*/ false,
-                              /*throws*/ true,
-                              DifferentiabilityKind::NonDifferentiable));
+    auto refType = FunctionType::get(args, result,
+      FunctionType::ExtInfo(FunctionType::Representation::Swift,
+                            /*noescape*/ false,
+                            /*throws*/ true,
+                            DifferentiabilityKind::NonDifferentiable,
+                            /*clangFunctionType*/ nullptr));
     return {refType, refType};
   }
   case DeclTypeCheckingSemantics::OpenExistential: {
@@ -1725,17 +1757,18 @@ static std::pair<Type, Type> getTypeOfReferenceWithSpecialTypeCheckingSemantics(
         FunctionType::ExtInfo(FunctionType::Representation::Swift,
                               /*noescape*/ true,
                               /*throws*/ true,
-                              DifferentiabilityKind::NonDifferentiable));
+                              DifferentiabilityKind::NonDifferentiable,
+                              /*clangFunctionType*/ nullptr));
     FunctionType::Param args[] = {
       FunctionType::Param(existentialTy),
       FunctionType::Param(bodyClosure, CS.getASTContext().getIdentifier("do")),
     };
-    auto refType = FunctionType::get(
-        args, result,
-        FunctionType::ExtInfo(FunctionType::Representation::Swift,
-                              /*noescape*/ false,
-                              /*throws*/ true,
-                              DifferentiabilityKind::NonDifferentiable));
+    auto refType = FunctionType::get(args, result,
+      FunctionType::ExtInfo(FunctionType::Representation::Swift,
+                            /*noescape*/ false,
+                            /*throws*/ true,
+                            DifferentiabilityKind::NonDifferentiable,
+                            /*clangFunctionType*/ nullptr));
     return {refType, refType};
   }
   }
@@ -2250,7 +2283,7 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
         // Hashable, because it would be used as a component inside key path.
         for (auto index : indices(subscriptTy->getParams())) {
           const auto &param = subscriptTy->getParams()[index];
-          verifyThatArgumentIsHashable(index, param.getPlainType(), locator);
+          verifyThatArgumentIsHashable(index, param.getParameterType(), locator);
         }
       }
     }
@@ -2437,7 +2470,7 @@ DeclName OverloadChoice::getName() const {
     case OverloadChoiceKind::TupleIndex:
       llvm_unreachable("no name!");
   }
-  
+
   llvm_unreachable("Unhandled OverloadChoiceKind in switch.");
 }
 
@@ -2552,6 +2585,18 @@ static void diagnoseOperatorAmbiguity(ConstraintSystem &cs,
   if (!applyExpr)
     return;
 
+  auto isNameOfStandardComparisonOperator = [](Identifier opName) -> bool {
+    return opName.is("==") || opName.is("!=") || opName.is("===") ||
+           opName.is("!==") || opName.is("<") || opName.is(">") ||
+           opName.is("<=") || opName.is(">=");
+  };
+
+  auto isEnumWithAssociatedValues = [](Type type) -> bool {
+    if (auto *enumType = type->getAs<EnumType>())
+      return !enumType->getDecl()->hasOnlyCasesWithoutAssociatedValues();
+    return false;
+  };
+
   const auto &solution = solutions.front();
   if (auto *binaryOp = dyn_cast<BinaryExpr>(applyExpr)) {
     auto *lhs = binaryOp->getArg()->getElement(0);
@@ -2565,6 +2610,14 @@ static void diagnoseOperatorAmbiguity(ConstraintSystem &cs,
                   operatorName.str(), lhsType)
           .highlight(lhs->getSourceRange())
           .highlight(rhs->getSourceRange());
+
+      if (isNameOfStandardComparisonOperator(operatorName) &&
+          isEnumWithAssociatedValues(lhsType)) {
+        DE.diagnose(applyExpr->getLoc(),
+                    diag::no_binary_op_overload_for_enum_with_payload,
+                    operatorName.str());
+        return;
+      }
     } else {
       DE.diagnose(anchor->getLoc(), diag::cannot_apply_binop_to_args,
                   operatorName.str(), lhsType, rhsType)
@@ -2593,15 +2646,34 @@ static void diagnoseOperatorAmbiguity(ConstraintSystem &cs,
           FunctionType::getParamListAsString(fnType->getParams()));
   }
 
+  // All of the overload choices had generic parameters like `Self`.
+  if (parameters.empty())
+    return;
+
   DE.diagnose(anchor->getLoc(), diag::suggest_partial_overloads,
               /*isResult=*/false, operatorName.str(),
               llvm::join(parameters, ", "));
 }
 
 bool ConstraintSystem::diagnoseAmbiguityWithFixes(
-    ArrayRef<Solution> solutions) {
+    SmallVectorImpl<Solution> &solutions) {
   if (solutions.empty())
     return false;
+
+  if (auto bestScore = solverState->BestScore) {
+    solutions.erase(llvm::remove_if(solutions,
+                                    [&](const Solution &solution) {
+                                      return solution.getFixedScore() >
+                                             *bestScore;
+                                    }),
+                    solutions.end());
+
+    if (llvm::all_of(solutions, [&](const Solution &solution) {
+          auto score = solution.getFixedScore();
+          return score.Data[SK_Fix] == 0 && solution.Fixes.empty();
+        }))
+      return false;
+  }
 
   // Problems related to fixes forming ambiguous solution set
   // could only be diagnosed (at the moment), if all of the fixes
@@ -2665,13 +2737,29 @@ bool ConstraintSystem::diagnoseAmbiguityWithFixes(
     const auto *fix = viableSolutions.front().second;
     auto *commonAnchor = commonCalleeLocator->getAnchor();
     auto &DE = getASTContext().Diags;
+    auto name = decl->getFullName();
+
     if (fix->getKind() == FixKind::UseSubscriptOperator) {
       auto *UDE = cast<UnresolvedDotExpr>(commonAnchor);
       DE.diagnose(commonAnchor->getLoc(),
                   diag::could_not_find_subscript_member_did_you_mean,
                   getType(UDE->getBase()));
+    } else if (fix->getKind() == FixKind::TreatRValueAsLValue) {
+      DE.diagnose(commonAnchor->getLoc(),
+                  diag::no_overloads_match_exactly_in_assignment,
+                  decl->getBaseName());
+    } else if (llvm::all_of(
+                   viableSolutions,
+                   [](const std::pair<const Solution *, const ConstraintFix *>
+                          &fix) {
+                     auto *locator = fix.second->getLocator();
+                     return locator
+                         ->isLastElement<LocatorPathElt::ContextualType>();
+                   })) {
+      auto baseName = name.getBaseName();
+      DE.diagnose(commonAnchor->getLoc(), diag::no_candidates_match_result_type,
+                  baseName.userFacingName(), getContextualType());
     } else {
-      auto name = decl->getFullName();
       // Three choices here:
       // 1. If this is a special name avoid printing it because
       //    printing kind is sufficient;

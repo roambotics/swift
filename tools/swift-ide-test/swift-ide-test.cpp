@@ -47,8 +47,6 @@
 #include "swift/Sema/IDETypeChecking.h"
 #include "swift/Markup/Markup.h"
 #include "swift/Config.h"
-#include "clang/APINotes/APINotesReader.h"
-#include "clang/APINotes/APINotesWriter.h"
 #include "clang/Rewrite/Core/RewriteBuffer.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Statistic.h"
@@ -745,6 +743,10 @@ static int doTypeContextInfo(const CompilerInvocation &InitInvok,
   // they are somewhat heavy operations and are not needed for completions.
   Invocation.getFrontendOptions().IgnoreSwiftSourceInfo = true;
 
+  // Disable to build syntax tree because code-completion skips some portion of
+  // source text. That breaks an invariant of syntax tree building.
+  Invocation.getLangOptions().BuildSyntaxTree = false;
+
   Invocation.setCodeCompletionPoint(CleanFile.get(), Offset);
 
   // Create a CodeCompletionConsumer.
@@ -809,6 +811,10 @@ doConformingMethodList(const CompilerInvocation &InitInvok,
   // Disable source location resolutions from .swiftsourceinfo file because
   // they are somewhat heavy operations and are not needed for completions.
   Invocation.getFrontendOptions().IgnoreSwiftSourceInfo = true;
+
+  // Disable to build syntax tree because code-completion skips some portion of
+  // source text. That breaks an invariant of syntax tree building.
+  Invocation.getLangOptions().BuildSyntaxTree = false;
 
   Invocation.setCodeCompletionPoint(CleanFile.get(), Offset);
 

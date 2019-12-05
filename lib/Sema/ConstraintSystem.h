@@ -2024,9 +2024,20 @@ public:
   ConstraintLocator *
   getConstraintLocator(ConstraintLocator *locator,
                        ConstraintLocator::PathElement pathElt) {
-    return getConstraintLocator(ConstraintLocatorBuilder(locator)
-                                  .withPathElement(pathElt));
+    ConstraintLocatorBuilder builder(locator);
+    return getConstraintLocator(builder.withPathElement(pathElt));
   }
+
+  /// Extend the given constraint locator with an array of path elements.
+  ConstraintLocator *
+  getConstraintLocator(ConstraintLocator *locator,
+                       ArrayRef<ConstraintLocator::PathElement> newElts);
+
+  /// Retrieve the locator described by a given builder extended by an array of
+  /// path elements.
+  ConstraintLocator *
+  getConstraintLocator(const ConstraintLocatorBuilder &builder,
+                       ArrayRef<ConstraintLocator::PathElement> newElts);
 
   /// Retrieve the constraint locator described by the given
   /// builder.
@@ -2136,7 +2147,7 @@ public:
   void diagnoseFailureForExpr(Expr *expr);
 
   bool diagnoseAmbiguity(ArrayRef<Solution> solutions);
-  bool diagnoseAmbiguityWithFixes(ArrayRef<Solution> solutions);
+  bool diagnoseAmbiguityWithFixes(SmallVectorImpl<Solution> &solutions);
 
   /// Give the deprecation warning for referring to a global function
   /// when there's a method from a conditional conformance in a smaller/closer

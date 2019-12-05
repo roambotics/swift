@@ -717,7 +717,7 @@ func rdar37790062() {
 }
 
 // <rdar://problem/39489003>
-typealias KeyedItem<K, T> = (key: K, value: T) // expected-note {{'T' declared as parameter to type 'KeyedItem'}}
+typealias KeyedItem<K, T> = (key: K, value: T)
 
 protocol Node {
   associatedtype T
@@ -731,7 +731,7 @@ extension Node {
   func getChild(for key:K)->(key: K, value: T) {
     return children.first(where: { (item:KeyedItem) -> Bool in
         return item.key == key
-        // expected-error@-1 {{generic parameter 'T' could not be inferred}}
+        // expected-error@-1 {{binary operator '==' cannot be applied to two 'Self.K' operands}}
       })!
   }
 }
@@ -763,6 +763,7 @@ overloaded { print("hi"); print("bye") } // multiple expression closure without 
 // expected-error@-1 {{ambiguous use of 'overloaded'}}
 
 func not_overloaded(_ handler: () -> Int) {}
+// expected-note@-1 {{'not_overloaded' declared here}}
 
 not_overloaded { } // empty body
 // expected-error@-1 {{cannot convert value of type '()' to closure result type 'Int'}}
