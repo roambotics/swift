@@ -932,7 +932,7 @@ namespace {
 
     /// Add constraints for a reference to a named member of the given
     /// base type, and return the type of such a reference.
-    Type addMemberRefConstraints(Expr *expr, Expr *base, DeclName name,
+    Type addMemberRefConstraints(Expr *expr, Expr *base, DeclNameRef name,
                                  FunctionRefKind functionRefKind,
                                  ArrayRef<ValueDecl *> outerAlternatives) {
       // The base must have a member of the given name, such that accessing
@@ -1077,7 +1077,7 @@ namespace {
         CS.addBindOverloadConstraint(memberTy, choice, memberLocator,
                                      CurDC);
       } else {
-        CS.addValueMemberConstraint(baseTy, DeclBaseName::createSubscript(),
+        CS.addValueMemberConstraint(baseTy, DeclNameRef::createSubscript(),
                                     memberTy, CurDC,
                                     FunctionRefKind::DoubleApply,
                                     /*outerAlternatives=*/{},
@@ -1243,6 +1243,7 @@ namespace {
       switch (expr->getKind()) {
       case MagicIdentifierLiteralExpr::Column:
       case MagicIdentifierLiteralExpr::File:
+      case MagicIdentifierLiteralExpr::FilePath:
       case MagicIdentifierLiteralExpr::Function:
       case MagicIdentifierLiteralExpr::Line:
         return visitLiteralExpr(expr);
@@ -2042,8 +2043,8 @@ namespace {
 
     Type visitTupleElementExpr(TupleElementExpr *expr) {
       ASTContext &context = CS.getASTContext();
-      Identifier name
-        = context.getIdentifier(llvm::utostr(expr->getFieldNumber()));
+      DeclNameRef name(
+          context.getIdentifier(llvm::utostr(expr->getFieldNumber())));
       return addMemberRefConstraints(expr, expr->getBase(), name,
                                      FunctionRefKind::Unapplied,
                                      /*outerAlternatives=*/{});
@@ -2429,7 +2430,8 @@ namespace {
           CS.getConstraintLocator(expr, ConstraintLocator::ClosureResult);
 
         if (expr->hasEmptyBody()) {
-          resultTy = CS.createTypeVariable(locator, 0);
+          resultTy = CS.createTypeVariable(
+              locator, expr->hasSingleExpressionBody() ? 0 : TVO_CanBindToHole);
 
           // Closures with empty bodies should be inferred to return
           // ().
@@ -2441,7 +2443,8 @@ namespace {
         } else {
           // If no return type was specified, create a fresh type
           // variable for it.
-          resultTy = CS.createTypeVariable(locator, 0);
+          resultTy = CS.createTypeVariable(
+              locator, expr->hasSingleExpressionBody() ? 0 : TVO_CanBindToHole);
 
           if (closureHasNoResult(expr)) {
             // Allow it to default to () if there are no return statements.
@@ -3052,8 +3055,8 @@ namespace {
                                                 TVO_CanBindToNoEscape);
           componentTypeVars.push_back(memberTy);
           auto lookupName = kind == KeyPathExpr::Component::Kind::UnresolvedProperty
-            ? component.getUnresolvedDeclName()
-            : component.getDeclRef().getDecl()->getFullName();
+            ? DeclNameRef(component.getUnresolvedDeclName()) // FIXME: type change needed
+            : component.getDeclRef().getDecl()->createNameRef();
           
           auto refKind = lookupName.isSimpleName()
             ? FunctionRefKind::Unapplied
@@ -3406,8 +3409,11 @@ namespace {
 
         // Restore '@autoclosure'd value.
         if (auto ACE = dyn_cast<AutoClosureExpr>(expr)) {
-          expr = ACE->getSingleExpressionBody();
-          continue;
+          // This is only valid if the closure doesn't have parameters.
+          if (ACE->getParameters()->size() == 0) {
+            expr = ACE->getSingleExpressionBody();
+            continue;
+          }
         }
 
         // Remove any semantic expression injected by typechecking.
@@ -3873,8 +3879,8 @@ swift::resolveValueMember(DeclContext &DC, Type BaseTy, DeclName Name) {
 
   // Look up all members of BaseTy with the given Name.
   MemberLookupResult LookupResult = CS.performMemberLookup(
-    ConstraintKind::ValueMember, Name, BaseTy, FunctionRefKind::SingleApply,
-    nullptr, false);
+    ConstraintKind::ValueMember, DeclNameRef(Name), BaseTy,
+    FunctionRefKind::SingleApply, nullptr, false);
 
   // Keep track of all the unviable members.
   for (auto Can : LookupResult.UnviableCandidates)

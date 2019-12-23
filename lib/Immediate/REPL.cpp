@@ -187,12 +187,10 @@ typeCheckREPLInput(ModuleDecl *MostRecentModule, StringRef Name,
     REPLInputFile.addImports(ImportsWithOptions);
   }
 
-  bool FoundAnySideEffects = false;
   bool Done;
   do {
-    FoundAnySideEffects |=
-        parseIntoSourceFile(REPLInputFile, BufferID, &Done, nullptr,
-                            &PersistentState);
+    parseIntoSourceFile(REPLInputFile, BufferID, &Done, nullptr,
+                        &PersistentState);
   } while (!Done);
   performTypeChecking(REPLInputFile);
   return REPLModule;
@@ -1092,7 +1090,7 @@ public:
           ASTContext &ctx = CI.getASTContext();
           SourceFile &SF =
               MostRecentModule->getMainSourceFile(SourceFileKind::REPL);
-          auto name = ctx.getIdentifier(Tok.getText());
+          DeclNameRef name(ctx.getIdentifier(Tok.getText()));
           auto descriptor = UnqualifiedLookupDescriptor(name, &SF);
           auto lookup = evaluateOrDefault(
               ctx.evaluator, UnqualifiedLookupRequest{descriptor}, {});
