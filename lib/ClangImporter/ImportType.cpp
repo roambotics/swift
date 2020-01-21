@@ -416,12 +416,11 @@ namespace {
       
       if (pointeeQualType->isFunctionType()) {
         auto funcTy = pointeeType->castTo<FunctionType>();
-        return {
-          FunctionType::get(funcTy->getParams(), funcTy->getResult(),
-            funcTy->getExtInfo()
-              .withRepresentation(
+        auto extInfo = funcTy->getExtInfo().withRepresentation(
                 AnyFunctionType::Representation::CFunctionPointer)
-              .withClangFunctionType(type)),
+                                           .withClangFunctionType(type);
+        return {
+          FunctionType::get(funcTy->getParams(), funcTy->getResult(), extInfo),
           ImportHint::CFunctionPointer
         };
       }
@@ -608,7 +607,7 @@ namespace {
     importObjCTypeParamDecl(const clang::ObjCTypeParamDecl *objcTypeParamDecl) {
       // Pull the corresponding generic type parameter from the imported class.
       const auto *typeParamContext = objcTypeParamDecl->getDeclContext();
-      GenericSignature genericSig = GenericSignature();
+      GenericSignature genericSig;
       if (auto *category =
             dyn_cast<clang::ObjCCategoryDecl>(typeParamContext)) {
         auto ext = cast_or_null<ExtensionDecl>(

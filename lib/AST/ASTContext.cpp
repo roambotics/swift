@@ -196,6 +196,9 @@ struct ASTContext::Implementation {
   /// The declaration of '+' function for two String.
   FuncDecl *PlusFunctionOnString = nullptr;
 
+  /// The declaration of 'Sequence.makeIterator()'.
+  FuncDecl *MakeIterator = nullptr;
+
   /// The declaration of Swift.Optional<T>.Some.
   EnumElementDecl *OptionalSomeDecl = nullptr;
 
@@ -530,7 +533,9 @@ ASTContext::ASTContext(LangOptions &langOpts, TypeCheckerOptions &typeckOpts,
   : LangOpts(langOpts),
     TypeCheckerOpts(typeckOpts),
     SearchPathOpts(SearchPathOpts), SourceMgr(SourceMgr), Diags(Diags),
-    evaluator(Diags, langOpts.DebugDumpCycles),
+    evaluator(Diags,
+              langOpts.DebugDumpCycles,
+              langOpts.BuildRequestDependencyGraph),
     TheBuiltinModule(createBuiltinModule(*this)),
     StdlibModuleName(getIdentifier(STDLIB_NAME)),
     SwiftShimsModuleName(getIdentifier(SWIFT_SHIMS_NAME)),
@@ -708,6 +713,31 @@ FuncDecl *ASTContext::getPlusFunctionOnString() const {
     }
   }
   return getImpl().PlusFunctionOnString;
+}
+
+FuncDecl *ASTContext::getSequenceMakeIterator() const {
+  if (getImpl().MakeIterator) {
+    return getImpl().MakeIterator;
+  }
+
+  auto proto = getProtocol(KnownProtocolKind::Sequence);
+  if (!proto)
+    return nullptr;
+
+  for (auto result : proto->lookupDirect(Id_makeIterator)) {
+    if (result->getDeclContext() != proto)
+      continue;
+
+    if (auto func = dyn_cast<FuncDecl>(result)) {
+      if (func->getParameters()->size() != 0)
+        continue;
+
+      getImpl().MakeIterator = func;
+      return func;
+    }
+  }
+
+  return nullptr;
 }
 
 #define KNOWN_STDLIB_TYPE_DECL(NAME, DECL_CLASS, NUM_GENERIC_PARAMS) \
@@ -1468,12 +1498,12 @@ ClangModuleLoader *ASTContext::getDWARFModuleLoader() const {
 }
 
 ModuleDecl *ASTContext::getLoadedModule(
-    ArrayRef<std::pair<Identifier, SourceLoc>> ModulePath) const {
+    ArrayRef<Located<Identifier>> ModulePath) const {
   assert(!ModulePath.empty());
 
   // TODO: Swift submodules.
   if (ModulePath.size() == 1) {
-    return getLoadedModule(ModulePath[0].first);
+    return getLoadedModule(ModulePath[0].Item);
   }
   return nullptr;
 }
@@ -1495,7 +1525,7 @@ static AllocationArena getArena(GenericSignature genericSig) {
 void ASTContext::registerGenericSignatureBuilder(
                                        GenericSignature sig,
                                        GenericSignatureBuilder &&builder) {
-  auto canSig = sig->getCanonicalSignature();
+  auto canSig = sig.getCanonicalSignature();
   auto arena = getArena(sig);
   auto &genericSignatureBuilders =
       getImpl().getArena(arena).GenericSignatureBuilders;
@@ -1534,12 +1564,12 @@ GenericSignatureBuilder *ASTContext::getOrCreateGenericSignatureBuilder(
   auto builderSig =
     builder->computeGenericSignature(SourceLoc(),
                                      /*allowConcreteGenericParams=*/true);
-  if (builderSig->getCanonicalSignature() != sig) {
+  if (builderSig.getCanonicalSignature() != sig) {
     llvm::errs() << "ERROR: generic signature builder is not idempotent.\n";
     llvm::errs() << "Original generic signature   : ";
     sig->print(llvm::errs());
     llvm::errs() << "\nReprocessed generic signature: ";
-    auto reprocessedSig = builderSig->getCanonicalSignature();
+    auto reprocessedSig = builderSig.getCanonicalSignature();
 
     reprocessedSig->print(llvm::errs());
     llvm::errs() << "\n";
@@ -1723,13 +1753,13 @@ bool ASTContext::shouldPerformTypoCorrection() {
   return NumTypoCorrections <= LangOpts.TypoCorrectionLimit;
 }
 
-bool ASTContext::canImportModule(std::pair<Identifier, SourceLoc> ModulePath) {
+bool ASTContext::canImportModule(Located<Identifier> ModulePath) {
   // If this module has already been successfully imported, it is importable.
   if (getLoadedModule(ModulePath) != nullptr)
     return true;
 
   // If we've failed loading this module before, don't look for it again.
-  if (FailedModuleImportNames.count(ModulePath.first))
+  if (FailedModuleImportNames.count(ModulePath.Item))
     return false;
 
   // Otherwise, ask the module loaders.
@@ -1739,12 +1769,12 @@ bool ASTContext::canImportModule(std::pair<Identifier, SourceLoc> ModulePath) {
     }
   }
 
-  FailedModuleImportNames.insert(ModulePath.first);
+  FailedModuleImportNames.insert(ModulePath.Item);
   return false;
 }
 
 ModuleDecl *
-ASTContext::getModule(ArrayRef<std::pair<Identifier, SourceLoc>> ModulePath) {
+ASTContext::getModule(ArrayRef<Located<Identifier>> ModulePath) {
   assert(!ModulePath.empty());
 
   if (auto *M = getLoadedModule(ModulePath))
@@ -1752,7 +1782,7 @@ ASTContext::getModule(ArrayRef<std::pair<Identifier, SourceLoc>> ModulePath) {
 
   auto moduleID = ModulePath[0];
   for (auto &importer : getImpl().ModuleLoaders) {
-    if (ModuleDecl *M = importer->loadModule(moduleID.second, ModulePath)) {
+    if (ModuleDecl *M = importer->loadModule(moduleID.Loc, ModulePath)) {
       return M;
     }
   }
@@ -1761,7 +1791,7 @@ ASTContext::getModule(ArrayRef<std::pair<Identifier, SourceLoc>> ModulePath) {
 }
 
 ModuleDecl *ASTContext::getModuleByName(StringRef ModuleName) {
-  SmallVector<std::pair<Identifier, SourceLoc>, 4>
+  SmallVector<Located<Identifier>, 4>
   AccessPath;
   while (!ModuleName.empty()) {
     StringRef SubModuleName;
@@ -1778,7 +1808,7 @@ ModuleDecl *ASTContext::getStdlibModule(bool loadIfAbsent) {
   if (loadIfAbsent) {
     auto mutableThis = const_cast<ASTContext*>(this);
     TheStdlibModule =
-      mutableThis->getModule({ std::make_pair(StdlibModuleName, SourceLoc()) });
+      mutableThis->getModule({ Located<Identifier>(StdlibModuleName, SourceLoc()) });
   } else {
     TheStdlibModule = getLoadedModule(StdlibModuleName);
   }
@@ -3128,6 +3158,17 @@ ArrayRef<Requirement> GenericFunctionType::getRequirements() const {
   return Signature->getRequirements();
 }
 
+SILUncommonInfo::SILUncommonInfo(AnyFunctionType::ExtInfo::Uncommon uncommon) {
+  auto *ty = uncommon.ClangFunctionType;
+  ClangFunctionType = ty ? ty->getCanonicalTypeInternal().getTypePtr()
+                         : nullptr;
+}
+
+void SILUncommonInfo::printClangFunctionType(
+    ClangModuleLoader *cml, llvm::raw_ostream &os) const {
+  cml->printClangType(ClangFunctionType, os);
+}
+
 void SILFunctionType::Profile(
     llvm::FoldingSetNodeID &id,
     GenericSignature genericParams,
@@ -3189,11 +3230,11 @@ SILFunctionType::SILFunctionType(
 
   Bits.SILFunctionType.HasErrorResult = errorResult.hasValue();
   Bits.SILFunctionType.ExtInfoBits = ext.Bits;
-  Bits.SILFunctionType.HasUncommonInfo = false;
   // The use of both assert() and static_assert() below is intentional.
   assert(Bits.SILFunctionType.ExtInfoBits == ext.Bits && "Bits were dropped!");
   static_assert(ExtInfo::NumMaskBits == NumSILExtInfoBits,
                 "ExtInfo and SILFunctionTypeBitfields must agree on bit size");
+  Bits.SILFunctionType.HasUncommonInfo = ext.getUncommonInfo().hasValue();
   Bits.SILFunctionType.CoroutineKind = unsigned(coroutineKind);
   NumParameters = params.size();
   if (coroutineKind == SILCoroutineKind::None) {
@@ -3226,6 +3267,9 @@ SILFunctionType::SILFunctionType(
     getMutableFormalResultsCache() = CanType();
     getMutableAllResultsCache() = CanType();
   }
+  if (auto uncommon = ext.getUncommonInfo())
+    *getTrailingObjects<ExtInfo::Uncommon>() = uncommon.getValue();
+
 #ifndef NDEBUG
   if (ext.getRepresentation() == Representation::WitnessMethod)
     assert(!WitnessMethodConformance.isInvalid() &&
@@ -3242,9 +3286,9 @@ SILFunctionType::SILFunctionType(
             "types and substitutions");
         
   if (substitutions) {
-    assert(substitutions.getGenericSignature()->getCanonicalSignature()
-             == genericSig->getCanonicalSignature()
-           && "substitutions must match generic signature");
+    assert(substitutions.getGenericSignature().getCanonicalSignature() ==
+               genericSig.getCanonicalSignature() &&
+           "substitutions must match generic signature");
   }
         
   if (genericSig) {
@@ -3325,6 +3369,10 @@ CanSILFunctionType SILFunctionType::get(
   assert(coroutineKind != SILCoroutineKind::None || yields.empty());
   assert(!ext.isPseudogeneric() || genericSig);
 
+  // FIXME: [clang-function-type-serialization] Don't drop the Clang type...
+  if (!ctx.LangOpts.UseClangFunctionTypes)
+    ext = ext.withClangFunctionType(nullptr);
+
   llvm::FoldingSetNodeID id;
   SILFunctionType::Profile(id, genericSig, ext, coroutineKind, callee, params,
                            yields, normalResults, errorResult,
@@ -3339,13 +3387,14 @@ CanSILFunctionType SILFunctionType::get(
 
   // All SILFunctionTypes are canonical.
 
-  // Allocate storage for the object.
-  size_t bytes = sizeof(SILFunctionType)
-                 + sizeof(SILParameterInfo) * params.size()
-                 + sizeof(SILYieldInfo) * yields.size()
-                 + sizeof(SILResultInfo) * normalResults.size()
-                 + (errorResult ? sizeof(SILResultInfo) : 0)
-                 + (normalResults.size() > 1 ? sizeof(CanType) * 2 : 0);
+  // See [SILFunctionType-layout]
+  bool hasResultCache = normalResults.size() > 1;
+  size_t bytes = totalSizeToAlloc<SILParameterInfo, SILResultInfo, SILYieldInfo,
+                                  CanType, SILFunctionType::ExtInfo::Uncommon>(
+      params.size(), normalResults.size() + (errorResult ? 1 : 0),
+      yields.size(), hasResultCache ? 2 : 0,
+      ext.getUncommonInfo().hasValue() ? 1 : 0);
+
   void *mem = ctx.Allocate(bytes, alignof(SILFunctionType));
 
   RecursiveTypeProperties properties;
@@ -3376,6 +3425,8 @@ CanSILFunctionType SILFunctionType::get(
                                 params, yields, normalResults, errorResult,
                                 substitutions, genericSigIsImplied,
                                 ctx, properties, witnessMethodConformance);
+  assert(fnType->hasResultCache() == hasResultCache);
+
   ctx.getImpl().SILFunctionTypes.InsertNode(fnType, insertPos);
   return CanSILFunctionType(fnType);
 }
@@ -4335,17 +4386,35 @@ Type ASTContext::getBridgedToObjC(const DeclContext *dc, Type type,
   return Type();
 }
 
-const clang::Type *
-ASTContext::getClangFunctionType(ArrayRef<AnyFunctionType::Param> params,
-                                 Type resultTy,
-                                 FunctionType::ExtInfo incompleteExtInfo,
-                                 FunctionTypeRepresentation trueRep) {
+void
+ASTContext::initializeClangTypeConverter() {
   auto &impl = getImpl();
   if (!impl.Converter) {
     auto *cml = getClangModuleLoader();
     impl.Converter.emplace(*this, cml->getClangASTContext(), LangOpts.Target);
   }
-  return impl.Converter.getValue().getFunctionType(params, resultTy, trueRep);
+}
+
+const clang::Type *
+ASTContext::getClangFunctionType(ArrayRef<AnyFunctionType::Param> params,
+                                 Type resultTy,
+                                 FunctionType::ExtInfo incompleteExtInfo,
+                                 FunctionTypeRepresentation trueRep) {
+  initializeClangTypeConverter();
+  return getImpl().Converter.getValue().getFunctionType(params, resultTy,
+                                                        trueRep);
+}
+
+const clang::Type *
+ASTContext::getCanonicalClangFunctionType(
+    ArrayRef<SILParameterInfo> params,
+    Optional<SILResultInfo> result,
+    SILFunctionType::ExtInfo incompleteExtInfo,
+    SILFunctionType::Representation trueRep) {
+  initializeClangTypeConverter();
+  auto *ty = getImpl().Converter.getValue().getFunctionType(params, result,
+                                                            trueRep);
+  return ty ? ty->getCanonicalTypeInternal().getTypePtr() : nullptr;
 }
 
 CanGenericSignature ASTContext::getSingleGenericParameterSignature() const {
@@ -4397,10 +4466,12 @@ ASTContext::getOverrideGenericSignature(const ValueDecl *base,
                                         const ValueDecl *derived) {
   auto baseGenericCtx = base->getAsGenericContext();
   auto derivedGenericCtx = derived->getAsGenericContext();
-  auto &ctx = base->getASTContext();
 
   if (!baseGenericCtx || !derivedGenericCtx)
     return nullptr;
+
+  if (base == derived)
+    return derivedGenericCtx->getGenericSignature();
 
   auto baseClass = base->getDeclContext()->getSelfClassDecl();
   if (!baseClass)
@@ -4457,7 +4528,7 @@ ASTContext::getOverrideGenericSignature(const ValueDecl *base,
     }
 
     return CanGenericTypeParamType::get(
-        gp->getDepth() - baseDepth + derivedDepth, gp->getIndex(), ctx);
+        gp->getDepth() - baseDepth + derivedDepth, gp->getIndex(), *this);
   };
 
   auto lookupConformanceFn =
@@ -4477,7 +4548,7 @@ ASTContext::getOverrideGenericSignature(const ValueDecl *base,
   }
 
   auto genericSig = evaluateOrDefault(
-      ctx.evaluator,
+      evaluator,
       AbstractGenericSignatureRequest{
         derivedClass->getGenericSignature().getPointer(),
         std::move(addedGenericParams),

@@ -391,6 +391,9 @@ MutableArrayRef<RequirementRepr> WhereClauseOwner::getRequirements() const {
   } else if (const auto attr = source.dyn_cast<SpecializeAttr *>()) {
     if (auto whereClause = attr->getTrailingWhereClause())
       return whereClause->getRequirements();
+  } else if (const auto attr = source.dyn_cast<DifferentiableAttr *>()) {
+    if (auto whereClause = attr->getWhereClause())
+      return whereClause->getRequirements();
   } else if (const auto whereClause = source.get<TrailingWhereClause *>()) {
     return whereClause->getRequirements();
   }
@@ -1074,6 +1077,12 @@ void swift::simple_display(llvm::raw_ostream &out,
   case ImplicitMemberAction::ResolveCodingKeys:
     out << "resolve CodingKeys";
     break;
+  case ImplicitMemberAction::ResolveEncodable:
+    out << "resolve Encodable.encode(to:)";
+    break;
+  case ImplicitMemberAction::ResolveDecodable:
+    out << "resolve Decodable.init(from:)";
+    break;
   }
 }
 
@@ -1233,6 +1242,24 @@ Optional<Expr *> CallerSideDefaultArgExprRequest::getCachedResult() const {
 void CallerSideDefaultArgExprRequest::cacheResult(Expr *expr) const {
   auto *defaultExpr = std::get<0>(getStorage());
   defaultExpr->ContextOrCallerSideExpr = expr;
+}
+
+//----------------------------------------------------------------------------//
+// DifferentiableAttributeTypeCheckRequest computation.
+//----------------------------------------------------------------------------//
+
+Optional<IndexSubset *>
+DifferentiableAttributeTypeCheckRequest::getCachedResult() const {
+  auto *attr = std::get<0>(getStorage());
+  if (attr->hasBeenTypeChecked())
+    return attr->ParameterIndicesAndBit.getPointer();
+  return None;
+}
+
+void DifferentiableAttributeTypeCheckRequest::cacheResult(
+    IndexSubset *parameterIndices) const {
+  auto *attr = std::get<0>(getStorage());
+  attr->ParameterIndicesAndBit.setPointerAndInt(parameterIndices, true);
 }
 
 //----------------------------------------------------------------------------//

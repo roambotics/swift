@@ -44,7 +44,6 @@
 
 namespace clang {
 class Type;
-class FunctionType;
 } // namespace clang
 
 namespace llvm {
@@ -59,6 +58,7 @@ class AssociatedTypeDecl;
 class ASTContext;
 enum BufferPointerTypeKind : unsigned;
 class ClassDecl;
+class ClangModuleLoader;
 class DependentMemberType;
 class GenericTypeParamDecl;
 class GenericTypeParamType;
@@ -1159,6 +1159,11 @@ public:
   /// Return whether this type is or can be substituted for a bridgeable
   /// object type.
   TypeTraitResult canBeClass();
+
+  /// Return the tangent space of the given type, if it exists. Otherwise,
+  /// return `None`.
+  Optional<TangentSpace>
+  getAutoDiffTangentSpace(LookupConformanceFn lookupConformance);
 
 private:
   // Make vanilla new/delete illegal for Types.
@@ -2941,6 +2946,7 @@ public:
       friend ExtInfo;
       friend class AnyFunctionType;
       friend class FunctionType;
+      friend class SILUncommonInfo;
       // We preserve a full clang::Type *, not a clang::FunctionType * as:
       // 1. We need to keep sugar in case we need to present an error to the user.
       // 2. The actual type being stored is [ignoring sugar] either a
@@ -2950,6 +2956,11 @@ public:
 
       bool empty() const { return !ClangFunctionType; }
       Uncommon(const clang::Type *type) : ClangFunctionType(type) {}
+
+    public:
+      /// Use the ClangModuleLoader to print the Clang type as a string.
+      void printClangFunctionType(ClangModuleLoader *cml,
+                                  llvm::raw_ostream &os);
     };
 
   private:
@@ -2958,7 +2969,7 @@ public:
     static void assertIsFunctionType(const clang::Type *);
 
     ExtInfo(unsigned Bits, Uncommon Other) : Bits(Bits), Other(Other) {
-      // TODO: [store-sil-clang-function-type] Once we start serializing
+      // TODO: [clang-function-type-serialization] Once we start serializing
       // the Clang type, we should also assert that the pointer is non-null.
       auto Rep = Representation(Bits & RepresentationMask);
       if ((Rep == Representation::CFunctionPointer) && Other.ClangFunctionType)
@@ -3179,6 +3190,76 @@ public:
     return getExtInfo().getRepresentation();
   }
 
+  /// Returns the derivative function type for the given parameter indices,
+  /// result index, derivative function kind, derivative function generic
+  /// signature (optional), and other auxiliary parameters.
+  ///
+  /// Preconditions:
+  /// - Parameters corresponding to parameter indices must conform to
+  ///   `Differentiable`.
+  /// - The result corresponding to the result index must conform to
+  ///   `Differentiable`.
+  ///
+  /// Typing rules, given:
+  /// - Original function type. Three cases:
+  ///   - Top-level function: `(T0, T1, ...) -> R`
+  ///   - Static method: `(Self.Type) -> (T0, T1, ...) -> R`
+  ///   - Instance method: `(Self) -> (T0, T1, ...) -> R`
+  ///
+  /// Terminology:
+  /// - The derivative of a `Differentiable`-conforming type has the
+  ///   `TangentVector` associated type. `TangentVector` is abbreviated as `Tan`
+  ///   below.
+  /// - "wrt" parameters refers to differentiability parameters, identified by
+  ///   the parameter indices.
+  /// - "wrt" result refers to the result identified by the result index.
+  ///
+  /// JVP derivative type:
+  /// - Takes original parameters.
+  /// - Returns original result, followed by a differential function, which
+  ///   takes "wrt" parameter derivatives and returns a "wrt" result derivative.
+  ///
+  /// \verbatim
+  ///   (T0, T1, ...) -> (R,       (T0.Tan, T1.Tan, ...) -> R.Tan)
+  ///                     ^         ^~~~~~~~~~~~~~~~~~~     ^~~~~
+  ///           original result | derivatives wrt params | derivative wrt result
+  ///
+  ///   (Self) -> (T0, ...) -> (R, (Self.Tan, T0.Tan, ...) -> R.Tan)
+  ///                           ^   ^~~~~~~~~~~~~~~~~~~~~     ^~~~~
+  ///             original result  |  deriv. wrt params  |  deriv. wrt result
+  /// \endverbatim
+  ///
+  /// VJP derivative type:
+  /// - Takes original parameters.
+  /// - Returns original result, followed by a pullback function, which
+  ///   takes a "wrt" result derivative and returns "wrt" parameter derivatives.
+  ///
+  /// \verbatim
+  ///   (T0, T1, ...) -> (R,           (R.Tan)    ->     (T0.Tan, T1.Tan, ...))
+  ///                     ^             ^~~~~             ^~~~~~~~~~~~~~~~~~~
+  ///          original result | derivative wrt result | derivatives wrt params
+  ///
+  ///   (Self) -> (T0, ...) -> (R,     (R.Tan)    ->    (Self.Tan, T0.Tan, ...))
+  ///                           ^       ^~~~~            ^~~~~~~~~~~~~~~~~~~~~
+  ///              original result | deriv. wrt result | deriv. wrt params
+  /// \endverbatim
+  ///
+  /// By default, if the original type has a `self` parameter list and parameter
+  /// indices include `self`, the computed derivative function type will return
+  /// a linear map taking/returning self's tangent *last* instead of first, for
+  /// consistency with SIL.
+  ///
+  /// If `makeSelfParamFirst` is true, `self`'s tangent is reordered to appear
+  /// first. `makeSelfParamFirst` should be true when working with user-facing
+  /// derivative function types, e.g. when type-checking `@differentiable` and
+  /// `@derivative` attributes.
+  AnyFunctionType *getAutoDiffDerivativeFunctionType(
+      IndexSubset *parameterIndices, unsigned resultIndex,
+      AutoDiffDerivativeFunctionKind kind,
+      LookupConformanceFn lookupConformance,
+      GenericSignature derivativeGenericSignature = GenericSignature(),
+      bool makeSelfParamFirst = false);
+
   /// True if the parameter declaration it is attached to is guaranteed
   /// to not persist the closure for longer than the duration of the call.
   bool isNoEscape() const {
@@ -3307,7 +3388,6 @@ END_CAN_TYPE_WRAPPER(FunctionType, AnyFunctionType)
 /// has a default argument.
 struct ParameterListInfo {
   SmallBitVector defaultArguments;
-  std::vector<Type> functionBuilderTypes;
 
 public:
   ParameterListInfo() { }
@@ -3325,9 +3405,6 @@ public:
 
   /// Retrieve the number of parameters for which we have information.
   unsigned size() const { return defaultArguments.size(); }
-
-  /// Retrieve the function builder type for the given parameter.
-  Type getFunctionBuilderType(unsigned paramIdx) const;
 };
 
 /// Turn a param list into a symbolic and printable representation that does not
@@ -3840,6 +3917,24 @@ namespace Lowering {
   class TypeConverter;
 };
 
+class SILUncommonInfo {
+  friend class SILFunctionType;
+
+  // Invariant: The FunctionType is canonical.
+  // We store a clang::FunctionType * instead of a clang::CanQualType to
+  // avoid depending on the Clang AST in this header.
+  const clang::Type *ClangFunctionType;
+
+  bool empty() const { return !ClangFunctionType; }
+  SILUncommonInfo(const clang::Type *type) : ClangFunctionType(type) {}
+  SILUncommonInfo(AnyFunctionType::ExtInfo::Uncommon uncommon);
+
+public:
+  /// Analog of AnyFunctionType::ExtInfo::Uncommon::printClangFunctionType.
+  void printClangFunctionType(ClangModuleLoader *cml,
+                              llvm::raw_ostream &os) const;
+};
+
 /// SILFunctionType - The lowered type of a function value, suitable
 /// for use by SIL.
 ///
@@ -3848,7 +3943,8 @@ namespace Lowering {
 /// function parameter and result types.
 class SILFunctionType final : public TypeBase, public llvm::FoldingSetNode,
     private llvm::TrailingObjects<SILFunctionType, SILParameterInfo,
-                                  SILResultInfo> {
+                                  SILResultInfo, SILYieldInfo, CanType,
+                                  SILUncommonInfo> {
   friend TrailingObjects;
 
   size_t numTrailingObjects(OverloadToken<SILParameterInfo>) const {
@@ -3856,7 +3952,19 @@ class SILFunctionType final : public TypeBase, public llvm::FoldingSetNode,
   }
 
   size_t numTrailingObjects(OverloadToken<SILResultInfo>) const {
-    return hasErrorResult() ? 1 : 0;
+    return getNumResults() + (hasErrorResult() ? 1 : 0);
+  }
+
+  size_t numTrailingObjects(OverloadToken<SILYieldInfo>) const {
+    return getNumYields();
+  }
+
+  size_t numTrailingObjects(OverloadToken<CanType>) const {
+    return hasResultCache() ? 2 : 0;
+  }
+
+  size_t numTrailingObjects(OverloadToken<SILUncommonInfo>) const {
+    return Bits.SILFunctionType.HasUncommonInfo ? 1 : 0;
   }
 
 public:
@@ -3883,22 +3991,31 @@ public:
 
     unsigned Bits; // Naturally sized for speed.
 
-    class Uncommon {
-      friend ExtInfo;
-      friend class SILFunctionType;
-
-      // Invariant: The FunctionType is canonical.
-      // We store a clang::FunctionType * instead of a clang::CanQualType to
-      // avoid depending on the Clang AST in this header.
-      const clang::FunctionType *ClangFunctionType;
-
-      bool empty() const { return !ClangFunctionType; }
-      Uncommon(const clang::FunctionType *type) : ClangFunctionType(type) {}
-    };
+    // For symmetry with AnyFunctionType::Uncommon
+    using Uncommon = SILUncommonInfo;
 
     Uncommon Other;
 
-    ExtInfo(unsigned Bits, Uncommon Other) : Bits(Bits), Other(Other) {}
+    static void assertIsFunctionType(const clang::Type *);
+
+    ExtInfo(unsigned Bits, Uncommon Other) : Bits(Bits), Other(Other) {
+      auto Rep = Representation(Bits & RepresentationMask);
+      // TODO: [clang-function-type-serialization] Once we start serializing
+      // the Clang type, we should also assert that the pointer is non-null.
+      if ((Rep == Representation::CFunctionPointer) && Other.ClangFunctionType)
+        assertIsFunctionType(Other.ClangFunctionType);
+    }
+
+    static constexpr unsigned makeBits(Representation rep,
+                                       bool isPseudogeneric,
+                                       bool isNoEscape,
+                                       DifferentiabilityKind diffKind) {
+      return ((unsigned) rep)
+              | (isPseudogeneric ? PseudogenericMask : 0)
+              | (isNoEscape ? NoEscapeMask : 0)
+              | (((unsigned)diffKind << DifferentiabilityMaskOffset)
+                 & DifferentiabilityMask);
+    }
 
     friend class SILFunctionType;
   public:
@@ -3908,13 +4025,19 @@ public:
     // Constructor for polymorphic type.
     ExtInfo(Representation rep, bool isPseudogeneric, bool isNoEscape,
             DifferentiabilityKind diffKind,
-            const clang::FunctionType *type)
-      : ExtInfo(((unsigned) rep)
-                  | (isPseudogeneric ? PseudogenericMask : 0)
-                  | (isNoEscape ? NoEscapeMask : 0)
-                  | (((unsigned)diffKind << DifferentiabilityMaskOffset)
-                     & DifferentiabilityMask),
+            const clang::Type *type)
+      : ExtInfo(makeBits(rep, isPseudogeneric, isNoEscape, diffKind),
                 Uncommon(type)) {
+    }
+
+    ExtInfo(AnyFunctionType::ExtInfo info, bool isPseudogeneric)
+      : ExtInfo(makeBits(info.getSILRepresentation(),
+                         isPseudogeneric,
+                         info.isNoEscape(),
+                         info.getDifferentiabilityKind()),
+                info.getUncommonInfo().hasValue()
+                ? Uncommon(info.getUncommonInfo().getValue())
+                : Uncommon(nullptr)) {
     }
 
     static ExtInfo getThin() {
@@ -3945,6 +4068,11 @@ public:
     }
     Language getLanguage() const {
       return getSILFunctionLanguage(getRepresentation());
+    }
+
+    /// Return the underlying Uncommon value if it is not the default value.
+    Optional<Uncommon> getUncommonInfo() const {
+      return Other.empty() ? Optional<Uncommon>() : Other;
     }
 
     bool hasSelfParam() const {
@@ -3998,6 +4126,9 @@ public:
       return ExtInfo(NoEscape ? (Bits | NoEscapeMask) : (Bits & ~NoEscapeMask),
                      Other);
     }
+    ExtInfo withClangFunctionType(const clang::Type *type) const {
+      return ExtInfo(Bits, Uncommon(type));
+    }
 
     std::pair<unsigned, const void *> getFuncAttrKey() const {
       return std::make_pair(Bits, Other.ClangFunctionType);
@@ -4019,12 +4150,13 @@ private:
   unsigned NumAnyResults : 16;         // Not including the ErrorResult.
   unsigned NumAnyIndirectFormalResults : 16; // Subset of NumAnyResults.
 
+  // [SILFunctionType-layout]
   // The layout of a SILFunctionType in memory is:
   //   SILFunctionType
   //   SILParameterInfo[NumParameters]
   //   SILResultInfo[isCoroutine() ? 0 : NumAnyResults]
-  //   SILYieldInfo[isCoroutine() ? NumAnyResults : 0]
   //   SILResultInfo?    // if hasErrorResult()
+  //   SILYieldInfo[isCoroutine() ? NumAnyResults : 0]
   //   CanType?          // if !isCoro && NumAnyResults > 1, formal result cache
   //   CanType?          // if !isCoro && NumAnyResults > 1, all result cache
 
@@ -4037,34 +4169,16 @@ private:
   }
 
   MutableArrayRef<SILResultInfo> getMutableResults() {
-    auto *ptr = reinterpret_cast<SILResultInfo *>(getMutableParameters().end());
-    return {ptr, getNumResults()};
+    return {getTrailingObjects<SILResultInfo>(), getNumResults()};
   }
 
   MutableArrayRef<SILYieldInfo> getMutableYields() {
-    auto *ptr = reinterpret_cast<SILYieldInfo *>(getMutableParameters().end());
-    return {ptr, getNumYields()};
-  }
-
-  /// Return a pointer past the end of the formal results, whether they
-  /// are yield-results or normal results.
-  void *getEndOfFormalResults() {
-    return isCoroutine() ? static_cast<void*>(getMutableYields().end())
-                         : static_cast<void*>(getMutableResults().end());
+    return {getTrailingObjects<SILYieldInfo>(), getNumYields()};
   }
 
   SILResultInfo &getMutableErrorResult() {
     assert(hasErrorResult());
-    return *reinterpret_cast<SILResultInfo*>(getEndOfFormalResults());
-  }
-
-  /// Return a pointer past the end of all of the results, including the
-  /// error result if one is present.
-  void *getEndOfAllResults() {
-    void *end = getEndOfFormalResults();
-    if (hasErrorResult())
-      end = reinterpret_cast<char*>(end) + sizeof(SILResultInfo);
-    return end;
+    return *(getTrailingObjects<SILResultInfo>() + getNumResults());
   }
 
   /// Do we have slots for caches of the normal-result tuple type?
@@ -4074,14 +4188,13 @@ private:
 
   CanType &getMutableFormalResultsCache() const {
     assert(hasResultCache());
-    auto *ptr = const_cast<SILFunctionType *>(this)->getEndOfAllResults();
-    return *reinterpret_cast<CanType*>(ptr);
+    return *const_cast<SILFunctionType *>(this)->getTrailingObjects<CanType>();
   }
 
   CanType &getMutableAllResultsCache() const {
     assert(hasResultCache());
-    auto *ptr = const_cast<SILFunctionType *>(this)->getEndOfAllResults();
-    return *(reinterpret_cast<CanType *>(ptr) + 1);
+    return *(const_cast<SILFunctionType *>(this)->getTrailingObjects<CanType>()
+             + 1);
   }
 
   SILFunctionType(GenericSignature genericSig, ExtInfo ext,
@@ -4311,7 +4424,7 @@ public:
     return WitnessMethodConformance;
   }
 
-  const clang::FunctionType *getClangFunctionType() const;
+  const clang::Type *getClangFunctionType() const;
 
   ExtInfo getExtInfo() const {
     return ExtInfo(Bits.SILFunctionType.ExtInfoBits, getClangFunctionType());

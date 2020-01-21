@@ -31,6 +31,10 @@ struct ModuleInterfaceOptions {
   /// interface, or should we fully-qualify them?
   bool PreserveTypesAsWritten = false;
 
+  /// See \ref FrontendOptions.PrintFullConvention.
+  /// FIXME: [clang-function-type-serialization] This flag should go away.
+  bool PrintFullConvention = false;
+
   /// Copy of all the command-line flags passed at .swiftinterface
   /// generation time, re-applied to CompilerInvocation when reading
   /// back .swiftinterface and reconstructing .swiftmodule.

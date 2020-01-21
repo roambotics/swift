@@ -1799,6 +1799,8 @@ namespace {
                                 AnyFunctionType::Representation representation
                                   = AnyFunctionType::Representation::Swift,
                                 bool noescape = false,
+                                const clang::Type *parsedClangFunctionType
+                                  = nullptr,
                                 DifferentiabilityKind diffKind
                                   = DifferentiabilityKind::NonDifferentiable);
     bool
@@ -1812,8 +1814,12 @@ namespace {
                                 TypeResolutionOptions options,
                                 SILCoroutineKind coroutineKind
                                   = SILCoroutineKind::None,
-                                SILFunctionType::ExtInfo extInfo
+                                SILFunctionType::ExtInfo incompleteExtInfo
                                   = SILFunctionType::ExtInfo(),
+                                SILFunctionType::Representation representation
+                                  = SILFunctionType::Representation::Thick,
+                                const clang::Type *parsedClangType
+                                  = nullptr,
                                 ParameterConvention calleeConvention
                                   = DefaultParameterConvention,
                                 TypeRepr *witnessmethodProtocol = nullptr);
@@ -2166,7 +2172,29 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
   // Function attributes require a syntactic function type.
   auto *fnRepr = dyn_cast<FunctionTypeRepr>(repr);
 
+  auto tryParseClangType = [this](TypeAttributes::Convention &conv,
+                                  bool hasConventionCOrBlock)
+                           -> const clang::Type * {
+    if (conv.ClangType.Item.empty())
+      return nullptr;
+    if (!hasConventionCOrBlock) {
+      diagnose(conv.ClangType.Loc,
+               diag::unexpected_ctype_for_non_c_convention,
+               conv.Name, conv.ClangType.Item);
+      return nullptr;
+    }
+
+    const clang::Type *type = Context.getClangModuleLoader()
+                              ->parseClangFunctionType(conv.ClangType.Item,
+                                                       conv.ClangType.Loc);
+    if (!type)
+      diagnose(conv.ClangType.Loc, diag::unable_to_parse_c_function_type,
+               conv.ClangType.Item);
+    return type;
+  };
+
   if (fnRepr && hasFunctionAttr) {
+    const clang::Type *parsedClangFunctionType = nullptr;
     if (options & TypeResolutionFlags::SILType) {
       SILFunctionType::Representation rep;
       TypeRepr *witnessMethodProtocol = nullptr;
@@ -2214,6 +2242,11 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
           rep = SILFunctionType::Representation::Thin;
         } else {
           rep = *parsedRep;
+          bool isCOrBlock =
+            rep == SILFunctionTypeRepresentation::CFunctionPointer
+            || rep == SILFunctionTypeRepresentation::Block;
+          parsedClangFunctionType =
+            tryParseClangType(attrs.ConventionArguments.getValue(), isCOrBlock);
         }
 
         if (rep == SILFunctionType::Representation::WitnessMethod) {
@@ -2236,13 +2269,14 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
                                 : DifferentiabilityKind::Normal;
       }
 
-      // Resolve the function type directly with these attributes.
-      // TODO: [store-sil-clang-function-type]
-      SILFunctionType::ExtInfo extInfo(rep, attrs.has(TAK_pseudogeneric),
-                                       attrs.has(TAK_noescape), diffKind,
-                                       nullptr);
+      SILFunctionType::ExtInfo incompleteExtInfo(
+        SILFunctionType::Representation::Thick,
+        attrs.has(TAK_pseudogeneric), attrs.has(TAK_noescape), diffKind,
+        /*clangFunctionType*/ nullptr);
 
-      ty = resolveSILFunctionType(fnRepr, options, coroutineKind, extInfo,
+      ty = resolveSILFunctionType(fnRepr, options, coroutineKind,
+                                  incompleteExtInfo, rep,
+                                  /*parsedClangType*/nullptr,
                                   calleeConvention, witnessMethodProtocol);
       if (!ty || ty->hasError())
         return ty;
@@ -2264,6 +2298,11 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
           rep = FunctionType::Representation::Swift;
         } else {
           rep = *parsedRep;
+
+          bool isCOrBlock = rep == FunctionTypeRepresentation::CFunctionPointer
+                          || rep == FunctionTypeRepresentation::Block;
+          parsedClangFunctionType =
+            tryParseClangType(attrs.ConventionArguments.getValue(), isCOrBlock);
         }
       }
 
@@ -2280,6 +2319,7 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
       }
 
       ty = resolveASTFunctionType(fnRepr, options, rep, /*noescape=*/false,
+                                  parsedClangFunctionType,
                                   diffKind);
       if (!ty || ty->hasError())
         return ty;
@@ -2593,6 +2633,7 @@ Type TypeResolver::resolveOpaqueReturnType(TypeRepr *repr,
 Type TypeResolver::resolveASTFunctionType(
     FunctionTypeRepr *repr, TypeResolutionOptions parentOptions,
     AnyFunctionType::Representation representation, bool noescape,
+    const clang::Type *parsedClangFunctionType,
     DifferentiabilityKind diffKind) {
 
   TypeResolutionOptions options = None;
@@ -2631,8 +2672,9 @@ Type TypeResolver::resolveASTFunctionType(
                                           noescape, repr->throws(), diffKind,
                                           /*clangFunctionType*/nullptr);
   
-  const clang::Type *clangFnType = nullptr;
-  if (representation == AnyFunctionType::Representation::CFunctionPointer)
+  const clang::Type *clangFnType = parsedClangFunctionType;
+  if (representation == AnyFunctionType::Representation::CFunctionPointer
+      && !clangFnType)
     clangFnType = Context.getClangFunctionType(
       params, outputTy, incompleteExtInfo,
       AnyFunctionType::Representation::CFunctionPointer);
@@ -2699,8 +2741,8 @@ Type TypeResolver::resolveSILBoxType(SILBoxTypeRepr *repr,
   // Substitute out parsed context types into interface types.
   CanGenericSignature genericSig;
   if (auto *genericEnv = repr->getGenericEnvironment()) {
-    genericSig = genericEnv->getGenericSignature()->getCanonicalSignature();
-    
+    genericSig = genericEnv->getGenericSignature().getCanonicalSignature();
+
     for (auto &field : fields) {
       auto transTy = field.getLoweredType()->mapTypeOutOfContext();
       field = {transTy->getCanonicalType(), field.isMutable()};
@@ -2735,12 +2777,15 @@ Type TypeResolver::resolveSILBoxType(SILBoxTypeRepr *repr,
   return SILBoxType::get(Context, layout, subMap);
 }
 
-Type TypeResolver::resolveSILFunctionType(FunctionTypeRepr *repr,
-                                          TypeResolutionOptions options,
-                                          SILCoroutineKind coroutineKind,
-                                          SILFunctionType::ExtInfo extInfo,
-                                          ParameterConvention callee,
-                                          TypeRepr *witnessMethodProtocol) {
+Type TypeResolver::resolveSILFunctionType(
+    FunctionTypeRepr *repr,
+    TypeResolutionOptions options,
+    SILCoroutineKind coroutineKind,
+    SILFunctionType::ExtInfo incompleteExtInfo,
+    SILFunctionType::Representation representation,
+    const clang::Type *parsedClangType,
+    ParameterConvention callee,
+    TypeRepr *witnessMethodProtocol) {
   options.setContext(None);
 
   bool hasError = false;
@@ -2804,8 +2849,9 @@ Type TypeResolver::resolveSILFunctionType(FunctionTypeRepr *repr,
   // Resolve substitutions if we have them.
   SubstitutionMap subs;
   if (!repr->getSubstitutions().empty()) {
-    auto sig = repr->getGenericEnvironment()->getGenericSignature()
-                   ->getCanonicalSignature();
+    auto sig = repr->getGenericEnvironment()
+                   ->getGenericSignature()
+                   .getCanonicalSignature();
     TypeSubstitutionMap subsMap;
     auto params = sig->getGenericParams();
     for (unsigned i : indices(repr->getSubstitutions())) {
@@ -2828,8 +2874,8 @@ Type TypeResolver::resolveSILFunctionType(FunctionTypeRepr *repr,
   SmallVector<SILResultInfo, 4> interfaceResults;
   Optional<SILResultInfo> interfaceErrorResult;
   if (auto *genericEnv = repr->getGenericEnvironment()) {
-    genericSig = genericEnv->getGenericSignature()->getCanonicalSignature();
- 
+    genericSig = genericEnv->getGenericSignature().getCanonicalSignature();
+
     for (auto &param : params) {
       auto transParamType = param.getInterfaceType()->mapTypeOutOfContext()
           ->getCanonicalType();
@@ -2883,6 +2929,20 @@ Type TypeResolver::resolveSILFunctionType(FunctionTypeRepr *repr,
     assert(witnessMethodConformance &&
            "found witness_method without matching conformance");
   }
+
+  const clang::Type *clangFnType = parsedClangType;
+  if ((representation == SILFunctionType::Representation::CFunctionPointer)
+      && !clangFnType) {
+    assert(results.size() <= 1 && yields.size() == 0
+           && "@convention(c) functions have at most 1 result and 0 yields.");
+    auto result = results.empty() ? Optional<SILResultInfo>() : results[0];
+    clangFnType = Context.getCanonicalClangFunctionType(interfaceParams, result,
+                                                        incompleteExtInfo,
+                                                        representation);
+  }
+
+  auto extInfo = incompleteExtInfo.withRepresentation(representation)
+                                  .withClangFunctionType(clangFnType);
 
   return SILFunctionType::get(genericSig, extInfo, coroutineKind,
                               callee,

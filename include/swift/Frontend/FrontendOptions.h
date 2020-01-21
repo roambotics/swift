@@ -207,10 +207,6 @@ public:
   /// \see ResilienceStrategy::Resilient
   bool EnableLibraryEvolution = false;
 
-  /// Indicates that the frontend should emit "verbose" SIL
-  /// (if asked to emit SIL).
-  bool EmitVerboseSIL = false;
-
   /// If set, this module is part of a mixed Objective-C/Swift framework, and
   /// the Objective-C half should implicitly be visible to the Swift sources.
   bool ImportUnderlyingModule = false;
@@ -251,9 +247,14 @@ public:
   /// exit.
   bool PrintTargetInfo = false;
 
-  /// Should we sort SIL functions, vtables, witness tables, and global
-  /// variables by name when we print it out. This eases diffing of SIL files.
+  /// See the \ref SILOptions.EmitVerboseSIL flag.
+  bool EmitVerboseSIL = false;
+
+  /// See the \ref SILOptions.EmitSortedSIL flag.
   bool EmitSortedSIL = false;
+
+  /// Should we emit the cType when printing @convention(c) or no?
+  bool PrintFullConvention = false;
 
   /// Indicates whether the dependency tracker should track system
   /// dependencies as well.
