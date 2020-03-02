@@ -76,6 +76,10 @@ public:
     CodeCompletionOffset = Offset;
   }
 
+  bool hasCodeCompletionBuffer() const {
+    return CodeCompletionBufferID != 0U;
+  }
+
   unsigned getCodeCompletionBufferID() const {
     return CodeCompletionBufferID;
   }
@@ -242,6 +246,9 @@ public:
   /// Translate the end position of the given line to the offset.
   llvm::Optional<unsigned> resolveOffsetForEndOfLine(unsigned BufferId,
                                                      unsigned Line) const;
+
+  /// Get the length of the line
+  llvm::Optional<unsigned> getLineLength(unsigned BufferId, unsigned Line) const;
 
   SourceLoc getLocForLineCol(unsigned BufferId, unsigned Line, unsigned Col) const {
     auto Offset = resolveFromLineCol(BufferId, Line, Col);

@@ -102,6 +102,10 @@ static llvm::cl::opt<bool>
 VerifyExclusivity("enable-verify-exclusivity",
                   llvm::cl::desc("Verify the access markers used to enforce exclusivity."));
 
+static llvm::cl::opt<bool>
+EnableSpeculativeDevirtualization("enable-spec-devirt",
+                  llvm::cl::desc("Enable Speculative Devirtualization pass."));
+
 namespace {
 enum EnforceExclusivityMode {
   Unchecked, // static only
@@ -196,10 +200,10 @@ static llvm::cl::opt<std::string>
 ModuleCachePath("module-cache-path", llvm::cl::desc("Clang module cache path"));
 
 static llvm::cl::opt<bool>
-EmitSortedSIL("emit-sorted-sil", llvm::cl::Hidden,
-              llvm::cl::init(false),
-              llvm::cl::desc("Sort Functions, VTables, Globals, "
-                             "WitnessTables by name to ease diffing."));
+EnableSILSortOutput("emit-sorted-sil", llvm::cl::Hidden,
+                    llvm::cl::init(false),
+                    llvm::cl::desc("Sort Functions, VTables, Globals, "
+                                   "WitnessTables by name to ease diffing."));
 
 static llvm::cl::opt<bool>
 DisableASTDump("sil-disable-ast-dump", llvm::cl::Hidden,
@@ -375,8 +379,8 @@ int main(int argc, char **argv) {
       break;
     }
   }
-  SILOpts.EmitVerboseSIL |= EmitVerboseSIL;
-  SILOpts.EmitSortedSIL |= EmitSortedSIL;
+
+  SILOpts.EnableSpeculativeDevirtualization = EnableSpeculativeDevirtualization;
 
   serialization::ExtendedValidationInfo extendedInfo;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
@@ -427,13 +431,13 @@ int main(int argc, char **argv) {
   std::unique_ptr<llvm::raw_fd_ostream> OptRecordFile;
   if (RemarksFilename != "") {
     std::error_code EC;
-    OptRecordFile = llvm::make_unique<llvm::raw_fd_ostream>(
+    OptRecordFile = std::make_unique<llvm::raw_fd_ostream>(
         RemarksFilename, EC, llvm::sys::fs::F_None);
     if (EC) {
       llvm::errs() << EC.message() << '\n';
       return 1;
     }
-    auto Stream = llvm::make_unique<llvm::yaml::Output>(*OptRecordFile,
+    auto Stream = std::make_unique<llvm::yaml::Output>(*OptRecordFile,
                                                         &CI.getSourceMgr());
     CI.getSILModule()->setOptRecordStream(std::move(Stream),
                                           std::move(OptRecordFile));
@@ -481,10 +485,12 @@ int main(int argc, char **argv) {
   } else {
     const StringRef OutputFile = OutputFilename.size() ?
                                    StringRef(OutputFilename) : "-";
-
+    auto SILOpts = SILOptions();
+    SILOpts.EmitVerboseSIL = EmitVerboseSIL;
+    SILOpts.EmitSortedSIL = EnableSILSortOutput;
     if (OutputFile == "-") {
       CI.getSILModule()->print(llvm::outs(), CI.getMainModule(),
-                               Invocation.getSILOptions(), !DisableASTDump);
+                               SILOpts, !DisableASTDump);
     } else {
       std::error_code EC;
       llvm::raw_fd_ostream OS(OutputFile, EC, llvm::sys::fs::F_None);
@@ -493,8 +499,8 @@ int main(int argc, char **argv) {
                      << EC.message() << '\n';
         return 1;
       }
-      CI.getSILModule()->print(OS, CI.getMainModule(),
-                               Invocation.getSILOptions(), !DisableASTDump);
+      CI.getSILModule()->print(OS, CI.getMainModule(), SILOpts,
+                               !DisableASTDump);
     }
   }
 

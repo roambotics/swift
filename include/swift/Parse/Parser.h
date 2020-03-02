@@ -122,8 +122,14 @@ public:
   CodeCompletionCallbacks *CodeCompletion = nullptr;
   std::vector<Located<std::vector<ParamDecl*>>> AnonClosureVars;
 
-  bool IsParsingInterfaceTokens = false;
-  
+  NullablePtr<llvm::MD5> CurrentTokenHash;
+  void recordTokenHash(const Token Tok) {
+    if (!Tok.getText().empty())
+      recordTokenHash(Tok.getText());
+  }
+
+  void recordTokenHash(StringRef token);
+
   /// DisabledVars is a list of variables for whom local name lookup is
   /// disabled.  This is used when parsing a PatternBindingDecl to reject self
   /// uses and to disable uses of the bound variables in a let/else block.  The
@@ -216,6 +222,13 @@ public:
   /// This is true for non-primary files, where declarations only need to be
   /// lazily parsed and type checked.
   bool DelayBodyParsing;
+
+  /// Whether to evaluate the conditions of #if decls, meaning that the bodies
+  /// of any active clauses are hoisted such that they become sibling nodes with
+  /// the #if decl.
+  // FIXME: When condition evaluation moves to a later phase, remove this bit
+  // and adjust the client call 'performParseOnly'.
+  bool EvaluateConditionals;
 
   /// The receiver to collect all consumed tokens.
   ConsumeTokenReceiver *TokReceiver;
@@ -395,19 +408,20 @@ public:
          SILParserTUStateBase *SIL,
          PersistentParserState *PersistentState,
          std::shared_ptr<SyntaxParseActions> SPActions = nullptr,
-         bool DelayBodyParsing = true);
+         bool DelayBodyParsing = true, bool EvaluateConditionals = true);
   Parser(unsigned BufferID, SourceFile &SF, SILParserTUStateBase *SIL,
          PersistentParserState *PersistentState = nullptr,
          std::shared_ptr<SyntaxParseActions> SPActions = nullptr,
-         bool DelayBodyParsing = true);
+         bool DelayBodyParsing = true, bool EvaluateConditionals = true);
   Parser(std::unique_ptr<Lexer> Lex, SourceFile &SF,
          SILParserTUStateBase *SIL = nullptr,
          PersistentParserState *PersistentState = nullptr,
          std::shared_ptr<SyntaxParseActions> SPActions = nullptr,
-         bool DelayBodyParsing = true);
+         bool DelayBodyParsing = true, bool EvaluateConditionals = true);
   ~Parser();
 
-  bool isInSILMode() const { return SIL != nullptr; }
+  /// Returns true if the buffer being parsed is allowed to contain SIL.
+  bool isInSILMode() const;
 
   /// Calling this function to finalize libSyntax tree creation without destroying
   /// the parser instance.
@@ -424,9 +438,8 @@ public:
                           PreviousLoc);
   }
 
-  ParserPosition getParserPosition(const PersistentParserState::ParserPos &Pos){
-    return ParserPosition(L->getStateForBeginningOfTokenLoc(Pos.Loc),
-                          Pos.PrevLoc);
+  ParserPosition getParserPosition(SourceLoc loc, SourceLoc previousLoc) {
+    return ParserPosition(L->getStateForBeginningOfTokenLoc(loc), previousLoc);
   }
 
   void restoreParserPosition(ParserPosition PP, bool enableDiagnostics = false) {
@@ -655,6 +668,9 @@ public:
   /// Returns \c true if the parser hit the eof before finding matched '}'.
   bool skipBracedBlock();
 
+  /// Skip over SIL decls until we encounter the start of a Swift decl or eof.
+  void skipSILUntilSwiftDecl();
+
   /// If the parser is generating only a syntax tree, try loading the current
   /// node from a previously generated syntax tree.
   /// Returns \c true if the node has been loaded and inserted into the current
@@ -874,10 +890,17 @@ public:
   //===--------------------------------------------------------------------===//
   // Decl Parsing
 
-  /// Return true if parser is at the start of a decl or decl-import.
-  bool isStartOfDecl();
+  /// Returns true if parser is at the start of a Swift decl or decl-import.
+  bool isStartOfSwiftDecl();
 
+  /// Returns true if the parser is at the start of a SIL decl.
+  bool isStartOfSILDecl();
+
+  /// Parse the top-level Swift decls into the source file.
   void parseTopLevel();
+
+  /// Parse the top-level SIL decls into the SIL module.
+  void parseTopLevelSIL();
 
   /// Flags that control the parsing of declarations.
   enum ParseDeclFlags {
@@ -921,7 +944,8 @@ public:
                                bool IsAtStartOfLineOrPreviousHadSemi,
                                llvm::function_ref<void(Decl*)> Handler);
 
-  std::vector<Decl *> parseDeclListDelayed(IterableDeclContext *IDC);
+  std::pair<std::vector<Decl *>, Optional<std::string>>
+  parseDeclListDelayed(IterableDeclContext *IDC);
 
   bool parseMemberDeclList(SourceLoc LBLoc, SourceLoc &RBLoc,
                            SourceLoc PosBeforeLB,
@@ -1059,10 +1083,10 @@ public:
   ParserStatus parseDeclItem(bool &PreviousHadSemi,
                              Parser::ParseDeclOptions Options,
                              llvm::function_ref<void(Decl*)> handler);
-  std::vector<Decl *> parseDeclList(SourceLoc LBLoc, SourceLoc &RBLoc,
-                                    Diag<> ErrorDiag, ParseDeclOptions Options,
-                                    IterableDeclContext *IDC,
-                                    bool &hadError);
+  std::pair<std::vector<Decl *>, Optional<std::string>>
+  parseDeclList(SourceLoc LBLoc, SourceLoc &RBLoc, Diag<> ErrorDiag,
+                ParseDeclOptions Options, IterableDeclContext *IDC,
+                bool &hadError);
   ParserResult<ExtensionDecl> parseDeclExtension(ParseDeclOptions Flags,
                                                  DeclAttributes &Attributes);
   ParserResult<EnumDecl> parseDeclEnum(ParseDeclOptions Flags,
@@ -1105,6 +1129,8 @@ public:
                                        ParseDeclOptions Flags,
                                        DeclAttributes &Attributes,
                                        bool HasFuncKeyword = true);
+  ParserResult<BraceStmt>
+  parseAbstractFunctionBodyImpl(AbstractFunctionDecl *AFD);
   void parseAbstractFunctionBody(AbstractFunctionDecl *AFD);
   BraceStmt *parseAbstractFunctionBodyDelayed(AbstractFunctionDecl *AFD);
   ParserResult<ProtocolDecl> parseDeclProtocol(ParseDeclOptions Flags,

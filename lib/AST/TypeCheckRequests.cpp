@@ -363,7 +363,7 @@ SourceLoc WhereClauseOwner::getLoc() const {
 
 void swift::simple_display(llvm::raw_ostream &out,
                            const WhereClauseOwner &owner) {
-  if (auto where = owner.source.dyn_cast<TrailingWhereClause *>()) {
+  if (owner.source.is<TrailingWhereClause *>()) {
     simple_display(out, owner.dc->getAsDecl());
   } else if (owner.source.is<SpecializeAttr *>()) {
     out << "@_specialize";
@@ -1125,15 +1125,15 @@ void ValueWitnessRequest::cacheResult(Witness type) const {
 //----------------------------------------------------------------------------//
 
 void swift::simple_display(llvm::raw_ostream &out,
-                           FunctionBuilderClosurePreCheck value) {
+                           FunctionBuilderBodyPreCheck value) {
   switch (value) {
-  case FunctionBuilderClosurePreCheck::Okay:
+  case FunctionBuilderBodyPreCheck::Okay:
     out << "okay";
     break;
-  case FunctionBuilderClosurePreCheck::HasReturnStmt:
+  case FunctionBuilderBodyPreCheck::HasReturnStmt:
     out << "has return statement";
     break;
-  case FunctionBuilderClosurePreCheck::Error:
+  case FunctionBuilderBodyPreCheck::Error:
     out << "error";
     break;
   }

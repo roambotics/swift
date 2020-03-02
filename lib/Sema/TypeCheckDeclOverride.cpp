@@ -163,14 +163,17 @@ bool swift::isOverrideBasedOnType(const ValueDecl *decl, Type declTy,
   //
   // We can still succeed with a subtype match later in
   // OverrideMatcher::match().
-  auto declGenericCtx = decl->getAsGenericContext();
-  auto &ctx = decl->getASTContext();
-  auto sig = ctx.getOverrideGenericSignature(parentDecl, decl);
+  if (decl->getDeclContext()->getSelfClassDecl()) {
+    if (auto declGenericCtx = decl->getAsGenericContext()) {
+      auto &ctx = decl->getASTContext();
+      auto sig = ctx.getOverrideGenericSignature(parentDecl, decl);
 
-  if (sig && declGenericCtx &&
-      declGenericCtx->getGenericSignature().getCanonicalSignature() !=
-          sig.getCanonicalSignature()) {
-    return false;
+      if (sig &&
+          declGenericCtx->getGenericSignature().getCanonicalSignature() !=
+              sig.getCanonicalSignature()) {
+        return false;
+      }
+    }
   }
 
   // If this is a constructor, let's compare only parameter types.
@@ -613,8 +616,8 @@ static bool hasOverridingDifferentiableAttribute(ValueDecl *derivedDecl,
           .getAttributes<DifferentiableAttr, /*AllowInvalid*/ true>();
   auto baseDAs = baseAFD->getAttrs().getAttributes<DifferentiableAttr>();
 
-  // Make sure all the `@differentiable` attributes in `baseDecl` are
-  // also declared in `derivedDecl`.
+  // Make sure all the `@differentiable` attributes on `baseDecl` are
+  // also declared on `derivedDecl`.
   bool diagnosed = false;
   for (auto *baseDA : baseDAs) {
     auto baseParameters = baseDA->getParameterIndices();
@@ -640,21 +643,26 @@ static bool hasOverridingDifferentiableAttribute(ValueDecl *derivedDecl,
     if (defined)
       continue;
     diagnosed = true;
-    // Omit printing wrt clause if attribute differentiation parameters match
-    // inferred differentiation parameters.
+    // Emit an error and fix-it showing the missing base declaration's
+    // `@differentiable` attribute.
+    // Omit printing `wrt:` clause if attribute's differentiability parameters
+    // match inferred differentiability parameters.
     auto *inferredParameters =
         TypeChecker::inferDifferentiabilityParameters(derivedAFD, nullptr);
     bool omitWrtClause =
         !baseParameters ||
         baseParameters->getNumIndices() == inferredParameters->getNumIndices();
     // Get `@differentiable` attribute description.
-    std::string baseDAString;
-    llvm::raw_string_ostream stream(baseDAString);
-    baseDA->print(stream, derivedDecl, omitWrtClause,
+    std::string baseDiffAttrString;
+    llvm::raw_string_ostream os(baseDiffAttrString);
+    baseDA->print(os, derivedDecl, omitWrtClause,
                   /*omitDerivativeFunctions*/ true);
-    diags.diagnose(derivedDecl,
-                   diag::overriding_decl_missing_differentiable_attr,
-                   StringRef(stream.str()).trim());
+    os.flush();
+    diags
+        .diagnose(derivedDecl,
+                  diag::overriding_decl_missing_differentiable_attr,
+                  baseDiffAttrString)
+        .fixItInsert(derivedDecl->getStartLoc(), baseDiffAttrString + ' ');
     diags.diagnose(baseDecl, diag::overridden_here);
   }
   // If a diagnostic was produced, return false.
@@ -683,9 +691,6 @@ static bool hasOverridingDifferentiableAttribute(ValueDecl *derivedDecl,
           derivedParameters->isSubsetOf(baseParameters)) {
         overrides = false;
         break;
-      }
-      if (!derivedParameters && !baseParameters) {
-        assert(false);
       }
     }
     if (overrides)
@@ -1058,21 +1063,23 @@ bool OverrideMatcher::checkOverride(ValueDecl *baseDecl,
     emittedMatchError = true;
   }
 
-  auto baseGenericCtx = baseDecl->getAsGenericContext();
-  auto derivedGenericCtx = decl->getAsGenericContext();
+  if (isClassOverride()) {
+    auto baseGenericCtx = baseDecl->getAsGenericContext();
+    auto derivedGenericCtx = decl->getAsGenericContext();
 
-  using Direction = ASTContext::OverrideGenericSignatureReqCheck;
-  if (baseGenericCtx && derivedGenericCtx) {
-    if (!ctx.overrideGenericSignatureReqsSatisfied(
-            baseDecl, decl, Direction::DerivedReqSatisfiedByBase)) {
-      auto newSig = ctx.getOverrideGenericSignature(baseDecl, decl);
-      diags.diagnose(decl, diag::override_method_different_generic_sig,
-                     decl->getBaseName(),
-                     derivedGenericCtx->getGenericSignature()->getAsString(),
-                     baseGenericCtx->getGenericSignature()->getAsString(),
-                     newSig->getAsString());
-      diags.diagnose(baseDecl, diag::overridden_here);
-      emittedMatchError = true;
+    using Direction = ASTContext::OverrideGenericSignatureReqCheck;
+    if (baseGenericCtx && derivedGenericCtx) {
+      if (!ctx.overrideGenericSignatureReqsSatisfied(
+              baseDecl, decl, Direction::DerivedReqSatisfiedByBase)) {
+        auto newSig = ctx.getOverrideGenericSignature(baseDecl, decl);
+        diags.diagnose(decl, diag::override_method_different_generic_sig,
+                       decl->getBaseName(),
+                       derivedGenericCtx->getGenericSignature()->getAsString(),
+                       baseGenericCtx->getGenericSignature()->getAsString(),
+                       newSig->getAsString());
+        diags.diagnose(baseDecl, diag::overridden_here);
+        emittedMatchError = true;
+      }
     }
   }
 
@@ -1152,7 +1159,8 @@ bool OverrideMatcher::checkOverride(ValueDecl *baseDecl,
     // Otherwise, if this is a subscript, validate that covariance is ok.
     // If the parent is non-mutable, it's okay to be covariant.
     auto parentSubscript = cast<SubscriptDecl>(baseDecl);
-    if (parentSubscript->supportsMutation()) {
+    if (parentSubscript->supportsMutation() &&
+        attempt != OverrideCheckingAttempt::MismatchedTypes) {
       diags.diagnose(subscript, diag::override_mutable_covariant_subscript,
                      declTy, baseTy);
       diags.diagnose(baseDecl, diag::subscript_override_here);
@@ -1429,6 +1437,8 @@ namespace  {
     UNINTERESTING_ATTR(Convenience)
     UNINTERESTING_ATTR(Semantics)
     UNINTERESTING_ATTR(SetterAccess)
+    UNINTERESTING_ATTR(TypeEraser)
+    UNINTERESTING_ATTR(SPIAccessControl)
     UNINTERESTING_ATTR(HasStorage)
     UNINTERESTING_ATTR(UIApplicationMain)
     UNINTERESTING_ATTR(UsableFromInline)
@@ -1857,16 +1867,6 @@ static bool checkSingleOverride(ValueDecl *override, ValueDecl *base) {
 
   if (!ctx.LangOpts.DisableAvailabilityChecking) {
     diagnoseOverrideForAvailability(override, base);
-  }
-
-  // Overrides of NSObject.hashValue are deprecated; one should override
-  // NSObject.hash instead.
-  // FIXME: Remove this when NSObject.hashValue becomes non-open in
-  // swift-corelibs-foundation.
-  if (isNSObjectHashValue(base) &&
-      base->hasOpenAccess(override->getDeclContext())) {
-    override->diagnose(diag::override_nsobject_hashvalue_warning)
-      .fixItReplace(SourceRange(override->getNameLoc()), "hash");
   }
 
   /// Check attributes associated with the base; some may need to merged with

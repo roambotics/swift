@@ -1755,7 +1755,7 @@ public:
   void cacheResult(Witness value) const;
 };
 
-enum class FunctionBuilderClosurePreCheck : uint8_t {
+enum class FunctionBuilderBodyPreCheck : uint8_t {
   /// There were no problems pre-checking the closure.
   Okay,
 
@@ -1768,7 +1768,7 @@ enum class FunctionBuilderClosurePreCheck : uint8_t {
 
 class PreCheckFunctionBuilderRequest
     : public SimpleRequest<PreCheckFunctionBuilderRequest,
-                           FunctionBuilderClosurePreCheck(AnyFunctionRef),
+                           FunctionBuilderBodyPreCheck(AnyFunctionRef),
                            CacheKind::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -1777,7 +1777,7 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  llvm::Expected<FunctionBuilderClosurePreCheck>
+  llvm::Expected<FunctionBuilderBodyPreCheck>
   evaluate(Evaluator &evaluator, AnyFunctionRef fn) const;
 
 public:
@@ -1959,8 +1959,7 @@ public:
 
 class TypeCheckSourceFileRequest :
     public SimpleRequest<TypeCheckSourceFileRequest,
-                         bool (SourceFile *, unsigned),
-                         CacheKind::SeparatelyCached> {
+                         bool (SourceFile *), CacheKind::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -1968,8 +1967,7 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  llvm::Expected<bool> evaluate(Evaluator &evaluator,
-                                SourceFile *SF, unsigned StartElem) const;
+  llvm::Expected<bool> evaluate(Evaluator &evaluator, SourceFile *SF) const;
 
 public:
   // Separate caching.
@@ -2056,6 +2054,51 @@ public:
   void cacheResult(IndexSubset *value) const;
 };
 
+/// Checks whether a type eraser has a viable initializer.
+class TypeEraserHasViableInitRequest
+    : public SimpleRequest<TypeEraserHasViableInitRequest,
+                           bool(TypeEraserAttr *, ProtocolDecl *),
+                           CacheKind::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation
+  llvm::Expected<bool> evaluate(Evaluator &evaluator, TypeEraserAttr *attr,
+                                ProtocolDecl *protocol) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
+/// Looks up the decls that a scoped import references, ensuring the import is
+/// valid.
+///
+/// A "scoped import" is an import which only covers one particular
+/// declaration, such as:
+///
+///     import class Foundation.NSString
+///
+class ScopedImportLookupRequest
+    : public SimpleRequest<ScopedImportLookupRequest,
+                           ArrayRef<ValueDecl *>(ImportDecl *),
+                           CacheKind::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  llvm::Expected<ArrayRef<ValueDecl *>> evaluate(Evaluator &evaluator,
+                                                 ImportDecl *import) const;
+
+public:
+  // Cached.
+  bool isCached() const { return true; }
+};
+
 // Allow AnyValue to compare two Type values, even though Type doesn't
 // support ==.
 template<>
@@ -2078,7 +2121,7 @@ AnyValue::Holder<GenericSignature>::equals(const HolderBase &other) const {
 void simple_display(llvm::raw_ostream &out, Type value);
 void simple_display(llvm::raw_ostream &out, const TypeRepr *TyR);
 void simple_display(llvm::raw_ostream &out, ImplicitMemberAction action);
-void simple_display(llvm::raw_ostream &out, FunctionBuilderClosurePreCheck pck);
+void simple_display(llvm::raw_ostream &out, FunctionBuilderBodyPreCheck pck);
 
 #define SWIFT_TYPEID_ZONE TypeChecker
 #define SWIFT_TYPEID_HEADER "swift/AST/TypeCheckerTypeIDZone.def"

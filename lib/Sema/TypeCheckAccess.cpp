@@ -18,6 +18,7 @@
 #include "TypeAccessScopeChecker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Pattern.h"
@@ -37,6 +38,15 @@ namespace {
 ///
 /// \see checkTypeAccess
 enum class DowngradeToWarning: bool {
+  No,
+  Yes
+};
+
+/// A uniquely-typed boolean to reduce the chances of accidentally inverting
+/// a check.
+///
+/// \see checkTypeAccessImpl
+enum class FromSPI: bool {
   No,
   Yes
 };
@@ -77,7 +87,7 @@ protected:
 
   void checkTypeAccessImpl(
       Type type, TypeRepr *typeRepr, AccessScope contextAccessScope,
-      const DeclContext *useDC, bool mayBeInferred,
+      const DeclContext *useDC, bool mayBeInferred, FromSPI fromSPI,
       llvm::function_ref<CheckTypeAccessCallback> diagnose);
 
   void checkTypeAccess(
@@ -99,7 +109,7 @@ protected:
       llvm::function_ref<CheckTypeAccessCallback> diagnose) {
     forAllRequirementTypes(std::move(source), [&](Type type, TypeRepr *typeRepr) {
       checkTypeAccessImpl(type, typeRepr, accessScope, useDC,
-                          /*mayBeInferred*/false, diagnose);
+                          /*mayBeInferred*/false, FromSPI::No, diagnose);
     });
   }
 
@@ -188,10 +198,17 @@ public:
 /// using `Array` to mean `Array<Element>` in an extension of Array.) If
 /// \p typeRepr is known to be absent, it's okay to pass \c false for
 /// \p mayBeInferred.
+///
+/// If searching from an SPI context, pass \c FromSPI::YES for \p fromSPI.
+/// In this mode, all types must be public and diagnostic messages are adapted.
 void AccessControlCheckerBase::checkTypeAccessImpl(
     Type type, TypeRepr *typeRepr, AccessScope contextAccessScope,
-    const DeclContext *useDC, bool mayBeInferred,
+    const DeclContext *useDC, bool mayBeInferred, FromSPI fromSPI,
     llvm::function_ref<CheckTypeAccessCallback> diagnose) {
+
+  if (fromSPI == FromSPI::Yes)
+    contextAccessScope = AccessScope::getPublic();
+
   auto &Context = useDC->getASTContext();
   if (Context.isAccessControlDisabled())
     return;
@@ -266,6 +283,17 @@ void AccessControlCheckerBase::checkTypeAccessImpl(
 
   const TypeRepr *complainRepr = TypeAccessScopeDiagnoser::findTypeWithScope(
       typeRepr, problematicAccessScope, useDC, checkUsableFromInline);
+
+  if (fromSPI == FromSPI::Yes) {
+    // If in SPI mode, don't report SPI use from within the same module.
+    if (auto CITR = dyn_cast<ComponentIdentTypeRepr>(complainRepr)) {
+      const ValueDecl *VD = CITR->getBoundDecl();
+      if (useDC->getParentModule() == VD->getModuleContext() &&
+          VD->getAttrs().hasAttribute<SPIAccessControlAttr>())
+        return;
+    }
+  }
+
   diagnose(problematicAccessScope, complainRepr, downgradeToWarning);
 }
 
@@ -289,9 +317,12 @@ void AccessControlCheckerBase::checkTypeAccess(
   const DeclContext *DC = context->getDeclContext();
   AccessScope contextAccessScope =
     context->getFormalAccessScope(
-      nullptr, checkUsableFromInline);
+      context->getDeclContext(), checkUsableFromInline);
+
+  auto fromSPI = static_cast<FromSPI>(
+      context->getAttrs().hasAttribute<SPIAccessControlAttr>());
   checkTypeAccessImpl(type, typeRepr, contextAccessScope, DC, mayBeInferred,
-                      diagnose);
+                      fromSPI, diagnose);
 }
 
 /// Highlights the given TypeRepr, and adds a note pointing to the type's
@@ -350,6 +381,8 @@ void AccessControlCheckerBase::checkGenericParamAccess(
   };
 
   auto *DC = ownerDecl->getDeclContext();
+  auto fromSPI = static_cast<FromSPI>(
+     ownerDecl->getAttrs().hasAttribute<SPIAccessControlAttr>());
 
   for (auto param : *params) {
     if (param->getInherited().empty())
@@ -357,7 +390,8 @@ void AccessControlCheckerBase::checkGenericParamAccess(
     assert(param->getInherited().size() == 1);
     checkTypeAccessImpl(param->getInherited().front().getType(),
                         param->getInherited().front().getTypeRepr(),
-                        accessScope, DC, /*mayBeInferred*/false, callback);
+                        accessScope, DC, /*mayBeInferred*/false,
+                        fromSPI, callback);
   }
   callbackACEK = ACEK::Requirement;
 
@@ -956,16 +990,31 @@ public:
       bool isExplicit =
         fn->getAttrs().hasAttribute<AccessControlAttr>() ||
         isa<ProtocolDecl>(fn->getDeclContext());
-      auto diagID = diag::function_type_access;
-      if (downgradeToWarning == DowngradeToWarning::Yes)
-        diagID = diag::function_type_access_warn;
       auto fnAccess = isExplicit
         ? fn->getFormalAccess()
         : minAccessScope.requiredAccessForDiagnostics();
-      auto diag = fn->diagnose(diagID, isExplicit, fnAccess,
-                               isa<FileUnit>(fn->getDeclContext()), minAccess,
-                               functionKind, problemIsResult);
-      highlightOffendingType(diag, complainRepr);
+
+      // Report as an SPI problem if the type is at least as public as the decl.
+      AccessScope contextAccessScope =
+        fn->getFormalAccessScope(fn->getDeclContext(), checkUsableFromInline);
+      auto restrictedBySPI = !minAccessScope.isChildOf(contextAccessScope);
+      assert((!restrictedBySPI ||
+              fn->getAttrs().hasAttribute<SPIAccessControlAttr>()) &&
+             "There should be SPI attributes on this decl");
+
+      if (restrictedBySPI) {
+        auto diag = fn->diagnose(diag::function_type_spi, functionKind,
+                                 problemIsResult, minAccess);
+        highlightOffendingType(diag, complainRepr);
+      } else {
+        auto diagID = diag::function_type_access;
+        if (downgradeToWarning == DowngradeToWarning::Yes)
+          diagID = diag::function_type_access_warn;
+        auto diag = fn->diagnose(diagID, isExplicit, fnAccess,
+                                 isa<FileUnit>(fn->getDeclContext()), minAccess,
+                                 functionKind, problemIsResult);
+        highlightOffendingType(diag, complainRepr);
+      }
     }
   }
 
@@ -1445,15 +1494,11 @@ public:
 };
 
 class ExportabilityChecker : public DeclVisitor<ExportabilityChecker> {
-  using CheckExportabilityTypeCallback =
-      llvm::function_ref<void(const TypeDecl *, const TypeRepr *)>;
-  using CheckExportabilityConformanceCallback =
-      llvm::function_ref<void(const ProtocolConformance *)>;
+  class Diagnoser;
 
   void checkTypeImpl(
       Type type, const TypeRepr *typeRepr, const SourceFile &SF,
-      CheckExportabilityTypeCallback diagnoseType,
-      CheckExportabilityConformanceCallback diagnoseConformance) {
+      const Diagnoser &diagnoser) {
     // Don't bother checking errors.
     if (type && type->hasError())
       return;
@@ -1466,10 +1511,12 @@ class ExportabilityChecker : public DeclVisitor<ExportabilityChecker> {
       const_cast<TypeRepr *>(typeRepr)->walk(TypeReprIdentFinder(
           [&](const ComponentIdentTypeRepr *component) {
         ModuleDecl *M = component->getBoundDecl()->getModuleContext();
-        if (!SF.isImportedImplementationOnly(M))
+        if (!SF.isImportedImplementationOnly(M) &&
+            !SF.isImportedAsSPI(component->getBoundDecl()))
           return true;
 
-        diagnoseType(component->getBoundDecl(), component);
+        diagnoser.diagnoseType(component->getBoundDecl(), component,
+                               SF.isImportedImplementationOnly(M));
         foundAnyIssues = true;
         // We still continue even in the diagnostic case to report multiple
         // violations.
@@ -1488,22 +1535,19 @@ class ExportabilityChecker : public DeclVisitor<ExportabilityChecker> {
 
     class ProblematicTypeFinder : public TypeDeclFinder {
       const SourceFile &SF;
-      CheckExportabilityTypeCallback diagnoseType;
-      CheckExportabilityConformanceCallback diagnoseConformance;
+      const Diagnoser &diagnoser;
     public:
-      ProblematicTypeFinder(
-          const SourceFile &SF,
-          CheckExportabilityTypeCallback diagnoseType,
-          CheckExportabilityConformanceCallback diagnoseConformance)
-        : SF(SF), diagnoseType(diagnoseType),
-          diagnoseConformance(diagnoseConformance) {}
+      ProblematicTypeFinder(const SourceFile &SF, const Diagnoser &diagnoser)
+        : SF(SF), diagnoser(diagnoser) {}
 
       void visitTypeDecl(const TypeDecl *typeDecl) {
         ModuleDecl *M = typeDecl->getModuleContext();
-        if (!SF.isImportedImplementationOnly(M))
+        if (!SF.isImportedImplementationOnly(M) &&
+            !SF.isImportedAsSPI(typeDecl))
           return;
 
-        diagnoseType(typeDecl, /*typeRepr*/nullptr);
+        diagnoser.diagnoseType(typeDecl, /*typeRepr*/nullptr,
+                               SF.isImportedImplementationOnly(M));
       }
 
       void visitSubstitutionMap(SubstitutionMap subs) {
@@ -1521,7 +1565,7 @@ class ExportabilityChecker : public DeclVisitor<ExportabilityChecker> {
           ModuleDecl *M = rootConf->getDeclContext()->getParentModule();
           if (!SF.isImportedImplementationOnly(M))
             continue;
-          diagnoseConformance(rootConf);
+          diagnoser.diagnoseConformance(rootConf);
         }
       }
 
@@ -1543,27 +1587,40 @@ class ExportabilityChecker : public DeclVisitor<ExportabilityChecker> {
         visitSubstitutionMap(ty->getSubstitutionMap());
         return Action::Continue;
       }
+
+      // We diagnose unserializable Clang function types in the
+      // post-visitor so that we diagnose any unexportable component
+      // types first.
+      Action walkToTypePost(Type T) override {
+        if (auto fnType = T->getAs<AnyFunctionType>()) {
+          if (auto clangType = fnType->getClangFunctionType()) {
+            auto loader = T->getASTContext().getClangModuleLoader();
+            // Serialization will serialize the sugared type if it can,
+            // but we need the canonical type to be serializable or else
+            // canonicalization (e.g. in SIL) might break things.
+            if (!loader->isSerializable(clangType, /*check canonical*/ true)) {
+              diagnoser.diagnoseClangFunctionType(T, clangType);
+            }
+          }
+        }
+        return TypeDeclFinder::walkToTypePost(T);
+      }
     };
 
-    type.walk(ProblematicTypeFinder(SF, diagnoseType, diagnoseConformance));
+    type.walk(ProblematicTypeFinder(SF, diagnoser));
   }
 
   void checkType(
       Type type, const TypeRepr *typeRepr, const Decl *context,
-      CheckExportabilityTypeCallback diagnoseType,
-      CheckExportabilityConformanceCallback diagnoseConformance) {
+      const Diagnoser &diagnoser) {
     auto *SF = context->getDeclContext()->getParentSourceFile();
     assert(SF && "checking a non-source declaration?");
-    return checkTypeImpl(type, typeRepr, *SF, diagnoseType,
-                         diagnoseConformance);
+    return checkTypeImpl(type, typeRepr, *SF, diagnoser);
   }
 
   void checkType(
-      const TypeLoc &TL, const Decl *context,
-      CheckExportabilityTypeCallback diagnoseType,
-      CheckExportabilityConformanceCallback diagnoseConformance) {
-    checkType(TL.getType(), TL.getTypeRepr(), context, diagnoseType,
-              diagnoseConformance);
+      const TypeLoc &TL, const Decl *context, const Diagnoser &diagnoser) {
+    checkType(TL.getType(), TL.getTypeRepr(), context, diagnoser);
   }
 
   void checkGenericParams(const GenericContext *ownerCtx,
@@ -1577,64 +1634,65 @@ class ExportabilityChecker : public DeclVisitor<ExportabilityChecker> {
         continue;
       assert(param->getInherited().size() == 1);
       checkType(param->getInherited().front(), ownerDecl,
-                getDiagnoseCallback(ownerDecl),
-                getDiagnoseCallback(ownerDecl));
+                getDiagnoser(ownerDecl));
     }
 
     forAllRequirementTypes(WhereClauseOwner(
                              const_cast<GenericContext *>(ownerCtx)),
                            [&](Type type, TypeRepr *typeRepr) {
-      checkType(type, typeRepr, ownerDecl, getDiagnoseCallback(ownerDecl),
-                getDiagnoseCallback(ownerDecl));
+      checkType(type, typeRepr, ownerDecl, getDiagnoser(ownerDecl));
     });
   }
 
-  // This enum must be kept in sync with
-  // diag::decl_from_implementation_only_module and
+  // These enums must be kept in sync with
+  // diag::decl_from_hidden_module and
   // diag::conformance_from_implementation_only_module.
   enum class Reason : unsigned {
     General,
     ExtensionWithPublicMembers,
     ExtensionWithConditionalConformances
   };
+  enum class HiddenImportKind : uint8_t {
+    ImplementationOnly,
+    SPI
+  };
 
-  class DiagnoseGenerically {
+  class Diagnoser {
     const Decl *D;
     Reason reason;
   public:
-    DiagnoseGenerically(const Decl *D, Reason reason) : D(D), reason(reason) {}
+    Diagnoser(const Decl *D, Reason reason) : D(D), reason(reason) {}
 
-    void operator()(const TypeDecl *offendingType,
-                    const TypeRepr *complainRepr) {
+    void diagnoseType(const TypeDecl *offendingType,
+                      const TypeRepr *complainRepr,
+                      bool isImplementationOnly) const {
       ModuleDecl *M = offendingType->getModuleContext();
-      auto diag = D->diagnose(diag::decl_from_implementation_only_module,
+      HiddenImportKind importKind = isImplementationOnly?
+                                HiddenImportKind::ImplementationOnly:
+                                HiddenImportKind::SPI;
+      auto diag = D->diagnose(diag::decl_from_hidden_module,
                               offendingType->getDescriptiveKind(),
                               offendingType->getFullName(),
-                              static_cast<unsigned>(reason), M->getName());
+                              static_cast<unsigned>(reason), M->getName(),
+                              static_cast<unsigned>(importKind));
       highlightOffendingType(diag, complainRepr);
     }
 
-    void operator()(const ProtocolConformance *offendingConformance) {
+    void diagnoseConformance(const ProtocolConformance *offendingConformance) const {
       ModuleDecl *M = offendingConformance->getDeclContext()->getParentModule();
       D->diagnose(diag::conformance_from_implementation_only_module,
                   offendingConformance->getType(),
                   offendingConformance->getProtocol()->getFullName(),
                   static_cast<unsigned>(reason), M->getName());
     }
+
+    void diagnoseClangFunctionType(Type fnType, const clang::Type *type) const {
+      D->diagnose(diag::unexportable_clang_function_type, fnType);
+    }
   };
 
-  static_assert(
-      std::is_convertible<DiagnoseGenerically,
-                          CheckExportabilityTypeCallback>::value,
-      "DiagnoseGenerically has wrong call signature");
-  static_assert(
-      std::is_convertible<DiagnoseGenerically,
-                          CheckExportabilityConformanceCallback>::value,
-      "DiagnoseGenerically has wrong call signature for conformance diags");
-
-  DiagnoseGenerically getDiagnoseCallback(const Decl *D,
-                                          Reason reason = Reason::General) {
-    return DiagnoseGenerically(D, reason);
+  Diagnoser getDiagnoser(const Decl *D, Reason reason = Reason::General) {
+    return Diagnoser(D, reason);
   }
 
 public:
@@ -1768,7 +1826,7 @@ public:
       return;
 
     checkType(theVar->getInterfaceType(), /*typeRepr*/nullptr, theVar,
-              getDiagnoseCallback(theVar), getDiagnoseCallback(theVar));
+              getDiagnoser(theVar));
   }
 
   /// \see visitPatternBindingDecl
@@ -1787,8 +1845,7 @@ public:
     if (shouldSkipChecking(anyVar))
       return;
 
-    checkType(TP->getTypeLoc(), anyVar, getDiagnoseCallback(anyVar),
-              getDiagnoseCallback(anyVar));
+    checkType(TP->getTypeLoc(), anyVar, getDiagnoser(anyVar));
   }
 
   void visitPatternBindingDecl(PatternBindingDecl *PBD) {
@@ -1812,25 +1869,22 @@ public:
   void visitTypeAliasDecl(TypeAliasDecl *TAD) {
     checkGenericParams(TAD, TAD);
     checkType(TAD->getUnderlyingType(),
-              TAD->getUnderlyingTypeRepr(), TAD, getDiagnoseCallback(TAD),
-              getDiagnoseCallback(TAD));
+              TAD->getUnderlyingTypeRepr(), TAD, getDiagnoser(TAD));
   }
 
   void visitAssociatedTypeDecl(AssociatedTypeDecl *assocType) {
     llvm::for_each(assocType->getInherited(),
                    [&](TypeLoc requirement) {
-      checkType(requirement, assocType, getDiagnoseCallback(assocType),
-                getDiagnoseCallback(assocType));
+      checkType(requirement, assocType, getDiagnoser(assocType));
     });
     checkType(assocType->getDefaultDefinitionType(),
               assocType->getDefaultDefinitionTypeRepr(), assocType,
-              getDiagnoseCallback(assocType), getDiagnoseCallback(assocType));
+              getDiagnoser(assocType));
 
     if (assocType->getTrailingWhereClause()) {
       forAllRequirementTypes(assocType,
                              [&](Type type, TypeRepr *typeRepr) {
-        checkType(type, typeRepr, assocType, getDiagnoseCallback(assocType),
-                  getDiagnoseCallback(assocType));
+        checkType(type, typeRepr, assocType, getDiagnoser(assocType));
       });
     }
   }
@@ -1840,22 +1894,19 @@ public:
 
     llvm::for_each(nominal->getInherited(),
                    [&](TypeLoc nextInherited) {
-      checkType(nextInherited, nominal, getDiagnoseCallback(nominal),
-                getDiagnoseCallback(nominal));
+      checkType(nextInherited, nominal, getDiagnoser(nominal));
     });
   }
 
   void visitProtocolDecl(ProtocolDecl *proto) {
     llvm::for_each(proto->getInherited(),
                   [&](TypeLoc requirement) {
-      checkType(requirement, proto, getDiagnoseCallback(proto),
-                getDiagnoseCallback(proto));
+      checkType(requirement, proto, getDiagnoser(proto));
     });
 
     if (proto->getTrailingWhereClause()) {
       forAllRequirementTypes(proto, [&](Type type, TypeRepr *typeRepr) {
-        checkType(type, typeRepr, proto, getDiagnoseCallback(proto),
-                  getDiagnoseCallback(proto));
+        checkType(type, typeRepr, proto, getDiagnoser(proto));
       });
     }
   }
@@ -1865,10 +1916,9 @@ public:
 
     for (auto &P : *SD->getIndices()) {
       checkType(P->getInterfaceType(), P->getTypeRepr(), SD,
-                getDiagnoseCallback(SD), getDiagnoseCallback(SD));
+                getDiagnoser(SD));
     }
-    checkType(SD->getElementTypeLoc(), SD, getDiagnoseCallback(SD),
-              getDiagnoseCallback(SD));
+    checkType(SD->getElementTypeLoc(), SD, getDiagnoser(SD));
   }
 
   void visitAbstractFunctionDecl(AbstractFunctionDecl *fn) {
@@ -1876,13 +1926,12 @@ public:
 
     for (auto *P : *fn->getParameters())
       checkType(P->getInterfaceType(), P->getTypeRepr(), fn,
-                getDiagnoseCallback(fn), getDiagnoseCallback(fn));
+                getDiagnoser(fn));
   }
 
   void visitFuncDecl(FuncDecl *FD) {
     visitAbstractFunctionDecl(FD);
-    checkType(FD->getBodyResultTypeLoc(), FD, getDiagnoseCallback(FD),
-              getDiagnoseCallback(FD));
+    checkType(FD->getBodyResultTypeLoc(), FD, getDiagnoser(FD));
   }
 
   void visitEnumElementDecl(EnumElementDecl *EED) {
@@ -1890,7 +1939,7 @@ public:
       return;
     for (auto &P : *EED->getParameterList())
       checkType(P->getInterfaceType(), P->getTypeRepr(), EED,
-                getDiagnoseCallback(EED), getDiagnoseCallback(EED));
+                getDiagnoser(EED));
   }
 
   void checkConstrainedExtensionRequirements(ExtensionDecl *ED,
@@ -1898,8 +1947,7 @@ public:
     if (!ED->getTrailingWhereClause())
       return;
     forAllRequirementTypes(ED, [&](Type type, TypeRepr *typeRepr) {
-      checkType(type, typeRepr, ED, getDiagnoseCallback(ED, reason),
-                getDiagnoseCallback(ED, reason));
+      checkType(type, typeRepr, ED, getDiagnoser(ED, reason));
     });
   }
 
@@ -1913,8 +1961,7 @@ public:
     // but just hide that from interfaces.
     llvm::for_each(ED->getInherited(),
                    [&](TypeLoc nextInherited) {
-      checkType(nextInherited, ED, getDiagnoseCallback(ED),
-                getDiagnoseCallback(ED));
+      checkType(nextInherited, ED, getDiagnoser(ED));
     });
 
     bool hasPublicMembers = llvm::any_of(ED->getMembers(),
@@ -1927,8 +1974,7 @@ public:
 
     if (hasPublicMembers) {
       checkType(ED->getExtendedType(),  ED->getExtendedTypeRepr(), ED,
-                getDiagnoseCallback(ED, Reason::ExtensionWithPublicMembers),
-                getDiagnoseCallback(ED, Reason::ExtensionWithPublicMembers));
+                getDiagnoser(ED, Reason::ExtensionWithPublicMembers));
     }
 
     if (hasPublicMembers || !ED->getInherited().empty()) {
@@ -1949,9 +1995,11 @@ public:
 
     auto &DE = PGD->getASTContext().Diags;
     auto diag =
-        DE.diagnose(diagLoc, diag::decl_from_implementation_only_module,
+        DE.diagnose(diagLoc, diag::decl_from_hidden_module,
                     PGD->getDescriptiveKind(), PGD->getName(),
-                    static_cast<unsigned>(Reason::General), M->getName());
+                    static_cast<unsigned>(Reason::General), M->getName(),
+                    static_cast<unsigned>(HiddenImportKind::ImplementationOnly)
+                    );
     if (refRange.isValid())
       diag.highlight(refRange);
     diag.flush();

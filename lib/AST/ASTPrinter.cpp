@@ -100,7 +100,8 @@ static bool contributesToParentTypeStorage(const AbstractStorageDecl *ASD) {
 }
 
 PrintOptions PrintOptions::printSwiftInterfaceFile(bool preferTypeRepr,
-                                                   bool printFullConvention) {
+                                                   bool printFullConvention,
+                                                   bool printSPIs) {
   PrintOptions result;
   result.PrintLongAttrsOnSeparateLines = true;
   result.TypeDefinitions = true;
@@ -120,6 +121,7 @@ PrintOptions PrintOptions::printSwiftInterfaceFile(bool preferTypeRepr,
   if (printFullConvention)
     result.PrintFunctionRepresentationAttrs =
       PrintOptions::FunctionRepresentationMode::Full;
+  result.PrintSPIs = printSPIs;
 
   // We should print __consuming, __owned, etc for the module interface file.
   result.SkipUnderscoredKeywords = false;
@@ -143,7 +145,8 @@ PrintOptions PrintOptions::printSwiftInterfaceFile(bool preferTypeRepr,
       if (D->getAttrs().hasAttribute<ImplementationOnlyAttr>())
         return false;
 
-      // Skip anything that isn't 'public' or '@usableFromInline'.
+      // Skip anything that isn't 'public' or '@usableFromInline',
+      // or SPI if desired.
       if (auto *VD = dyn_cast<ValueDecl>(D)) {
         if (!isPublicOrUsableFromInline(VD)) {
           // We do want to print private stored properties, without their
@@ -151,6 +154,12 @@ PrintOptions PrintOptions::printSwiftInterfaceFile(bool preferTypeRepr,
           if (auto *ASD = dyn_cast<AbstractStorageDecl>(VD))
             if (contributesToParentTypeStorage(ASD))
               return true;
+
+          // Always print SPI decls if `PrintSPIs`.
+          if (options.PrintSPIs &&
+              VD->getAttrs().hasAttribute<SPIAccessControlAttr>())
+            return true;
+
           return false;
         }
       }
@@ -3529,24 +3538,7 @@ class TypePrinter : public TypeVisitor<TypePrinter> {
       return;
     }
 
-    bool isSimple = T->hasSimpleTypeRepr();
-    if (!isSimple && T->is<OpaqueTypeArchetypeType>()) {
-      auto opaqueTy = T->castTo<OpaqueTypeArchetypeType>();
-      switch (Options.OpaqueReturnTypePrinting) {
-      case PrintOptions::OpaqueReturnTypePrintingMode::StableReference:
-      case PrintOptions::OpaqueReturnTypePrintingMode::Description:
-        isSimple = true;
-        break;
-      case PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword:
-        isSimple = false;
-        break;
-      case PrintOptions::OpaqueReturnTypePrintingMode::WithoutOpaqueKeyword: {
-        isSimple = opaqueTy->getExistentialType()->hasSimpleTypeRepr();
-        break;
-      }
-      }
-    }
-
+    bool isSimple = isSimpleUnderPrintOptions(T);
     if (isSimple) {
       visit(T);
     } else {
@@ -3554,6 +3546,28 @@ class TypePrinter : public TypeVisitor<TypePrinter> {
       visit(T);
       Printer << ")";
     }
+  }
+
+  /// Determinee whether the given type has a simple representation
+  /// under the current print options.
+  bool isSimpleUnderPrintOptions(Type T) {
+    if (auto typealias = dyn_cast<TypeAliasType>(T.getPointer())) {
+      if (shouldDesugarTypeAliasType(typealias))
+        return isSimpleUnderPrintOptions(typealias->getSinglyDesugaredType());
+    } else if (auto opaque =
+                 dyn_cast<OpaqueTypeArchetypeType>(T.getPointer())) {
+      switch (Options.OpaqueReturnTypePrinting) {
+      case PrintOptions::OpaqueReturnTypePrintingMode::StableReference:
+      case PrintOptions::OpaqueReturnTypePrintingMode::Description:
+        return true;
+      case PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword:
+        return false;
+      case PrintOptions::OpaqueReturnTypePrintingMode::WithoutOpaqueKeyword:
+        return isSimpleUnderPrintOptions(opaque->getExistentialType());
+      }
+      llvm_unreachable("bad opaque-return-type printing mode");
+    }
+    return T->hasSimpleTypeRepr();
   }
 
   template <typename T>
@@ -3693,8 +3707,12 @@ public:
     Printer << BUILTIN_TYPE_NAME_SILTOKEN;
   }
 
+  bool shouldDesugarTypeAliasType(TypeAliasType *T) {
+    return Options.PrintForSIL || Options.PrintTypeAliasUnderlyingType;
+  }
+
   void visitTypeAliasType(TypeAliasType *T) {
-    if (Options.PrintForSIL || Options.PrintTypeAliasUnderlyingType) {
+    if (shouldDesugarTypeAliasType(T)) {
       visit(T->getSinglyDesugaredType());
       return;
     }
@@ -4527,6 +4545,14 @@ void LayoutConstraintInfo::print(ASTPrinter &Printer,
     break;
   }
 }
+  
+void LayoutConstraint::dump() const {
+  if (!*this) {
+    llvm::errs() << "(null)\n";
+    return;
+  }
+  getPointer()->print(llvm::errs());
+}
 
 void GenericSignatureImpl::print(raw_ostream &OS, PrintOptions PO) const {
   GenericSignature(const_cast<GenericSignatureImpl *>(this)).print(OS, PO);
@@ -4649,6 +4675,13 @@ void SILParameterInfo::print(raw_ostream &OS, const PrintOptions &Opts) const {
 }
 void SILParameterInfo::print(ASTPrinter &Printer,
                              const PrintOptions &Opts) const {
+  switch (getDifferentiability()) {
+  case SILParameterDifferentiability::NotDifferentiable:
+    Printer << "@noDerivative ";
+    break;
+  default:
+    break;
+  }
   Printer << getStringForParameterConvention(getConvention());
   getInterfaceType().print(Printer, Opts);
 }

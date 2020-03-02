@@ -73,7 +73,14 @@ static void setDefaultPrebuiltCacheIfNecessary(
     return;
 
   SmallString<64> defaultPrebuiltPath{searchPathOpts.RuntimeResourcePath};
-  StringRef platform = getPlatformNameForTriple(triple);
+  StringRef platform;
+  if (tripleIsMacCatalystEnvironment(triple)) {
+    // The prebuilt cache for macCatalyst is the same as the one for macOS, not iOS
+    // or a separate location of its own.
+    platform = "macosx";
+  } else {
+    platform = getPlatformNameForTriple(triple);
+  }
   llvm::sys::path::append(defaultPrebuiltPath, platform, "prebuilt-modules");
   frontendOpts.PrebuiltModuleCachePath = defaultPrebuiltPath.str();
 }
@@ -82,7 +89,11 @@ static void updateRuntimeLibraryPaths(SearchPathOptions &SearchPathOpts,
                                       llvm::Triple &Triple) {
   llvm::SmallString<128> LibPath(SearchPathOpts.RuntimeResourcePath);
 
-  llvm::sys::path::append(LibPath, getPlatformNameForTriple(Triple));
+  StringRef LibSubDir = getPlatformNameForTriple(Triple);
+  if (tripleIsMacCatalystEnvironment(Triple))
+    LibSubDir = "maccatalyst";
+
+  llvm::sys::path::append(LibPath, LibSubDir);
   SearchPathOpts.RuntimeLibraryPaths.clear();
   SearchPathOpts.RuntimeLibraryPaths.push_back(LibPath.str());
   if (Triple.isOSDarwin())
@@ -101,6 +112,13 @@ static void updateRuntimeLibraryPaths(SearchPathOptions &SearchPathOpts,
   SearchPathOpts.RuntimeLibraryImportPaths.push_back(LibPath.str());
 
   if (!SearchPathOpts.SDKPath.empty()) {
+    if (tripleIsMacCatalystEnvironment(Triple)) {
+      LibPath = SearchPathOpts.SDKPath;
+      llvm::sys::path::append(LibPath, "System", "iOSSupport");
+      llvm::sys::path::append(LibPath, "usr", "lib", "swift");
+      SearchPathOpts.RuntimeLibraryImportPaths.push_back(LibPath.str());
+    }
+
     LibPath = SearchPathOpts.SDKPath;
     llvm::sys::path::append(LibPath, "usr", "lib", "swift");
     if (!Triple.isOSDarwin()) {
@@ -410,7 +428,19 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
 
   Opts.EnableFineGrainedDependencies =
       Args.hasFlag(options::OPT_enable_fine_grained_dependencies,
-                   options::OPT_disable_fine_grained_dependencies, false);
+                   options::OPT_disable_fine_grained_dependencies,
+                   Opts.EnableFineGrainedDependencies);
+  Opts.EnableTypeFingerprints =
+      Args.hasFlag(options::OPT_enable_type_fingerprints,
+                   options::OPT_disable_type_fingerprints,
+                   LangOptions().EnableTypeFingerprints);
+
+  if (!Opts.EnableFineGrainedDependencies && Opts.EnableTypeFingerprints) {
+    Diags.diagnose(
+        SourceLoc(),
+        diag::warning_type_fingerprints_require_fine_grained_dependencies);
+    Opts.EnableTypeFingerprints = false;
+  }
 
   if (Args.hasArg(OPT_emit_fine_grained_dependency_sourcefile_dot_files))
     Opts.EmitFineGrainedDependencySourcefileDotFiles = true;
@@ -513,11 +543,20 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableConcisePoundFile =
       Args.hasArg(OPT_enable_experimental_concise_pound_file);
 
+  Opts.EnableCrossImportOverlays =
+      Args.hasFlag(OPT_enable_cross_import_overlays,
+                   OPT_disable_cross_import_overlays,
+                   Opts.EnableCrossImportOverlays);
+
   llvm::Triple Target = Opts.Target;
   StringRef TargetArg;
   if (const Arg *A = Args.getLastArg(OPT_target)) {
     Target = llvm::Triple(A->getValue());
     TargetArg = A->getValue();
+  }
+
+  if (const Arg *A = Args.getLastArg(OPT_target_variant)) {
+    Opts.TargetVariant = llvm::Triple(A->getValue());
   }
 
   Opts.EnableCXXInterop |= Args.hasArg(OPT_enable_cxx_interop);
@@ -936,14 +975,13 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
 
   Opts.EnableARCOptimizations &= !Args.hasArg(OPT_disable_arc_opts);
   Opts.EnableOSSAOptimizations &= !Args.hasArg(OPT_disable_ossa_opts);
+  Opts.EnableSpeculativeDevirtualization |= Args.hasArg(OPT_enable_spec_devirt);
   Opts.DisableSILPerfOptimizations |= Args.hasArg(OPT_disable_sil_perf_optzns);
   Opts.CrossModuleOptimization |= Args.hasArg(OPT_CrossModuleOptimization);
   Opts.VerifyAll |= Args.hasArg(OPT_sil_verify_all);
   Opts.DebugSerialization |= Args.hasArg(OPT_sil_debug_serialization);
   Opts.EmitVerboseSIL |= Args.hasArg(OPT_emit_verbose_sil);
   Opts.EmitSortedSIL |= Args.hasArg(OPT_emit_sorted_sil);
-  Opts.PrintFullConvention |=
-    Args.hasArg(OPT_experimental_print_full_convention);
   Opts.PrintInstCounts |= Args.hasArg(OPT_print_inst_counts);
   if (const Arg *A = Args.getLastArg(OPT_external_pass_pipeline_filename))
     Opts.ExternalPassPipelineFilename = A->getValue();
@@ -1071,6 +1109,9 @@ static bool ParseTBDGenArgs(TBDGenOptions &Opts, ArgList &Args,
   }
   if (const Arg *A = Args.getLastArg(OPT_previous_module_installname_map_file)) {
     Opts.ModuleInstallNameMapPath = A->getValue();
+  }
+  for (auto A : Args.getAllArgValues(OPT_embed_tbd_for_module)) {
+    Opts.embedSymbolsFromModules.push_back(StringRef(A).str());
   }
   return false;
 }
@@ -1223,6 +1264,12 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
   Opts.EnableDynamicReplacementChaining |=
       Args.hasArg(OPT_enable_dynamic_replacement_chaining);
 
+  if (auto A = Args.getLastArg(OPT_enable_type_layouts,
+                               OPT_disable_type_layouts)) {
+    Opts.UseTypeLayoutValueHandling
+      = A->getOption().matches(OPT_enable_type_layouts);
+  }
+
   Opts.UseSwiftCall = Args.hasArg(OPT_enable_swiftcall);
 
   // This is set to true by default.
@@ -1305,7 +1352,8 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
     Opts.DisableLegacyTypeInfo = true;
   }
 
-  if (Args.hasArg(OPT_prespecialize_generic_metadata)) {
+  if (Args.hasArg(OPT_prespecialize_generic_metadata) && 
+      !Args.hasArg(OPT_disable_generic_metadata_prespecialization)) {
     Opts.PrespecializeGenericMetadata = true;
   }
 

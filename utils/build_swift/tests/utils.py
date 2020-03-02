@@ -15,9 +15,11 @@ import platform
 import sys
 import unittest
 
-from six import StringIO
+from build_swift import cache_utils
+from build_swift.versions import Version
 
-from swift_build_support.swift_build_support import cache_util
+import six
+from six import StringIO
 
 
 __all__ = [
@@ -27,22 +29,14 @@ __all__ = [
     'requires_attr',
     'requires_module',
     'requires_platform',
-
-    'BUILD_SCRIPT_IMPL_PATH',
-    'BUILD_SWIFT_PATH',
-    'TESTS_PATH',
-    'UTILS_PATH',
+    'requires_python',
 ]
 
 
 # -----------------------------------------------------------------------------
 # Constants
 
-TESTS_PATH = os.path.abspath(os.path.dirname(__file__))
-BUILD_SWIFT_PATH = os.path.abspath(os.path.join(TESTS_PATH, os.pardir))
-UTILS_PATH = os.path.abspath(os.path.join(BUILD_SWIFT_PATH, os.pardir))
-
-BUILD_SCRIPT_IMPL_PATH = os.path.join(UTILS_PATH, 'build-script-impl')
+_PYTHON_VERSION = Version(platform.python_version())
 
 
 # -----------------------------------------------------------------------------
@@ -124,9 +118,10 @@ class redirect_stdout():
         sys.stderr = self._old_stdout
 
 
-@cache_util.cached
+@cache_utils.cache
 def requires_attr(obj, attr):
-    """
+    """Decorator used to skip tests if an object does not have the required
+    attribute.
     """
 
     try:
@@ -137,7 +132,7 @@ def requires_attr(obj, attr):
             attr, obj))
 
 
-@cache_util.cached
+@cache_utils.cache
 def requires_module(fullname):
     """Decorator used to skip tests if a module is not imported.
     """
@@ -148,7 +143,7 @@ def requires_module(fullname):
     return unittest.skip('Unable to import "{}"'.format(fullname))
 
 
-@cache_util.cached
+@cache_utils.cache
 def requires_platform(name):
     """Decorator used to skip tests if not running on the given platform.
     """
@@ -157,4 +152,20 @@ def requires_platform(name):
         return lambda func: func
 
     return unittest.skip(
-        'Required platform "{}"" does not match system'.format(name))
+        'Required platform "{}" does not match system'.format(name))
+
+
+@cache_utils.cache
+def requires_python(version):
+    """Decorator used to skip tests if the running Python version is not
+    greater or equal to the required version.
+    """
+
+    if isinstance(version, six.string_types):
+        version = Version(version)
+
+    if _PYTHON_VERSION >= version:
+        return lambda func: func
+
+    return unittest.skip(
+        'Requires Python version {} or greater'.format(version))

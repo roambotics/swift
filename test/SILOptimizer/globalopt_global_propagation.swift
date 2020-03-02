@@ -1,5 +1,7 @@
-// RUN: %target-swift-frontend  -O -emit-sil -enforce-exclusivity=unchecked  %s | %FileCheck %s
-// RUN: %target-swift-frontend  -O -wmo -emit-sil -enforce-exclusivity=unchecked  %s | %FileCheck -check-prefix=CHECK-WMO %s
+// RUN: %target-swift-frontend -O -emit-sil -enforce-exclusivity=unchecked  %s | %FileCheck %s
+// RUN: %target-swift-frontend -O -wmo -emit-sil -enforce-exclusivity=unchecked  %s | %FileCheck -check-prefix=CHECK-WMO %s
+// RUN: %target-swift-frontend -parse-as-library -O -emit-sil -enforce-exclusivity=unchecked  %s | %FileCheck %s
+// RUN: %target-swift-frontend -parse-as-library -O -wmo -emit-sil -enforce-exclusivity=unchecked  %s | %FileCheck -check-prefix=CHECK-WMO %s
 
 // Check that values of internal and private global variables, which are provably assigned only 
 // once, are propagated into their uses and enable further optimizations like constant
@@ -113,12 +115,12 @@ public func test_public_global_var_int() -> Int {
 // Values of globals cannot be propagated as there are multiple assignments to it.
 // CHECK-WMO-LABEL: sil [noinline] @$s28globalopt_global_propagation026test_internal_and_private_B25_var_with_two_assignmentsSiyF
 // CHECK-WMO: bb0: 
-// CHECK-WMO: global_addr
-// CHECK-WMO: global_addr
-// CHECK-WMO: struct_element_addr
-// CHECK-WMO: load
-// CHECK-WMO: struct_element_addr
-// CHECK-WMO: load
+// CHECK-WMO-DAG: global_addr
+// CHECK-WMO-DAG: struct_element_addr
+// CHECK-WMO-DAG: load
+// CHECK-WMO-DAG: global_addr
+// CHECK-WMO-DAG: struct_element_addr
+// CHECK-WMO-DAG: load
 // CHECK-WMO: return
 @inline(never)
 public func test_internal_and_private_global_var_with_two_assignments() -> Int {
@@ -227,3 +229,25 @@ let IT2 = (100, 200, 300)
 public func test_let_tuple_wrapped_ints() -> Int {
   return IT1.0.0 + IT2.1
 }
+
+class Foo {
+  fileprivate static var x: Int = 0
+}
+
+// CHECK-LABEL: sil @$s28globalopt_global_propagation25test_optimize_init_staticSiyF
+// CHECK: bb0:
+// CHECK-NOT: global_addr
+// CHECK-NEXT: integer_literal
+// CHECK-NEXT: struct
+// CHECK-NEXT: return
+
+// CHECK-WMO-LABEL: sil @$s28globalopt_global_propagation25test_optimize_init_staticSiyF
+// CHECK-WMO: bb0:
+// CHECK-WMO-NOT: global_addr
+// CHECK-WMO-NEXT: integer_literal
+// CHECK-WMO-NEXT: struct
+// CHECK-WMO-NEXT: return
+public func test_optimize_init_static() -> Int {
+  return Foo.x
+}
+

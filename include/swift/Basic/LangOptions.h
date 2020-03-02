@@ -64,6 +64,17 @@ namespace swift {
     /// This represents the minimum deployment target.
     llvm::Triple Target;
 
+    /// \brief The second target for a zippered build
+    ///
+    /// This represents the target and minimum deployment version for the
+    /// second ('variant') target when performing a zippered build.
+    /// For example, if the target is x86_64-apple-macosx10.14 then
+    /// a target-variant of x86_64-apple-ios12.0-macabi will produce
+    /// a zippered binary that can be loaded into both macCatalyst and
+    /// macOS processes. A value of 'None' means no zippering will be
+    /// performed.
+    llvm::Optional<llvm::Triple> TargetVariant;
+
     ///
     /// Language features
     ///
@@ -97,6 +108,9 @@ namespace swift {
     /// If false, '#file' evaluates to the full path rather than a
     /// human-readable string.
     bool EnableConcisePoundFile = false;
+
+    /// Detect and automatically import modules' cross-import overlays.
+    bool EnableCrossImportOverlays = false;
 
     ///
     /// Support for alternate usage modes
@@ -178,7 +192,7 @@ namespace swift {
     bool BuildRequestDependencyGraph = false;
 
     /// Enable SIL type lowering
-    bool EnableSubstSILFunctionTypesForFunctionValues = false;
+    bool EnableSubstSILFunctionTypesForFunctionValues = true;
 
     /// Whether to diagnose an ephemeral to non-ephemeral conversion as an
     /// error.
@@ -287,7 +301,13 @@ namespace swift {
 
     /// Emit the newer, finer-grained swiftdeps file. Eventually will support
     /// faster rebuilds.
-    bool EnableFineGrainedDependencies = false;
+    bool EnableFineGrainedDependencies = true;
+
+    /// Instead of hashing tokens inside of NominalType and ExtensionBodies into
+    /// the interface hash, hash them into per-iterable-decl-context
+    /// fingerprints. Fine-grained dependency types won't dirty every provides
+    /// in a file when the user adds a member to, e.g., a struct.
+    bool EnableTypeFingerprints = true;
 
     /// When using fine-grained dependencies, emit dot files for every swiftdeps
     /// file.
@@ -402,7 +422,8 @@ namespace swift {
     ///
     /// \param suggestedKind Populated with suggested replacement platform condition
     /// \param suggestedValues Populated with suggested replacement values
-    /// if a match is not found.
+    /// if a match is not found, or if the value has been deprecated
+    /// in favor of a newer one.
     static bool checkPlatformConditionSupported(
       PlatformConditionKind Kind, StringRef Value,
       PlatformConditionKind &suggestedKind,

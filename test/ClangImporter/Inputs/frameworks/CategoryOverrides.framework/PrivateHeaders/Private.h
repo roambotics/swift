@@ -14,3 +14,17 @@
 
 @interface MyBaseClass () <MyPrivateProtocol>
 @end
+
+@interface Refinery ()
+@property (nonatomic, readwrite) RefinedSugar sugar;
+@end
+
+@interface ExtraRefinery ()
+- (void)setSugar:(RefinedSugar)sugar;
+@end
+
+@interface MyBaseClass () <NonNullProtocol>
+@end
+
+@interface MyDerivedClass () <ReadwriteProtocol>
+@end

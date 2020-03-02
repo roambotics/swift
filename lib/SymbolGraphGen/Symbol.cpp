@@ -74,29 +74,46 @@ void Symbol::serializeKind(llvm::json::OStream &OS) const {
   }
 }
 
-void Symbol::serializeIdentifier(SymbolGraphASTWalker &Walker,
-                                 llvm::json::OStream &OS) const {
-  AttributeRAII A("identifier", OS);
-  Walker.getSymbolIdentifier(VD).serialize(OS);
+void Symbol::serializeIdentifier(llvm::json::OStream &OS) const {
+  OS.attributeObject("identifier", [&](){
+    OS.attribute("precise", Graph.getUSR(VD));
+    OS.attribute("interfaceLanguage", "swift");
+  });
 }
 
-void Symbol::serializeNames(SymbolGraphASTWalker &Walker,
-                            llvm::json::OStream &OS) const {
+void Symbol::serializePathComponents(llvm::json::OStream &OS) const {
+  OS.attributeArray("pathComponents", [&](){
+    SmallVector<SmallString<32>, 8> PathComponents;
+    Graph.getPathComponents(VD, PathComponents);
+    for (auto Component : PathComponents) {
+      OS.value(Component);
+    }
+  });
+}
+
+void Symbol::serializeNames(llvm::json::OStream &OS) const {
   OS.attributeObject("names", [&](){
-    auto Identifier = Walker.getSymbolIdentifier(VD);
-    OS.attribute("title", Identifier.SimpleComponents.back());
+    SmallVector<SmallString<32>, 8> PathComponents;
+    Graph.getPathComponents(VD, PathComponents);
+    
+    OS.attribute("title", PathComponents.back());
     // "navigator": null
-    Walker.serializeSubheadingDeclarationFragments("subheading", VD, OS);
+    Graph.serializeSubheadingDeclarationFragments("subheading", VD, OS);
     // "prose": null
   });
 }
 
-void Symbol::serializePosition(StringRef Key,
-                               unsigned Line, unsigned ByteOffset,
+void Symbol::serializePosition(StringRef Key, SourceLoc Loc,
+                               SourceManager &SourceMgr,
                                llvm::json::OStream &OS) const {
+  // Note: Line and columns are zero-based in this serialized format.
+  auto LineAndColumn = SourceMgr.getLineAndColumn(Loc);
+  auto Line = LineAndColumn.first - 1;
+  auto Column = LineAndColumn.second - 1;
+
   OS.attributeObject(Key, [&](){
     OS.attribute("line", Line);
-    OS.attribute("character", ByteOffset);
+    OS.attribute("character", Column);
   });
 }
 
@@ -104,22 +121,20 @@ void Symbol::serializeRange(size_t InitialIndentation,
                             SourceRange Range, SourceManager &SourceMgr,
                             llvm::json::OStream &OS) const {
   OS.attributeObject("range", [&](){
-    auto StartLineAndColumn = SourceMgr.getLineAndColumn(Range.Start);
-    auto StartLine = StartLineAndColumn.first;
-    auto StartColumn = StartLineAndColumn.second + InitialIndentation;
-    serializePosition("start", StartLine, StartColumn, OS);
+    // Note: Line and columns in the serialized format are zero-based.
+    auto Start = Range.Start.getAdvancedLoc(InitialIndentation);
+    serializePosition("start", Start, SourceMgr, OS);
 
-    auto EndLineAndColumn = SourceMgr.getLineAndColumn(Range.End);
-    auto EndLine = EndLineAndColumn.first;
-    auto EndColumn = EndLineAndColumn.second + InitialIndentation;
-    serializePosition("end", EndLine, EndColumn, OS);
+    auto End = SourceMgr.isBeforeInBuffer(Range.End, Start)
+      ? Start
+      : Range.End;
+    serializePosition("end", End, SourceMgr, OS);
   });
 }
 
-void Symbol::serializeDocComment(SymbolGraphASTWalker &Walker,
-                                 llvm::json::OStream &OS) const {
+void Symbol::serializeDocComment(llvm::json::OStream &OS) const {
   OS.attributeObject("docComment", [&](){
-    auto LL = Walker.Ctx.getLineList(VD->getRawComment());
+    auto LL = Graph.Ctx.getLineList(VD->getRawComment(/*SerializedOK=*/true));
     size_t InitialIndentation = LL.getLines().empty()
       ? 0
       : markup::measureIndentation(LL.getLines().front().Text);
@@ -131,7 +146,7 @@ void Symbol::serializeDocComment(SymbolGraphASTWalker &Walker,
           // text and start of its source range, if it has one.
           if (Line.Range.isValid()) {
             serializeRange(InitialIndentation,
-                           Line.Range, Walker.M.getASTContext().SourceMgr, OS);
+                           Line.Range, Graph.M.getASTContext().SourceMgr, OS);
           }
           auto TrimmedLine = Line.Text.drop_front(std::min(InitialIndentation,
                                                   Line.FirstNonspaceOffset));
@@ -142,8 +157,7 @@ void Symbol::serializeDocComment(SymbolGraphASTWalker &Walker,
   }); // end docComment:
 }
 
-void Symbol::serializeFunctionSignature(SymbolGraphASTWalker &Walker,
-                                llvm::json::OStream &OS) const {
+void Symbol::serializeFunctionSignature(llvm::json::OStream &OS) const {
   if (const auto *FD = dyn_cast_or_null<FuncDecl>(VD)) {
     OS.attributeObject("functionSignature", [&](){
 
@@ -165,7 +179,7 @@ void Symbol::serializeFunctionSignature(SymbolGraphASTWalker &Walker,
                     OS.attribute("internalName", InternalName);
                   }
                 }
-                Walker.serializeDeclarationFragments("declarationFragments",
+                Graph.serializeDeclarationFragments("declarationFragments",
                                                      Param, OS);
               }); // end parameter object
             }
@@ -175,7 +189,7 @@ void Symbol::serializeFunctionSignature(SymbolGraphASTWalker &Walker,
 
       // Returns
       if (const auto ReturnType = FD->getResultInterfaceType()) {
-        Walker.serializeDeclarationFragments("returns", ReturnType, OS);
+        Graph.serializeDeclarationFragments("returns", ReturnType, OS);
       }
     });
   }
@@ -242,12 +256,15 @@ void Symbol::serializeSwiftGenericMixin(llvm::json::OStream &OS) const {
   }
 }
 
-void Symbol::serializeSwiftExtensionMixin(SymbolGraphASTWalker &Walker,
-                                          llvm::json::OStream &OS) const {
+void Symbol::serializeSwiftExtensionMixin(llvm::json::OStream &OS) const {
   if (const auto *Extension
           = dyn_cast_or_null<ExtensionDecl>(VD->getInnermostDeclContext())) {
     OS.attributeObject("swiftExtension", [&](){
-      OS.attribute("definedInModule", Walker.M.getNameStr());
+      if (const auto *ExtendedNominal = Extension->getExtendedNominal()) {
+        if (const auto *ExtendedModule = ExtendedNominal->getModuleContext()) {
+          OS.attribute("extendedModule", ExtendedModule->getNameStr());
+        }
+      }
       auto Generics = Extension->getGenericSignature();
       if (Generics && !Generics->getRequirements().empty()) {
         OS.attributeArray("constraints", [&](){
@@ -260,13 +277,28 @@ void Symbol::serializeSwiftExtensionMixin(SymbolGraphASTWalker &Walker,
   }
 }
 
-void Symbol::serializeDeclarationFragmentMixin(SymbolGraphASTWalker &Walker,
-                                               llvm::json::OStream &OS) const {
-  Walker.serializeDeclarationFragments("declarationFragments", VD, OS);
+void Symbol::serializeDeclarationFragmentMixin(llvm::json::OStream &OS) const {
+  Graph.serializeDeclarationFragments("declarationFragments", VD, OS);
 }
 
 void Symbol::serializeAccessLevelMixin(llvm::json::OStream &OS) const {
   OS.attribute("accessLevel", getAccessLevelSpelling(VD->getFormalAccess()));
+}
+
+void Symbol::serializeLocationMixin(llvm::json::OStream &OS) const {
+  auto Loc = VD->getLoc(/*SerializedOK=*/true);
+  if (Loc.isInvalid()) {
+    return;
+  }
+  auto FileName = VD->getASTContext().SourceMgr.getDisplayNameForLoc(Loc);
+  OS.attributeObject("location", [&](){
+    if (!FileName.empty()) {
+      SmallString<1024> FileURI("file://");
+      FileURI.append(FileName);
+      OS.attribute("uri", FileURI.str());
+    }
+    serializePosition("position", Loc, Graph.M.getASTContext().SourceMgr, OS);
+  });
 }
 
 llvm::Optional<StringRef>
@@ -292,6 +324,8 @@ Symbol::getDomain(PlatformAgnosticAvailabilityKind AgnosticKind,
   switch (Kind) {
     case swift::PlatformKind::iOS:
       return { "iOS" };
+    case swift::PlatformKind::macCatalyst:
+      return { "macCatalyst" };
     case swift::PlatformKind::OSX:
       return { "macOS" };
     case swift::PlatformKind::tvOS:
@@ -300,6 +334,8 @@ Symbol::getDomain(PlatformAgnosticAvailabilityKind AgnosticKind,
       return { "watchOS" };
     case swift::PlatformKind::iOSApplicationExtension:
       return { "iOSAppExtension" };
+    case swift::PlatformKind::macCatalystApplicationExtension:
+      return { "macCatalystAppExtension" };
     case swift::PlatformKind::OSXApplicationExtension:
       return { "macOSAppExtension" };
     case swift::PlatformKind::tvOSApplicationExtension:
@@ -361,20 +397,21 @@ void Symbol::serializeAvailabilityMixin(llvm::json::OStream &OS) const {
   }); // end availability: []
 }
 
-void Symbol::serialize(SymbolGraphASTWalker &Walker,
-                       llvm::json::OStream &OS) const {
+void Symbol::serialize(llvm::json::OStream &OS) const {
   OS.object([&](){
     serializeKind(OS);
-    serializeIdentifier(Walker, OS);
-    serializeNames(Walker, OS);
-    serializeDocComment(Walker, OS);
+    serializeIdentifier(OS);
+    serializePathComponents(OS);
+    serializeNames(OS);
+    serializeDocComment(OS);
 
     // "Mixins"
-    serializeFunctionSignature(Walker, OS);
+    serializeFunctionSignature(OS);
     serializeSwiftGenericMixin(OS);
-    serializeSwiftExtensionMixin(Walker, OS);
-    serializeDeclarationFragmentMixin(Walker, OS);
+    serializeSwiftExtensionMixin(OS);
+    serializeDeclarationFragmentMixin(OS);
     serializeAccessLevelMixin(OS);
     serializeAvailabilityMixin(OS);
+    serializeLocationMixin(OS);
   });
 }

@@ -68,8 +68,6 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   Opts.EmitVerboseSIL |= Args.hasArg(OPT_emit_verbose_sil);
   Opts.EmitSortedSIL |= Args.hasArg(OPT_emit_sorted_sil);
-  Opts.PrintFullConvention |=
-    Args.hasArg(OPT_experimental_print_full_convention);
 
   Opts.EnableTesting |= Args.hasArg(OPT_enable_testing);
   Opts.EnablePrivateImports |= Args.hasArg(OPT_enable_private_imports);
@@ -87,6 +85,8 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   Opts.RemarkOnRebuildFromModuleInterface |=
     Args.hasArg(OPT_Rmodule_interface_rebuild);
+
+  Opts.DisableInterfaceFileLock |= Args.hasArg(OPT_disable_interface_lockfile);
 
   computePrintStatsOptions();
   computeDebugTimeOptions();
@@ -176,8 +176,6 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   Opts.EnableSourceImport |= Args.hasArg(OPT_enable_source_import);
   Opts.ImportUnderlyingModule |= Args.hasArg(OPT_import_underlying_module);
-  Opts.EnableSerializationNestedTypeLookupTable &=
-      !Args.hasArg(OPT_disable_serialization_nested_type_lookup_table);
 
   computeImportObjCHeaderOptions();
   computeImplicitImportModuleNames();

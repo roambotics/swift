@@ -14,7 +14,6 @@ import os
 
 import android.adb.commands
 
-from swift_build_support.swift_build_support import host
 from swift_build_support.swift_build_support import targets
 from swift_build_support.swift_build_support.targets import \
     StdlibDeploymentTarget
@@ -131,28 +130,6 @@ def _apply_default_arguments(args):
         raise ValueError('error: --watchos-all is unavailable in open-source '
                          'Swift.\nUse --watchos to skip watchOS device tests.')
 
-    # Propagate global --skip-build
-    if args.skip_build:
-        args.build_linux = False
-        args.build_freebsd = False
-        args.build_cygwin = False
-        args.build_osx = False
-        args.build_ios = False
-        args.build_tvos = False
-        args.build_watchos = False
-        args.build_android = False
-        args.build_benchmarks = False
-        args.build_external_benchmarks = False
-        args.build_lldb = False
-        args.build_llbuild = False
-        args.build_libcxx = False
-        args.build_swiftpm = False
-        args.build_xctest = False
-        args.build_foundation = False
-        args.build_libdispatch = False
-        args.build_libicu = False
-        args.build_playgroundsupport = False
-
     # --skip-{ios,tvos,watchos} or --skip-build-{ios,tvos,watchos} are
     # merely shorthands for --skip-build-{**os}-{device,simulator}
     if not args.ios or not args.build_ios:
@@ -246,7 +223,11 @@ def _apply_default_arguments(args):
         args.test_watchos_simulator = False
 
     if not args.build_android:
-        args.test_android = False
+        # If building natively on an Android host, allow running the test suite
+        # without the NDK config.
+        if not StdlibDeploymentTarget.Android.contains(StdlibDeploymentTarget
+                                                       .host_target().name):
+            args.test_android = False
         args.test_android_host = False
 
     if not args.test_android:
@@ -335,6 +316,13 @@ def create_argument_parser():
     option('--skip-watchos', store_false('watchos'),
            help='set to skip everything watchOS-related')
 
+    option('--maccatalyst', toggle_true,
+           help='Enable building Swift with macCatalyst support')
+
+    option('--maccatalyst-ios-tests', toggle_true,
+           help='When building for macCatalyst run tests with iOS-like '
+                'target triple')
+
     option('--android', toggle_true,
            help='also build for Android')
 
@@ -393,6 +381,7 @@ def create_argument_parser():
     option('--host-libtool', store_path(executable=True),
            help='the absolute path to libtool. Default is auto detected.')
     option('--distcc', toggle_true,
+           default=os.environ.get('USE_DISTCC') == '1',
            help='use distcc in pump mode')
     option('--enable-asan', toggle_true,
            help='enable Address Sanitizer')
@@ -478,15 +467,14 @@ def create_argument_parser():
     option('--clang-profile-instr-use', store_path,
            help='profile file to use for clang PGO')
 
-    default_max_lto_link_job_counts = host.max_lto_link_job_counts()
     option('--llvm-max-parallel-lto-link-jobs', store_int,
-           default=default_max_lto_link_job_counts['llvm'],
+           default=defaults.LLVM_MAX_PARALLEL_LTO_LINK_JOBS,
            metavar='COUNT',
            help='the maximum number of parallel link jobs to use when '
                 'compiling llvm')
 
     option('--swift-tools-max-parallel-lto-link-jobs', store_int,
-           default=default_max_lto_link_job_counts['swift'],
+           default=defaults.SWIFT_MAX_PARALLEL_LTO_LINK_JOBS,
            metavar='COUNT',
            help='the maximum number of parallel link jobs to use when '
                 'compiling swift tools.')
@@ -587,6 +575,8 @@ def create_argument_parser():
            toggle_true('swiftsyntax_verify_generated_files'),
            help='set to verify that the generated files in the source tree '
                 'match the ones that would be generated from current master')
+    option(['--install-pythonkit'], toggle_true('install_pythonkit'),
+           help='install PythonKit')
     option(['--install-sourcekit-lsp'], toggle_true('install_sourcekitlsp'),
            help='install SourceKitLSP')
     option(['--install-skstresstester'], toggle_true('install_skstresstester'),
@@ -610,8 +600,20 @@ def create_argument_parser():
     option('--libicu', toggle_true('build_libicu'),
            help='build libicu')
 
-    option('--playgroundsupport', store_true('build_playgroundsupport'),
+    option('--playgroundsupport', toggle_true('build_playgroundsupport'),
            help='build PlaygroundSupport')
+    option('--install-playgroundsupport',
+           store_true('install_playgroundsupport'),
+           help='install playground support')
+
+    option('--pythonkit', store_true('build_pythonkit'),
+           help='build PythonKit')
+
+    option('--tensorflow-swift-apis', store_true('build_tensorflow_swift_apis'),
+           help='build TensorFlow Swift APIs')
+    option('--install-tensorflow-swift-apis',
+           store_true('install_tensorflow_swift_apis'),
+           help='install TensorFlow Swift APIs')
 
     option('--build-ninja', toggle_true,
            help='build the Ninja tool')
@@ -827,6 +829,8 @@ def create_argument_parser():
     option('--only-executable-test', toggle_true,
            help='Only run executable tests. Does nothing if host-test is not '
                 'allowed')
+    option('--only-non-executable-test', toggle_true,
+           help='Only run non-executable tests.')
 
     option('--test-paths', append,
            type=argparse.ShellSplitType(),
@@ -861,6 +865,9 @@ def create_argument_parser():
            help='skip testing Swift stdlibs for FreeBSD')
     option('--skip-test-cygwin', toggle_false('test_cygwin'),
            help='skip testing Swift stdlibs for Cygwin')
+
+    option('--test-pythonkit', toggle_true('test_pythonkit'),
+           help='skip testing PythonKit')
 
     # -------------------------------------------------------------------------
     in_group('Run build')
@@ -989,6 +996,9 @@ def create_argument_parser():
            help='skip testing indexstore-db')
     option('--skip-test-sourcekit-lsp', toggle_false('test_sourcekitlsp'),
            help='skip testing sourcekit-lsp')
+    option('--skip-test-playgroundsupport',
+           toggle_false('test_playgroundsupport'),
+           help='skip testing PlaygroundSupport')
     option('--skip-test-skstresstester', toggle_false('test_skstresstester'),
            help='skip testing the SourceKit Stress tester')
     option('--skip-test-swiftevolve', toggle_false('test_swiftevolve'),

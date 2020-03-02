@@ -15,6 +15,7 @@ import sys
 import unittest
 
 from build_swift import argparse
+from build_swift import constants
 from build_swift import driver_arguments
 from build_swift import migration
 from build_swift.presets import PresetParser
@@ -27,7 +28,7 @@ from .. import utils
 
 
 PRESETS_FILES = [
-    os.path.join(utils.UTILS_PATH, 'build-presets.ini'),
+    os.path.join(constants.UTILS_PATH, 'build-presets.ini'),
 ]
 
 
@@ -349,7 +350,7 @@ class TestDriverArgumentParser(unittest.TestCase):
 
         try:
             migration.check_impl_args(
-                utils.BUILD_SCRIPT_IMPL_PATH,
+                constants.BUILD_SCRIPT_IMPL_PATH,
                 namespace.build_script_impl_args)
         except (SystemExit, ValueError) as e:
             raise ParserError('failed to parse impl arguments: {}'.format(
@@ -539,30 +540,6 @@ class TestDriverArgumentParser(unittest.TestCase):
         self.assertEqual(namespace.llvm_build_variant, 'Debug')
         self.assertEqual(namespace.swift_build_variant, 'Debug')
         self.assertEqual(namespace.swift_stdlib_build_variant, 'Debug')
-
-    def test_implied_defaults_skip_build(self):
-        namespace = self.parse_default_args(['--skip-build'])
-
-        self.assertFalse(namespace.build_benchmarks)
-
-        self.assertFalse(namespace.build_linux)
-        self.assertFalse(namespace.build_android)
-        self.assertFalse(namespace.build_freebsd)
-        self.assertFalse(namespace.build_cygwin)
-        self.assertFalse(namespace.build_osx)
-        self.assertFalse(namespace.build_ios)
-        self.assertFalse(namespace.build_tvos)
-        self.assertFalse(namespace.build_watchos)
-
-        self.assertFalse(namespace.build_foundation)
-        self.assertFalse(namespace.build_libdispatch)
-        self.assertFalse(namespace.build_libicu)
-        self.assertFalse(namespace.build_lldb)
-        self.assertFalse(namespace.build_llbuild)
-        self.assertFalse(namespace.build_libcxx)
-        self.assertFalse(namespace.build_playgroundsupport)
-        self.assertFalse(namespace.build_swiftpm)
-        self.assertFalse(namespace.build_xctest)
 
     def test_implied_defaults_skip_build_ios(self):
         namespace = self.parse_default_args(['--skip-build-ios'])

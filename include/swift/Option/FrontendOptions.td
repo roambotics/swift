@@ -126,6 +126,11 @@ def verify_syntax_tree : Flag<["-"], "verify-syntax-tree">,
 def show_diagnostics_after_fatal : Flag<["-"], "show-diagnostics-after-fatal">,
   HelpText<"Keep emitting subsequent diagnostics after a fatal error">;
   
+def enable_cross_import_overlays : Flag<["-"], "enable-cross-import-overlays">,
+  HelpText<"Automatically import declared cross-import overlays.">;
+def disable_cross_import_overlays : Flag<["-"], "disable-cross-import-overlays">,
+  HelpText<"Do not automatically import declared cross-import overlays.">;
+
 def enable_descriptive_diagnostics : Flag<["-"], "enable-descriptive-diagnostics">,
   HelpText<"Show descriptive diagnostic information, if available.">;
   
@@ -181,10 +186,6 @@ def autolink_library : Separate<["-"], "autolink-library">,
 
 def disable_typo_correction : Flag<["-"], "disable-typo-correction">,
   HelpText<"Disable typo correction">;
-
-def disable_serialization_nested_type_lookup_table :
-  Flag<["-"], "disable-serialization-nested-type-lookup-table">,
-  HelpText<"Force module merging to use regular lookups to find nested types">;
 
 } // end let Flags = [FrontendOption, NoDriverOption]
 
@@ -281,6 +282,9 @@ def disable_ossa_opts : Flag<["-"], "disable-ossa-opts">,
 
 def disable_sil_partial_apply : Flag<["-"], "disable-sil-partial-apply">,
   HelpText<"Disable use of partial_apply in SIL generation">;
+
+def enable_spec_devirt : Flag<["-"], "enable-spec-devirt">,
+  HelpText<"Enable speculative devirtualization pass.">;
 
 def enable_ownership_stripping_after_serialization
   : Flag<["-"], "enable-ownership-stripping-after-serialization">,
@@ -608,12 +612,10 @@ def module_interface_preserve_types_as_written :
   HelpText<"When emitting a module interface, preserve types as they were "
            "written in the source">;
 
-// FIXME: [clang-function-type-serialization] Make this a SIL-only option once we
-// start unconditionally emitting non-canonical Clang types in swiftinterfaces.
 def experimental_print_full_convention :
  Flag<["-"], "experimental-print-full-convention">,
- HelpText<"When emitting a module interface or SIL, emit additional @convention"
-          " arguments, regardless of whether they were written in the source">;
+ HelpText<"When emitting a module interface, emit additional @convention "
+          "arguments, regardless of whether they were written in the source">;
 
 def prebuilt_module_cache_path :
   Separate<["-"], "prebuilt-module-cache-path">,
@@ -650,9 +652,13 @@ def disable_verify_exclusivity : Flag<["-"], "disable-verify-exclusivity">,
 def disable_legacy_type_info : Flag<["-"], "disable-legacy-type-info">,
   HelpText<"Completely disable legacy type layout">;
 
+def disable_generic_metadata_prespecialization : Flag<["-"], "disable-generic-metadata-prespecialization">,
+  HelpText<"Do not statically specialize metadata for generic types at types "
+           "that are known to be used in source.">;
+
 def prespecialize_generic_metadata : Flag<["-"], "prespecialize-generic-metadata">,
-  HelpText<"Statically specialize metadata for generic types at types that "
-           "are known to be used in source.">;
+   HelpText<"Statically specialize metadata for generic types at types that "
+            "are known to be used in source.">;
 
 def read_legacy_type_info_path_EQ : Joined<["-"], "read-legacy-type-info-path=">,
   HelpText<"Read legacy type layout from the given path instead of default path">;
@@ -668,4 +674,13 @@ def emit_ldadd_cfile_path
 def previous_module_installname_map_file
   : Separate<["-"], "previous-module-installname-map-file">, MetaVarName<"<path>">,
     HelpText<"Path to a Json file indicating module name to installname map for @_originallyDefinedIn">;
+
+def enable_type_layouts : Flag<["-"], "enable-type-layout">,
+  HelpText<"Enable type layout based lowering">;
+
+def disable_type_layouts : Flag<["-"], "disable-type-layout">,
+  HelpText<"Disable type layout based lowering">;
+
+def disable_interface_lockfile : Flag<["-"], "disable-interface-lock">,
+  HelpText<"Don't lock interface file when building module">;
 } // end let Flags = [FrontendOption, NoDriverOption, HelpHidden]

@@ -1303,27 +1303,6 @@ resolveTopLevelIdentTypeComponent(TypeResolution resolution,
   auto DC = resolution.getDeclContext();
   auto id = comp->getNameRef();
 
-  // Dynamic 'Self' in the result type of a function body.
-  if (id.isSimpleName(ctx.Id_Self)) {
-    if (auto *typeDC = DC->getInnermostTypeContext()) {
-      // FIXME: The passed-in TypeRepr should get 'typechecked' as well.
-      // The issue is though that ComponentIdentTypeRepr only accepts a ValueDecl
-      // while the 'Self' type is more than just a reference to a TypeDecl.
-      auto selfType = resolution.mapTypeIntoContext(
-        typeDC->getSelfInterfaceType());
-
-      // Check if we can reference Self here, and if so, what kind of Self it is.
-      switch (getSelfTypeKind(DC, options)) {
-      case SelfTypeKind::StaticSelf:
-        return selfType;
-      case SelfTypeKind::DynamicSelf:
-        return DynamicSelfType::get(selfType, ctx);
-      case SelfTypeKind::InvalidSelf:
-        break;
-      }
-    }
-  }
-
   NameLookupOptions lookupOptions = defaultUnqualifiedLookupOptions;
   if (options.contains(TypeResolutionFlags::KnownNonCascadingDependency))
     lookupOptions |= NameLookupFlags::KnownPrivate;
@@ -1380,6 +1359,27 @@ resolveTopLevelIdentTypeComponent(TypeResolution resolution,
 
   // If we found nothing, complain and give ourselves a chance to recover.
   if (current.isNull()) {
+    // Dynamic 'Self' in the result type of a function body.
+    if (id.isSimpleName(ctx.Id_Self)) {
+      if (auto *typeDC = DC->getInnermostTypeContext()) {
+        // FIXME: The passed-in TypeRepr should get 'typechecked' as well.
+        // The issue is though that ComponentIdentTypeRepr only accepts a ValueDecl
+        // while the 'Self' type is more than just a reference to a TypeDecl.
+        auto selfType = resolution.mapTypeIntoContext(
+          typeDC->getSelfInterfaceType());
+
+        // Check if we can reference Self here, and if so, what kind of Self it is.
+        switch (getSelfTypeKind(DC, options)) {
+        case SelfTypeKind::StaticSelf:
+          return selfType;
+        case SelfTypeKind::DynamicSelf:
+          return DynamicSelfType::get(selfType, ctx);
+        case SelfTypeKind::InvalidSelf:
+          break;
+        }
+      }
+    }
+
     // If we're not allowed to complain or we couldn't fix the
     // source, bail out.
     if (options.contains(TypeResolutionFlags::SilenceErrors))
@@ -1462,10 +1462,6 @@ static Type resolveNestedIdentTypeComponent(
       maybeDiagnoseBadConformanceRef(DC, parentTy, comp->getLoc(),
                                      inferredAssocType);
     }
-
-    // At this point, we need to have resolved the type of the member.
-    if (memberType->hasError())
-      return memberType;
 
     // If there are generic arguments, apply them now.
     return applyGenericArguments(memberType, resolution, comp, options);
@@ -1747,8 +1743,8 @@ bool TypeChecker::validateType(ASTContext &Context, TypeLoc &Loc,
   if (Loc.wasValidated())
     return Loc.isError();
 
-  if (Context.Stats)
-    Context.Stats->getFrontendCounters().NumTypesValidated++;
+  if (auto *Stats = Context.Stats)
+    Stats->getFrontendCounters().NumTypesValidated++;
 
   Type type = resolution.resolveType(Loc.getTypeRepr(), options);
   Loc.setType(type);
@@ -1814,12 +1810,8 @@ namespace {
                                 TypeResolutionOptions options,
                                 SILCoroutineKind coroutineKind
                                   = SILCoroutineKind::None,
-                                SILFunctionType::ExtInfo incompleteExtInfo
+                                SILFunctionType::ExtInfo extInfo
                                   = SILFunctionType::ExtInfo(),
-                                SILFunctionType::Representation representation
-                                  = SILFunctionType::Representation::Thick,
-                                const clang::Type *parsedClangType
-                                  = nullptr,
                                 ParameterConvention calleeConvention
                                   = DefaultParameterConvention,
                                 TypeRepr *witnessmethodProtocol = nullptr);
@@ -1873,7 +1865,8 @@ namespace {
 Type TypeResolution::resolveType(TypeRepr *TyR,
                               TypeResolutionOptions options) {
   auto &ctx = getASTContext();
-  FrontendStatsTracer StatsTracer(ctx.Stats, "resolve-type", TyR);
+  FrontendStatsTracer StatsTracer(ctx.Stats,
+                                  "resolve-type", TyR);
   PrettyStackTraceTypeRepr stackTrace(ctx, "resolving", TyR);
 
   TypeResolver typeResolver(*this);
@@ -2269,14 +2262,13 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
                                 : DifferentiabilityKind::Normal;
       }
 
-      SILFunctionType::ExtInfo incompleteExtInfo(
-        SILFunctionType::Representation::Thick,
-        attrs.has(TAK_pseudogeneric), attrs.has(TAK_noescape), diffKind,
-        /*clangFunctionType*/ nullptr);
+      // Resolve the function type directly with these attributes.
+      // TODO: [store-sil-clang-function-type]
+      SILFunctionType::ExtInfo extInfo(rep, attrs.has(TAK_pseudogeneric),
+                                       attrs.has(TAK_noescape), diffKind,
+                                       nullptr);
 
-      ty = resolveSILFunctionType(fnRepr, options, coroutineKind,
-                                  incompleteExtInfo, rep,
-                                  /*parsedClangType*/nullptr,
+      ty = resolveSILFunctionType(fnRepr, options, coroutineKind, extInfo,
                                   calleeConvention, witnessMethodProtocol);
       if (!ty || ty->hasError())
         return ty;
@@ -2777,15 +2769,12 @@ Type TypeResolver::resolveSILBoxType(SILBoxTypeRepr *repr,
   return SILBoxType::get(Context, layout, subMap);
 }
 
-Type TypeResolver::resolveSILFunctionType(
-    FunctionTypeRepr *repr,
-    TypeResolutionOptions options,
-    SILCoroutineKind coroutineKind,
-    SILFunctionType::ExtInfo incompleteExtInfo,
-    SILFunctionType::Representation representation,
-    const clang::Type *parsedClangType,
-    ParameterConvention callee,
-    TypeRepr *witnessMethodProtocol) {
+Type TypeResolver::resolveSILFunctionType(FunctionTypeRepr *repr,
+                                          TypeResolutionOptions options,
+                                          SILCoroutineKind coroutineKind,
+                                          SILFunctionType::ExtInfo extInfo,
+                                          ParameterConvention callee,
+                                          TypeRepr *witnessMethodProtocol) {
   options.setContext(None);
 
   bool hasError = false;
@@ -2916,6 +2905,10 @@ Type TypeResolver::resolveSILFunctionType(
       return ErrorType::get(Context);
 
     Type selfType = params.back().getInterfaceType();
+    if (subs) {
+      selfType = selfType.subst(subs);
+    }
+    
     // The Self type can be nested in a few layers of metatypes (etc.).
     while (auto metatypeType = selfType->getAs<MetatypeType>()) {
       auto next = metatypeType->getInstanceType();
@@ -2929,20 +2922,6 @@ Type TypeResolver::resolveSILFunctionType(
     assert(witnessMethodConformance &&
            "found witness_method without matching conformance");
   }
-
-  const clang::Type *clangFnType = parsedClangType;
-  if ((representation == SILFunctionType::Representation::CFunctionPointer)
-      && !clangFnType) {
-    assert(results.size() <= 1 && yields.size() == 0
-           && "@convention(c) functions have at most 1 result and 0 yields.");
-    auto result = results.empty() ? Optional<SILResultInfo>() : results[0];
-    clangFnType = Context.getCanonicalClangFunctionType(interfaceParams, result,
-                                                        incompleteExtInfo,
-                                                        representation);
-  }
-
-  auto extInfo = incompleteExtInfo.withRepresentation(representation)
-                                  .withClangFunctionType(clangFnType);
 
   return SILFunctionType::get(genericSig, extInfo, coroutineKind,
                               callee,
@@ -2970,6 +2949,8 @@ SILParameterInfo TypeResolver::resolveSILParameter(
   auto convention = DefaultParameterConvention;
   Type type;
   bool hadError = false;
+  auto differentiability =
+      SILParameterDifferentiability::DifferentiableOrNotApplicable;
 
   if (auto attrRepr = dyn_cast<AttributedTypeRepr>(repr)) {
     auto attrs = attrRepr->getAttrs();
@@ -2995,6 +2976,10 @@ SILParameterInfo TypeResolver::resolveSILParameter(
     checkFor(TypeAttrKind::TAK_owned, ParameterConvention::Direct_Owned);
     checkFor(TypeAttrKind::TAK_guaranteed,
              ParameterConvention::Direct_Guaranteed);
+    if (attrs.has(TAK_noDerivative)) {
+      attrs.clearAttribute(TAK_noDerivative);
+      differentiability = SILParameterDifferentiability::NotDifferentiable;
+    }
 
     type = resolveAttributedType(attrs, attrRepr->getTypeRepr(), options);
   } else {
@@ -3011,7 +2996,8 @@ SILParameterInfo TypeResolver::resolveSILParameter(
   }
 
   if (hadError) type = ErrorType::get(Context);
-  return SILParameterInfo(type->getCanonicalType(), convention);
+  return SILParameterInfo(type->getCanonicalType(), convention,
+                          differentiability);
 }
 
 bool TypeResolver::resolveSingleSILResult(TypeRepr *repr,

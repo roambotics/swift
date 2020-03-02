@@ -322,8 +322,8 @@ ParserResult<TypeRepr> Parser::parseSILBoxType(GenericParamList *generics,
   
   SourceLoc LAngleLoc, RAngleLoc;
   SmallVector<TypeRepr*, 4> Args;
-  if (Tok.isContextualPunctuator("<")) {
-    LAngleLoc = consumeToken();
+  if (startsWithLess(Tok)) {
+    LAngleLoc = consumeStartingLess();
     for (;;) {
       auto argTy = parseType();
       if (!argTy.getPtrOrNull())
@@ -333,12 +333,12 @@ ParserResult<TypeRepr> Parser::parseSILBoxType(GenericParamList *generics,
         continue;
       break;
     }
-    if (!Tok.isContextualPunctuator(">")) {
+    if (!startsWithGreater(Tok)) {
       diagnose(Tok, diag::sil_box_expected_r_angle);
       return makeParserError();
     }
     
-    RAngleLoc = consumeToken();
+    RAngleLoc = consumeStartingGreater();
   }
   
   auto repr = SILBoxTypeRepr::create(Context, generics,
@@ -485,12 +485,12 @@ ParserResult<TypeRepr> Parser::parseType(Diag<> MessageID,
     SourceLoc SubsLAngleLoc, SubsRAngleLoc;
     MutableArrayRef<TypeRepr *> SubsTypes;
     if (isInSILMode() && consumeIf(tok::kw_for)) {
-      if (!Tok.isContextualPunctuator("<")) {
+      if (!startsWithLess(Tok)) {
         diagnose(Tok, diag::sil_function_subst_expected_l_angle);
         return makeParserError();
       }
       
-      SubsLAngleLoc = consumeToken();
+      SubsLAngleLoc = consumeStartingLess();
 
       SmallVector<TypeRepr*, 4> SubsTypesVec;
       for (;;) {
@@ -502,12 +502,12 @@ ParserResult<TypeRepr> Parser::parseType(Diag<> MessageID,
           continue;
         break;
       }
-      if (!Tok.isContextualPunctuator(">")) {
+      if (!startsWithGreater(Tok)) {
         diagnose(Tok, diag::sil_function_subst_expected_r_angle);
         return makeParserError();
       }
       
-      SubsRAngleLoc = consumeToken();
+      SubsRAngleLoc = consumeStartingGreater();
 
       SubsTypes = Context.AllocateCopy(SubsTypesVec);
     }
@@ -1636,7 +1636,7 @@ bool Parser::canParseOldStyleProtocolComposition() {
 
 bool Parser::canParseTypeTupleBody() {
   if (Tok.isNot(tok::r_paren) && Tok.isNot(tok::r_brace) &&
-      Tok.isNotEllipsis() && !isStartOfDecl()) {
+      Tok.isNotEllipsis() && !isStartOfSwiftDecl()) {
     do {
       // The contextual inout marker is part of argument lists.
       consumeIf(tok::kw_inout);
@@ -1661,8 +1661,7 @@ bool Parser::canParseTypeTupleBody() {
         if (consumeIf(tok::equal)) {
           while (Tok.isNot(tok::eof) && Tok.isNot(tok::r_paren) &&
                  Tok.isNot(tok::r_brace) && Tok.isNotEllipsis() &&
-                 Tok.isNot(tok::comma) &&
-                 !isStartOfDecl()) {
+                 Tok.isNot(tok::comma) && !isStartOfSwiftDecl()) {
             skipSingle();
           }
         }

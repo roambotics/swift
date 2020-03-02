@@ -44,6 +44,7 @@
 
 namespace clang {
 class Type;
+class FunctionType;
 } // namespace clang
 
 namespace llvm {
@@ -779,6 +780,9 @@ public:
 
   /// Check if this type is equal to Builtin.IntN.
   bool isBuiltinIntegerType(unsigned bitWidth);
+  
+  /// Check if this is a nominal type defined at the top level of the Swift module
+  bool isStdlibType();
 
   /// If this is a class type or a bound generic class type, returns the
   /// (possibly generic) class.
@@ -891,14 +895,26 @@ public:
   /// Visit this type and the argument type in parallel, invoking the callback
   /// function with each archetype-to-substituted-type binding. The callback
   /// may return a new type to substitute into the result type, or return
-  /// CanType() to error out of the operation.
+  /// CanType() to error out of the operation. Each invocation of the callback
+  /// receives three arguments:
+  /// - The `orig` archetype from a position in `this` type.
+  /// - The `subst` type in the same structural position of `ty` that is trying to be bound
+  ///  to `orig`.
+  /// - The `upperBound` archetype, which if set, indicates the minimum set of constraints
+  ///  that any type substituted in this structural position must conform to. May be null,
+  ///  indicating an unconstrained context.
+  /// - If `upperBound` is set, then the `substConformances` array will contain the
+  ///  protocol conformances for `subst` to each of the protocol requirements
+  ///  on `upperBound` in `getConformsTo` order.
   ///
   /// Returns the substituted type, or a null CanType() if this type
   /// is not bindable to the substituted type, or the callback returns
   /// CanType().
   CanType substituteBindingsTo(Type ty,
-         llvm::function_ref<CanType(ArchetypeType*, CanType)> substFn);
-
+         llvm::function_ref<CanType(ArchetypeType *orig,
+                CanType subst,
+                ArchetypeType *upperBound,
+                ArrayRef<ProtocolConformanceRef> substConformances)> substFn);
   
   /// Determines whether this type is similar to \p other as defined by
   /// \p matchOptions.
@@ -1160,6 +1176,8 @@ public:
   /// object type.
   TypeTraitResult canBeClass();
 
+  Type replaceSubstitutedSILFunctionTypesWithUnsubstituted(SILModule &M) const; // in SILType.cpp
+  
   /// Return the tangent space of the given type, if it exists. Otherwise,
   /// return `None`.
   Optional<TangentSpace>
@@ -2779,7 +2797,8 @@ public:
                    Identifier l = Identifier(),
                    ParameterTypeFlags f = ParameterTypeFlags())
         : Ty(t), Label(l), Flags(f) {
-      assert(!t || !t->is<InOutType>() && "set flags instead");
+      assert(t && "param type must be non-null");
+      assert(!t->is<InOutType>() && "set flags instead");
     }
 
   private:
@@ -2852,6 +2871,10 @@ public:
     Param getWithoutLabel() const { return Param(Ty, Identifier(), Flags); }
 
     Param withType(Type newType) const { return Param(newType, Label, Flags); }
+
+    Param withFlags(ParameterTypeFlags flags) const {
+      return Param(Ty, Label, flags);
+    }
   };
 
   class CanParam : public Param {
@@ -2946,7 +2969,6 @@ public:
       friend ExtInfo;
       friend class AnyFunctionType;
       friend class FunctionType;
-      friend class SILUncommonInfo;
       // We preserve a full clang::Type *, not a clang::FunctionType * as:
       // 1. We need to keep sugar in case we need to present an error to the user.
       // 2. The actual type being stored is [ignoring sugar] either a
@@ -2969,7 +2991,7 @@ public:
     static void assertIsFunctionType(const clang::Type *);
 
     ExtInfo(unsigned Bits, Uncommon Other) : Bits(Bits), Other(Other) {
-      // TODO: [clang-function-type-serialization] Once we start serializing
+      // TODO: [store-sil-clang-function-type] Once we start serializing
       // the Clang type, we should also assert that the pointer is non-null.
       auto Rep = Representation(Bits & RepresentationMask);
       if ((Rep == Representation::CFunctionPointer) && Other.ClangFunctionType)
@@ -3083,6 +3105,14 @@ public:
     ExtInfo withClangFunctionType(const clang::Type *type) const {
       return ExtInfo(Bits, Uncommon(type));
     }
+    LLVM_NODISCARD
+    ExtInfo
+    withDifferentiabilityKind(DifferentiabilityKind differentiability) const {
+      return ExtInfo(
+          (Bits & ~DifferentiabilityMask) |
+              ((unsigned)differentiability << DifferentiabilityMaskOffset),
+          Other);
+    }
 
     std::pair<unsigned, const void *> getFuncAttrKey() const {
       return std::make_pair(Bits, Other.ClangFunctionType);
@@ -3190,6 +3220,16 @@ public:
     return getExtInfo().getRepresentation();
   }
 
+  /// Appends the parameters indicated by `parameterIndices` to `results`.
+  ///
+  /// For curried function types: if `reverseCurryLevels` is true, append
+  /// the `self` parameter last instead of first.
+  ///
+  /// TODO(TF-874): Simplify logic and remove the `reverseCurryLevels` flag.
+  void getSubsetParameters(IndexSubset *parameterIndices,
+                           SmallVectorImpl<AnyFunctionType::Param> &results,
+                           bool reverseCurryLevels = false);
+
   /// Returns the derivative function type for the given parameter indices,
   /// result index, derivative function kind, derivative function generic
   /// signature (optional), and other auxiliary parameters.
@@ -3197,8 +3237,8 @@ public:
   /// Preconditions:
   /// - Parameters corresponding to parameter indices must conform to
   ///   `Differentiable`.
-  /// - The result corresponding to the result index must conform to
-  ///   `Differentiable`.
+  /// - There is one semantic function result type: either the formal original
+  ///   result or an `inout` parameter. It must conform to `Differentiable`.
   ///
   /// Typing rules, given:
   /// - Original function type. Three cases:
@@ -3244,6 +3284,11 @@ public:
   ///              original result | deriv. wrt result | deriv. wrt params
   /// \endverbatim
   ///
+  /// The original type may have `inout` parameters. If so, the
+  /// differential/pullback typing rules are more nuanced: see documentation for
+  /// `getAutoDiffDerivativeFunctionLinearMapType` for details. Semantically,
+  /// `inout` parameters behave as both parameters and results.
+  ///
   /// By default, if the original type has a `self` parameter list and parameter
   /// indices include `self`, the computed derivative function type will return
   /// a linear map taking/returning self's tangent *last* instead of first, for
@@ -3254,11 +3299,53 @@ public:
   /// derivative function types, e.g. when type-checking `@differentiable` and
   /// `@derivative` attributes.
   AnyFunctionType *getAutoDiffDerivativeFunctionType(
-      IndexSubset *parameterIndices, unsigned resultIndex,
-      AutoDiffDerivativeFunctionKind kind,
+      IndexSubset *parameterIndices, AutoDiffDerivativeFunctionKind kind,
       LookupConformanceFn lookupConformance,
       GenericSignature derivativeGenericSignature = GenericSignature(),
       bool makeSelfParamFirst = false);
+
+  /// Returns the corresponding linear map function type for the given parameter
+  /// indices, linear map function kind, and other auxiliary parameters.
+  ///
+  /// Preconditions:
+  /// - Parameters corresponding to parameter indices must conform to
+  ///   `Differentiable`.
+  /// - There is one semantic function result type: either the formal original
+  ///   result or an `inout` parameter. It must conform to `Differentiable`.
+  ///
+  /// Differential typing rules: takes "wrt" parameter derivatives and returns a
+  /// "wrt" result derivative.
+  ///
+  /// - Case 1: original function has no `inout` parameters.
+  ///   - Original:     `(T0, T1, ...) -> R`
+  ///   - Differential: `(T0.Tan, T1.Tan, ...) -> R.Tan`
+  /// - Case 2: original function has a non-wrt `inout` parameter.
+  ///   - Original:     `(T0, inout T1, ...) -> Void`
+  ///   - Differential: `(T0.Tan, ...) -> T1.Tan`
+  /// - Case 3: original function has a wrt `inout` parameter.
+  ///   - Original:     `(T0, inout T1, ...) -> Void`
+  ///   - Differential: `(T0.Tan, inout T1.Tan, ...) -> Void`
+  ///
+  /// Pullback typing rules: takes a "wrt" result derivative and returns "wrt"
+  /// parameter derivatives.
+  ///
+  /// - Case 1: original function has no `inout` parameters.
+  ///   - Original: `(T0, T1, ...) -> R`
+  ///   - Pullback: `R.Tan -> (T0.Tan, T1.Tan, ...)`
+  /// - Case 2: original function has a non-wrt `inout` parameter.
+  ///   - Original: `(T0, inout T1, ...) -> Void`
+  ///   - Pullback: `(T1.Tan) -> (T0.Tan, ...)`
+  /// - Case 3: original function has a wrt `inout` parameter.
+  ///   - Original: `(T0, inout T1, ...) -> Void`
+  ///   - Pullback: `(inout T1.Tan) -> (T0.Tan, ...)`
+  ///
+  /// If `makeSelfParamFirst` is true, `self`'s tangent is reordered to appear
+  /// first. `makeSelfParamFirst` should be true when working with user-facing
+  /// derivative function types, e.g. when type-checking `@differentiable` and
+  /// `@derivative` attributes.
+  AnyFunctionType *getAutoDiffDerivativeFunctionLinearMapType(
+      IndexSubset *parameterIndices, AutoDiffLinearMapKind kind,
+      LookupConformanceFn lookupConformance, bool makeSelfParamFirst = false);
 
   /// True if the parameter declaration it is attached to is guaranteed
   /// to not persist the closure for longer than the duration of the call.
@@ -3637,13 +3724,35 @@ inline bool isGuaranteedParameter(ParameterConvention conv) {
   llvm_unreachable("bad convention kind");
 }
 
+/// The differentiability of a SIL function type parameter.
+enum class SILParameterDifferentiability : unsigned {
+  /// Either differentiable or not applicable.
+  ///
+  /// - If the function type is not `@differentiable`, parameter
+  ///   differentiability is not applicable. This case is the default value.
+  /// - If the function type is `@differentiable`, the function is
+  ///   differentiable with respect to this parameter.
+  DifferentiableOrNotApplicable,
+
+  /// Not differentiable: a `@noDerivative` parameter.
+  ///
+  /// May be applied only to parameters of `@differentiable` function types.
+  /// The function type is not differentiable with respect to this parameter.
+  NotDifferentiable,
+};
+
 /// A parameter type and the rules for passing it.
 class SILParameterInfo {
   llvm::PointerIntPair<CanType, 3, ParameterConvention> TypeAndConvention;
+  SILParameterDifferentiability Differentiability : 1;
+
 public:
   SILParameterInfo() = default;//: Ty(), Convention((ParameterConvention)0) {}
-  SILParameterInfo(CanType type, ParameterConvention conv)
-    : TypeAndConvention(type, conv) {
+  SILParameterInfo(
+      CanType type, ParameterConvention conv,
+      SILParameterDifferentiability differentiability =
+          SILParameterDifferentiability::DifferentiableOrNotApplicable)
+      : TypeAndConvention(type, conv), Differentiability(differentiability) {
     assert(type->isLegalSILType() && "SILParameterInfo has illegal SIL type");
   }
 
@@ -3698,6 +3807,16 @@ public:
     return isGuaranteedParameter(getConvention());
   }
 
+  SILParameterDifferentiability getDifferentiability() const {
+    return Differentiability;
+  }
+
+  SILParameterInfo getWithDifferentiability(
+      SILParameterDifferentiability differentiability) const {
+    return SILParameterInfo(getInterfaceType(), getConvention(),
+                            differentiability);
+  }
+
   /// The SIL storage type determines the ABI for arguments based purely on the
   /// formal parameter conventions. The actual SIL type for the argument values
   /// may differ in canonical SIL. In particular, opaque values require indirect
@@ -3710,7 +3829,7 @@ public:
 
   /// Return a version of this parameter info with the type replaced.
   SILParameterInfo getWithInterfaceType(CanType type) const {
-    return SILParameterInfo(type, getConvention());
+    return SILParameterInfo(type, getConvention(), getDifferentiability());
   }
 
   /// Transform this SILParameterInfo by applying the user-provided
@@ -3726,6 +3845,7 @@ public:
   void profile(llvm::FoldingSetNodeID &id) {
     id.AddPointer(getInterfaceType().getPointer());
     id.AddInteger((unsigned)getConvention());
+    id.AddInteger((unsigned)getDifferentiability());
   }
 
   SWIFT_DEBUG_DUMP;
@@ -3739,8 +3859,9 @@ public:
   }
 
   bool operator==(SILParameterInfo rhs) const {
-    return getInterfaceType() == rhs.getInterfaceType()
-      && getConvention() == rhs.getConvention();
+    return getInterfaceType() == rhs.getInterfaceType() &&
+           getConvention() == rhs.getConvention() &&
+           getDifferentiability() == rhs.getDifferentiability();
   }
   bool operator!=(SILParameterInfo rhs) const {
     return !(*this == rhs);
@@ -3858,7 +3979,7 @@ public:
   }
 
   ValueOwnershipKind
-  getOwnershipKind(SILFunction &) const; // in SILType.cpp
+  getOwnershipKind(SILFunction &, CanSILFunctionType fTy) const; // in SILType.cpp
 
   bool operator==(SILResultInfo rhs) const {
     return TypeAndConvention == rhs.TypeAndConvention;
@@ -3917,24 +4038,6 @@ namespace Lowering {
   class TypeConverter;
 };
 
-class SILUncommonInfo {
-  friend class SILFunctionType;
-
-  // Invariant: The FunctionType is canonical.
-  // We store a clang::FunctionType * instead of a clang::CanQualType to
-  // avoid depending on the Clang AST in this header.
-  const clang::Type *ClangFunctionType;
-
-  bool empty() const { return !ClangFunctionType; }
-  SILUncommonInfo(const clang::Type *type) : ClangFunctionType(type) {}
-  SILUncommonInfo(AnyFunctionType::ExtInfo::Uncommon uncommon);
-
-public:
-  /// Analog of AnyFunctionType::ExtInfo::Uncommon::printClangFunctionType.
-  void printClangFunctionType(ClangModuleLoader *cml,
-                              llvm::raw_ostream &os) const;
-};
-
 /// SILFunctionType - The lowered type of a function value, suitable
 /// for use by SIL.
 ///
@@ -3943,8 +4046,7 @@ public:
 /// function parameter and result types.
 class SILFunctionType final : public TypeBase, public llvm::FoldingSetNode,
     private llvm::TrailingObjects<SILFunctionType, SILParameterInfo,
-                                  SILResultInfo, SILYieldInfo, CanType,
-                                  SILUncommonInfo> {
+                                  SILResultInfo, SILYieldInfo, CanType> {
   friend TrailingObjects;
 
   size_t numTrailingObjects(OverloadToken<SILParameterInfo>) const {
@@ -3961,10 +4063,6 @@ class SILFunctionType final : public TypeBase, public llvm::FoldingSetNode,
 
   size_t numTrailingObjects(OverloadToken<CanType>) const {
     return hasResultCache() ? 2 : 0;
-  }
-
-  size_t numTrailingObjects(OverloadToken<SILUncommonInfo>) const {
-    return Bits.SILFunctionType.HasUncommonInfo ? 1 : 0;
   }
 
 public:
@@ -3991,31 +4089,27 @@ public:
 
     unsigned Bits; // Naturally sized for speed.
 
-    // For symmetry with AnyFunctionType::Uncommon
-    using Uncommon = SILUncommonInfo;
+    class Uncommon {
+      friend ExtInfo;
+      friend class SILFunctionType;
+
+      // Invariant: The FunctionType is canonical.
+      // We store a clang::FunctionType * instead of a clang::CanQualType to
+      // avoid depending on the Clang AST in this header.
+      const clang::FunctionType *ClangFunctionType;
+
+      bool empty() const { return !ClangFunctionType; }
+      Uncommon(const clang::FunctionType *type) : ClangFunctionType(type) {}
+
+    public:
+      /// Analog of AnyFunctionType::ExtInfo::Uncommon::printClangFunctionType.
+      void printClangFunctionType(ClangModuleLoader *cml,
+                                  llvm::raw_ostream &os) const;
+    };
 
     Uncommon Other;
 
-    static void assertIsFunctionType(const clang::Type *);
-
-    ExtInfo(unsigned Bits, Uncommon Other) : Bits(Bits), Other(Other) {
-      auto Rep = Representation(Bits & RepresentationMask);
-      // TODO: [clang-function-type-serialization] Once we start serializing
-      // the Clang type, we should also assert that the pointer is non-null.
-      if ((Rep == Representation::CFunctionPointer) && Other.ClangFunctionType)
-        assertIsFunctionType(Other.ClangFunctionType);
-    }
-
-    static constexpr unsigned makeBits(Representation rep,
-                                       bool isPseudogeneric,
-                                       bool isNoEscape,
-                                       DifferentiabilityKind diffKind) {
-      return ((unsigned) rep)
-              | (isPseudogeneric ? PseudogenericMask : 0)
-              | (isNoEscape ? NoEscapeMask : 0)
-              | (((unsigned)diffKind << DifferentiabilityMaskOffset)
-                 & DifferentiabilityMask);
-    }
+    ExtInfo(unsigned Bits, Uncommon Other) : Bits(Bits), Other(Other) {}
 
     friend class SILFunctionType;
   public:
@@ -4025,19 +4119,13 @@ public:
     // Constructor for polymorphic type.
     ExtInfo(Representation rep, bool isPseudogeneric, bool isNoEscape,
             DifferentiabilityKind diffKind,
-            const clang::Type *type)
-      : ExtInfo(makeBits(rep, isPseudogeneric, isNoEscape, diffKind),
+            const clang::FunctionType *type)
+      : ExtInfo(((unsigned) rep)
+                  | (isPseudogeneric ? PseudogenericMask : 0)
+                  | (isNoEscape ? NoEscapeMask : 0)
+                  | (((unsigned)diffKind << DifferentiabilityMaskOffset)
+                     & DifferentiabilityMask),
                 Uncommon(type)) {
-    }
-
-    ExtInfo(AnyFunctionType::ExtInfo info, bool isPseudogeneric)
-      : ExtInfo(makeBits(info.getSILRepresentation(),
-                         isPseudogeneric,
-                         info.isNoEscape(),
-                         info.getDifferentiabilityKind()),
-                info.getUncommonInfo().hasValue()
-                ? Uncommon(info.getUncommonInfo().getValue())
-                : Uncommon(nullptr)) {
     }
 
     static ExtInfo getThin() {
@@ -4126,8 +4214,12 @@ public:
       return ExtInfo(NoEscape ? (Bits | NoEscapeMask) : (Bits & ~NoEscapeMask),
                      Other);
     }
-    ExtInfo withClangFunctionType(const clang::Type *type) const {
-      return ExtInfo(Bits, Uncommon(type));
+    ExtInfo
+    withDifferentiabilityKind(DifferentiabilityKind differentiability) const {
+      return ExtInfo(
+          (Bits & ~DifferentiabilityMask) |
+              ((unsigned)differentiability << DifferentiabilityMaskOffset),
+          Other);
     }
 
     std::pair<unsigned, const void *> getFuncAttrKey() const {
@@ -4386,6 +4478,28 @@ public:
     return getParameters().back();
   }
 
+  struct IndirectMutatingParameterFilter {
+    bool operator()(SILParameterInfo param) const {
+      return param.isIndirectMutating();
+    }
+  };
+  using IndirectMutatingParameterIter =
+      llvm::filter_iterator<const SILParameterInfo *,
+                            IndirectMutatingParameterFilter>;
+  using IndirectMutatingParameterRange =
+      iterator_range<IndirectMutatingParameterIter>;
+
+  /// A range of SILParameterInfo for all indirect mutating parameters.
+  IndirectMutatingParameterRange getIndirectMutatingParameters() const {
+    return llvm::make_filter_range(getParameters(),
+                                   IndirectMutatingParameterFilter());
+  }
+
+  /// Returns the number of indirect mutating parameters.
+  unsigned getNumIndirectMutatingParameters() const {
+    return llvm::count_if(getParameters(), IndirectMutatingParameterFilter());
+  }
+
   /// Get the generic signature used to apply the substitutions of a substituted function type
   CanGenericSignature getSubstGenericSignature() const {
     return GenericSigAndIsImplied.getPointer();
@@ -4424,7 +4538,151 @@ public:
     return WitnessMethodConformance;
   }
 
-  const clang::Type *getClangFunctionType() const;
+  const clang::FunctionType *getClangFunctionType() const;
+
+  /// Given that `this` is a `@differentiable` or `@differentiable(linear)`
+  /// function type, returns an `IndexSubset` corresponding to the
+  /// differentiability/linearity parameters (e.g. all parameters except the
+  /// `@noDerivative` ones).
+  IndexSubset *getDifferentiabilityParameterIndices();
+
+  /// Returns the `@differentiable` or `@differentiable(linear)` function type
+  /// for the given differentiability kind and parameter indices representing
+  /// differentiability/linearity parameters.
+  CanSILFunctionType getWithDifferentiability(DifferentiabilityKind kind,
+                                              IndexSubset *parameterIndices);
+
+  /// Returns the SIL function type stripping differentiability kind and
+  /// differentiability from all parameters.
+  CanSILFunctionType getWithoutDifferentiability();
+
+  /// Returns the type of the derivative function for the given parameter
+  /// indices, result index, derivative function kind, derivative function
+  /// generic signature (optional), and other auxiliary parameters.
+  ///
+  /// Preconditions:
+  /// - Parameters corresponding to parameter indices must conform to
+  ///   `Differentiable`.
+  /// - The result corresponding to the result index must conform to
+  ///   `Differentiable`.
+  ///
+  /// Typing rules, given:
+  /// - Original function type: $(T0, T1, ...) -> (R0, R1, ...)
+  ///
+  /// Terminology:
+  /// - The derivative of a `Differentiable`-conforming type has the
+  ///   `TangentVector` associated type. `TangentVector` is abbreviated as `Tan`
+  ///   below.
+  /// - "wrt" parameters refers to parameters indicated by the parameter
+  ///   indices.
+  /// - "wrt" result refers to the result indicated by the result index.
+  ///
+  /// JVP derivative type:
+  /// - Takes original parameters.
+  /// - Returns original results, followed by a differential function, which
+  ///   takes "wrt" parameter derivatives and returns a "wrt" result derivative.
+  ///
+  /// \verbatim
+  ///     $(T0, ...) -> (R0, ...,  (T0.Tan, T1.Tan, ...) -> R0.Tan)
+  ///                    ^~~~~~~    ^~~~~~~~~~~~~~~~~~~     ^~~~~~
+  ///          original results | derivatives wrt params | derivative wrt result
+  /// \endverbatim
+  ///
+  /// VJP derivative type:
+  /// - Takes original parameters.
+  /// - Returns original results, followed by a pullback function, which
+  ///   takes a "wrt" result derivative and returns "wrt" parameter derivatives.
+  ///
+  /// \verbatim
+  ///     $(T0, ...) -> (R0, ...,       (R0.Tan)  ->     (T0.Tan, T1.Tan, ...))
+  ///                    ^~~~~~~         ^~~~~~            ^~~~~~~~~~~~~~~~~~~
+  ///          original results | derivative wrt result | derivatives wrt params
+  /// \endverbatim
+  ///
+  /// The original type may have `inout` parameters. If so, the
+  /// differential/pullback typing rules are more nuanced: see documentation for
+  /// `getAutoDiffDerivativeFunctionLinearMapType` for details. Semantically,
+  /// `inout` parameters behave as both parameters and results.
+  ///
+  /// A "constrained derivative generic signature" is computed from
+  /// `derivativeFunctionGenericSignature`, if specified. Otherwise, it is
+  /// computed from the original generic signature. A "constrained derivative
+  /// generic signature" requires all "wrt" parameters to conform to
+  /// `Differentiable`; this is important for correctness.
+  ///
+  /// This "constrained derivative generic signature" is used for
+  /// parameter/result type lowering. It is used as the actual generic signature
+  /// of the derivative function type iff the original function type has a
+  /// generic signature and not all generic parameters are bound to concrete
+  /// types. Otherwise, no derivative generic signature is used.
+  ///
+  /// Other properties of the original function type are copied exactly:
+  /// `ExtInfo`, coroutine kind, callee convention, yields, optional error
+  /// result, witness method conformance, etc.
+  ///
+  /// Special cases:
+  /// - Reabstraction thunks have special derivative type calculation. The
+  ///   original function-typed last parameter is transformed into a
+  ///   `@differentiable` function-typed parameter in the derivative type. This
+  ///   is necessary for the differentiation transform to support reabstraction
+  ///   thunk differentiation because the function argument is opaque and cannot
+  ///   be differentiated. Instead, the argument is made `@differentiable` and
+  ///   reabstraction thunk JVP/VJP callers are responsible for passing a
+  ///   `@differentiable` function.
+  ///   - TODO(TF-1036): Investigate more efficient reabstraction thunk
+  ///     derivative approaches. The last argument can simply be a
+  ///     corresponding derivative function, instead of a `@differentiable`
+  ///     function - this is more direct. It may be possible to implement
+  ///     reabstraction thunk derivatives using "reabstraction thunks for
+  ///     the original function's derivative", avoiding extra code generation.
+  ///
+  /// Caveats:
+  /// - We may support multiple result indices instead of a single result index
+  ///   eventually. At the SIL level, this enables differentiating wrt multiple
+  ///   function results. At the Swift level, this enables differentiating wrt
+  ///   multiple tuple elements for tuple-returning functions.
+  CanSILFunctionType getAutoDiffDerivativeFunctionType(
+      IndexSubset *parameterIndices, unsigned resultIndex,
+      AutoDiffDerivativeFunctionKind kind, Lowering::TypeConverter &TC,
+      LookupConformanceFn lookupConformance,
+      CanGenericSignature derivativeFunctionGenericSignature = nullptr,
+      bool isReabstractionThunk = false);
+
+  /// Returns the type of the transpose function for the given parameter
+  /// indices, transpose function generic signature (optional), and other
+  /// auxiliary parameters.
+  ///
+  /// Preconditions:
+  /// - Linearity parameters corresponding to parameter indices must conform to
+  ///   `Differentiable` and satisfy `Self == Self.TangentVector`.
+  ///
+  /// Typing rules, given:
+  /// - Original function type: $(T0, T1, ...) -> (R0, R1, ...)
+  ///
+  /// Transpose function type:
+  /// - Takes non-linearity parameters, followed by original results, as
+  ///   parameters.
+  /// - Returns linearity parameters.
+  ///
+  /// A "constrained transpose generic signature" is computed from
+  /// `transposeFunctionGenericSignature`, if specified. Otherwise, it is
+  /// computed from the original generic signature. A "constrained transpose
+  /// generic signature" requires all linearity parameters to conform to
+  /// `Differentiable` and to satisfy `Self == Self.TangentVector`; this is
+  /// important for correctness.
+  ///
+  /// This "constrained transpose generic signature" is used for
+  /// parameter/result type lowering. It is used as the actual generic signature
+  /// of the transpose function type iff the original function type has a
+  /// generic signature and not all generic parameters are bound to concrete
+  /// types. Otherwise, no transpose generic signature is used.
+  ///
+  /// Other properties of the original function type are copied exactly:
+  /// `ExtInfo`, callee convention, witness method conformance, etc.
+  CanSILFunctionType getAutoDiffTransposeFunctionType(
+      IndexSubset *parameterIndices, Lowering::TypeConverter &TC,
+      LookupConformanceFn lookupConformance,
+      CanGenericSignature transposeFunctionGenericSignature = nullptr);
 
   ExtInfo getExtInfo() const {
     return ExtInfo(Bits.SILFunctionType.ExtInfoBits, getClangFunctionType());

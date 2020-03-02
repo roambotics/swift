@@ -695,7 +695,7 @@ void CodeCompletionResult::print(raw_ostream &OS) const {
     Prefix.append(Twine(NumBytesToErase).str());
     Prefix.append("]");
   }
-  switch (TypeDistance) {
+  switch (getExpectedTypeRelation()) {
     case ExpectedTypeRelation::Invalid:
       Prefix.append("/TypeRelation[Invalid]");
       break;
@@ -705,6 +705,8 @@ void CodeCompletionResult::print(raw_ostream &OS) const {
     case ExpectedTypeRelation::Convertible:
       Prefix.append("/TypeRelation[Convertible]");
       break;
+    case ExpectedTypeRelation::NotApplicable:
+    case ExpectedTypeRelation::Unknown:
     case ExpectedTypeRelation::Unrelated:
       break;
   }
@@ -886,6 +888,11 @@ calculateTypeRelationForDecl(const Decl *D, Type ExpectedType,
       return relation;
     }
   }
+  if (auto EED = dyn_cast<EnumElementDecl>(VD)) {
+    return calculateTypeRelation(
+        EED->getParentEnum()->TypeDecl::getDeclaredInterfaceType(),
+        ExpectedType, DC);
+  }
   if (auto NTD = dyn_cast<NominalTypeDecl>(VD)) {
     return std::max(
         calculateTypeRelation(NTD->getInterfaceType(), ExpectedType, DC),
@@ -898,6 +905,9 @@ static CodeCompletionResult::ExpectedTypeRelation
 calculateMaxTypeRelationForDecl(
     const Decl *D, const ExpectedTypeContext &typeContext,
     bool IsImplicitlyCurriedInstanceMethod = false) {
+  if (typeContext.empty())
+    return CodeCompletionResult::ExpectedTypeRelation::Unknown;
+
   auto Result = CodeCompletionResult::ExpectedTypeRelation::Unrelated;
   for (auto Type : typeContext.possibleTypes) {
     // Do not use Void type context for a single-expression body, since the
@@ -1029,7 +1039,7 @@ CodeCompletionResult *CodeCompletionResultBuilder::takeResult() {
     }
 
     auto typeRelation = ExpectedTypeRelation;
-    if (typeRelation == CodeCompletionResult::Unrelated)
+    if (typeRelation == CodeCompletionResult::Unknown)
       typeRelation =
           calculateMaxTypeRelationForDecl(AssociatedDecl, declTypeContext);
 
@@ -1365,7 +1375,7 @@ public:
                               Optional<StmtKind> ParentKind) override;
   void completeAfterPoundDirective() override;
   void completePlatformCondition() override;
-  void completeGenericParams(TypeLoc TL) override;
+  void completeGenericRequirement() override;
   void completeAfterIfStmt(bool hasElse) override;
 
   void doneParsing() override;
@@ -1453,7 +1463,8 @@ class CompletionLookup final : public swift::VisibleDeclConsumer {
     EnumElement,
     Type,
     TypeInDeclContext,
-    ImportFromModule
+    ImportFromModule,
+    GenericRequirement,
   };
 
   LookupKind Kind;
@@ -1553,6 +1564,25 @@ private:
       }
     }
     return false;
+  }
+
+  /// Returns \c true if \p TAD is usable as a first type of a requirement in
+  /// \c where clause for a context.
+  /// \p selfTy must be a \c Self type of the context.
+  static bool canBeUsedAsRequirementFirstType(Type selfTy, TypeAliasDecl *TAD) {
+    auto T = TAD->getDeclaredInterfaceType();
+    auto subMap = selfTy->getMemberSubstitutionMap(TAD->getParentModule(), TAD);
+    T = T.subst(subMap)->getCanonicalType();
+
+    ArchetypeType *archeTy = T->getAs<ArchetypeType>();
+    if (!archeTy)
+      return false;
+    archeTy = archeTy->getRoot();
+
+    // For protocol, the 'archeTy' should match with the 'baseTy' which is the
+    // dynamic 'Self' type of the protocol. For nominal decls, 'archTy' should
+    // be one of the generic params in 'selfTy'. Search 'archeTy' in 'baseTy'.
+    return selfTy.findIf([&](Type T) { return archeTy->isEqual(T); });
   }
 
 public:
@@ -1710,6 +1740,7 @@ public:
     ImportFilter |= ModuleDecl::ImportFilterKind::Public;
     ImportFilter |= ModuleDecl::ImportFilterKind::Private;
     ImportFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
+    // FIXME: ImportFilterKind::ShadowedBySeparateOverlay?
 
     SmallVector<ModuleDecl::ImportedModule, 16> Imported;
     SmallVector<ModuleDecl::ImportedModule, 16> FurtherImported;
@@ -2502,6 +2533,7 @@ public:
     case LookupKind::EnumElement:
     case LookupKind::Type:
     case LookupKind::TypeInDeclContext:
+    case LookupKind::GenericRequirement:
       llvm_unreachable("cannot have a method call while doing a "
                        "type completion");
     case LookupKind::ImportFromModule:
@@ -3140,13 +3172,19 @@ public:
         return;
       }
 
-      if (auto *TAD = dyn_cast<TypeAliasDecl>(D)) {
-        addTypeAliasRef(TAD, Reason, dynamicLookupInfo);
+      if (auto *GP = dyn_cast<GenericTypeParamDecl>(D)) {
+        addGenericTypeParamRef(GP, Reason, dynamicLookupInfo);
         return;
       }
 
-      if (auto *GP = dyn_cast<GenericTypeParamDecl>(D)) {
-        addGenericTypeParamRef(GP, Reason, dynamicLookupInfo);
+      LLVM_FALLTHROUGH;
+    case LookupKind::GenericRequirement:
+
+      if (TypeAliasDecl *TAD = dyn_cast<TypeAliasDecl>(D)) {
+        if (Kind == LookupKind::GenericRequirement &&
+            !canBeUsedAsRequirementFirstType(BaseType, TAD))
+          return;
+        addTypeAliasRef(TAD, Reason, dynamicLookupInfo);
         return;
       }
 
@@ -3605,8 +3643,13 @@ public:
     }
 
     // Fallback to showing the default type.
-    if (!defaultTypeName.empty())
+    if (!defaultTypeName.empty()) {
       builder.addTypeAnnotation(defaultTypeName);
+      builder.setExpectedTypeRelation(
+          expectedTypeContext.possibleTypes.empty()
+              ? CodeCompletionResult::ExpectedTypeRelation::Unknown
+              : CodeCompletionResult::ExpectedTypeRelation::Unrelated);
+    }
   }
 
   /// Add '#file', '#line', et at.
@@ -3904,6 +3947,33 @@ public:
     } else if (!BaseType->is<ModuleType>()) {
       addKeyword("Type", MetatypeType::get(BaseType));
     }
+  }
+
+  void getGenericRequirementCompletions(DeclContext *DC) {
+    auto genericSig = DC->getGenericSignatureOfContext();
+    if (!genericSig)
+      return;
+
+    for (auto GPT : genericSig->getGenericParams()) {
+      addGenericTypeParamRef(GPT->getDecl(),
+                             DeclVisibilityKind::GenericParameter, {});
+    }
+
+    // For non-protocol nominal type decls, only suggest generic parameters.
+    if (auto D = DC->getAsDecl())
+      if (isa<NominalTypeDecl>(D) && !isa<ProtocolDecl>(D))
+        return;
+
+    auto typeContext = DC->getInnermostTypeContext();
+    if (!typeContext)
+      return;
+
+    auto selfTy = typeContext->getSelfTypeInContext();
+    Kind = LookupKind::GenericRequirement;
+    this->BaseType = selfTy;
+    NeedLeadingDot = false;
+    lookupVisibleMemberDecls(*this, MetatypeType::get(selfTy),
+                             CurrDeclContext, IncludeInstanceMembers);
   }
 
   static bool canUseAttributeOnDecl(DeclAttrKind DAK, bool IsInSil,
@@ -4303,6 +4373,8 @@ public:
     CodeCompletionResultBuilder Builder(
         Sink, CodeCompletionResult::ResultKind::Declaration,
         SemanticContextKind::Super, {});
+    Builder.setExpectedTypeRelation(
+        CodeCompletionResult::ExpectedTypeRelation::NotApplicable);
     Builder.setAssociatedDecl(FD);
     addValueOverride(FD, Reason, dynamicLookupInfo, Builder, hasFuncIntroducer);
     Builder.addBraceStmtWithCursor();
@@ -4330,6 +4402,8 @@ public:
     CodeCompletionResultBuilder Builder(
         Sink, CodeCompletionResult::ResultKind::Declaration,
         SemanticContextKind::Super, {});
+    Builder.setExpectedTypeRelation(
+        CodeCompletionResult::ExpectedTypeRelation::NotApplicable);
     Builder.setAssociatedDecl(SD);
     addValueOverride(SD, Reason, dynamicLookupInfo, Builder, false);
     Builder.addBraceStmtWithCursor();
@@ -4340,6 +4414,8 @@ public:
     CodeCompletionResultBuilder Builder(Sink,
       CodeCompletionResult::ResultKind::Declaration,
       SemanticContextKind::Super, {});
+    Builder.setExpectedTypeRelation(
+        CodeCompletionResult::ExpectedTypeRelation::NotApplicable);
     Builder.setAssociatedDecl(ATD);
     if (!hasTypealiasIntroducer && !hasAccessModifier)
       addAccessControl(ATD, Builder);
@@ -4356,6 +4432,8 @@ public:
         Sink,
         CodeCompletionResult::ResultKind::Declaration,
         SemanticContextKind::Super, {});
+    Builder.setExpectedTypeRelation(
+        CodeCompletionResult::ExpectedTypeRelation::NotApplicable);
     Builder.setAssociatedDecl(CD);
 
     if (!hasAccessModifier)
@@ -4807,10 +4885,9 @@ void CodeCompletionCallbacksImpl::completeAfterIfStmt(bool hasElse) {
   }
 }
 
-void CodeCompletionCallbacksImpl::completeGenericParams(TypeLoc TL) {
+void CodeCompletionCallbacksImpl::completeGenericRequirement() {
   CurDeclContext = P.CurDeclContext;
-  Kind = CompletionKind::GenericParams;
-  ParsedTypeLoc = TL;
+  Kind = CompletionKind::GenericRequirement;
 }
 
 void CodeCompletionCallbacksImpl::completeNominalMemberBeginning(
@@ -4840,16 +4917,19 @@ static bool isClangSubModule(ModuleDecl *TheModule) {
   return false;
 }
 
-static void addKeyword(CodeCompletionResultSink &Sink, StringRef Name,
-                       CodeCompletionKeywordKind Kind,
-                       StringRef TypeAnnotation = "") {
-    CodeCompletionResultBuilder Builder(
-        Sink, CodeCompletionResult::ResultKind::Keyword,
-        SemanticContextKind::None, {});
-    Builder.setKeywordKind(Kind);
-    Builder.addTextChunk(Name);
-    if (!TypeAnnotation.empty())
-      Builder.addTypeAnnotation(TypeAnnotation);
+static void
+addKeyword(CodeCompletionResultSink &Sink, StringRef Name,
+           CodeCompletionKeywordKind Kind, StringRef TypeAnnotation = "",
+           CodeCompletionResult::ExpectedTypeRelation TypeRelation =
+               CodeCompletionResult::ExpectedTypeRelation::NotApplicable) {
+  CodeCompletionResultBuilder Builder(Sink,
+                                      CodeCompletionResult::ResultKind::Keyword,
+                                      SemanticContextKind::None, {});
+  Builder.setKeywordKind(Kind);
+  Builder.addTextChunk(Name);
+  if (!TypeAnnotation.empty())
+    Builder.addTypeAnnotation(TypeAnnotation);
+  Builder.setExpectedTypeRelation(TypeRelation);
 }
 
 static void addDeclKeywords(CodeCompletionResultSink &Sink) {
@@ -4942,7 +5022,7 @@ void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink,
   case CompletionKind::AfterPoundExpr:
   case CompletionKind::AfterPoundDirective:
   case CompletionKind::PlatformConditon:
-  case CompletionKind::GenericParams:
+  case CompletionKind::GenericRequirement:
   case CompletionKind::KeyPathExprObjC:
   case CompletionKind::KeyPathExprSwift:
   case CompletionKind::PrecedenceGroup:
@@ -5213,7 +5293,7 @@ void CodeCompletionCallbacksImpl::doneParsing() {
   }
   if (auto *DRE = dyn_cast_or_null<DeclRefExpr>(ParsedExpr)) {
     Lookup.setIsSelfRefExpr(DRE->getDecl()->getFullName() == Context.Id_self);
-  } else if (auto *SRE = dyn_cast_or_null<SuperRefExpr>(ParsedExpr)) {
+  } else if (ParsedExpr && isa<SuperRefExpr>(ParsedExpr)) {
     Lookup.setIsSuperRefExpr();
   }
 
@@ -5270,12 +5350,20 @@ void CodeCompletionCallbacksImpl::doneParsing() {
       for (auto T : ContextInfo.getPossibleTypes()) {
         if (auto unwrapped = T->getOptionalObjectType())
           T = unwrapped;
-        if (!T->getAnyNominal() || !T->getAnyNominal()->getKeyPathTypeKind() ||
-            T->hasUnresolvedType() || !T->is<BoundGenericType>())
-          continue;
-        // Use the first KeyPath context type found.
-        baseType = T->castTo<BoundGenericType>()->getGenericArgs()[0];
-        break;
+
+        // If the context type is any of the KeyPath types, use it.
+        if (T->getAnyNominal() && T->getAnyNominal()->getKeyPathTypeKind() &&
+            !T->hasUnresolvedType() && T->is<BoundGenericType>()) {
+          baseType = T->castTo<BoundGenericType>()->getGenericArgs()[0];
+          break;
+        }
+
+        // KeyPath can be used as a function that receives its root type.
+        if (T->is<AnyFunctionType>() &&
+            T->castTo<AnyFunctionType>()->getNumParams() == 1) {
+          baseType = T->castTo<AnyFunctionType>()->getParams()[0].getOldType();
+          break;
+        }
       }
     }
     if (!OnRoot && KPE->getComponents().back().getKind() ==
@@ -5524,15 +5612,8 @@ void CodeCompletionCallbacksImpl::doneParsing() {
     break;
   }
 
-  case CompletionKind::GenericParams:
-    if (auto GT = ParsedTypeLoc.getType()->getAnyGeneric()) {
-      if (auto Params = GT->getGenericParams()) {
-        for (auto GP : Params->getParams()) {
-          Lookup.addGenericTypeParamRef(
-              GP, DeclVisibilityKind::GenericParameter, {});
-        }
-      }
-    }
+  case CompletionKind::GenericRequirement:
+    Lookup.getGenericRequirementCompletions(CurDeclContext);
     break;
   case CompletionKind::PrecedenceGroup:
     Lookup.getPrecedenceGroupCompletions(SyntxKind);
@@ -5614,6 +5695,7 @@ void CodeCompletionCallbacksImpl::doneParsing() {
       ImportFilter |= ModuleDecl::ImportFilterKind::Public;
       ImportFilter |= ModuleDecl::ImportFilterKind::Private;
       ImportFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
+      // FIXME: ImportFilterKind::ShadowedBySeparateOverlay?
       SmallVector<ModuleDecl::ImportedModule, 4> Imports;
       auto *SF = CurDeclContext->getParentSourceFile();
       SF->getImportedModules(Imports, ImportFilter);

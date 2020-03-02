@@ -17,6 +17,7 @@
 #include "SILGenFunctionBuilder.h"
 #include "Scope.h"
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/AST/Evaluator.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/NameLookup.h"
@@ -34,6 +35,7 @@
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILProfiler.h"
+#include "swift/AST/SILGenRequests.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/Serialization/SerializedSILLoader.h"
 #include "swift/Strings.h"
@@ -452,6 +454,8 @@ SILGenModule::getKeyPathProjectionCoroutine(bool isReadAccess,
 
 SILFunction *SILGenModule::emitTopLevelFunction(SILLocation Loc) {
   ASTContext &C = getASTContext();
+  auto extInfo = SILFunctionType::ExtInfo()
+    .withRepresentation(SILFunctionType::Representation::CFunctionPointer);
 
   // Use standard library types if we have them; otherwise, fall back to
   // builtins.
@@ -482,19 +486,13 @@ SILFunction *SILGenModule::emitTopLevelFunction(SILLocation Loc) {
     SILParameterInfo(PtrPtrInt8Ty, ParameterConvention::Direct_Unowned),
   };
 
-  SILResultInfo results[] = {SILResultInfo(Int32Ty, ResultConvention::Unowned)};
-
-  auto rep = SILFunctionType::Representation::CFunctionPointer;
-  auto incompleteExtInfo = SILFunctionType::ExtInfo();
-  auto *clangTy = C.getCanonicalClangFunctionType(params, results[0],
-                                                  incompleteExtInfo, rep);
-  auto extInfo = incompleteExtInfo.withRepresentation(rep)
-                                  .withClangFunctionType(clangTy);
-
   CanSILFunctionType topLevelType = SILFunctionType::get(nullptr, extInfo,
                                    SILCoroutineKind::None,
                                    ParameterConvention::Direct_Unowned,
-                                   params, /*yields*/ {}, results, None,
+                                   params, /*yields*/ {},
+                                   SILResultInfo(Int32Ty,
+                                                 ResultConvention::Unowned),
+                                   None,
                                    SubstitutionMap(), false,
                                    C);
 
@@ -555,7 +553,7 @@ static bool haveProfiledAssociatedFunction(SILDeclRef constant) {
 /// Set up the function for profiling instrumentation.
 static void setUpForProfiling(SILDeclRef constant, SILFunction *F,
                               ForDefinition_t forDefinition) {
-  if (!forDefinition)
+  if (!forDefinition || F->getProfiler())
     return;
 
   ASTNode profiledNode;
@@ -614,9 +612,13 @@ SILFunction *SILGenModule::getFunction(SILDeclRef constant,
 
   // Note: Do not provide any SILLocation. You can set it afterwards.
   SILGenFunctionBuilder builder(*this);
-  auto *F = builder.getOrCreateFunction(constant.hasDecl() ? constant.getDecl()
-                                                           : (Decl *)nullptr,
-                                        constant, forDefinition);
+  auto &IGM = *this;
+  auto *F = builder.getOrCreateFunction(
+      constant.hasDecl() ? constant.getDecl() : (Decl *)nullptr, constant,
+      forDefinition,
+      [&IGM](SILLocation loc, SILDeclRef constant) -> SILFunction * {
+        return IGM.getFunction(constant, NotForDefinition);
+      });
   setUpForProfiling(constant, F, forDefinition);
 
   assert(F && "SILFunction should have been defined");
@@ -810,7 +812,8 @@ void SILGenModule::emitFunction(FuncDecl *fd) {
   emitAbstractFuncDecl(fd);
 
   if (fd->hasBody()) {
-    FrontendStatsTracer Tracer(getASTContext().Stats, "SILGen-funcdecl", fd);
+    FrontendStatsTracer Tracer(getASTContext().Stats,
+                               "SILGen-funcdecl", fd);
     PrettyStackTraceDecl stackTrace("emitting SIL for", fd);
 
     SILDeclRef constant(decl);
@@ -1355,6 +1358,24 @@ SILGenModule::canStorageUseStoredKeyPathComponent(AbstractStorageDecl *decl,
     // unowned properties.
     if (decl->getInterfaceType()->is<ReferenceStorageType>())
       return false;
+
+    // If the field offset depends on the generic instantiation, we have to
+    // load it from metadata when instantiating the keypath component.
+    //
+    // However the metadata offset itself will not be fixed if the superclass
+    // is resilient. Fall back to treating the property as computed in this
+    // case.
+    //
+    // See the call to getClassFieldOffsetOffset() inside
+    // emitKeyPathComponent().
+    if (auto *parentClass = dyn_cast<ClassDecl>(decl->getDeclContext())) {
+      if (parentClass->isGeneric()) {
+        auto ancestry = parentClass->checkAncestry();
+        if (ancestry.contains(AncestryFlags::ResilientOther))
+          return false;
+      }
+    }
+
     // If the stored value would need to be reabstracted in fully opaque
     // context, then we have to treat the component as computed.
     auto componentObjTy = decl->getValueInterfaceType();
@@ -1462,6 +1483,7 @@ void SILGenModule::tryEmitPropertyDescriptor(AbstractStorageDecl *decl) {
                                                baseOperand, needsGenericContext,
                                                subs, decl, {},
                                                baseTy->getCanonicalType(),
+                                               M.getSwiftModule(),
                                                /*property descriptor*/ true);
   
   (void)SILProperty::create(M, /*serialized*/ false, decl, component);
@@ -1540,7 +1562,7 @@ public:
       sgm.TopLevelSGF = new SILGenFunction(sgm, *toplevel, sf);
       sgm.TopLevelSGF->MagicFunctionName = sgm.SwiftModule->getName();
       auto moduleCleanupLoc = CleanupLocation::getModuleCleanupLocation();
-      sgm.TopLevelSGF->prepareEpilog(Type(), true, moduleCleanupLoc);
+      sgm.TopLevelSGF->prepareEpilog(false, true, moduleCleanupLoc);
 
       // Create the argc and argv arguments.
       auto prologueLoc = RegularLocation::getModuleLocation();
@@ -1669,98 +1691,112 @@ public:
   }
 };
 
+// An RAII object that constructs a \c SILGenModule instance.
+// On destruction, delayed definitions are automatically emitted.
+class SILGenModuleRAII {
+  SILGenModule SGM;
+
+public:
+  void emitSourceFile(SourceFile *sf) {
+    SourceFileScope scope(SGM, sf);
+    for (Decl *D : sf->getTopLevelDecls()) {
+      FrontendStatsTracer StatsTracer(SGM.getASTContext().Stats,
+                                      "SILgen-decl", D);
+      SGM.visit(D);
+    }
+
+    for (TypeDecl *TD : sf->LocalTypeDecls) {
+      FrontendStatsTracer StatsTracer(SGM.getASTContext().Stats,
+                                      "SILgen-tydecl", TD);
+      // FIXME: Delayed parsing would prevent these types from being added to
+      //        the module in the first place.
+      if (TD->getDeclContext()->getInnermostSkippedFunctionContext())
+        continue;
+      SGM.visit(TD);
+    }
+  }
+
+  SILGenModuleRAII(SILModule &M, ModuleDecl *SM) : SGM{M, SM} {}
+
+  ~SILGenModuleRAII() {
+    // Emit any delayed definitions that were forced.
+    // Emitting these may in turn force more definitions, so we have to take
+    // care to keep pumping the queues.
+    while (!SGM.forcedFunctions.empty()
+           || !SGM.pendingConformances.empty()) {
+      while (!SGM.forcedFunctions.empty()) {
+        auto &front = SGM.forcedFunctions.front();
+        front.second.emitter(SGM.getFunction(front.first, ForDefinition));
+        SGM.forcedFunctions.pop_front();
+      }
+      while (!SGM.pendingConformances.empty()) {
+        SGM.getWitnessTable(SGM.pendingConformances.front());
+        SGM.pendingConformances.pop_front();
+      }
+    }
+  }
+};
 } // end anonymous namespace
 
-void SILGenModule::emitSourceFile(SourceFile *sf) {
-  SourceFileScope scope(*this, sf);
-  FrontendStatsTracer StatsTracer(getASTContext().Stats, "SILgen-file", sf);
-  for (Decl *D : sf->getTopLevelDecls()) {
-    FrontendStatsTracer StatsTracer(getASTContext().Stats, "SILgen-decl", D);
-    visit(D);
+llvm::Expected<std::unique_ptr<SILModule>>
+SILGenSourceFileRequest::evaluate(Evaluator &evaluator,
+                                  SILGenDescriptor desc) const {
+  auto *unit = desc.context.get<FileUnit *>();
+  auto *mod = unit->getParentModule();
+  auto M = std::unique_ptr<SILModule>(
+      new SILModule(mod, desc.conv, desc.opts, unit, /*wholeModule*/ false));
+  SILGenModuleRAII scope(*M, mod);
+
+  if (auto *file = dyn_cast<SourceFile>(unit)) {
+    scope.emitSourceFile(file);
+  } else if (auto *file = dyn_cast<SerializedASTFile>(unit)) {
+    if (file->isSIB())
+      M->getSILLoader()->getAllForModule(mod->getName(), file);
   }
 
-  for (TypeDecl *TD : sf->LocalTypeDecls) {
-    FrontendStatsTracer StatsTracer(getASTContext().Stats, "SILgen-tydecl", TD);
-    // FIXME: Delayed parsing would prevent these types from being added to the
-    //        module in the first place.
-    if (TD->getDeclContext()->getInnermostSkippedFunctionContext())
-      continue;
-    visit(TD);
-  }
+  return std::move(M);
 }
 
-//===----------------------------------------------------------------------===//
-// SILModule::constructSIL method implementation
-//===----------------------------------------------------------------------===//
+llvm::Expected<std::unique_ptr<SILModule>>
+SILGenWholeModuleRequest::evaluate(Evaluator &evaluator,
+                                   SILGenDescriptor desc) const {
+  auto *mod = desc.context.get<ModuleDecl *>();
+  auto M = std::unique_ptr<SILModule>(
+      new SILModule(mod, desc.conv, desc.opts, mod, /*wholeModule*/ true));
+  SILGenModuleRAII scope(*M, mod);
 
-std::unique_ptr<SILModule>
-SILModule::constructSIL(ModuleDecl *mod, TypeConverter &tc,
-                        const SILOptions &options, FileUnit *SF) {
-  FrontendStatsTracer tracer(mod->getASTContext().Stats, "SILGen");
-  const DeclContext *DC;
-  if (SF) {
-    DC = SF;
-  } else {
-    DC = mod;
+  for (auto file : mod->getFiles()) {
+    auto nextSF = dyn_cast<SourceFile>(file);
+    if (!nextSF || nextSF->ASTStage != SourceFile::TypeChecked)
+      continue;
+    scope.emitSourceFile(nextSF);
   }
 
-  std::unique_ptr<SILModule> M(
-      new SILModule(mod, tc, options, DC, /*wholeModule*/ SF == nullptr));
-  SILGenModule SGM(*M, mod);
+  // Also make sure to process any intermediate files that may contain SIL
+  bool hasSIB = std::any_of(mod->getFiles().begin(),
+                            mod->getFiles().end(),
+                            [](const FileUnit *File) -> bool {
+    auto *SASTF = dyn_cast<SerializedASTFile>(File);
+    return SASTF && SASTF->isSIB();
+  });
+  if (hasSIB)
+    M->getSILLoader()->getAllForModule(mod->getName(), nullptr);
 
-  if (SF) {
-    if (auto *file = dyn_cast<SourceFile>(SF)) {
-      SGM.emitSourceFile(file);
-    } else if (auto *file = dyn_cast<SerializedASTFile>(SF)) {
-      if (file->isSIB())
-        M->getSILLoader()->getAllForModule(mod->getName(), file);
-    }
-  } else {
-    for (auto file : mod->getFiles()) {
-      auto nextSF = dyn_cast<SourceFile>(file);
-      if (!nextSF || nextSF->ASTStage != SourceFile::TypeChecked)
-        continue;
-      SGM.emitSourceFile(nextSF);
-    }
-
-    // Also make sure to process any intermediate files that may contain SIL
-    bool hasSIB = std::any_of(mod->getFiles().begin(),
-                              mod->getFiles().end(),
-                              [](const FileUnit *File) -> bool {
-      auto *SASTF = dyn_cast<SerializedASTFile>(File);
-      return SASTF && SASTF->isSIB();
-    });
-    if (hasSIB)
-      M->getSILLoader()->getAllForModule(mod->getName(), nullptr);
-  }
-
-  // Emit any delayed definitions that were forced.
-  // Emitting these may in turn force more definitions, so we have to take care
-  // to keep pumping the queues.
-  while (!SGM.forcedFunctions.empty()
-         || !SGM.pendingConformances.empty()) {
-    while (!SGM.forcedFunctions.empty()) {
-      auto &front = SGM.forcedFunctions.front();
-      front.second.emitter(SGM.getFunction(front.first, ForDefinition));
-      SGM.forcedFunctions.pop_front();
-    }
-    while (!SGM.pendingConformances.empty()) {
-      SGM.getWitnessTable(SGM.pendingConformances.front());
-      SGM.pendingConformances.pop_front();
-    }
-  }
-
-  return M;
+  return std::move(M);
 }
 
 std::unique_ptr<SILModule>
 swift::performSILGeneration(ModuleDecl *mod, Lowering::TypeConverter &tc,
                             const SILOptions &options) {
-  return SILModule::constructSIL(mod, tc, options, nullptr);
+  auto desc = SILGenDescriptor::forWholeModule(mod, tc, options);
+  return llvm::cantFail(
+      mod->getASTContext().evaluator(SILGenWholeModuleRequest{desc}));
 }
 
 std::unique_ptr<SILModule>
 swift::performSILGeneration(FileUnit &sf, Lowering::TypeConverter &tc,
                             const SILOptions &options) {
-  return SILModule::constructSIL(sf.getParentModule(), tc, options, &sf);
+  auto desc = SILGenDescriptor::forFile(sf, tc, options);
+  return llvm::cantFail(
+      sf.getASTContext().evaluator(SILGenSourceFileRequest{desc}));
 }

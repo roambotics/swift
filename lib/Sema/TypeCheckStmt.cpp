@@ -144,10 +144,10 @@ namespace {
           }
         }
 
-        // If the closure has a single expression body, we need to walk into it
-        // with a new sequence.  Otherwise, it'll have been separately
-        // type-checked.
-        if (CE->hasSingleExpressionBody())
+        // If the closure has a single expression body or has had a function
+        // builder applied to it, we need to walk into it with a new sequence.
+        // Otherwise, it'll have been separately type-checked.
+        if (CE->hasSingleExpressionBody() || CE->hasAppliedFunctionBuilder())
           CE->getBody()->walk(ContextualizeClosures(CE));
 
         TypeChecker::computeCaptures(CE);
@@ -198,7 +198,7 @@ namespace {
       ASTContext &ctx = Function.getAsDeclContext()->getASTContext();
       auto *AFD = Function.getAbstractFunctionDecl();
 
-      if (ctx.TypeCheckerOpts.WarnLongFunctionBodies) {
+      if (ctx.TypeCheckerOpts.DebugTimeFunctionBodies) {
         // Round up to the nearest 100th of a millisecond.
         llvm::errs() << llvm::format("%0.2f", ceil(elapsed * 100000) / 100) << "ms\t";
         Function.getLoc().print(llvm::errs(), ctx.SourceMgr);
@@ -213,7 +213,7 @@ namespace {
         llvm::errs() << "\n";
       }
 
-      const auto WarnLimit = ctx.TypeCheckerOpts.DebugTimeFunctionBodies;
+      const auto WarnLimit = ctx.TypeCheckerOpts.WarnLongFunctionBodies;
       if (WarnLimit != 0 && elapsedMS >= WarnLimit) {
         if (AFD) {
           ctx.Diags.diagnose(AFD, diag::debug_long_function_body,
@@ -408,7 +408,8 @@ public:
   
   template<typename StmtTy>
   bool typeCheckStmt(StmtTy *&S) {
-    FrontendStatsTracer StatsTracer(getASTContext().Stats, "typecheck-stmt", S);
+    FrontendStatsTracer StatsTracer(getASTContext().Stats,
+                                    "typecheck-stmt", S);
     PrettyStackTraceStmt trace(getASTContext(), "type-checking", S);
     StmtTy *S2 = cast_or_null<StmtTy>(visit(S));
     if (S2 == nullptr)
@@ -517,23 +518,6 @@ public:
     
     TypeCheckExprOptions options = {};
     
-    // If the result type is an opaque type, this is an opportunity to resolve
-    // the underlying type.
-    auto isOpaqueReturnTypeOfCurrentFunc = [&](OpaqueTypeDecl *opaque) -> bool {
-      // Closures currently don't support having opaque types.
-      auto funcDecl = TheFunc->getAbstractFunctionDecl();
-      if (!funcDecl)
-        return false;
-
-      return opaque->isOpaqueReturnTypeOfFunction(funcDecl);
-    };
-    
-    if (auto opaque = ResultTy->getAs<OpaqueTypeArchetypeType>()) {
-      if (isOpaqueReturnTypeOfCurrentFunc(opaque->getDecl())) {
-        options |= TypeCheckExprFlags::ConvertTypeIsOpaqueReturnType;
-      }
-    }
-
     if (EndTypeCheckLoc.isValid()) {
       assert(DiagnosticSuppression::isEnabled(getASTContext().Diags) &&
              "Diagnosing and AllowUnresolvedTypeVariables don't seem to mix");
@@ -627,13 +611,6 @@ public:
   }
   
   Stmt *visitThrowStmt(ThrowStmt *TS) {
-    // If the throw is in a defer, then it isn't valid.
-    if (isInDefer()) {
-      getASTContext().Diags.diagnose(TS->getThrowLoc(),
-                                     diag::jump_out_of_defer, "throw");
-      return nullptr;
-    }
-
     // Coerce the operand to the exception type.
     auto E = TS->getSubExpr();
 
@@ -1390,14 +1367,8 @@ static void diagnoseIgnoredLiteral(ASTContext &Ctx, LiteralExpr *LE) {
     case ExprKind::StringLiteral: return "string";
     case ExprKind::InterpolatedStringLiteral: return "string";
     case ExprKind::MagicIdentifierLiteral:
-      switch (cast<MagicIdentifierLiteralExpr>(LE)->getKind()) {
-      case MagicIdentifierLiteralExpr::Kind::File: return "#file";
-      case MagicIdentifierLiteralExpr::Kind::FilePath: return "#filePath";
-      case MagicIdentifierLiteralExpr::Kind::Line: return "#line";
-      case MagicIdentifierLiteralExpr::Kind::Column: return "#column";
-      case MagicIdentifierLiteralExpr::Kind::Function: return "#function";
-      case MagicIdentifierLiteralExpr::Kind::DSOHandle: return "#dsohandle";
-      }
+      return MagicIdentifierLiteralExpr::getKindString(
+          cast<MagicIdentifierLiteralExpr>(LE)->getKind());
     case ExprKind::NilLiteral: return "nil";
     case ExprKind::ObjectLiteral: return "object";
 
@@ -1496,8 +1467,8 @@ void TypeChecker::checkIgnoredExpr(Expr *E) {
         isa<DotSyntaxCallExpr>(E) ? cast<DotSyntaxCallExpr>(E)->getFn() : E;
 
     if (auto *Fn = dyn_cast<ApplyExpr>(expr)) {
-      if (auto *declRef = dyn_cast<DeclRefExpr>(Fn->getFn())) {
-        if (auto *FD = dyn_cast<AbstractFunctionDecl>(declRef->getDecl())) {
+      if (auto *calledValue = Fn->getCalledValue()) {
+        if (auto *FD = dyn_cast<AbstractFunctionDecl>(calledValue)) {
           if (FD->getAttrs().hasAttribute<DiscardableResultAttr>()) {
             isDiscardable = true;
           }
@@ -1961,15 +1932,6 @@ TypeCheckFunctionBodyUntilRequest::evaluate(Evaluator &evaluator,
                                             AbstractFunctionDecl *AFD,
                                             SourceLoc endTypeCheckLoc) const {
   ASTContext &ctx = AFD->getASTContext();
-
-  // Accounting for type checking of function bodies.
-  // FIXME: We could probably take this away, given that the request-evaluator
-  // does much of it for us.
-  FrontendStatsTracer StatsTracer(ctx.Stats, "typecheck-fn", AFD);
-  PrettyStackTraceDecl StackEntry("type-checking", AFD);
-
-  if (ctx.Stats)
-    ctx.Stats->getFrontendCounters().NumFunctionsTypechecked++;
 
   Optional<FunctionBodyTimer> timer;
   const auto &tyOpts = ctx.TypeCheckerOpts;

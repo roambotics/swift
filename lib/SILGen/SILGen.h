@@ -208,9 +208,6 @@ public:
 
   void emitAbstractFuncDecl(AbstractFunctionDecl *AFD);
   
-  /// Generate code for a source file of the module.
-  void emitSourceFile(SourceFile *sf);
-  
   /// Generates code for the given FuncDecl and adds the
   /// SILFunction to the current SILModule under the name SILDeclRef(decl). For
   /// curried functions, curried entry point Functions are also generated and
@@ -342,6 +339,7 @@ public:
                               AbstractStorageDecl *storage,
                               ArrayRef<ProtocolConformanceRef> indexHashables,
                               CanType baseTy,
+                              DeclContext *useDC,
                               bool forPropertyDescriptor);
 
   /// Known functions for bridging.

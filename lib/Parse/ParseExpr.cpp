@@ -189,8 +189,13 @@ ParserResult<Expr> Parser::parseExprSequence(Diag<> Message,
       if (CodeCompletion)
         CodeCompletion->setLeadingSequenceExprs(SequencedExprs);
     }
-    if (Primary.isNull())
+    if (Primary.isNull()) {
+      if (HasCodeCompletion) {
+        SequencedExprs.push_back(new (Context) CodeCompletionExpr(PreviousLoc));
+        break;
+      }
       return Primary;
+    }
 
     SequencedExprs.push_back(Primary.get());
 
@@ -242,16 +247,23 @@ parse_operator:
         HasCodeCompletion = true;
       if (middle.isNull())
         return nullptr;
-      
+
       // Make sure there's a matching ':' after the middle expr.
       if (!Tok.is(tok::colon)) {
+        if (middle.hasCodeCompletion()) {
+          SequencedExprs.push_back(new (Context) IfExpr(questionLoc,
+                                                        middle.get(),
+                                                        PreviousLoc));
+          SequencedExprs.push_back(new (Context) CodeCompletionExpr(PreviousLoc));
+          goto done;
+        }
+        
         diagnose(questionLoc, diag::expected_colon_after_if_question);
-
-      Status.setIsParseError();
-      return makeParserResult(Status, new (Context) ErrorExpr(
-          {startLoc, middle.get()->getSourceRange().End}));
+        Status.setIsParseError();
+        return makeParserResult(Status, new (Context) ErrorExpr(
+            {startLoc, middle.get()->getSourceRange().End}));
       }
-      
+
       SourceLoc colonLoc = consumeToken();
       
       auto *unresolvedIf
@@ -588,9 +600,10 @@ ParserResult<Expr> Parser::parseExprKeyPath() {
     pathResult = parseExprPostfixSuffix(inner, /*isExprBasic=*/true,
                                         /*periodHasKeyPathBehavior=*/false,
                                         unusedHasBindOptional);
-    if (pathResult.isParseError())
-      return pathResult;
   }
+
+  if (!rootResult.getPtrOrNull() && !pathResult.getPtrOrNull())
+    return pathResult;
 
   auto keypath = new (Context) KeyPathExpr(
       backslashLoc, rootResult.getPtrOrNull(), pathResult.getPtrOrNull());
@@ -606,7 +619,8 @@ ParserResult<Expr> Parser::parseExprKeyPath() {
     return makeParserCodeCompletionResult(keypath);
   }
 
-  return makeParserResult(keypath);
+  ParserStatus parseStatus = ParserStatus(rootResult) | ParserStatus(pathResult);
+  return makeParserResult(parseStatus, keypath);
 }
 
 ///   expr-keypath-objc:
@@ -1452,16 +1466,9 @@ ParserResult<Expr> Parser::parseExprPrimary(Diag<> ID, bool isExprBasic) {
     LLVM_FALLTHROUGH;
   }
 
-  case tok::pound_filePath:
-    // Check twice because of fallthrough--this is ugly but temporary.
-    if (Tok.is(tok::pound_filePath) && !Context.LangOpts.EnableConcisePoundFile)
-      diagnose(Tok.getLoc(), diag::unknown_pound_expr, "filePath");
-    // Continue since we actually do know how to handle it. This avoids extra
-    // diagnostics.
-    LLVM_FALLTHROUGH;
-
   case tok::pound_column:
   case tok::pound_file:
+  case tok::pound_filePath:
   case tok::pound_function:
   case tok::pound_line:
   case tok::pound_dsohandle: {
@@ -3451,7 +3458,7 @@ ParserResult<Expr> Parser::parseExprCollection() {
       // If The next token is at the beginning of a new line and can never start
       // an element, break.
       if (Tok.isAtStartOfLine() && (Tok.isAny(tok::r_brace, tok::pound_endif) ||
-                                    isStartOfDecl() || isStartOfStmt()))
+                                    isStartOfSwiftDecl() || isStartOfStmt()))
         break;
 
       diagnose(Tok, diag::expected_separator, ",")

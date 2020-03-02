@@ -1172,11 +1172,11 @@ public:
   ASTContext &getASTContext() const { return Ctx; }
 
   void visit(Decl *decl) {
-    if (getASTContext().Stats)
-      getASTContext().Stats->getFrontendCounters().NumDeclsTypechecked++;
+    if (auto *Stats = getASTContext().Stats)
+      Stats->getFrontendCounters().NumDeclsTypechecked++;
 
-    FrontendStatsTracer StatsTracer(getASTContext().Stats, "typecheck-decl",
-                                    decl);
+    FrontendStatsTracer StatsTracer(getASTContext().Stats,
+                                    "typecheck-decl", decl);
     PrettyStackTraceDecl StackTrace("type-checking", decl);
     
     DeclVisitor<DeclChecker>::visit(decl);
@@ -1231,6 +1231,10 @@ public:
   
   void visitImportDecl(ImportDecl *ID) {
     TypeChecker::checkDeclAttributes(ID);
+
+    // Force the lookup of decls referenced by a scoped import in case it emits
+    // diagnostics.
+    (void)ID->getDecls();
   }
 
   void visitOperatorDecl(OperatorDecl *OD) {
@@ -1336,13 +1340,13 @@ public:
     }
 
     if (VD->getDeclContext()->getSelfClassDecl()) {
-      checkDynamicSelfType(VD, VD->getValueInterfaceType());
-
       if (VD->getValueInterfaceType()->hasDynamicSelfType()) {
         if (VD->hasStorage())
           VD->diagnose(diag::dynamic_self_in_stored_property);
         else if (VD->isSettable(nullptr))
           VD->diagnose(diag::dynamic_self_in_mutable_property);
+        else
+          checkDynamicSelfType(VD, VD->getValueInterfaceType());
       }
     }
     
@@ -2153,8 +2157,11 @@ public:
 
     checkExplicitAvailability(FD);
 
-    if (FD->getDeclContext()->getSelfClassDecl())
-      checkDynamicSelfType(FD, FD->getResultInterfaceType());
+    // Skip this for accessors, since we should have diagnosed the
+    // storage itself.
+    if (!isa<AccessorDecl>(FD))
+      if (FD->getDeclContext()->getSelfClassDecl())
+        checkDynamicSelfType(FD, FD->getResultInterfaceType());
 
     checkDefaultArguments(FD->getParameters());
 

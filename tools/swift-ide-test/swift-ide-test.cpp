@@ -776,8 +776,8 @@ static bool doCodeCompletionImpl(
       Offset, /*EnableASTCaching=*/false, Error,
       CodeCompletionDiagnostics ? &PrintDiags : nullptr,
       [&](CompilerInstance &CI) {
-        performCodeCompletionSecondPass(CI.getPersistentParserState(),
-                                        *callbacksFactory);
+        auto SF = CI.getCodeCompletionFile();
+        performCodeCompletionSecondPass(*SF.get(), *callbacksFactory);
       });
   return isSuccess ? 0 : 1;
 }
@@ -834,7 +834,7 @@ static int doCodeCompletion(const CompilerInvocation &InitInvok,
                             bool CodeCompletionComments) {
   std::unique_ptr<ide::OnDiskCodeCompletionCache> OnDiskCache;
   if (!options::CompletionCachePath.empty()) {
-    OnDiskCache = llvm::make_unique<ide::OnDiskCodeCompletionCache>(
+    OnDiskCache = std::make_unique<ide::OnDiskCodeCompletionCache>(
         options::CompletionCachePath);
   }
   ide::CodeCompletionCache CompletionCache(OnDiskCache.get());
@@ -1043,8 +1043,8 @@ public:
     }
 
     if (Begin) {
-      if (const char *CStr =
-          llvm::sys::Process::OutputColor(Col, false, false)) {
+      if (const char *CStr = llvm::sys::Process::OutputColor(
+              static_cast<char>(Col), false, false)) {
         OS << CStr;
       }
     } else {
@@ -1124,7 +1124,7 @@ static int doSyntaxColoring(const CompilerInvocation &InitInvok,
     registerTypeCheckerRequestFunctions(Parser.getParser().Context.evaluator);
 
     // Collecting syntactic information shouldn't evaluate # conditions.
-    Parser.getParser().State->PerformConditionEvaluation = false;
+    Parser.getParser().EvaluateConditionals = false;
     Parser.getDiagnosticEngine().addConsumer(PrintDiags);
 
     (void)Parser.parse();
@@ -1361,7 +1361,7 @@ static int doStructureAnnotation(const CompilerInvocation &InitInvok,
       Parser.getParser().Context.evaluator);
 
   // Collecting syntactic information shouldn't evaluate # conditions.
-  Parser.getParser().State->PerformConditionEvaluation = false;
+  Parser.getParser().EvaluateConditionals = false;
 
   // Display diagnostics to stderr.
   PrintingDiagnosticConsumer PrintDiags;
@@ -1596,8 +1596,8 @@ private:
       Col = llvm::raw_ostream::CYAN; break;
     }
 
-    if (const char *CStr =
-        llvm::sys::Process::OutputColor(Col, false, false)) {
+    if (const char *CStr = llvm::sys::Process::OutputColor(
+            static_cast<char>(Col), false, false)) {
       OS << CStr;
     }
     OS << Text;
@@ -2758,6 +2758,7 @@ static int doPrintModuleImports(const CompilerInvocation &InitInvok,
       scratch.clear();
       next.second->getImportedModules(scratch,
                                       ModuleDecl::ImportFilterKind::Public);
+      // FIXME: ImportFilterKind::ShadowedBySeparateOverlay?
       for (auto &import : scratch) {
         llvm::outs() << "\t" << import.second->getName();
         for (auto accessPathPiece : import.first) {
@@ -3436,8 +3437,6 @@ int main(int argc, char *argv[]) {
     options::DebugForbidTypecheckPrefix;
   InitInvok.getTypeCheckerOptions().DebugConstraintSolver =
       options::DebugConstraintSolver;
-  InitInvok.getSearchPathOptions().DisableModulesValidateSystemDependencies =
-      true;
 
   for (auto ConfigName : options::BuildConfigs)
     InitInvok.getLangOptions().addCustomConditionalCompilationFlag(ConfigName);
