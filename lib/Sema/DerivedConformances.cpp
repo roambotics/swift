@@ -66,6 +66,12 @@ bool DerivedConformance::derivesProtocolConformance(DeclContext *DC,
     return canDeriveHashable(Nominal);
   }
 
+  if (*knownProtocol == KnownProtocolKind::AdditiveArithmetic)
+    return canDeriveAdditiveArithmetic(Nominal, DC);
+
+  if (*knownProtocol == KnownProtocolKind::Differentiable)
+    return canDeriveDifferentiable(Nominal, DC);
+
   if (auto *enumDecl = dyn_cast<EnumDecl>(Nominal)) {
     switch (*knownProtocol) {
         // The presence of a raw type is an explicit declaration that
@@ -217,6 +223,10 @@ ValueDecl *DerivedConformance::getDerivableRequirement(NominalTypeDecl *nominal,
     if (name.isSimpleName(ctx.Id_intValue))
       return getRequirement(KnownProtocolKind::CodingKey);
 
+    // AdditiveArithmetic.zero
+    if (name.isSimpleName(ctx.Id_zero))
+      return getRequirement(KnownProtocolKind::AdditiveArithmetic);
+
     return nullptr;
   }
 
@@ -227,6 +237,20 @@ ValueDecl *DerivedConformance::getDerivableRequirement(NominalTypeDecl *nominal,
     
     if (func->isOperator() && name.getBaseName() == "==")
       return getRequirement(KnownProtocolKind::Equatable);
+
+    // AdditiveArithmetic.+
+    // AdditiveArithmetic.-
+    if (func->isOperator() && name.getArgumentNames().size() == 2 &&
+        (name.getBaseName() == "+" || name.getBaseName() == "-")) {
+      return getRequirement(KnownProtocolKind::AdditiveArithmetic);
+    }
+
+    // Differentiable.move(along:)
+    if (name.isCompoundName() && name.getBaseName() == ctx.Id_move) {
+      auto argumentNames = name.getArgumentNames();
+      if (argumentNames.size() == 1 && argumentNames[0] == ctx.Id_along)
+        return getRequirement(KnownProtocolKind::Differentiable);
+    }
 
     // Encodable.encode(to: Encoder)
     if (name.isCompoundName() && name.getBaseName() == ctx.Id_encode) {
@@ -276,6 +300,10 @@ ValueDecl *DerivedConformance::getDerivableRequirement(NominalTypeDecl *nominal,
     // CaseIterable.AllCases
     if (name.isSimpleName(ctx.Id_AllCases))
       return getRequirement(KnownProtocolKind::CaseIterable);
+
+    // Differentiable.TangentVector
+    if (name.isSimpleName(ctx.Id_TangentVector))
+      return getRequirement(KnownProtocolKind::Differentiable);
 
     return nullptr;
   }

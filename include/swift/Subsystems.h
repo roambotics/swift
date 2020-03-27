@@ -66,7 +66,6 @@ namespace swift {
   class SyntaxParsingCache;
   class Token;
   class TopLevelContext;
-  class TypeChecker;
   class TypeCheckerOptions;
   struct TypeLoc;
   class UnifiedStatsReporter;
@@ -102,18 +101,6 @@ namespace swift {
   void verify(Decl *D);
 
   /// @}
-
-  /// Parse a single buffer into the given source file.
-  ///
-  /// \param SF The file within the module being parsed.
-  ///
-  /// \param BufferID The buffer to parse from.
-  ///
-  /// \param DelayBodyParsing Whether parsing of type and function bodies can be
-  /// delayed.
-  void parseIntoSourceFile(SourceFile &SF, unsigned BufferID,
-                           bool DelayBodyParsing = true,
-                           bool EvaluateConditionals = true);
 
   /// Parse a source file's SIL declarations into a given SIL module.
   void parseSourceFileSIL(SourceFile &SF, SILParserState *sil);
@@ -152,12 +139,6 @@ namespace swift {
   /// "program counter"-like debugging events. See the comment at the top of
   /// lib/Sema/PCMacro.cpp for a description of the calls inserted.
   void performPCMacro(SourceFile &SF);
-
-  /// Creates a type checker instance on the given AST context, if it
-  /// doesn't already have one.
-  ///
-  /// \returns a reference to the type checker instance.
-  TypeChecker &createTypeChecker(ASTContext &Ctx);
 
   /// Bind all 'extension' visible from \p SF to the extended nominal.
   void bindExtensions(SourceFile &SF);
@@ -373,11 +354,23 @@ namespace swift {
   /// should call this functions after forming the ASTContext.
   void registerSILGenRequestFunctions(Evaluator &evaluator);
 
+  /// Register SILOptimizer-level request functions with the evaluator.
+  ///
+  /// Clients that form an ASTContext and will perform any SIL optimization
+  /// should call this functions after forming the ASTContext.
+  void registerSILOptimizerRequestFunctions(Evaluator &evaluator);
+
   /// Register TBDGen-level request functions with the evaluator.
   ///
   /// Clients that form an ASTContext and will perform any TBD generation
   /// should call this functions after forming the ASTContext.
   void registerTBDGenRequestFunctions(Evaluator &evaluator);
+
+  /// Register IRGen-level request functions with the evaluator.
+  ///
+  /// Clients that form an ASTContext and will perform any IR generation
+  /// should call this functions after forming the ASTContext.
+  void registerIRGenRequestFunctions(Evaluator &evaluator);
 
   /// Register IDE-level request functions with the evaluator.
   ///
@@ -389,6 +382,9 @@ namespace swift {
   /// The ASTContext will automatically call these upon construction.
   /// Calling registerIDERequestFunctions will invoke this function as well.
   void registerIDETypeCheckRequestFunctions(Evaluator &evaluator);
+
+  /// Register SILOptimizer passes necessary for IRGen.
+  void registerIRGenSILTransforms(ASTContext &ctx);
 
 } // end namespace swift
 

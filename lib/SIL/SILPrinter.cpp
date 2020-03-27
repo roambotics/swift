@@ -47,6 +47,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/FileSystem.h"
+#include <set>
 
 
 using namespace swift;
@@ -343,15 +344,25 @@ void SILDeclRef::print(raw_ostream &OS) const {
     break;
   }
 
-  auto uncurryLevel = getParameterListCount() - 1;
-  if (uncurryLevel != 0)
-    OS << (isDot ? '.' : '!')  << uncurryLevel;
-
   if (isForeign)
-    OS << ((isDot || uncurryLevel != 0) ? '.' : '!')  << "foreign";
+    OS << (isDot ? '.' : '!')  << "foreign";
 
-  if (isDirectReference)
-    OS << ((isDot || uncurryLevel != 0) ? '.' : '!')  << "direct";
+  if (derivativeFunctionIdentifier) {
+    OS << ((isDot || isForeign) ? '.' : '!');
+    switch (derivativeFunctionIdentifier->getKind()) {
+    case AutoDiffDerivativeFunctionKind::JVP:
+      OS << "jvp.";
+      break;
+    case AutoDiffDerivativeFunctionKind::VJP:
+      OS << "vjp.";
+      break;
+    }
+    OS << derivativeFunctionIdentifier->getParameterIndices()->getString();
+    if (auto derivativeGenSig =
+            derivativeFunctionIdentifier->getDerivativeGenericSignature()) {
+      OS << "." << derivativeGenSig;
+    }
+  }
 }
 
 void SILDeclRef::dump() const {
@@ -444,7 +455,8 @@ static void printSILFunctionNameAndType(
     llvm::DenseMap<CanType, Identifier> &sugaredTypeNames) {
   function->printName(OS);
   OS << " : $";
-  auto genSig = function->getLoweredFunctionType()->getSubstGenericSignature();
+  auto genSig =
+    function->getLoweredFunctionType()->getInvocationGenericSignature();
   auto *genEnv = function->getGenericEnvironment();
   // If `genSig` and `genEnv` are both defined, get sugared names of generic
   // parameter types for printing.
@@ -2257,6 +2269,67 @@ public:
     }
   }
 
+  void visitDifferentiableFunctionInst(DifferentiableFunctionInst *dfi) {
+    *this << "[parameters";
+    for (auto i : dfi->getParameterIndices()->getIndices())
+      *this << ' ' << i;
+    *this << "] ";
+    *this << getIDAndType(dfi->getOriginalFunction());
+    if (dfi->hasDerivativeFunctions()) {
+      *this << " with_derivative ";
+      *this << '{' << getIDAndType(dfi->getJVPFunction()) << ", "
+            << getIDAndType(dfi->getVJPFunction()) << '}';
+    }
+  }
+
+  void visitLinearFunctionInst(LinearFunctionInst *lfi) {
+    *this << "[parameters";
+    for (auto i : lfi->getParameterIndices()->getIndices())
+      *this << ' ' << i;
+    *this << "] ";
+    *this << getIDAndType(lfi->getOriginalFunction());
+    if (lfi->hasTransposeFunction()) {
+      *this << " with_transpose ";
+      *this << getIDAndType(lfi->getTransposeFunction());
+    }
+  }
+
+  void visitDifferentiableFunctionExtractInst(
+      DifferentiableFunctionExtractInst *dfei) {
+    *this << '[';
+    switch (dfei->getExtractee()) {
+    case NormalDifferentiableFunctionTypeComponent::Original:
+      *this << "original";
+      break;
+    case NormalDifferentiableFunctionTypeComponent::JVP:
+      *this << "jvp";
+      break;
+    case NormalDifferentiableFunctionTypeComponent::VJP:
+      *this << "vjp";
+      break;
+    }
+    *this << "] ";
+    *this << getIDAndType(dfei->getOperand());
+    if (dfei->hasExplicitExtracteeType()) {
+      *this << " as ";
+      *this << dfei->getType();
+    }
+  }
+
+  void visitLinearFunctionExtractInst(LinearFunctionExtractInst *lfei) {
+    *this << '[';
+    switch (lfei->getExtractee()) {
+    case LinearDifferentiableFunctionTypeComponent::Original:
+      *this << "original";
+      break;
+    case LinearDifferentiableFunctionTypeComponent::Transpose:
+      *this << "transpose";
+      break;
+    }
+    *this << "] ";
+    *this << getIDAndType(lfei->getFunctionOperand());
+  }
+
   void visitDifferentiabilityWitnessFunctionInst(
       DifferentiabilityWitnessFunctionInst *dwfi) {
     auto *witness = dwfi->getWitness();
@@ -2442,8 +2515,16 @@ void SILFunction::print(SILPrintContext &PrintCtx) const {
   if (isWithoutActuallyEscapingThunk())
     OS << "[without_actually_escaping] ";
 
-  if (isGlobalInit())
+  switch (getSpecialPurpose()) {
+  case SILFunction::Purpose::None:
+    break;
+  case SILFunction::Purpose::GlobalInit:
     OS << "[global_init] ";
+    break;
+  case SILFunction::Purpose::LazyPropertyGetter:
+    OS << "[lazy_getter] ";
+    break;
+  }
   if (isAlwaysWeakImported())
     OS << "[weak_imported] ";
   auto availability = getAvailabilityForLinkage();
@@ -2750,6 +2831,57 @@ printSILCoverageMaps(SILPrintContext &Ctx,
     M->print(Ctx);
 }
 
+using MagicFileStringMap =
+    llvm::StringMap<std::pair<std::string, /*isWinner=*/bool>>;
+
+static void
+printMagicFileStringMapEntry(SILPrintContext &Ctx,
+                             const MagicFileStringMap::MapEntryTy &entry) {
+  auto &OS = Ctx.OS();
+  OS << "//   '" << std::get<0>(entry.second)
+     << "' => '" << entry.first() << "'";
+
+  if (!std::get<1>(entry.second))
+    OS << " (alternate)";
+
+  OS << "\n";
+}
+
+static void printMagicFileStringMap(SILPrintContext &Ctx,
+                                    const MagicFileStringMap map) {
+  if (map.empty())
+    return;
+
+  Ctx.OS() << "\n\n// Mappings from '#file' to '#filePath':\n";
+
+  if (Ctx.sortSIL()) {
+    llvm::SmallVector<llvm::StringRef, 16> keys;
+    llvm::copy(map.keys(), std::back_inserter(keys));
+
+    llvm::sort(keys, [&](StringRef leftKey, StringRef rightKey) -> bool {
+      const auto &leftValue = map.find(leftKey)->second;
+      const auto &rightValue = map.find(rightKey)->second;
+
+      // Lexicographically earlier #file strings sort earlier.
+      if (std::get<0>(leftValue) != std::get<0>(rightValue))
+        return std::get<0>(leftValue) < std::get<0>(rightValue);
+
+      // Conflict winners sort before losers.
+      if (std::get<1>(leftValue) != std::get<1>(rightValue))
+        return std::get<1>(leftValue);
+
+      // Finally, lexicographically earlier #filePath strings sort earlier.
+      return leftKey < rightKey;
+    });
+
+    for (auto key : keys)
+      printMagicFileStringMapEntry(Ctx, *map.find(key));
+  } else {
+    for (const auto &entry : map)
+      printMagicFileStringMapEntry(Ctx, entry);
+  }
+}
+
 void SILProperty::print(SILPrintContext &Ctx) const {
   PrintOptions Options = PrintOptions::printSIL();
   
@@ -2863,6 +2995,10 @@ void SILModule::print(SILPrintContext &PrintCtx, ModuleDecl *M,
   printSILCoverageMaps(PrintCtx, getCoverageMaps());
   printSILProperties(PrintCtx, getPropertyList());
   printExternallyVisibleDecls(PrintCtx, externallyVisible.getArrayRef());
+
+  if (M)
+    printMagicFileStringMap(
+        PrintCtx, M->computeMagicFileStringMap(/*shouldDiagnose=*/false));
 
   OS << "\n\n";
 }

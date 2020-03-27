@@ -90,6 +90,14 @@ SILGenModule::emitVTableMethod(ClassDecl *theClass,
     implFn = getDynamicThunk(
         derived, Types.getConstantInfo(TypeExpansionContext::minimal(), derived)
                      .SILFnType);
+  } else if (auto *derivativeId = derived.derivativeFunctionIdentifier) {
+    // For JVP/VJP methods, create a vtable entry thunk. The thunk contains an
+    // `differentiable_function` instruction, which is later filled during the
+    // differentiation transform.
+    auto derivedFnType =
+        Types.getConstantInfo(TypeExpansionContext::minimal(), derived)
+            .SILFnType;
+    implFn = getOrCreateAutoDiffClassMethodThunk(derived, derivedFnType);
   } else {
     implFn = getFunction(derived, NotForDefinition);
   }
@@ -158,6 +166,17 @@ SILGenModule::emitVTableMethod(ClassDecl *theClass,
         cast<ConstructorDecl>(baseDecl),
         cast<ConstructorDecl>(derivedDecl),
         base.kind == SILDeclRef::Kind::Allocator);
+    }
+    // TODO(TF-685): Use proper autodiff thunk mangling.
+    if (auto *derivativeId = derived.derivativeFunctionIdentifier) {
+      switch (derivativeId->getKind()) {
+      case AutoDiffDerivativeFunctionKind::JVP:
+        name += "_jvp";
+        break;
+      case AutoDiffDerivativeFunctionKind::VJP:
+        name += "_vjp";
+        break;
+      }
     }
   }
 
@@ -373,10 +392,9 @@ public:
     // If it's not an accessor, just look for the witness.
     if (!reqAccessor) {
       if (auto witness = asDerived().getWitness(requirementRef.getDecl())) {
-        return addMethodImplementation(requirementRef,
-                                       SILDeclRef(witness.getDecl(),
-                                                  requirementRef.kind),
-                                       witness);
+        return addMethodImplementation(
+            requirementRef, requirementRef.withDecl(witness.getDecl()),
+            witness);
       }
 
       return asDerived().addMissingMethod(requirementRef);
@@ -395,10 +413,8 @@ public:
     auto witnessAccessor =
       witnessStorage->getSynthesizedAccessor(reqAccessor->getAccessorKind());
 
-    return addMethodImplementation(requirementRef,
-                                   SILDeclRef(witnessAccessor,
-                                              SILDeclRef::Kind::Func),
-                                   witness);
+    return addMethodImplementation(
+        requirementRef, requirementRef.withDecl(witnessAccessor), witness);
   }
 
 private:
@@ -690,6 +706,20 @@ SILFunction *SILGenModule::emitProtocolWitness(
       conformance.isConcrete() ? conformance.getConcrete() : nullptr;
   std::string nameBuffer =
       NewMangler.mangleWitnessThunk(manglingConformance, requirement.getDecl());
+  // TODO(TF-685): Proper mangling for derivative witness thunks.
+  if (auto *derivativeId = requirement.derivativeFunctionIdentifier) {
+    std::string kindString;
+    switch (derivativeId->getKind()) {
+    case AutoDiffDerivativeFunctionKind::JVP:
+      kindString = "jvp";
+      break;
+    case AutoDiffDerivativeFunctionKind::VJP:
+      kindString = "vjp";
+      break;
+    }
+    nameBuffer = "AD__" + nameBuffer + "_" + kindString + "_" +
+                 derivativeId->getParameterIndices()->getString();
+  }
 
   // If the thunked-to function is set to be always inlined, do the
   // same with the witness, on the theory that the user wants all
@@ -749,7 +779,7 @@ static SILFunction *emitSelfConformanceWitness(SILGenModule &SGM,
   auto protocolType = protocol->getDeclaredInterfaceType();
   auto reqtSubs = SubstitutionMap::getProtocolSubstitutions(protocol,
                                           protocolType,
-                                          ProtocolConformanceRef(protocol));
+                                          ProtocolConformanceRef(conformance));
 
   // Open the protocol type.
   auto openedType = OpenedArchetypeType::get(protocolType);
@@ -998,7 +1028,7 @@ public:
     // Emit witness tables for conformances of concrete types. Protocol types
     // are existential and do not have witness tables.
     for (auto *conformance : theType->getLocalConformances(
-                               ConformanceLookupKind::NonInherited, nullptr)) {
+                               ConformanceLookupKind::NonInherited)) {
       if (conformance->isComplete()) {
         if (auto *normal = dyn_cast<NormalProtocolConformance>(conformance))
           SGM.getWitnessTable(normal);
@@ -1122,8 +1152,7 @@ public:
       // Emit witness tables for protocol conformances introduced by the
       // extension.
       for (auto *conformance : e->getLocalConformances(
-                                 ConformanceLookupKind::All,
-                                 nullptr)) {
+                                 ConformanceLookupKind::All)) {
         if (conformance->isComplete()) {
           if (auto *normal =dyn_cast<NormalProtocolConformance>(conformance))
             SGM.getWitnessTable(normal);

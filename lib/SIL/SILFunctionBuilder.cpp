@@ -66,6 +66,25 @@ void SILFunctionBuilder::addFunctionAttributes(
   if (Attrs.hasAttribute<SILGenNameAttr>() || Attrs.hasAttribute<CDeclAttr>())
     F->setHasCReferences(true);
 
+  // Validate `@differentiable` attributes by calling `getParameterIndices`.
+  // This is important for:
+  // - Skipping invalid `@differentiable` attributes in non-primary files.
+  // - Preventing duplicate SIL differentiability witness creation for
+  //   `@differentiable` attributes on `AbstractStorageDecl` declarations.
+  //   Such `@differentiable` attributes are deleted and recreated on the getter
+  //   `AccessorDecl` of the `AbstractStorageDecl`.
+  for (auto *A : Attrs.getAttributes<DifferentiableAttr>())
+    (void)A->getParameterIndices();
+
+  // Propagate `@noDerivative` as `[_semantics "autodiff.nonvarying"]`.
+  //
+  // `@noDerivative` implies non-varying semantics for differentiable activity
+  // analysis. SIL values produced from references to `@noDerivative`
+  // declarations will not be marked as varying; these values do not need a
+  // derivative.
+  if (Attrs.hasAttribute<NoDerivativeAttr>())
+    F->addSemanticsAttr("autodiff.nonvarying");
+
   // Propagate @_dynamicReplacement(for:).
   if (constant.isNull())
     return;
@@ -157,7 +176,9 @@ SILFunction *SILFunctionBuilder::getOrCreateFunction(
                                 inlineStrategy, EK);
   F->setDebugScope(new (mod) SILDebugScope(loc, F));
 
-  F->setGlobalInit(constant.isGlobal());
+  if (constant.isGlobal())
+    F->setSpecialPurpose(SILFunction::Purpose::GlobalInit);
+
   if (constant.hasDecl()) {
     auto decl = constant.getDecl();
 
@@ -172,6 +193,21 @@ SILFunction *SILFunctionBuilder::getOrCreateFunction(
       // Add attributes for e.g. computed properties.
       addFunctionAttributes(F, storage->getAttrs(), mod,
                             getOrCreateDeclaration);
+                            
+      auto *varDecl = dyn_cast<VarDecl>(storage);
+      if (varDecl && varDecl->getAttrs().hasAttribute<LazyAttr>() &&
+          accessor->getAccessorKind() == AccessorKind::Get) {
+        F->setSpecialPurpose(SILFunction::Purpose::LazyPropertyGetter);
+        
+        // Lazy property getters should not get inlined because they are usually
+        // non-tivial functions (otherwise the user would not implement it as
+        // lazy property). Inlining such getters would most likely not benefit
+        // other optimizations because the top-level switch_enum cannot be
+        // constant folded in most cases.
+        // Also, not inlining lazy property getters enables optimizing them in
+        // CSE.
+        F->setInlineStrategy(NoInline);
+      }
     }
     addFunctionAttributes(F, decl->getAttrs(), mod, getOrCreateDeclaration,
                           constant);

@@ -1283,8 +1283,7 @@ static void markAsObjC(ValueDecl *D, ObjCReason reason,
                        Optional<ForeignErrorConvention> errorConvention);
 
 
-llvm::Expected<bool>
-IsObjCRequest::evaluate(Evaluator &evaluator, ValueDecl *VD) const {
+bool IsObjCRequest::evaluate(Evaluator &evaluator, ValueDecl *VD) const {
   auto dc = VD->getDeclContext();
   Optional<ObjCReason> isObjC;
   if (dc->getSelfClassDecl() && !isa<TypeDecl>(VD)) {
@@ -2034,6 +2033,11 @@ bool swift::diagnoseUnintendedObjCMethodOverrides(SourceFile &sf) {
       if (overriddenCtor->hasStubImplementation())
         continue;
     }
+
+    // Require the declaration to actually come from a class. Selectors that
+    // come from protocol requirements are not actually overrides.
+    if (!overriddenMethod->getDeclContext()->getSelfClassDecl())
+      continue;
 
     // Diagnose the override.
     auto methodDiagInfo = getObjCMethodDiagInfo(method);

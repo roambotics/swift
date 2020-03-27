@@ -920,9 +920,22 @@ public:
   /// If this returns true, the decl can be safely casted to ValueDecl.
   bool isPotentiallyOverridable() const;
 
+  /// Returns true if this Decl cannot be seen by any other source file
+  bool isPrivateToEnclosingFile() const;
+
   /// If an alternative module name is specified for this decl, e.g. using
   /// @_originalDefinedIn attribute, this function returns this module name.
   StringRef getAlternateModuleName() const;
+
+  // Is this Decl an SPI? It can be directly marked with @_spi or is defined in
+  // an @_spi context.
+  bool isSPI() const;
+
+  // List the SPI groups declared with @_spi or inherited by this decl.
+  //
+  // SPI groups are inherited from the parent contexts only if the local decl
+  // doesn't declare any @_spi.
+  ArrayRef<Identifier> getSPIGroups() const;
 
   /// Emit a diagnostic tied to this declaration.
   template<typename ...ArgTypes>
@@ -1215,7 +1228,9 @@ public:
   void print(raw_ostream &OS) const;
   void print(ASTPrinter &Printer) const;
 };
-  
+
+using GenericParamSource = PointerUnion<GenericContext *, GenericParamList *>;
+
 /// GenericParamList - A list of generic parameters that is part of a generic
 /// function or type, along with extra requirements placed on those generic
 /// parameters and types derived from them.
@@ -2171,6 +2186,9 @@ public:
   /// Can the pattern at index i be default initialized?
   bool isDefaultInitializable(unsigned i) const;
 
+  /// Can the property wrapper be used to provide default initialization?
+  bool isDefaultInitializableViaPropertyWrapper(unsigned i) const;
+
   /// Does this pattern have a user-provided initializer expression?
   bool isExplicitlyInitialized(unsigned i) const;
 
@@ -2680,6 +2698,11 @@ public:
 
   bool isNativeDynamic() const {
     return !isObjC() && isDynamic();
+  }
+
+  bool isEffectiveLinkageMoreVisibleThan(ValueDecl *other) const {
+    return (std::min(getEffectiveAccess(), AccessLevel::Public) >
+            std::min(other->getEffectiveAccess(), AccessLevel::Public));
   }
 
   /// Set whether this type is 'dynamic' or not.
@@ -3496,6 +3519,27 @@ public:
   /// or \c nullptr if it does not have one.
   ConstructorDecl *getMemberwiseInitializer() const;
 
+  /// Retrieves the effective memberwise initializer for this declaration, or
+  /// \c nullptr if it does not have one.
+  ///
+  /// An effective memberwise initializer is either a synthesized memberwise
+  /// initializer or a user-defined initializer with the same type.
+  ///
+  /// The access level of the memberwise initializer is set to the minimum of:
+  /// - Public, by default. This enables public nominal types to have public
+  ///   memberwise initializers.
+  ///   - The `public` default is important for synthesized member types, e.g.
+  ///     `TangentVector` structs synthesized during `Differentiable` derived
+  ///     conformances. Manually extending these types to define a public
+  ///     memberwise initializer causes a redeclaration error.
+  /// - The minimum access level of memberwise-initialized properties in the
+  ///   nominal type declaration.
+  ///
+  /// Effective memberwise initializers are used only by derived conformances
+  /// for `Self`-returning protocol requirements like `AdditiveArithmetic.+`.
+  /// Such derived conformances require memberwise initialization.
+  ConstructorDecl *getEffectiveMemberwiseInitializer();
+
   /// Whether this declaration has a synthesized zero parameter default
   /// initializer.
   bool hasDefaultInitializer() const;
@@ -3582,7 +3626,6 @@ class EnumDecl final : public NominalTypeDecl {
 
   friend class EnumRawValuesRequest;
   friend class EnumRawTypeRequest;
-  friend class TypeChecker;
 
 public:
   EnumDecl(SourceLoc EnumLoc, Identifier Name, SourceLoc NameLoc,
@@ -3868,7 +3911,6 @@ class ClassDecl final : public NominalTypeDecl {
   friend class EmittedMembersRequest;
   friend class HasMissingDesignatedInitializersRequest;
   friend class InheritsSuperclassInitializersRequest;
-  friend class TypeChecker;
 
 public:
   ClassDecl(SourceLoc ClassLoc, Identifier Name, SourceLoc NameLoc,
@@ -4231,8 +4273,6 @@ class ProtocolDecl final : public NominalTypeDecl {
     Bits.ProtocolDecl.ExistentialTypeSupported = supported;
   }
 
-  ArrayRef<ProtocolDecl *> getInheritedProtocolsSlow();
-
   bool hasLazyRequirementSignature() const {
     return Bits.ProtocolDecl.HasLazyRequirementSignature;
   }
@@ -4243,8 +4283,8 @@ class ProtocolDecl final : public NominalTypeDecl {
   friend class ProtocolRequiresClassRequest;
   friend class ExistentialConformsToSelfRequest;
   friend class ExistentialTypeSupportedRequest;
-  friend class TypeChecker;
-
+  friend class InheritedProtocolsRequest;
+  
 public:
   ProtocolDecl(DeclContext *DC, SourceLoc ProtocolLoc, SourceLoc NameLoc,
                Identifier Name, MutableArrayRef<TypeLoc> Inherited,
@@ -4253,12 +4293,7 @@ public:
   using Decl::getASTContext;
 
   /// Retrieve the set of protocols inherited from this protocol.
-  ArrayRef<ProtocolDecl *> getInheritedProtocols() const {
-    if (Bits.ProtocolDecl.InheritedProtocolsValid)
-      return InheritedProtocols;
-
-    return const_cast<ProtocolDecl *>(this)->getInheritedProtocolsSlow();
-  }
+  ArrayRef<ProtocolDecl *> getInheritedProtocols() const;
 
   /// Determine whether this protocol has a superclass.
   bool hasSuperclass() const { return (bool)getSuperclassDecl(); }
@@ -4352,6 +4387,13 @@ public:
 
 private:
   void computeKnownProtocolKind() const;
+
+  bool areInheritedProtocolsValid() const {
+    return Bits.ProtocolDecl.InheritedProtocolsValid;
+  }
+  void setInheritedProtocolsValid() {
+    Bits.ProtocolDecl.InheritedProtocolsValid = true;
+  }
 
 public:
   /// If this is known to be a compiler-known protocol, returns the kind.
@@ -5099,15 +5141,17 @@ public:
   void setTopLevelGlobal(bool b) { Bits.VarDecl.IsTopLevelGlobal = b; }
   
   /// Retrieve the custom attributes that attach property wrappers to this
-  /// property. The returned list contains all of the attached property wrapper attributes in source order,
-  /// which means the outermost wrapper attribute is provided first.
+  /// property. The returned list contains all of the attached property wrapper
+  /// attributes in source order, which means the outermost wrapper attribute
+  /// is provided first.
   llvm::TinyPtrVector<CustomAttr *> getAttachedPropertyWrappers() const;
 
   /// Whether this property has any attached property wrappers.
   bool hasAttachedPropertyWrapper() const;
   
-  /// Whether all of the attached property wrappers have an init(initialValue:) initializer.
-  bool allAttachedPropertyWrappersHaveInitialValueInit() const;
+  /// Whether all of the attached property wrappers have an init(wrappedValue:)
+  /// initializer.
+  bool allAttachedPropertyWrappersHaveWrappedValueInit() const;
   
   /// Retrieve the type of the attached property wrapper as a contextual
   /// type.
@@ -5171,8 +5215,20 @@ public:
   /// \end
   ///
   /// Or when there is no initializer but each composed property wrapper has
-  /// a suitable `init(initialValue:)`.
+  /// a suitable `init(wrappedValue:)`.
   bool isPropertyMemberwiseInitializedWithWrappedType() const;
+
+  /// Whether the innermost property wrapper's initializer's 'wrappedValue' parameter
+  /// is marked with '@autoclosure' and '@escaping'.
+  bool isInnermostPropertyWrapperInitUsesEscapingAutoClosure() const;
+
+  /// Return the interface type of the value used for the 'wrappedValue:'
+  /// parameter when initializing a property wrapper.
+  ///
+  /// If the property has an attached property wrapper and the 'wrappedValue:'
+  /// parameter is an autoclosure, return a function type returning the stored
+  /// value. Otherwise, return the interface type of the stored value.
+  Type getPropertyWrapperInitValueInterfaceType() const;
 
   /// If this property is the backing storage for a property with an attached
   /// property wrapper, return the original property.
@@ -5745,6 +5801,7 @@ public:
 private:
   ParameterList *Params;
 
+private:
   /// The generation at which we last loaded derivative function configurations.
   unsigned DerivativeFunctionConfigGeneration = 0;
   /// Prepare to traverse the list of derivative function configurations.
@@ -5758,6 +5815,13 @@ private:
   ///   configurations from imported modules.
   struct DerivativeFunctionConfigurationList;
   DerivativeFunctionConfigurationList *DerivativeFunctionConfigs = nullptr;
+
+public:
+  /// Get all derivative function configurations.
+  ArrayRef<AutoDiffConfig> getDerivativeFunctionConfigurations();
+
+  /// Add the given derivative function configuration.
+  void addDerivativeFunctionConfiguration(AutoDiffConfig config);
 
 protected:
   // If a function has a body at all, we have either a parsed body AST node or
@@ -5971,11 +6035,6 @@ public:
   /// vtable.
   bool needsNewVTableEntry() const;
 
-  bool isEffectiveLinkageMoreVisibleThan(ValueDecl *other) const {
-    return (std::min(getEffectiveAccess(), AccessLevel::Public) >
-            std::min(other->getEffectiveAccess(), AccessLevel::Public));
-  }
-
   bool isSynthesized() const {
     return Bits.AbstractFunctionDecl.Synthesized;
   }
@@ -6082,12 +6141,6 @@ public:
   /// Tests if this is a function returning a DynamicSelfType, or a
   /// constructor.
   bool hasDynamicSelfResult() const;
-
-  /// Get all derivative function configurations.
-  ArrayRef<AutoDiffConfig> getDerivativeFunctionConfigurations();
-
-  /// Add the given derivative function configuration.
-  void addDerivativeFunctionConfiguration(AutoDiffConfig config);
 
   using DeclContext::operator new;
   using Decl::getASTContext;
@@ -7039,6 +7092,28 @@ public:
   }
 };
 
+/// The fixity of an OperatorDecl.
+enum class OperatorFixity : uint8_t {
+  Infix,
+  Prefix,
+  Postfix
+};
+
+inline void simple_display(llvm::raw_ostream &out, OperatorFixity fixity) {
+  switch (fixity) {
+  case OperatorFixity::Infix:
+    out << "infix";
+    return;
+  case OperatorFixity::Prefix:
+    out << "prefix";
+    return;
+  case OperatorFixity::Postfix:
+    out << "postfix";
+    return;
+  }
+  llvm_unreachable("Unhandled case in switch");
+}
+
 /// Abstract base class of operator declarations.
 class OperatorDecl : public Decl {
   SourceLoc OperatorLoc, NameLoc;
@@ -7064,6 +7139,21 @@ public:
       : Decl(kind, DC), OperatorLoc(OperatorLoc), NameLoc(NameLoc), name(Name),
         DesignatedNominalTypes(DesignatedNominalTypes) {}
 
+  /// Retrieve the operator's fixity, corresponding to the concrete subclass
+  /// of the OperatorDecl.
+  OperatorFixity getFixity() const {
+    switch (getKind()) {
+#define DECL(Id, Name) case DeclKind::Id: llvm_unreachable("Not an operator!");
+#define OPERATOR_DECL(Id, Name)
+#include "swift/AST/DeclNodes.def"
+    case DeclKind::InfixOperator:
+      return OperatorFixity::Infix;
+    case DeclKind::PrefixOperator:
+      return OperatorFixity::Prefix;
+    case DeclKind::PostfixOperator:
+      return OperatorFixity::Postfix;
+    }
+  }
 
   SourceLoc getOperatorLoc() const { return OperatorLoc; }
   SourceLoc getNameLoc() const { return NameLoc; }

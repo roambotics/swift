@@ -607,6 +607,159 @@ TryApplyInst *TryApplyInst::create(
                                      normalBB, errorBB, specializationInfo);
 }
 
+SILType DifferentiableFunctionInst::getDifferentiableFunctionType(
+    SILValue OriginalFunction, IndexSubset *ParameterIndices) {
+  auto fnTy = OriginalFunction->getType().castTo<SILFunctionType>();
+  auto diffTy = fnTy->getWithDifferentiability(DifferentiabilityKind::Normal,
+                                               ParameterIndices);
+  return SILType::getPrimitiveObjectType(diffTy);
+}
+
+ValueOwnershipKind DifferentiableFunctionInst::getMergedOwnershipKind(
+    SILValue OriginalFunction, ArrayRef<SILValue> DerivativeFunctions) {
+  if (DerivativeFunctions.empty())
+    return OriginalFunction.getOwnershipKind();
+  return *mergeSILValueOwnership(
+      {OriginalFunction, DerivativeFunctions[0], DerivativeFunctions[1]});
+}
+
+DifferentiableFunctionInst::DifferentiableFunctionInst(
+    SILDebugLocation Loc, IndexSubset *ParameterIndices,
+    SILValue OriginalFunction, ArrayRef<SILValue> DerivativeFunctions,
+    bool HasOwnership)
+    : InstructionBaseWithTrailingOperands(
+          OriginalFunction, DerivativeFunctions, Loc,
+          getDifferentiableFunctionType(OriginalFunction, ParameterIndices),
+          HasOwnership
+              ? getMergedOwnershipKind(OriginalFunction, DerivativeFunctions)
+              : ValueOwnershipKind(ValueOwnershipKind::None)),
+      ParameterIndices(ParameterIndices),
+      HasDerivativeFunctions(!DerivativeFunctions.empty()) {
+  assert(DerivativeFunctions.empty() || DerivativeFunctions.size() == 2);
+}
+
+DifferentiableFunctionInst *DifferentiableFunctionInst::create(
+    SILModule &Module, SILDebugLocation Loc, IndexSubset *ParameterIndices,
+    SILValue OriginalFunction,
+    Optional<std::pair<SILValue, SILValue>> VJPAndJVPFunctions,
+    bool HasOwnership) {
+  auto derivativeFunctions =
+      VJPAndJVPFunctions.hasValue()
+          ? ArrayRef<SILValue>(
+                reinterpret_cast<SILValue *>(VJPAndJVPFunctions.getPointer()),
+                2)
+          : ArrayRef<SILValue>();
+  size_t size = totalSizeToAlloc<Operand>(1 + derivativeFunctions.size());
+  void *buffer = Module.allocateInst(size, alignof(DifferentiableFunctionInst));
+  return ::new (buffer)
+      DifferentiableFunctionInst(Loc, ParameterIndices, OriginalFunction,
+                                 derivativeFunctions, HasOwnership);
+}
+
+SILType LinearFunctionInst::getLinearFunctionType(
+    SILValue OriginalFunction, IndexSubset *ParameterIndices) {
+  auto fnTy = OriginalFunction->getType().castTo<SILFunctionType>();
+  auto diffTy = fnTy->getWithDifferentiability(
+      DifferentiabilityKind::Linear, ParameterIndices);
+  return SILType::getPrimitiveObjectType(diffTy);
+}
+
+LinearFunctionInst::LinearFunctionInst(
+    SILDebugLocation Loc, IndexSubset *ParameterIndices,
+    SILValue OriginalFunction, Optional<SILValue> TransposeFunction,
+    bool HasOwnership)
+    : InstructionBaseWithTrailingOperands(
+          OriginalFunction,
+          TransposeFunction.hasValue()
+              ? ArrayRef<SILValue>(TransposeFunction.getPointer(), 1)
+              : ArrayRef<SILValue>(),
+          Loc, getLinearFunctionType(OriginalFunction, ParameterIndices),
+          HasOwnership ? (
+            TransposeFunction
+                ? *mergeSILValueOwnership(
+                       {OriginalFunction, *TransposeFunction})
+                : *mergeSILValueOwnership({OriginalFunction})
+          ) : ValueOwnershipKind(ValueOwnershipKind::None)),
+      ParameterIndices(ParameterIndices),
+      HasTransposeFunction(TransposeFunction.hasValue()) {
+}
+
+LinearFunctionInst *LinearFunctionInst::create(
+    SILModule &Module, SILDebugLocation Loc, IndexSubset *ParameterIndices,
+    SILValue OriginalFunction, Optional<SILValue> TransposeFunction,
+    bool HasOwnership) {
+  size_t size = totalSizeToAlloc<Operand>(TransposeFunction.hasValue() ? 2 : 1);
+  void *buffer = Module.allocateInst(size, alignof(DifferentiableFunctionInst));
+  return ::new (buffer) LinearFunctionInst(
+      Loc, ParameterIndices, OriginalFunction, TransposeFunction,
+      HasOwnership);
+}
+
+SILType DifferentiableFunctionExtractInst::getExtracteeType(
+    SILValue function, NormalDifferentiableFunctionTypeComponent extractee,
+    SILModule &module) {
+  auto fnTy = function->getType().castTo<SILFunctionType>();
+  assert(fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Normal);
+  auto originalFnTy = fnTy->getWithoutDifferentiability();
+  auto kindOpt = extractee.getAsDerivativeFunctionKind();
+  if (!kindOpt) {
+    assert(extractee == NormalDifferentiableFunctionTypeComponent::Original);
+    return SILType::getPrimitiveObjectType(originalFnTy);
+  }
+  auto resultFnTy = originalFnTy->getAutoDiffDerivativeFunctionType(
+      fnTy->getDifferentiabilityParameterIndices(), /*resultIndex*/ 0, *kindOpt,
+      module.Types, LookUpConformanceInModule(module.getSwiftModule()));
+  return SILType::getPrimitiveObjectType(resultFnTy);
+}
+
+DifferentiableFunctionExtractInst::DifferentiableFunctionExtractInst(
+    SILModule &module, SILDebugLocation debugLoc,
+    NormalDifferentiableFunctionTypeComponent extractee, SILValue function,
+    Optional<SILType> extracteeType)
+    : UnaryInstructionBase(debugLoc, function,
+                           extracteeType
+                               ? *extracteeType
+                               : getExtracteeType(function, extractee, module)),
+      Extractee(extractee), HasExplicitExtracteeType(extracteeType.hasValue()) {
+#ifndef NDEBUG
+  if (extracteeType.hasValue()) {
+    // Note: explicit extractee type is used to avoid inconsistent typing in:
+    // - Canonical SIL, due to generic specialization.
+    // - Lowered SIL, due to LoadableByAddress.
+    // See `TypeSubstCloner::visitDifferentiableFunctionExtractInst` for an
+    // explanation of how explicit extractee type is used.
+    assert((module.getStage() == SILStage::Canonical ||
+            module.getStage() == SILStage::Lowered) &&
+           "Explicit type is valid only in canonical or lowered SIL");
+  }
+#endif
+}
+
+SILType LinearFunctionExtractInst::
+getExtracteeType(
+    SILValue function, LinearDifferentiableFunctionTypeComponent extractee,
+    SILModule &module) {
+  auto fnTy = function->getType().castTo<SILFunctionType>();
+  assert(fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Linear);
+  auto originalFnTy = fnTy->getWithoutDifferentiability();
+  switch (extractee) {
+  case LinearDifferentiableFunctionTypeComponent::Original:
+    return SILType::getPrimitiveObjectType(originalFnTy);
+  case LinearDifferentiableFunctionTypeComponent::Transpose:
+    auto transposeFnTy = originalFnTy->getAutoDiffTransposeFunctionType(
+        fnTy->getDifferentiabilityParameterIndices(), module.Types,
+        LookUpConformanceInModule(module.getSwiftModule()));
+    return SILType::getPrimitiveObjectType(transposeFnTy);
+  }
+}
+
+LinearFunctionExtractInst::LinearFunctionExtractInst(
+    SILModule &module, SILDebugLocation debugLoc,
+    LinearDifferentiableFunctionTypeComponent extractee, SILValue theFunction)
+    : InstructionBase(debugLoc,
+                      getExtracteeType(theFunction, extractee, module)),
+      extractee(extractee), operands(this, theFunction) {}
+
 SILType DifferentiabilityWitnessFunctionInst::getDifferentiabilityWitnessType(
     SILModule &module, DifferentiabilityWitnessFunctionKind witnessKind,
     SILDifferentiabilityWitness *witness) {
@@ -1348,26 +1501,29 @@ CondBranchInst::create(SILDebugLocation Loc, SILValue Condition,
                                        TrueBBCount, FalseBBCount);
 }
 
-SILValue CondBranchInst::getArgForDestBB(const SILBasicBlock *DestBB,
-                                         const SILArgument *Arg) const {
-  return getArgForDestBB(DestBB, Arg->getIndex());
+Operand *CondBranchInst::getOperandForDestBB(const SILBasicBlock *destBlock,
+                                             const SILArgument *arg) const {
+  return getOperandForDestBB(destBlock, arg->getIndex());
 }
 
-SILValue CondBranchInst::getArgForDestBB(const SILBasicBlock *DestBB,
-                                         unsigned ArgIndex) const {
+Operand *CondBranchInst::getOperandForDestBB(const SILBasicBlock *destBlock,
+                                             unsigned argIndex) const {
   // If TrueBB and FalseBB equal, we cannot find an arg for this DestBB so
   // return an empty SILValue.
   if (getTrueBB() == getFalseBB()) {
-    assert(DestBB == getTrueBB() && "DestBB is not a target of this cond_br");
-    return SILValue();
+    assert(destBlock == getTrueBB() &&
+           "DestBB is not a target of this cond_br");
+    return nullptr;
   }
 
-  if (DestBB == getTrueBB())
-    return getAllOperands()[NumFixedOpers + ArgIndex].get();
+  auto *self = const_cast<CondBranchInst *>(this);
+  if (destBlock == getTrueBB()) {
+    return &self->getAllOperands()[NumFixedOpers + argIndex];
+  }
 
-  assert(DestBB == getFalseBB()
-         && "By process of elimination BB must be false BB");
-  return getAllOperands()[NumFixedOpers + getNumTrueArgs() + ArgIndex].get();
+  assert(destBlock == getFalseBB() &&
+         "By process of elimination BB must be false BB");
+  return &self->getAllOperands()[NumFixedOpers + getNumTrueArgs() + argIndex];
 }
 
 void CondBranchInst::swapSuccessors() {
@@ -2382,10 +2538,7 @@ void KeyPathPattern::Profile(llvm::FoldingSetNodeID &ID,
         auto declRef = id.getDeclRef();
         ID.AddPointer(declRef.loc.getOpaqueValue());
         ID.AddInteger((unsigned)declRef.kind);
-        ID.AddInteger(declRef.isCurried);
-        ID.AddBoolean(declRef.isCurried);
         ID.AddBoolean(declRef.isForeign);
-        ID.AddBoolean(declRef.isDirectReference);
         ID.AddBoolean(declRef.defaultArgIndex);
         break;
       }

@@ -10,8 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 //
-//  This file binds the names in non-ValueDecls Decls like imports, operators,
-//  and precedence groups.
+//  This file performs import resolution.
+//  FIXME: Rename NameBinding to ImportResolution.
 //
 //===----------------------------------------------------------------------===//
 
@@ -33,6 +33,7 @@
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Host.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include <algorithm>
@@ -183,6 +184,13 @@ namespace {
     /// often enormous.
     SmallSetVector<ImportedModuleDesc, 64> crossImportableModules;
 
+    /// The subset of \c crossImportableModules which may declare cross-imports.
+    ///
+    /// This is a performance optimization. Since most modules do not register
+    /// any cross-imports, we can usually compare against this list, which is
+    /// much, much smaller than \c crossImportableModules.
+    SmallVector<ImportedModuleDesc, 16> crossImportDeclaringModules;
+
     /// The index of the next module in \c visibleModules that should be
     /// cross-imported.
     size_t nextModuleToCrossImport = 0;
@@ -198,12 +206,8 @@ namespace {
     }
 
   private:
-    // Special behavior for these decls:
+    // We only need to visit import decls.
     void visitImportDecl(ImportDecl *ID);
-    void visitPrecedenceGroupDecl(PrecedenceGroupDecl *group);
-    void visitPrefixOperatorDecl(PrefixOperatorDecl *OpDecl);
-    void visitInfixOperatorDecl(InfixOperatorDecl *OpDecl);
-    void visitPostfixOperatorDecl(PostfixOperatorDecl *OpDecl);
 
     // Ignore other decls.
     void visitDecl(Decl *D) {}
@@ -230,22 +234,26 @@ namespace {
     ///   then adds them to \c unboundImports using source locations from \p I.
     void crossImport(ModuleDecl *M, UnboundImport &I);
 
+    /// Discovers any cross-imports between \p newImport and
+    /// \p oldImports and adds them to \c unboundImports, using source
+    /// locations from \p I.
+    void findCrossImportsInLists(UnboundImport &I,
+                                 ArrayRef<ImportedModuleDesc> declaring,
+                                 ArrayRef<ImportedModuleDesc> bystanding,
+                                 bool shouldDiagnoseRedundantCrossImports);
+
     /// Discovers any cross-imports between \p declaringImport and
     /// \p bystandingImport and adds them to \c unboundImports, using source
     /// locations from \p I.
     void findCrossImports(UnboundImport &I,
                           const ImportedModuleDesc &declaringImport,
                           const ImportedModuleDesc &bystandingImport,
-                          SmallVectorImpl<Identifier> &overlayNames);
+                          bool shouldDiagnoseRedundantCrossImports);
 
     /// Load a module referenced by an import statement.
     ///
     /// Returns null if no module can be loaded.
     ModuleDecl *getModule(ArrayRef<Located<Identifier>> ModuleID);
-
-    template<typename OP_DECL>
-    void insertOperatorDecl(SourceFile::OperatorMap<OP_DECL*> &Operators,
-                            OP_DECL *OpDecl);
   };
 } // end anonymous namespace
 
@@ -254,14 +262,12 @@ namespace {
 //===----------------------------------------------------------------------===//
 
 /// performNameBinding - Once parsing is complete, this walks the AST to
-/// resolve names and do other top-level validation.
+/// resolve imports.
 ///
 /// Most names are actually bound by the type checker, but before we can
 /// type-check a source file, we need to make declarations imported from other
-/// modules available and build tables of the operators and precedecence groups
-/// declared in that file. Name binding processes top-level \c ImportDecl,
-/// \c OperatorDecl, and \c PrecedenceGroupDecl nodes to perform these tasks,
-/// along with related validation.
+/// modules available. Name binding processes top-level \c ImportDecl nodes
+/// to perform this task, along with related validation.
 ///
 /// Name binding operates on a parsed but otherwise unvalidated AST.
 void swift::performNameBinding(SourceFile &SF) {
@@ -277,7 +283,7 @@ void swift::performNameBinding(SourceFile &SF) {
 
   NameBinder Binder(SF);
 
-  // Bind each import and operator declaration.
+  // Resolve each import declaration.
   for (auto D : SF.getTopLevelDecls())
     Binder.visit(D);
 
@@ -285,52 +291,6 @@ void swift::performNameBinding(SourceFile &SF) {
 
   SF.ASTStage = SourceFile::NameBound;
   verify(SF);
-}
-
-//===----------------------------------------------------------------------===//
-// MARK: Operator declarations
-//===----------------------------------------------------------------------===//
-
-template<typename OP_DECL> void
-NameBinder::insertOperatorDecl(SourceFile::OperatorMap<OP_DECL*> &Operators,
-                               OP_DECL *OpDecl) {
-  auto previousDecl = Operators.find(OpDecl->getName());
-  if (previousDecl != Operators.end()) {
-    diagnose(OpDecl->getLoc(), diag::operator_redeclared);
-    diagnose(previousDecl->second.getPointer(),
-             diag::previous_operator_decl);
-    return;
-  }
-
-  // FIXME: The second argument indicates whether the given operator is visible
-  // outside the current file.
-  Operators[OpDecl->getName()] = { OpDecl, true };
-}
-
-void NameBinder::visitPrefixOperatorDecl(PrefixOperatorDecl *OpDecl) {
-  insertOperatorDecl(SF.PrefixOperators, OpDecl);
-}
-
-void NameBinder::visitInfixOperatorDecl(InfixOperatorDecl *OpDecl) {
-  insertOperatorDecl(SF.InfixOperators, OpDecl);
-}
-
-void NameBinder::visitPostfixOperatorDecl(PostfixOperatorDecl *OpDecl) {
-  insertOperatorDecl(SF.PostfixOperators, OpDecl);
-}
-
-void NameBinder::visitPrecedenceGroupDecl(PrecedenceGroupDecl *group) {
-  auto previousDecl = SF.PrecedenceGroups.find(group->getName());
-  if (previousDecl != SF.PrecedenceGroups.end()) {
-    diagnose(group->getLoc(), diag::precedence_group_redeclared);
-    diagnose(previousDecl->second.getPointer(),
-             diag::previous_precedence_group_decl);
-    return;
-  }
-
-  // FIXME: The second argument indicates whether the given precedence
-  // group is visible outside the current file.
-  SF.PrecedenceGroups[group->getName()] = { group, true };
 }
 
 //===----------------------------------------------------------------------===//
@@ -697,7 +657,7 @@ static const char *getImportKindString(ImportKind kind) {
   llvm_unreachable("Unhandled ImportKind in switch.");
 }
 
-llvm::Expected<ArrayRef<ValueDecl *>>
+ArrayRef<ValueDecl *>
 ScopedImportLookupRequest::evaluate(Evaluator &evaluator,
                                     ImportDecl *import) const {
   using namespace namelookup;
@@ -852,55 +812,72 @@ void NameBinder::crossImport(ModuleDecl *M, UnboundImport &I) {
     // FIXME: Should we warn if M doesn't reexport underlyingModule?
     SF.addSeparatelyImportedOverlay(M, I.getUnderlyingModule().get());
 
-  // FIXME: Most of the comparisons we do here are probably unnecessary. We
-  // only need to findCrossImports() on pairs where at least one of the two
-  // modules declares cross-imports, and most modules don't. This is low-hanging
-  // performance fruit.
-
   auto newImports = crossImportableModules.getArrayRef()
-                        .slice(nextModuleToCrossImport);
+                        .drop_front(nextModuleToCrossImport);
+
+  if (newImports.empty())
+    // Nothing to do except crash when we read past the end of
+    // crossImportableModules in that assert at the bottom.
+    return;
+
   for (auto &newImport : newImports) {
     if (!canCrossImport(newImport))
       continue;
 
-    // Search imports up to, but not including or after, `newImport`.
+    // First we check if any of the imports of modules that have declared
+    // cross-imports have declared one with this module.
+    findCrossImportsInLists(I, crossImportDeclaringModules, {newImport},
+                            /*shouldDiagnoseRedundantCrossImports=*/false);
+
+    // If this module doesn't declare any cross-imports, we're done with this
+    // import.
+    if (!newImport.module.second->mightDeclareCrossImportOverlays())
+      continue;
+
+    // Fine, we need to do the slow-but-rare thing: check if this import
+    // declares a cross-import with any previous one.
     auto oldImports =
-        make_range(crossImportableModules.getArrayRef().data(), &newImport);
-    for (auto &oldImport : oldImports) {
-      if (!canCrossImport(oldImport))
-        continue;
+        // Slice from the start of crossImportableModules up to newImport.
+        llvm::makeArrayRef(crossImportableModules.getArrayRef().data(),
+                           &newImport);
+    findCrossImportsInLists(I, {newImport}, oldImports,
+                            /*shouldDiagnoseRedundantCrossImports=*/true);
 
-      SmallVector<Identifier, 2> newImportOverlays;
-      findCrossImports(I, newImport, oldImport, newImportOverlays);
-
-      SmallVector<Identifier, 2> oldImportOverlays;
-      findCrossImports(I, oldImport, newImport, oldImportOverlays);
-
-      // If both sides of the cross-import declare some of the same overlays,
-      // this will cause some strange name lookup behavior; let's warn about it.
-      for (auto name : newImportOverlays) {
-        if (llvm::is_contained(oldImportOverlays, name)) {
-          ctx.Diags.diagnose(I.importLoc, diag::cross_imported_by_both_modules,
-                             newImport.module.second->getName(),
-                             oldImport.module.second->getName(), name);
-        }
-      }
-
-      // If findCrossImports() ever changed the visibleModules list, we'd see
-      // memory smashers here.
-      assert(newImports.data() ==
-                 &crossImportableModules[nextModuleToCrossImport] &&
-             "findCrossImports() should never mutate visibleModules");
-    }
+    // Add this to the list of imports everyone needs to check against.
+    crossImportDeclaringModules.push_back(newImport);
   }
 
+  // Catch potential memory smashers
+  assert(newImports.data() ==
+             &crossImportableModules[nextModuleToCrossImport] &&
+         "findCrossImports() should never mutate visibleModules");
+
   nextModuleToCrossImport = crossImportableModules.size();
+}
+
+void
+NameBinder::findCrossImportsInLists(UnboundImport &I,
+                                    ArrayRef<ImportedModuleDesc> declaring,
+                                    ArrayRef<ImportedModuleDesc> bystanding,
+                                    bool shouldDiagnoseRedundantCrossImports) {
+  for (auto &declaringImport : declaring) {
+    if (!canCrossImport(declaringImport))
+      continue;
+
+    for (auto &bystandingImport : bystanding) {
+      if (!canCrossImport(bystandingImport))
+        continue;
+
+      findCrossImports(I, declaringImport, bystandingImport,
+                       shouldDiagnoseRedundantCrossImports);
+    }
+  }
 }
 
 void NameBinder::findCrossImports(UnboundImport &I,
                                   const ImportedModuleDesc &declaringImport,
                                   const ImportedModuleDesc &bystandingImport,
-                                  SmallVectorImpl<Identifier> &names) {
+                                  bool shouldDiagnoseRedundantCrossImports) {
   assert(&declaringImport != &bystandingImport);
 
   LLVM_DEBUG(
@@ -912,8 +889,16 @@ void NameBinder::findCrossImports(UnboundImport &I,
     ctx.Stats->getFrontendCounters().NumCrossImportsChecked++;
 
   // Find modules we need to import.
+  SmallVector<Identifier, 4> names;
   declaringImport.module.second->findDeclaredCrossImportOverlays(
       bystandingImport.module.second->getName(), names, I.importLoc);
+
+  // If we're diagnosing cases where we cross-import in both directions, get the
+  // inverse list. Otherwise, leave the list empty.
+  SmallVector<Identifier, 4> oppositeNames;
+  if (shouldDiagnoseRedundantCrossImports)
+    bystandingImport.module.second->findDeclaredCrossImportOverlays(
+        declaringImport.module.second->getName(), oppositeNames, I.importLoc);
 
   if (ctx.Stats && !names.empty())
     ctx.Stats->getFrontendCounters().NumCrossImportsFound++;
@@ -927,6 +912,11 @@ void NameBinder::findCrossImports(UnboundImport &I,
 
     unboundImports.emplace_back(declaringImport.module.second->getASTContext(),
                                 I, name, declaringImport, bystandingImport);
+
+    if (llvm::is_contained(oppositeNames, name))
+      ctx.Diags.diagnose(I.importLoc, diag::cross_imported_by_both_modules,
+                         declaringImport.module.second->getName(),
+                         bystandingImport.module.second->getName(), name);
 
     LLVM_DEBUG({
       auto &crossImportOptions = unboundImports.back().options;

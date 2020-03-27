@@ -1221,6 +1221,26 @@ void Remangler::mangleFunctionType(Node *node) {
   Buffer << 'c';
 }
 
+void Remangler::mangleDifferentiableFunctionType(Node *node) {
+  mangleFunctionSignature(node);
+  Buffer << "XF";
+}
+
+void Remangler::mangleEscapingDifferentiableFunctionType(Node *node) {
+  mangleFunctionSignature(node);
+  Buffer << "XG";
+}
+
+void Remangler::mangleLinearFunctionType(Node *node) {
+  mangleFunctionSignature(node);
+  Buffer << "XH";
+}
+
+void Remangler::mangleEscapingLinearFunctionType(Node *node) {
+  mangleFunctionSignature(node);
+  Buffer << "XI";
+}
+
 void Remangler::mangleGenericProtocolWitnessTable(Node *node) {
   mangleSingleChildNode(node);
   Buffer << "WG";
@@ -1378,6 +1398,14 @@ void Remangler::mangleIVarDestroyer(Node *node) {
   Buffer << "fE";
 }
 
+void Remangler::mangleImplDifferentiable(Node *node) {
+  Buffer << 'd';
+}
+
+void Remangler::mangleImplLinear(Node *node) {
+  Buffer << 'l';
+}
+
 void Remangler::mangleImplEscaping(Node *node) {
   Buffer << 'e';
 }
@@ -1396,19 +1424,19 @@ void Remangler::mangleImplFunctionAttribute(Node *node) {
   unreachable("handled inline");
 }
 
-void Remangler::mangleImplSubstitutions(Node *node) {
+void Remangler::mangleImplInvocationSubstitutions(Node *node) {
   unreachable("handled inline");
 }
 
-void Remangler::mangleImplImpliedSubstitutions(Node *node) {
+void Remangler::mangleImplPatternSubstitutions(Node *node) {
   unreachable("handled inline");
 }
 
 void Remangler::mangleImplFunctionType(Node *node) {
   const char *PseudoGeneric = "";
   Node *GenSig = nullptr;
-  Node *GenSubs = nullptr;
-  bool isImplied;
+  Node *PatternSubs = nullptr;
+  Node *InvocationSubs = nullptr;
   for (NodePointer Child : *node) {
     switch (auto kind = Child->getKind()) {
     case Node::Kind::ImplParameter:
@@ -1423,10 +1451,11 @@ void Remangler::mangleImplFunctionType(Node *node) {
     case Node::Kind::DependentGenericSignature:
       GenSig = Child;
       break;
-    case Node::Kind::ImplSubstitutions:
-    case Node::Kind::ImplImpliedSubstitutions:
-      GenSubs = Child;
-      isImplied = kind == Node::Kind::ImplImpliedSubstitutions;
+    case Node::Kind::ImplPatternSubstitutions:
+      PatternSubs = Child;
+      break;
+    case Node::Kind::ImplInvocationSubstitutions:
+      InvocationSubs = Child;
       break;
     default:
       break;
@@ -1434,24 +1463,36 @@ void Remangler::mangleImplFunctionType(Node *node) {
   }
   if (GenSig)
     mangle(GenSig);
-  if (GenSubs) {
+  if (InvocationSubs) {
     Buffer << 'y';
-    mangleChildNodes(GenSubs->getChild(0));
-    if (GenSubs->getNumChildren() >= 2)
-      mangleRetroactiveConformance(GenSubs->getChild(1));
+    mangleChildNodes(InvocationSubs->getChild(0));
+    if (InvocationSubs->getNumChildren() >= 2)
+      mangleRetroactiveConformance(InvocationSubs->getChild(1));
+  }
+  if (PatternSubs) {
+    mangle(PatternSubs->getChild(0));
+    Buffer << 'y';
+    mangleChildNodes(PatternSubs->getChild(1));
+    if (PatternSubs->getNumChildren() >= 3)
+      mangleRetroactiveConformance(PatternSubs->getChild(2));
   }
 
   Buffer << 'I';
 
-  if (GenSubs) {
+  if (PatternSubs)
     Buffer << 's';
-    if (!isImplied)
-      Buffer << 'i';
-  }
+  if (InvocationSubs)
+    Buffer << 'I';
 
   Buffer << PseudoGeneric;
   for (NodePointer Child : *node) {
     switch (Child->getKind()) {
+      case Node::Kind::ImplDifferentiable:
+        Buffer << 'd';
+        break;
+      case Node::Kind::ImplLinear:
+        Buffer << 'l';
+        break;
       case Node::Kind::ImplEscaping:
         Buffer << 'e';
         break;

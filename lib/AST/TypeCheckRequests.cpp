@@ -863,14 +863,14 @@ bool EnumRawValuesRequest::isCached() const {
   return std::get<1>(getStorage()) == TypeResolutionStage::Interface;
 }
 
-Optional<bool> EnumRawValuesRequest::getCachedResult() const {
+Optional<evaluator::SideEffect> EnumRawValuesRequest::getCachedResult() const {
   auto *ED = std::get<0>(getStorage());
   if (ED->LazySemanticInfo.hasCheckedRawValues())
-    return true;
+    return std::make_tuple<>();
   return None;
 }
 
-void EnumRawValuesRequest::cacheResult(bool) const {
+void EnumRawValuesRequest::cacheResult(evaluator::SideEffect) const {
   auto *ED = std::get<0>(getStorage());
   auto flags = ED->LazySemanticInfo.RawTypeAndFlags.getInt() |
       EnumDecl::HasFixedRawValues |
@@ -1017,15 +1017,16 @@ void InterfaceTypeRequest::cacheResult(Type type) const {
 }
 
 //----------------------------------------------------------------------------//
-// LookupPrecedenceGroupRequest computation.
+// ValidatePrecedenceGroupRequest computation.
 //----------------------------------------------------------------------------//
 
-SourceLoc LookupPrecedenceGroupRequest::getNearestLoc() const {
+SourceLoc ValidatePrecedenceGroupRequest::getNearestLoc() const {
   auto &desc = std::get<0>(getStorage());
   return desc.getLoc();
 }
 
-void LookupPrecedenceGroupRequest::diagnoseCycle(DiagnosticEngine &diags) const {
+void ValidatePrecedenceGroupRequest::diagnoseCycle(
+    DiagnosticEngine &diags) const {
   auto &desc = std::get<0>(getStorage());
   if (auto pathDir = desc.pathDirection) {
     diags.diagnose(desc.nameLoc, diag::precedence_group_cycle, (bool)*pathDir);
@@ -1034,7 +1035,8 @@ void LookupPrecedenceGroupRequest::diagnoseCycle(DiagnosticEngine &diags) const 
   }
 }
 
-void LookupPrecedenceGroupRequest::noteCycleStep(DiagnosticEngine &diag) const {
+void ValidatePrecedenceGroupRequest::noteCycleStep(
+    DiagnosticEngine &diag) const {
   auto &desc = std::get<0>(getStorage());
   diag.diagnose(desc.nameLoc,
                  diag::circular_reference_through_precedence_group, desc.ident);
@@ -1266,15 +1268,16 @@ void DifferentiableAttributeTypeCheckRequest::cacheResult(
 // TypeCheckSourceFileRequest computation.
 //----------------------------------------------------------------------------//
 
-Optional<bool> TypeCheckSourceFileRequest::getCachedResult() const {
+Optional<evaluator::SideEffect>
+TypeCheckSourceFileRequest::getCachedResult() const {
   auto *SF = std::get<0>(getStorage());
   if (SF->ASTStage == SourceFile::TypeChecked)
-    return true;
+    return std::make_tuple<>();
 
   return None;
 }
 
-void TypeCheckSourceFileRequest::cacheResult(bool result) const {
+void TypeCheckSourceFileRequest::cacheResult(evaluator::SideEffect) const {
   auto *SF = std::get<0>(getStorage());
 
   // Verify that we've checked types correctly.

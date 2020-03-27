@@ -1738,12 +1738,27 @@ NodePointer Demangler::demangleImplFunctionType() {
     NodePointer SubstitutionRetroConformances;
     if (!demangleBoundGenerics(Substitutions, SubstitutionRetroConformances))
       return nullptr;
-    
-    bool isImplied = !nextIf('i');
-    
-    auto subsNode = createNode(isImplied
-                               ? Node::Kind::ImplImpliedSubstitutions
-                               : Node::Kind::ImplSubstitutions);
+
+    NodePointer sig = popNode(Node::Kind::DependentGenericSignature);
+    if (!sig)
+      return nullptr;
+
+    auto subsNode = createNode(Node::Kind::ImplPatternSubstitutions);
+    subsNode->addChild(sig, *this);
+    assert(Substitutions.size() == 1);
+    subsNode->addChild(Substitutions[0], *this);
+    if (SubstitutionRetroConformances)
+      subsNode->addChild(SubstitutionRetroConformances, *this);
+    type->addChild(subsNode, *this);
+  }
+
+  if (nextIf('I')) {
+    Vector<NodePointer> Substitutions;
+    NodePointer SubstitutionRetroConformances;
+    if (!demangleBoundGenerics(Substitutions, SubstitutionRetroConformances))
+      return nullptr;
+
+    auto subsNode = createNode(Node::Kind::ImplInvocationSubstitutions);
     assert(Substitutions.size() == 1);
     subsNode->addChild(Substitutions[0], *this);
     if (SubstitutionRetroConformances)
@@ -1757,6 +1772,11 @@ NodePointer Demangler::demangleImplFunctionType() {
 
   if (nextIf('e'))
     type->addChild(createNode(Node::Kind::ImplEscaping), *this);
+
+  if (nextIf('d'))
+    type->addChild(createNode(Node::Kind::ImplDifferentiable), *this);
+  if (nextIf('l'))
+    type->addChild(createNode(Node::Kind::ImplLinear), *this);
 
   const char *CAttr = nullptr;
   switch (nextChar()) {
@@ -2776,6 +2796,14 @@ NodePointer Demangler::demangleSpecialType() {
       return popFunctionType(Node::Kind::ObjCBlock);
     case 'C':
       return popFunctionType(Node::Kind::CFunctionPointer);
+    case 'F':
+      return popFunctionType(Node::Kind::DifferentiableFunctionType);
+    case 'G':
+      return popFunctionType(Node::Kind::EscapingDifferentiableFunctionType);
+    case 'H':
+      return popFunctionType(Node::Kind::LinearFunctionType);
+    case 'I':
+      return popFunctionType(Node::Kind::EscapingLinearFunctionType);
     case 'o':
       return createType(createWithChild(Node::Kind::Unowned,
                                         popNode(Node::Kind::Type)));

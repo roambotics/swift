@@ -16,12 +16,14 @@
 
 #include "MetadataRequest.h"
 
+#include "Callee.h"
 #include "ConstantBuilder.h"
 #include "Explosion.h"
 #include "FixedTypeInfo.h"
 #include "GenArchetype.h"
 #include "GenClass.h"
 #include "GenMeta.h"
+#include "GenPointerAuth.h"
 #include "GenProto.h"
 #include "GenType.h"
 #include "GenericArguments.h"
@@ -300,7 +302,7 @@ llvm::Constant *IRGenModule::getAddrOfStringForMetadataRef(
 
 llvm::Constant *IRGenModule::getAddrOfStringForTypeRef(StringRef str,
                                                        MangledTypeRefRole role){
-  return getAddrOfStringForTypeRef(SymbolicMangling{str, {}}, role);
+  return getAddrOfStringForTypeRef(SymbolicMangling{str.str(), {}}, role);
 }
 
 llvm::Constant *IRGenModule::getAddrOfStringForTypeRef(
@@ -587,7 +589,7 @@ llvm::Value *irgen::emitObjCHeapMetadataRef(IRGenFunction &IGF,
   if (allowUninitialized) return classObject;
 
   // TODO: memoize this the same way that we memoize Swift type metadata?
-  return IGF.Builder.CreateCall(IGF.IGM.getGetInitializedObjCClassFn(),
+  return IGF.Builder.CreateCall(IGF.IGM.getFixedClassInitializationFn(),
                                 classObject);
 }
 
@@ -612,7 +614,7 @@ emitIdempotentClassMetadataInitialization(IRGenFunction &IGF,
                                           llvm::Value *metadata) {
   if (IGF.IGM.ObjCInterop) {
     metadata = IGF.Builder.CreateBitCast(metadata, IGF.IGM.ObjCClassPtrTy);
-    metadata = IGF.Builder.CreateCall(IGF.IGM.getGetInitializedObjCClassFn(),
+    metadata = IGF.Builder.CreateCall(IGF.IGM.getFixedClassInitializationFn(),
                                       metadata);
     metadata = IGF.Builder.CreateBitCast(metadata, IGF.IGM.TypeMetadataPtrTy);
   }
@@ -1229,12 +1231,30 @@ namespace {
         break;
       }
 
+      FunctionMetadataDifferentiabilityKind metadataDifferentiabilityKind;
+      switch (type->getDifferentiabilityKind()) {
+      case DifferentiabilityKind::NonDifferentiable:
+        metadataDifferentiabilityKind =
+            FunctionMetadataDifferentiabilityKind::NonDifferentiable;
+        break;
+      case DifferentiabilityKind::Normal:
+        metadataDifferentiabilityKind =
+            FunctionMetadataDifferentiabilityKind::Normal;
+        break;
+      case DifferentiabilityKind::Linear:
+        metadataDifferentiabilityKind =
+            FunctionMetadataDifferentiabilityKind::Linear;
+        break;
+      }
+
       auto flagsVal = FunctionTypeFlags()
                           .withNumParameters(numParams)
                           .withConvention(metadataConvention)
                           .withThrows(type->throws())
                           .withParameterFlags(hasFlags)
-                          .withEscaping(isEscaping);
+                          .withEscaping(isEscaping)
+                          .withDifferentiabilityKind(
+                              metadataDifferentiabilityKind);
 
       auto flags = llvm::ConstantInt::get(IGF.IGM.SizeTy,
                                           flagsVal.getIntValue());
@@ -1881,8 +1901,17 @@ MetadataResponse irgen::emitGenericTypeMetadataAccessFunction(
     GenericArguments &genericArgs) {
   auto &IGM = IGF.IGM;
   
-  llvm::Constant *descriptor =
+  llvm::Value *descriptor =
     IGM.getAddrOfTypeContextDescriptor(nominal, RequireMetadata);
+
+  // Sign the descriptor.
+  auto schema = IGF.IGM.getOptions().PointerAuth.TypeDescriptorsAsArguments;
+  if (schema) {
+    auto authInfo = PointerAuthInfo::emit(
+        IGF, schema, nullptr,
+        PointerAuthEntity::Special::TypeDescriptorAsArgument);
+    descriptor = emitPointerAuthSign(IGF, descriptor, authInfo);
+  }
 
   auto request = params.claimNext();
 
@@ -2191,6 +2220,10 @@ irgen::getGenericTypeMetadataAccessFunction(IRGenModule &IGM,
 }
 
 static bool shouldAccessByMangledName(IRGenModule &IGM, CanType type) {
+  // Never access by mangled name if we've been asked not to.
+  if (IGM.getOptions().DisableConcreteTypeMetadataMangledNameAccessors)
+    return false;
+  
   // A nongeneric nominal type with nontrivial metadata has an accessor
   // already we can just call.
   if (auto nom = dyn_cast<NominalType>(type)) {
@@ -2202,17 +2235,19 @@ static bool shouldAccessByMangledName(IRGenModule &IGM, CanType type) {
   }
   
   // The Swift 5.1 runtime fails to demangle associated types of opaque types.
-  auto hasNestedOpaqueArchetype = type.findIf([](CanType sub) -> bool {
-    if (auto archetype = dyn_cast<NestedArchetypeType>(sub)) {
-      if (isa<OpaqueTypeArchetypeType>(archetype->getRoot())) {
-        return true;
+  if (!IGM.getAvailabilityContext().isContainedIn(IGM.Context.getSwift52Availability())) {
+    auto hasNestedOpaqueArchetype = type.findIf([](CanType sub) -> bool {
+      if (auto archetype = dyn_cast<NestedArchetypeType>(sub)) {
+        if (isa<OpaqueTypeArchetypeType>(archetype->getRoot())) {
+          return true;
+        }
       }
-    }
-    return false;
-  });
-  
-  if (hasNestedOpaqueArchetype)
-    return false;
+      return false;
+    });
+    
+    if (hasNestedOpaqueArchetype)
+      return false;
+  }
   
   return true;
 

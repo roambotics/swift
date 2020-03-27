@@ -308,7 +308,8 @@ static ValueDecl *getStandinForAccessor(AbstractStorageDecl *witness,
 /// witness.
 /// - If requirement's `@differentiable` attributes are met, or if `result` is
 ///   not viable, returns `result`.
-/// - Otherwise, returns a `DifferentiableConflict` `RequirementMatch`.
+/// - Otherwise, returns a "missing `@differentiable` attribute"
+///   `RequirementMatch`.
 // Note: the `result` argument is only necessary for using
 // `RequirementMatch::WitnessSubstitutions`.
 static RequirementMatch
@@ -384,15 +385,50 @@ matchWitnessDifferentiableAttr(DeclContext *dc, ValueDecl *req,
     }
     if (!foundExactConfig) {
       bool success = false;
-      if (supersetConfig) {
-        // If the witness has a "superset" derivative configuration, create an
-        // implicit `@differentiable` attribute with the exact requirement
-        // `@differentiable` attribute parameter indices.
+      // If no exact witness derivative configuration was found, check
+      // conditions for creating an implicit witness `@differentiable` attribute
+      // with the exact derivative configuration:
+      // - If the witness has a "superset" derivative configuration.
+      // - If the witness is less than public and is declared in the same file
+      //   as the conformance.
+      //   - `@differentiable` attributes are really only significant for public
+      //     declarations: it improves usability to not require explicit
+      //     `@differentiable` attributes for less-visible declarations.
+      bool createImplicitWitnessAttribute =
+          supersetConfig || witness->getFormalAccess() < AccessLevel::Public;
+      // If the witness has less-than-public visibility and is declared in a
+      // different file than the conformance, produce an error.
+      if (!supersetConfig && witness->getFormalAccess() < AccessLevel::Public &&
+          dc->getModuleScopeContext() !=
+              witness->getDeclContext()->getModuleScopeContext()) {
+        // FIXME(TF-1014): `@differentiable` attribute diagnostic does not
+        // appear if associated type inference is involved.
+        if (auto *vdWitness = dyn_cast<VarDecl>(witness)) {
+          return RequirementMatch(
+              getStandinForAccessor(vdWitness, AccessorKind::Get),
+              MatchKind::MissingDifferentiableAttr, reqDiffAttr);
+        } else {
+          return RequirementMatch(witness, MatchKind::MissingDifferentiableAttr,
+                                  reqDiffAttr);
+        }
+      }
+      if (createImplicitWitnessAttribute) {
+        auto derivativeGenSig = witnessAFD->getGenericSignature();
+        if (supersetConfig)
+          derivativeGenSig = supersetConfig->derivativeGenericSignature;
+        // Use source location of the witness declaration as the source location
+        // of the implicit `@differentiable` attribute.
         auto *newAttr = DifferentiableAttr::create(
-            witnessAFD, /*implicit*/ true, reqDiffAttr->AtLoc,
-            reqDiffAttr->getRange(), reqDiffAttr->isLinear(),
-            reqDiffAttr->getParameterIndices(), /*jvp*/ None,
-            /*vjp*/ None, supersetConfig->derivativeGenericSignature);
+            witnessAFD, /*implicit*/ true, witness->getLoc(), witness->getLoc(),
+            reqDiffAttr->isLinear(), reqDiffAttr->getParameterIndices(),
+            derivativeGenSig);
+        // If the implicit attribute is inherited from a protocol requirement's
+        // attribute, store the protocol requirement attribute's location for
+        // use in diagnostics.
+        if (witness->getFormalAccess() < AccessLevel::Public) {
+          newAttr->getImplicitlyInheritedDifferentiableAttrLocation(
+              reqDiffAttr->getLocation());
+        }
         auto insertion = ctx.DifferentiableAttrs.try_emplace(
             {witnessAFD, newAttr->getParameterIndices()}, newAttr);
         // Valid `@differentiable` attributes are uniqued by original function
@@ -402,6 +438,11 @@ matchWitnessDifferentiableAttr(DeclContext *dc, ValueDecl *req,
         } else {
           witness->getAttrs().add(newAttr);
           success = true;
+          // Register derivative function configuration.
+          auto *resultIndices = IndexSubset::get(ctx, 1, {0});
+          witnessAFD->addDerivativeFunctionConfiguration(
+              {newAttr->getParameterIndices(), resultIndices,
+               newAttr->getDerivativeGenericSignature()});
         }
       }
       if (!success) {
@@ -418,9 +459,9 @@ matchWitnessDifferentiableAttr(DeclContext *dc, ValueDecl *req,
         if (auto *vdWitness = dyn_cast<VarDecl>(witness)) {
           return RequirementMatch(
               getStandinForAccessor(vdWitness, AccessorKind::Get),
-              MatchKind::DifferentiableConflict, reqDiffAttr);
+              MatchKind::MissingDifferentiableAttr, reqDiffAttr);
         } else {
-          return RequirementMatch(witness, MatchKind::DifferentiableConflict,
+          return RequirementMatch(witness, MatchKind::MissingDifferentiableAttr,
                                   reqDiffAttr);
         }
       }
@@ -2318,14 +2359,15 @@ diagnoseMatch(ModuleDecl *module, NormalProtocolConformance *conformance,
   case MatchKind::NonObjC:
     diags.diagnose(match.Witness, diag::protocol_witness_not_objc);
     break;
-  case MatchKind::DifferentiableConflict: {
+  case MatchKind::MissingDifferentiableAttr: {
+    auto *witness = match.Witness;
     // Emit a note and fix-it showing the missing requirement `@differentiable`
     // attribute.
     auto *reqAttr = cast<DifferentiableAttr>(match.UnmetAttribute);
     assert(reqAttr);
     // Omit printing `wrt:` clause if attribute's differentiability
     // parameters match inferred differentiability parameters.
-    auto *original = cast<AbstractFunctionDecl>(match.Witness);
+    auto *original = cast<AbstractFunctionDecl>(witness);
     auto *whereClauseGenEnv =
         reqAttr->getDerivativeGenericEnvironment(original);
     auto *inferredParameters = TypeChecker::inferDifferentiabilityParameters(
@@ -2334,13 +2376,31 @@ diagnoseMatch(ModuleDecl *module, NormalProtocolConformance *conformance,
                          inferredParameters->getNumIndices();
     std::string reqDiffAttrString;
     llvm::raw_string_ostream os(reqDiffAttrString);
-    reqAttr->print(os, req, omitWrtClause, /*omitDerivativeFunctions*/ true);
+    reqAttr->print(os, req, omitWrtClause);
     os.flush();
-    diags
-        .diagnose(match.Witness,
-                  diag::protocol_witness_missing_differentiable_attr,
-                  reqDiffAttrString)
-        .fixItInsert(match.Witness->getStartLoc(), reqDiffAttrString + ' ');
+    // If the witness has less-than-public visibility and is declared in a
+    // different file than the conformance, emit a specialized diagnostic.
+    if (witness->getFormalAccess() < AccessLevel::Public &&
+        conformance->getDeclContext()->getModuleScopeContext() !=
+            witness->getDeclContext()->getModuleScopeContext()) {
+      diags
+          .diagnose(
+              witness,
+              diag::
+                  protocol_witness_missing_differentiable_attr_nonpublic_other_file,
+              reqDiffAttrString, witness->getDescriptiveKind(),
+              witness->getFullName(), req->getDescriptiveKind(),
+              req->getFullName(), conformance->getType(),
+              conformance->getProtocol()->getDeclaredInterfaceType())
+          .fixItInsert(match.Witness->getStartLoc(), reqDiffAttrString + ' ');
+    }
+    // Otherwise, emit a general "missing attribute" diagnostic.
+    else {
+      diags
+          .diagnose(witness, diag::protocol_witness_missing_differentiable_attr,
+                    reqDiffAttrString)
+          .fixItInsert(witness->getStartLoc(), reqDiffAttrString + ' ');
+    }
     break;
   }
   }
@@ -3795,10 +3855,7 @@ static void recordConformanceDependency(DeclContext *DC,
       Conformance->getDeclContext()->getParentModule())
     return;
 
-  // FIXME: 'deinit' is being used as a dummy identifier here. Really we
-  // don't care about /any/ of the type's members, only that it conforms to
-  // the protocol.
-  tracker->addUsedMember({Adoptee, DeclBaseName::createDestructor()},
+  tracker->addUsedMember({Adoptee, Identifier()},
                          DC->isCascadingContextForLookup(InExpression));
 }
 
@@ -4896,7 +4953,10 @@ static void inferStaticInitializeObjCMetadata(ClassDecl *classDecl) {
   // If the class does not have a custom @objc name and the deployment target
   // supports the objc_getClass() hook, the workaround is unnecessary.
   ASTContext &ctx = classDecl->getASTContext();
-  if (ctx.LangOpts.doesTargetSupportObjCGetClassHook() &&
+  auto deploymentAvailability =
+      AvailabilityContext::forDeploymentTarget(ctx);
+  if (deploymentAvailability.isContainedIn(
+        ctx.getObjCGetClassHookAvailability()) &&
       !hasExplicitObjCName(classDecl))
     return;
 
@@ -5011,6 +5071,12 @@ diagnoseMissingAppendInterpolationMethod(NominalTypeDecl *typeDecl) {
   }
 }
 
+SmallVector<ProtocolConformance *, 2>
+LookupAllConformancesInContextRequest::evaluate(
+    Evaluator &eval, const DeclContext *DC) const {
+  return DC->getLocalConformances(ConformanceLookupKind::All);
+}
+
 void TypeChecker::checkConformancesInContext(DeclContext *dc,
                                              IterableDeclContext *idc) {
   // For anything imported from Clang, lazily check conformances.
@@ -5037,9 +5103,9 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
     tracker = SF->getReferencedNameTracker();
 
   // Check each of the conformances associated with this context.
-  SmallVector<ConformanceDiagnostic, 4> diagnostics;
-  auto conformances = dc->getLocalConformances(ConformanceLookupKind::All,
-                                               &diagnostics);
+  auto conformances =
+      evaluateOrDefault(dc->getASTContext().evaluator,
+                        LookupAllConformancesInContextRequest{dc}, {});
 
   // The conformance checker bundle that checks all conformances in the context.
   auto &Context = dc->getASTContext();
@@ -5096,7 +5162,7 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
                     groupChecker.getUnsatisfiedRequirements().end());
 
   // Diagnose any conflicts attributed to this declaration context.
-  for (const auto &diag : diagnostics) {
+  for (const auto &diag : dc->takeConformanceDiagnostics()) {
     // Figure out the declaration of the existing conformance.
     Decl *existingDecl = dyn_cast<NominalTypeDecl>(diag.ExistingDC);
     if (!existingDecl)
@@ -5450,7 +5516,7 @@ swift::findWitnessedObjCRequirements(const ValueDecl *witness,
   return result;
 }
 
-llvm::Expected<TypeWitnessAndDecl>
+TypeWitnessAndDecl
 TypeWitnessRequest::evaluate(Evaluator &eval,
                              NormalProtocolConformance *conformance,
                              AssociatedTypeDecl *requirement) const {
@@ -5468,7 +5534,7 @@ TypeWitnessRequest::evaluate(Evaluator &eval,
   return known->second;
 }
 
-llvm::Expected<Witness>
+Witness
 ValueWitnessRequest::evaluate(Evaluator &eval,
                               NormalProtocolConformance *conformance,
                               ValueDecl *requirement) const {
@@ -5536,6 +5602,12 @@ ValueDecl *TypeChecker::deriveProtocolRequirement(DeclContext *DC,
   case KnownProtocolKind::Decodable:
     return derived.deriveDecodable(Requirement);
 
+  case KnownProtocolKind::AdditiveArithmetic:
+    return derived.deriveAdditiveArithmetic(Requirement);
+
+  case KnownProtocolKind::Differentiable:
+    return derived.deriveDifferentiable(Requirement);
+
   default:
     return nullptr;
   }
@@ -5560,6 +5632,8 @@ Type TypeChecker::deriveTypeWitness(DeclContext *DC,
     return derived.deriveRawRepresentable(AssocType);
   case KnownProtocolKind::CaseIterable:
     return derived.deriveCaseIterable(AssocType);
+  case KnownProtocolKind::Differentiable:
+    return derived.deriveDifferentiable(AssocType);
   default:
     return nullptr;
   }

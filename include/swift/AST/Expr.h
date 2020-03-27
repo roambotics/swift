@@ -566,11 +566,14 @@ public:
 /// typically this will have an ErrorType.
 class ErrorExpr : public Expr {
   SourceRange Range;
+  Expr *OriginalExpr;
 public:
-  ErrorExpr(SourceRange Range, Type Ty = Type())
-    : Expr(ExprKind::Error, /*Implicit=*/true, Ty), Range(Range) {}
+  ErrorExpr(SourceRange Range, Type Ty = Type(), Expr *OriginalExpr = nullptr)
+    : Expr(ExprKind::Error, /*Implicit=*/true, Ty), Range(Range),
+      OriginalExpr(OriginalExpr) {}
 
   SourceRange getSourceRange() const { return Range; }
+  Expr *getOriginalExpr() const { return OriginalExpr; }
   
   static bool classof(const Expr *E) {
     return E->getKind() == ExprKind::Error;
@@ -2962,6 +2965,61 @@ public:
     return E->getKind() == ExprKind::UnevaluatedInstance;
   }
 };
+
+class DifferentiableFunctionExpr : public ImplicitConversionExpr {
+public:
+  DifferentiableFunctionExpr(Expr *subExpr, Type ty)
+      : ImplicitConversionExpr(ExprKind::DifferentiableFunction, subExpr, ty) {}
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::DifferentiableFunction;
+  }
+};
+
+class LinearFunctionExpr : public ImplicitConversionExpr {
+public:
+  LinearFunctionExpr(Expr *subExpr, Type ty)
+      : ImplicitConversionExpr(ExprKind::LinearFunction, subExpr, ty) {}
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::LinearFunction;
+  }
+};
+
+class DifferentiableFunctionExtractOriginalExpr
+    : public ImplicitConversionExpr {
+public:
+  DifferentiableFunctionExtractOriginalExpr(Expr *subExpr, Type ty)
+      : ImplicitConversionExpr(ExprKind::DifferentiableFunctionExtractOriginal,
+                               subExpr, ty) {}
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::DifferentiableFunctionExtractOriginal;
+  }
+};
+
+class LinearFunctionExtractOriginalExpr : public ImplicitConversionExpr {
+public:
+  LinearFunctionExtractOriginalExpr(Expr *subExpr, Type ty)
+      : ImplicitConversionExpr(ExprKind::LinearFunctionExtractOriginal,
+                               subExpr, ty) {}
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::LinearFunctionExtractOriginal;
+  }
+};
+
+class LinearToDifferentiableFunctionExpr : public ImplicitConversionExpr {
+public:
+  LinearToDifferentiableFunctionExpr(Expr *subExpr, Type ty)
+      : ImplicitConversionExpr(
+            ExprKind::LinearToDifferentiableFunction, subExpr, ty) {}
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::LinearToDifferentiableFunction;
+  }
+};
+
 
 /// Use an opaque type to abstract a value of the underlying concrete type.
 class UnderlyingToOpaqueExpr : public ImplicitConversionExpr {

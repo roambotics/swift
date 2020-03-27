@@ -37,6 +37,7 @@
 #include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
@@ -336,7 +337,7 @@ static void checkInheritanceClause(
 static void installCodingKeysIfNecessary(NominalTypeDecl *NTD) {
   auto req =
     ResolveImplicitMemberRequest{NTD, ImplicitMemberAction::ResolveCodingKeys};
-  (void)evaluateOrDefault(NTD->getASTContext().evaluator, req, false);
+  (void)evaluateOrDefault(NTD->getASTContext().evaluator, req, {});
 }
 
 // Check for static properties that produce empty option sets
@@ -416,6 +417,65 @@ static void checkGenericParams(GenericContext *ownerCtx) {
   WhereClauseOwner(ownerCtx)
       .visitRequirements(TypeResolutionStage::Interface,
                          [](Requirement, RequirementRepr *) { return false; });
+}
+
+template <typename T>
+static void checkOperatorOrPrecedenceGroupRedeclaration(
+    T *decl, Diag<> diagID, Diag<> noteID,
+    llvm::function_ref<TinyPtrVector<T *>(OperatorLookupDescriptor)>
+        lookupOthers) {
+  if (decl->isInvalid())
+    return;
+
+  auto *currentFile = decl->getDeclContext()->getParentSourceFile();
+  assert(currentFile);
+
+  auto *module = currentFile->getParentModule();
+  auto &ctx = module->getASTContext();
+  auto desc = OperatorLookupDescriptor::forModule(module, decl->getName(),
+                                                  /*cascades*/ true,
+                                                  /*diagLoc*/ SourceLoc());
+  auto otherDecls = lookupOthers(desc);
+  for (auto *other : otherDecls) {
+    if (other == decl || other->isInvalid())
+      continue;
+
+    // Emit a redeclaration error if the two declarations occur in the same
+    // source file. We currently allow redeclarations across source files to
+    // allow the user to shadow operator decls from imports, as we currently
+    // favor those decls over ones from other files.
+    // FIXME: Once we prefer operator decls from the same module, start
+    // diagnosing redeclarations across files.
+    if (currentFile == other->getDeclContext()->getParentSourceFile()) {
+      // Make sure we get the diagnostic ordering to be sensible.
+      if (decl->getLoc().isValid() && other->getLoc().isValid() &&
+          ctx.SourceMgr.isBeforeInBuffer(decl->getLoc(), other->getLoc())) {
+        std::swap(decl, other);
+      }
+      ctx.Diags.diagnose(decl, diagID);
+      ctx.Diags.diagnose(other, noteID);
+      decl->setInvalid();
+      return;
+    }
+  }
+}
+
+static void checkRedeclaration(OperatorDecl *op) {
+  checkOperatorOrPrecedenceGroupRedeclaration<OperatorDecl>(
+      op, diag::operator_redeclared, diag::previous_operator_decl,
+      [&](OperatorLookupDescriptor desc) {
+        DirectOperatorLookupRequest req{desc, op->getFixity()};
+        return evaluateOrDefault(op->getASTContext().evaluator, req, {});
+      });
+}
+
+static void checkRedeclaration(PrecedenceGroupDecl *group) {
+  checkOperatorOrPrecedenceGroupRedeclaration<PrecedenceGroupDecl>(
+      group, diag::precedence_group_redeclared,
+      diag::previous_precedence_group_decl, [&](OperatorLookupDescriptor desc) {
+        DirectPrecedenceGroupLookupRequest req{desc};
+        return evaluateOrDefault(group->getASTContext().evaluator, req, {});
+      });
 }
 
 /// Check whether \c current is a redeclaration.
@@ -723,9 +783,8 @@ static void checkDefaultArguments(ParameterList *params) {
     (void)param->getTypeCheckedDefaultExpr();
 }
 
-llvm::Expected<Expr *>
-DefaultArgumentExprRequest::evaluate(Evaluator &evaluator,
-                                     ParamDecl *param) const {
+Expr *DefaultArgumentExprRequest::evaluate(Evaluator &evaluator,
+                                           ParamDecl *param) const {
   if (param->getDefaultArgumentKind() == DefaultArgumentKind::Inherited) {
     // Inherited default arguments don't have expressions, but we need to
     // perform a couple of semantic checks to make sure they're valid.
@@ -757,7 +816,7 @@ DefaultArgumentExprRequest::evaluate(Evaluator &evaluator,
   return initExpr;
 }
 
-llvm::Expected<Initializer *>
+Initializer *
 DefaultArgumentInitContextRequest::evaluate(Evaluator &eval,
                                             ParamDecl *param) const {
   auto &ctx = param->getASTContext();
@@ -1166,10 +1225,15 @@ namespace {
 class DeclChecker : public DeclVisitor<DeclChecker> {
 public:
   ASTContext &Ctx;
+  SourceFile *SF;
 
-  explicit DeclChecker(ASTContext &ctx) : Ctx(ctx) {}
+  explicit DeclChecker(ASTContext &ctx, SourceFile *SF) : Ctx(ctx), SF(SF) {}
 
   ASTContext &getASTContext() const { return Ctx; }
+  void addDelayedFunction(AbstractFunctionDecl *AFD) {
+    if (!SF) return;
+    SF->DelayedFunctions.push_back(AFD);
+  }
 
   void visit(Decl *decl) {
     if (auto *Stats = getASTContext().Stats)
@@ -1239,6 +1303,7 @@ public:
 
   void visitOperatorDecl(OperatorDecl *OD) {
     TypeChecker::checkDeclAttributes(OD);
+    checkRedeclaration(OD);
     auto &Ctx = OD->getASTContext();
     if (auto *IOD = dyn_cast<InfixOperatorDecl>(OD)) {
       (void)IOD->getPrecedenceGroup();
@@ -1260,6 +1325,7 @@ public:
   void visitPrecedenceGroupDecl(PrecedenceGroupDecl *PGD) {
     TypeChecker::checkDeclAttributes(PGD);
     validatePrecedenceGroup(PGD);
+    checkRedeclaration(PGD);
     checkAccessControl(PGD);
   }
 
@@ -1385,7 +1451,7 @@ public:
     TypeChecker::checkDeclAttributes(PBD);
 
     bool isInSILMode = false;
-    if (auto sourceFile = DC->getParentSourceFile())
+    if (auto sourceFile = SF)
       isInSILMode = sourceFile->Kind == SourceFileKind::SIL;
     bool isTypeContext = DC->isTypeContext();
 
@@ -1443,7 +1509,7 @@ public:
         // protocol.
         if (var->isStatic() && !isa<ProtocolDecl>(DC)) {
           // ...but don't enforce this for SIL or module interface files.
-          switch (DC->getParentSourceFile()->Kind) {
+          switch (SF->Kind) {
           case SourceFileKind::Interface:
           case SourceFileKind::SIL:
             return;
@@ -1461,7 +1527,7 @@ public:
 
         // Global variables require an initializer in normal source files.
         if (DC->isModuleScopeContext()) {
-          switch (DC->getParentSourceFile()->Kind) {
+          switch (SF->Kind) {
           case SourceFileKind::Main:
           case SourceFileKind::REPL:
           case SourceFileKind::Interface:
@@ -1994,7 +2060,6 @@ public:
     // Check for circular inheritance within the protocol.
     (void)PD->hasCircularInheritedProtocols();
 
-    auto *SF = PD->getParentSourceFile();
     if (SF) {
       if (auto *tracker = SF->getReferencedNameTracker()) {
         bool isNonPrivate = (PD->getFormalAccess() > AccessLevel::FilePrivate);
@@ -2150,9 +2215,7 @@ public:
     } else if (shouldSkipBodyTypechecking(FD)) {
       FD->setBodySkipped(FD->getBodySourceRange());
     } else {
-      // FIXME: Remove TypeChecker dependency.
-      auto &TC = *Ctx.getLegacyGlobalTypeChecker();
-      TC.definedFunctions.push_back(FD);
+      addDelayedFunction(FD);
     }
 
     checkExplicitAvailability(FD);
@@ -2484,9 +2547,7 @@ public:
     } else if (shouldSkipBodyTypechecking(CD)) {
       CD->setBodySkipped(CD->getBodySourceRange());
     } else {
-      // FIXME: Remove TypeChecker dependency.
-      auto &TC = *Ctx.getLegacyGlobalTypeChecker();
-      TC.definedFunctions.push_back(CD);
+      addDelayedFunction(CD);
     }
 
     checkDefaultArguments(CD->getParameters());
@@ -2501,14 +2562,13 @@ public:
     } else if (shouldSkipBodyTypechecking(DD)) {
       DD->setBodySkipped(DD->getBodySourceRange());
     } else {
-      // FIXME: Remove TypeChecker dependency.
-      auto &TC = *Ctx.getLegacyGlobalTypeChecker();
-      TC.definedFunctions.push_back(DD);
+      addDelayedFunction(DD);
     }
   }
 };
 } // end anonymous namespace
 
 void TypeChecker::typeCheckDecl(Decl *D) {
-  DeclChecker(D->getASTContext()).visit(D);
+  auto *SF = D->getDeclContext()->getParentSourceFile();
+  DeclChecker(D->getASTContext(), SF).visit(D);
 }

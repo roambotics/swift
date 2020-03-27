@@ -254,3 +254,21 @@ extension Int {
 }
 
 _ = 1 ^^ 2 ^^ 3 * 4 // expected-error {{adjacent operators are in unordered precedence groups 'PowerPrecedence' and 'MultiplicationPrecedence'}}
+
+// rdar://problem/60185506 - Ambiguity with Float comparison
+func rdar_60185506() {
+  struct X {
+    var foo: Float
+  }
+
+  func test(x: X?) {
+    let _ = (x?.foo ?? 0) <= 0.5 // Ok
+  }
+}
+
+// rdar://problem/60727310
+func rdar60727310() {
+  func myAssertion<T>(_ a: T, _ op: ((T,T)->Bool), _ b: T) {}
+  var e: Error? = nil
+  myAssertion(e, ==, nil) // expected-error {{binary operator '==' cannot be applied to two 'Error?' operands}}
+}

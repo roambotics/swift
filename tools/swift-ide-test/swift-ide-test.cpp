@@ -315,6 +315,12 @@ EnableSourceImport("enable-source-import", llvm::cl::Hidden,
                    llvm::cl::cat(Category), llvm::cl::init(false));
 
 static llvm::cl::opt<bool>
+EnableCrossImportOverlays("enable-cross-import-overlays",
+                          llvm::cl::desc("Automatically import declared cross-import overlays."),
+                          llvm::cl::cat(Category),
+                          llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
 SkipDeinit("skip-deinit",
            llvm::cl::desc("Whether to skip printing destructors"),
            llvm::cl::cat(Category),
@@ -690,6 +696,11 @@ static llvm::cl::opt<bool>
     DisableObjCInterop("disable-objc-interop",
                        llvm::cl::desc("Disable ObjC interop."),
                        llvm::cl::cat(Category), llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
+    EnableCxxInterop("enable-cxx-interop",
+                     llvm::cl::desc("Enable C++ interop."),
+                     llvm::cl::cat(Category), llvm::cl::init(false));
 
 static llvm::cl::opt<std::string>
 GraphVisPath("output-request-graphviz",
@@ -1123,8 +1134,6 @@ static int doSyntaxColoring(const CompilerInvocation &InitInvok,
     registerParseRequestFunctions(Parser.getParser().Context.evaluator);
     registerTypeCheckerRequestFunctions(Parser.getParser().Context.evaluator);
 
-    // Collecting syntactic information shouldn't evaluate # conditions.
-    Parser.getParser().EvaluateConditionals = false;
     Parser.getDiagnosticEngine().addConsumer(PrintDiags);
 
     (void)Parser.parse();
@@ -1359,9 +1368,6 @@ static int doStructureAnnotation(const CompilerInvocation &InitInvok,
   registerParseRequestFunctions(Parser.getParser().Context.evaluator);
   registerTypeCheckerRequestFunctions(
       Parser.getParser().Context.evaluator);
-
-  // Collecting syntactic information shouldn't evaluate # conditions.
-  Parser.getParser().EvaluateConditionals = false;
 
   // Display diagnostics to stderr.
   PrintingDiagnosticConsumer PrintDiags;
@@ -3362,6 +3368,8 @@ int main(int argc, char *argv[]) {
   InitInvok.getLangOptions().BuildSyntaxTree = true;
   InitInvok.getLangOptions().RequestEvaluatorGraphVizPath =
     options::GraphVisPath;
+  InitInvok.getLangOptions().EnableCrossImportOverlays =
+    options::EnableCrossImportOverlays;
   if (options::DisableObjCInterop) {
     InitInvok.getLangOptions().EnableObjCInterop = false;
   } else if (options::EnableObjCInterop) {
@@ -3369,6 +3377,9 @@ int main(int argc, char *argv[]) {
   } else if (!options::Triple.empty()) {
     InitInvok.getLangOptions().EnableObjCInterop =
         llvm::Triple(options::Triple).isOSDarwin();
+  }
+  if (options::EnableCxxInterop) {
+    InitInvok.getLangOptions().EnableCXXInterop = true;
   }
 
   // We disable source location resolutions from .swiftsourceinfo files by
