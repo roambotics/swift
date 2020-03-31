@@ -2013,7 +2013,7 @@ ModuleDecl *ModuleFile::getModule(ArrayRef<Identifier> name,
   if (name.empty() || name.front().empty())
     return getContext().TheBuiltinModule;
 
-  // FIXME: duplicated from NameBinder::getModule
+  // FIXME: duplicated from ImportResolver::getModule
   if (name.size() == 1 &&
       name.front() == FileContext->getParentModule()->getName()) {
     if (!UnderlyingModule && allowLoading) {
@@ -4369,6 +4369,30 @@ llvm::Error DeclDeserializer::deserializeDeclAttributes() {
         break;
       }
 
+      case decls_block::Transpose_DECL_ATTR: {
+        bool isImplicit;
+        uint64_t origNameId;
+        DeclID origDeclId;
+        ArrayRef<uint64_t> parameters;
+
+        serialization::decls_block::TransposeDeclAttrLayout::readRecord(
+            scratch, isImplicit, origNameId, origDeclId, parameters);
+
+        DeclNameRefWithLoc origName{
+            DeclNameRef(MF.getDeclBaseName(origNameId)), DeclNameLoc()};
+        auto *origDecl = cast<AbstractFunctionDecl>(MF.getDecl(origDeclId));
+        llvm::SmallBitVector parametersBitVector(parameters.size());
+        for (unsigned i : indices(parameters))
+          parametersBitVector[i] = parameters[i];
+        auto *indices = IndexSubset::get(ctx, parametersBitVector);
+        auto *transposeAttr =
+            TransposeAttr::create(ctx, isImplicit, SourceLoc(), SourceRange(),
+                                  /*baseTypeRepr*/ nullptr, origName, indices);
+        transposeAttr->setOriginalFunction(origDecl);
+        Attr = transposeAttr;
+        break;
+      }
+
       case decls_block::SPIAccessControl_DECL_ATTR: {
         ArrayRef<uint64_t> spiIds;
         serialization::decls_block::SPIAccessControlDeclAttrLayout::readRecord(
@@ -5387,8 +5411,11 @@ public:
     };
 
     // Bounds check.  FIXME: overflow
-    if (2 * numParams + 2 * numResults + 2 * unsigned(hasErrorResult)
-          > variableData.size()) {
+    unsigned entriesPerParam =
+        diffKind != DifferentiabilityKind::NonDifferentiable ? 3 : 2;
+    if (entriesPerParam * numParams + 2 * numResults +
+            2 * unsigned(hasErrorResult) >
+        variableData.size()) {
       MF.fatal();
     }
 
