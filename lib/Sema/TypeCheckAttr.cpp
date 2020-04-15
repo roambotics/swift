@@ -161,7 +161,7 @@ public:
       // An indirect case should have a payload.
       if (!caseDecl->hasAssociatedValues())
         diagnose(attr->getLocation(), diag::indirect_case_without_payload,
-                 caseDecl->getName());
+                 caseDecl->getBaseIdentifier());
       // If the enum is already indirect, its cases don't need to be.
       else if (caseDecl->getParentEnum()->getAttrs()
                  .hasAttribute<IndirectAttr>())
@@ -347,10 +347,6 @@ void AttributeChecker::visitDynamicAttr(DynamicAttr *attr) {
   // Members cannot be both dynamic and @_transparent.
   if (D->getAttrs().hasAttribute<TransparentAttr>())
     diagnoseAndRemoveAttr(attr, diag::dynamic_with_transparent);
-  if (!D->getAttrs().hasAttribute<ObjCAttr>() &&
-      D->getModuleContext()->isResilient())
-    diagnoseAndRemoveAttr(attr,
-                          diag::dynamic_and_library_evolution_not_supported);
 }
 
 static bool
@@ -479,7 +475,7 @@ void AttributeChecker::visitIBSegueActionAttr(IBSegueActionAttr *attr) {
   // explicit selector.
   if (!FD->getAttrs().hasAttribute<ObjCAttr>() ||
       !FD->getAttrs().getAttribute<ObjCAttr>()->hasName()) {
-    auto newSwiftBaseName = replacingPrefix(FD->getBaseName().getIdentifier());
+    auto newSwiftBaseName = replacingPrefix(FD->getBaseIdentifier());
     auto argumentNames = FD->getFullName().getArgumentNames();
     DeclName newSwiftName(Ctx, newSwiftBaseName, argumentNames);
 
@@ -1562,9 +1558,9 @@ void AttributeChecker::checkOperatorAttribute(DeclAttribute *attr) {
   }
 
   // Reject attempts to define builtin operators.
-  if (isBuiltinOperator(FD->getName().str(), attr)) {
+  if (isBuiltinOperator(FD->getBaseIdentifier().str(), attr)) {
     diagnose(D->getStartLoc(), diag::redefining_builtin_operator,
-             attr->getAttrName(), FD->getName().str());
+             attr->getAttrName(), FD->getBaseIdentifier().str());
     attr->setInvalid();
     return;
   }
@@ -2394,25 +2390,36 @@ void AttributeChecker::visitDynamicReplacementAttr(DynamicReplacementAttr *attr)
   }
 }
 
+Type
+ResolveTypeEraserTypeRequest::evaluate(Evaluator &evaluator,
+                                       ProtocolDecl *PD,
+                                       TypeEraserAttr *attr) const {
+  if (auto *typeEraserRepr = attr->getParsedTypeEraserTypeRepr()) {
+    auto resolution = TypeResolution::forContextual(PD);
+    return resolution.resolveType(typeEraserRepr, /*options=*/None);
+  } else {
+    auto *LazyResolver = attr->Resolver;
+    assert(LazyResolver && "type eraser was neither parsed nor deserialized?");
+    auto ty = LazyResolver->loadTypeEraserType(attr, attr->ResolverContextData);
+    attr->Resolver = nullptr;
+    if (!ty) {
+      return ErrorType::get(PD->getASTContext());
+    }
+    return ty;
+  }
+}
+
 bool
 TypeEraserHasViableInitRequest::evaluate(Evaluator &evaluator,
                                          TypeEraserAttr *attr,
                                          ProtocolDecl *protocol) const {
   auto &ctx = protocol->getASTContext();
   auto &diags = ctx.Diags;
-  TypeLoc &typeEraserLoc = attr->getTypeEraserLoc();
-  TypeRepr *typeEraserRepr = typeEraserLoc.getTypeRepr();
   DeclContext *dc = protocol->getDeclContext();
   Type protocolType = protocol->getDeclaredType();
 
   // Get the NominalTypeDecl for the type eraser.
-  Type typeEraser = typeEraserLoc.getType();
-  if (!typeEraser && typeEraserRepr) {
-    auto resolution = TypeResolution::forContextual(protocol);
-    typeEraser = resolution.resolveType(typeEraserRepr, /*options=*/None);
-    typeEraserLoc.setType(typeEraser);
-  }
-
+  Type typeEraser = attr->getResolvedType(protocol);
   if (typeEraser->hasError())
     return false;
 
@@ -2422,13 +2429,13 @@ TypeEraserHasViableInitRequest::evaluate(Evaluator &evaluator,
     nominalTypeDecl = typeAliasDecl->getUnderlyingType()->getAnyNominal();
 
   if (!nominalTypeDecl || isa<ProtocolDecl>(nominalTypeDecl)) {
-    diags.diagnose(typeEraserLoc.getLoc(), diag::non_nominal_type_eraser);
+    diags.diagnose(attr->getLoc(), diag::non_nominal_type_eraser);
     return false;
   }
 
   // The nominal type must be accessible wherever the protocol is accessible
   if (nominalTypeDecl->getFormalAccess() < protocol->getFormalAccess()) {
-    diags.diagnose(typeEraserLoc.getLoc(), diag::type_eraser_not_accessible,
+    diags.diagnose(attr->getLoc(), diag::type_eraser_not_accessible,
                    nominalTypeDecl->getFormalAccess(), nominalTypeDecl->getName(),
                    protocolType, protocol->getFormalAccess());
     diags.diagnose(nominalTypeDecl->getLoc(), diag::type_eraser_declared_here);
@@ -2437,7 +2444,7 @@ TypeEraserHasViableInitRequest::evaluate(Evaluator &evaluator,
 
   // The type eraser must conform to the annotated protocol
   if (!TypeChecker::conformsToProtocol(typeEraser, protocol, dc, None)) {
-    diags.diagnose(typeEraserLoc.getLoc(), diag::type_eraser_does_not_conform,
+    diags.diagnose(attr->getLoc(), diag::type_eraser_does_not_conform,
                    typeEraser, protocolType);
     diags.diagnose(nominalTypeDecl->getLoc(), diag::type_eraser_declared_here);
     return false;
@@ -3146,20 +3153,43 @@ DynamicallyReplacedDeclRequest::evaluate(Evaluator &evaluator,
   return nullptr;
 }
 
-/// Returns true if the given type conforms to `Differentiable` in the given
-/// module.
-static bool conformsToDifferentiable(Type type, DeclContext *DC) {
+/// If the given type conforms to `Differentiable` in the given context, returns
+/// the `ProtocolConformanceRef`. Otherwise, returns an invalid
+/// `ProtocolConformanceRef`.
+///
+/// This helper verifies that the `TangentVector` type witness is valid, in case
+/// the conformance has not been fully checked and the type witness cannot be
+/// resolved.
+static ProtocolConformanceRef getDifferentiableConformance(Type type,
+                                                           DeclContext *DC) {
   auto &ctx = type->getASTContext();
   auto *differentiableProto =
       ctx.getProtocol(KnownProtocolKind::Differentiable);
-  auto conf = TypeChecker::conformsToProtocol(
-      type, differentiableProto, DC, ConformanceCheckFlags::InExpression);
+  auto conf =
+      TypeChecker::conformsToProtocol(type, differentiableProto, DC, None);
   if (!conf)
-    return false;
+    return ProtocolConformanceRef();
   // Try to get the `TangentVector` type witness, in case the conformance has
-  // not been fully checked and the type witness cannot be resolved.
+  // not been fully checked.
   Type tanType = conf.getTypeWitnessByName(type, ctx.Id_TangentVector);
-  return !tanType.isNull() && !tanType->hasError();
+  if (tanType.isNull() || tanType->hasError())
+    return ProtocolConformanceRef();
+  return conf;
+};
+
+/// Returns true if the given type conforms to `Differentiable` in the given
+/// contxt. If `tangentVectorEqualsSelf` is true, also check whether the given
+/// type satisfies `TangentVector == Self`.
+static bool conformsToDifferentiable(Type type, DeclContext *DC,
+                                     bool tangentVectorEqualsSelf = false) {
+  auto conf = getDifferentiableConformance(type, DC);
+  if (conf.isInvalid())
+    return false;
+  if (!tangentVectorEqualsSelf)
+    return true;
+  auto &ctx = type->getASTContext();
+  Type tanType = conf.getTypeWitnessByName(type, ctx.Id_TangentVector);
+  return type->isEqual(tanType);
 };
 
 IndexSubset *TypeChecker::inferDifferentiabilityParameters(
@@ -3694,8 +3724,6 @@ getTransposeOriginalFunctionType(AnyFunctionType *transposeFnType,
   return originalType;
 }
 
-
-
 /// Given a `@differentiable` attribute, attempts to resolve the original
 /// `AbstractFunctionDecl` for which it is registered, using the declaration
 /// on which it is actually declared. On error, emits diagnostic and returns
@@ -3906,27 +3934,21 @@ bool resolveDifferentiableAttrDifferentiabilityParameters(
 
 /// Checks whether differentiable programming is enabled for the given
 /// differentiation-related attribute. Returns true on error.
-bool checkIfDifferentiableProgrammingEnabled(
-    ASTContext &ctx, DeclAttribute *attr) {
+bool checkIfDifferentiableProgrammingEnabled(ASTContext &ctx,
+                                             DeclAttribute *attr,
+                                             DeclContext *DC) {
   auto &diags = ctx.Diags;
-  // The experimental differentiable programming flag must be enabled.
-  if (!ctx.LangOpts.EnableExperimentalDifferentiableProgramming) {
-    diags
-        .diagnose(attr->getLocation(),
-                  diag::experimental_differentiable_programming_disabled)
-        .highlight(attr->getRangeWithAt());
-    return true;
-  }
+  auto *SF = DC->getParentSourceFile();
+  assert(SF && "Source file not found");
   // The `Differentiable` protocol must be available.
   // If unavailable, the `_Differentiation` module should be imported.
-  if (!ctx.getProtocol(KnownProtocolKind::Differentiable)) {
-    diags
-        .diagnose(attr->getLocation(), diag::attr_used_without_required_module,
-                  attr, ctx.Id_Differentiation)
-        .highlight(attr->getRangeWithAt());
-    return true;
-  }
-  return false;
+  if (isDifferentiableProgrammingEnabled(*SF))
+    return false;
+  diags
+      .diagnose(attr->getLocation(), diag::attr_used_without_required_module,
+                attr, ctx.Id_Differentiation)
+      .highlight(attr->getRangeWithAt());
+  return true;
 }
 
 IndexSubset *DifferentiableAttributeTypeCheckRequest::evaluate(
@@ -3945,7 +3967,7 @@ IndexSubset *DifferentiableAttributeTypeCheckRequest::evaluate(
   auto &diags = ctx.Diags;
   // `@differentiable` attribute requires experimental differentiable
   // programming to be enabled.
-  if (checkIfDifferentiableProgrammingEnabled(ctx, attr))
+  if (checkIfDifferentiableProgrammingEnabled(ctx, attr, D->getDeclContext()))
     return nullptr;
 
   // Resolve the original `AbstractFunctionDecl`.
@@ -4111,7 +4133,7 @@ static bool typeCheckDerivativeAttr(ASTContext &Ctx, Decl *D,
   auto &diags = Ctx.Diags;
   // `@derivative` attribute requires experimental differentiable programming
   // to be enabled.
-  if (checkIfDifferentiableProgrammingEnabled(Ctx, attr))
+  if (checkIfDifferentiableProgrammingEnabled(Ctx, attr, D->getDeclContext()))
     return true;
   auto *derivative = cast<FuncDecl>(D);
   auto lookupConformance =
@@ -4361,9 +4383,8 @@ static bool typeCheckDerivativeAttr(ASTContext &Ctx, Decl *D,
   auto originalResult = originalResults.front();
   auto originalResultType = originalResult.type;
   // Check that the original semantic result conforms to `Differentiable`.
-  auto *diffableProto = Ctx.getProtocol(KnownProtocolKind::Differentiable);
-  auto valueResultConf = TypeChecker::conformsToProtocol(
-      originalResultType, diffableProto, derivative->getDeclContext(), None);
+  auto valueResultConf = getDifferentiableConformance(
+      originalResultType, derivative->getDeclContext());
   if (!valueResultConf) {
     diags.diagnose(attr->getLocation(),
                    diag::derivative_attr_result_value_not_differentiable,
@@ -4418,14 +4439,6 @@ static bool typeCheckDerivativeAttr(ASTContext &Ctx, Decl *D,
     return true;
   }
 
-  // Reject different-file derivative registration.
-  // TODO(TF-1021): Lift same-file derivative registration restriction.
-  if (originalAFD->getParentSourceFile() != derivative->getParentSourceFile()) {
-    diags.diagnose(attr->getLocation(),
-                   diag::derivative_attr_not_in_same_file_as_original);
-    return true;
-  }
-
   // Reject duplicate `@derivative` attributes.
   auto &derivativeAttrs = Ctx.DerivativeAttrs[std::make_tuple(
       originalAFD, resolvedDiffParamIndices, kind)];
@@ -4457,20 +4470,20 @@ void AttributeChecker::visitDerivativeAttr(DerivativeAttr *attr) {
     attr->setInvalid();
 }
 
-/// Returns true if the given type's `TangentVector` is equal to itself in the
-/// given module.
-static bool tangentVectorEqualsSelf(Type type, DeclContext *DC) {
-  assert(conformsToDifferentiable(type, DC));
-  auto &ctx = type->getASTContext();
-  auto *differentiableProto =
-      ctx.getProtocol(KnownProtocolKind::Differentiable);
-  auto conf = TypeChecker::conformsToProtocol(
-                  type, differentiableProto, DC,
-                  ConformanceCheckFlags::InExpression);
-  auto tanType = conf.getTypeWitnessByName(type, ctx.Id_TangentVector);
-  return type->getCanonicalType() == tanType->getCanonicalType();
-};
+AbstractFunctionDecl *
+DerivativeAttrOriginalDeclRequest::evaluate(Evaluator &evaluator,
+                                            DerivativeAttr *attr) const {
+  // If the typechecker has resolved the original function, return it.
+  if (auto *FD = attr->OriginalFunction.dyn_cast<AbstractFunctionDecl *>())
+    return FD;
 
+  // If the function can be lazily resolved, do so now.
+  if (auto *Resolver = attr->OriginalFunction.dyn_cast<LazyMemberLoader *>())
+    return Resolver->loadReferencedFunctionDecl(attr,
+                                                attr->ResolverContextData);
+
+  return nullptr;
+}
 
 // Computes the linearity parameter indices from the given parsed linearity
 // parameters for the given transpose function. On error, emits diagnostics and
@@ -4590,8 +4603,8 @@ static bool checkLinearityParameters(
         parsedLinearParams.empty() ? attrLoc : parsedLinearParams[i].getLoc();
     // Parameter must conform to `Differentiable` and satisfy
     // `Self == Self.TangentVector`.
-    if (!conformsToDifferentiable(linearParamType, originalAFD) ||
-        !tangentVectorEqualsSelf(linearParamType, originalAFD)) {
+    if (!conformsToDifferentiable(linearParamType, originalAFD,
+                                  /*tangentVectorEqualsSelf*/ true)) {
       diags.diagnose(loc,
                      diag::transpose_attr_invalid_linearity_parameter_or_result,
                      linearParamType.getString(), /*isParameter*/ true);
@@ -4703,8 +4716,8 @@ void AttributeChecker::visitTransposeAttr(TransposeAttr *attr) {
   if (expectedOriginalResultType->hasTypeParameter())
     expectedOriginalResultType = transpose->mapTypeIntoContext(
         expectedOriginalResultType);
-  if (!conformsToDifferentiable(expectedOriginalResultType, transpose) ||
-      !tangentVectorEqualsSelf(expectedOriginalResultType, transpose)) {
+  if (!conformsToDifferentiable(expectedOriginalResultType, transpose,
+                                /*tangentVectorEqualsSelf*/ true)) {
     diagnoseAndRemoveAttr(
         attr, diag::transpose_attr_invalid_linearity_parameter_or_result,
         expectedOriginalResultType.getString(), /*isParameter*/ false);

@@ -2263,13 +2263,17 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
 
       DifferentiabilityKind diffKind = DifferentiabilityKind::NonDifferentiable;
       if (attrs.has(TAK_differentiable)) {
-        if (Context.LangOpts.EnableExperimentalDifferentiableProgramming) {
+        auto *SF = DC->getParentSourceFile();
+        if (SF && isDifferentiableProgrammingEnabled(*SF)) {
           diffKind = attrs.linear ? DifferentiabilityKind::Linear
                                   : DifferentiabilityKind::Normal;
         } else {
           diagnoseInvalid(
               repr, attrs.getLoc(TAK_differentiable),
-              diag::experimental_differentiable_programming_disabled);
+              diag::
+                  differentiable_programming_attr_used_without_required_module,
+              TypeAttributes::getAttrName(TAK_differentiable),
+              Context.Id_Differentiation);
         }
       }
 
@@ -2311,13 +2315,17 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
 
       DifferentiabilityKind diffKind = DifferentiabilityKind::NonDifferentiable;
       if (attrs.has(TAK_differentiable)) {
-        if (Context.LangOpts.EnableExperimentalDifferentiableProgramming) {
+        auto *SF = DC->getParentSourceFile();
+        if (SF && isDifferentiableProgrammingEnabled(*SF)) {
           diffKind = attrs.linear ? DifferentiabilityKind::Linear
                                   : DifferentiabilityKind::Normal;
         } else {
           diagnoseInvalid(
               repr, attrs.getLoc(TAK_differentiable),
-              diag::experimental_differentiable_programming_disabled);
+              diag::
+                  differentiable_programming_attr_used_without_required_module,
+              TypeAttributes::getAttrName(TAK_differentiable),
+              Context.Id_Differentiation);
         }
       }
 
@@ -2384,13 +2392,14 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
         auto loc = attrs.getLoc(TAK_escaping);
         auto attrRange = getTypeAttrRangeWithAt(Context, loc);
 
-        diagnoseInvalid(repr, loc, diag::escaping_non_function_parameter)
-            .fixItRemove(attrRange);
-
-        // Try to find a helpful note based on how the type is being used
+        // Try to find a better diagnostic based on how the type is being used
         if (options.is(TypeResolverContext::ImmediateOptionalTypeArgument)) {
           diagnoseInvalid(repr, repr->getLoc(),
-                          diag::escaping_optional_type_argument);
+                          diag::escaping_optional_type_argument)
+              .fixItRemove(attrRange);
+        } else {
+          diagnoseInvalid(repr, loc, diag::escaping_non_function_parameter)
+              .fixItRemove(attrRange);
         }
       }
 
@@ -2410,25 +2419,29 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
       attrs.clearAttribute(TAK_autoclosure);
     }
 
+    const auto diagnoseInvalidAttr = [&](TypeAttrKind kind) {
+      if (kind == TAK_escaping) {
+        Type optionalObjectType = ty->getOptionalObjectType();
+        if (optionalObjectType && optionalObjectType->is<AnyFunctionType>()) {
+          return diagnoseInvalid(repr, attrs.getLoc(kind),
+                                 diag::escaping_optional_type_argument);
+        }
+      }
+      return diagnoseInvalid(repr, attrs.getLoc(kind),
+                             diag::attribute_requires_function_type,
+                             TypeAttributes::getAttrName(kind));
+    };
+
     for (auto i : FunctionAttrs) {
       if (!attrs.has(i))
         continue;
 
-      auto diag = diagnoseInvalid(repr, attrs.getLoc(i),
-                                  diag::attribute_requires_function_type,
-                                  TypeAttributes::getAttrName(i));
-
-      // If we see @escaping among the attributes on this type, because it isn't
-      // a function type, we'll remove it.
+      auto diag = diagnoseInvalidAttr(i);
+      // If we see @escaping among the attributes on this type, because it
+      // isn't a function type, we'll remove it.
       if (i == TAK_escaping) {
-        diag.fixItRemove(getTypeAttrRangeWithAt(Context,
-                                                attrs.getLoc(TAK_escaping)));
-        // Specialize the diagnostic for Optionals.
-        if (ty->getOptionalObjectType()) {
-          diag.flush();
-          diagnoseInvalid(repr, repr->getLoc(),
-                          diag::escaping_optional_type_argument);
-        }
+        diag.fixItRemove(
+            getTypeAttrRangeWithAt(Context, attrs.getLoc(TAK_escaping)));
       }
       attrs.clearAttribute(i);
     }
@@ -2440,9 +2453,13 @@ Type TypeResolver::resolveAttributedType(TypeAttributes &attrs,
   }
 
   if (attrs.has(TAK_noDerivative)) {
-    if (!Context.LangOpts.EnableExperimentalDifferentiableProgramming) {
-      diagnose(attrs.getLoc(TAK_noDerivative),
-               diag::experimental_differentiable_programming_disabled);
+    auto *SF = DC->getParentSourceFile();
+    if (SF && !isDifferentiableProgrammingEnabled(*SF)) {
+      diagnose(
+          attrs.getLoc(TAK_noDerivative),
+          diag::differentiable_programming_attr_used_without_required_module,
+          TypeAttributes::getAttrName(TAK_noDerivative),
+          Context.Id_Differentiation);
     } else if (!isParam) {
       // @noDerivative is only valid on parameters.
       diagnose(attrs.getLoc(TAK_noDerivative),
@@ -2577,7 +2594,7 @@ bool TypeResolver::resolveASTFunctionTypeParams(
     if (auto *attrTypeRepr = dyn_cast<AttributedTypeRepr>(eltTypeRepr)) {
       if (attrTypeRepr->getAttrs().has(TAK_noDerivative)) {
         if (diffKind == DifferentiabilityKind::NonDifferentiable &&
-            Context.LangOpts.EnableExperimentalDifferentiableProgramming)
+            isDifferentiableProgrammingEnabled(*DC->getParentSourceFile()))
           diagnose(eltTypeRepr->getLoc(),
                    diag::attr_only_on_parameters_of_differentiable,
                    "@noDerivative")

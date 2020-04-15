@@ -96,8 +96,7 @@ set(SWIFT_BENCH_MODULES
     single-source/Hanoi
     single-source/Hash
     single-source/Histogram
-    single-source/InsertCharacter  
-    single-source/IntegerParsing
+    single-source/HTTP2StateMachine
     single-source/Integrate
     single-source/IterateData
     single-source/Join
@@ -226,6 +225,9 @@ endif()
 
 set(SWIFT_BENCHMARK_EXTRA_FLAGS "" CACHE STRING
     "Extra options to pass to swiftc when building the benchmarks")
+
+set(SWIFT_BENCHMARK_UNOPTIMIZED_DRIVER NO CACHE BOOL
+    "Build the benchmark driver utilites without optimization (default: no)")
 
 if (SWIFT_BENCHMARK_BUILT_STANDALONE)
   # This option's value must match the value of the same option used when

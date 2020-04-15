@@ -46,7 +46,7 @@ PrintOptions SymbolGraph::getDeclarationFragmentsPrintOptions() const {
   PrintOptions Opts;
   Opts.FunctionDefinitions = false;
   Opts.ArgAndParamPrinting =
-    PrintOptions::ArgAndParamPrintingMode::ArgumentOnly;
+    PrintOptions::ArgAndParamPrintingMode::MatchSource;
   Opts.PrintGetSetOnRWProperties = false;
   Opts.PrintPropertyAccessors = false;
   Opts.PrintSubscriptAccessors = false;
@@ -253,17 +253,27 @@ SymbolGraph::recordInheritanceRelationships(Symbol S) {
 }
 
 void SymbolGraph::recordDefaultImplementationRelationships(Symbol S) {
-  const auto VD = S.getSymbolDecl();
-  if (const auto *Extension = dyn_cast<ExtensionDecl>(VD->getDeclContext())) {
-    if (const auto *Protocol = Extension->getExtendedProtocolDecl()) {
-      for (const auto *Member : Protocol->getMembers()) {
-        if (const auto *MemberVD = dyn_cast<ValueDecl>(Member)) {
-          if (MemberVD->getFullName().compare(VD->getFullName()) == 0) {
-            recordEdge(Symbol(this, VD, nullptr),
-                       Symbol(this, MemberVD, nullptr),
-                       RelationshipKind::DefaultImplementationOf());
-          }
+  const auto *VD = S.getSymbolDecl();
+
+  /// Claim a protocol `P`'s members as default implementation targets
+  /// for `VD`.
+  auto HandleProtocol = [=](const ProtocolDecl *P) {
+    for (const auto *Member : P->getMembers()) {
+      if (const auto *MemberVD = dyn_cast<ValueDecl>(Member)) {
+        if (MemberVD->getFullName().compare(VD->getFullName()) == 0) {
+          recordEdge(Symbol(this, VD, nullptr),
+                     Symbol(this, MemberVD, nullptr),
+                     RelationshipKind::DefaultImplementationOf());
         }
+      }
+    }
+  };
+
+  if (const auto *Extension = dyn_cast<ExtensionDecl>(VD->getDeclContext())) {
+    if (const auto *ExtendedProtocol = Extension->getExtendedProtocolDecl()) {
+      HandleProtocol(ExtendedProtocol);
+      for (const auto *Inherited : ExtendedProtocol->getInheritedProtocols()) {
+        HandleProtocol(Inherited);
       }
     }
   }
@@ -350,6 +360,8 @@ void SymbolGraph::serialize(llvm::json::OStream &OS) {
             llvm_unreachable("Unexpected module kind: DWARFModule");
           case FileUnitKind::Source:
             llvm_unreachable("Unexpected module kind: Source");
+          case FileUnitKind::Synthesized:
+            llvm_unreachable("Unexpected module kind: Synthesized");
             break;
           case FileUnitKind::SerializedAST: {
             auto SerializedAST = cast<SerializedASTFile>(MainFile);
@@ -410,6 +422,8 @@ SymbolGraph::serializeSubheadingDeclarationFragments(StringRef Key,
                                                      llvm::json::OStream &OS) {
   DeclarationFragmentPrinter Printer(OS, Key);
   auto Options = getDeclarationFragmentsPrintOptions();
+  Options.ArgAndParamPrinting =
+    PrintOptions::ArgAndParamPrintingMode::ArgumentOnly;
   Options.VarInitializers = false;
   Options.PrintDefaultArgumentValue = false;
   Options.PrintEmptyArgumentNames = false;

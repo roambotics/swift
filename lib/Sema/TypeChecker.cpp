@@ -306,11 +306,6 @@ static void typeCheckDelayedFunctions(SourceFile &SF) {
   } while (currentFunctionIdx < SF.DelayedFunctions.size() ||
            currentSynthesizedDecl < SF.SynthesizedDecls.size());
 
-
-  for (AbstractFunctionDecl *FD : llvm::reverse(SF.DelayedFunctions)) {
-    TypeChecker::computeCaptures(FD);
-  }
-
   SF.DelayedFunctions.clear();
 }
 
@@ -413,6 +408,18 @@ void swift::performWholeModuleTypeChecking(SourceFile &SF) {
     Ctx.verifyAllLoadedModules();
   }
 #endif
+}
+
+bool swift::isAdditiveArithmeticConformanceDerivationEnabled(SourceFile &SF) {
+  auto &ctx = SF.getASTContext();
+  // Return true if `AdditiveArithmetic` derived conformances are explicitly
+  // enabled.
+  if (ctx.LangOpts.EnableExperimentalAdditiveArithmeticDerivedConformances)
+    return true;
+  // Otherwise, return true iff differentiable programming is enabled.
+  // Differentiable programming depends on `AdditiveArithmetic` derived
+  // conformances.
+  return isDifferentiableProgrammingEnabled(SF);
 }
 
 void swift::checkInconsistentImplementationOnlyImports(ModuleDecl *MainModule) {

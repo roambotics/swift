@@ -2,11 +2,6 @@ module script {
   header "script.h"
 }
 
-module AccessSpecifiers {
-  header "AccessSpecifiers.h"
-  export *
-}
-
 module AvailabilityExtras {
   header "AvailabilityExtras.h"
   export *
@@ -50,11 +45,6 @@ module ctypes_bits_exported {
   export *
 }
 
-module EnumExhaustivity {
-  header "EnumExhaustivity.h"
-  export *
-}
-
 module ExternIntX { header "x.h" }
 
 module HasSubmodule {
@@ -87,11 +77,6 @@ module LinkMusket {
   link "Lock"
   link "Stock"
   link framework "Barrel"
-}
-
-module MemoryLayout {
-  header "MemoryLayout.h"
-  export *
 }
 
 module MissingHeader {

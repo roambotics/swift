@@ -492,7 +492,7 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
   if (!currentFile || currentDC->isLocalContext())
     return std::make_tuple<>();
 
-  ReferencedNameTracker *tracker = currentFile->getReferencedNameTracker();
+  ReferencedNameTracker *tracker = currentFile->getLegacyReferencedNameTracker();
   bool isCascading = (current->getFormalAccess() > AccessLevel::FilePrivate);
 
   // Find other potential definitions.
@@ -502,6 +502,8 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
     if (auto nominal = currentDC->getSelfNominalTypeDecl()) {
       auto found = nominal->lookupDirect(current->getBaseName());
       otherDefinitions.append(found.begin(), found.end());
+      // FIXME(Evaluator Incremental Dependencies): Remove this. The direct
+      // lookup registers this edge, and so does the redeclaration request.
       if (tracker)
         tracker->addUsedMember({nominal, current->getBaseName()}, isCascading);
     }
@@ -510,6 +512,8 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
     currentFile->getParentModule()->lookupValue(current->getBaseName(),
                                                 NLKind::QualifiedLookup,
                                                 otherDefinitions);
+    // FIXME(Evaluator Incremental Dependencies): Remove this. The redeclaration
+    // request itself registers this edge.
     if (tracker)
       tracker->addTopLevelName(current->getBaseName(), isCascading);
   }
@@ -808,7 +812,7 @@ Expr *DefaultArgumentExprRequest::evaluate(Evaluator &evaluator,
 
   // Walk the checked initializer and contextualize any closures
   // we saw there.
-  (void)TypeChecker::contextualizeInitializer(dc, initExpr);
+  TypeChecker::contextualizeInitializer(dc, initExpr);
   return initExpr;
 }
 
@@ -1274,7 +1278,7 @@ public:
           Context.SourceMgr.extractText({VD->getNameLoc(), 1}) != "`") {
         auto &DE = getASTContext().Diags;
         DE.diagnose(VD->getNameLoc(), diag::reserved_member_name,
-                    VD->getFullName(), VD->getBaseName().getIdentifier().str());
+                    VD->getFullName(), VD->getBaseIdentifier().str());
         DE.diagnose(VD->getNameLoc(), diag::backticks_to_escape)
             .fixItReplace(VD->getNameLoc(),
                           "`" + VD->getBaseName().userFacingName().str() + "`");
@@ -1578,7 +1582,7 @@ public:
           if (initContext) {
             // Check safety of error-handling in the declaration, too.
             TypeChecker::checkInitializerErrorHandling(initContext, init);
-            (void)TypeChecker::contextualizeInitializer(initContext, init);
+            TypeChecker::contextualizeInitializer(initContext, init);
           }
         }
       }
@@ -1954,7 +1958,11 @@ public:
       ClassDecl *Super = superclassTy->getClassOrBoundGenericClass();
 
       if (auto *SF = CD->getParentSourceFile()) {
-        if (auto *tracker = SF->getReferencedNameTracker()) {
+        // FIXME(Evaluator Incremental Dependencies): Remove this. Type lookup
+        // for the superclass will run (un)qualified lookup which will register
+        // the appropriate edge, then SuperclassTypeRequest registers the
+        // potential member edge.
+        if (auto *tracker = SF->getLegacyReferencedNameTracker()) {
           bool isPrivate =
               CD->getFormalAccess() <= AccessLevel::FilePrivate;
           tracker->addUsedMember({Super, Identifier()}, !isPrivate);
@@ -2059,8 +2067,11 @@ public:
     (void)PD->hasCircularInheritedProtocols();
 
     if (SF) {
-      if (auto *tracker = SF->getReferencedNameTracker()) {
+      if (auto *tracker = SF->getLegacyReferencedNameTracker()) {
         bool isNonPrivate = (PD->getFormalAccess() > AccessLevel::FilePrivate);
+        // FIXME(Evaluator Incremental Dependencies): Remove this. Type lookup
+        // for the ancestor protocols will run (un)qualified lookup which will
+        // register the appropriate edge.
         for (auto *parentProto : PD->getInheritedProtocols())
           tracker->addUsedMember({parentProto, Identifier()}, isNonPrivate);
       }

@@ -338,6 +338,9 @@ def emit_loaded_module_trace_path : Separate<["-"], "emit-loaded-module-trace-pa
 def emit_loaded_module_trace_path_EQ : Joined<["-"], "emit-loaded-module-trace-path=">,
   Flags<[FrontendOption, NoInteractiveOption, ArgumentIsPath]>,
   Alias<emit_loaded_module_trace_path>;
+def emit_cross_import_remarks : Flag<["-"], "Rcross-import">,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
+  HelpText<"Emit a remark if a cross-import of a module is triggered.">;
 
 def emit_tbd : Flag<["-"], "emit-tbd">,
   HelpText<"Emit a TBD file">,
@@ -498,10 +501,13 @@ def disable_bridging_pch : Flag<["-"], "disable-bridging-pch">,
   HelpText<"Disable automatic generation of bridging PCH files">;
 
 // Experimental feature options
-def enable_experimental_differentiable_programming :
-  Flag<["-"], "enable-experimental-differentiable-programming">,
+
+// Note: this flag will be removed when JVP/differential generation in the
+// differentiation transform is robust.
+def enable_experimental_forward_mode_differentiation :
+  Flag<["-"], "enable-experimental-forward-mode-differentiation">,
   Flags<[FrontendOption]>,
-  HelpText<"Enable experimental differentiable programming features">;
+  HelpText<"Enable experimental forward mode differentiation">;
 
 def enable_experimental_additive_arithmetic_derivation :
   Flag<["-"], "enable-experimental-additive-arithmetic-derivation">,
@@ -1032,6 +1038,16 @@ def disable_astscope_lookup : Flag<["-"], "disable-astscope-lookup">,
 def disable_parser_lookup : Flag<["-"], "disable-parser-lookup">,
   Flags<[FrontendOption]>,
   HelpText<"Disable parser lookup & use ast scope lookup only (experimental)">;
+
+def enable_request_based_incremental_dependencies : Flag<["-"],
+  "enable-request-based-incremental-dependencies">,
+  Flags<[FrontendOption]>,
+  HelpText<"Enable request-based name tracking">;
+
+def disable_request_based_incremental_dependencies : Flag<["-"],
+  "disable-request-based-incremental-dependencies">,
+  Flags<[FrontendOption]>,
+  HelpText<"Disable request-based name tracking">;
 
 def index_file : Flag<["-"], "index-file">,
   HelpText<"Produce index data for a source file">, ModeOpt,

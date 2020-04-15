@@ -24,9 +24,12 @@ endmacro()
 add_subdirectory(IR)
 add_subdirectory(Utils)
 add_subdirectory(Verifier)
+add_subdirectory(Parser)
 
 add_swift_host_library(swiftSIL STATIC
   ${SIL_SOURCES})
+target_link_libraries(swiftSIL PUBLIC
+  swiftDemangling)
 target_link_libraries(swiftSIL PRIVATE
   swiftSema
   swiftSerialization)

@@ -428,16 +428,15 @@ protected:
     HasTopLevelLocalContextCaptures : 1
   );
 
-  SWIFT_INLINE_BITFIELD(AccessorDecl, FuncDecl, 4+1+1,
-    /// The kind of accessor this is.
-    AccessorKind : 4,
+  SWIFT_INLINE_BITFIELD(AccessorDecl, FuncDecl, 4 + 1 + 1,
+                        /// The kind of accessor this is.
+                        AccessorKind : 4,
 
-    /// Whether the accessor is transparent.
-    IsTransparent : 1,
+                        /// Whether the accessor is transparent.
+                        IsTransparent : 1,
 
-    /// Whether we have computed the above.
-    IsTransparentComputed : 1
-  );
+                        /// Whether we have computed the above.
+                        IsTransparentComputed : 1);
 
   SWIFT_INLINE_BITFIELD(ConstructorDecl, AbstractFunctionDecl, 3+1+1,
     /// The body initialization kind (+1), or zero if not yet computed.
@@ -1435,6 +1434,8 @@ public:
     return SourceRange(WhereLoc,
                        getRequirements().back().getSourceRange().End);
   }
+
+  void print(llvm::raw_ostream &OS, bool printWhereKeyword) const;
 };
 
 // A private class for forcing exact field layout.
@@ -2496,6 +2497,10 @@ public:
   /// names.
   DeclBaseName getBaseName() const { return Name.getBaseName(); }
 
+  Identifier getBaseIdentifier() const {
+    return Name.getBaseIdentifier();
+  }
+
   /// Generates a DeclNameRef referring to this declaration with as much
   /// specificity as possible.
   DeclNameRef createNameRef() const {
@@ -2824,12 +2829,12 @@ protected:
     ValueDecl(K, context, name, NameLoc), Inherited(inherited) {}
 
 public:
-  Identifier getName() const { return getFullName().getBaseIdentifier(); }
+  Identifier getName() const { return getBaseIdentifier(); }
 
   /// Returns the string for the base name, or "_" if this is unnamed.
   StringRef getNameStr() const {
     assert(!getFullName().isSpecial() && "Cannot get string for special names");
-    return hasName() ? getBaseName().getIdentifier().str() : "_";
+    return hasName() ? getBaseIdentifier().str() : "_";
   }
 
   /// The type of this declaration's values. For the type of the
@@ -4803,6 +4808,13 @@ public:
   /// Does this storage require a 'modify' accessor in its opaque-accessors set?
   bool requiresOpaqueModifyCoroutine() const;
 
+  /// Does this storage have any explicit observers (willSet or didSet) attached
+  /// to it?
+  bool hasObservers() const {
+    return getParsedAccessor(AccessorKind::WillSet) ||
+           getParsedAccessor(AccessorKind::DidSet);
+  }
+
   SourceRange getBracesRange() const {
     if (auto info = Accessors.getPointer())
       return info->getBracesRange();
@@ -4929,12 +4941,12 @@ public:
 
   SourceRange getSourceRange() const;
 
-  Identifier getName() const { return getFullName().getBaseIdentifier(); }
+  Identifier getName() const { return getBaseIdentifier(); }
 
   /// Returns the string for the base name, or "_" if this is unnamed.
   StringRef getNameStr() const {
     assert(!getFullName().isSpecial() && "Cannot get string for special names");
-    return hasName() ? getBaseName().getIdentifier().str() : "_";
+    return hasName() ? getBaseIdentifier().str() : "_";
   }
 
   /// Get the type of the variable within its context. If the context is generic,
@@ -5231,7 +5243,7 @@ public:
   ///
   /// \code
   /// @Lazy var i = 17
-  /// \end
+  /// \endcode
   ///
   /// Or when there is no initializer but each composed property wrapper has
   /// a suitable `init(wrappedValue:)`.
@@ -5909,7 +5921,7 @@ public:
   /// Returns the string for the base name, or "_" if this is unnamed.
   StringRef getNameStr() const {
     assert(!getFullName().isSpecial() && "Cannot get string for special names");
-    return hasName() ? getBaseName().getIdentifier().str() : "_";
+    return hasName() ? getBaseIdentifier().str() : "_";
   }
 
   /// Should this declaration be treated as if annotated with transparent
@@ -6257,8 +6269,6 @@ public:
                           TypeLoc FnRetType, DeclContext *Parent,
                           ClangNode ClangN = ClangNode());
 
-  Identifier getName() const { return getFullName().getBaseIdentifier(); }
-
   bool isStatic() const;
 
   /// \returns the way 'static'/'class' was spelled in the source.
@@ -6500,6 +6510,11 @@ public:
     return isGetter() && getAccessorKeywordLoc().isInvalid();
   }
 
+  /// Is this accessor a "simple" didSet? A "simple" didSet does not
+  /// use the implicit oldValue parameter in its body or does not have
+  /// an explicit parameter in its parameter list.
+  bool isSimpleDidSet() const;
+
   void setIsTransparent(bool transparent) {
     Bits.AccessorDecl.IsTransparent = transparent;
     Bits.AccessorDecl.IsTransparentComputed = 1;
@@ -6601,12 +6616,10 @@ public:
                   LiteralExpr *RawValueExpr,
                   DeclContext *DC);
 
-  Identifier getName() const { return getFullName().getBaseIdentifier(); }
-
   /// Returns the string for the base name, or "_" if this is unnamed.
   StringRef getNameStr() const {
     assert(!getFullName().isSpecial() && "Cannot get string for special names");
-    return hasName() ? getBaseName().getIdentifier().str() : "_";
+    return hasName() ? getBaseIdentifier().str() : "_";
   }
 
   Type getArgumentInterfaceType() const;

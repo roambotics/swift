@@ -92,6 +92,11 @@ static void addMandatoryOptPipeline(SILPassPipelinePlan &P) {
   P.addAllocBoxToStack();
   P.addNoReturnFolding();
   addDefiniteInitialization(P);
+
+  // Automatic differentiation: canonicalize all differentiability witnesses
+  // and `differentiable_function` instructions.
+  P.addDifferentiation();
+
   // Only run semantic arc opts if we are optimizing and if mandatory semantic
   // arc opts is explicitly enabled.
   //
