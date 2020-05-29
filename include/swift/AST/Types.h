@@ -39,6 +39,7 @@
 #include "llvm/ADT/PointerEmbeddedInt.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/TrailingObjects.h"
 
@@ -557,7 +558,7 @@ public:
   
   /// allowsOwnership() - Are variables of this type permitted to have
   /// ownership attributes?
-  bool allowsOwnership(GenericSignatureImpl *sig = nullptr);
+  bool allowsOwnership(const GenericSignatureImpl *sig = nullptr);
 
   /// Determine whether this type involves a type variable.
   bool hasTypeVariable() const {
@@ -2695,10 +2696,10 @@ enum class FunctionTypeRepresentation : uint8_t {
   /// A "thin" function that needs no context.
   Thin,
   
-  /// A C function pointer, which is thin and also uses the C calling
-  /// convention.
+  /// A C function pointer (or reference), which is thin and also uses the C
+  /// calling convention.
   CFunctionPointer,
-  
+
   /// The value of the greatest AST function representation.
   Last = CFunctionPointer,
 };
@@ -2979,8 +2980,8 @@ public:
       // We preserve a full clang::Type *, not a clang::FunctionType * as:
       // 1. We need to keep sugar in case we need to present an error to the user.
       // 2. The actual type being stored is [ignoring sugar] either a
-      //    clang::PointerType or a clang::BlockPointerType which points to a
-      //    clang::FunctionType.
+      //    clang::PointerType, a clang::BlockPointerType, or a
+      //    clang::ReferenceType which points to a clang::FunctionType.
       const clang::Type *ClangFunctionType;
 
       bool empty() const { return !ClangFunctionType; }
@@ -3350,7 +3351,7 @@ public:
   /// first. `makeSelfParamFirst` should be true when working with user-facing
   /// derivative function types, e.g. when type-checking `@differentiable` and
   /// `@derivative` attributes.
-  AnyFunctionType *getAutoDiffDerivativeFunctionLinearMapType(
+  llvm::Expected<AnyFunctionType *> getAutoDiffDerivativeFunctionLinearMapType(
       IndexSubset *parameterIndices, AutoDiffLinearMapKind kind,
       LookupConformanceFn lookupConformance, bool makeSelfParamFirst = false);
 
@@ -3776,8 +3777,7 @@ public:
   /// Return the type of a call argument matching this parameter.
   ///
   /// \c t must refer back to the function type this is a parameter for.
-  CanType getArgumentType(SILModule &M,
-                          const SILFunctionType *t) const;
+  CanType getArgumentType(SILModule &M, const SILFunctionType *t, TypeExpansionContext context) const;
   ParameterConvention getConvention() const {
     return TypeAndConvention.getInt();
   }
@@ -3832,8 +3832,9 @@ public:
   /// storage. Therefore they will be passed using an indirect formal
   /// convention, and this method will return an address type. However, in
   /// canonical SIL the opaque arguments might not have an address type.
-  SILType getSILStorageType(SILModule &M,
-                            const SILFunctionType *t) const; // in SILFunctionConventions.h
+  SILType getSILStorageType(
+      SILModule &M, const SILFunctionType *t,
+      TypeExpansionContext context) const; // in SILFunctionConventions.h
   SILType getSILStorageInterfaceType() const;
 
   /// Return a version of this parameter info with the type replaced.
@@ -3865,9 +3866,9 @@ public:
   /// type, apply any substitutions from the function type to it to
   /// get a substituted version of it, as you would get from
   /// SILFunctionType::getUnsubstitutedType.
-  SILParameterInfo getUnsubstituted(SILModule &M,
-                                    const SILFunctionType *fnType) const {
-    return getWithInterfaceType(getArgumentType(M, fnType));
+  SILParameterInfo getUnsubstituted(SILModule &M, const SILFunctionType *fnType,
+                                    TypeExpansionContext context) const {
+    return getWithInterfaceType(getArgumentType(M, fnType, context));
   }
 
   void profile(llvm::FoldingSetNodeID &id) {
@@ -3952,9 +3953,9 @@ public:
   /// The type of a return value corresponding to this result.
   ///
   /// \c t must refer back to the function type this is a parameter for.
-  CanType getReturnValueType(SILModule &M,
-                             const SILFunctionType *t) const;
-  
+  CanType getReturnValueType(SILModule &M, const SILFunctionType *t,
+                             TypeExpansionContext context) const;
+
   ResultConvention getConvention() const {
     return TypeAndConvention.getInt();
   }
@@ -3964,8 +3965,9 @@ public:
   /// storage. Therefore they will be returned using an indirect formal
   /// convention, and this method will return an address type. However, in
   /// canonical SIL the opaque results might not have an address type.
-  SILType getSILStorageType(SILModule &M,
-                            const SILFunctionType *t) const; // in SILFunctionConventions.h
+  SILType getSILStorageType(
+      SILModule &M, const SILFunctionType *t,
+      TypeExpansionContext context) const; // in SILFunctionConventions.h
   SILType getSILStorageInterfaceType() const;
   /// Return a version of this result info with the type replaced.
   SILResultInfo getWithInterfaceType(CanType type) const {
@@ -4006,9 +4008,9 @@ public:
   /// type, apply any substitutions from the function type to it to
   /// get a substituted version of it, as you would get from
   /// SILFunctionType::getUnsubstitutedType.
-  SILResultInfo getUnsubstituted(SILModule &M,
-                                 const SILFunctionType *fnType) const {
-    return getWithInterfaceType(getReturnValueType(M, fnType));
+  SILResultInfo getUnsubstituted(SILModule &M, const SILFunctionType *fnType,
+                                 TypeExpansionContext context) const {
+    return getWithInterfaceType(getReturnValueType(M, fnType, context));
   }
 
   void profile(llvm::FoldingSetNodeID &id) {
@@ -4066,18 +4068,18 @@ public:
                                                   ->getCanonicalType());
   }
 
-  CanType getYieldValueType(SILModule &M,
-                            const SILFunctionType *fnType) const {
-    return getArgumentType(M, fnType);
+  CanType getYieldValueType(SILModule &M, const SILFunctionType *fnType,
+                            TypeExpansionContext context) const {
+    return getArgumentType(M, fnType, context);
   }
 
   /// Treating this yield info as a component of the given function
   /// type, apply any substitutions from the function type to it to
   /// get a substituted version of it, as you would get from
   /// SILFunctionType::getUnsubstitutedType.
-  SILYieldInfo getUnsubstituted(SILModule &M,
-                                const SILFunctionType *fnType) const {
-    return getWithInterfaceType(getYieldValueType(M, fnType));
+  SILYieldInfo getUnsubstituted(SILModule &M, const SILFunctionType *fnType,
+                                TypeExpansionContext context) const {
+    return getWithInterfaceType(getYieldValueType(M, fnType, context));
   }
 };
 
@@ -4528,14 +4530,15 @@ public:
   /// this function depends on the current SIL stage and is known by
   /// SILFunctionConventions. It may be a wider tuple that includes formally
   /// indirect results.
-  SILType getDirectFormalResultsType(SILModule &M);
+  SILType getDirectFormalResultsType(SILModule &M,
+                                     TypeExpansionContext expansion);
 
   /// Get a single non-address SILType for all SIL results regardless of whether
   /// they are formally indirect. The actual SIL result type of an apply
   /// instruction that calls this function depends on the current SIL stage and
   /// is known by SILFunctionConventions. It may be a narrower tuple that omits
   /// formally indirect results.
-  SILType getAllResultsSubstType(SILModule &M);
+  SILType getAllResultsSubstType(SILModule &M, TypeExpansionContext expansion);
   SILType getAllResultsInterfaceType();
 
   /// Does this function have a blessed Swift-native error result?
@@ -4678,12 +4681,13 @@ public:
     return getInvocationGenericSignature() && !getInvocationSubstitutions();
   }
 
-  CanType getSelfInstanceType(SILModule &M) const;
+  CanType getSelfInstanceType(SILModule &M, TypeExpansionContext context) const;
 
   /// If this is a @convention(witness_method) function with a class
   /// constrained self parameter, return the class constraint for the
   /// Self type.
-  ClassDecl *getWitnessMethodClass(SILModule &M) const;
+  ClassDecl *getWitnessMethodClass(SILModule &M,
+                                   TypeExpansionContext context) const;
 
   /// If this is a @convention(witness_method) function, return the conformance
   /// for which the method is a witness. If it isn't that convention, return
@@ -4875,8 +4879,9 @@ public:
     return getExtInfo().getDifferentiabilityKind();
   }
 
-  bool isNoReturnFunction(SILModule &M) const; // Defined in SILType.cpp
-                                    
+  bool isNoReturnFunction(SILModule &M, TypeExpansionContext context)
+      const; // Defined in SILType.cpp
+
   /// Create a SILFunctionType with the same structure as this one,
   /// but with a different (or new) set of invocation substitutions.
   /// The substitutions must have the same generic signature as this.
@@ -4956,7 +4961,8 @@ public:
                                                 TypeExpansionContext context);
 
   SILType substInterfaceType(SILModule &M,
-                             SILType interfaceType) const;
+                             SILType interfaceType,
+                             TypeExpansionContext context) const;
 
   /// Return the unsubstituted function type equivalent to this type; that is, the type that has the same
   /// argument and result types as `this` type after substitutions, if any.

@@ -458,10 +458,11 @@ getGlibcModuleMapPath(SearchPathOptions& Opts, llvm::Triple triple,
   return None;
 }
 
-static void
-getNormalInvocationArguments(std::vector<std::string> &invocationArgStrs,
-                             ASTContext &ctx,
-                             const ClangImporterOptions &importerOpts) {
+void
+importer::getNormalInvocationArguments(
+    std::vector<std::string> &invocationArgStrs,
+    ASTContext &ctx,
+    const ClangImporterOptions &importerOpts) {
   const auto &LangOpts = ctx.LangOpts;
   const llvm::Triple &triple = LangOpts.Target;
   SearchPathOptions &searchPathOpts = ctx.SearchPathOpts;
@@ -695,16 +696,23 @@ getEmbedBitcodeInvocationArguments(std::vector<std::string> &invocationArgStrs,
   });
 }
 
-static void
-addCommonInvocationArguments(std::vector<std::string> &invocationArgStrs,
-                             ASTContext &ctx,
-                             const ClangImporterOptions &importerOpts) {
+void
+importer::addCommonInvocationArguments(
+    std::vector<std::string> &invocationArgStrs,
+    ASTContext &ctx,
+    const ClangImporterOptions &importerOpts) {
   using ImporterImpl = ClangImporter::Implementation;
   const llvm::Triple &triple = ctx.LangOpts.Target;
   SearchPathOptions &searchPathOpts = ctx.SearchPathOpts;
 
   invocationArgStrs.push_back("-target");
   invocationArgStrs.push_back(triple.str());
+
+  if (ctx.LangOpts.SDKVersion) {
+    invocationArgStrs.push_back("-Xclang");
+    invocationArgStrs.push_back(
+        "-target-sdk-version=" + ctx.LangOpts.SDKVersion->getAsString());
+  }
 
   invocationArgStrs.push_back(ImporterImpl::moduleImportBufferName);
 
@@ -795,7 +803,7 @@ bool ClangImporter::canReadPCH(StringRef PCHFilename) {
   CI.setInvocation(std::move(invocation));
   CI.setTarget(&Impl.Instance->getTarget());
   CI.setDiagnostics(
-      &*CompilerInstance::createDiagnostics(new clang::DiagnosticOptions()));
+      &*clang::CompilerInstance::createDiagnostics(new clang::DiagnosticOptions()));
 
   // Note: Reusing the file manager is safe; this is a component that's already
   // reused when building PCM files for the module cache.
@@ -897,15 +905,10 @@ ClangImporter::getOrCreatePCH(const ClangImporterOptions &ImporterOptions,
   return PCHFilename.getValue();
 }
 
-std::unique_ptr<ClangImporter>
-ClangImporter::create(ASTContext &ctx, const ClangImporterOptions &importerOpts,
-                      std::string swiftPCHHash, DependencyTracker *tracker,
-                      DWARFImporterDelegate *dwarfImporterDelegate) {
-  std::unique_ptr<ClangImporter> importer{
-      new ClangImporter(ctx, importerOpts, tracker, dwarfImporterDelegate)};
-
+std::vector<std::string>
+ClangImporter::getClangArguments(ASTContext &ctx,
+                                 const ClangImporterOptions &importerOpts) {
   std::vector<std::string> invocationArgStrs;
-
   // Clang expects this to be like an actual command line. So we need to pass in
   // "clang" for argv[0]
   invocationArgStrs.push_back("clang");
@@ -919,19 +922,59 @@ ClangImporter::create(ASTContext &ctx, const ClangImporterOptions &importerOpts,
     break;
   }
   addCommonInvocationArguments(invocationArgStrs, ctx, importerOpts);
+  return invocationArgStrs;
+}
 
-  if (importerOpts.DumpClangDiagnostics) {
-    llvm::errs() << "'";
-    interleave(invocationArgStrs,
-               [](StringRef arg) { llvm::errs() << arg; },
-               [] { llvm::errs() << "' '"; });
-    llvm::errs() << "'\n";
-  }
-
+std::unique_ptr<clang::CompilerInvocation>
+ClangImporter::createClangInvocation(ClangImporter *importer,
+                                     const ClangImporterOptions &importerOpts,
+                                     ArrayRef<std::string> invocationArgStrs,
+                                     std::vector<std::string> *CC1Args) {
   std::vector<const char *> invocationArgs;
   invocationArgs.reserve(invocationArgStrs.size());
   for (auto &argStr : invocationArgStrs)
     invocationArgs.push_back(argStr.c_str());
+  // Set up a temporary diagnostic client to report errors from parsing the
+  // command line, which may be important for Swift clients if, for example,
+  // they're using -Xcc options. Unfortunately this diagnostic engine has to
+  // use the default options because the /actual/ options haven't been parsed
+  // yet.
+  //
+  // The long-term client for Clang diagnostics is set up below, after the
+  // clang::CompilerInstance is created.
+  llvm::IntrusiveRefCntPtr<clang::DiagnosticOptions> tempDiagOpts{
+    new clang::DiagnosticOptions
+  };
+
+  ClangDiagnosticConsumer tempDiagClient{importer->Impl, *tempDiagOpts,
+                                         importerOpts.DumpClangDiagnostics};
+  llvm::IntrusiveRefCntPtr<clang::DiagnosticsEngine> tempClangDiags =
+      clang::CompilerInstance::createDiagnostics(tempDiagOpts.get(),
+                                                 &tempDiagClient,
+                                                 /*owned*/false);
+
+  return clang::createInvocationFromCommandLine(invocationArgs, tempClangDiags,
+                                                nullptr, false, CC1Args);
+}
+
+std::unique_ptr<ClangImporter>
+ClangImporter::create(ASTContext &ctx, const ClangImporterOptions &importerOpts,
+                      std::string swiftPCHHash, DependencyTracker *tracker,
+                      DWARFImporterDelegate *dwarfImporterDelegate) {
+  std::unique_ptr<ClangImporter> importer{
+      new ClangImporter(ctx, importerOpts, tracker, dwarfImporterDelegate)};
+  importer->Impl.ClangArgs = getClangArguments(ctx, importerOpts);
+  ArrayRef<std::string> invocationArgStrs = importer->Impl.ClangArgs;
+
+  if (importerOpts.DumpClangDiagnostics) {
+    llvm::errs() << "'";
+    llvm::interleave(
+        invocationArgStrs, [](StringRef arg) { llvm::errs() << arg; },
+        [] { llvm::errs() << "' '"; });
+    llvm::errs() << "'\n";
+  }
+
+
 
   if (llvm::sys::path::extension(importerOpts.BridgingHeader)
         .endswith(file_types::getExtension(file_types::TY_PCH))) {
@@ -949,27 +992,9 @@ ClangImporter::create(ASTContext &ctx, const ClangImporterOptions &importerOpts,
 
   // Create a new Clang compiler invocation.
   {
-    // Set up a temporary diagnostic client to report errors from parsing the
-    // command line, which may be important for Swift clients if, for example,
-    // they're using -Xcc options. Unfortunately this diagnostic engine has to
-    // use the default options because the /actual/ options haven't been parsed
-    // yet.
-    //
-    // The long-term client for Clang diagnostics is set up below, after the
-    // clang::CompilerInstance is created.
-    llvm::IntrusiveRefCntPtr<clang::DiagnosticOptions> tempDiagOpts{
-      new clang::DiagnosticOptions
-    };
-
-    ClangDiagnosticConsumer tempDiagClient{importer->Impl, *tempDiagOpts,
-                                           importerOpts.DumpClangDiagnostics};
-    llvm::IntrusiveRefCntPtr<clang::DiagnosticsEngine> tempClangDiags =
-        clang::CompilerInstance::createDiagnostics(tempDiagOpts.get(),
-                                                   &tempDiagClient,
-                                                   /*owned*/false);
-
-    importer->Impl.Invocation =
-        clang::createInvocationFromCommandLine(invocationArgs, tempClangDiags);
+    importer->Impl.Invocation = createClangInvocation(importer.get(),
+                                                      importerOpts,
+                                                      invocationArgStrs);
     if (!importer->Impl.Invocation)
       return nullptr;
   }
@@ -1869,7 +1894,7 @@ ClangImporter::getWrapperForModule(const clang::Module *mod,
   return clangUnit->getParentModule();
 }
 
-PlatformAvailability::PlatformAvailability(LangOptions &langOpts)
+PlatformAvailability::PlatformAvailability(const LangOptions &langOpts)
     : platformKind(targetPlatform(langOpts)) {
   switch (platformKind) {
   case PlatformKind::iOS:
@@ -2392,7 +2417,7 @@ public:
   FilteringDeclaredDeclConsumer(swift::VisibleDeclConsumer &consumer,
                                 const ClangModuleUnit *CMU)
       : NextConsumer(consumer), ModuleFilter(CMU) {
-    assert(CMU);
+    assert(CMU && CMU->isTopLevel() && "Only top-level modules supported");
   }
 
   void foundDecl(ValueDecl *VD, DeclVisibilityKind Reason,
@@ -2974,7 +2999,7 @@ ClangModuleUnit::lookupNestedType(Identifier name,
       if (importedContext != baseType)
         return true;
 
-      assert(decl->getFullName().matchesRef(name) &&
+      assert(decl->getName() == name &&
              "importFullName behaved differently from importDecl");
       results.push_back(decl);
       anyMatching = true;
@@ -3037,11 +3062,6 @@ void ClangImporter::loadObjCMethods(
        bool isInstanceMethod,
        unsigned previousGeneration,
        llvm::TinyPtrVector<AbstractFunctionDecl *> &methods) {
-  // If we're currently looking for this selector, don't load any Objective-C
-  // methods.
-  if (Impl.ActiveSelectors.count({selector, isInstanceMethod}))
-    return;
-
   const auto *objcClass =
       dyn_cast_or_null<clang::ObjCInterfaceDecl>(classDecl->getClangDecl());
   if (!objcClass)
@@ -3074,10 +3094,7 @@ void ClangImporter::loadObjCMethods(
   // earlier, because we aren't tracking generation counts for Clang modules.
   // Filter out the duplicates.
   // FIXME: We shouldn't need to do this.
-  llvm::SmallPtrSet<AbstractFunctionDecl *, 4> known;
-  known.insert(methods.begin(), methods.end());
-
-  if (known.insert(method).second)
+  if (!llvm::is_contained(methods, method))
     methods.push_back(method);
 }
 
@@ -3149,13 +3166,8 @@ void ClangModuleUnit::lookupObjCMethods(
       (void)owner.importDecl(objcMethod->findPropertyDecl(true),
                              owner.CurrentVersion);
 
-    // Import it.
-    // FIXME: Retrying a failed import works around recursion bugs in the Clang
-    // importer.
     auto imported =
         owner.importDecl(objcMethod, owner.CurrentVersion);
-    if (!imported)
-      imported = owner.importDecl(objcMethod, owner.CurrentVersion);
     if (!imported) continue;
 
     if (auto func = dyn_cast<AbstractFunctionDecl>(imported))
@@ -3629,7 +3641,7 @@ void ClangImporter::Implementation::lookupValue(
 
     // If the name matched, report this result.
     bool anyMatching = false;
-    if (decl->getFullName().matchesRef(name) &&
+    if (decl->getName().matchesRef(name) &&
         decl->getDeclContext()->isModuleScopeContext()) {
       consumer.foundDecl(decl, DeclVisibilityKind::VisibleAtTopLevel);
       anyMatching = true;
@@ -3638,7 +3650,7 @@ void ClangImporter::Implementation::lookupValue(
     // If there is an alternate declaration and the name matches,
     // report this result.
     for (auto alternate : getAlternateDecls(decl)) {
-      if (alternate->getFullName().matchesRef(name) &&
+      if (alternate->getName().matchesRef(name) &&
           alternate->getDeclContext()->isModuleScopeContext()) {
         consumer.foundDecl(alternate, DeclVisibilityKind::VisibleAtTopLevel);
         anyMatching = true;
@@ -3673,7 +3685,7 @@ void ClangImporter::Implementation::lookupValue(
                                                      nameVersion));
           if (!alternateNamedDecl || alternateNamedDecl == decl)
             return;
-          assert(alternateNamedDecl->getFullName().matchesRef(name) &&
+          assert(alternateNamedDecl->getName().matchesRef(name) &&
                  "importFullName behaved differently from importDecl");
           if (alternateNamedDecl->getDeclContext()->isModuleScopeContext()) {
             consumer.foundDecl(alternateNamedDecl,
@@ -3719,7 +3731,7 @@ void ClangImporter::Implementation::lookupObjCMembers(
       // If the name we found matches, report the declaration.
       // FIXME: If we didn't need to check alternate decls here, we could avoid
       // importing the member at all by checking importedName ahead of time.
-      if (decl->getFullName().matchesRef(name)) {
+      if (decl->getName().matchesRef(name)) {
         consumer.foundDecl(decl, DeclVisibilityKind::DynamicLookup,
                            DynamicLookupInfo::AnyObject);
       }
@@ -3727,7 +3739,7 @@ void ClangImporter::Implementation::lookupObjCMembers(
       // Check for an alternate declaration; if its name matches,
       // report it.
       for (auto alternate : getAlternateDecls(decl)) {
-        if (alternate->getFullName().matchesRef(name)) {
+        if (alternate->getName().matchesRef(name)) {
           consumer.foundDecl(alternate, DeclVisibilityKind::DynamicLookup,
                              DynamicLookupInfo::AnyObject);
         }
@@ -3999,3 +4011,20 @@ bool ClangImporter::isInOverlayModuleForImportedModule(
   return !clangModule->ExportAsModule.empty() &&
     clangModule->ExportAsModule == overlayModule->getName().str();
 }
+
+/// Extract the specified-or-defaulted -module-cache-path that winds up in
+/// the clang importer, for reuse as the .swiftmodule cache path when
+/// building a ModuleInterfaceLoader.
+std::string
+swift::getModuleCachePathFromClang(const clang::CompilerInstance &Clang) {
+  if (!Clang.hasPreprocessor())
+    return "";
+  std::string SpecificModuleCachePath =
+      Clang.getPreprocessor().getHeaderSearchInfo().getModuleCachePath().str();
+
+  // The returned-from-clang module cache path includes a suffix directory
+  // that is specific to the clang version and invocation; we want the
+  // directory above that.
+  return llvm::sys::path::parent_path(SpecificModuleCachePath).str();
+}
+

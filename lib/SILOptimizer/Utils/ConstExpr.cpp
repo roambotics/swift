@@ -45,6 +45,8 @@ enum class WellKnownFunction {
   ArrayInitEmpty,
   // Array._allocateUninitializedArray
   AllocateUninitializedArray,
+  // Array._endMutation
+  EndArrayMutation,
   // Array.append(_:)
   ArrayAppendElement,
   // String.init()
@@ -71,6 +73,8 @@ static llvm::Optional<WellKnownFunction> classifyFunction(SILFunction *fn) {
     return WellKnownFunction::ArrayInitEmpty;
   if (fn->hasSemanticsAttr(semantics::ARRAY_UNINITIALIZED_INTRINSIC))
     return WellKnownFunction::AllocateUninitializedArray;
+  if (fn->hasSemanticsAttr(semantics::ARRAY_END_MUTATION))
+    return WellKnownFunction::EndArrayMutation;
   if (fn->hasSemanticsAttr(semantics::ARRAY_APPEND_ELEMENT))
     return WellKnownFunction::ArrayAppendElement;
   if (fn->hasSemanticsAttr(semantics::STRING_INIT_EMPTY))
@@ -946,6 +950,17 @@ ConstExprFunctionState::computeWellKnownCallResult(ApplyInst *apply,
                                                 resultType, allocator));
     return None;
   }
+  case WellKnownFunction::EndArrayMutation: {
+    // This function has the following signature in SIL:
+    //    (@inout Array<Element>) -> ()
+    assert(conventions.getNumParameters() == 1 &&
+           conventions.getNumDirectSILResults() == 0 &&
+           conventions.getNumIndirectSILResults() == 0 &&
+           "unexpected Array._endMutation() signature");
+
+    // _endMutation is a no-op.
+    return None;
+  }
   case WellKnownFunction::ArrayAppendElement: {
     // This function has the following signature in SIL:
     //    (@in Element, @inout Array<Element>) -> ()
@@ -1214,11 +1229,13 @@ ConstExprFunctionState::computeCallResult(ApplyInst *apply) {
   SubstitutionMap calleeSubMap;
 
   auto calleeFnType = callee->getLoweredFunctionType();
-  assert(
-      !calleeFnType->hasSelfParam() ||
-      !calleeFnType->getSelfInstanceType(callee->getModule())
-                   ->getClassOrBoundGenericClass() &&
-      "class methods are not supported");
+  assert(!calleeFnType->hasSelfParam() ||
+         !calleeFnType
+                 ->getSelfInstanceType(
+                     callee->getModule(),
+                     apply->getFunction()->getTypeExpansionContext())
+                 ->getClassOrBoundGenericClass() &&
+             "class methods are not supported");
   if (calleeFnType->getInvocationGenericSignature()) {
     // Get the substitution map of the call.  This maps from the callee's space
     // into the caller's world. Witness methods require additional work to

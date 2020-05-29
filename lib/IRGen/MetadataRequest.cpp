@@ -441,26 +441,12 @@ static llvm::Value *emitObjCMetadataRef(IRGenFunction &IGF,
   return emitObjCMetadataRefForMetadata(IGF, classPtr);
 }
 
-static bool isTypeErasedGenericClass(NominalTypeDecl *ntd) {
-  // ObjC classes are type erased.
-  // TODO: Unless they have magic methods...
-  if (auto clas = dyn_cast<ClassDecl>(ntd))
-    return clas->hasClangNode() && clas->isGenericContext();
-  return false;
-}
-
-static bool isTypeErasedGenericClassType(CanType type) {
-  if (auto nom = type->getAnyNominal())
-    return isTypeErasedGenericClass(nom);
-  return false;
-}
-
 // Get the type that exists at runtime to represent a compile-time type.
 CanType IRGenModule::getRuntimeReifiedType(CanType type) {
   // Leave type-erased ObjC generics with their generic arguments unbound, since
   // the arguments do not exist at runtime.
   return CanType(type.transform([&](Type t) -> Type {
-    if (isTypeErasedGenericClassType(CanType(t))) {
+    if (CanType(t).isTypeErasedGenericClassType()) {
       return t->getAnyNominal()->getDeclaredType()->getCanonicalType();
     }
     return t;
@@ -709,8 +695,10 @@ bool irgen::isNominalGenericContextTypeMetadataAccessTrivial(
   }
 
   if (IGM.getSILModule().isWholeModule()) {
-    if (nominal.isResilient(IGM.getSwiftModule(),
-                            ResilienceExpansion::Maximal)) {
+    // Canonical prespecializations can only be emitted within the module where
+    // the generic type is itself defined, since it is the module where the 
+    // metadata accessor is defined.
+    if (IGM.getSwiftModule() != nominal.getModuleContext()) {
       return false;
     }
   } else {
@@ -727,6 +715,11 @@ bool irgen::isNominalGenericContextTypeMetadataAccessTrivial(
     }
   }
 
+  if (nominal.isResilient(IGM.getSwiftModule(),
+                          ResilienceExpansion::Maximal)) {
+    return false;
+  }
+
   if (isa<ClassType>(type) || isa<BoundGenericClassType>(type)) {
     // TODO: Support classes.
     return false;
@@ -741,7 +734,7 @@ bool irgen::isNominalGenericContextTypeMetadataAccessTrivial(
 
   auto allWitnessTablesAreReferenceable = llvm::all_of(environment->getGenericParams(), [&](auto parameter) {
     auto signature = environment->getGenericSignature();
-    auto protocols = signature->getConformsTo(parameter);
+    const auto protocols = signature->getRequiredProtocols(parameter);
     auto argument = ((Type *)parameter)->subst(substitutions);
     auto canonicalType = argument->getCanonicalType();
     auto witnessTablesAreReferenceable = [&]() {
@@ -763,12 +756,11 @@ bool irgen::isNominalGenericContextTypeMetadataAccessTrivial(
       return genericArgument && genericArgument->isGenericContext() && 
         (protocols.size() > 0);
     };
-    auto isExistential = [&]() { return argument->isExistentialType(); };
     auto metadataAccessIsTrivial = [&]() {
       return irgen::isCompleteTypeMetadataStaticallyAddressable(IGM,
                                                 argument->getCanonicalType());
     };
-    return !isGenericWithoutPrespecializedConformance() && !isExistential() && 
+    return !isGenericWithoutPrespecializedConformance() &&
            metadataAccessIsTrivial() && witnessTablesAreReferenceable();
   });
   return allWitnessTablesAreReferenceable
@@ -2126,7 +2118,7 @@ static llvm::Function *getAccessFunctionPrototype(IRGenModule &IGM,
                                                ForDefinition_t forDefinition) {
   assert(!type->hasArchetype());
   // Type should be bound unless it's type erased.
-  assert(isTypeErasedGenericClassType(type)
+  assert(type.isTypeErasedGenericClassType()
            ? !isa<BoundGenericType>(type)
            : !isa<UnboundGenericType>(type));
 
@@ -2214,7 +2206,7 @@ irgen::getGenericTypeMetadataAccessFunction(IRGenModule &IGM,
                                             NominalTypeDecl *nominal,
                                             ForDefinition_t shouldDefine) {
   assert(nominal->isGenericContext());
-  assert(!isTypeErasedGenericClass(nominal));
+  assert(!nominal->isTypeErasedGenericClass());
 
   GenericArguments genericArgs;
   genericArgs.collectTypes(IGM, nominal);

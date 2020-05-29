@@ -99,25 +99,6 @@ static bool isRelease(SILInstruction *Inst, SILValue RetainedValue,
         return true;
       }
 
-  if (auto *AI = dyn_cast<ApplyInst>(Inst)) {
-    if (auto *F = AI->getReferencedFunctionOrNull()) {
-      auto Params = F->getLoweredFunctionType()->getParameters();
-      auto Args = AI->getArguments();
-      for (unsigned ArgIdx = 0, ArgEnd = Params.size(); ArgIdx != ArgEnd;
-           ++ArgIdx) {
-        if (MatchedReleases.count(&AI->getArgumentRef(ArgIdx)))
-          continue;
-        if (!areArraysEqual(RCIA, Args[ArgIdx], RetainedValue, ArrayAddress))
-          continue;
-        ParameterConvention P = Params[ArgIdx].getConvention();
-        if (P == ParameterConvention::Direct_Owned) {
-          LLVM_DEBUG(llvm::dbgs() << "     matching with release " << *Inst);
-          MatchedReleases.insert(&AI->getArgumentRef(ArgIdx));
-          return true;
-        }
-      }
-    }
-  }
   LLVM_DEBUG(llvm::dbgs() << "      not a matching release " << *Inst);
   return false;
 }
@@ -307,6 +288,7 @@ static bool isNonMutatingArraySemanticCall(SILInstruction *Inst) {
   case ArrayCallKind::kGetCapacity:
   case ArrayCallKind::kGetElement:
   case ArrayCallKind::kGetElementAddress:
+  case ArrayCallKind::kEndMutation:
     return true;
   case ArrayCallKind::kMakeMutable:
   case ArrayCallKind::kMutateUnknown:
@@ -315,6 +297,7 @@ static bool isNonMutatingArraySemanticCall(SILInstruction *Inst) {
   case ArrayCallKind::kArrayInit:
   case ArrayCallKind::kArrayUninitialized:
   case ArrayCallKind::kArrayUninitializedIntrinsic:
+  case ArrayCallKind::kArrayFinalizeIntrinsic:
   case ArrayCallKind::kAppendContentsOf:
   case ArrayCallKind::kAppendElement:
     return false;

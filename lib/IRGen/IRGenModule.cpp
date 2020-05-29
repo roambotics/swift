@@ -20,6 +20,7 @@
 #include "swift/AST/DiagnosticsIRGen.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/AST/IRGenRequests.h"
 #include "swift/Basic/Dwarf.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/ClangImporter/ClangImporter.h"
@@ -54,6 +55,7 @@
 #include "ConformanceDescription.h"
 #include "GenDecl.h"
 #include "GenEnum.h"
+#include "GenMeta.h"
 #include "GenPointerAuth.h"
 #include "GenIntegerLiteral.h"
 #include "GenType.h"
@@ -88,11 +90,26 @@ static llvm::PointerType *createStructPointerType(IRGenModule &IGM,
   return createStructType(IGM, name, types)->getPointerTo(DefaultAS);
 };
 
-static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
-                                                 llvm::LLVMContext &LLVMContext,
-                                                      const IRGenOptions &Opts,
-                                                      StringRef ModuleName,
-                                                      StringRef PD) {
+static clang::CodeGenOptions::FramePointerKind
+shouldUseFramePointer(const IRGenOptions &Opts, const llvm::Triple &triple) {
+  if (Opts.DisableFPElim) {
+    // General frame pointer elimination is disabled.
+    // Should we at least eliminate in leaf functions?
+    // Currently we only do that on arm64 (this matches the behavior of clang).
+    return Opts.DisableFPElimLeaf
+               ? clang::CodeGenOptions::FramePointerKind::All
+               : triple.isAArch64()
+                     ? clang::CodeGenOptions::FramePointerKind::NonLeaf
+                     : clang::CodeGenOptions::FramePointerKind::All;
+  }
+
+  return clang::CodeGenOptions::FramePointerKind::None;
+}
+
+static clang::CodeGenerator *
+createClangCodeGenerator(ASTContext &Context, llvm::LLVMContext &LLVMContext,
+                         const IRGenOptions &Opts, StringRef ModuleName,
+                         StringRef PD, const llvm::Triple &triple) {
   auto Loader = Context.getClangModuleLoader();
   auto *Importer = static_cast<ClangImporter*>(&*Loader);
   assert(Importer && "No clang module loader!");
@@ -100,9 +117,7 @@ static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
 
   auto &CGO = Importer->getClangCodeGenOpts();
   CGO.OptimizationLevel = Opts.shouldOptimize() ? 3 : 0;
-  CGO.setFramePointer(Opts.DisableFPElim
-                          ? clang::CodeGenOptions::FramePointerKind::All
-                          : clang::CodeGenOptions::FramePointerKind::None);
+  CGO.setFramePointer(shouldUseFramePointer(Opts, triple));
   CGO.DiscardValueNames = !Opts.shouldProvideValueNames();
   switch (Opts.DebugInfoLevel) {
   case IRGenDebugInfoLevel::None:
@@ -192,14 +207,18 @@ static void sanityCheckStdlib(IRGenModule &IGM) {
 
 IRGenModule::IRGenModule(IRGenerator &irgen,
                          std::unique_ptr<llvm::TargetMachine> &&target,
-                         SourceFile *SF, llvm::LLVMContext &LLVMContext,
-                         StringRef ModuleName, StringRef OutputFilename,
+                         SourceFile *SF, StringRef ModuleName,
+                         StringRef OutputFilename,
                          StringRef MainInputFilenameForDebugInfo,
                          StringRef PrivateDiscriminator)
-    : IRGen(irgen), Context(irgen.SIL.getASTContext()),
-      ClangCodeGen(createClangCodeGenerator(Context, LLVMContext, irgen.Opts,
-                                            ModuleName, PrivateDiscriminator)),
-      Module(*ClangCodeGen->GetModule()), LLVMContext(Module.getContext()),
+    : LLVMContext(new llvm::LLVMContext()), IRGen(irgen),
+      Context(irgen.SIL.getASTContext()),
+      // The LLVMContext (and the IGM itself) will get deleted by the IGMDeleter
+      // as long as the IGM is registered with the IRGenerator.
+      ClangCodeGen(createClangCodeGenerator(Context, *LLVMContext, irgen.Opts,
+                                            ModuleName, PrivateDiscriminator,
+                                            irgen.getEffectiveClangTriple())),
+      Module(*ClangCodeGen->GetModule()),
       DataLayout(irgen.getClangDataLayout()),
       Triple(irgen.getEffectiveClangTriple()), TargetMachine(std::move(target)),
       silConv(irgen.SIL), OutputFilename(OutputFilename),
@@ -333,6 +352,8 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   // A full type metadata record is basically just an adjustment to the
   // address point of a type metadata.  Resilience may cause
   // additional data to be laid out prior to this address point.
+  static_assert(MetadataAdjustmentIndex::ValueType == 1,
+                "Adjustment index must be synchronized with this layout");
   FullTypeMetadataStructTy = createStructType(*this, "swift.full_type", {
     WitnessTablePtrTy,
     TypeMetadataStructTy
@@ -345,6 +366,8 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   // A full heap metadata is basically just an additional small prefix
   // on a full metadata, used for metadata corresponding to heap
   // allocations.
+  static_assert(MetadataAdjustmentIndex::Class == 2,
+                "Adjustment index must be synchronized with this layout");
   FullHeapMetadataStructTy =
                   createStructType(*this, "swift.full_heapmetadata", {
     dtorPtrTy,
@@ -378,7 +401,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
     RefCountedPtrTy,
   });
 
-  OpaqueTy = llvm::StructType::create(LLVMContext, "swift.opaque");
+  OpaqueTy = llvm::StructType::create(getLLVMContext(), "swift.opaque");
   OpaquePtrTy = OpaqueTy->getPointerTo(DefaultAS);
   NoEscapeFunctionPairTy = createStructType(*this, "swift.noescape.function", {
     FunctionPtrTy,
@@ -402,12 +425,12 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
     = ProtocolConformanceDescriptorTy->getPointerTo(DefaultAS);
 
   TypeContextDescriptorTy
-    = llvm::StructType::create(LLVMContext, "swift.type_descriptor");
+    = llvm::StructType::create(getLLVMContext(), "swift.type_descriptor");
   TypeContextDescriptorPtrTy
     = TypeContextDescriptorTy->getPointerTo(DefaultAS);
 
   ClassContextDescriptorTy =
-        llvm::StructType::get(LLVMContext, {
+        llvm::StructType::get(getLLVMContext(), {
     Int32Ty, // context flags
     Int32Ty, // parent
     Int32Ty, // name
@@ -448,7 +471,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
     = TypeMetadataRecordTy->getPointerTo(DefaultAS);
 
   FieldDescriptorTy
-    = llvm::StructType::create(LLVMContext, "swift.field_descriptor");
+    = llvm::StructType::create(getLLVMContext(), "swift.field_descriptor");
   FieldDescriptorPtrTy = FieldDescriptorTy->getPointerTo(DefaultAS);
   FieldDescriptorPtrPtrTy = FieldDescriptorPtrTy->getPointerTo(DefaultAS);
 
@@ -461,7 +484,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   BridgeObjectPtrTy = llvm::StructType::create(getLLVMContext(), "swift.bridge")
                 ->getPointerTo(DefaultAS);
 
-  ObjCClassStructTy = llvm::StructType::create(LLVMContext, "objc_class");
+  ObjCClassStructTy = llvm::StructType::create(getLLVMContext(), "objc_class");
   ObjCClassPtrTy = ObjCClassStructTy->getPointerTo(DefaultAS);
   llvm::Type *objcClassElts[] = {
     ObjCClassPtrTy,
@@ -472,7 +495,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   };
   ObjCClassStructTy->setBody(objcClassElts);
 
-  ObjCSuperStructTy = llvm::StructType::create(LLVMContext, "objc_super");
+  ObjCSuperStructTy = llvm::StructType::create(getLLVMContext(), "objc_super");
   ObjCSuperPtrTy = ObjCSuperStructTy->getPointerTo(DefaultAS);
   llvm::Type *objcSuperElts[] = {
     ObjCPtrTy,
@@ -480,7 +503,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   };
   ObjCSuperStructTy->setBody(objcSuperElts);
   
-  ObjCBlockStructTy = llvm::StructType::create(LLVMContext, "objc_block");
+  ObjCBlockStructTy = llvm::StructType::create(getLLVMContext(), "objc_block");
   ObjCBlockPtrTy = ObjCBlockStructTy->getPointerTo(DefaultAS);
   llvm::Type *objcBlockElts[] = {
     ObjCClassPtrTy, // isa
@@ -510,7 +533,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
     ObjCUpdateCallbackTy->getPointerTo() // the update callback
   });
 
-  auto ErrorStructTy = llvm::StructType::create(LLVMContext, "swift.error");
+  auto ErrorStructTy = llvm::StructType::create(getLLVMContext(), "swift.error");
   // ErrorStruct is currently opaque to the compiler.
   ErrorPtrTy = ErrorStructTy->getPointerTo(DefaultAS);
   
@@ -530,9 +553,9 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   OpaqueTypeDescriptorTy = TypeContextDescriptorTy;
   OpaqueTypeDescriptorPtrTy = OpaqueTypeDescriptorTy->getPointerTo();
 
-  InvariantMetadataID = LLVMContext.getMDKindID("invariant.load");
-  InvariantNode = llvm::MDNode::get(LLVMContext, {});
-  DereferenceableID = LLVMContext.getMDKindID("dereferenceable");
+  InvariantMetadataID = getLLVMContext().getMDKindID("invariant.load");
+  InvariantNode = llvm::MDNode::get(getLLVMContext(), {});
+  DereferenceableID = getLLVMContext().getMDKindID("dereferenceable");
   
   C_CC = llvm::CallingConv::C;
   // TODO: use "tinycc" on platforms that support it
@@ -792,7 +815,7 @@ std::pair<llvm::GlobalVariable *, llvm::Constant *>
 IRGenModule::createStringConstant(StringRef Str,
   bool willBeRelativelyAddressed, StringRef sectionName) {
   // If not, create it.  This implicitly adds a trailing null.
-  auto init = llvm::ConstantDataArray::getString(LLVMContext, Str);
+  auto init = llvm::ConstantDataArray::getString(getLLVMContext(), Str);
   auto global = new llvm::GlobalVariable(Module, init->getType(), true,
                                          llvm::GlobalValue::PrivateLinkage,
                                          init);
@@ -902,8 +925,11 @@ llvm::Module *IRGenModule::getModule() const {
   return ClangCodeGen->GetModule();
 }
 
-llvm::Module *IRGenModule::releaseModule() {
-  return ClangCodeGen->ReleaseModule();
+GeneratedModule IRGenModule::intoGeneratedModule() && {
+  return GeneratedModule{
+    std::move(LLVMContext),
+    std::unique_ptr<llvm::Module>{ClangCodeGen->ReleaseModule()},
+  };
 }
 
 bool IRGenerator::canEmitWitnessTableLazily(SILWitnessTable *wt) {
@@ -957,10 +983,12 @@ void IRGenerator::addClassForEagerInitialization(ClassDecl *ClassDecl) {
 llvm::AttributeList IRGenModule::getAllocAttrs() {
   if (AllocAttrs.isEmpty()) {
     AllocAttrs =
-        llvm::AttributeList::get(LLVMContext, llvm::AttributeList::ReturnIndex,
+        llvm::AttributeList::get(getLLVMContext(),
+                                 llvm::AttributeList::ReturnIndex,
                                  llvm::Attribute::NoAlias);
     AllocAttrs =
-        AllocAttrs.addAttribute(LLVMContext, llvm::AttributeList::FunctionIndex,
+        AllocAttrs.addAttribute(getLLVMContext(),
+                                llvm::AttributeList::FunctionIndex,
                                 llvm::Attribute::NoUnwind);
   }
   return AllocAttrs;
@@ -973,7 +1001,20 @@ bool swift::irgen::shouldRemoveTargetFeature(StringRef feature) {
 
 void IRGenModule::setHasFramePointer(llvm::AttrBuilder &Attrs,
                                      bool HasFramePointer) {
-  Attrs.addAttribute("frame-pointer", HasFramePointer ? "all" : "none");
+  if (!HasFramePointer) {
+    Attrs.addAttribute("frame-pointer", "none");
+    return;
+  }
+  if (IRGen.Opts.DisableFPElimLeaf) {
+    Attrs.addAttribute("frame-pointer", "all");
+    return;
+  }
+
+  // We omit frame pointers for leaf functions only for arm64 for now (matching
+  // clang's behavior).
+  auto framePointer =
+      IRGen.getEffectiveClangTriple().isAArch64() ? "non-leaf" : "all";
+  Attrs.addAttribute("frame-pointer", framePointer);
 }
 
 void IRGenModule::setHasFramePointer(llvm::Function *F,
@@ -986,49 +1027,29 @@ void IRGenModule::setHasFramePointer(llvm::Function *F,
 /// Construct initial function attributes from options.
 void IRGenModule::constructInitialFnAttributes(llvm::AttrBuilder &Attrs,
                                                OptimizationMode FuncOptMode) {
+  // Add the default attributes for the Clang configuration.
+  clang::CodeGen::addDefaultFunctionDefinitionAttributes(getClangCGM(), Attrs);
+
   // Add frame pointer attributes.
+  // FIXME: why are we doing this?
   setHasFramePointer(Attrs, IRGen.Opts.DisableFPElim);
   
-  // Add target-cpu and target-features if they are non-null.
-  auto *Clang = static_cast<ClangImporter *>(Context.getClangModuleLoader());
-  clang::TargetOptions &ClangOpts = Clang->getTargetInfo().getTargetOpts();
-
-  std::string &CPU = ClangOpts.CPU;
-  if (CPU != "")
-    Attrs.addAttribute("target-cpu", CPU);
-
-  std::vector<std::string> Features;
-  for (auto &F : ClangOpts.Features)
-    if (!shouldRemoveTargetFeature(F))
-        Features.push_back(F);
-
-  if (!Features.empty()) {
-    SmallString<64> allFeatures;
-    // Sort so that the target features string is canonical.
-    std::sort(Features.begin(), Features.end());
-    interleave(Features, [&](const std::string &s) {
-      allFeatures.append(s);
-    }, [&]{
-      allFeatures.push_back(',');
-    });
-    Attrs.addAttribute("target-features", allFeatures);
-  }
+  // Add/remove MinSize based on the appropriate setting.
   if (FuncOptMode == OptimizationMode::NotSet)
     FuncOptMode = IRGen.Opts.OptMode;
-  if (FuncOptMode == OptimizationMode::ForSize)
+  if (FuncOptMode == OptimizationMode::ForSize) {
+    Attrs.addAttribute(llvm::Attribute::OptimizeForSize);
     Attrs.addAttribute(llvm::Attribute::MinSize);
-
-  auto triple = llvm::Triple(ClangOpts.Triple);
-  if (triple.getArchName() == "arm64e") {
-    Attrs.addAttribute("ptrauth-returns");
-    Attrs.addAttribute("ptrauth-calls");
+  } else {
+    Attrs.removeAttribute(llvm::Attribute::MinSize);
+    Attrs.removeAttribute(llvm::Attribute::OptimizeForSize);
   }
 }
 
 llvm::AttributeList IRGenModule::constructInitialAttributes() {
   llvm::AttrBuilder b;
   constructInitialFnAttributes(b);
-  return llvm::AttributeList::get(LLVMContext,
+  return llvm::AttributeList::get(getLLVMContext(),
                                   llvm::AttributeList::FunctionIndex, b);
 }
 
@@ -1193,14 +1214,9 @@ static bool isFirstObjectFileInModule(IRGenModule &IGM) {
   if (IGM.getSILModule().isWholeModule())
     return IGM.IRGen.getPrimaryIGM() == &IGM;
 
-  const DeclContext *DC = IGM.getSILModule().getAssociatedContext();
-  if (!DC)
-    return false;
-
-  assert(!isa<ModuleDecl>(DC) && "that would be a whole module build");
-  assert(isa<FileUnit>(DC) && "compiling something smaller than a file?");
-  ModuleDecl *containingModule = cast<FileUnit>(DC)->getParentModule();
-  return containingModule->getFiles().front() == DC;
+  auto *file = cast<FileUnit>(IGM.getSILModule().getAssociatedContext());
+  auto *containingModule = file->getParentModule();
+  return containingModule->getFiles().front() == file;
 }
 
 void IRGenModule::emitAutolinkInfo() {
@@ -1242,7 +1258,7 @@ void IRGenModule::emitAutolinkInfo() {
       }
     }
     auto EntriesConstant = llvm::ConstantDataArray::getString(
-        LLVMContext, EntriesString, /*AddNull=*/false);
+        getLLVMContext(), EntriesString, /*AddNull=*/false);
     // Mark the swift1_autolink_entries section with the SHF_EXCLUDE attribute
     // to get the linker to drop it in the final linked binary.
     // LLVM doesn't provide an interface to specify section attributs in the IR
@@ -1398,13 +1414,18 @@ void IRGenModule::error(SourceLoc loc, const Twine &message) {
 bool IRGenModule::useDllStorage() { return ::useDllStorage(Triple); }
 
 bool IRGenModule::shouldPrespecializeGenericMetadata() {
+  auto canPrespecializeTarget =
+      (Triple.isOSDarwin() || Triple.isTvOS() || Triple.isOSLinux());
+  if (canPrespecializeTarget && isStandardLibrary()) {
+    return true;
+  }
   auto &context = getSwiftModule()->getASTContext();
   auto deploymentAvailability =
       AvailabilityContext::forDeploymentTarget(context);
-  return IRGen.Opts.PrespecializeGenericMetadata && 
-    deploymentAvailability.isContainedIn(
-      context.getPrespecializedGenericMetadataAvailability()) &&
-    (Triple.isOSDarwin() || Triple.isTvOS() || Triple.isOSLinux());
+  return IRGen.Opts.PrespecializeGenericMetadata &&
+         deploymentAvailability.isContainedIn(
+             context.getPrespecializedGenericMetadataAvailability()) &&
+         canPrespecializeTarget;
 }
 
 void IRGenerator::addGenModule(SourceFile *SF, IRGenModule *IGM) {

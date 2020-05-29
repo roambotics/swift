@@ -1459,7 +1459,8 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn, SILBasicBlock *BB,
     SmallVector<SILValue, 4> Args;
     for (unsigned I = 0, E = ListOfValues.size(); I < E; I++)
       Args.push_back(getLocalValue(ListOfValues[I],
-                                   substConventions.getSILArgumentType(I)));
+                                   substConventions.getSILArgumentType(
+                                       I, Builder.getTypeExpansionContext())));
     SubstitutionMap Substitutions = MF->getSubstitutionMap(NumSubs);
 
     if (OpCode == SILInstructionKind::ApplyInst) {
@@ -1495,7 +1496,8 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn, SILBasicBlock *BB,
     SmallVector<SILValue, 4> Args;
     for (unsigned I = 0, E = ListOfValues.size(); I < E; I++)
       Args.push_back(getLocalValue(ListOfValues[I],
-                                   substConventions.getSILArgumentType(I)));
+                                   substConventions.getSILArgumentType(
+                                       I, Builder.getTypeExpansionContext())));
     SubstitutionMap Substitutions = MF->getSubstitutionMap(NumSubs);
 
     ResultVal = Builder.createTryApply(Loc, getLocalValue(ValID, FnTy),
@@ -1527,7 +1529,9 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn, SILBasicBlock *BB,
     unsigned unappliedArgs = numArgs - ListOfValues.size();
     for (unsigned I = 0, E = ListOfValues.size(); I < E; I++)
       Args.push_back(getLocalValue(
-          ListOfValues[I], fnConv.getSILArgumentType(I + unappliedArgs)));
+          ListOfValues[I],
+          fnConv.getSILArgumentType(I + unappliedArgs,
+                                    Builder.getTypeExpansionContext())));
     auto onStack = closureTy.castTo<SILFunctionType>()->isNoEscape()
                        ? PartialApplyInst::OnStackKind::OnStack
                        : PartialApplyInst::OnStackKind::NotOnStack;
@@ -1830,6 +1834,28 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn, SILBasicBlock *BB,
         getLocalValue(ValID, getSILType(MF->getType(TyID),
                                         (SILValueCategory)TyCategory, Fn)),
         verificationType);
+    break;
+  }
+
+  case SILInstructionKind::BeginCOWMutationInst: {
+    assert(RecordKind == SIL_ONE_OPERAND && "Layout should be OneOperand.");
+    unsigned isNative = Attr;
+    ResultVal = Builder.createBeginCOWMutation(
+        Loc,
+        getLocalValue(ValID,
+            getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn)),
+        isNative != 0);
+    break;
+  }
+
+  case SILInstructionKind::EndCOWMutationInst: {
+    assert(RecordKind == SIL_ONE_OPERAND && "Layout should be OneOperand.");
+    unsigned keepUnique = Attr;
+    ResultVal = Builder.createEndCOWMutation(
+        Loc,
+        getLocalValue(ValID, getSILType(MF->getType(TyID),
+                                        (SILValueCategory)TyCategory, Fn)),
+        keepUnique != 0);
     break;
   }
 
@@ -2294,19 +2320,19 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn, SILBasicBlock *BB,
     auto ResultTy = Val->getType().getFieldType(
         Field, SILMod, Builder.getTypeExpansionContext());
     ResultVal = Builder.createRefElementAddr(Loc, Val, Field,
-                                             ResultTy);
+                                          ResultTy, /*Immutable*/ Attr & 0x1);
     break;
   }
   case SILInstructionKind::RefTailAddrInst: {
     assert(RecordKind == SIL_ONE_TYPE_ONE_OPERAND &&
            "Layout should be OneTypeOneOperand.");
-    assert(Attr == 0);
     assert((SILValueCategory)TyCategory == SILValueCategory::Address);
     ResultVal = Builder.createRefTailAddr(
         Loc,
         getLocalValue(ValID, getSILType(MF->getType(TyID2),
                                         (SILValueCategory)TyCategory2, Fn)),
-        getSILType(MF->getType(TyID), SILValueCategory::Address, Fn));
+        getSILType(MF->getType(TyID), SILValueCategory::Address, Fn),
+        /*Immutable*/ Attr & 0x1);
     break;
   }
   case SILInstructionKind::ClassMethodInst:

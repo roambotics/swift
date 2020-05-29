@@ -274,6 +274,7 @@ validateControlBlock(llvm::BitstreamCursor &cursor,
         break;
       }
 
+      result.miscVersion = blobData;
       versionSeen = true;
       break;
     }
@@ -1340,6 +1341,10 @@ static bool areCompatibleArchitectures(const llvm::Triple &moduleTarget,
 
 static bool areCompatibleOSs(const llvm::Triple &moduleTarget,
                              const llvm::Triple &ctxTarget) {
+  if ((!moduleTarget.hasEnvironment() && ctxTarget.isSimulatorEnvironment()) ||
+      (!ctxTarget.hasEnvironment() && moduleTarget.isSimulatorEnvironment()))
+    return false;
+
   if (moduleTarget.getOS() == ctxTarget.getOS())
     return true;
 
@@ -1673,6 +1678,7 @@ ModuleFile::ModuleFile(
       TargetTriple = info.targetTriple;
       CompatibilityVersion = info.compatibilityVersion;
       IsSIB = extInfo->isSIB();
+      MiscVersion = info.miscVersion;
 
       hasValidControlBlock = true;
       break;
@@ -1971,9 +1977,7 @@ ModuleFile::ModuleFile(
   }
 }
 
-Status ModuleFile::associateWithFileContext(FileUnit *file,
-                                            SourceLoc diagLoc,
-                                            bool treatAsPartialModule) {
+Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc) {
   PrettyStackTraceModuleFile stackEntry(*this);
 
   assert(!hasError() && "error already detected; should not call this");
@@ -2022,12 +2026,17 @@ Status ModuleFile::associateWithFileContext(FileUnit *file,
           return error(Status::FailedToLoadBridgingHeader);
       }
       ModuleDecl *importedHeaderModule = clangImporter->getImportedHeaderModule();
-      dependency.Import = { {}, importedHeaderModule };
+      dependency.Import = ModuleDecl::ImportedModule{ModuleDecl::AccessPathTy(),
+                                                     importedHeaderModule};
       continue;
     }
 
+    // If this module file is being installed into the main module, it's treated
+    // as a partial module.
+    auto isPartialModule = M->isMainModule();
+
     if (dependency.isImplementationOnly() &&
-        !(treatAsPartialModule || ctx.LangOpts.DebuggerSupport)) {
+        !(isPartialModule || ctx.LangOpts.DebuggerSupport)) {
       // When building normally (and not merging partial modules), we don't
       // want to bring in the implementation-only module, because that might
       // change the set of visible declarations. However, when debugging we
@@ -2070,14 +2079,15 @@ Status ModuleFile::associateWithFileContext(FileUnit *file,
     }
 
     if (scopePath.empty()) {
-      dependency.Import = { {}, module };
+      dependency.Import =
+          ModuleDecl::ImportedModule{ModuleDecl::AccessPathTy(), module};
     } else {
       auto scopeID = ctx.getIdentifier(scopePath);
       assert(!scopeID.empty() &&
              "invalid decl name (non-top-level decls not supported)");
       Located<Identifier> accessPathElem = { scopeID, SourceLoc() };
-      dependency.Import = {ctx.AllocateCopy(llvm::makeArrayRef(accessPathElem)),
-                           module};
+      dependency.Import = ModuleDecl::ImportedModule{
+          ctx.AllocateCopy(llvm::makeArrayRef(accessPathElem)), module};
     }
 
     // SPI
@@ -2142,7 +2152,7 @@ void ModuleFile::lookupValue(DeclName name,
           continue;
         }
         auto VD = cast<ValueDecl>(declOrError.get());
-        if (name.isSimpleName() || VD->getFullName().matchesRef(name))
+        if (name.isSimpleName() || VD->getName().matchesRef(name))
           results.push_back(VD);
       }
     }
@@ -2239,9 +2249,6 @@ OperatorDecl *ModuleFile::lookupOperator(Identifier name,
     if (getStableFixity(fixity) == item.first)
       return cast<OperatorDecl>(getDecl(item.second));
   }
-
-  // FIXME: operators re-exported from other modules?
-
   return nullptr;
 }
 
@@ -2285,7 +2292,7 @@ void ModuleFile::getImportedModules(
     }
 
     assert(dep.isLoaded());
-    results.push_back(dep.Import);
+    results.push_back(*(dep.Import));
   }
 }
 
@@ -2585,7 +2592,7 @@ void ModuleFile::lookupClassMember(ModuleDecl::AccessPathTy accessPath,
     } else {
       for (auto item : *iter) {
         auto vd = cast<ValueDecl>(getDecl(item.second));
-        if (!vd->getFullName().matchesRef(name))
+        if (!vd->getName().matchesRef(name))
           continue;
         
         auto dc = vd->getDeclContext();
@@ -2660,7 +2667,7 @@ void ModuleFile::lookupImportedSPIGroups(const ModuleDecl *importedModule,
                                     SmallVectorImpl<Identifier> &spiGroups) const {
   for (auto &dep : Dependencies) {
     auto depSpis = dep.spiGroups;
-    if (dep.Import.second == importedModule &&
+    if (dep.Import.hasValue() && dep.Import->importedModule == importedModule &&
         !depSpis.empty()) {
       spiGroups.append(depSpis.begin(), depSpis.end());
     }
@@ -2972,9 +2979,9 @@ bool SerializedASTFile::getAllGenericSignatures(
   return true;
 }
 
-ClassDecl *SerializedASTFile::getMainClass() const {
+Decl *SerializedASTFile::getMainDecl() const {
   assert(hasEntryPoint());
-  return cast_or_null<ClassDecl>(File.getDecl(File.Bits.EntryPointDeclID));
+  return File.getDecl(File.Bits.EntryPointDeclID);
 }
 
 const version::Version &SerializedASTFile::getLanguageVersionBuiltWith() const {

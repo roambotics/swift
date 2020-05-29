@@ -252,6 +252,8 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
         selfTy.getFieldType(field, SGF.SGM.M, SGF.getTypeExpansionContext());
     RValue value;
 
+    FullExpr scope(SGF.Cleanups, field->getParentPatternBinding());
+
     // If it's memberwise initialized, do so now.
     if (field->isMemberwiseInitialized(/*preferDeclaredProperties=*/false)) {
       assert(elti != eltEnd && "number of args does not match number of fields");
@@ -276,7 +278,6 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
     }
 
     // Cleanup after this initialization.
-    FullExpr scope(SGF.Cleanups, field->getParentPatternBinding());
     SILValue v = maybeEmitPropertyWrapperInitFromValue(SGF, Loc, field, subs,
                                                        std::move(value))
         .forwardAsSingleStorageValue(SGF, fieldTy, Loc);
@@ -698,7 +699,6 @@ void SILGenFunction::emitClassConstructorInitializer(ConstructorDecl *ctor) {
     if (NeedsBoxForSelf) {
       SILLocation prologueLoc = RegularLocation(ctor);
       prologueLoc.markAsPrologue();
-      // SEMANTIC ARC TODO: When the verifier is complete, review this.
       B.emitStoreValueOperation(prologueLoc, selfArg.forward(*this),
                                 VarLocs[selfDecl].value,
                                 StoreOwnershipQualifier::Init);

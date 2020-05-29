@@ -260,12 +260,20 @@ public:
   bool hasMainClass() const {
     return getMainClass();
   }
-  virtual ClassDecl *getMainClass() const {
-    assert(hasEntryPoint());
-    return nullptr;
+  ClassDecl *getMainClass() const {
+    return dyn_cast_or_null<ClassDecl>(getMainDecl());
+  }
+  bool hasMainDecl() const { return getMainDecl(); }
+  virtual Decl *getMainDecl() const { return nullptr; }
+  FuncDecl *getMainFunc() const {
+    return dyn_cast_or_null<FuncDecl>(getMainDecl());
   }
   virtual bool hasEntryPoint() const {
     return false;
+  }
+
+  virtual ModuleDecl *getUnderlyingModuleIfOverlay() const {
+    return nullptr;
   }
 
   /// Returns the associated clang module if one exists.
@@ -375,6 +383,9 @@ public:
   virtual ModuleDecl *getOverlayModule() const { return nullptr; }
 
   virtual bool isSystemModule() const { return false; }
+
+  /// Checks whether an error was encountered while loading the file.
+  virtual bool hadLoadError() const { return false; }
 
   /// Retrieve the set of generic signatures stored within this module.
   ///

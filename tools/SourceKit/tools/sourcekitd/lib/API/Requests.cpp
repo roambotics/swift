@@ -113,8 +113,10 @@ static SourceKit::Context *GlobalCtx = nullptr;
 
 void sourcekitd::initialize() {
   llvm::EnablePrettyStackTrace();
-  GlobalCtx = new SourceKit::Context(sourcekitd::getRuntimeLibPath(),
-                                     SourceKit::createSwiftLangSupport);
+  GlobalCtx =
+      new SourceKit::Context(sourcekitd::getRuntimeLibPath(),
+                             sourcekitd::getDiagnosticDocumentationPath(),
+                             SourceKit::createSwiftLangSupport);
   GlobalCtx->getNotificationCenter()->addDocumentUpdateNotificationReceiver(
     onDocumentUpdateNotification);
 }
@@ -438,9 +440,21 @@ void handleRequestImpl(sourcekitd_object_t ReqObj, ResponseReceiver Rec) {
     if (!Req.getInt64(KeyOptimizeForIDE, EditorMode, true)) {
       OptimizeForIDE = EditorMode;
     }
+    Optional<unsigned> CompletionCheckDependencyInterval;
+    int64_t IntervalValue = 0;
+    if (!Req.getInt64(KeyCompletionCheckDependencyInterval,
+                      IntervalValue, /*isOptional=*/true))
+      CompletionCheckDependencyInterval = IntervalValue;
 
-    GlobalConfig::Settings UpdatedConfig = Config->update(OptimizeForIDE);
+    GlobalConfig::Settings UpdatedConfig = Config->update(
+        OptimizeForIDE, CompletionCheckDependencyInterval);
+
+    getGlobalContext().getSwiftLangSupport().globalConfigurationUpdated(Config);
+
     dict.set(KeyOptimizeForIDE, UpdatedConfig.OptimizeForIDE);
+    dict.set(KeyCompletionCheckDependencyInterval,
+             UpdatedConfig.CompletionCheckDependencyInterval);
+
     return Rec(RB.createResponse());
   }
   if (ReqUID == RequestProtocolVersion) {
@@ -1152,7 +1166,11 @@ static void handleSemanticRequest(
     else
       return Rec(createErrorRequestInvalid("'key.namekind' is unrecognizable"));
     if (auto Base = Req.getString(KeyBaseName)) {
-      Input.BaseName = Base.getValue();
+      if (Input.NameKind == UIDKindNameSwift) {
+        Input.BaseName = Base.getValue().trim('`');
+      } else {
+        Input.BaseName = Base.getValue();
+      }
     }
     llvm::SmallVector<const char*, 4> ArgParts;
     llvm::SmallVector<const char*, 4> Selectors;
@@ -1164,7 +1182,7 @@ static void handleSemanticRequest(
     }
     std::transform(ArgParts.begin(), ArgParts.end(),
                    std::back_inserter(Input.ArgNames),
-                   [](const char *C) { return StringRef(C); });
+                   [](const char *C) { return StringRef(C).trim('`'); });
     std::transform(Selectors.begin(), Selectors.end(),
                    std::back_inserter(Input.ArgNames),
                    [](const char *C) { return StringRef(C); });
@@ -1930,6 +1948,7 @@ public:
 
   void setCompletionKind(UIdent kind) override;
   void setReusingASTContext(bool flag) override;
+  void setAnnotatedTypename(bool flag) override;
   bool handleResult(const CodeCompletionInfo &Info) override;
 };
 } // end anonymous namespace
@@ -1966,6 +1985,11 @@ void SKCodeCompletionConsumer::setReusingASTContext(bool flag) {
     RespBuilder.getDictionary().setBool(KeyReusingASTContext, flag);
 }
 
+void SKCodeCompletionConsumer::setAnnotatedTypename(bool flag) {
+  if (flag)
+    RespBuilder.getDictionary().setBool(KeyAnnotatedTypename, flag);
+}
+
 bool SKCodeCompletionConsumer::handleResult(const CodeCompletionInfo &R) {
   Optional<StringRef> ModuleNameOpt;
   if (!R.ModuleName.empty())
@@ -1990,6 +2014,7 @@ bool SKCodeCompletionConsumer::handleResult(const CodeCompletionInfo &R) {
                      R.SemanticContext,
                      R.TypeRelation,
                      R.NotRecommended,
+                     R.IsSystem,
                      R.NumBytesToErase);
   return true;
 }
@@ -2022,6 +2047,8 @@ public:
   void startGroup(UIdent kind, StringRef name) override;
   void endGroup() override;
   void setNextRequestStart(unsigned offset) override;
+  void setReusingASTContext(bool flag) override;
+  void setAnnotatedTypename(bool flag) override;
 };
 } // end anonymous namespace
 
@@ -2164,6 +2191,8 @@ bool SKGroupedCodeCompletionConsumer::handleResult(const CodeCompletionInfo &R) 
     result.set(KeyModuleImportDepth, *R.ModuleImportDepth);
   if (R.NotRecommended)
     result.set(KeyNotRecommended, R.NotRecommended);
+  if (R.IsSystem)
+    result.set(KeyIsSystem, R.IsSystem);
   result.set(KeyNumBytesToErase, R.NumBytesToErase);
 
   if (R.descriptionStructure) {
@@ -2218,6 +2247,14 @@ void SKGroupedCodeCompletionConsumer::endGroup() {
 void SKGroupedCodeCompletionConsumer::setNextRequestStart(unsigned offset) {
   assert(!Response.isNull());
   Response.set(KeyNextRequestStart, offset);
+}
+void SKGroupedCodeCompletionConsumer::setReusingASTContext(bool flag) {
+  if (flag)
+    RespBuilder.getDictionary().setBool(KeyReusingASTContext, flag);
+}
+void SKGroupedCodeCompletionConsumer::setAnnotatedTypename(bool flag) {
+  if (flag)
+    RespBuilder.getDictionary().setBool(KeyAnnotatedTypename, flag);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3144,6 +3181,21 @@ public:
 };
 } // end anonymous namespace
 
+static Optional<UIdent> getUIDForOperationKind(trace::OperationKind OpKind) {
+  static UIdent CompileOperationIndexSource("source.compile.operation.index-source");
+  static UIdent CompileOperationCodeCompletion("source.compile.operation.code-completion");
+  switch (OpKind) {
+    case trace::OperationKind::PerformSema:
+      return None;
+    case trace::OperationKind::IndexSource:
+      return CompileOperationIndexSource;
+    case trace::OperationKind::CodeCompletion:
+      return CompileOperationCodeCompletion;
+    default:
+      llvm_unreachable("Unknown operation kind");
+  }
+}
+
 void CompileTrackingConsumer::operationStarted(
     uint64_t OpId, trace::OperationKind OpKind,
     const trace::SwiftInvocation &Inv, const trace::StringPairs &OpArgs) {
@@ -3156,7 +3208,9 @@ void CompileTrackingConsumer::operationStarted(
   Dict.set(KeyNotification, CompileWillStartUID);
   Dict.set(KeyCompileID, std::to_string(OpId));
   Dict.set(KeyFilePath, Inv.Args.PrimaryFile);
-  // FIXME: OperationKind
+  if (auto OperationUID = getUIDForOperationKind(OpKind)) {
+    Dict.set(KeyCompileOperation, OperationUID.getValue());
+  }
   Dict.set(KeyCompilerArgsString, Inv.Args.Arguments);
   sourcekitd::postNotification(RespBuilder.createResponse());
 }
@@ -3172,6 +3226,9 @@ void CompileTrackingConsumer::operationFinished(
   auto Dict = RespBuilder.getDictionary();
   Dict.set(KeyNotification, CompileDidFinishUID);
   Dict.set(KeyCompileID, std::to_string(OpId));
+  if (auto OperationUID = getUIDForOperationKind(OpKind)) {
+    Dict.set(KeyCompileOperation, OperationUID.getValue());
+  }
   auto DiagArray = Dict.setArray(KeyDiagnostics);
   for (const auto &DiagInfo : Diagnostics) {
     fillDictionaryForDiagnosticInfo(DiagArray.appendDictionary(), DiagInfo);

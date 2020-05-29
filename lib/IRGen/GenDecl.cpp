@@ -476,6 +476,11 @@ void IRGenModule::emitSourceFile(SourceFile &SF) {
                                          LibraryKind::Library,
                                          /*forceLoad*/ true));
       }
+      if (*compatibilityVersion <= llvm::VersionTuple(5, 1)) {
+        this->addLinkLibrary(LinkLibrary("swiftCompatibility51",
+                                         LibraryKind::Library,
+                                         /*forceLoad*/ true));
+      }
     }
 
     if (auto compatibilityVersion =
@@ -908,9 +913,9 @@ IRGenModule::getConstantReferenceForProtocolDescriptor(ProtocolDecl *proto) {
                                      LinkEntity::forProtocolDescriptor(proto));
 }
 
-void IRGenModule::addLazyConformances(DeclContext *dc) {
+void IRGenModule::addLazyConformances(const IterableDeclContext *idc) {
   for (const ProtocolConformance *conf :
-         dc->getLocalConformances(ConformanceLookupKind::All)) {
+         idc->getLocalConformances(ConformanceLookupKind::All)) {
     IRGen.addLazyWitnessTable(conf);
   }
 }
@@ -1522,17 +1527,23 @@ void IRGenerator::emitDynamicReplacements() {
   llvm::SmallSet<OpaqueTypeArchetypeType *, 8> newUniqueOpaqueTypes;
   llvm::SmallSet<OpaqueTypeArchetypeType *, 8> origUniqueOpaqueTypes;
   for (auto *newFunc : DynamicReplacements) {
-    if (!newFunc->getLoweredFunctionType()->hasOpaqueArchetype())
+    auto newResultTy = newFunc->getLoweredFunctionType()
+             ->getAllResultsInterfaceType()
+             .getASTType();
+    if (!newResultTy->hasOpaqueArchetype())
       continue;
-    CanType(newFunc->getLoweredFunctionType()).visit([&](CanType ty) {
+    newResultTy.visit([&](CanType ty) {
       if (auto opaque = ty->getAs<OpaqueTypeArchetypeType>())
         if (newUniqueOpaqueTypes.insert(opaque).second)
           newFuncTypes.push_back(opaque);
     });
     auto *origFunc = newFunc->getDynamicallyReplacedFunction();
     assert(origFunc);
-    assert(origFunc->getLoweredFunctionType()->hasOpaqueArchetype());
-    CanType(origFunc->getLoweredFunctionType()).visit([&](CanType ty) {
+    auto origResultTy = origFunc->getLoweredFunctionType()
+                            ->getAllResultsInterfaceType()
+                            .getASTType();
+    assert(origResultTy->hasOpaqueArchetype());
+    origResultTy.visit([&](CanType ty) {
       if (auto opaque = ty->getAs<OpaqueTypeArchetypeType>())
         if (origUniqueOpaqueTypes.insert(opaque).second)
           origFuncTypes.push_back(opaque);
@@ -1729,7 +1740,9 @@ void IRGenModule::emitVTableStubs() {
       stub->setCallingConv(DefaultCC);
       auto *entry = llvm::BasicBlock::Create(getLLVMContext(), "entry", stub);
       auto *errorFunc = getDeletedMethodErrorFn();
-      llvm::CallInst::Create(errorFunc, ArrayRef<llvm::Value *>(), "", entry);
+      llvm::CallInst::Create(cast<llvm::FunctionType>(
+                                 errorFunc->getType()->getPointerElementType()),
+                             errorFunc, ArrayRef<llvm::Value *>(), "", entry);
       new llvm::UnreachableInst(getLLVMContext(), entry);
     }
 
@@ -2217,7 +2230,7 @@ Address IRGenModule::getAddrOfSILGlobalVariable(SILGlobalVariable *var,
     inFixedBuffer = true;
     storageType = getFixedBufferTy();
     fixedSize = Size(DataLayout.getTypeAllocSize(storageType));
-    fixedAlignment = Alignment(DataLayout.getABITypeAlignment(storageType));
+    fixedAlignment = getFixedBufferAlignment(*this);
   }
 
   // Check whether we've created the global variable already.
@@ -3013,11 +3026,6 @@ IRGenModule::getAddrOfLLVMVariableOrGOTEquivalent(LinkEntity entity) {
       cast<llvm::GlobalValue>(entry), entity);
     return {gotEquivalent, ConstantReference::Indirect};
   };
-  
-  // The integrated REPL incrementally adds new definitions, so always use
-  // indirect references in this mode.
-  if (IRGen.Opts.IntegratedREPL)
-    return indirect();
 
   // Dynamically replaceable function keys are stored in the GlobalVars
   // table, but they don't have an associated Decl, so they require
@@ -4440,7 +4448,7 @@ llvm::Constant *IRGenModule::getAddrOfGlobalUTF16String(StringRef utf8) {
   *toPtr = 0;
   ArrayRef<llvm::UTF16> utf16(&buffer[0], utf16Length + 1);
 
-  auto init = llvm::ConstantDataArray::get(LLVMContext, utf16);
+  auto init = llvm::ConstantDataArray::get(getLLVMContext(), utf16);
   auto global = new llvm::GlobalVariable(Module, init->getType(), true,
                                          llvm::GlobalValue::PrivateLinkage,
                                          init);

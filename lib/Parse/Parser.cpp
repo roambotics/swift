@@ -110,7 +110,7 @@ void tokenize(const LangOptions &LangOpts, const SourceManager &SM,
 using namespace swift;
 using namespace swift::syntax;
 
-void SILParserTUStateBase::anchor() { }
+void SILParserStateBase::anchor() { }
 
 void swift::performCodeCompletionSecondPass(
     SourceFile &SF, CodeCompletionCallbacksFactory &Factory) {
@@ -220,6 +220,19 @@ swift::Parser::BacktrackingScope::~BacktrackingScope() {
     P.backtrackToPosition(PP);
     DT.abort();
   }
+}
+
+void swift::Parser::BacktrackingScope::cancelBacktrack() {
+  if (!Backtrack)
+    return;
+
+  Backtrack = false;
+  SynContext->cancelBacktrack();
+  SynContext->setTransparent();
+  if (SynContext->isTopOfContextStack())
+    SynContext.reset();
+  DT.commit();
+  TempReceiver.shouldTransfer = true;
 }
 
 /// Tokenizes a string literal, taking into account string interpolation.
@@ -361,20 +374,19 @@ static LexerMode sourceFileKindToLexerMode(SourceFileKind kind) {
       return LexerMode::SIL;
     case swift::SourceFileKind::Library:
     case swift::SourceFileKind::Main:
-    case swift::SourceFileKind::REPL:
       return LexerMode::Swift;
   }
   llvm_unreachable("covered switch");
 }
 
-Parser::Parser(unsigned BufferID, SourceFile &SF, SILParserTUStateBase *SIL,
+Parser::Parser(unsigned BufferID, SourceFile &SF, SILParserStateBase *SIL,
                PersistentParserState *PersistentState,
                std::shared_ptr<SyntaxParseActions> SPActions)
     : Parser(BufferID, SF, &SF.getASTContext().Diags, SIL, PersistentState,
              std::move(SPActions)) {}
 
 Parser::Parser(unsigned BufferID, SourceFile &SF, DiagnosticEngine* LexerDiags,
-               SILParserTUStateBase *SIL,
+               SILParserStateBase *SIL,
                PersistentParserState *PersistentState,
                std::shared_ptr<SyntaxParseActions> SPActions)
     : Parser(
@@ -509,8 +521,7 @@ public:
 } // End of an anonymous namespace.
 
 Parser::Parser(std::unique_ptr<Lexer> Lex, SourceFile &SF,
-               SILParserTUStateBase *SIL,
-               PersistentParserState *PersistentState,
+               SILParserStateBase *SIL, PersistentParserState *PersistentState,
                std::shared_ptr<SyntaxParseActions> SPActions)
   : SourceMgr(SF.getASTContext().SourceMgr),
     Diags(SF.getASTContext().Diags),
@@ -1190,8 +1201,7 @@ struct ParserUnit::Implementation {
         Ctx(*ASTContext::get(LangOpts, TypeCheckerOpts, SearchPathOpts, SM, Diags)),
         SF(new (Ctx) SourceFile(
             *ModuleDecl::create(Ctx.getIdentifier(ModuleName), Ctx), SFKind,
-            BufferID, SourceFile::ImplicitModuleImportKind::None,
-            Opts.CollectParsedToken, Opts.BuildSyntaxTree,
+            BufferID, Opts.CollectParsedToken, Opts.BuildSyntaxTree,
             SourceFile::ParsingFlags::DisableDelayedBodies |
                 SourceFile::ParsingFlags::DisablePoundIfEvaluation)) {}
 

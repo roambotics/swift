@@ -872,8 +872,8 @@ namespace {
         contractedCycle = false;
         for (const auto &edge : cycleEdges) {
           if (unionSets(edge.first, edge.second)) {
-            if (ctx.TypeCheckerOpts.DebugConstraintSolver) {
-              auto &log = ctx.TypeCheckerDebug->getStream();
+            if (cs.isDebugMode()) {
+              auto &log = llvm::errs();
               if (cs.solverState)
                 log.indent(cs.solverState->depth * 2);
 
@@ -1126,6 +1126,10 @@ bool ConstraintGraph::contractEdges() {
     if (isParamBindingConstraint && tyvar1->getImpl().canBindToInOut()) {
       bool isNotContractable = true;
       if (auto bindings = CS.getPotentialBindings(tyvar1)) {
+        // Holes can't be contracted.
+        if (bindings.IsHole)
+          continue;
+
         for (auto &binding : bindings.Bindings) {
           auto type = binding.BindingType;
           isNotContractable = type.findIf([&](Type nestedType) -> bool {
@@ -1155,8 +1159,8 @@ bool ConstraintGraph::contractEdges() {
           rep2->getImpl().canBindToLValue()) ||
          // Allow l-value contractions when binding parameter types.
          isParamBindingConstraint)) {
-      if (CS.getASTContext().TypeCheckerOpts.DebugConstraintSolver) {
-        auto &log = CS.getASTContext().TypeCheckerDebug->getStream();
+      if (CS.isDebugMode()) {
+        auto &log = llvm::errs();
         if (CS.solverState)
           log.indent(CS.solverState->depth * 2);
 
@@ -1165,43 +1169,14 @@ bool ConstraintGraph::contractEdges() {
         log << "\n";
       }
 
-      // Merge the edges and remove the constraint.
-      removeEdge(constraint);
+      // Merge the edges and retire the constraint.
+      CS.retireConstraint(constraint);
       if (rep1 != rep2)
         CS.mergeEquivalenceClasses(rep1, rep2, /*updateWorkList*/ false);
       didContractEdges = true;
     }
   }
   return didContractEdges;
-}
-
-void ConstraintGraph::removeEdge(Constraint *constraint) {
-  bool isExistingConstraint = false;
-
-  for (auto &active : CS.ActiveConstraints) {
-    if (&active == constraint) {
-      CS.ActiveConstraints.erase(constraint);
-      isExistingConstraint = true;
-      break;
-    }
-  }
-
-  for (auto &inactive : CS.InactiveConstraints) {
-    if (&inactive == constraint) {
-      CS.InactiveConstraints.erase(constraint);
-      isExistingConstraint = true;
-      break;
-    }
-  }
-
-  if (CS.solverState) {
-    if (isExistingConstraint)
-      CS.solverState->retireConstraint(constraint);
-    else
-      CS.solverState->removeGeneratedConstraint(constraint);
-  }
-
-  removeConstraint(constraint);
 }
 
 void ConstraintGraph::optimize() {
@@ -1326,7 +1301,7 @@ void ConstraintGraph::printConnectedComponents(
 
     // Print all of the one-way components.
     out << " depends on ";
-    interleave(
+    llvm::interleave(
         component.dependsOn,
         [&](unsigned index) { out << index; },
         [&] { out << ", "; }
