@@ -28,15 +28,12 @@
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/SourceLoc.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MD5.h"
+#include <set>
 
 namespace clang {
   class Module;
@@ -394,6 +391,11 @@ public:
   /// Add a file declaring a cross-import overlay.
   void addCrossImportOverlayFile(StringRef file);
 
+  /// Collect cross-import overlay names from a given YAML file path.
+  static llvm::SmallSetVector<Identifier, 4>
+  collectCrossImportOverlay(ASTContext &ctx, StringRef file,
+                            StringRef moduleName, StringRef& bystandingModule);
+
   /// If this method returns \c false, the module does not declare any
   /// cross-import overlays.
   ///
@@ -551,6 +553,10 @@ public:
     return Bits.ModuleDecl.IsMainModule;
   }
 
+  /// For the main module, retrieves the list of primary source files being
+  /// compiled, that is, the files we're generating code for.
+  ArrayRef<SourceFile *> getPrimarySourceFiles() const;
+
   /// Retrieve the top-level module. If this module is already top-level, this
   /// returns itself. If this is a submodule such as \c Foo.Bar.Baz, this
   /// returns the module \c Foo.
@@ -646,8 +652,9 @@ public:
 
   /// Find all SPI names imported from \p importedModule by this module,
   /// collecting the identifiers in \p spiGroups.
-  void lookupImportedSPIGroups(const ModuleDecl *importedModule,
-                          SmallVectorImpl<Identifier> &spiGroups) const;
+  void lookupImportedSPIGroups(
+                         const ModuleDecl *importedModule,
+                         llvm::SmallSetVector<Identifier, 4> &spiGroups) const;
 
   /// \sa getImportedModules
   enum class ImportFilterKind {

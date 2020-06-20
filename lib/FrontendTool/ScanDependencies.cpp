@@ -69,16 +69,16 @@ static std::vector<ModuleDependencyID> resolveDirectDependencies(
   auto ModuleCachePath = getModuleCachePathFromClang(ctx
     .getClangModuleLoader()->getClangInstance());
   auto &FEOpts = instance.getInvocation().getFrontendOptions();
+  ModuleInterfaceLoaderOptions LoaderOpts(FEOpts);
   InterfaceSubContextDelegateImpl ASTDelegate(ctx.SourceMgr, ctx.Diags,
                                               ctx.SearchPathOpts, ctx.LangOpts,
+                                              LoaderOpts,
                                               ctx.getClangModuleLoader(),
                                               /*buildModuleCacheDirIfAbsent*/false,
                                               ModuleCachePath,
                                               FEOpts.PrebuiltModuleCachePath,
                                               FEOpts.SerializeModuleInterfaceDependencyHashes,
-                                              FEOpts.TrackSystemDeps,
-                                              FEOpts.RemarkOnRebuildFromModuleInterface,
-                                              FEOpts.DisableInterfaceFileLock);
+                                              FEOpts.TrackSystemDeps);
   // Find the dependencies of every module this module directly depends on.
   std::vector<ModuleDependencyID> result;
   for (auto dependsOn : knownDependencies.getModuleDependencies()) {
@@ -130,12 +130,46 @@ static std::vector<ModuleDependencyID> resolveDirectDependencies(
     for (const auto &clangDep : allClangModules) {
       if (auto found = ctx.getModuleDependencies(
               clangDep, /*onlyClangModule=*/false, cache, ASTDelegate)) {
-        if (found->getKind() == ModuleDependenciesKind::Swift)
+        // ASTContext::getModuleDependencies returns dependencies for a module with a given name.
+        // This Clang module may have the same name as the Swift module we are resolving, so we
+        // need to make sure we don't add a dependency from a Swift module to itself.
+        if (found->getKind() == ModuleDependenciesKind::Swift && clangDep != module.first)
           result.push_back({clangDep, found->getKind()});
       }
     }
   }
-
+  // Only resolve cross-import overlays when this is the main module.
+  // For other modules, these overlays are explicitly written.
+  bool isMainModule =
+    instance.getMainModule()->getName().str() == module.first &&
+    module.second == ModuleDependenciesKind::Swift;
+  if (isMainModule) {
+    // Modules explicitly imported. Only these can be secondary module.
+    std::vector<ModuleDependencyID> explicitImports = result;
+    for (unsigned I = 0; I != result.size(); ++I) {
+      auto dep = result[I];
+      auto moduleName = dep.first;
+      auto dependencies = *cache.findDependencies(moduleName, dep.second);
+      // Collect a map from secondary module name to cross-import overlay names.
+      auto overlayMap = dependencies.collectCrossImportOverlayNames(
+        instance.getASTContext(), moduleName);
+      if (overlayMap.empty())
+        continue;
+      std::for_each(explicitImports.begin(), explicitImports.end(),
+                    [&](ModuleDependencyID Id) {
+        // check if any explicitly imported modules can serve as a secondary
+        // module, and add the overlay names to the dependencies list.
+        for (auto overlayName: overlayMap[Id.first]) {
+          if (auto found = ctx.getModuleDependencies(overlayName.str(),
+                                                     /*onlyClangModule=*/false,
+                                                     cache,
+                                                     ASTDelegate)) {
+            result.push_back({overlayName.str(), found->getKind()});
+          }
+        }
+      });
+    }
+  }
   return result;
 }
 

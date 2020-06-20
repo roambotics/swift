@@ -33,6 +33,8 @@
 #include <vector>
 #include <unordered_map>
 
+#include <inttypes.h>
+
 namespace swift {
 namespace remote {
 
@@ -2192,6 +2194,8 @@ private:
         readMangledName(RemoteAddress(extendedContextAddress),
                         MangledNameKind::Type,
                         dem);
+      if (!demangledExtendedContext)
+        return nullptr;
 
       auto demangling = dem.createNode(Node::Kind::Extension);
       demangling->addChild(parentDemangling, dem);

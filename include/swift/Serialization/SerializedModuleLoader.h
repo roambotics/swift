@@ -138,6 +138,9 @@ protected:
   /// Scan the given serialized module file to determine dependencies.
   llvm::ErrorOr<ModuleDependencies> scanModuleFile(Twine modulePath);
 
+  /// Load the module file into a buffer and also collect its module name.
+  static std::unique_ptr<llvm::MemoryBuffer>
+  getModuleName(ASTContext &Ctx, StringRef modulePath, std::string &Name);
 public:
   virtual ~SerializedModuleLoaderBase();
   SerializedModuleLoaderBase(const SerializedModuleLoaderBase &) = delete;
@@ -368,8 +371,9 @@ public:
          SmallVectorImpl<AbstractFunctionDecl *> &results) const override;
 
   virtual void
-  lookupImportedSPIGroups(const ModuleDecl *importedModule,
-                         SmallVectorImpl<Identifier> &spiGroups) const override;
+  lookupImportedSPIGroups(
+                const ModuleDecl *importedModule,
+                llvm::SmallSetVector<Identifier, 4> &spiGroups) const override;
 
   Optional<CommentInfo> getCommentForDecl(const Decl *D) const override;
 

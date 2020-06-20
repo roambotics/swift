@@ -41,7 +41,6 @@
 #include "swift/Basic/OptionalEnum.h"
 #include "swift/Basic/Range.h"
 #include "swift/Basic/Located.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/TrailingObjects.h"
 #include <type_traits>
@@ -2716,6 +2715,7 @@ public:
   /// Is this declaration marked with 'dynamic'?
   bool isDynamic() const;
 
+private:
   bool isObjCDynamic() const {
     return isObjC() && isDynamic();
   }
@@ -2723,6 +2723,37 @@ public:
   bool isNativeDynamic() const {
     return !isObjC() && isDynamic();
   }
+
+  bool isObjCDynamicInGenericClass() const;
+
+public:
+  /// Should we use Objective-C method dispatch for this decl.
+  bool shouldUseObjCDispatch() const {
+    return isObjCDynamic();
+  }
+
+  /// Should we use native dynamic function replacement dispatch for this decl.
+  bool shouldUseNativeDynamicDispatch() const {
+    return isNativeDynamic();
+  }
+
+  /// Should we use Objective-C category based function replacement for this
+  /// decl.
+  /// This is all `@objc dynamic` methods except for such methods in native
+  /// generic classes. We can't use a category for generic classes so we use
+  /// native replacement instead (this behavior is only enabled with
+  /// -enable-implicit-dynamic).
+  bool shouldUseObjCMethodReplacement() const;
+
+  /// Should we use native dynamic function replacement mechanism for this decl.
+  /// This is all native dynamic methods except for `@objc dynamic` methods in
+  /// generic classes (see above).
+  bool shouldUseNativeMethodReplacement() const;
+
+  /// Is this a native dynamic function replacement based replacement.
+  /// This is all @_dynamicReplacement(for:) of native functions and @objc
+  /// dynamic methods on generic classes (see above).
+  bool isNativeMethodReplacement() const;
 
   bool isEffectiveLinkageMoreVisibleThan(ValueDecl *other) const {
     return (std::min(getEffectiveAccess(), AccessLevel::Public) >
