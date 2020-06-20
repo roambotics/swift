@@ -253,6 +253,10 @@ ERROR(no_candidates_match_result_type,none,
       "no '%0' candidates produce the expected contextual result type %1",
       (StringRef, Type))
 
+ERROR(no_candidates_match_argument_type,none,
+      "no '%0' candidates produce the expected type %1 for parameter #%2",
+      (StringRef, Type, unsigned))
+
 ERROR(cannot_infer_closure_parameter_type,none,
       "unable to infer type of a closure parameter %0 in the current context",
        (StringRef))
@@ -2668,6 +2672,9 @@ ERROR(enum_non_integer_convertible_raw_type_no_value,none,
       "expressible by integer or string literal", ())
 ERROR(enum_raw_value_not_unique,none,
       "raw value for enum case is not unique", ())
+ERROR(enum_raw_value_magic_literal,none,
+      "use of '%0' literal as raw value for enum case is not supported",
+      (StringRef))
 NOTE(enum_raw_value_used_here,none,
      "raw value previously used here", ())
 NOTE(enum_raw_value_incrementing_from_here,none,

@@ -47,8 +47,9 @@ SILGlobalVariable::SILGlobalVariable(SILModule &Module, SILLinkage Linkage,
   : Module(Module),
     Name(Name),
     LoweredType(LoweredType),
-    Location(Loc),
+    Location(Loc.getValueOr(SILLocation::invalid())),
     Linkage(unsigned(Linkage)),
+    HasLocation(Loc.hasValue()),
     VDecl(Decl) {
   setSerialized(isSerialized);
   IsDeclaration = isAvailableExternally(Linkage);
@@ -135,6 +136,8 @@ bool SILGlobalVariable::isValidStaticInitializerInst(const SILInstruction *I,
           auto *TE = bi->getSingleUserOfType<TupleExtractInst>();
           return TE && getOffsetSubtract(TE, M);
         }
+        case BuiltinValueKind::OnFastPath:
+          return true;
         default:
           break;
       }
