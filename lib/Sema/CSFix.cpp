@@ -83,21 +83,24 @@ bool UnwrapOptionalBase::diagnose(const Solution &solution, bool asNote) const {
   bool resultIsOptional =
       getKind() == FixKind::UnwrapOptionalBaseWithOptionalResult;
   MemberAccessOnOptionalBaseFailure failure(solution, getLocator(), MemberName,
-                                            resultIsOptional);
+                                            MemberBaseType, resultIsOptional);
   return failure.diagnose(asNote);
 }
 
 UnwrapOptionalBase *UnwrapOptionalBase::create(ConstraintSystem &cs,
                                                DeclNameRef member,
+                                               Type memberBaseType,
                                                ConstraintLocator *locator) {
-  return new (cs.getAllocator())
-      UnwrapOptionalBase(cs, FixKind::UnwrapOptionalBase, member, locator);
+  return new (cs.getAllocator()) UnwrapOptionalBase(
+      cs, FixKind::UnwrapOptionalBase, member, memberBaseType, locator);
 }
 
 UnwrapOptionalBase *UnwrapOptionalBase::createWithOptionalResult(
-    ConstraintSystem &cs, DeclNameRef member, ConstraintLocator *locator) {
-  return new (cs.getAllocator()) UnwrapOptionalBase(
-      cs, FixKind::UnwrapOptionalBaseWithOptionalResult, member, locator);
+    ConstraintSystem &cs, DeclNameRef member, Type memberBaseType,
+    ConstraintLocator *locator) {
+  return new (cs.getAllocator())
+      UnwrapOptionalBase(cs, FixKind::UnwrapOptionalBaseWithOptionalResult,
+                         member, memberBaseType, locator);
 }
 
 bool AddAddressOf::diagnose(const Solution &solution, bool asNote) const {
@@ -148,7 +151,7 @@ CoerceToCheckedCast *CoerceToCheckedCast::attempt(ConstraintSystem &cs,
     return nullptr;
 
   const auto castKind = TypeChecker::typeCheckCheckedCast(
-      fromType, toType, CheckedCastContextKind::None, cs.DC,
+      fromType, toType, CheckedCastContextKind::Coercion, cs.DC,
       SourceLoc(), coerceExpr->getSubExpr(), SourceRange());
 
   // Invalid cast.
@@ -1314,21 +1317,6 @@ RemoveInvalidCall *RemoveInvalidCall::create(ConstraintSystem &cs,
   return new (cs.getAllocator()) RemoveInvalidCall(cs, locator);
 }
 
-bool AllowInvalidUseOfTrailingClosure::diagnose(const Solution &solution,
-                                                bool asNote) const {
-  InvalidUseOfTrailingClosure failure(solution, getFromType(), getToType(),
-                                      getLocator());
-  return failure.diagnose(asNote);
-}
-
-AllowInvalidUseOfTrailingClosure *
-AllowInvalidUseOfTrailingClosure::create(ConstraintSystem &cs, Type argType,
-                                         Type paramType,
-                                         ConstraintLocator *locator) {
-  return new (cs.getAllocator())
-      AllowInvalidUseOfTrailingClosure(cs, argType, paramType, locator);
-}
-
 bool TreatEphemeralAsNonEphemeral::diagnose(const Solution &solution,
                                             bool asNote) const {
   NonEphemeralConversionFailure failure(solution, getLocator(), getFromType(),
@@ -1504,4 +1492,50 @@ bool SpecifyKeyPathRootType::diagnose(const Solution &solution,
   UnableToInferKeyPathRootFailure failure(solution, getLocator());
   
   return failure.diagnose(asNote);
+}
+
+bool UnwrapOptionalBaseKeyPathApplication::diagnose(const Solution &solution,
+                                                    bool asNote) const {
+  MissingOptionalUnwrapKeyPathFailure failure(solution, getFromType(),
+                                              getToType(), getLocator());
+  return failure.diagnose(asNote);
+}
+
+UnwrapOptionalBaseKeyPathApplication *
+UnwrapOptionalBaseKeyPathApplication::attempt(ConstraintSystem &cs, Type baseTy,
+                                              Type rootTy,
+                                              ConstraintLocator *locator) {
+  if(baseTy->hasTypeVariable() || rootTy->hasTypeVariable())
+    return nullptr;
+
+  if (!isExpr<SubscriptExpr>(locator->getAnchor()))
+    return nullptr;
+  
+  // Only diagnose this if base is an optional type and we only have a
+  // single level of optionality so we can safely suggest unwrapping.
+  auto nonOptionalTy = baseTy->getOptionalObjectType();
+  if (!nonOptionalTy || nonOptionalTy->getOptionalObjectType())
+    return nullptr;
+
+  auto result =
+      cs.matchTypes(nonOptionalTy, rootTy, ConstraintKind::Subtype,
+                    ConstraintSystem::TypeMatchFlags::TMF_ApplyingFix, locator);
+  if (result.isFailure())
+    return nullptr;
+
+  return new (cs.getAllocator())
+      UnwrapOptionalBaseKeyPathApplication(cs, baseTy, rootTy, locator);
+}
+
+bool SpecifyLabelToAssociateTrailingClosure::diagnose(const Solution &solution,
+                                                      bool asNote) const {
+  TrailingClosureRequiresExplicitLabel failure(solution, getLocator());
+  return failure.diagnose(asNote);
+}
+
+SpecifyLabelToAssociateTrailingClosure *
+SpecifyLabelToAssociateTrailingClosure::create(ConstraintSystem &cs,
+                                               ConstraintLocator *locator) {
+  return new (cs.getAllocator())
+      SpecifyLabelToAssociateTrailingClosure(cs, locator);
 }

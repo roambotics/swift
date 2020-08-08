@@ -786,8 +786,10 @@ SwiftDocumentSemanticInfo::takeSemanticTokens(
           });
 
       std::vector<SwiftSemanticToken>::iterator ReplaceEnd;
-      if (Upd->getLength() == 0) {
+      if (ReplaceBegin == SemaToks.end()) {
         ReplaceEnd = ReplaceBegin;
+      } else if (Upd->getLength() == 0) {
+        ReplaceEnd = ReplaceBegin + 1;
       } else {
         ReplaceEnd = std::upper_bound(ReplaceBegin, SemaToks.end(),
             Upd->getByteOffset() + Upd->getLength(),
@@ -1987,10 +1989,18 @@ void SwiftEditorDocument::parse(ImmutableTextSnapshotRef Snapshot,
   Impl.SyntaxInfo->parse();
 }
 
-void SwiftEditorDocument::readSyntaxInfo(EditorConsumer &Consumer) {
+static UIdent SemaDiagStage("source.diagnostic.stage.swift.sema");
+static UIdent ParseDiagStage("source.diagnostic.stage.swift.parse");
+
+void SwiftEditorDocument::readSyntaxInfo(EditorConsumer &Consumer, bool ReportDiags) {
   llvm::sys::ScopedLock L(Impl.AccessMtx);
 
   Impl.ParserDiagnostics = Impl.SyntaxInfo->getDiagnostics();
+  if (ReportDiags) {
+    Consumer.setDiagnosticStage(ParseDiagStage);
+    for (auto &Diag : Impl.ParserDiagnostics)
+      Consumer.handleDiagnostic(Diag, ParseDiagStage);
+  }
 
   SwiftSyntaxMap NewMap = SwiftSyntaxMap(Impl.SyntaxMap.Tokens.size() + 16);
 
@@ -2056,9 +2066,6 @@ void SwiftEditorDocument::readSemanticInfo(ImmutableTextSnapshotRef Snapshot,
     if (Kind.isValid())
       Consumer.handleSemanticAnnotation(Offset, Length, Kind, IsSystem);
   }
-
-  static UIdent SemaDiagStage("source.diagnostic.stage.swift.sema");
-  static UIdent ParseDiagStage("source.diagnostic.stage.swift.parse");
 
   // If there's no value returned for diagnostics it means they are out-of-date
   // (based on a different snapshot).
@@ -2127,23 +2134,10 @@ void SwiftEditorDocument::formatText(unsigned Line, unsigned Length,
   Consumer.recordAffectedLineRange(LineRange.startLine(), LineRange.lineCount());
 }
 
-bool isReturningVoid(const SourceManager &SM, CharSourceRange Range) {
-  if (Range.isInvalid())
-    return false;
-  StringRef Text = SM.extractText(Range);
-  return "()" == Text || "Void" == Text;
-}
-
 static void
 printClosureBody(const PlaceholderExpansionScanner::ClosureInfo &closure,
                  llvm::raw_ostream &OS, const SourceManager &SM) {
-  bool ReturningVoid = isReturningVoid(SM, closure.ReturnTypeRange);
-
-  bool HasSignature = !closure.Params.empty() ||
-                      (closure.ReturnTypeRange.isValid() && !ReturningVoid);
   bool FirstParam = true;
-  if (HasSignature)
-    OS << "(";
   for (auto &Param : closure.Params) {
     if (!FirstParam)
       OS << ", ";
@@ -2151,30 +2145,19 @@ printClosureBody(const PlaceholderExpansionScanner::ClosureInfo &closure,
     if (Param.NameRange.isValid()) {
       // If we have a parameter name, just output the name as is and skip
       // the type. For example:
-      // <#(arg1: Int, arg2: Int)#> turns into (arg1, arg2).
+      // <#(arg1: Int, arg2: Int)#> turns into '{ arg1, arg2 in'.
       OS << SM.extractText(Param.NameRange);
     } else {
       // If we only have the parameter type, output the type as a
       // placeholder. For example:
-      // <#(Int, Int)#> turns into (<#Int#>, <#Int#>).
+      // <#(Int, Int)#> turns into '{ <#Int#>, <#Int#> in'.
       OS << "<#";
       OS << SM.extractText(Param.TypeRange);
       OS << "#>";
     }
   }
-  if (HasSignature)
-    OS << ") ";
-  if (closure.ReturnTypeRange.isValid()) {
-    auto ReturnTypeText = SM.extractText(closure.ReturnTypeRange);
-
-    // We need return type if it is not Void.
-    if (!ReturningVoid) {
-      OS << "-> ";
-      OS << ReturnTypeText << " ";
-    }
-  }
-  if (HasSignature)
-    OS << "in";
+  if (!FirstParam)
+    OS << " in";
   OS << "\n" << getCodePlaceholder() << "\n";
 }
 
@@ -2326,7 +2309,6 @@ void SwiftEditorDocument::reportDocumentStructure(SourceFile &SrcFile,
 //===----------------------------------------------------------------------===//
 // EditorOpen
 //===----------------------------------------------------------------------===//
-
 void SwiftLangSupport::editorOpen(
     StringRef Name, llvm::MemoryBuffer *Buf, EditorConsumer &Consumer,
     ArrayRef<const char *> Args, Optional<VFSOptions> vfsOptions) {
@@ -2365,8 +2347,7 @@ void SwiftLangSupport::editorOpen(
     EditorDoc->updateSemaInfo();
   }
 
-  EditorDoc->readSyntaxInfo(Consumer);
-  EditorDoc->readSemanticInfo(Snapshot, Consumer);
+  EditorDoc->readSyntaxInfo(Consumer, /*ReportDiags=*/true);
 
   if (Consumer.syntaxTreeEnabled()) {
     assert(EditorDoc->getSyntaxTree().hasValue());
@@ -2528,7 +2509,8 @@ void SwiftLangSupport::editorReplaceText(StringRef Name,
     }
     EditorDoc->parse(Snapshot, *this, Consumer.syntaxTreeEnabled(),
                      SyntaxCachePtr);
-    EditorDoc->readSyntaxInfo(Consumer);
+    // Do not report syntactic diagnostics; will be handled in readSemanticInfo.
+    EditorDoc->readSyntaxInfo(Consumer, /*ReportDiags=*/false);
 
     // Log reuse information
     if (SyntaxCache.hasValue() && LogReuseRegions) {

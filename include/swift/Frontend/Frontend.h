@@ -53,7 +53,7 @@
 
 namespace swift {
 
-class SerializedModuleLoader;
+class SerializedModuleLoaderBase;
 class MemoryBufferSerializedModuleLoader;
 class SILModule;
 
@@ -128,7 +128,8 @@ public:
   bool parseArgs(ArrayRef<const char *> Args, DiagnosticEngine &Diags,
                  SmallVectorImpl<std::unique_ptr<llvm::MemoryBuffer>>
                      *ConfigurationFileBuffers = nullptr,
-                 StringRef workingDirectory = {});
+                 StringRef workingDirectory = {},
+                 StringRef mainExecutablePath = {});
 
   /// Sets specific options based on the given serialized Swift binary data.
   ///
@@ -213,8 +214,11 @@ public:
   /// Computes the runtime resource path relative to the given Swift
   /// executable.
   static void computeRuntimeResourcePathFromExecutablePath(
-      StringRef mainExecutablePath,
-      llvm::SmallString<128> &runtimeResourcePath);
+      StringRef mainExecutablePath, bool shared,
+      llvm::SmallVectorImpl<char> &runtimeResourcePath);
+
+  /// Appends `lib/swift[_static]` to the given path
+  static void appendSwiftLibDir(llvm::SmallVectorImpl<char> &path, bool shared);
 
   void setSDKPath(const std::string &Path);
 
@@ -434,7 +438,7 @@ class CompilerInstance {
   std::unique_ptr<UnifiedStatsReporter> Stats;
 
   mutable ModuleDecl *MainModule = nullptr;
-  SerializedModuleLoader *SML = nullptr;
+  SerializedModuleLoaderBase *DefaultSerializedLoader = nullptr;
   MemoryBufferSerializedModuleLoader *MemoryBufferLoader = nullptr;
 
   /// Contains buffer IDs for input source code files.
@@ -498,10 +502,6 @@ public:
     Diagnostics.removeConsumer(*DC);
   }
 
-  void createDependencyTracker(bool TrackSystemDeps) {
-    assert(!Context && "must be called before setup()");
-    DepTracker = std::make_unique<DependencyTracker>(TrackSystemDeps);
-  }
   DependencyTracker *getDependencyTracker() { return DepTracker.get(); }
   const DependencyTracker *getDependencyTracker() const { return DepTracker.get(); }
 
@@ -582,6 +582,7 @@ private:
   bool setUpASTContextIfNeeded();
   void setupStatsReporter();
   void setupDiagnosticVerifierIfNeeded();
+  void setupDependencyTrackerIfNeeded();
   Optional<unsigned> setUpCodeCompletionBuffer();
 
   /// Set up all state in the CompilerInstance to process the given input file.

@@ -81,14 +81,19 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   Opts.EnableImplicitDynamic |= Args.hasArg(OPT_enable_implicit_dynamic);
 
-  Opts.TrackSystemDeps |= Args.hasArg(OPT_track_system_dependencies);
+  if (Args.hasArg(OPT_track_system_dependencies)) {
+    Opts.IntermoduleDependencyTracking =
+        IntermoduleDepTrackingMode::IncludeSystem;
+  }
 
   Opts.DisableImplicitModules |= Args.hasArg(OPT_disable_implicit_swift_modules);
 
   // Always track system dependencies when scanning dependencies.
   if (const Arg *ModeArg = Args.getLastArg(OPT_modes_Group)) {
-    if (ModeArg->getOption().matches(OPT_scan_dependencies))
-      Opts.TrackSystemDeps = true;
+    if (ModeArg->getOption().matches(OPT_scan_dependencies)) {
+      Opts.IntermoduleDependencyTracking =
+          IntermoduleDepTrackingMode::IncludeSystem;
+    }
   }
 
   Opts.SerializeModuleInterfaceDependencyHashes |=
@@ -96,8 +101,6 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   Opts.RemarkOnRebuildFromModuleInterface |=
     Args.hasArg(OPT_Rmodule_interface_rebuild);
-
-  Opts.DisableInterfaceFileLock |= Args.hasArg(OPT_disable_interface_lockfile);
 
   computePrintStatsOptions();
   computeDebugTimeOptions();
@@ -144,6 +147,15 @@ bool ArgsToFrontendOptionsConverter::convert(
     Opts.RequestedAction = determineRequestedAction(Args);
   }
 
+  if (Opts.RequestedAction == FrontendOptions::ActionType::CompileModuleFromInterface) {
+    // The situations where we use this action, e.g. explicit module building and
+    // generating prebuilt module cache, don't need synchronization. We should avoid
+    // using lock files for them.
+    Opts.DisableInterfaceFileLock = true;
+  } else {
+    Opts.DisableInterfaceFileLock |= Args.hasArg(OPT_disable_interface_lockfile);
+  }
+
   if (Opts.RequestedAction == FrontendOptions::ActionType::Immediate &&
       Opts.InputsAndOutputs.hasPrimaryInputs()) {
     Diags.diagnose(SourceLoc(), diag::error_immediate_mode_primary_file);
@@ -181,6 +193,7 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.EnableSourceImport |= Args.hasArg(OPT_enable_source_import);
   Opts.ImportUnderlyingModule |= Args.hasArg(OPT_import_underlying_module);
   Opts.EnableIncrementalDependencyVerifier |= Args.hasArg(OPT_verify_incremental_dependencies);
+  Opts.UseSharedResourceFolder = !Args.hasArg(OPT_use_static_resource_dir);
 
   computeImportObjCHeaderOptions();
   computeImplicitImportModuleNames();
@@ -222,8 +235,6 @@ void ArgsToFrontendOptionsConverter::computePrintStatsOptions() {
 
 void ArgsToFrontendOptionsConverter::computeDebugTimeOptions() {
   using namespace options;
-  Opts.DebugTimeCompilation |= Args.hasArg(OPT_debug_time_compilation);
-
   if (const Arg *A = Args.getLastArg(OPT_stats_output_dir)) {
     Opts.StatsOutputDir = A->getValue();
     if (Args.getLastArg(OPT_trace_stats_events)) {
@@ -314,6 +325,10 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
       // (Setting up module output will be handled below.)
       return FrontendOptions::ActionType::EmitModuleOnly;
     }
+
+    if (args.hasArg(OPT_version))
+      return FrontendOptions::ActionType::PrintVersion;
+
     return FrontendOptions::ActionType::NoneAction;
   }
   Option Opt = A->getOption();
@@ -386,7 +401,8 @@ bool ArgsToFrontendOptionsConverter::setUpInputKindAndImmediateArgs() {
   if (Opts.InputsAndOutputs.verifyInputs(
           Diags, treatAsSIL,
           Opts.RequestedAction == FrontendOptions::ActionType::REPL,
-          Opts.RequestedAction == FrontendOptions::ActionType::NoneAction)) {
+          (Opts.RequestedAction == FrontendOptions::ActionType::NoneAction ||
+           Opts.RequestedAction == FrontendOptions::ActionType::PrintVersion))){
     return true;
   }
   if (Opts.RequestedAction == FrontendOptions::ActionType::Immediate) {

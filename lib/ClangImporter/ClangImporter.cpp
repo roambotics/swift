@@ -40,6 +40,7 @@
 #include "swift/Config.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/Parser.h"
+#include "swift/Strings.h"
 #include "swift/Subsystems.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Mangle.h"
@@ -328,12 +329,13 @@ class ClangImporterDependencyCollector : public clang::DependencyCollector
   /// The FileCollector is used by LLDB to generate reproducers. It's not used
   /// by Swift to track dependencies.
   std::shared_ptr<llvm::FileCollector> FileCollector;
-  const bool TrackSystemDeps;
+  const IntermoduleDepTrackingMode Mode;
 
 public:
   ClangImporterDependencyCollector(
-      bool TrackSystemDeps, std::shared_ptr<llvm::FileCollector> FileCollector)
-      : FileCollector(FileCollector), TrackSystemDeps(TrackSystemDeps) {}
+      IntermoduleDepTrackingMode Mode,
+      std::shared_ptr<llvm::FileCollector> FileCollector)
+      : FileCollector(FileCollector), Mode(Mode) {}
 
   void excludePath(StringRef filename) {
     ExcludedPaths.insert(filename);
@@ -345,7 +347,9 @@ public:
             || Filename == ImporterImpl::bridgingHeaderBufferName);
   }
 
-  bool needSystemDependencies() override { return TrackSystemDeps; }
+  bool needSystemDependencies() override {
+    return Mode == IntermoduleDepTrackingMode::IncludeSystem;
+  }
 
   bool sawDependency(StringRef Filename, bool FromClangModule,
                      bool IsSystem, bool IsClangModuleFile,
@@ -375,8 +379,9 @@ public:
 
 std::shared_ptr<clang::DependencyCollector>
 ClangImporter::createDependencyCollector(
-    bool TrackSystemDeps, std::shared_ptr<llvm::FileCollector> FileCollector) {
-  return std::make_shared<ClangImporterDependencyCollector>(TrackSystemDeps,
+    IntermoduleDepTrackingMode Mode,
+    std::shared_ptr<llvm::FileCollector> FileCollector) {
+  return std::make_shared<ClangImporterDependencyCollector>(Mode,
                                                             FileCollector);
 }
 
@@ -724,14 +729,23 @@ importer::addCommonInvocationArguments(
     invocationArgStrs.push_back("-mcpu=" + importerOpts.TargetCPU);
 
   } else if (triple.isOSDarwin()) {
-    // Special case: arm64 defaults to the "cyclone" CPU for Darwin,
-    // and arm64e defaults to the "vortex" CPU for Darwin,
-    // but Clang only detects this if we use -arch.
+    // Special case CPU based on known deployments:
+    //   - arm64 deploys to apple-a7
+    //   - arm64 on macOS
+    //   - arm64 for iOS/tvOS/watchOS simulators
+    //   - arm64e deploys to apple-a12
+    // and arm64e (everywhere) and arm64e macOS defaults to the "apple-a12" CPU
+    // for Darwin, but Clang only detects this if we use -arch.
     if (triple.getArchName() == "arm64e")
-      invocationArgStrs.push_back("-mcpu=vortex");
+      invocationArgStrs.push_back("-mcpu=apple-a12");
+    else if (triple.isAArch64() && triple.isMacOSX())
+      invocationArgStrs.push_back("-mcpu=apple-a12");
+    else if (triple.isAArch64() && triple.isSimulatorEnvironment() &&
+             (triple.isiOS() || triple.isWatchOS()))
+      invocationArgStrs.push_back("-mcpu=apple-a12");
     else if (triple.getArch() == llvm::Triple::aarch64 ||
              triple.getArch() == llvm::Triple::aarch64_be) {
-      invocationArgStrs.push_back("-mcpu=cyclone");
+      invocationArgStrs.push_back("-mcpu=apple-a7");
     }
   } else if (triple.getArch() == llvm::Triple::systemz) {
     invocationArgStrs.push_back("-march=z13");
@@ -1183,7 +1197,8 @@ ClangImporter::create(ASTContext &ctx, const ClangImporterOptions &importerOpts,
     = clangContext.Selectors.getSelector(2, setObjectForKeyedSubscriptIdents);
 
   // Set up the imported header module.
-  auto *importedHeaderModule = ModuleDecl::create(ctx.getIdentifier("__ObjC"), ctx);
+  auto *importedHeaderModule =
+      ModuleDecl::create(ctx.getIdentifier(CLANG_HEADER_MODULE_NAME), ctx);
   importer->Impl.ImportedHeaderUnit =
     new (ctx) ClangModuleUnit(*importedHeaderModule, importer->Impl, nullptr);
   importedHeaderModule->addFile(*importer->Impl.ImportedHeaderUnit);
@@ -1721,10 +1736,8 @@ ModuleDecl *ClangImporter::Implementation::loadModuleClang(
   auto &diagClient = static_cast<ClangDiagnosticConsumer &>(rawDiagClient);
 
   auto loadModule = [&](clang::ModuleIdPath path,
-                        bool makeVisible) -> clang::ModuleLoadResult {
-    clang::Module::NameVisibilityKind visibility =
-        makeVisible ? clang::Module::AllVisible : clang::Module::Hidden;
-
+                        clang::Module::NameVisibilityKind visibility)
+      -> clang::ModuleLoadResult {
     auto importRAII =
         diagClient.handleImport(clangPath.front().first, importLoc);
 
@@ -1750,16 +1763,23 @@ ModuleDecl *ClangImporter::Implementation::loadModuleClang(
       clangFEOpts.IndexStorePath = preservedIndexStorePathOption;
     }
 
-    if (result && makeVisible)
+    if (result && (visibility == clang::Module::AllVisible)) {
       getClangPreprocessor().makeModuleVisible(result, clangImportLoc);
+    }
     return result;
   };
 
   // Now load the top-level module, so that we can check if the submodule
   // exists without triggering a fatal error.
-  clangModule = loadModule(clangPath.front(), false);
+  clangModule = loadModule(clangPath.front(), clang::Module::AllVisible);
   if (!clangModule)
     return nullptr;
+
+  // If we're asked to import the top-level module then we're done here.
+  auto *topSwiftModule = finishLoadingClangModule(clangModule, importLoc);
+  if (path.size() == 1) {
+    return topSwiftModule;
+  }
 
   // Verify that the submodule exists.
   clang::Module *submodule = clangModule;
@@ -1772,7 +1792,8 @@ ModuleDecl *ClangImporter::Implementation::loadModuleClang(
     // put the Clang AST in a fatal error state if it /doesn't/ exist.
     if (!submodule && component.Item.str() == "Private" &&
         (&component) == (&path[1])) {
-      submodule = loadModule(llvm::makeArrayRef(clangPath).slice(0, 2), false);
+      submodule = loadModule(llvm::makeArrayRef(clangPath).slice(0, 2),
+                             clang::Module::Hidden);
     }
 
     if (!submodule) {
@@ -1782,7 +1803,7 @@ ModuleDecl *ClangImporter::Implementation::loadModuleClang(
   }
 
   // Finally, load the submodule and make it visible.
-  clangModule = loadModule(clangPath, true);
+  clangModule = loadModule(clangPath, clang::Module::AllVisible);
   if (!clangModule)
     return nullptr;
 
@@ -1888,8 +1909,8 @@ PlatformAvailability::PlatformAvailability(const LangOptions &langOpts)
     deprecatedAsUnavailableMessage = "";
     break;
 
-  case PlatformKind::OSX:
-  case PlatformKind::OSXApplicationExtension:
+  case PlatformKind::macOS:
+  case PlatformKind::macOSApplicationExtension:
     deprecatedAsUnavailableMessage =
         "APIs deprecated as of macOS 10.9 and earlier are unavailable in Swift";
     break;
@@ -1901,9 +1922,9 @@ PlatformAvailability::PlatformAvailability(const LangOptions &langOpts)
 
 bool PlatformAvailability::isPlatformRelevant(StringRef name) const {
   switch (platformKind) {
-  case PlatformKind::OSX:
+  case PlatformKind::macOS:
     return name == "macos";
-  case PlatformKind::OSXApplicationExtension:
+  case PlatformKind::macOSApplicationExtension:
     return name == "macos" || name == "macos_app_extension";
 
   case PlatformKind::iOS:
@@ -1943,8 +1964,8 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
   case PlatformKind::none:
     llvm_unreachable("version but no platform?");
 
-  case PlatformKind::OSX:
-  case PlatformKind::OSXApplicationExtension:
+  case PlatformKind::macOS:
+  case PlatformKind::macOSApplicationExtension:
     // Anything deprecated in OSX 10.9.x and earlier is unavailable in Swift.
     return major < 10 ||
            (major == 10 && (!minor.hasValue() || minor.getValue() <= 9));
@@ -2889,11 +2910,12 @@ void ClangModuleUnit::lookupValue(DeclName name, NLKind lookupKind,
 bool ClangImporter::Implementation::isVisibleClangEntry(
     const clang::NamedDecl *clangDecl) {
   // For a declaration, check whether the declaration is hidden.
-  if (!clangDecl->isHidden()) return true;
+  clang::Sema &clangSema = getClangSema();
+  if (clangSema.isVisible(clangDecl)) return true;
 
   // Is any redeclaration visible?
   for (auto redecl : clangDecl->redecls()) {
-    if (!cast<clang::NamedDecl>(redecl)->isHidden()) return true;
+    if (clangSema.isVisible(cast<clang::NamedDecl>(redecl))) return true;
   }
 
   return false;
@@ -3004,8 +3026,10 @@ void ClangImporter::loadExtensions(NominalTypeDecl *nominal,
     SmallVector<clang::NamedDecl *, 4> DelayedCategories;
 
     // Simply importing the categories adds them to the list of extensions.
-    for (const auto *Cat : objcClass->visible_categories()) {
-      Impl.importDeclReal(Cat, Impl.CurrentVersion);
+    for (const auto *Cat : objcClass->known_categories()) {
+      if (getClangSema().isVisible(Cat)) {
+        Impl.importDeclReal(Cat, Impl.CurrentVersion);
+      }
     }
   }
 
@@ -3391,6 +3415,8 @@ void ClangModuleUnit::getImportedModules(
   if (filter.containsOnly(ModuleDecl::ImportFilterKind::ImplementationOnly))
     return;
 
+  // [NOTE: Pure-Clang-modules-privately-import-stdlib]:
+  // Needed for implicitly synthesized conformances.
   if (filter.contains(ModuleDecl::ImportFilterKind::Private))
     if (auto stdlib = owner.getStdlibModule())
       imports.push_back({ModuleDecl::AccessPathTy(), stdlib});
@@ -3586,6 +3612,18 @@ void ClangImporter::Implementation::lookupValue(
        VisibleDeclConsumer &consumer) {
   auto &clangCtx = getClangASTContext();
   auto clangTU = clangCtx.getTranslationUnitDecl();
+
+  // For operators we have to look up static member functions in addition to the
+  // top-level function lookup below.
+  if (name.isOperator()) {
+    for (auto entry : table.lookupMemberOperators(name.getBaseName())) {
+      if (isVisibleClangEntry(entry)) {
+        if (auto decl = dyn_cast<ValueDecl>(
+                importDeclReal(entry->getMostRecentDecl(), CurrentVersion)))
+          consumer.foundDecl(decl, DeclVisibilityKind::VisibleAtTopLevel);
+      }
+    }
+  }
 
   for (auto entry : table.lookup(name.getBaseName(), clangTU)) {
     // If the entry is not visible, skip it.

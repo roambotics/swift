@@ -147,6 +147,10 @@ public:
     return nullptr;
   }
 
+  // Erases \p inst and all of its users, recursively.
+  // The caller has to make sure that all users are removable (e.g. dead).
+  void eraseInstIncludingUsers(SILInstruction *inst);
+
   SILInstruction *eraseInstFromFunction(SILInstruction &I,
                                         bool AddOperandsToWorklist = true) {
     SILBasicBlock::iterator nullIter;
@@ -246,8 +250,11 @@ public:
   bool tryOptimizeKeypath(ApplyInst *AI);
   bool tryOptimizeInoutKeypath(BeginApplyInst *AI);
   bool tryOptimizeKeypathApplication(ApplyInst *AI, SILFunction *callee);
-  bool tryOptimizeKeypathKVCString(ApplyInst *AI, SILDeclRef callee);
-      
+  bool tryOptimizeKeypathOffsetOf(ApplyInst *AI, FuncDecl *calleeFn,
+                                  KeyPathInst *kp);
+  bool tryOptimizeKeypathKVCString(ApplyInst *AI, FuncDecl *calleeFn,
+                                  KeyPathInst *kp);
+
   // Optimize concatenation of string literals.
   // Constant-fold concatenation of string literals known at compile-time.
   SILInstruction *optimizeConcatenationOfStringLiterals(ApplyInst *AI);

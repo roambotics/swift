@@ -1183,13 +1183,6 @@ swift_dynamicCastMetatypeImpl(const Metadata *sourceType,
     }
     break;
 
-  case MetadataKind::Existential: {
-    auto targetTypeAsExistential = static_cast<const ExistentialTypeMetadata *>(targetType);
-    if (_conformsToProtocols(nullptr, sourceType, targetTypeAsExistential, nullptr))
-      return origSourceType;
-    return nullptr;
-  }
-
   default:
     return nullptr;
   }
@@ -1835,7 +1828,7 @@ static bool _dynamicCastToFunction(OpaqueValue *dest,
       return _fail(src, srcType, targetType, flags);
     
     // If the target type can't throw, neither can the source.
-    if (srcFn->throws() && !targetFn->throws())
+    if (srcFn->isThrowing() && !targetFn->isThrowing())
       return _fail(src, srcType, targetType, flags);
     
     // The result and argument types must match.

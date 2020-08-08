@@ -49,7 +49,6 @@ static unsigned toStableStringEncoding(StringLiteralInst::Encoding encoding) {
   switch (encoding) {
   case StringLiteralInst::Encoding::Bytes: return SIL_BYTES;
   case StringLiteralInst::Encoding::UTF8: return SIL_UTF8;
-  case StringLiteralInst::Encoding::UTF16: return SIL_UTF16;
   case StringLiteralInst::Encoding::ObjCSelector: return SIL_OBJC_SELECTOR;
   }
   llvm_unreachable("bad string encoding");
@@ -434,13 +433,13 @@ void SILSerializer::writeSILFunction(const SILFunction &F, bool DeclOnly) {
       Out, ScratchRecord, abbrCode, toStableSILLinkage(Linkage),
       (unsigned)F.isTransparent(), (unsigned)F.isSerialized(),
       (unsigned)F.isThunk(), (unsigned)F.isWithoutActuallyEscapingThunk(),
-      (unsigned)F.getSpecialPurpose(), (unsigned)F.getInlineStrategy(),
-      (unsigned)F.getOptimizationMode(), (unsigned)F.getEffectsKind(),
-      (unsigned)numSpecAttrs, (unsigned)F.hasOwnership(),
-      F.isAlwaysWeakImported(), LIST_VER_TUPLE_PIECES(available),
-      (unsigned)F.isDynamicallyReplaceable(),
-      (unsigned)F.isExactSelfClass(),
-      FnID, replacedFunctionID, genericSigID, clangNodeOwnerID, SemanticsIDs);
+      (unsigned)F.isAsync(), (unsigned)F.getSpecialPurpose(),
+      (unsigned)F.getInlineStrategy(), (unsigned)F.getOptimizationMode(),
+      (unsigned)F.getEffectsKind(), (unsigned)numSpecAttrs,
+      (unsigned)F.hasOwnership(), F.isAlwaysWeakImported(),
+      LIST_VER_TUPLE_PIECES(available), (unsigned)F.isDynamicallyReplaceable(),
+      (unsigned)F.isExactSelfClass(), FnID, replacedFunctionID, genericSigID,
+      clangNodeOwnerID, SemanticsIDs);
 
   if (NoBody)
     return;
@@ -734,8 +733,26 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   PrettyStackTraceSILNode stackTrace("Serializing", &SI);
 
   switch (SI.getKind()) {
-  case SILInstructionKind::ObjectInst:
-    llvm_unreachable("static initializers of sil_global are not serialized");
+  case SILInstructionKind::ObjectInst: {
+    const ObjectInst *OI = cast<ObjectInst>(&SI);
+    unsigned abbrCode = SILAbbrCodes[SILOneTypeValuesLayout::Code];
+    SmallVector<ValueID, 4> Args;
+    Args.push_back((unsigned)OI->getBaseElements().size());
+    for (const Operand &op : OI->getAllOperands()) {
+      SILValue OpVal = op.get();
+      Args.push_back(addValueRef(OpVal));
+      SILType OpType = OpVal->getType();
+      assert(OpType.isObject());
+      Args.push_back(S.addTypeRef(OpType.getASTType()));
+    }
+    SILOneTypeValuesLayout::emitRecord(Out, ScratchRecord, abbrCode,
+                                       (unsigned)SI.getKind(),
+                                       S.addTypeRef(
+                                         OI->getType().getASTType()),
+                                       (unsigned)OI->getType().getCategory(),
+                                       Args);
+    break;
+  }
 
   case SILInstructionKind::DebugValueInst:
   case SILInstructionKind::DebugValueAddrInst:
@@ -1073,6 +1090,12 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
         S.addUniquedStringRef(G->getName()));
     break;
   }
+  case SILInstructionKind::BaseAddrForOffsetInst: {
+    const BaseAddrForOffsetInst *BAI = cast<BaseAddrForOffsetInst>(&SI);
+    writeOneTypeLayout(BAI->getKind(), /*attrs*/ 0, BAI->getType());
+    break;
+  }
+
   case SILInstructionKind::BranchInst: {
     // Format: destination basic block ID, a list of arguments. Use
     // SILOneTypeValuesLayout.
@@ -1533,6 +1556,7 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   case SILInstructionKind::UncheckedAddrCastInst:
   case SILInstructionKind::UncheckedTrivialBitCastInst:
   case SILInstructionKind::UncheckedBitwiseCastInst:
+  case SILInstructionKind::UncheckedValueCastInst:
   case SILInstructionKind::BridgeObjectToRefInst:
   case SILInstructionKind::BridgeObjectToWordInst:
   case SILInstructionKind::UpcastInst:
@@ -2349,6 +2373,19 @@ void SILSerializer::writeSILGlobalVar(const SILGlobalVariable &g) {
                                  (unsigned)!g.isDefinition(),
                                  (unsigned)g.isLet(),
                                  TyID, dID);
+
+  ValueIDs.clear();
+  InstID = 0;
+  unsigned ValueID = 2;
+  for (const SILInstruction &initInst : g) {
+      for (auto result : initInst.getResults()) {
+        ValueIDs[result] = ValueID++;
+      }
+  }
+
+  for (const SILInstruction &initInst : g) {
+    writeSILInstruction(initInst);
+  }
 }
 
 void SILSerializer::writeSILVTable(const SILVTable &vt) {

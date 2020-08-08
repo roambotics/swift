@@ -31,6 +31,7 @@
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/RawComment.h"
+#include "swift/AST/SILLayout.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/SynthesizedFileUnit.h"
 #include "swift/AST/TypeCheckRequests.h"
@@ -38,7 +39,6 @@
 #include "swift/Basic/Dwarf.h"
 #include "swift/Basic/FileSystem.h"
 #include "swift/Basic/STLExtras.h"
-#include "swift/Basic/Timer.h"
 #include "swift/Basic/Version.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/ClangImporter/ClangModule.h"
@@ -1020,13 +1020,12 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
   if (!options.ModuleInterface.empty())
     ModuleInterface.emit(ScratchRecord, options.ModuleInterface);
 
-  ModuleDecl::ImportFilter allImportFilter;
-  allImportFilter |= ModuleDecl::ImportFilterKind::Public;
-  allImportFilter |= ModuleDecl::ImportFilterKind::Private;
-  allImportFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
-  allImportFilter |= ModuleDecl::ImportFilterKind::SPIAccessControl;
   SmallVector<ModuleDecl::ImportedModule, 8> allImports;
-  M->getImportedModules(allImports, allImportFilter);
+  M->getImportedModules(allImports,
+                        {ModuleDecl::ImportFilterKind::Public,
+                         ModuleDecl::ImportFilterKind::Private,
+                         ModuleDecl::ImportFilterKind::ImplementationOnly,
+                         ModuleDecl::ImportFilterKind::SPIAccessControl});
   ModuleDecl::removeDuplicateImports(allImports);
 
   // Collect the public and private imports as a subset so that we can
@@ -1121,8 +1120,10 @@ static uint8_t getRawStableDefaultArgumentKind(swift::DefaultArgumentKind kind) 
   CASE(Normal)
   CASE(Inherited)
   CASE(Column)
-  CASE(File)
+  CASE(FileID)
   CASE(FilePath)
+  CASE(FileIDSpelledAsFile)
+  CASE(FilePathSpelledAsFile)
   CASE(Line)
   CASE(Function)
   CASE(DSOHandle)
@@ -2431,11 +2432,16 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       assert(attr->getOriginalFunction(ctx) &&
              "`@derivative` attribute should have original declaration set "
              "during construction or parsing");
-      auto origName = attr->getOriginalFunctionName().Name.getBaseName();
+      auto origDeclNameRef = attr->getOriginalFunctionName();
+      auto origName = origDeclNameRef.Name.getBaseName();
       IdentifierID origNameId = S.addDeclBaseNameRef(origName);
       DeclID origDeclID = S.addDeclRef(attr->getOriginalFunction(ctx));
       auto derivativeKind =
           getRawStableAutoDiffDerivativeFunctionKind(attr->getDerivativeKind());
+      uint8_t rawAccessorKind = 0;
+      auto origAccessorKind = origDeclNameRef.AccessorKind;
+      if (origAccessorKind)
+        rawAccessorKind = uint8_t(getStableAccessorKind(*origAccessorKind));
       auto *parameterIndices = attr->getParameterIndices();
       assert(parameterIndices && "Parameter indices must be resolved");
       SmallVector<bool, 4> paramIndicesVector;
@@ -2443,7 +2449,8 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
         paramIndicesVector.push_back(parameterIndices->contains(i));
       DerivativeDeclAttrLayout::emitRecord(
           S.Out, S.ScratchRecord, abbrCode, attr->isImplicit(), origNameId,
-          origDeclID, derivativeKind, paramIndicesVector);
+          origAccessorKind.hasValue(), rawAccessorKind, origDeclID,
+          derivativeKind, paramIndicesVector);
       return;
     }
 
@@ -2716,12 +2723,12 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
     case PatternKind::Expr:
       llvm_unreachable("Refutable patterns cannot be serialized");
 
-    case PatternKind::Var: {
-      auto var = cast<VarPattern>(pattern);
+    case PatternKind::Binding: {
+      auto var = cast<BindingPattern>(pattern);
 
-      unsigned abbrCode = S.DeclTypeAbbrCodes[VarPatternLayout::Code];
-      VarPatternLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
-                                   var->isLet());
+      unsigned abbrCode = S.DeclTypeAbbrCodes[BindingPatternLayout::Code];
+      BindingPatternLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
+                                       var->isLet());
       writePattern(var->getSubPattern());
       break;
     }
@@ -3414,6 +3421,7 @@ public:
                            uint8_t(
                              getStableSelfAccessKind(fn->getSelfAccessKind())),
                            fn->hasForcedStaticDispatch(),
+                           fn->hasAsync(),
                            fn->hasThrows(),
                            S.addGenericSignatureRef(
                                                   fn->getGenericSignature()),
@@ -4120,7 +4128,7 @@ public:
     using namespace decls_block;
 
     auto resultType = S.addTypeRef(fnTy->getResult());
-    auto clangType = S.addClangTypeRef(fnTy->getClangFunctionType());
+    auto clangType = S.addClangTypeRef(fnTy->getClangTypeInfo().getType());
 
     unsigned abbrCode = S.DeclTypeAbbrCodes[FunctionTypeLayout::Code];
     FunctionTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
@@ -4128,7 +4136,8 @@ public:
         getRawStableFunctionTypeRepresentation(fnTy->getRepresentation()),
         clangType,
         fnTy->isNoEscape(),
-        fnTy->throws(),
+        fnTy->isAsync(),
+        fnTy->isThrowing(),
         getRawStableDifferentiabilityKind(fnTy->getDifferentiabilityKind()));
 
     serializeFunctionTypeParams(fnTy);
@@ -4142,7 +4151,7 @@ public:
     GenericFunctionTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
         S.addTypeRef(fnTy->getResult()),
         getRawStableFunctionTypeRepresentation(fnTy->getRepresentation()),
-        fnTy->throws(),
+        fnTy->isAsync(), fnTy->isThrowing(),
         getRawStableDifferentiabilityKind(fnTy->getDifferentiabilityKind()),
         S.addGenericSignatureRef(genericSig));
 
@@ -4207,7 +4216,7 @@ public:
       S.addSubstitutionMapRef(fnTy->getInvocationSubstitutions());
     auto patternSubstMapID =
       S.addSubstitutionMapRef(fnTy->getPatternSubstitutions());
-    auto clangTypeID = S.addClangTypeRef(fnTy->getClangFunctionType());
+    auto clangTypeID = S.addClangTypeRef(fnTy->getClangTypeInfo().getType());
 
     auto stableCoroutineKind =
       getRawStableSILCoroutineKind(fnTy->getCoroutineKind());
@@ -4482,7 +4491,7 @@ void Serializer::writeAllDeclsAndTypes() {
   registerDeclTypeAbbr<TuplePatternLayout>();
   registerDeclTypeAbbr<TuplePatternEltLayout>();
   registerDeclTypeAbbr<NamedPatternLayout>();
-  registerDeclTypeAbbr<VarPatternLayout>();
+  registerDeclTypeAbbr<BindingPatternLayout>();
   registerDeclTypeAbbr<AnyPatternLayout>();
   registerDeclTypeAbbr<TypedPatternLayout>();
   registerDeclTypeAbbr<InlinableBodyTextLayout>();

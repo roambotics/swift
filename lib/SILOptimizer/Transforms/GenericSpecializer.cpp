@@ -28,6 +28,10 @@
 
 using namespace swift;
 
+// For testing during bring up.
+static llvm::cl::opt<bool> EnableGenericSpecializerWithOwnership(
+    "sil-generic-specializer-enable-ownership", llvm::cl::init(false));
+
 namespace {
 
 class GenericSpecializer : public SILFunctionTransform {
@@ -39,7 +43,7 @@ class GenericSpecializer : public SILFunctionTransform {
     SILFunction &F = *getFunction();
 
     // TODO: We should be able to handle ownership.
-    if (F.hasOwnership())
+    if (F.hasOwnership() && !EnableGenericSpecializerWithOwnership)
       return;
 
     LLVM_DEBUG(llvm::dbgs() << "***** GenericSpecializer on function:"
@@ -57,7 +61,7 @@ bool GenericSpecializer::specializeAppliesInFunction(SILFunction &F) {
   SILOptFunctionBuilder FunctionBuilder(*this);
   DeadInstructionSet DeadApplies;
   llvm::SmallSetVector<SILInstruction *, 8> Applies;
-  OptRemark::Emitter ORE(DEBUG_TYPE, F.getModule());
+  OptRemark::Emitter ORE(DEBUG_TYPE, F);
 
   bool Changed = false;
   for (auto &BB : F) {

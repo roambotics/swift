@@ -82,11 +82,8 @@ static CodableConformanceType typeConformsToCodable(DeclContext *context,
                                                     ProtocolDecl *proto) {
   target = context->mapTypeIntoContext(target);
 
-  if (isIUO) {
-    return typeConformsToCodable(context,
-                                 target->lookThroughSingleOptionalType(),
-                                 false, proto);
-  }
+  if (isIUO)
+    target = target->lookThroughSingleOptionalType();
 
   auto conf = TypeChecker::conformsToProtocol(target, proto, context);
   return conf.isInvalid() ? DoesNotConform : Conforms;
@@ -175,10 +172,20 @@ static bool validateCodingKeysEnum(DerivedConformance &derived,
         properties.erase(it);
         break;
 
-      case DoesNotConform:
+      case DoesNotConform: {
+        // We use a TypeLoc here so diagnostics can show the type
+        // as written by the user in source if possible. This is useful
+        // when the user has written an IUO type for example, since
+        // diagnostics would show the type as 'T?' instead of 'T!' if
+        // we use a Type instead.
+        TypeLoc typeLoc = {
+            it->second->getTypeReprOrParentPatternTypeRepr(),
+            it->second->getType(),
+        };
         it->second->diagnose(diag::codable_non_conforming_property_here,
-                             derived.getProtocolType(), it->second->getType());
+                             derived.getProtocolType(), typeLoc);
         LLVM_FALLTHROUGH;
+      }
 
       case TypeNotValidated:
         // We don't produce a diagnostic for a type which failed to validate.
@@ -307,7 +314,7 @@ static EnumDecl *synthesizeCodingKeysEnum(DerivedConformance &derived) {
   // We want to look through all the var declarations of this type to create
   // enum cases based on those var names.
   auto *codingKeyProto = C.getProtocol(KnownProtocolKind::CodingKey);
-  auto *codingKeyType = codingKeyProto->getDeclaredType();
+  auto codingKeyType = codingKeyProto->getDeclaredInterfaceType();
   TypeLoc protoTypeLoc[1] = {TypeLoc::withoutLoc(codingKeyType)};
   MutableArrayRef<TypeLoc> inherited = C.AllocateCopy(protoTypeLoc);
 
@@ -355,10 +362,20 @@ static EnumDecl *synthesizeCodingKeysEnum(DerivedConformance &derived) {
         break;
       }
 
-      case DoesNotConform:
+      case DoesNotConform: {
+        // We use a TypeLoc here so diagnostics can show the type
+        // as written by the user in source if possible. This is useful
+        // when the user has written an IUO type for example, since
+        // diagnostics would show the type as 'T?' instead of 'T!' if
+        // we use a Type instead.
+        TypeLoc typeLoc = {
+            varDecl->getTypeReprOrParentPatternTypeRepr(),
+            varDecl->getType(),
+        };
         varDecl->diagnose(diag::codable_non_conforming_property_here,
-                          derived.getProtocolType(), varDecl->getType());
+                          derived.getProtocolType(), typeLoc);
         LLVM_FALLTHROUGH;
+      }
 
       case TypeNotValidated:
         // We don't produce a diagnostic for a type which failed to validate.
@@ -619,9 +636,9 @@ deriveBodyEncodable_encode(AbstractFunctionDecl *encodeDecl, void *) {
                                           DeclNameLoc(), /*Implicit=*/true);
 
     // CodingKeys.x
-    auto *eltRef = new (C) DeclRefExpr(elt, DeclNameLoc(), /*implicit=*/true);
     auto *metaTyRef = TypeExpr::createImplicit(codingKeysType, C);
-    auto *keyExpr = new (C) DotSyntaxCallExpr(eltRef, SourceLoc(), metaTyRef);
+    auto *keyExpr = new (C) MemberRefExpr(metaTyRef, SourceLoc(), elt,
+                                          DeclNameLoc(), /*Implicit=*/true);
 
     // encode(_:forKey:)/encodeIfPresent(_:forKey:)
     auto methodName = useIfPresentVariant ? C.Id_encodeIfPresent : C.Id_encode;
@@ -717,6 +734,7 @@ static FuncDecl *deriveEncodable_encode(DerivedConformance &derived) {
   DeclName name(C, C.Id_encode, params);
   auto *encodeDecl = FuncDecl::create(
       C, SourceLoc(), StaticSpellingKind::None, SourceLoc(), name, SourceLoc(),
+      /*Async*/ false, SourceLoc(),
       /*Throws=*/true, SourceLoc(), nullptr, params,
       TypeLoc::withoutLoc(returnType), conformanceDC);
   encodeDecl->setImplicit();
@@ -901,9 +919,9 @@ deriveBodyDecodable_init(AbstractFunctionDecl *initDecl, void *) {
                                              SourceLoc(), varType);
 
       // CodingKeys.x
-      auto *eltRef = new (C) DeclRefExpr(elt, DeclNameLoc(), /*implicit=*/true);
       metaTyRef = TypeExpr::createImplicit(codingKeysType, C);
-      auto *keyExpr = new (C) DotSyntaxCallExpr(eltRef, SourceLoc(), metaTyRef);
+      auto *keyExpr = new (C) MemberRefExpr(metaTyRef, SourceLoc(),
+                                            elt, DeclNameLoc(), /*Implicit=*/true);
 
       // decode(_:forKey:)/decodeIfPresent(_:forKey:)
       SmallVector<Identifier, 2> argNames{Identifier(), C.Id_forKey};

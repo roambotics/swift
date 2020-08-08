@@ -578,6 +578,20 @@ ParserResult<AvailableAttr> Parser::parseExtendedAvailabilitySpecList(
     return nullptr;
   }
 
+  if (PlatformKind) {
+      if (!Introduced.empty())
+        Introduced.Version =
+            canonicalizePlatformVersion(*PlatformKind, Introduced.Version);
+
+      if (!Deprecated.empty())
+        Deprecated.Version =
+            canonicalizePlatformVersion(*PlatformKind, Deprecated.Version);
+
+      if (!Obsoleted.empty())
+        Obsoleted.Version =
+            canonicalizePlatformVersion(*PlatformKind, Obsoleted.Version);
+  }
+
   auto Attr = new (Context)
   AvailableAttr(AtLoc, SourceRange(AttrLoc, Tok.getLoc()),
                 PlatformKind.getValue(),
@@ -1037,11 +1051,24 @@ bool Parser::parseDifferentiableAttributeArguments(
   return false;
 }
 
+// Helper function that returns the accessor kind if a token is an accessor
+// label.
+static Optional<AccessorKind> isAccessorLabel(const Token &token) {
+  if (token.is(tok::identifier)) {
+    StringRef tokText = token.getText();
+    for (auto accessor : allAccessorKinds())
+      if (tokText == getAccessorLabel(accessor))
+        return accessor;
+  }
+  return None;
+}
+
 /// Helper function that parses 'type-identifier' for `parseQualifiedDeclName`.
 /// Returns true on error. Sets `baseType` to the parsed base type if present,
 /// or to `nullptr` if not. A missing base type is not considered an error.
 static bool parseBaseTypeForQualifiedDeclName(Parser &P, TypeRepr *&baseType) {
   baseType = nullptr;
+  Parser::BacktrackingScope backtrack(P);
 
   // If base type cannot be parsed, return false (no error).
   if (!P.canParseBaseTypeForQualifiedDeclName())
@@ -1057,6 +1084,28 @@ static bool parseBaseTypeForQualifiedDeclName(Parser &P, TypeRepr *&baseType) {
   // `parseTypeIdentifier(/*isParsingQualifiedDeclName*/ true)` leaves the
   // leading period unparsed to avoid syntax verification errors.
   assert(P.startsWithSymbol(P.Tok, '.') && "false");
+
+  // Check if this is a reference to a property or subscript accessor.
+  //
+  // Note: There is an parsing ambiguity here. An accessor label identifier
+  // (e.g. "set") may refer to the final declaration name component instead of
+  // an accessor kind.
+  //
+  // FIXME: It is wrong to backtrack parsing the entire base type if an accessor
+  // label is found. Instead, only the final component of the base type should
+  // be backtracked. It may be best to implement this in
+  // `Parser::parseTypeIdentifier`.
+  //
+  // Example: consider parsing `A.B.property.set`.
+  // Current behavior: base type is entirely backtracked.
+  // Ideal behavior: base type is parsed as `A.B`.
+  if (P.Tok.is(tok::period)) {
+    const Token &nextToken = P.peekToken();
+    if (isAccessorLabel(nextToken).hasValue())
+      return false;
+  }
+
+  backtrack.cancelBacktrack();
   P.consumeStartingCharacterOfCurrentToken(tok::period);
 
   // Set base type and return false (no error).
@@ -1079,20 +1128,52 @@ static bool parseBaseTypeForQualifiedDeclName(Parser &P, TypeRepr *&baseType) {
 static bool parseQualifiedDeclName(Parser &P, Diag<> nameParseError,
                                    TypeRepr *&baseType,
                                    DeclNameRefWithLoc &original) {
-  SyntaxParsingContext DeclNameContext(P.SyntaxContext,
-                                       SyntaxKind::QualifiedDeclName);
-  // Parse base type.
-  if (parseBaseTypeForQualifiedDeclName(P, baseType))
-    return true;
-  // Parse final declaration name.
-  original.Name = P.parseDeclNameRef(
-      original.Loc, nameParseError,
-      Parser::DeclNameFlag::AllowZeroArgCompoundNames |
-      Parser::DeclNameFlag::AllowKeywordsUsingSpecialNames |
-      Parser::DeclNameFlag::AllowOperators);
-  // The base type is optional, but the final unqualified declaration name is
-  // not. If name could not be parsed, return true for error.
-  return !original.Name;
+  {
+    SyntaxParsingContext DeclNameContext(P.SyntaxContext,
+                                         SyntaxKind::QualifiedDeclName);
+    // Parse base type.
+    if (parseBaseTypeForQualifiedDeclName(P, baseType))
+      return true;
+    // Parse final declaration name.
+    original.Name = P.parseDeclNameRef(
+        original.Loc, nameParseError,
+        Parser::DeclNameFlag::AllowZeroArgCompoundNames |
+            Parser::DeclNameFlag::AllowKeywordsUsingSpecialNames |
+            Parser::DeclNameFlag::AllowOperators);
+    // The base type is optional, but the final unqualified declaration name is
+    // not. If name could not be parsed, return true for error.
+    if (!original.Name)
+      return true;
+  }
+
+  // Parse an optional accessor kind.
+  //
+  // Note: there is an parsing ambiguity here.
+  //
+  // Example: `A.B.property.set` may be parsed as one of the following:
+  //
+  // 1. No accessor kind.
+  // - Base type: `A.B.property`
+  // - Declaration name: `set`
+  // - Accessor kind: <none>
+  //
+  // 2. Accessor kind exists.
+  // - Base type: `A.B`
+  // - Declaration name: `property`
+  // - Accessor kind: `set`
+  //
+  // Currently, we follow (2) because it's more useful in practice.
+  if (P.Tok.is(tok::period)) {
+    const Token &nextToken = P.peekToken();
+    Optional<AccessorKind> kind = isAccessorLabel(nextToken);
+    if (kind.hasValue()) {
+      original.AccessorKind = kind;
+      P.consumeIf(tok::period);
+      P.consumeIf(tok::identifier);
+    }
+  }
+
+  return false;
 }
 
 /// Parse a `@derivative(of:)` attribute, returning true on error.
@@ -1966,6 +2047,8 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
         } else {
           continue;
         }
+
+        Version = canonicalizePlatformVersion(Platform, Version);
 
         Attributes.add(new (Context)
                        AvailableAttr(AtLoc, AttrRange,
@@ -3671,7 +3754,8 @@ Parser::parseDecl(ParseDeclOptions Flags,
                               StaticSpelling, tryLoc, HasLetOrVarKeyword);
     StaticLoc = SourceLoc(); // we handled static if present.
     MayNeedOverrideCompletion = true;
-    if (DeclResult.hasCodeCompletion() && isCodeCompletionFirstPass())
+    if ((AttrStatus.hasCodeCompletion() || DeclResult.hasCodeCompletion())
+        && isCodeCompletionFirstPass())
       return;
     std::for_each(Entries.begin(), Entries.end(), Handler);
     if (auto *D = DeclResult.getPtrOrNull())
@@ -3718,7 +3802,8 @@ Parser::parseDecl(ParseDeclOptions Flags,
     llvm::SmallVector<Decl *, 4> Entries;
     DeclParsingContext.setCreateSyntax(SyntaxKind::EnumCaseDecl);
     DeclResult = parseDeclEnumCase(Flags, Attributes, Entries);
-    if (DeclResult.hasCodeCompletion() && isCodeCompletionFirstPass())
+    if ((AttrStatus.hasCodeCompletion() || DeclResult.hasCodeCompletion()) &&
+        isCodeCompletionFirstPass())
       break;
     std::for_each(Entries.begin(), Entries.end(), Handler);
     if (auto *D = DeclResult.getPtrOrNull())
@@ -3762,7 +3847,8 @@ Parser::parseDecl(ParseDeclOptions Flags,
     DeclResult = parseDeclSubscript(StaticLoc, StaticSpelling, Flags,
                                     Attributes, Entries);
     StaticLoc = SourceLoc(); // we handled static if present.
-    if (DeclResult.hasCodeCompletion() && isCodeCompletionFirstPass())
+    if ((AttrStatus.hasCodeCompletion() || DeclResult.hasCodeCompletion()) &&
+        isCodeCompletionFirstPass())
       break;
     std::for_each(Entries.begin(), Entries.end(), Handler);
     MayNeedOverrideCompletion = true;
@@ -3941,6 +4027,8 @@ Parser::parseDecl(ParseDeclOptions Flags,
       CodeCompletion->setAttrTargetDeclKind(DK);
     }
     DeclResult.setHasCodeCompletion();
+    if (isCodeCompletionFirstPass())
+      return DeclResult;
   }
 
   if (DeclResult.isNonNull()) {
@@ -4964,10 +5052,10 @@ parseDeclTypeAlias(Parser::ParseDeclOptions Flags, DeclAttributes &Attributes) {
   TAD->setUnderlyingTypeRepr(UnderlyingTy.getPtrOrNull());
   TAD->getAttrs() = Attributes;
 
-  // Parse a 'where' clause if present, adding it to our GenericParamList.
+  // Parse a 'where' clause if present.
   if (Tok.is(tok::kw_where)) {
     ContextChange CC(*this, TAD);
-    Status |= parseFreestandingGenericWhereClause(TAD, genericParams, Flags);
+    Status |= parseFreestandingGenericWhereClause(TAD);
   }
 
   if (UnderlyingTy.isNull()) {
@@ -5637,7 +5725,7 @@ Parser::parseDeclVarGetSet(Pattern *pattern, ParseDeclOptions Flags,
       } else if (auto paren = dyn_cast<ParenPattern>(cur)) {
         primaryVarIsWellFormed = false;
         cur = paren->getSubPattern();
-      } else if (auto var = dyn_cast<VarPattern>(cur)) {
+      } else if (auto var = dyn_cast<BindingPattern>(cur)) {
         primaryVarIsWellFormed = false;
         cur = var->getSubPattern();
       } else {
@@ -6278,10 +6366,12 @@ ParserResult<FuncDecl> Parser::parseDeclFunc(SourceLoc StaticLoc,
   TypeRepr *FuncRetTy = nullptr;
   DeclName FullName;
   ParameterList *BodyParams;
+  SourceLoc asyncLoc;
   SourceLoc throwsLoc;
   bool rethrows;
   Status |= parseFunctionSignature(SimpleName, FullName, BodyParams,
-                                   DefaultArgs, throwsLoc, rethrows, FuncRetTy);
+                                   DefaultArgs, asyncLoc, throwsLoc, rethrows,
+                                   FuncRetTy);
   if (Status.hasCodeCompletion() && !CodeCompletion) {
     // Trigger delayed parsing, no need to continue.
     return Status;
@@ -6292,6 +6382,7 @@ ParserResult<FuncDecl> Parser::parseDeclFunc(SourceLoc StaticLoc,
   // Create the decl for the func and add it to the parent scope.
   auto *FD = FuncDecl::create(Context, StaticLoc, StaticSpelling,
                               FuncLoc, FullName, NameLoc,
+                              /*Async=*/asyncLoc.isValid(), asyncLoc,
                               /*Throws=*/throwsLoc.isValid(), throwsLoc,
                               GenericParams,
                               BodyParams, FuncRetTy,
@@ -6305,11 +6396,11 @@ ParserResult<FuncDecl> Parser::parseDeclFunc(SourceLoc StaticLoc,
     }
   }
   
-  // Parse a 'where' clause if present, adding it to our GenericParamList.
+  // Parse a 'where' clause if present.
   if (Tok.is(tok::kw_where)) {
     ContextChange CC(*this, FD);
 
-    Status |= parseFreestandingGenericWhereClause(FD, GenericParams, Flags);
+    Status |= parseFreestandingGenericWhereClause(FD);
     if (Status.hasCodeCompletion() && !CodeCompletion) {
       // Trigger delayed parsing, no need to continue.
       return Status;
@@ -6562,10 +6653,9 @@ ParserResult<EnumDecl> Parser::parseDeclEnum(ParseDeclOptions Flags,
 
   diagnoseWhereClauseInGenericParamList(GenericParams);
   
-  // Parse a 'where' clause if present, adding it to our GenericParamList.
+  // Parse a 'where' clause if present.
   if (Tok.is(tok::kw_where)) {
-    auto whereStatus =
-        parseFreestandingGenericWhereClause(ED, GenericParams, Flags);
+    auto whereStatus = parseFreestandingGenericWhereClause(ED);
     if (whereStatus.hasCodeCompletion() && !CodeCompletion) {
       // Trigger delayed parsing, no need to continue.
       return whereStatus;
@@ -6843,10 +6933,9 @@ ParserResult<StructDecl> Parser::parseDeclStruct(ParseDeclOptions Flags,
 
   diagnoseWhereClauseInGenericParamList(GenericParams);
 
-  // Parse a 'where' clause if present, adding it to our GenericParamList.
+  // Parse a 'where' clause if present.
   if (Tok.is(tok::kw_where)) {
-    auto whereStatus =
-        parseFreestandingGenericWhereClause(SD, GenericParams, Flags);
+    auto whereStatus = parseFreestandingGenericWhereClause(SD);
     if (whereStatus.hasCodeCompletion() && !CodeCompletion) {
       // Trigger delayed parsing, no need to continue.
       return whereStatus;
@@ -6956,10 +7045,9 @@ ParserResult<ClassDecl> Parser::parseDeclClass(ParseDeclOptions Flags,
 
   diagnoseWhereClauseInGenericParamList(GenericParams);
 
-  // Parse a 'where' clause if present, adding it to our GenericParamList.
+  // Parse a 'where' clause if present.
   if (Tok.is(tok::kw_where)) {
-    auto whereStatus =
-        parseFreestandingGenericWhereClause(CD, GenericParams, Flags);
+    auto whereStatus = parseFreestandingGenericWhereClause(CD);
     if (whereStatus.hasCodeCompletion() && !CodeCompletion) {
       // Trigger delayed parsing, no need to continue.
       return whereStatus;
@@ -7199,12 +7287,11 @@ Parser::parseDeclSubscript(SourceLoc StaticLoc,
 
   DefaultArgs.setFunctionContext(Subscript, Subscript->getIndices());
 
-  // Parse a 'where' clause if present, adding it to our GenericParamList.
+  // Parse a 'where' clause if present.
   if (Tok.is(tok::kw_where)) {
     ContextChange CC(*this, Subscript);
 
-    Status |= parseFreestandingGenericWhereClause(Subscript, GenericParams,
-                                                  Flags);
+    Status |= parseFreestandingGenericWhereClause(Subscript);
     if (Status.hasCodeCompletion() && !CodeCompletion) {
       // Trigger delayed parsing, no need to continue.
       return Status;
@@ -7323,12 +7410,22 @@ Parser::parseDeclInit(ParseDeclOptions Flags, DeclAttributes &Attributes) {
     return nullptr;
   }
 
-  // Parse 'throws' or 'rethrows'.
+  // Parse 'async' / 'throws' / 'rethrows'.
+  SourceLoc asyncLoc;
   SourceLoc throwsLoc;
-  if (consumeIf(tok::kw_throws, throwsLoc)) {
-    // okay
-  } else if (consumeIf(tok::kw_rethrows, throwsLoc)) {
+  bool rethrows = false;
+  parseAsyncThrows(SourceLoc(), asyncLoc, throwsLoc, &rethrows);
+
+  if (rethrows) {
     Attributes.add(new (Context) RethrowsAttr(throwsLoc));
+  }
+
+  // Initializers cannot be 'async'.
+  // FIXME: We should be able to lift this restriction.
+  if (asyncLoc.isValid()) {
+    diagnose(asyncLoc, diag::async_init)
+      .fixItRemove(asyncLoc);
+    asyncLoc = SourceLoc();
   }
 
   diagnoseWhereClauseInGenericParamList(GenericParams);
@@ -7342,11 +7439,11 @@ Parser::parseDeclInit(ParseDeclOptions Flags, DeclAttributes &Attributes) {
   CD->setImplicitlyUnwrappedOptional(IUO);
   CD->getAttrs() = Attributes;
 
-  // Parse a 'where' clause if present, adding it to our GenericParamList.
+  // Parse a 'where' clause if present.
   if (Tok.is(tok::kw_where)) {
     ContextChange(*this, CD);
 
-    Status |= parseFreestandingGenericWhereClause(CD, GenericParams, Flags);
+    Status |= parseFreestandingGenericWhereClause(CD);
     if (Status.hasCodeCompletion() && !CodeCompletion) {
       // Trigger delayed parsing, no need to continue.
       return Status;

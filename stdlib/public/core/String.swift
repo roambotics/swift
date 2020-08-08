@@ -359,6 +359,18 @@ public struct String {
     _invariantCheck()
   }
 
+  // This is intentionally a static function and not an initializer, because
+  // an initializer would conflict with the Int-parsing initializer, when used
+  // as function name, e.g.
+  //   [1, 2, 3].map(String.init)
+  @_alwaysEmitIntoClient
+  @_semantics("string.init_empty_with_capacity")
+  @_semantics("inline_late")
+  @inlinable
+  internal static func _createEmpty(withInitialCapacity: Int) -> String {
+    return String(_StringGuts(_initialCapacity: withInitialCapacity))
+  }
+
   /// Creates an empty string.
   ///
   /// Using this initializer is equivalent to initializing a string with an
@@ -501,7 +513,7 @@ extension String {
   ///     memory with room for `capacity` UTF-8 code units, initializes
   ///     that memory, and returns the number of initialized elements.
   @inline(__always)
-  @available(macOS 9999, iOS 9999, tvOS 9999, watchOS 9999, *)
+  @available(macOS 10.16, iOS 14.0, watchOS 7.0, tvOS 14.0, *)
   public init(
     unsafeUninitializedCapacity capacity: Int,
     initializingUTF8With initializer: (

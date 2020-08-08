@@ -288,8 +288,35 @@ void CompilerInstance::setupDiagnosticVerifierIfNeeded() {
   }
 }
 
+void CompilerInstance::setupDependencyTrackerIfNeeded() {
+  assert(!Context && "Must be called before the ASTContext is created");
+
+  const auto &Invocation = getInvocation();
+  const auto &opts = Invocation.getFrontendOptions();
+
+  // Note that we may track dependencies even when we don't need to write them
+  // directly; in particular, -track-system-dependencies affects how module
+  // interfaces get loaded, and so we need to be consistently tracking system
+  // dependencies throughout the compiler.
+  auto collectionMode = opts.IntermoduleDependencyTracking;
+  if (!collectionMode) {
+    // If we have an output path specified, but no other tracking options,
+    // default to non-system dependency tracking.
+    if (opts.InputsAndOutputs.hasDependencyTrackerPath() ||
+        !opts.IndexStorePath.empty()) {
+      collectionMode = IntermoduleDepTrackingMode::ExcludeSystem;
+    }
+  }
+  if (!collectionMode)
+    return;
+
+  DepTracker = std::make_unique<DependencyTracker>(*collectionMode);
+}
+
 bool CompilerInstance::setup(const CompilerInvocation &Invok) {
   Invocation = Invok;
+
+  setupDependencyTrackerIfNeeded();
 
   // If initializing the overlay file system fails there's no sense in
   // continuing because the compiler will read the wrong files.
@@ -383,6 +410,11 @@ void CompilerInstance::setUpDiagnosticOptions() {
   }
   Diagnostics.setDiagnosticDocumentationPath(
       Invocation.getDiagnosticOptions().DiagnosticDocumentationPath);
+  if (!Invocation.getDiagnosticOptions().LocalizationCode.empty()) {
+    Diagnostics.setLocalization(
+        Invocation.getDiagnosticOptions().LocalizationCode,
+        Invocation.getDiagnosticOptions().LocalizationPath);
+  }
 }
 
 // The ordering of ModuleLoaders is important!
@@ -392,14 +424,17 @@ void CompilerInstance::setUpDiagnosticOptions() {
 //    Ideally, we'd get rid of it.
 // 2. MemoryBufferSerializedModuleLoader: This is used by LLDB, because it might
 //    already have the module available in memory.
-// 3. ModuleInterfaceLoader: Tries to find an up-to-date swiftmodule. If it
+// 3. ExplicitSwiftModuleLoader: Loads a serialized module if it can, provided
+//    this modules was specified as an explicit input to the compiler.
+// 4. ModuleInterfaceLoader: Tries to find an up-to-date swiftmodule. If it
 //    succeeds, it issues a particular "error" (see
-//    [Note: ModuleInterfaceLoader-defer-to-SerializedModuleLoader]), which
-//    is interpreted by the overarching loader as a command to use the
-//    SerializedModuleLoader. If we failed to find a .swiftmodule, this falls
-//    back to using an interface. Actual errors lead to diagnostics.
-// 4. SerializedModuleLoader: Loads a serialized module if it can.
-// 5. ClangImporter: This must come after all the Swift module loaders because
+//    [NOTE: ModuleInterfaceLoader-defer-to-ImplicitSerializedModuleLoader]),
+//    which is interpreted by the overarching loader as a command to use the
+//    ImplicitSerializedModuleLoader. If we failed to find a .swiftmodule,
+//    this falls back to using an interface. Actual errors lead to diagnostics.
+// 5. ImplicitSerializedModuleLoader: Loads a serialized module if it can.
+//    Used for implicit loading of modules from the compiler's search paths.
+// 6. ClangImporter: This must come after all the Swift module loaders because
 //    in the presence of overlays and mixed-source frameworks, we want to prefer
 //    the overlay or framework module over the underlying Clang module.
 bool CompilerInstance::setUpModuleLoaders() {
@@ -452,15 +487,18 @@ bool CompilerInstance::setUpModuleLoaders() {
 
   // If implicit modules are disabled, we need to install an explicit module
   // loader.
-  if (Invocation.getFrontendOptions().DisableImplicitModules) {
+  bool ExplicitModuleBuild = Invocation.getFrontendOptions().DisableImplicitModules;
+  if (ExplicitModuleBuild) {
     auto ESML = ExplicitSwiftModuleLoader::create(
         *Context,
         getDependencyTracker(), MLM,
         Invocation.getSearchPathOptions().ExplicitSwiftModules,
         Invocation.getSearchPathOptions().ExplicitSwiftModuleMap,
         IgnoreSourceInfoFile);
+    this->DefaultSerializedLoader = ESML.get();
     Context->addModuleLoader(std::move(ESML));
   }
+
   if (MLM != ModuleLoadingMode::OnlySerialized) {
     auto const &Clang = clangImporter->getClangInstance();
     std::string ModuleCachePath = getModuleCachePathFromClang(Clang);
@@ -472,15 +510,17 @@ bool CompilerInstance::setUpModuleLoaders() {
         getDependencyTracker(), MLM, FEOpts.PreferInterfaceForModules,
         LoaderOpts,
         IgnoreSourceInfoFile);
-    Context->addModuleLoader(std::move(PIML));
+    Context->addModuleLoader(std::move(PIML), false, false, true);
   }
 
-  std::unique_ptr<SerializedModuleLoader> SML =
-    SerializedModuleLoader::create(*Context, getDependencyTracker(), MLM,
+  if (!ExplicitModuleBuild) {
+    std::unique_ptr<ImplicitSerializedModuleLoader> ISML =
+    ImplicitSerializedModuleLoader::create(*Context, getDependencyTracker(), MLM,
                                    IgnoreSourceInfoFile);
-  this->SML = SML.get();
-  Context->addModuleLoader(std::move(SML));
-
+    this->DefaultSerializedLoader = ISML.get();
+    Context->addModuleLoader(std::move(ISML));
+  }
+  
   Context->addModuleLoader(std::move(clangImporter), /*isClang*/ true);
 
   return false;
@@ -685,8 +725,8 @@ bool CompilerInvocation::shouldImportSwiftONoneSupport() const {
   // This optimization is disabled by -track-system-dependencies to preserve
   // the explicit dependency.
   const auto &options = getFrontendOptions();
-  return options.TrackSystemDeps
-      || FrontendOptions::doesActionGenerateSIL(options.RequestedAction);
+  return options.shouldTrackSystemDependencies() ||
+         FrontendOptions::doesActionGenerateSIL(options.RequestedAction);
 }
 
 ImplicitImportInfo CompilerInstance::getImplicitImportInfo() const {
@@ -836,6 +876,7 @@ bool CompilerInstance::loadStdlibIfNeeded() {
 
 bool CompilerInstance::loadPartialModulesAndImplicitImports(
     ModuleDecl *mod, SmallVectorImpl<FileUnit *> &partialModules) const {
+  assert(DefaultSerializedLoader && "Expected module loader in Compiler Instance");
   FrontendStatsTracer tracer(getStatsReporter(),
                              "load-partial-modules-and-implicit-imports");
   // Force loading implicit imports. This is currently needed to allow
@@ -849,7 +890,7 @@ bool CompilerInstance::loadPartialModulesAndImplicitImports(
   for (auto &PM : PartialModules) {
     assert(PM.ModuleBuffer);
     auto *file =
-        SML->loadAST(*mod, /*diagLoc*/ SourceLoc(), /*moduleInterfacePath*/ "",
+      DefaultSerializedLoader->loadAST(*mod, /*diagLoc*/ SourceLoc(), /*moduleInterfacePath*/ "",
                      std::move(PM.ModuleBuffer), std::move(PM.ModuleDocBuffer),
                      std::move(PM.ModuleSourceInfoBuffer),
                      /*isFramework*/ false);
@@ -942,7 +983,7 @@ void CompilerInstance::freeASTContext() {
   TheSILTypes.reset();
   Context.reset();
   MainModule = nullptr;
-  SML = nullptr;
+  DefaultSerializedLoader = nullptr;
   MemoryBufferLoader = nullptr;
   PrimaryBufferIDs.clear();
 }
@@ -950,22 +991,17 @@ void CompilerInstance::freeASTContext() {
 /// Perform "stable" optimizations that are invariant across compiler versions.
 static bool performMandatorySILPasses(CompilerInvocation &Invocation,
                                       SILModule *SM) {
+  // Don't run diagnostic passes at all when merging modules.
   if (Invocation.getFrontendOptions().RequestedAction ==
       FrontendOptions::ActionType::MergeModules) {
-    // Don't run diagnostic passes at all.
-  } else if (!Invocation.getDiagnosticOptions().SkipDiagnosticPasses) {
-    if (runSILDiagnosticPasses(*SM))
-      return true;
-  } else {
+    return false;
+  }
+  if (Invocation.getDiagnosticOptions().SkipDiagnosticPasses) {
     // Even if we are not supposed to run the diagnostic passes, we still need
     // to run the ownership evaluator.
-    if (runSILOwnershipEliminatorPass(*SM))
-      return true;
+    return runSILOwnershipEliminatorPass(*SM);
   }
-
-  if (Invocation.getSILOptions().MergePartialModules)
-    SM->linkAllFromCurrentModule();
-  return false;
+  return runSILDiagnosticPasses(*SM);
 }
 
 /// Perform SIL optimization passes if optimizations haven't been disabled.

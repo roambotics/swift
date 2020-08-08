@@ -51,9 +51,9 @@ f0(i, i, // expected-error@:7 {{cannot convert value of type 'Int' to expected a
 
 
 // Cannot conform to protocols.
-f5(f4)  // expected-error {{type '(Int) -> Int' cannot conform to 'P2'; only struct/enum/class types can conform to protocols}}
-f5((1, "hello"))  // expected-error {{type '(Int, String)' cannot conform to 'P2'; only struct/enum/class types can conform to protocols}}
-f5(Int.self) // expected-error {{type 'Int.Type' cannot conform to 'P2'; only struct/enum/class types can conform to protocols}}
+f5(f4)  // expected-error {{type '(Int) -> Int' cannot conform to 'P2'; only concrete types such as structs, enums and classes can conform to protocols}}
+f5((1, "hello"))  // expected-error {{type '(Int, String)' cannot conform to 'P2'; only concrete types such as structs, enums and classes can conform to protocols}}
+f5(Int.self) // expected-error {{type 'Int.Type' cannot conform to 'P2'; only concrete types such as structs, enums and classes can conform to protocols}}
 
 // Tuple element not convertible.
 f0(i,
@@ -104,7 +104,7 @@ func f8<T:P2>(_ n: T, _ f: @escaping (T) -> T) {}  // expected-note {{where 'T' 
 f8(3, f4) // expected-error {{global function 'f8' requires that 'Int' conform to 'P2'}}
 typealias Tup = (Int, Double)
 func f9(_ x: Tup) -> Tup { return x }
-f8((1,2.0), f9) // expected-error {{type 'Tup' (aka '(Int, Double)') cannot conform to 'P2'; only struct/enum/class types can conform to protocols}}
+f8((1,2.0), f9) // expected-error {{type 'Tup' (aka '(Int, Double)') cannot conform to 'P2'; only concrete types such as structs, enums and classes can conform to protocols}}
 
 // <rdar://problem/19658691> QoI: Incorrect diagnostic for calling nonexistent members on literals
 1.doesntExist(0)  // expected-error {{value of type 'Int' has no member 'doesntExist'}}
@@ -207,7 +207,7 @@ func r17020197(_ x : Int?, y : Int) {
 
 // <rdar://problem/20714480> QoI: Boolean expr not treated as Bool type when function return type is different
 func validateSaveButton(_ text: String) {
-  return (text.count > 0) ? true : false  // expected-error {{unexpected non-void return value in void function}}
+  return (text.count > 0) ? true : false  // expected-error {{unexpected non-void return value in void function}} expected-note {{did you mean to add a return type?}}
 }
 
 // <rdar://problem/20201968> QoI: poor diagnostic when calling a class method via a metatype
@@ -687,7 +687,9 @@ enum AssocTest {
   case one(Int)
 }
 
-if AssocTest.one(1) == AssocTest.one(1) {} // expected-error{{binary operator '==' cannot be applied to two 'AssocTest' operands}}
+// FIXME(rdar://problem/65688291) - on iOS simulator this diagnostic is flaky,
+// either `referencing operator function '==' on 'Equatable'` or `operator function '==' requires`
+if AssocTest.one(1) == AssocTest.one(1) {} // expected-error{{requires that 'AssocTest' conform to 'Equatable'}}
 // expected-note @-1 {{binary operator '==' cannot be synthesized for enums with associated values}}
 
 
@@ -1100,9 +1102,10 @@ func rdar17170728() {
   }
 
   let _ = [i, j, k].reduce(0 as Int?) {
+    // expected-error@-1{{missing argument label 'into:' in call}}
+    // expected-error@-2{{cannot convert value of type 'Int?' to expected argument type}}
     $0 && $1 ? $0 + $1 : ($0 ? $0 : ($1 ? $1 : nil))
-    // expected-error@-1 {{binary operator '+' cannot be applied to two 'Int?' operands}}
-    // expected-error@-2 4 {{optional type 'Int?' cannot be used as a boolean; test for '!= nil' instead}}
+    // expected-error@-1 {{binary operator '+' cannot be applied to two 'Bool' operands}}
   }
 }
 
@@ -1342,3 +1345,10 @@ func rdar62989214() {
     arr[flag].isTrue // expected-error {{cannot convert value of type 'Flag' to expected argument type 'Int'}}
   }
 }
+
+// SR-5688
+func SR5688_1() -> String? { "" }
+SR5688_1!.count // expected-error {{function 'SR5688_1' was used as a property; add () to call it}} {{9-9=()}}
+
+func SR5688_2() -> Int? { 0 }
+let _: Int = SR5688_2! // expected-error {{function 'SR5688_2' was used as a property; add () to call it}} {{22-22=()}}

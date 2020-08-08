@@ -37,6 +37,9 @@ class SILGlobalVariable
   : public llvm::ilist_node<SILGlobalVariable>,
     public SILAllocated<SILGlobalVariable>
 {
+public:
+  using const_iterator = SILBasicBlock::const_iterator;
+
 private:
   friend class SILModule;
   friend class SILBuilder;
@@ -157,6 +160,9 @@ public:
     return dyn_cast_or_null<ObjectInst>(getStaticInitializerValue()) != nullptr;
   }
 
+  const_iterator begin() const { return StaticInitializerBlock.begin(); }
+  const_iterator end() const { return StaticInitializerBlock.end(); }
+
   /// Returns true if \p I is a valid instruction to be contained in the
   /// static initializer.
   static bool isValidStaticInitializerInst(const SILInstruction *I,
@@ -254,8 +260,7 @@ SILFunction *getCalleeOfOnceCall(BuiltinInst *BI);
 /// Given an addressor, AddrF, find the call to the global initializer if
 /// present, otherwise return null. If an initializer is returned, then
 /// `CallToOnce` is initialized to the corresponding builtin "once" call.
-SILFunction *findInitializer(SILModule *Module, SILFunction *AddrF,
-                             BuiltinInst *&CallToOnce);
+SILFunction *findInitializer(SILFunction *AddrF, BuiltinInst *&CallToOnce);
 
 /// Helper for getVariableOfGlobalInit(), so GlobalOpts can deeply inspect and
 /// rewrite the initialization pattern.

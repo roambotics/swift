@@ -22,6 +22,7 @@
 #include "SwiftTargetInfo.h"
 #include "TypeLayout.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/LinkLibrary.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ReferenceCounting.h"
 #include "swift/AST/SourceFile.h"
@@ -105,6 +106,7 @@ namespace swift {
   class SILModule;
   class SILProperty;
   class SILType;
+  class SILVTable;
   class SILWitnessTable;
   class SourceLoc;
   class SourceFile;
@@ -374,7 +376,7 @@ public:
   
   /// Emit functions, variables and tables which are needed anyway, e.g. because
   /// they are externally visible.
-  void emitGlobalTopLevel(llvm::StringSet<> *LinkerDirectives);
+  void emitGlobalTopLevel(const std::vector<std::string> &LinkerDirectives);
 
   /// Emit references to each of the protocol descriptors defined in this
   /// IR module.
@@ -397,6 +399,9 @@ public:
 
   // Emit the code to replace dynamicReplacement(for:) functions.
   void emitDynamicReplacements();
+
+  // Emit info that describes the entry point to the module, if it has one.
+  void emitEntryPointInfo();
 
   /// Checks if metadata for this type can be emitted lazily. This is true for
   /// non-public types as well as imported types, except for classes and
@@ -542,6 +547,11 @@ enum class MangledTypeRefRole {
   DefaultAssociatedTypeWitness,
 };
 
+enum class TypeMetadataCanonicality : bool {
+  Noncanonical,
+  Canonical,
+};
+
 /// IRGenModule - Primary class for emitting IR for global declarations.
 /// 
 class IRGenModule {
@@ -634,6 +644,7 @@ public:
   llvm::FunctionType *DeallocatingDtorTy; /// void (%swift.refcounted*)
   llvm::StructType *TypeMetadataStructTy; /// %swift.type = type { ... }
   llvm::PointerType *TypeMetadataPtrTy;/// %swift.type*
+  llvm::PointerType *TypeMetadataPtrPtrTy; /// %swift.type**
   union {
     llvm::StructType *TypeMetadataResponseTy;   /// { %swift.type*, iSize }
     llvm::StructType *TypeMetadataDependencyTy; /// { %swift.type*, iSize }
@@ -1045,7 +1056,6 @@ private:
   llvm::StringMap<llvm::Constant*> GlobalUTF16Strings;
   llvm::StringMap<std::pair<llvm::GlobalVariable*, llvm::Constant*>>
     StringsForTypeRef;
-  llvm::DenseMap<CanType, llvm::GlobalVariable*> TypeRefs;
   llvm::StringMap<std::pair<llvm::GlobalVariable*, llvm::Constant*>> FieldNames;
   llvm::StringMap<llvm::Constant*> ObjCSelectorRefs;
   llvm::StringMap<llvm::Constant*> ObjCMethodNames;
@@ -1077,7 +1087,7 @@ private:
   SmallVector<llvm::WeakTrackingVH, 4> LLVMCompilerUsed;
 
   /// Metadata nodes for autolinking info.
-  SmallVector<llvm::MDNode *, 32> AutolinkEntries;
+  SmallVector<LinkLibrary, 32> AutolinkEntries;
 
   /// List of Objective-C classes, bitcast to i8*.
   SmallVector<llvm::WeakTrackingVH, 4> ObjCClasses;
@@ -1367,6 +1377,8 @@ public:
                                             llvm::Constant *definition);
   llvm::Constant *getAddrOfMethodDescriptor(SILDeclRef declRef,
                                             ForDefinition_t forDefinition);
+  void emitNonoverriddenMethodDescriptor(const SILVTable *VTable,
+                                         SILDeclRef declRef);
 
   Address getAddrOfEnumCase(EnumElementDecl *Case,
                             ForDefinition_t forDefinition);
@@ -1391,9 +1403,14 @@ public:
 
   TypeEntityReference getTypeEntityReference(GenericTypeDecl *D);
 
-  llvm::Constant *getAddrOfTypeMetadata(CanType concreteType);
-  ConstantReference getAddrOfTypeMetadata(CanType concreteType,
-                                          SymbolReferenceKind kind);
+  llvm::Constant *
+  getAddrOfTypeMetadata(CanType concreteType,
+                        TypeMetadataCanonicality canonicality =
+                            TypeMetadataCanonicality::Canonical);
+  ConstantReference
+  getAddrOfTypeMetadata(CanType concreteType, SymbolReferenceKind kind,
+                        TypeMetadataCanonicality canonicality =
+                            TypeMetadataCanonicality::Canonical);
   llvm::Constant *getAddrOfTypeMetadataPattern(NominalTypeDecl *D);
   llvm::Constant *getAddrOfTypeMetadataPattern(NominalTypeDecl *D,
                                                ConstantInit init,
@@ -1419,6 +1436,7 @@ public:
   llvm::Constant *getAddrOfTypeMetadataLazyCacheVariable(CanType type);
   llvm::Constant *getAddrOfTypeMetadataDemanglingCacheVariable(CanType type,
                                                        ConstantInit definition);
+  llvm::Constant *getAddrOfNoncanonicalSpecializedGenericTypeMetadataCacheVariable(CanType type);
 
   llvm::Constant *getAddrOfClassMetadataBounds(ClassDecl *D,
                                                ForDefinition_t forDefinition);

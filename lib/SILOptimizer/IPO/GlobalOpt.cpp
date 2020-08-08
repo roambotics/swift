@@ -431,9 +431,8 @@ bool SILGlobalOpt::optimizeInitializer(SILFunction *AddrF,
   // If the addressor contains a single "once" call, it calls globalinit_func,
   // and the globalinit_func is called by "once" from a single location,
   // continue; otherwise bail.
-  auto *InitF = findInitializer(Module, AddrF, CallToOnce);
-  if (!InitF || !InitF->getName().startswith("globalinit_") ||
-      InitializerCount[InitF] > 1)
+  auto *InitF = findInitializer(AddrF, CallToOnce);
+  if (!InitF || InitializerCount[InitF] > 1)
     return false;
 
   // If the globalinit_func is trivial, continue; otherwise bail.
@@ -713,11 +712,6 @@ void SILGlobalOpt::reset() {
 
 void SILGlobalOpt::collect() {
   for (auto &F : *Module) {
-    // TODO: Add support for ownership.
-    if (F.hasOwnership()) {
-      continue;
-    }
-
     // Make sure to create an entry. This is important in case a global variable
     // (e.g. a public one) is not used inside the same module.
     if (F.isGlobalInit())

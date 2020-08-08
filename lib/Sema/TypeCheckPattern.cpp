@@ -286,7 +286,7 @@ public:
   ALWAYS_RESOLVED_PATTERN(Bool)
 #undef ALWAYS_RESOLVED_PATTERN
 
-  Pattern *visitVarPattern(VarPattern *P) {
+  Pattern *visitBindingPattern(BindingPattern *P) {
     // Keep track of the fact that we're inside of a var/let pattern.  This
     // affects how unqualified identifiers are processed.
     P->setSubPattern(visit(P->getSubPattern()));
@@ -467,26 +467,26 @@ public:
     if (!ExprToIdentTypeRepr(components, Context).visit(ude->getBase()))
       return nullptr;
 
-    TypeResolutionOptions options = None;
-    options |= TypeResolutionFlags::AllowUnboundGenerics;
-    options |= TypeResolutionFlags::SilenceErrors;
+    auto *const repr = IdentTypeRepr::create(Context, components);
 
-    auto *repr = IdentTypeRepr::create(Context, components);
+    // See first if the repr unambiguously references an enum declaration.
+    bool anyObject = false;
+    const auto &referencedDecls =
+        getDirectlyReferencedNominalTypeDecls(Context, repr, DC, anyObject);
+    if (referencedDecls.size() != 1)
+      return nullptr;
 
-    // See if the repr resolves to a type.
-    auto ty = TypeResolution::forContextual(DC, options).resolveType(repr);
-    auto *enumDecl = dyn_cast_or_null<EnumDecl>(ty->getAnyNominal());
+    auto *const enumDecl = dyn_cast<EnumDecl>(referencedDecls.front());
     if (!enumDecl)
       return nullptr;
 
-    EnumElementDecl *referencedElement
-      = lookupEnumMemberElement(DC, ty, ude->getName(), ude->getLoc());
+    EnumElementDecl *referencedElement =
+        lookupEnumMemberElement(DC, enumDecl->getDeclaredInterfaceType(),
+                                ude->getName(), ude->getLoc());
     if (!referencedElement)
       return nullptr;
 
-    auto *base =
-        TypeExpr::createForMemberDecl(repr, ude->getNameLoc(), enumDecl);
-    base->setType(MetatypeType::get(ty));
+    auto *const base = new (Context) TypeExpr(repr);
     return new (Context)
         EnumElementPattern(base, ude->getDotLoc(), ude->getNameLoc(),
                            ude->getName(), referencedElement, nullptr);
@@ -564,34 +564,31 @@ public:
       baseTE = TypeExpr::createImplicit(enumDecl->getDeclaredTypeInContext(),
                                         Context);
     } else {
-      TypeResolutionOptions options = None;
-      options |= TypeResolutionFlags::AllowUnboundGenerics;
-      options |= TypeResolutionFlags::SilenceErrors;
-
       // Otherwise, see whether we had an enum type as the penultimate
       // component, and look up an element inside it.
-      auto *prefixRepr = IdentTypeRepr::create(Context, components);
+      auto *const prefixRepr = IdentTypeRepr::create(Context, components);
 
-      // See first if the entire repr resolves to a type.
-      Type enumTy = TypeResolution::forContextual(DC, options)
-                        .resolveType(prefixRepr);
-      auto *enumDecl = dyn_cast_or_null<EnumDecl>(enumTy->getAnyNominal());
+      // See first if the repr unambiguously references an enum declaration.
+      bool anyObject = false;
+      const auto &referencedDecls = getDirectlyReferencedNominalTypeDecls(
+          Context, prefixRepr, DC, anyObject);
+      if (referencedDecls.size() != 1)
+        return nullptr;
+
+      auto *const enumDecl = dyn_cast<EnumDecl>(referencedDecls.front());
       if (!enumDecl)
         return nullptr;
 
-      referencedElement
-        = lookupEnumMemberElement(DC, enumTy,
-                                  tailComponent->getNameRef(),
-                                  tailComponent->getLoc());
+      referencedElement = lookupEnumMemberElement(
+          DC, enumDecl->getDeclaredInterfaceType(), tailComponent->getNameRef(),
+          tailComponent->getLoc());
       if (!referencedElement)
         return nullptr;
 
-      baseTE = TypeExpr::createForMemberDecl(
-          prefixRepr, tailComponent->getNameLoc(), enumDecl);
-      baseTE->setType(MetatypeType::get(enumTy));
+      baseTE = new (Context) TypeExpr(prefixRepr);
     }
 
-    assert(baseTE && baseTE->getType() && "Didn't initialize base expression?");
+    assert(baseTE && "Didn't initialize base expression?");
     assert(!isa<GenericIdentTypeRepr>(tailComponent) &&
            "should be handled above");
 
@@ -635,11 +632,11 @@ Pattern *TypeChecker::resolvePattern(Pattern *P, DeclContext *DC,
   if (auto *TP = dyn_cast<TypedPattern>(P))
     InnerP = TP->getSubPattern();
 
-  // If the pattern was valid, check for an implicit VarPattern on the outer
+  // If the pattern was valid, check for an implicit BindingPattern on the outer
   // level.  If so, we have an "if let" condition and we want to enforce some
   // more structure on it.
-  if (isStmtCondition && isa<VarPattern>(InnerP) && InnerP->isImplicit()) {
-    auto *Body = cast<VarPattern>(InnerP)->getSubPattern();
+  if (isStmtCondition && isa<BindingPattern>(InnerP) && InnerP->isImplicit()) {
+    auto *Body = cast<BindingPattern>(InnerP)->getSubPattern();
 
     // If they wrote a "x?" pattern, they probably meant "if let x".
     // Check for this and recover nicely if they wrote that.
@@ -726,7 +723,6 @@ static TypeResolutionOptions applyContextualPatternOptions(
     TypeResolutionOptions options, ContextualPattern pattern) {
   if (pattern.allowsInference()) {
     options |= TypeResolutionFlags::AllowUnspecifiedTypes;
-    options |= TypeResolutionFlags::AllowUnboundGenerics;
   }
 
   return options;
@@ -750,12 +746,12 @@ Type PatternTypeRequest::evaluate(Evaluator &evaluator,
   // Type-check paren patterns by checking the sub-pattern and
   // propagating that type out.
   case PatternKind::Paren:
-  case PatternKind::Var: {
+  case PatternKind::Binding: {
     Pattern *SP;
     if (auto *PP = dyn_cast<ParenPattern>(P))
       SP = PP->getSubPattern();
     else
-      SP = cast<VarPattern>(P)->getSubPattern();
+      SP = cast<BindingPattern>(P)->getSubPattern();
     Type subType = TypeChecker::typeCheckPattern(
         pattern.forSubPattern(SP, /*retainTopLevel=*/true));
     if (subType->hasError())
@@ -770,8 +766,17 @@ Type PatternTypeRequest::evaluate(Evaluator &evaluator,
   // If we see an explicit type annotation, coerce the sub-pattern to
   // that type.
   case PatternKind::Typed: {
-    auto resolution = TypeResolution::forContextual(dc, options);
-    return validateTypedPattern(cast<TypedPattern>(P), resolution);
+    OpenUnboundGenericTypeFn unboundTyOpener = nullptr;
+    if (pattern.allowsInference()) {
+      unboundTyOpener = [](auto unboundTy) {
+        // FIXME: Don't let unbound generic types escape type resolution.
+        // For now, just return the unbound generic type.
+        return unboundTy;
+      };
+    }
+    return validateTypedPattern(
+        cast<TypedPattern>(P),
+        TypeResolution::forContextual(dc, options, unboundTyOpener));
   }
 
   // A wildcard or name pattern cannot appear by itself in a context
@@ -824,9 +829,17 @@ Type PatternTypeRequest::evaluate(Evaluator &evaluator,
     // typed pattern, the resulting pattern must have optional type.
     auto somePat = cast<OptionalSomePattern>(P);
     if (somePat->isImplicit() && isa<TypedPattern>(somePat->getSubPattern())) {
-      auto resolution = TypeResolution::forContextual(dc, options);
+      OpenUnboundGenericTypeFn unboundTyOpener = nullptr;
+      if (pattern.allowsInference()) {
+        unboundTyOpener = [](auto unboundTy) {
+          // FIXME: Don't let unbound generic types escape type resolution.
+          // For now, just return the unbound generic type.
+          return unboundTy;
+        };
+      }
       TypedPattern *TP = cast<TypedPattern>(somePat->getSubPattern());
-      auto type = validateTypedPattern(TP, resolution);
+      const auto type = validateTypedPattern(
+          TP, TypeResolution::forContextual(dc, options, unboundTyOpener));
       if (type && !type->hasError()) {
         return OptionalType::get(type);
       }
@@ -987,9 +1000,9 @@ Pattern *TypeChecker::coercePatternToType(ContextualPattern pattern,
     PP->setType(sub->getType());
     return P;
   }
-  case PatternKind::Var: {
-    auto VP = cast<VarPattern>(P);
-    
+  case PatternKind::Binding: {
+    auto VP = cast<BindingPattern>(P);
+
     Pattern *sub = VP->getSubPattern();
     sub = coercePatternToType(
         pattern.forSubPattern(sub, /*retainTopLevel=*/false), type, subOptions);
@@ -1230,9 +1243,12 @@ Pattern *TypeChecker::coercePatternToType(ContextualPattern pattern,
     auto IP = cast<IsPattern>(P);
 
     // Type-check the type parameter.
-    TypeResolutionOptions paramOptions(TypeResolverContext::InExpression);
-    auto castType = TypeResolution::forContextual(dc, paramOptions)
-                        .resolveType(IP->getCastTypeRepr());
+    const auto castType =
+        TypeResolution::forContextual(dc, TypeResolverContext::InExpression,
+                                      // FIXME: Should we really unconditionally
+                                      // complain about unbound generics here?
+                                      /*unboundTyOpener*/ nullptr)
+            .resolveType(IP->getCastTypeRepr());
     if (castType->hasError())
       return nullptr;
     IP->setCastType(castType);
@@ -1292,6 +1308,9 @@ Pattern *TypeChecker::coercePatternToType(ContextualPattern pattern,
       diags.diagnose(IP->getLoc(),
                      diag::isa_collection_downcast_pattern_value_unimplemented,
                      IP->getCastType());
+      IP->setType(ErrorType::get(Context));
+      if (Pattern *sub = IP->getSubPattern())
+        sub->forEachVariable([](VarDecl *VD) { VD->setInvalid(); });
       return P;
     }
 
@@ -1407,11 +1426,25 @@ Pattern *TypeChecker::coercePatternToType(ContextualPattern pattern,
 
       enumTy = type;
     } else {
+      // Validate the parent type if we haven't done so yet.
+      if (EEP->getParentType().isNull()) {
+        const auto resolution =
+            TypeResolution::forContextual(dc, options, [](auto unboundTy) {
+              // FIXME: Don't let unbound generic types escape type resolution.
+              // For now, just return the unbound generic type.
+              return unboundTy;
+            });
+        const auto ty = resolution.resolveType(EEP->getParentTypeRepr());
+        EEP->setParentType(ty);
+
+        if (ty->hasError()) {
+          return nullptr;
+        }
+      }
+
       // Check if the explicitly-written enum type matches the type we're
       // coercing to.
-      assert(!EEP->getParentType().isNull()
-             && "enum with resolved element doesn't specify parent type?!");
-      auto parentTy = EEP->getParentType();
+      const Type parentTy = EEP->getParentType();
       // If the type matches exactly, use it.
       if (parentTy->isEqual(type)) {
         enumTy = type;

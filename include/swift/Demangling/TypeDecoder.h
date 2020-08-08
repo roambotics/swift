@@ -20,6 +20,7 @@
 
 #include "swift/ABI/MetadataValues.h"
 #include "swift/Demangling/Demangler.h"
+#include "swift/Demangling/NamespaceMacros.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Runtime/Unreachable.h"
 #include "swift/Strings.h"
@@ -28,6 +29,7 @@
 
 namespace swift {
 namespace Demangle {
+SWIFT_BEGIN_INLINE_NAMESPACE
 
 enum class ImplMetatypeRepresentation {
   Thin,
@@ -591,16 +593,29 @@ class TypeDecoder {
             FunctionMetadataDifferentiabilityKind::Linear);
       }
 
-      bool isThrow =
-        Node->getChild(0)->getKind() == NodeKind::ThrowsAnnotation;
-      flags = flags.withThrows(isThrow);
+      unsigned firstChildIdx = 0;
+      bool isThrow = false;
+      if (Node->getChild(firstChildIdx)->getKind()
+            == NodeKind::ThrowsAnnotation) {
+        isThrow = true;
+        ++firstChildIdx;
+      }
 
-      if (isThrow && Node->getNumChildren() < 3)
+      bool isAsync = false;
+      if (Node->getChild(firstChildIdx)->getKind()
+            == NodeKind::AsyncAnnotation) {
+        isAsync = true;
+        ++firstChildIdx;
+      }
+
+      flags = flags.withAsync(isAsync).withThrows(isThrow);
+
+      if (Node->getNumChildren() < firstChildIdx + 2)
         return BuiltType();
 
       bool hasParamFlags = false;
       llvm::SmallVector<FunctionParam<BuiltType>, 8> parameters;
-      if (!decodeMangledFunctionInputType(Node->getChild(isThrow ? 1 : 0),
+      if (!decodeMangledFunctionInputType(Node->getChild(firstChildIdx),
                                           parameters, hasParamFlags))
         return BuiltType();
       flags =
@@ -615,7 +630,7 @@ class TypeDecoder {
                           Node->getKind() ==
                               NodeKind::EscapingLinearFunctionType);
 
-      auto result = decodeMangledType(Node->getChild(isThrow ? 2 : 1));
+      auto result = decodeMangledType(Node->getChild(firstChildIdx+1));
       if (!result) return BuiltType();
       return Builder.createFunctionType(parameters, result, flags);
     }
@@ -709,7 +724,6 @@ class TypeDecoder {
     case NodeKind::Tuple: {
       llvm::SmallVector<BuiltType, 8> elements;
       std::string labels;
-      bool variadic = false;
       for (auto &element : *Node) {
         if (element->getKind() != NodeKind::TupleElement)
           return BuiltType();
@@ -742,7 +756,7 @@ class TypeDecoder {
 
         elements.push_back(elementType);
       }
-      return Builder.createTupleType(elements, std::move(labels), variadic);
+      return Builder.createTupleType(elements, std::move(labels));
     }
     case NodeKind::TupleElement:
       if (Node->getNumChildren() < 1)
@@ -1152,6 +1166,7 @@ decodeMangledType(BuilderType &Builder,
 }
 
 
+SWIFT_END_INLINE_NAMESPACE
 } // end namespace Demangle
 } // end namespace swift
 

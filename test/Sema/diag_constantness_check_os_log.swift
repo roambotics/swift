@@ -1,6 +1,6 @@
 // RUN: %target-typecheck-verify-swift -swift-version 5
 
-// REQUIRES: OS=macosx || OS=ios || OS=tvos || OS=watchos
+// REQUIRES: VENDOR=apple
 
 // Tests the constantness Sema diagnostics for the OSLogTestHelper module,
 // which acts as a stub for the os overlay.
@@ -155,4 +155,33 @@ func testNonConstantLogObjectLevel(
 
   osLogWithLevel(level, log: log, message)
     // expected-error@-1 {{argument must be a string interpolation}}
+}
+
+// Test that log messages can be wrapped in constant_evaluable functions.
+
+// A function similar to the one used by SwiftUI preview to wrap string
+// literals.
+@_semantics("constant_evaluable")
+public func __designTimeStringStub(
+  _ key: String,
+  fallback: OSLogMessage
+) -> OSLogMessage {
+  fallback
+}
+
+func testSwiftUIPreviewWrapping() {
+  // This should not produce any diagnostics.
+  _osLogTestHelper(__designTimeStringStub("key", fallback: "A literal message"))
+}
+
+public func nonConstantFunction(
+  _ key: String,
+  fallback: OSLogMessage
+) -> OSLogMessage {
+  fallback
+}
+
+func testLogMessageWrappingDiagnostics() {
+  _osLogTestHelper(nonConstantFunction("key", fallback: "A literal message"))
+    // expected-error@-1{{argument must be a string interpolation}}
 }

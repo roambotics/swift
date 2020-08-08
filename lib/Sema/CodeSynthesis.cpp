@@ -253,8 +253,9 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
         // type.
         if (var->isPropertyMemberwiseInitializedWithWrappedType()) {
           varInterfaceType = var->getPropertyWrapperInitValueInterfaceType();
-          isAutoClosure =
-            var->isInnermostPropertyWrapperInitUsesEscapingAutoClosure();
+
+          auto wrapperInfo = var->getPropertyWrapperBackingPropertyInfo();
+          isAutoClosure = wrapperInfo.wrappedValuePlaceholder->isAutoClosure();
         } else {
           varInterfaceType = backingPropertyType;
         }
@@ -322,11 +323,11 @@ synthesizeStubBody(AbstractFunctionDecl *fn, void *) {
   }
 
   auto *staticStringDecl = ctx.getStaticStringDecl();
-  auto staticStringType = staticStringDecl->getDeclaredType();
+  auto staticStringType = staticStringDecl->getDeclaredInterfaceType();
   auto staticStringInit = ctx.getStringBuiltinInitDecl(staticStringDecl);
 
   auto *uintDecl = ctx.getUIntDecl();
-  auto uintType = uintDecl->getDeclaredType();
+  auto uintType = uintDecl->getDeclaredInterfaceType();
   auto uintInit = ctx.getIntBuiltinInitDecl(uintDecl);
 
   // Create a call to Swift._unimplementedInitializer
@@ -355,7 +356,7 @@ synthesizeStubBody(AbstractFunctionDecl *fn, void *) {
   initName->setBuiltinInitializer(staticStringInit);
 
   auto *file = new (ctx) MagicIdentifierLiteralExpr(
-    MagicIdentifierLiteralExpr::File, loc, /*Implicit=*/true);
+    MagicIdentifierLiteralExpr::FileID, loc, /*Implicit=*/true);
   file->setType(staticStringType);
   file->setBuiltinInitializer(staticStringInit);
 
@@ -1413,23 +1414,4 @@ void swift::addFixedLayoutAttr(NominalTypeDecl *nominal) {
   }
   // Add `@_fixed_layout` to the nominal.
   nominal->getAttrs().add(new (C) FixedLayoutAttr(/*Implicit*/ true));
-}
-
-Expr *DiscriminatorFinder::walkToExprPost(Expr *E) {
-  auto *ACE = dyn_cast<AbstractClosureExpr>(E);
-  if (!ACE)
-    return E;
-
-  unsigned Discriminator = ACE->getDiscriminator();
-  assert(Discriminator != AbstractClosureExpr::InvalidDiscriminator &&
-         "Existing closures should have valid discriminators");
-  if (Discriminator >= NextDiscriminator)
-    NextDiscriminator = Discriminator + 1;
-  return E;
-}
-
-unsigned DiscriminatorFinder::getNextDiscriminator() {
-  if (NextDiscriminator == AbstractClosureExpr::InvalidDiscriminator)
-    llvm::report_fatal_error("Out of valid closure discriminators");
-  return NextDiscriminator++;
 }

@@ -553,6 +553,9 @@ public:
   /// Array.reserveCapacityForAppend(newElementsCount: Int)
   FuncDecl *getArrayReserveCapacityDecl() const;
 
+  /// Retrieve the declaration of String.init(_builtinStringLiteral ...)
+  ConstructorDecl *getMakeUTF8StringDecl() const;
+
   // Retrieve the declaration of Swift._stdlib_isOSVersionAtLeast.
   FuncDecl *getIsOSVersionAtLeastDecl() const;
   
@@ -587,13 +590,9 @@ public:
   ///
   /// \param params The function parameters.
   /// \param resultTy The Swift result type.
-  /// \param incompleteExtInfo Used to convey escaping and throwing
-  ///                          information, in case it is needed.
   /// \param trueRep The actual calling convention, which must be C-compatible.
-  ///                The calling convention in \p incompleteExtInfo is ignored.
   const clang::Type *
   getClangFunctionType(ArrayRef<AnyFunctionType::Param> params, Type resultTy,
-                       const FunctionType::ExtInfo incompleteExtInfo,
                        FunctionTypeRepresentation trueRep);
 
   /// Get the Swift declaration that a Clang declaration was exported from,
@@ -648,6 +647,19 @@ public:
   /// Get the runtime availability of support for prespecialized generic 
   /// metadata.
   AvailabilityContext getPrespecializedGenericMetadataAvailability();
+
+  /// Get the runtime availability of the swift_compareTypeContextDescriptors
+  /// for the target platform.
+  AvailabilityContext getCompareTypeContextDescriptorsAvailability();
+
+  /// Get the runtime availability of the
+  /// swift_compareProtocolConformanceDescriptors entry point for the target
+  /// platform.
+  AvailabilityContext getCompareProtocolConformanceDescriptorsAvailability();
+
+  /// Get the runtime availability of support for inter-module prespecialized
+  /// generic metadata.
+  AvailabilityContext getIntermodulePrespecializedGenericMetadataAvailability();
 
   /// Get the runtime availability of features introduced in the Swift 5.2
   /// compiler for the target platform.
@@ -707,8 +719,11 @@ public:
   ///                compiler.
   /// \param isDWARF \c true if this module loader can load Clang modules
   ///                from DWARF.
+  /// \param IsInterface \c true if this module loader can load Swift textual
+  ///                interface.
   void addModuleLoader(std::unique_ptr<ModuleLoader> loader,
-                       bool isClang = false, bool isDWARF = false);
+                       bool isClang = false, bool isDWARF = false,
+                       bool IsInterface = false);
 
   /// Retrieve the module dependencies for the module with the given name.
   ///
@@ -782,6 +797,8 @@ public:
   /// The loader is owned by the AST context.
   ClangModuleLoader *getDWARFModuleLoader() const;
 
+  /// Retrieve the module interface loader for this ASTContext.
+  ModuleLoader *getModuleInterfaceLoader() const;
 public:
   namelookup::ImportCache &getImportCache() const;
 

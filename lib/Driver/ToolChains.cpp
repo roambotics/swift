@@ -22,6 +22,7 @@
 #include "swift/Driver/Compilation.h"
 #include "swift/Driver/Driver.h"
 #include "swift/Driver/Job.h"
+#include "swift/Frontend/Frontend.h"
 #include "swift/Option/Options.h"
 #include "clang/Basic/Version.h"
 #include "clang/Driver/Util.h"
@@ -167,6 +168,17 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
     arguments.push_back("-disable-objc-interop");
   }
 
+  // Add flags for C++ interop.
+  if (inputArgs.hasArg(options::OPT_enable_experimental_cxx_interop)) {
+    arguments.push_back("-enable-cxx-interop");
+  }
+  if (const Arg *arg =
+          inputArgs.getLastArg(options::OPT_experimental_cxx_stdlib)) {
+    arguments.push_back("-Xcc");
+    arguments.push_back(
+        inputArgs.MakeArgString(Twine("-stdlib=") + arg->getValue()));
+  }
+
   // Handle the CPU and its preferences.
   inputArgs.AddLastArg(arguments, options::OPT_target_cpu);
 
@@ -242,6 +254,8 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   inputArgs.AddLastArg(arguments,
                        options::OPT_emit_fine_grained_dependency_sourcefile_dot_files);
   inputArgs.AddLastArg(arguments, options::OPT_package_description_version);
+  inputArgs.AddLastArg(arguments, options::OPT_locale);
+  inputArgs.AddLastArg(arguments, options::OPT_localization_path);
   inputArgs.AddLastArg(arguments, options::OPT_serialize_diagnostics_path);
   inputArgs.AddLastArg(arguments, options::OPT_debug_diagnostic_names);
   inputArgs.AddLastArg(arguments, options::OPT_print_educational_notes);
@@ -251,6 +265,10 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   inputArgs.AddLastArg(arguments, options::OPT_disable_parser_lookup);
   inputArgs.AddLastArg(arguments,
                        options::OPT_enable_experimental_concise_pound_file);
+  inputArgs.AddLastArg(
+      arguments,
+      options::OPT_enable_fuzzy_forward_scan_trailing_closure_matching,
+      options::OPT_disable_fuzzy_forward_scan_trailing_closure_matching);
   inputArgs.AddLastArg(arguments,
                        options::OPT_verify_incremental_dependencies);
   inputArgs.AddLastArg(arguments,
@@ -518,6 +536,13 @@ ToolChain::constructInvocation(const CompileJobAction &job,
   }
   if (context.Args.hasArg(options::OPT_track_system_dependencies)) {
     Arguments.push_back("-track-system-dependencies");
+  }
+
+  if (context.Args.hasFlag(options::OPT_static_executable,
+                           options::OPT_no_static_executable, false) ||
+      context.Args.hasFlag(options::OPT_static_stdlib,
+                           options::OPT_no_static_stdlib, false)) {
+    Arguments.push_back("-use-static-resource-dir");
   }
 
   context.Args.AddLastArg(
@@ -979,9 +1004,6 @@ ToolChain::constructInvocation(const MergeModuleJobAction &job,
   // serialized ASTs.
   Arguments.push_back("-parse-as-library");
 
-  // Merge serialized SIL from partial modules.
-  Arguments.push_back("-sil-merge-partial-modules");
-
   // Disable SIL optimization passes; we've already optimized the code in each
   // partial mode.
   Arguments.push_back("-disable-diagnostic-passes");
@@ -1256,24 +1278,18 @@ void ToolChain::getClangLibraryPath(const ArgList &Args,
 void ToolChain::getResourceDirPath(SmallVectorImpl<char> &resourceDirPath,
                                    const llvm::opt::ArgList &args,
                                    bool shared) const {
-  // FIXME: Duplicated from CompilerInvocation, but in theory the runtime
-  // library link path and the standard library module import path don't
-  // need to be the same.
   if (const Arg *A = args.getLastArg(options::OPT_resource_dir)) {
     StringRef value = A->getValue();
     resourceDirPath.append(value.begin(), value.end());
   } else if (!getTriple().isOSDarwin() && args.hasArg(options::OPT_sdk)) {
     StringRef value = args.getLastArg(options::OPT_sdk)->getValue();
     resourceDirPath.append(value.begin(), value.end());
-    llvm::sys::path::append(resourceDirPath, "usr", "lib",
-                            shared ? "swift" : "swift_static");
+    llvm::sys::path::append(resourceDirPath, "usr");
+    CompilerInvocation::appendSwiftLibDir(resourceDirPath, shared);
   } else {
     auto programPath = getDriver().getSwiftProgramPath();
-    resourceDirPath.append(programPath.begin(), programPath.end());
-    llvm::sys::path::remove_filename(resourceDirPath); // remove /swift
-    llvm::sys::path::remove_filename(resourceDirPath); // remove /bin
-    llvm::sys::path::append(resourceDirPath, "lib",
-                            shared ? "swift" : "swift_static");
+    CompilerInvocation::computeRuntimeResourcePathFromExecutablePath(
+        programPath, shared, resourceDirPath);
   }
 
   StringRef libSubDir = getPlatformNameForTriple(getTriple());
@@ -1326,6 +1342,26 @@ void ToolChain::getRuntimeLibraryPaths(SmallVectorImpl<std::string> &runtimeLibP
     llvm::sys::path::append(scratchPath, "usr", "lib", "swift");
     runtimeLibPaths.push_back(std::string(scratchPath.str()));
   }
+}
+
+const char *ToolChain::getClangLinkerDriver(
+    const llvm::opt::ArgList &Args) const {
+  // We don't use `clang++` unconditionally because we want to avoid pulling in
+  // a C++ standard library if it's not needed, in particular because the
+  // standard library that `clang++` selects by default may not be the one that
+  // is desired.
+  const char *LinkerDriver =
+      Args.hasArg(options::OPT_enable_experimental_cxx_interop) ? "clang++"
+                                                                : "clang";
+  if (const Arg *A = Args.getLastArg(options::OPT_tools_directory)) {
+    StringRef toolchainPath(A->getValue());
+
+    // If there is a linker driver in the toolchain folder, use that instead.
+    if (auto tool = llvm::sys::findProgramByName(LinkerDriver, {toolchainPath}))
+      LinkerDriver = Args.MakeArgString(tool.get());
+  }
+
+  return LinkerDriver;
 }
 
 bool ToolChain::sanitizerRuntimeLibExists(const ArgList &args,

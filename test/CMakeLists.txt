@@ -49,7 +49,7 @@ function(get_test_dependencies SDK result_var_name)
       sil-nm
       sil-opt
       sil-passpipeline-dumper
-      swift
+      swift-frontend
       swift-api-digester
       swift-demangle
       swift-demangle-yamldump
@@ -114,15 +114,10 @@ function(get_test_dependencies SDK result_var_name)
     message(FATAL_ERROR "Unknown SDK: ${SDK}")
   endif()
 
-  if(XCODE)
-    # Xcode's build paths have a configuration variable in them,
-    # so CMake can't match them at compile time. Just use target names.
-    list(APPEND deps ${deps_binaries})
-  else()
-    foreach(binary ${deps_binaries})
-      list(APPEND deps "${SWIFT_NATIVE_SWIFT_TOOLS_PATH}/${binary}${CMAKE_EXECUTABLE_SUFFIX}")
-    endforeach()
-  endif()
+  # Just use target names for dependency generation. This works for both Xcode
+  # and non-Xcode build systems. In the case of Xcode, its build paths have a
+  # configuration variable in them, so CMake can't match them at compile time.
+  list(APPEND deps ${deps_binaries})
 
   set("${result_var_name}" "${deps}" PARENT_SCOPE)
 endfunction()
@@ -168,6 +163,7 @@ normalize_boolean_spelling(SWIFT_ASAN_BUILD)
 normalize_boolean_spelling(SWIFT_BUILD_SYNTAXPARSERLIB)
 normalize_boolean_spelling(SWIFT_ENABLE_SOURCEKIT_TESTS)
 normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING)
+normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY)
 is_build_type_optimized("${SWIFT_STDLIB_BUILD_TYPE}" SWIFT_OPTIMIZED)
 
 set(profdata_merge_worker
@@ -366,6 +362,10 @@ _Block_release(void) { }\n")
 
       if(SWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING)
         list(APPEND LIT_ARGS "--param" "differentiable_programming")
+      endif()
+
+      if(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY)
+        list(APPEND LIT_ARGS "--param" "concurrency")
       endif()
 
       foreach(test_subset ${TEST_SUBSETS})

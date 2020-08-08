@@ -58,18 +58,17 @@ class StorageImplInfo;
 
 /// Display a nominal type or extension thereof.
 void simple_display(
-       llvm::raw_ostream &out,
-       const llvm::PointerUnion<TypeDecl *, ExtensionDecl *> &value);
+    llvm::raw_ostream &out,
+    const llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> &value);
 
 /// Request the type from the ith entry in the inheritance clause for the
 /// given declaration.
-class InheritedTypeRequest :
-    public SimpleRequest<InheritedTypeRequest,
-                         Type(llvm::PointerUnion<TypeDecl *, ExtensionDecl *>,
-                              unsigned,
-                              TypeResolutionStage),
-                         RequestFlags::SeparatelyCached>
-{
+class InheritedTypeRequest
+    : public SimpleRequest<
+          InheritedTypeRequest,
+          Type(llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *>,
+               unsigned, TypeResolutionStage),
+          RequestFlags::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -79,9 +78,8 @@ private:
   // Evaluation.
   Type
   evaluate(Evaluator &evaluator,
-           llvm::PointerUnion<TypeDecl *, ExtensionDecl *> decl,
-           unsigned index,
-           TypeResolutionStage stage) const;
+           llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> decl,
+           unsigned index, TypeResolutionStage stage) const;
 
 public:
   // Source location
@@ -397,6 +395,9 @@ struct WhereClauseOwner {
 
   WhereClauseOwner(DeclContext *dc, GenericParamList *genericParams)
       : dc(dc), source(genericParams) {}
+
+  WhereClauseOwner(DeclContext *dc, TrailingWhereClause *where)
+      : dc(dc), source(where) {}
 
   WhereClauseOwner(DeclContext *dc, SpecializeAttr *attr)
       : dc(dc), source(attr) {}
@@ -894,9 +895,9 @@ public:
 /// Request to typecheck a function body element at the given source location.
 ///
 /// Produces true if an error occurred, false otherwise.
-class TypeCheckFunctionBodyAtLocRequest
-    : public SimpleRequest<TypeCheckFunctionBodyAtLocRequest,
-                           bool(AbstractFunctionDecl *, SourceLoc),
+class TypeCheckASTNodeAtLocRequest
+    : public SimpleRequest<TypeCheckASTNodeAtLocRequest,
+                           bool(DeclContext *, SourceLoc),
                            RequestFlags::Uncached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -905,8 +906,7 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  bool evaluate(Evaluator &evaluator, AbstractFunctionDecl *func,
-                SourceLoc Loc) const;
+  bool evaluate(Evaluator &evaluator, DeclContext *DC, SourceLoc Loc) const;
 };
 
 /// Request to obtain a list of stored properties in a nominal type.
@@ -1064,8 +1064,8 @@ public:
 
 class EmittedMembersRequest :
     public SimpleRequest<EmittedMembersRequest,
-                         DeclRange(ClassDecl *),
-                         RequestFlags::SeparatelyCached> {
+                         ArrayRef<Decl *>(ClassDecl *),
+                         RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -1073,14 +1073,11 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  DeclRange
+  ArrayRef<Decl *>
   evaluate(Evaluator &evaluator, ClassDecl *classDecl) const;
 
 public:
-  // Separate caching.
   bool isCached() const { return true; }
-  Optional<DeclRange> getCachedResult() const;
-  void cacheResult(DeclRange value) const;
 };
 
 class IsImplicitlyUnwrappedOptionalRequest :
@@ -1826,6 +1823,45 @@ public:
   void cacheResult(Witness value) const;
 };
 
+struct PreCheckFunctionBuilderDescriptor {
+  AnyFunctionRef Fn;
+
+private:
+  // NOTE: Since source tooling (e.g. code completion) might replace the body,
+  // we need to take the body into account to calculate 'hash_value' and '=='.
+  // Also, we cannot 'getBody()' inside 'hash_value' and '==' because it invokes
+  // another request (even if it's cached).
+  BraceStmt *Body;
+
+public:
+  PreCheckFunctionBuilderDescriptor(AnyFunctionRef Fn)
+      : Fn(Fn), Body(Fn.getBody()) {}
+
+  friend llvm::hash_code
+  hash_value(const PreCheckFunctionBuilderDescriptor &owner) {
+    return llvm::hash_combine(owner.Fn, owner.Body);
+  }
+
+  friend bool operator==(const PreCheckFunctionBuilderDescriptor &lhs,
+                         const PreCheckFunctionBuilderDescriptor &rhs) {
+    return lhs.Fn == rhs.Fn && lhs.Body == rhs.Body;
+  }
+
+  friend bool operator!=(const PreCheckFunctionBuilderDescriptor &lhs,
+                         const PreCheckFunctionBuilderDescriptor &rhs) {
+    return !(lhs == rhs);
+  }
+
+  friend SourceLoc extractNearestSourceLoc(PreCheckFunctionBuilderDescriptor d) {
+    return extractNearestSourceLoc(d.Fn);
+  }
+
+  friend void simple_display(llvm::raw_ostream &out,
+                             const PreCheckFunctionBuilderDescriptor &d) {
+    simple_display(out, d.Fn);
+  }
+};
+
 enum class FunctionBuilderBodyPreCheck : uint8_t {
   /// There were no problems pre-checking the closure.
   Okay,
@@ -1839,7 +1875,8 @@ enum class FunctionBuilderBodyPreCheck : uint8_t {
 
 class PreCheckFunctionBuilderRequest
     : public SimpleRequest<PreCheckFunctionBuilderRequest,
-                           FunctionBuilderBodyPreCheck(AnyFunctionRef),
+                           FunctionBuilderBodyPreCheck(
+                               PreCheckFunctionBuilderDescriptor),
                            RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -1849,7 +1886,7 @@ private:
 
   // Evaluation.
   FunctionBuilderBodyPreCheck
-  evaluate(Evaluator &evaluator, AnyFunctionRef fn) const;
+  evaluate(Evaluator &evaluator, PreCheckFunctionBuilderDescriptor owner) const;
 
 public:
   // Separate caching.
@@ -2191,6 +2228,27 @@ public:
   bool isCached() const { return true; }
 };
 
+/// Resolves the "tangent stored property" corresponding to an original stored
+/// property in a `Differentiable`-conforming type.
+class TangentStoredPropertyRequest
+    : public SimpleRequest<TangentStoredPropertyRequest,
+                           TangentPropertyInfo(VarDecl *, CanType),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  TangentPropertyInfo evaluate(Evaluator &evaluator, VarDecl *originalField,
+                               CanType parentType) const;
+
+public:
+  // Caching.
+  bool isCached() const { return true; }
+};
+
 /// Checks whether a type eraser has a viable initializer.
 class TypeEraserHasViableInitRequest
     : public SimpleRequest<TypeEraserHasViableInitRequest,
@@ -2426,7 +2484,7 @@ public:
 
 class ResolveTypeRequest
     : public SimpleRequest<ResolveTypeRequest,
-                           Type(TypeResolution *, TypeRepr *),
+                           Type(const TypeResolution *, TypeRepr *),
                            RequestFlags::Uncached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -2439,7 +2497,7 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  Type evaluate(Evaluator &evaluator, TypeResolution *resolution,
+  Type evaluate(Evaluator &evaluator, const TypeResolution *resolution,
                 TypeRepr *repr) const;
 };
 
@@ -2544,6 +2602,23 @@ public:
   bool isCached() const { return true; }
   Optional<Type> getCachedResult() const;
   void cacheResult(Type value) const;
+};
+
+class SynthesizeMainFunctionRequest
+    : public SimpleRequest<SynthesizeMainFunctionRequest,
+                           FuncDecl *(Decl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  FuncDecl *evaluate(Evaluator &evaluator, Decl *) const;
+
+public:
+  bool isCached() const { return true; }
 };
 
 // Allow AnyValue to compare two Type values, even though Type doesn't

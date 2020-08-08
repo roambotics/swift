@@ -458,6 +458,8 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
                       LiteralInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(GlobalAddrInst, global_addr,
                       LiteralInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST(BaseAddrForOffsetInst, base_addr_for_offset,
+                      LiteralInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(GlobalValueInst, global_value,
                       LiteralInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(IntegerLiteralInst, integer_literal,
@@ -497,6 +499,8 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
     SINGLE_VALUE_INST(UncheckedTrivialBitCastInst, unchecked_trivial_bit_cast,
                       ConversionInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(UncheckedBitwiseCastInst, unchecked_bitwise_cast,
+                      ConversionInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST(UncheckedValueCastInst, unchecked_value_cast,
                       ConversionInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(RefToRawPointerInst, ref_to_raw_pointer,
                       ConversionInst, None, DoesNotRelease)

@@ -988,6 +988,14 @@ public:
       }
       
       if (S->hasResult()) {
+        if (isa<ConstructorDecl>(func)) {
+          Out << "Expected ReturnStmt not to have a result. A constructor "
+                 "should not return a result. Returned expression: ";
+          S->getResult()->dump(Out);
+          Out << "\n";
+          abort();
+        }
+
         auto result = S->getResult();
         auto returnType = result->getType();
         // Make sure that the return has the same type as the function.
@@ -1032,7 +1040,8 @@ public:
       case StmtConditionElement::CK_Boolean: {
         auto *E = elt.getBoolean();
         if (shouldVerifyChecked(E))
-          checkSameType(E->getType(), Ctx.getBoolDecl()->getDeclaredType(),
+          checkSameType(E->getType(),
+                        Ctx.getBoolDecl()->getDeclaredInterfaceType(),
                         "condition type");
         break;
       }
@@ -1625,7 +1634,8 @@ public:
         abort();
       }
 
-      checkSameType(E->getType(), anyHashableDecl->getDeclaredType(),
+      checkSameType(E->getType(),
+                    anyHashableDecl->getDeclaredInterfaceType(),
                     "AnyHashableErasureExpr and the standard AnyHashable type");
 
       if (E->getConformance().getRequirement() != hashableDecl) {
@@ -1791,7 +1801,7 @@ public:
         E->dump(Out);
         Out << "\n";
         abort();
-      } else if (E->throws() && !FT->throws()) {
+      } else if (E->throws() && !FT->isThrowing()) {
         Out << "apply expression is marked as throwing, but function operand"
                "does not have a throwing function type\n";
         E->dump(Out);
@@ -3014,7 +3024,7 @@ public:
       if (AFD->hasImplicitSelfDecl())
         fnTy = fnTy->getResult()->castTo<FunctionType>();
 
-      if (AFD->hasThrows() != fnTy->getExtInfo().throws()) {
+      if (AFD->hasThrows() != fnTy->getExtInfo().isThrowing()) {
         Out << "function 'throws' flag does not match function type\n";
         AFD->dump(Out);
         abort();
@@ -3347,7 +3357,7 @@ public:
 
     Type checkExceptionTypeExists(const char *where) {
       auto exn = Ctx.getErrorDecl();
-      if (exn) return exn->getDeclaredType();
+      if (exn) return exn->getDeclaredInterfaceType();
 
       Out << "exception type does not exist in " << where << "\n";
       abort();

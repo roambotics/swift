@@ -105,7 +105,7 @@ documentation, please create a thread on the Swift forums under the
   - [RequestEvaluator.md](/docs/RequestEvaluator.md):
     Describes the request evaluator architecture, which is used for
     lazy type-checking and efficient caching.
-  - [Literal.md](/docs/Literal.md):
+  - [Literals.md](/docs/Literals.md):
     Describes type-checking and inference specifically for literals.
 - [Serialization.rst](/docs/Serialization.rst):
   Gives an overview of the LLVM bitcode format used for swiftmodules.
@@ -252,12 +252,10 @@ They are preserved mostly for historical interest.
 
 ## External Resources
 
-The official [Swift blog](https://swift.org/blog/) contains a lot of useful
-information, such as how library evolution works and how the compiler's new
-diagnostic architecture is structured, helping us provide more precise
-diagnostics.
-
-TODO: Add a new document ExternalResources.md.
+External resources are listed in [docs/ExternalResources.md](ExternalResources.md).
+These cover a variety of topics,
+such as the design of different aspects of the Swift compiler and runtime
+and contributing to the project more effectively.
 
 ## Uncategorized
 

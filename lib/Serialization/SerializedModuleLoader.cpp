@@ -12,6 +12,7 @@
 
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "ModuleFile.h"
+#include "ModuleFileSharedCore.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ModuleDependencies.h"
@@ -114,7 +115,7 @@ SerializedModuleLoaderBase::SerializedModuleLoaderBase(
       IgnoreSwiftSourceInfoFile(IgnoreSwiftSourceInfoFile) {}
 
 SerializedModuleLoaderBase::~SerializedModuleLoaderBase() = default;
-SerializedModuleLoader::~SerializedModuleLoader() = default;
+ImplicitSerializedModuleLoader::~ImplicitSerializedModuleLoader() = default;
 MemoryBufferSerializedModuleLoader::~MemoryBufferSerializedModuleLoader() =
     default;
 
@@ -242,7 +243,7 @@ void SerializedModuleLoaderBase::collectVisibleTopLevelModuleNamesImpl(
   });
 }
 
-void SerializedModuleLoader::collectVisibleTopLevelModuleNames(
+void ImplicitSerializedModuleLoader::collectVisibleTopLevelModuleNames(
     SmallVectorImpl<Identifier> &names) const {
   collectVisibleTopLevelModuleNamesImpl(
       names, file_types::getExtension(file_types::TY_SwiftModuleFile));
@@ -346,8 +347,27 @@ std::error_code SerializedModuleLoaderBase::openModuleFile(
   }
 
   // Actually load the file and error out if necessary.
+  //
+  // Use the default arguments except for IsVolatile that is set by the
+  // frontend option -enable-volatile-modules. If set, we avoid the use of
+  // mmap to workaround issues on NFS when the swiftmodule file loaded changes
+  // on disk while it's in use.
+  //
+  // In practice, a swiftmodule file can chane when a client uses a
+  // swiftmodule file from a framework while the framework is recompiled and
+  // installed over existing files. Or when many processes rebuild the same
+  // module interface.
+  //
+  // We have seen these scenarios leading to deserialization errors that on
+  // the surface look like memory corruption.
+  //
+  // rdar://63755989
+  bool enableVolatileModules = Ctx.LangOpts.EnableVolatileModules;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> ModuleOrErr =
-      FS.getBufferForFile(ModulePath);
+      FS.getBufferForFile(ModulePath,
+                          /*FileSize=*/-1,
+                          /*RequiresNullTerminator=*/true,
+                          /*IsVolatile=*/enableVolatileModules);
   if (!ModuleOrErr)
     return ModuleOrErr.getError();
 
@@ -364,15 +384,16 @@ llvm::ErrorOr<ModuleDependencies> SerializedModuleLoaderBase::scanModuleFile(
     return moduleBuf.getError();
 
   // Load the module file without validation.
-  std::unique_ptr<ModuleFile> loadedModuleFile;
+  std::shared_ptr<const ModuleFileSharedCore> loadedModuleFile;
   bool isFramework = false;
+  serialization::ExtendedValidationInfo extInfo;
   serialization::ValidationInfo loadInfo =
-      ModuleFile::load(modulePath.str(),
+      ModuleFileSharedCore::load(modulePath.str(),
                        std::move(moduleBuf.get()),
                        nullptr,
                        nullptr,
                        isFramework, loadedModuleFile,
-                       nullptr);
+                       &extInfo);
 
   // Map the set of dependencies over to the "module dependencies".
   auto dependencies = ModuleDependencies::forSwiftModule(modulePath.str());
@@ -389,13 +410,13 @@ llvm::ErrorOr<ModuleDependencies> SerializedModuleLoaderBase::scanModuleFile(
     if (dotPos != std::string::npos)
       moduleName = moduleName.slice(0, dotPos);
 
-    dependencies.addModuleDependency(moduleName, addedModuleNames);
+    dependencies.addModuleDependency(moduleName, &addedModuleNames);
   }
 
   return std::move(dependencies);
 }
 
-std::error_code SerializedModuleLoader::findModuleFilesInDirectory(
+std::error_code ImplicitSerializedModuleLoader::findModuleFilesInDirectory(
     AccessPathElem ModuleID,
     const SerializedModuleBaseName &BaseName,
     SmallVectorImpl<char> *ModuleInterfacePath,
@@ -432,7 +453,7 @@ std::error_code SerializedModuleLoader::findModuleFilesInDirectory(
   return std::error_code();
 }
 
-bool SerializedModuleLoader::maybeDiagnoseTargetMismatch(
+bool ImplicitSerializedModuleLoader::maybeDiagnoseTargetMismatch(
     SourceLoc sourceLocation, StringRef moduleName,
     const SerializedModuleBaseName &absoluteBaseName) {
   llvm::vfs::FileSystem &fs = *Ctx.SourceMgr.getFileSystem();
@@ -623,7 +644,7 @@ getOSAndVersionForDiagnostics(const llvm::Triple &triple) {
     // macOS triples represent their versions differently, so we have to use the
     // special accessor.
     triple.getMacOSXVersion(major, minor, micro);
-    osName = swift::prettyPlatformString(PlatformKind::OSX);
+    osName = swift::prettyPlatformString(PlatformKind::macOS);
   } else {
     triple.getOSVersion(major, minor, micro);
     if (triple.isWatchOS()) {
@@ -674,14 +695,17 @@ FileUnit *SerializedModuleLoaderBase::loadAST(
 
   serialization::ExtendedValidationInfo extendedInfo;
   std::unique_ptr<ModuleFile> loadedModuleFile;
+  std::shared_ptr<const ModuleFileSharedCore> loadedModuleFileCore;
   serialization::ValidationInfo loadInfo =
-      ModuleFile::load(moduleInterfacePath,
+      ModuleFileSharedCore::load(moduleInterfacePath,
                        std::move(moduleInputBuffer),
                        std::move(moduleDocInputBuffer),
                        std::move(moduleSourceInfoInputBuffer),
-                       isFramework, loadedModuleFile,
+                       isFramework, loadedModuleFileCore,
                        &extendedInfo);
   if (loadInfo.status == serialization::Status::Valid) {
+    loadedModuleFile =
+        std::make_unique<ModuleFile>(std::move(loadedModuleFileCore));
     M.setResilienceStrategy(extendedInfo.getResilienceStrategy());
 
     // We've loaded the file. Now try to bring it into the AST.
@@ -716,16 +740,19 @@ FileUnit *SerializedModuleLoaderBase::loadAST(
 
   // From here on is the failure path.
 
-  // Even though the module failed to load, it's possible its contents include
-  // a source buffer that need to survive because it's already been used for
-  // diagnostics.
-  if (auto orphanedBuffer = loadedModuleFile->takeBufferForDiagnostics())
-    OrphanedMemoryBuffers.push_back(std::move(orphanedBuffer));
-
   if (diagLoc)
     serialization::diagnoseSerializedASTLoadFailure(
         Ctx, *diagLoc, loadInfo, extendedInfo, moduleBufferID,
         moduleDocBufferID, loadedModuleFile.get(), M.getName());
+
+  // Even though the module failed to load, it's possible its contents include
+  // a source buffer that need to survive because it's already been used for
+  // diagnostics.
+  // Note this is only necessary in case a bridging header failed to load
+  // during the `associateWithFileContext()` call.
+  if (loadedModuleFile && loadedModuleFile->mayHaveDiagnosticsPointingAtBuffer())
+    OrphanedModuleFiles.push_back(std::move(loadedModuleFile));
+
   return nullptr;
 }
 
@@ -793,20 +820,20 @@ void swift::serialization::diagnoseSerializedASTLoadFailure(
                Ctx.LangOpts.DebuggerSupport)) {
             return false;
           }
-          return duplicates.insert(dependency.RawPath).second;
+          return duplicates.insert(dependency.Core.RawPath).second;
         });
 
     // FIXME: only show module part of RawAccessPath
     assert(!missing.empty() && "unknown missing dependency?");
     if (missing.size() == 1) {
       Ctx.Diags.diagnose(diagLoc, diag::serialization_missing_single_dependency,
-                         missing.front().getPrettyPrintedPath());
+                         missing.front().Core.getPrettyPrintedPath());
     } else {
       llvm::SmallString<64> missingNames;
       missingNames += '\'';
       interleave(missing,
                  [&](const ModuleFile::Dependency &next) {
-                   missingNames += next.getPrettyPrintedPath();
+                   missingNames += next.Core.getPrettyPrintedPath();
                  },
                  [&] { missingNames += "', '"; });
       missingNames += '\'';
@@ -840,7 +867,7 @@ void swift::serialization::diagnoseSerializedASTLoadFailure(
     // hard because we're discovering this /while/ resolving imports, which
     // means the problematic modules haven't been recorded yet.
     Ctx.Diags.diagnose(diagLoc, diag::serialization_circular_dependency,
-                       circularDependencyIter->getPrettyPrintedPath(),
+                       circularDependencyIter->Core.getPrettyPrintedPath(),
                        ModuleName);
     break;
   }
@@ -1087,12 +1114,9 @@ void SerializedASTFile::getImportedModules(
 
 void SerializedASTFile::collectLinkLibrariesFromImports(
     ModuleDecl::LinkLibraryCallback callback) const {
-  ModuleDecl::ImportFilter ImportFilter;
-  ImportFilter |= ModuleDecl::ImportFilterKind::Public;
-  ImportFilter |= ModuleDecl::ImportFilterKind::Private;
-
   llvm::SmallVector<ModuleDecl::ImportedModule, 8> Imports;
-  File.getImportedModules(Imports, ImportFilter);
+  File.getImportedModules(Imports, {ModuleDecl::ImportFilterKind::Public,
+                                    ModuleDecl::ImportFilterKind::Private});
 
   for (auto Import : Imports)
     Import.importedModule->collectLinkLibraries(callback);
@@ -1108,7 +1132,7 @@ void SerializedASTFile::collectLinkLibraries(
 }
 
 bool SerializedASTFile::isSIB() const {
-  return File.IsSIB;
+  return File.isSIB();
 }
 
 bool SerializedASTFile::hadLoadError() const {

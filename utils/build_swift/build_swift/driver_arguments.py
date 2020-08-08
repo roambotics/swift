@@ -189,6 +189,7 @@ def _apply_default_arguments(args):
         args.test_indexstoredb = False
         args.test_sourcekitlsp = False
         args.test_skstresstester = False
+        args.test_swiftformat = False
         args.test_swiftevolve = False
         args.test_toolchainbenchmarks = False
 
@@ -572,6 +573,9 @@ def create_argument_parser():
     option(['--skstresstester'], store_true('build_skstresstester'),
            help='build the SourceKit stress tester')
 
+    option(['--swiftformat'], store_true('build_swiftformat'),
+           help='build swift-format')
+
     option(['--swiftevolve'], store_true('build_swiftevolve'),
            help='build the swift-evolve tool')
 
@@ -594,8 +598,6 @@ def create_argument_parser():
            toggle_true('swiftsyntax_verify_generated_files'),
            help='set to verify that the generated files in the source tree '
                 'match the ones that would be generated from current master')
-    option(['--install-pythonkit'], toggle_true('install_pythonkit'),
-           help='install PythonKit')
     option(['--install-sourcekit-lsp'], toggle_true('install_sourcekitlsp'),
            help='install SourceKitLSP')
     option(['--install-skstresstester'], toggle_true('install_skstresstester'),
@@ -630,15 +632,6 @@ def create_argument_parser():
     option('--install-playgroundsupport',
            store_true('install_playgroundsupport'),
            help='install playground support')
-
-    option('--pythonkit', store_true('build_pythonkit'),
-           help='build PythonKit')
-
-    option('--tensorflow-swift-apis', store_true('build_tensorflow_swift_apis'),
-           help='build TensorFlow Swift APIs')
-    option('--install-tensorflow-swift-apis',
-           store_true('install_tensorflow_swift_apis'),
-           help='install TensorFlow Swift APIs')
 
     option('--build-ninja', toggle_true,
            help='build the Ninja tool')
@@ -891,9 +884,6 @@ def create_argument_parser():
     option('--skip-test-cygwin', toggle_false('test_cygwin'),
            help='skip testing Swift stdlibs for Cygwin')
 
-    option('--test-pythonkit', toggle_true('test_pythonkit'),
-           help='skip testing PythonKit')
-
     # -------------------------------------------------------------------------
     in_group('Run build')
 
@@ -1028,6 +1018,8 @@ def create_argument_parser():
            help='skip testing PlaygroundSupport')
     option('--skip-test-skstresstester', toggle_false('test_skstresstester'),
            help='skip testing the SourceKit Stress tester')
+    option('--skip-test-swiftformat', toggle_false('test_swiftformat'),
+           help='skip testing swift-format')
     option('--skip-test-swiftevolve', toggle_false('test_swiftevolve'),
            help='skip testing SwiftEvolve')
     option('--skip-test-toolchain-benchmarks',
@@ -1096,6 +1088,10 @@ def create_argument_parser():
            default=True,
            help='Enable experimental Swift differentiable programming language'
                 ' features.')
+
+    option('--enable-experimental-concurrency', toggle_true,
+           default=True,
+           help='Enable experimental Swift concurrency model.')
 
     # -------------------------------------------------------------------------
     in_group('Unsupported options')

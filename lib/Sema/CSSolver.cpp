@@ -135,6 +135,15 @@ Solution ConstraintSystem::finalize() {
     solution.DisjunctionChoices.insert(choice);
   }
 
+  // Remember all of the trailing closure matching choices we made.
+  for (auto &trailingClosureMatch : trailingClosureMatchingChoices) {
+    auto inserted = solution.trailingClosureMatchingChoices.insert(
+        trailingClosureMatch);
+    assert((inserted.second ||
+            inserted.first->second == trailingClosureMatch.second));
+    (void)inserted;
+  }
+
   // Remember the opened types.
   for (const auto &opened : OpenedTypes) {
     // We shouldn't ever register opened types multiple times,
@@ -215,6 +224,11 @@ void ConstraintSystem::applySolution(const Solution &solution) {
   // Register the solution's disjunction choices.
   for (auto &choice : solution.DisjunctionChoices) {
     DisjunctionChoices.push_back(choice);
+  }
+
+  // Remember all of the trailing closure matching choices we made.
+  for (auto &trailingClosureMatch : solution.trailingClosureMatchingChoices) {
+    trailingClosureMatchingChoices.push_back(trailingClosureMatch);
   }
 
   // Register the solution's opened types.
@@ -456,6 +470,7 @@ ConstraintSystem::SolverScope::SolverScope(ConstraintSystem &cs)
   numFixes = cs.Fixes.size();
   numFixedRequirements = cs.FixedRequirements.size();
   numDisjunctionChoices = cs.DisjunctionChoices.size();
+  numTrailingClosureMatchingChoices = cs.trailingClosureMatchingChoices.size();
   numOpenedTypes = cs.OpenedTypes.size();
   numOpenedExistentialTypes = cs.OpenedExistentialTypes.size();
   numDefaultedConstraints = cs.DefaultedConstraints.size();
@@ -509,6 +524,10 @@ ConstraintSystem::SolverScope::~SolverScope() {
 
   // Remove any disjunction choices.
   truncate(cs.DisjunctionChoices, numDisjunctionChoices);
+
+  // Remove any trailing closure matching choices;
+  truncate(
+      cs.trailingClosureMatchingChoices, numTrailingClosureMatchingChoices);
 
   // Remove any opened types.
   truncate(cs.OpenedTypes, numOpenedTypes);
@@ -997,8 +1016,14 @@ void ConstraintSystem::shrink(Expr *expr) {
           auto *const typeRepr = coerceExpr->getCastTypeRepr();
 
           if (typeRepr && isSuitableCollection(typeRepr)) {
-            auto resolution = TypeResolution::forContextual(CS.DC, None);
-            auto coercionType = resolution.resolveType(typeRepr);
+            const auto coercionType =
+                TypeResolution::forContextual(
+                    CS.DC, None,
+                    // FIXME: Should we really be unconditionally complaining
+                    // about unbound generics here? For example:
+                    // let foo: [Array<Float>] = [[0], [1], [2]] as [Array]
+                    /*unboundTyOpener*/ nullptr)
+                    .resolveType(typeRepr);
 
             // Looks like coercion type is invalid, let's skip this sub-tree.
             if (coercionType->hasError())
@@ -2374,7 +2399,7 @@ void DisjunctionChoice::propagateConversionInfo(ConstraintSystem &cs) const {
   if (typeVar->getImpl().getFixedType(nullptr))
     return;
 
-  auto bindings = cs.getPotentialBindings(typeVar);
+  auto bindings = cs.inferBindingsFor(typeVar);
   if (bindings.InvolvesTypeVariables || bindings.Bindings.size() != 1)
     return;
 

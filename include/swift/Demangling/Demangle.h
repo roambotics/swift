@@ -25,6 +25,7 @@
 #include <cstdint>
 #include "llvm/ADT/StringRef.h"
 #include "swift/Runtime/Config.h"
+#include "swift/Demangling/NamespaceMacros.h"
 
 namespace llvm {
   class raw_ostream;
@@ -32,6 +33,7 @@ namespace llvm {
 
 namespace swift {
 namespace Demangle {
+SWIFT_BEGIN_INLINE_NAMESPACE
 
 enum class SymbolicReferenceKind : uint8_t;
 
@@ -60,6 +62,8 @@ struct DemangleOptions {
   bool DisplayDebuggerGeneratedModule = true;
   bool DisplayStdlibModule = true;
   bool DisplayObjCModule = true;
+  bool PrintForTypeName = false;
+
   /// If this is nonempty, entities in this module name will not be qualified.
   llvm::StringRef HidingCurrentModule;
   /// A function to render generic parameter names.
@@ -621,6 +625,7 @@ bool isFunctionAttr(Node::Kind kind);
 /// contain symbolic references.
 llvm::StringRef makeSymbolicMangledNameStringRef(const char *base);
 
+SWIFT_END_INLINE_NAMESPACE
 } // end namespace Demangle
 } // end namespace swift
 

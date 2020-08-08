@@ -1043,9 +1043,6 @@ CondFailInst *CondFailInst::create(SILDebugLocation DebugLoc, SILValue Operand,
 }
 
 uint64_t StringLiteralInst::getCodeUnitCount() {
-  auto E = unsigned(Encoding::UTF16);
-  if (SILInstruction::Bits.StringLiteralInst.TheEncoding == E)
-    return unicode::getUTF16Length(getValue());
   return SILInstruction::Bits.StringLiteralInst.Length;
 }
 
@@ -2215,6 +2212,21 @@ UncheckedRefCastInst::create(SILDebugLocation DebugLoc, SILValue Operand,
   void *Buffer = Mod.allocateInst(size, alignof(UncheckedRefCastInst));
   return ::new (Buffer) UncheckedRefCastInst(DebugLoc, Operand,
                                              TypeDependentOperands, Ty);
+}
+
+UncheckedValueCastInst *
+UncheckedValueCastInst::create(SILDebugLocation DebugLoc, SILValue Operand,
+                               SILType Ty, SILFunction &F,
+                               SILOpenedArchetypesState &OpenedArchetypes) {
+  SILModule &Mod = F.getModule();
+  SmallVector<SILValue, 8> TypeDependentOperands;
+  collectTypeDependentOperands(TypeDependentOperands, OpenedArchetypes, F,
+                               Ty.getASTType());
+  unsigned size =
+      totalSizeToAlloc<swift::Operand>(1 + TypeDependentOperands.size());
+  void *Buffer = Mod.allocateInst(size, alignof(UncheckedValueCastInst));
+  return ::new (Buffer)
+      UncheckedValueCastInst(DebugLoc, Operand, TypeDependentOperands, Ty);
 }
 
 UncheckedAddrCastInst *

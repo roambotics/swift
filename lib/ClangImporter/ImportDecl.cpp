@@ -180,6 +180,7 @@ static FuncDecl *createFuncOrAccessor(ASTContext &ctx, SourceLoc funcLoc,
     return FuncDecl::create(ctx, /*StaticLoc=*/SourceLoc(),
                             StaticSpellingKind::None,
                             funcLoc, name, nameLoc,
+                            /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
                             throws, /*ThrowsLoc=*/SourceLoc(),
                             /*GenericParams=*/nullptr,
                             bodyParams,
@@ -502,9 +503,7 @@ synthesizeEnumRawValueConstructorBody(AbstractFunctionDecl *afd,
                                      /*implicit*/ true);
   assign->setType(TupleType::getEmpty(ctx));
 
-  auto result = TupleExpr::createEmpty(ctx, SourceLoc(), SourceLoc(),
-                                       /*Implicit=*/true);
-  auto ret = new (ctx) ReturnStmt(SourceLoc(), result, /*Implicit=*/true);
+  auto ret = new (ctx) ReturnStmt(SourceLoc(), nullptr, /*Implicit=*/true);
 
   auto body = BraceStmt::create(ctx, SourceLoc(), {assign, ret}, SourceLoc(),
                                 /*implicit*/ true);
@@ -553,7 +552,7 @@ synthesizeEnumRawValueGetterBody(AbstractFunctionDecl *afd, void *context) {
   auto getterDecl = cast<AccessorDecl>(afd);
   auto enumDecl = static_cast<EnumDecl *>(context);
   auto rawTy = enumDecl->getRawType();
-  auto enumTy = enumDecl->getDeclaredType();
+  auto enumTy = enumDecl->getDeclaredInterfaceType();
 
   ASTContext &ctx = getterDecl->getASTContext();
   auto *selfDecl = getterDecl->getImplicitSelfDecl();
@@ -1272,11 +1271,7 @@ synthesizeStructDefaultConstructorBody(AbstractFunctionDecl *afd,
   auto assign = new (ctx) AssignExpr(lhs, SourceLoc(), call, /*implicit*/ true);
   assign->setType(emptyTuple);
 
-  auto result = TupleExpr::createEmpty(ctx, SourceLoc(), SourceLoc(),
-                                       /*Implicit=*/true);
-  result->setType(emptyTuple);
-
-  auto ret = new (ctx) ReturnStmt(SourceLoc(), result, /*Implicit=*/true);
+  auto ret = new (ctx) ReturnStmt(SourceLoc(), nullptr, /*Implicit=*/true);
 
   // Create the function body.
   auto body = BraceStmt::create(ctx, SourceLoc(), {assign, ret}, SourceLoc());
@@ -1370,11 +1365,7 @@ synthesizeValueConstructorBody(AbstractFunctionDecl *afd, void *context) {
     }
   }
 
-  auto result = TupleExpr::createEmpty(ctx, SourceLoc(), SourceLoc(),
-                                       /*Implicit=*/true);
-  result->setType(TupleType::getEmpty(ctx));
-
-  auto ret = new (ctx) ReturnStmt(SourceLoc(), result, /*Implicit=*/true);
+  auto ret = new (ctx) ReturnStmt(SourceLoc(), nullptr, /*Implicit=*/true);
   stmts.push_back(ret);
 
   // Create the function body.
@@ -1571,9 +1562,7 @@ synthesizeRawValueBridgingConstructorBody(AbstractFunctionDecl *afd,
                                      /*Implicit=*/true);
   assign->setType(TupleType::getEmpty(ctx));
 
-  auto result = TupleExpr::createEmpty(ctx, SourceLoc(), SourceLoc(),
-                                       /*Implicit=*/true);
-  auto ret = new (ctx) ReturnStmt(SourceLoc(), result, /*Implicit=*/true);
+  auto ret = new (ctx) ReturnStmt(SourceLoc(), nullptr, /*Implicit=*/true);
 
   auto body = BraceStmt::create(ctx, SourceLoc(), {assign, ret}, SourceLoc());
   return { body, /*isTypeChecked=*/true };
@@ -1646,10 +1635,10 @@ static void makeStructRawValuedWithBridge(
   makeComputed(computedVar, computedVarGetter, nullptr);
 
   // Create a pattern binding to describe the variable.
-  Pattern *computedVarPattern = createTypedNamedPattern(computedVar);
+  Pattern *computedBindingPattern = createTypedNamedPattern(computedVar);
   auto *computedPatternBinding = PatternBindingDecl::createImplicit(
-      ctx, StaticSpellingKind::None, computedVarPattern, /*InitExpr*/ nullptr,
-      structDecl);
+      ctx, StaticSpellingKind::None, computedBindingPattern,
+      /*InitExpr*/ nullptr, structDecl);
 
   auto init = createRawValueBridgingConstructor(Impl, structDecl, computedVar,
                                                 storedVar,
@@ -1903,7 +1892,7 @@ static bool addErrorDomain(NominalTypeDecl *swiftDecl,
   auto &C = importer.SwiftContext;
   auto swiftValueDecl = dyn_cast_or_null<ValueDecl>(
       importer.importDecl(errorDomainDecl, importer.CurrentVersion));
-  auto stringTy = C.getStringDecl()->getDeclaredType();
+  auto stringTy = C.getStringDecl()->getDeclaredInterfaceType();
   assert(stringTy && "no string type available");
   if (!swiftValueDecl || !swiftValueDecl->getInterfaceType()->isEqual(stringTy)) {
     // Couldn't actually import it as an error enum, fall back to enum
@@ -3466,20 +3455,19 @@ namespace {
       result->setHasUnreferenceableStorage(hasUnreferenceableStorage);
 
       if (auto cxxRecordDecl = dyn_cast<clang::CXXRecordDecl>(decl)) {
-        result->setIsCxxNotTriviallyCopyable(
-            !cxxRecordDecl->isTriviallyCopyable());
+        result->setIsCxxNonTrivial(!cxxRecordDecl->isTriviallyCopyable());
 
         for (auto ctor : cxxRecordDecl->ctors()) {
           if (ctor->isCopyConstructor() &&
               (ctor->isDeleted() || ctor->getAccess() != clang::AS_public)) {
-            result->setIsCxxNotTriviallyCopyable(true);
+            result->setIsCxxNonTrivial(true);
             break;
           }
         }
 
         if (auto dtor = cxxRecordDecl->getDestructor()) {
           if (dtor->isDeleted() || dtor->getAccess() != clang::AS_public) {
-            result->setIsCxxNotTriviallyCopyable(true);
+            result->setIsCxxNonTrivial(true);
           }
         }
       }
@@ -3805,14 +3793,20 @@ namespace {
             decl->isVariadic(), isInSystemModule(dc), name, bodyParams);
 
         if (auto *mdecl = dyn_cast<clang::CXXMethodDecl>(decl)) {
-          if (!mdecl->isStatic()) {
+          if (mdecl->isStatic() ||
+              // C++ operators that are implemented as non-static member
+              // functions get imported into Swift as static member functions
+              // that use an additional parameter for the left-hand side operand
+              // instead of the receiver object.
+              mdecl->getDeclName().getNameKind() ==
+                  clang::DeclarationName::CXXOperatorName) {
+            selfIdx = None;
+          } else {
             selfIdx = 0;
             // Workaround until proper const support is handled: Force
             // everything to be mutating. This implicitly makes the parameter
             // indirect.
             selfIsInOut = true;
-          } else {
-            selfIdx = None;
           }
         }
       }
@@ -5024,27 +5018,6 @@ namespace {
         }
       }
       result->setSuperclass(superclassType);
-
-      // Mark the class as runtime-only if it is named 'OS_object', even
-      // if it doesn't have the runtime-only Clang attribute. This is a
-      // targeted fix allowing IRGen to emit convenience initializers
-      // correctly.
-      //
-      // FIXME: Remove this once SILGen gets proper support for factory
-      // initializers.
-      if (decl->getName() == "OS_object" ||
-          decl->getName() == "OS_os_log") {
-        result->setForeignClassKind(ClassDecl::ForeignKind::RuntimeOnly);
-      }
-
-      // If the superclass is runtime-only, our class is also. This only
-      // matters in the case above.
-      if (superclassType) {
-        auto superclassDecl = cast<ClassDecl>(superclassType->getAnyNominal());
-        auto kind = superclassDecl->getForeignClassKind();
-        if (kind != ClassDecl::ForeignKind::Normal)
-          result->setForeignClassKind(kind);
-      }
 
       // Import protocols this class conforms to.
       importObjCProtocols(result, decl->getReferencedProtocols(),
@@ -6988,7 +6961,8 @@ void SwiftDeclConverter::importObjCProtocols(
     if (auto proto = castIgnoringCompatibilityAlias<ProtocolDecl>(
             Impl.importDecl(*cp, getActiveSwiftVersion()))) {
       addProtocols(proto, protocols, knownProtocols);
-      inheritedTypes.push_back(TypeLoc::withoutLoc(proto->getDeclaredType()));
+      inheritedTypes.push_back(
+        TypeLoc::withoutLoc(proto->getDeclaredInterfaceType()));
     }
   }
 
@@ -7039,7 +7013,8 @@ Optional<GenericParamList *> SwiftDeclConverter::importObjCGenericParams(
         if (!proto) {
           return None;
         }
-        inherited.push_back(TypeLoc::withoutLoc(proto->getDeclaredType()));
+        inherited.push_back(
+          TypeLoc::withoutLoc(proto->getDeclaredInterfaceType()));
       }
     }
     if (inherited.empty()) {
@@ -7124,9 +7099,12 @@ void SwiftDeclConverter::importMirroredProtocolMembers(
           return;
 
         bool inNearbyCategory =
-            std::any_of(interfaceDecl->visible_categories_begin(),
-                        interfaceDecl->visible_categories_end(),
+            std::any_of(interfaceDecl->known_categories_begin(),
+                        interfaceDecl->known_categories_end(),
                         [=](const clang::ObjCCategoryDecl *category) -> bool {
+                          if (!Impl.getClangSema().isVisible(category)) {
+                            return false;
+                          }
                           if (category != decl) {
                             auto *categoryModule =
                                 Impl.getClangModuleForDecl(category);
@@ -7637,12 +7615,12 @@ void ClangImporter::Implementation::importAttributes(
       auto platformK =
         llvm::StringSwitch<Optional<PlatformKind>>(Platform)
           .Case("ios", PlatformKind::iOS)
-          .Case("macos", PlatformKind::OSX)
+          .Case("macos", PlatformKind::macOS)
           .Case("tvos", PlatformKind::tvOS)
           .Case("watchos", PlatformKind::watchOS)
           .Case("ios_app_extension", PlatformKind::iOSApplicationExtension)
           .Case("macos_app_extension",
-                PlatformKind::OSXApplicationExtension)
+                PlatformKind::macOSApplicationExtension)
           .Case("tvos_app_extension",
                 PlatformKind::tvOSApplicationExtension)
           .Case("watchos_app_extension",

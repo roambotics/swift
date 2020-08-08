@@ -198,7 +198,7 @@ struct RuntimeVersionCheck {
     // platformSpec = "\(attr.platform) \(attr.introduced)"
     auto platformSpec = new (C) PlatformVersionConstraintAvailabilitySpec(
                             Platform, SourceLoc(),
-                            Version, SourceLoc()
+                            Version, Version, SourceLoc()
                         );
 
     // otherSpec = "*"
@@ -332,9 +332,9 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
     // Create a statement which assigns the case to self.
 
     // valueExpr = "\(enumType).\(elt)"
-    auto eltRef = new (C) DeclRefExpr(elt, DeclNameLoc(), /*implicit*/true);
     auto metaTyRef = TypeExpr::createImplicit(enumType, C);
-    auto valueExpr = new (C) DotSyntaxCallExpr(eltRef, SourceLoc(), metaTyRef);
+    auto valueExpr = new (C) MemberRefExpr(metaTyRef, SourceLoc(),
+                                           elt, DeclNameLoc(), /*implicit*/true);
     
     // assignment = "self = \(valueExpr)"
     auto selfRef = new (C) DeclRefExpr(selfDecl, DeclNameLoc(),

@@ -208,11 +208,6 @@ protected:
       llvm::function_ref<void(GenericTypeParamType *, Type)> substitution =
           [](GenericTypeParamType *, Type) {});
 
-  bool isCollectionType(Type type) const {
-    auto &cs = getConstraintSystem();
-    return cs.isCollectionType(type);
-  }
-
   bool isArrayType(Type type) const {
     auto &cs = getConstraintSystem();
     return bool(cs.isArrayType(type));
@@ -265,8 +260,9 @@ public:
     assert(getGenericContext() &&
            "Affected decl not within a generic context?");
 
-    if (auto *parentExpr = findParentExpr(getRawAnchor().get<Expr *>()))
-      Apply = dyn_cast<ApplyExpr>(parentExpr);
+    if (auto *expr = getAsExpr(getRawAnchor()))
+      if (auto *parentExpr = findParentExpr(expr))
+        Apply = dyn_cast<ApplyExpr>(parentExpr);
   }
 
   unsigned getRequirementIndex() const {
@@ -479,16 +475,32 @@ public:
 /// type without optional chaining or force-unwrapping it first.
 class MemberAccessOnOptionalBaseFailure final : public FailureDiagnostic {
   DeclNameRef Member;
+  Type MemberBaseType;
   bool ResultTypeIsOptional;
 
 public:
   MemberAccessOnOptionalBaseFailure(const Solution &solution,
                                     ConstraintLocator *locator,
-                                    DeclNameRef memberName, bool resultOptional)
+                                    DeclNameRef memberName,
+                                    Type memberBaseType,
+                                    bool resultOptional)
       : FailureDiagnostic(solution, locator), Member(memberName),
+        MemberBaseType(resolveType(memberBaseType)),
         ResultTypeIsOptional(resultOptional) {}
 
   bool diagnoseAsError() override;
+  
+  Type getMemberBaseType() const {
+    return MemberBaseType;
+  }
+  
+  SourceLoc getLoc() const override {
+    // The end location points to the dot in the member access.
+    return getSourceRange().End;
+  }
+  
+  SourceRange getSourceRange() const override;
+
 };
 
 /// Diagnose errors associated with rvalues in positions
@@ -773,7 +785,7 @@ public:
       : ContextualFailure(solution, fromType, toType, locator) {
     auto fnType1 = fromType->castTo<FunctionType>();
     auto fnType2 = toType->castTo<FunctionType>();
-    assert(fnType1->throws() != fnType2->throws());
+    assert(fnType1->isThrowing() != fnType2->isThrowing());
   }
 
   bool diagnoseAsError() override;
@@ -1281,9 +1293,10 @@ private:
   bool isPropertyWrapperInitialization() const;
 
   /// Gather information associated with expression that represents
-  /// a call - function, arguments, # of arguments and whether it has
-  /// a trailing closure.
-  std::tuple<Expr *, Expr *, unsigned, bool> getCallInfo(ASTNode anchor) const;
+  /// a call - function, arguments, # of arguments and the position of
+  /// the first trailing closure.
+  std::tuple<Expr *, Expr *, unsigned, Optional<unsigned>>
+      getCallInfo(ASTNode anchor) const;
 
   /// Transform given argument into format suitable for a fix-it
   /// text e.g. `[<label>:]? <#<type#>`
@@ -1624,6 +1637,8 @@ public:
       : ContextualFailure(solution, eltType, contextualType, locator) {}
 
   bool diagnoseAsError() override;
+
+  bool diagnoseMergedLiteralElements();
 };
 
 class MissingContextualConformanceFailure final : public ContextualFailure {
@@ -1802,6 +1817,10 @@ public:
   /// property wrapper initialization via implicit `init(wrappedValue:)`
   /// or now deprecated `init(initialValue:)`.
   bool diagnosePropertyWrapperMismatch() const;
+
+  /// Tailored diagnostics for argument mismatches associated with trailing
+  /// closures being passed to non-closure parameters.
+  bool diagnoseTrailingClosureMismatch() const;
 
 protected:
   /// \returns The position of the argument being diagnosed, starting at 1.
@@ -2177,6 +2196,48 @@ public:
 
 private:
   void fixIt(InFlightDiagnostic &diagnostic) const override;
+};
+
+/// Diagnose a key path optional base that should be unwraped in order to 
+/// apply key path subscript.
+///
+/// \code
+/// func f(_ bar: Bar? , keyPath: KeyPath<Bar, Int>) {
+///   bar[keyPath: keyPath]
+/// }
+/// \endcode
+class MissingOptionalUnwrapKeyPathFailure final : public ContextualFailure {
+public:
+  MissingOptionalUnwrapKeyPathFailure(const Solution &solution, Type lhs,
+                                      Type rhs, ConstraintLocator *locator)
+      : ContextualFailure(solution, lhs, rhs, locator) {}
+
+  bool diagnoseAsError() override;
+  SourceLoc getLoc() const override;
+};
+
+/// Diagnose situations when trailing closure has been matched to a specific
+/// parameter via a deprecated backward scan.
+///
+/// \code
+/// func multiple_trailing_with_defaults(
+///   duration: Int,
+///   animations: (() -> Void)? = nil,
+///   completion: (() -> Void)? = nil) {}
+///
+/// multiple_trailing_with_defaults(duration: 42) {} // picks `completion:`
+/// \endcode
+class TrailingClosureRequiresExplicitLabel final : public FailureDiagnostic {
+public:
+  TrailingClosureRequiresExplicitLabel(const Solution &solution,
+                                       ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator) {}
+
+  bool diagnoseAsError() override;
+
+private:
+  void fixIt(InFlightDiagnostic &diagnostic,
+             const FunctionArgApplyInfo &info) const;
 };
 
 } // end namespace constraints

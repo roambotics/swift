@@ -237,6 +237,9 @@ static bool buildObjCKeyPathString(KeyPathExpr *E,
       // Don't bother building the key path string if the key path didn't even
       // resolve.
       return false;
+    case KeyPathExpr::Component::Kind::DictionaryKey:
+      llvm_unreachable("DictionaryKey only valid in #keyPath expressions.");
+      return false;
     }
   }
   
@@ -979,7 +982,7 @@ namespace {
       Expr *closureBody = closureCall;
       closureBody = coerceToType(closureCall, resultTy, locator);
 
-      if (selfFnTy->getExtInfo().throws()) {
+      if (selfFnTy->getExtInfo().isThrowing()) {
         closureBody = new (context) TryExpr(closureBody->getStartLoc(), closureBody,
                                             cs.getType(closureBody),
                                             /*implicit=*/true);
@@ -1529,8 +1532,6 @@ namespace {
     /// \param callee The callee for the function being applied.
     /// \param apply The ApplyExpr that forms the call.
     /// \param argLabels The argument labels provided for the call.
-    /// \param hasTrailingClosure Whether the last argument is a trailing
-    /// closure.
     /// \param locator Locator used to describe where in this expression we are.
     ///
     /// \returns the coerced expression, which will have type \c ToType.
@@ -1538,7 +1539,6 @@ namespace {
     coerceCallArguments(Expr *arg, AnyFunctionType *funcType,
                         ConcreteDeclRef callee, ApplyExpr *apply,
                         ArrayRef<Identifier> argLabels,
-                        bool hasTrailingClosure,
                         ConstraintLocatorBuilder locator);
 
     /// Coerce the given object argument (e.g., for the base of a
@@ -1749,7 +1749,7 @@ namespace {
       auto fullSubscriptTy = openedFullFnType->getResult()
                                   ->castTo<FunctionType>();
       index = coerceCallArguments(index, fullSubscriptTy, subscriptRef, nullptr,
-                                  argLabels, hasTrailingClosure,
+                                  argLabels,
                                   locator.withPathElement(
                                     ConstraintLocator::ApplyArgument));
       if (!index)
@@ -2512,17 +2512,16 @@ namespace {
     
     Expr *visitMagicIdentifierLiteralExpr(MagicIdentifierLiteralExpr *expr) {
       switch (expr->getKind()) {
-      case MagicIdentifierLiteralExpr::File:
-      case MagicIdentifierLiteralExpr::FilePath:
-      case MagicIdentifierLiteralExpr::Function:
+#define MAGIC_STRING_IDENTIFIER(NAME, STRING, SYNTAX_KIND) \
+      case MagicIdentifierLiteralExpr::NAME: \
         return handleStringLiteralExpr(expr);
-
-      case MagicIdentifierLiteralExpr::Line:
-      case MagicIdentifierLiteralExpr::Column:
+#define MAGIC_INT_IDENTIFIER(NAME, STRING, SYNTAX_KIND) \
+      case MagicIdentifierLiteralExpr::NAME: \
         return handleIntegerLiteralExpr(expr);
-
-      case MagicIdentifierLiteralExpr::DSOHandle:
+#define MAGIC_POINTER_IDENTIFIER(NAME, STRING, SYNTAX_KIND) \
+      case MagicIdentifierLiteralExpr::NAME: \
         return expr;
+#include "swift/AST/MagicIdentifierKinds.def"
       }
 
 
@@ -2533,14 +2532,15 @@ namespace {
       if (cs.getType(expr) && !cs.getType(expr)->hasTypeVariable())
         return expr;
 
-      auto &ctx = cs.getASTContext();
-
       // Figure out the type we're converting to.
       auto openedType = cs.getType(expr);
       auto type = simplifyType(openedType);
       cs.setType(expr, type);
 
-      if (type->is<UnresolvedType>()) return expr;
+      if (type->is<UnresolvedType>())
+        return expr;
+
+      auto &ctx = cs.getASTContext();
 
       Type conformingType = type;
       if (auto baseType = conformingType->getOptionalObjectType()) {
@@ -2550,7 +2550,7 @@ namespace {
       }
 
       // Find the appropriate object literal protocol.
-      auto proto = TypeChecker::getLiteralProtocol(cs.getASTContext(), expr);
+      auto proto = TypeChecker::getLiteralProtocol(ctx, expr);
       assert(proto && "Missing object literal protocol?");
       auto conformance =
         TypeChecker::conformsToProtocol(conformingType, proto, cs.DC);
@@ -2560,10 +2560,23 @@ namespace {
 
       ConcreteDeclRef witness = conformance.getWitnessByName(
           conformingType->getRValueType(), constrName);
-      if (!witness || !isa<AbstractFunctionDecl>(witness.getDecl()))
+
+      auto selectedOverload = solution.getOverloadChoiceIfAvailable(
+          cs.getConstraintLocator(expr, ConstraintLocator::ConstructorMember));
+
+      if (!selectedOverload)
         return nullptr;
+
+      auto fnType =
+          simplifyType(selectedOverload->openedType)->castTo<FunctionType>();
+
+      auto newArg = coerceCallArguments(
+          expr->getArg(), fnType, witness,
+          /*applyExpr=*/nullptr, expr->getArgumentLabels(),
+          cs.getConstraintLocator(expr, ConstraintLocator::ApplyArgument));
+
       expr->setInitializer(witness);
-      expr->setArg(cs.coerceToRValue(expr->getArg()));
+      expr->setArg(newArg);
       return expr;
     }
 
@@ -3560,12 +3573,14 @@ namespace {
           castKind == CheckedCastKind::ArrayDowncast ||
           castKind == CheckedCastKind::DictionaryDowncast ||
           castKind == CheckedCastKind::SetDowncast) {
-        auto *const cast = ConditionalCheckedCastExpr::createImplicit(
-            ctx, sub, castTypeRepr, toType);
+        auto *const cast =
+            ConditionalCheckedCastExpr::createImplicit(ctx, sub, toType);
+        cast->setType(OptionalType::get(toType));
+        cast->setCastType(toType);
         cs.setType(cast, cast->getType());
 
         // Type-check this conditional case.
-        Expr *result = handleConditionalCheckedCastExpr(cast, true);
+        Expr *result = handleConditionalCheckedCastExpr(cast, castTypeRepr);
         if (!result)
           return nullptr;
 
@@ -3574,14 +3589,18 @@ namespace {
 
         // Match the optional value against its `Some` case.
         auto *someDecl = ctx.getOptionalSomeDecl();
-        auto isSomeExpr = new (ctx) EnumIsCaseExpr(result, someDecl);
+        auto isSomeExpr =
+            new (ctx) EnumIsCaseExpr(result, castTypeRepr, someDecl);
         auto boolDecl = ctx.getBoolDecl();
 
         if (!boolDecl) {
           ctx.Diags.diagnose(SourceLoc(), diag::broken_bool);
         }
 
-        cs.setType(isSomeExpr, boolDecl ? boolDecl->getDeclaredType() : Type());
+        cs.setType(isSomeExpr,
+                   boolDecl
+                   ? boolDecl->getDeclaredInterfaceType()
+                   : Type());
         return isSomeExpr;
       }
 
@@ -3996,10 +4015,16 @@ namespace {
     }
 
     Expr *visitConditionalCheckedCastExpr(ConditionalCheckedCastExpr *expr) {
+      // Simplify and update the type we're casting to.
+      auto *const castTypeRepr = expr->getCastTypeRepr();
+      const auto toType = simplifyType(cs.getType(castTypeRepr));
+      expr->setCastType(toType);
+      cs.setType(castTypeRepr, toType);
+
       // If we need to insert a force-unwrap for coercions of the form
       // 'as! T!', do so now.
       if (hasForcedOptionalResult(expr)) {
-        auto *coerced = handleConditionalCheckedCastExpr(expr);
+        auto *coerced = handleConditionalCheckedCastExpr(expr, castTypeRepr);
         if (!coerced)
           return nullptr;
 
@@ -4007,29 +4032,28 @@ namespace {
             coerced, cs.getType(coerced)->getOptionalObjectType());
       }
 
-      return handleConditionalCheckedCastExpr(expr);
+      return handleConditionalCheckedCastExpr(expr, castTypeRepr);
     }
 
     Expr *handleConditionalCheckedCastExpr(ConditionalCheckedCastExpr *expr,
-                                           bool isInsideIsExpr = false) {
+                                           TypeRepr *castTypeRepr) {
+      assert(castTypeRepr &&
+             "cast requires TypeRepr; implicit casts are superfluous");
+
       // The subexpression is always an rvalue.
       auto &ctx = cs.getASTContext();
       auto sub = cs.coerceToRValue(expr->getSubExpr());
       expr->setSubExpr(sub);
 
       // Simplify and update the type we're casting to.
-      auto *const castTypeRepr = expr->getCastTypeRepr();
-
       const auto fromType = cs.getType(sub);
-      const auto toType = simplifyType(cs.getType(castTypeRepr));
-      expr->setCastType(toType);
-      cs.setType(castTypeRepr, toType);
+      const auto toType = expr->getCastType();
 
       bool isSubExprLiteral = isa<LiteralExpr>(sub);
       auto castContextKind =
-          (SuppressDiagnostics || isInsideIsExpr || isSubExprLiteral)
-            ? CheckedCastContextKind::None
-            : CheckedCastContextKind::ConditionalCast;
+          (SuppressDiagnostics || expr->isImplicit() || isSubExprLiteral)
+              ? CheckedCastContextKind::None
+              : CheckedCastContextKind::ConditionalCast;
 
       auto castKind = TypeChecker::typeCheckCheckedCast(
           fromType, toType, castContextKind, cs.DC, expr->getLoc(), sub,
@@ -4111,6 +4135,10 @@ namespace {
       // If we end up here, we should have diagnosed somewhere else
       // already.
       Expr *simplified = simplifyExprType(expr);
+      // Invalidate 'VarDecl's inside the pattern.
+      expr->getSubPattern()->forEachVariable([](VarDecl *VD) {
+        VD->setInvalid();
+      });
       if (!SuppressDiagnostics
           && !cs.getType(simplified)->is<UnresolvedType>()) {
         auto &de = cs.getASTContext().Diags;
@@ -4665,6 +4693,10 @@ namespace {
         case KeyPathExpr::Component::Kind::OptionalWrap:
         case KeyPathExpr::Component::Kind::TupleElement:
           llvm_unreachable("already resolved");
+          break;
+        case KeyPathExpr::Component::Kind::DictionaryKey:
+          llvm_unreachable("DictionaryKey only valid in #keyPath");
+          break;
         }
 
         // Update "componentTy" with the result type of the last component.
@@ -4904,7 +4936,7 @@ namespace {
       auto *newIndexExpr =
           coerceCallArguments(indexExpr, subscriptType, ref,
                               /*applyExpr*/ nullptr, labels,
-                              /*hasTrailingClosure*/ false, locator);
+                              locator);
 
       // We need to be able to hash the captured index values in order for
       // KeyPath itself to be hashable, so check that all of the subscript
@@ -5383,7 +5415,7 @@ Expr *ExprRewriter::coerceOptionalToOptional(Expr *expr, Type toType,
 
 Expr *ExprRewriter::coerceImplicitlyUnwrappedOptionalToValue(Expr *expr, Type objTy) {
   auto optTy = cs.getType(expr);
-  // Coerce to an r-value.
+  // Preserve l-valueness of the result.
   if (optTy->is<LValueType>())
     objTy = LValueType::get(objTy);
 
@@ -5437,12 +5469,12 @@ static bool hasCurriedSelf(ConstraintSystem &cs, ConcreteDeclRef callee,
   return false;
 }
 
-Expr *ExprRewriter::coerceCallArguments(Expr *arg, AnyFunctionType *funcType,
-                                        ConcreteDeclRef callee,
-                                        ApplyExpr *apply,
-                                        ArrayRef<Identifier> argLabels,
-                                        bool hasTrailingClosure,
-                                        ConstraintLocatorBuilder locator) {
+Expr *ExprRewriter::coerceCallArguments(
+    Expr *arg, AnyFunctionType *funcType,
+    ConcreteDeclRef callee,
+    ApplyExpr *apply,
+    ArrayRef<Identifier> argLabels,
+    ConstraintLocatorBuilder locator) {
   auto &ctx = getConstraintSystem().getASTContext();
   auto params = funcType->getParams();
 
@@ -5473,14 +5505,17 @@ Expr *ExprRewriter::coerceCallArguments(Expr *arg, AnyFunctionType *funcType,
   bool shouldInjectWrappedValuePlaceholder =
      target->shouldInjectWrappedValuePlaceholder(apply);
 
-  auto injectWrappedValuePlaceholder = [&](Expr *arg) -> Expr * {
-    auto *placeholder = PropertyWrapperValuePlaceholderExpr::create(ctx,
-        arg->getSourceRange(), cs.getType(arg), arg);
-    cs.cacheType(placeholder);
-    cs.cacheType(placeholder->getOpaqueValuePlaceholder());
-    shouldInjectWrappedValuePlaceholder = false;
-    return placeholder;
-  };
+  auto injectWrappedValuePlaceholder =
+      [&](Expr *arg, bool isAutoClosure = false) -> Expr * {
+        auto *placeholder = PropertyWrapperValuePlaceholderExpr::create(
+            ctx, arg->getSourceRange(), cs.getType(arg),
+            target->propertyWrapperHasInitialWrappedValue() ? arg : nullptr,
+            isAutoClosure);
+        cs.cacheType(placeholder);
+        cs.cacheType(placeholder->getOpaqueValuePlaceholder());
+        shouldInjectWrappedValuePlaceholder = false;
+        return placeholder;
+      };
 
   // Quickly test if any further fix-ups for the argument types are necessary.
   if (AnyFunctionType::equalParams(args, params) &&
@@ -5491,16 +5526,33 @@ Expr *ExprRewriter::coerceCallArguments(Expr *arg, AnyFunctionType *funcType,
   AnyFunctionType::relabelParams(args, argLabels);
 
   MatchCallArgumentListener listener;
-  SmallVector<ParamBinding, 4> parameterBindings;
-  bool failed = constraints::matchCallArguments(args, params,
-                                                paramInfo,
-                       arg->getUnlabeledTrailingClosureIndexOfPackedArgument(),
-                                                /*allowFixes=*/false, listener,
-                                                parameterBindings);
+  auto unlabeledTrailingClosureIndex =
+      arg->getUnlabeledTrailingClosureIndexOfPackedArgument();
 
-  assert((matchCanFail || !failed) && "Call arguments did not match up?");
-  (void)failed;
+  // Determine the trailing closure matching rule that was applied. This
+  // is only relevant for explicit calls and subscripts.
+  auto trailingClosureMatching = TrailingClosureMatching::Forward;
+  {
+    SmallVector<LocatorPathElt, 4> path;
+    auto anchor = locator.getLocatorParts(path);
+    if (!path.empty() && path.back().is<LocatorPathElt::ApplyArgument>() &&
+        (anchor.isExpr(ExprKind::Call) || anchor.isExpr(ExprKind::Subscript))) {
+      auto locatorPtr = cs.getConstraintLocator(locator);
+      assert(solution.trailingClosureMatchingChoices.count(locatorPtr) == 1);
+      trailingClosureMatching = solution.trailingClosureMatchingChoices.find(
+          locatorPtr)->second;
+    }
+  }
+
+  auto callArgumentMatch = constraints::matchCallArguments(
+      args, params, paramInfo, unlabeledTrailingClosureIndex,
+      /*allowFixes=*/false, listener, trailingClosureMatching);
+
+  assert((matchCanFail || callArgumentMatch) &&
+         "Call arguments did not match up?");
   (void)matchCanFail;
+
+  auto parameterBindings = std::move(callArgumentMatch->parameterBindings);
 
   // We should either have parentheses or a tuple.
   auto *argTuple = dyn_cast<TupleExpr>(arg);
@@ -5675,19 +5727,18 @@ Expr *ExprRewriter::coerceCallArguments(Expr *arg, AnyFunctionType *funcType,
           locator.withPathElement(ConstraintLocator::AutoclosureResult));
 
       if (shouldInjectWrappedValuePlaceholder) {
-        // If init(wrappedValue:) takes an escaping autoclosure, then we want
+        // If init(wrappedValue:) takes an autoclosure, then we want
         // the effect of autoclosure forwarding of the placeholder
         // autoclosure. The only way to do this is to call the placeholder
         // autoclosure when passing it to the init.
-        if (!closureType->isNoEscape()) {
-          auto *placeholder = injectWrappedValuePlaceholder(
-              cs.buildAutoClosureExpr(arg, closureType));
-          arg = CallExpr::createImplicit(ctx, placeholder, {}, {});
-          arg->setType(closureType->getResult());
-          cs.cacheType(arg);
-        } else {
-          arg = injectWrappedValuePlaceholder(arg);
-        }
+        bool isDefaultWrappedValue =
+            target->propertyWrapperHasInitialWrappedValue();
+        auto *placeholder = injectWrappedValuePlaceholder(
+            cs.buildAutoClosureExpr(arg, closureType, isDefaultWrappedValue),
+            /*isAutoClosure=*/true);
+        arg = CallExpr::createImplicit(ctx, placeholder, {}, {});
+        arg->setType(closureType->getResult());
+        cs.cacheType(arg);
       }
 
       convertedArg = cs.buildAutoClosureExpr(arg, closureType);
@@ -5724,7 +5775,7 @@ Expr *ExprRewriter::coerceCallArguments(Expr *arg, AnyFunctionType *funcType,
       (params[0].getValueOwnership() == ValueOwnership::Default ||
        params[0].getValueOwnership() == ValueOwnership::InOut)) {
     assert(newArgs.size() == 1);
-    assert(!hasTrailingClosure);
+    assert(!unlabeledTrailingClosureIndex);
     return newArgs[0];
   }
 
@@ -5737,8 +5788,9 @@ Expr *ExprRewriter::coerceCallArguments(Expr *arg, AnyFunctionType *funcType,
       argParen->setSubExpr(newArgs[0]);
     } else {
       bool isImplicit = arg->isImplicit();
-      arg = new (ctx)
-          ParenExpr(lParenLoc, newArgs[0], rParenLoc, hasTrailingClosure);
+      arg = new (ctx) ParenExpr(
+          lParenLoc, newArgs[0], rParenLoc,
+          static_cast<bool>(unlabeledTrailingClosureIndex));
       arg->setImplicit(isImplicit);
     }
   } else {
@@ -5752,8 +5804,8 @@ Expr *ExprRewriter::coerceCallArguments(Expr *arg, AnyFunctionType *funcType,
       }
     } else {
       // Build a new TupleExpr, re-using source location information.
-      arg = TupleExpr::create(ctx, lParenLoc, newArgs, newLabels, newLabelLocs,
-                              rParenLoc, hasTrailingClosure,
+      arg = TupleExpr::create(ctx, lParenLoc, rParenLoc, newArgs, newLabels,
+                              newLabelLocs, unlabeledTrailingClosureIndex,
                               /*implicit=*/arg->isImplicit());
     }
   }
@@ -5762,16 +5814,9 @@ Expr *ExprRewriter::coerceCallArguments(Expr *arg, AnyFunctionType *funcType,
   return cs.cacheType(arg);
 }
 
-static ClosureExpr *getClosureLiteralExpr(Expr *expr) {
+static bool isClosureLiteralExpr(Expr *expr) {
   expr = expr->getSemanticsProvidingExpr();
-
-  if (auto *captureList = dyn_cast<CaptureListExpr>(expr))
-    return captureList->getClosureBody();
-
-  if (auto *closure = dyn_cast<ClosureExpr>(expr))
-    return closure;
-
-  return nullptr;
+  return (isa<CaptureListExpr>(expr) || isa<ClosureExpr>(expr));
 }
 
 /// If the expression is an explicit closure expression (potentially wrapped in
@@ -6572,7 +6617,9 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
       maybeDiagnoseUnsupportedDifferentiableConversion(cs, expr, toFunc);
       if (!isFromDifferentiable && isToDifferentiable) {
         auto newEI =
-            fromEI.withDifferentiabilityKind(toEI.getDifferentiabilityKind());
+            fromEI.intoBuilder()
+                .withDifferentiabilityKind(toEI.getDifferentiabilityKind())
+                .build();
         fromFunc = FunctionType::get(toFunc->getParams(), fromFunc->getResult())
             ->withExtInfo(newEI)
             ->castTo<FunctionType>();
@@ -7111,9 +7158,6 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
   auto *arg = apply->getArg();
   auto *fn = apply->getFn();
 
-  bool hasTrailingClosure =
-    isa<CallExpr>(apply) && cast<CallExpr>(apply)->hasTrailingClosure();
-
   auto finishApplyOfDeclWithSpecialTypeCheckingSemantics
     = [&](ApplyExpr *apply,
           ConcreteDeclRef declRef,
@@ -7129,7 +7173,6 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
         arg = coerceCallArguments(arg, fnType, declRef,
                                   apply,
                                   apply->getArgumentLabels(argLabelsScratch),
-                                  hasTrailingClosure,
                                   locator.withPathElement(
                                     ConstraintLocator::ApplyArgument));
         if (!arg) {
@@ -7314,7 +7357,7 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
   }
 
   // An immediate application of a closure literal is always noescape.
-  if (getClosureLiteralExpr(fn)) {
+  if (isClosureLiteralExpr(fn)) {
     if (auto fnTy = cs.getType(fn)->getAs<FunctionType>()) {
       fnTy = cast<FunctionType>(
         fnTy->withExtInfo(fnTy->getExtInfo().withNoEscape()));
@@ -7333,7 +7376,6 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
   if (auto fnType = cs.getType(fn)->getAs<FunctionType>()) {
     arg = coerceCallArguments(arg, fnType, callee, apply,
                               apply->getArgumentLabels(argLabelsScratch),
-                              hasTrailingClosure,
                               locator.withPathElement(
                                   ConstraintLocator::ApplyArgument));
     if (!arg) {
@@ -7585,9 +7627,8 @@ namespace {
             componentType = solution.simplifyType(cs.getType(kp, i));
             assert(!componentType->hasTypeVariable() &&
                    "Should not write type variable into key-path component");
+            kp->getMutableComponents()[i].setComponentType(componentType);
           }
-
-          kp->getMutableComponents()[i].setComponentType(componentType);
         }
       }
 
@@ -7630,6 +7671,13 @@ namespace {
         // We remember the DeclContext because the code to handle
         // single-expression-body closures above changes it.
         TapsToTypeCheck.push_back(std::make_pair(tap, Rewriter.dc));
+      }
+
+      if (auto captureList = dyn_cast<CaptureListExpr>(expr)) {
+        // Rewrite captures.
+        for (const auto &capture : captureList->getCaptureList()) {
+          (void)rewriteTarget(SolutionApplicationTarget(capture.Init));
+        }
       }
 
       Rewriter.walkToExprPre(expr);
@@ -7676,8 +7724,11 @@ namespace {
         return true;
 
       case SolutionApplicationToFunctionResult::Delay: {
-        auto closure = cast<ClosureExpr>(fn.getAbstractClosureExpr());
-        ClosuresToTypeCheck.push_back(closure);
+        if (!Rewriter.cs.Options
+                .contains(ConstraintSystemFlags::LeaveClosureBodyUnchecked)) {
+          auto closure = cast<ClosureExpr>(fn.getAbstractClosureExpr());
+          ClosuresToTypeCheck.push_back(closure);
+        }
         return false;
       }
       }
@@ -7903,7 +7954,7 @@ static Optional<SolutionApplicationTarget> applySolutionToForEachStmt(
   if (forEachStmtInfo.whereExpr) {
     auto *boolDecl = dc->getASTContext().getBoolDecl();
     assert(boolDecl);
-    Type boolType = boolDecl->getDeclaredType();
+    Type boolType = boolDecl->getDeclaredInterfaceType();
     assert(boolType);
 
     SolutionApplicationTarget whereTarget(
@@ -8031,6 +8082,8 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
     case swift::CTP_AssignSource:
     case swift::CTP_SubscriptAssignSource:
     case swift::CTP_Condition:
+    case swift::CTP_WrappedProperty:
+    case swift::CTP_ComposedPropertyWrapper:
     case swift::CTP_CannotFail:
       result.setExpr(rewrittenExpr);
       break;
@@ -8090,7 +8143,7 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
                                          target.getDeclContext());
     if (auto coercedPattern = TypeChecker::coercePatternToType(
             contextualPattern, patternType, patternOptions)) {
-      (*caseLabelItem)->setPattern(coercedPattern);
+      (*caseLabelItem)->setPattern(coercedPattern, /*resolved=*/true);
     } else {
       return None;
     }
@@ -8102,7 +8155,7 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
         return None;
 
       // FIXME: Feels like we could leverage existing code more.
-      Type boolType = cs.getASTContext().getBoolDecl()->getDeclaredType();
+      Type boolType = cs.getASTContext().getBoolDecl()->getDeclaredInterfaceType();
       guardExpr = solution.coerceToType(
           guardExpr, boolType, cs.getConstraintLocator(info.guardExpr));
       if (!guardExpr)
@@ -8130,6 +8183,17 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
           resultTarget->getDeclContext());
       patternBinding->setInit(index, resultTarget->getAsExpr());
     }
+
+    return target;
+  } else if (auto *wrappedVar = target.getAsUninitializedWrappedVar()) {
+    // Get the outermost wrapper type from the solution
+    auto outermostWrapper = wrappedVar->getAttachedPropertyWrappers().front();
+    auto backingType = solution.simplifyType(
+        solution.getType(outermostWrapper->getTypeRepr()));
+
+    auto &ctx = solution.getConstraintSystem().getASTContext();
+    ctx.setSideCachedPropertyWrapperBackingPropertyType(
+        wrappedVar, backingType->mapTypeOutOfContext());
 
     return target;
   } else {
@@ -8243,6 +8307,7 @@ Optional<SolutionApplicationTarget> ConstraintSystem::applySolution(
 
   // Visit closures that have non-single expression bodies.
   bool hadError = false;
+
   for (auto *closure : walker.getClosuresToTypeCheck())
     hadError |= TypeChecker::typeCheckClosureBody(closure);
 
@@ -8400,7 +8465,8 @@ SolutionApplicationTarget SolutionApplicationTarget::walk(ASTWalker &walker) {
   case Kind::caseLabelItem:
     if (auto newPattern =
             caseLabelItem.caseLabelItem->getPattern()->walk(walker)) {
-      caseLabelItem.caseLabelItem->setPattern(newPattern);
+      caseLabelItem.caseLabelItem->setPattern(
+          newPattern, caseLabelItem.caseLabelItem->isPatternResolved());
     }
     if (auto guardExpr = caseLabelItem.caseLabelItem->getGuardExpr()) {
       if (auto newGuardExpr = guardExpr->walk(walker))
@@ -8410,6 +8476,9 @@ SolutionApplicationTarget SolutionApplicationTarget::walk(ASTWalker &walker) {
     return *this;
 
   case Kind::patternBinding:
+    return *this;
+
+  case Kind::uninitializedWrappedVar:
     return *this;
   }
 

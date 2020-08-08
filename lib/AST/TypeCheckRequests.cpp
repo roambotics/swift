@@ -37,14 +37,14 @@ namespace swift {
 }
 
 void swift::simple_display(
-       llvm::raw_ostream &out,
-       const llvm::PointerUnion<TypeDecl *, ExtensionDecl *> &value) {
-  if (auto type = value.dyn_cast<TypeDecl *>()) {
+    llvm::raw_ostream &out,
+    const llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> &value) {
+  if (auto type = value.dyn_cast<const TypeDecl *>()) {
     type->dumpRef(out);
     return;
   }
 
-  auto ext = value.get<ExtensionDecl *>();
+  auto ext = value.get<const ExtensionDecl *>();
   simple_display(out, ext);
 }
 
@@ -116,7 +116,7 @@ void InheritedTypeRequest::cacheResult(Type value) const {
   const auto &storage = getStorage();
   auto &typeLoc = getInheritedTypeLocAtIndex(std::get<0>(storage),
                                              std::get<1>(storage));
-  typeLoc.setType(value);
+  const_cast<TypeLoc &>(typeLoc).setType(value);
 }
 
 //----------------------------------------------------------------------------//
@@ -781,23 +781,6 @@ void SynthesizeAccessorRequest::cacheResult(AccessorDecl *accessor) const {
   auto kind = std::get<1>(getStorage());
 
   storage->setSynthesizedAccessor(kind, accessor);
-}
-
-//----------------------------------------------------------------------------//
-// EmittedMembersRequest computation.
-//----------------------------------------------------------------------------//
-
-Optional<DeclRange>
-EmittedMembersRequest::getCachedResult() const {
-  auto *classDecl = std::get<0>(getStorage());
-  if (classDecl->hasForcedEmittedMembers())
-    return classDecl->getMembers();
-  return None;
-}
-
-void EmittedMembersRequest::cacheResult(DeclRange result) const {
-  auto *classDecl = std::get<0>(getStorage());
-  classDecl->setHasForcedEmittedMembers();
 }
 
 //----------------------------------------------------------------------------//

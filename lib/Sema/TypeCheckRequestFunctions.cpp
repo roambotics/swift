@@ -25,36 +25,36 @@
 
 using namespace swift;
 
-Type
-InheritedTypeRequest::evaluate(
-    Evaluator &evaluator, llvm::PointerUnion<TypeDecl *, ExtensionDecl *> decl,
-    unsigned index,
-    TypeResolutionStage stage) const {
+Type InheritedTypeRequest::evaluate(
+    Evaluator &evaluator,
+    llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> decl,
+    unsigned index, TypeResolutionStage stage) const {
   // Figure out how to resolve types.
   TypeResolutionOptions options = None;
   DeclContext *dc;
-  if (auto typeDecl = decl.dyn_cast<TypeDecl *>()) {
+  if (auto typeDecl = decl.dyn_cast<const TypeDecl *>()) {
     if (auto nominal = dyn_cast<NominalTypeDecl>(typeDecl)) {
-      dc = nominal;
+      dc = (DeclContext *)nominal;
 
       options |= TypeResolutionFlags::AllowUnavailableProtocol;
     } else {
       dc = typeDecl->getDeclContext();
     }
   } else {
-    auto ext = decl.get<ExtensionDecl *>();
-    dc = ext;
+    dc = (DeclContext *)decl.get<const ExtensionDecl *>();
     options |= TypeResolutionFlags::AllowUnavailableProtocol;
   }
 
   Optional<TypeResolution> resolution;
   switch (stage) {
   case TypeResolutionStage::Structural:
-    resolution = TypeResolution::forStructural(dc, options);
+    resolution =
+        TypeResolution::forStructural(dc, options, /*unboundTyOpener*/ nullptr);
     break;
 
   case TypeResolutionStage::Interface:
-    resolution = TypeResolution::forInterface(dc, options);
+    resolution =
+        TypeResolution::forInterface(dc, options, /*unboundTyOpener*/ nullptr);
     break;
 
   case TypeResolutionStage::Contextual: {
@@ -69,7 +69,7 @@ InheritedTypeRequest::evaluate(
   }
   }
 
-  TypeLoc &typeLoc = getInheritedTypeLocAtIndex(decl, index);
+  const TypeLoc &typeLoc = getInheritedTypeLocAtIndex(decl, index);
 
   Type inheritedType;
   if (typeLoc.getTypeRepr())

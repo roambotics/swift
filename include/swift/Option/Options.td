@@ -154,7 +154,7 @@ Flag<["-"], "enable-only-one-dependency-file">, Flags<[DoesNotAffectIncrementalB
 def disable_only_one_dependency_file :
 Flag<["-"], "disable-only-one-dependency-file">, Flags<[DoesNotAffectIncrementalBuild]>,
  HelpText<"Disables incremental build optimization that only produces one dependencies file">;
- 
+
 
 def enable_source_range_dependencies :
 Flag<["-"], "enable-source-range-dependencies">, Flags<[]>,
@@ -167,7 +167,7 @@ HelpText<"Print a simple message comparing dependencies with source ranges (w/ f
 
 def driver_compare_incremental_schemes_path :
 Separate<["-"], "driver-compare-incremental-schemes-path">, Flags<[ArgumentIsPath,DoesNotAffectIncrementalBuild]>,
-HelpText<"Path to use for machine-readable comparision">,
+HelpText<"Path to use for machine-readable comparison">,
 MetaVarName<"<path>">;
 
 def driver_compare_incremental_schemes_path_EQ :
@@ -197,7 +197,7 @@ HelpText<"Include within-file dependencies.">;
 
 def emit_fine_grained_dependency_sourcefile_dot_files :
 Flag<["-"], "emit-fine-grained-dependency-sourcefile-dot-files">,
-InternalDebugOpt,
+Flags<[FrontendOption, HelpHidden]>,
 HelpText<"Emit dot files for every source file.">;
 
 def driver_mode : Joined<["--"], "driver-mode=">, Flags<[HelpHidden]>,
@@ -213,7 +213,7 @@ def help_hidden : Flag<["-", "--"], "help-hidden">,
 
 def v : Flag<["-"], "v">, Flags<[DoesNotAffectIncrementalBuild]>,
   HelpText<"Show commands to run and use verbose output">;
-def version : Flag<["-", "--"], "version">,
+def version : Flag<["-", "--"], "version">, Flags<[FrontendOption]>,
   HelpText<"Print version information and exit">;
 
 def parseable_output : Flag<["-"], "parseable-output">,
@@ -389,6 +389,14 @@ def diagnostic_style : Separate<["-"], "diagnostic-style">,
 def diagnostic_style_EQ : Joined<["-"], "diagnostic-style=">,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
   MetaVarName<"<style>">, Alias<diagnostic_style>;
+def locale : Separate<["-"], "locale">,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
+  HelpText<"Choose a language for diagnostic messages">,
+  MetaVarName<"<locale-code>">;
+def localization_path : Separate<["-"], "localization-path">,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild, ArgumentIsPath]>,
+  HelpText<"Path to localized diagnostic messages directory">,
+  MetaVarName<"<path>">;
 
 def module_cache_path : Separate<["-"], "module-cache-path">,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild, ArgumentIsPath]>,
@@ -515,6 +523,10 @@ def disable_bridging_pch : Flag<["-"], "disable-bridging-pch">,
   Flags<[HelpHidden]>,
   HelpText<"Disable automatic generation of bridging PCH files">;
 
+def lto : Joined<["-"], "lto=">,
+  Flags<[FrontendOption, NoInteractiveOption]>,
+  HelpText<"Specify the LTO type to either 'llvm-thin' or 'llvm-full'">;
+
 // Experimental feature options
 
 // Note: this flag will be removed when JVP/differential generation in the
@@ -531,8 +543,18 @@ def enable_experimental_additive_arithmetic_derivation :
 
 def enable_experimental_concise_pound_file : Flag<["-"],
     "enable-experimental-concise-pound-file">,
-  Flags<[FrontendOption]>,
+  Flags<[FrontendOption, ModuleInterfaceOption]>,
   HelpText<"Enable experimental concise '#file' identifier">;
+
+def disable_fuzzy_forward_scan_trailing_closure_matching : Flag<["-"],
+    "disable-fuzzy-forward-scan-trailing-closure-matching">,
+  Flags<[FrontendOption]>,
+  HelpText<"Disable fuzzy forward-scan trailing closure matching">;
+
+def enable_fuzzy_forward_scan_trailing_closure_matching : Flag<["-"],
+    "enable-fuzzy-forward-scan-trailing-closure-matching">,
+  Flags<[FrontendOption]>,
+  HelpText<"Enable fuzzy forward-scan trailing closure matching">;
 
 def enable_direct_intramodule_dependencies : Flag<["-"],
     "enable-direct-intramodule-dependencies">,
@@ -543,6 +565,14 @@ def disable_direct_intramodule_dependencies : Flag<["-"],
     "disable-direct-intramodule-dependencies">,
   Flags<[FrontendOption, HelpHidden]>,
   HelpText<"Disable experimental dependency tracking that never cascades">;
+
+def enable_experimental_cxx_interop :
+  Flag<["-"], "enable-experimental-cxx-interop">,
+  HelpText<"Allow importing C++ modules into Swift (experimental feature)">;
+
+def experimental_cxx_stdlib :
+  Separate<["-"], "experimental-cxx-stdlib">,
+  HelpText<"C++ standard library to use; forwarded to Clang's -stdlib flag">;
 
 
 // Diagnostic control options

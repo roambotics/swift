@@ -1418,7 +1418,7 @@ struct RelabelAndTrailingClosure {
   func f2(aa: Int, bb: Int, _ cc: () -> Void = {}) {}
 
   func test() {
-    f1(aax: 1, bbx: 2) {} // expected-error {{incorrect argument labels in call (have 'aax:bbx:_:', expected 'aa:bb:cc:')}} {{8-11=aa}} {{16-19=bb}} {{none}}
+    f1(aax: 1, bbx: 2) {} // expected-error {{incorrect argument labels in call (have 'aax:bbx:_:', expected 'aa:bb:_:')}} {{8-11=aa}} {{16-19=bb}} {{none}}
     f2(aax: 1, bbx: 2) {} // expected-error {{incorrect argument labels in call (have 'aax:bbx:_:', expected 'aa:bb:_:')}} {{8-11=aa}} {{16-19=bb}} {{none}}
 
     f1(aax: 1, bbx: 2) // expected-error {{incorrect argument labels in call (have 'aax:bbx:', expected 'aa:bb:')}} {{8-11=aa}} {{16-19=bb}} {{none}}
@@ -1607,3 +1607,34 @@ struct DiagnoseAllLabels {
     f(aax: 0, bbx: 1, dd: 3, ff: 5) // expected-error {{incorrect argument labels in call (have 'aax:bbx:dd:ff:', expected 'aa:bb:dd:ff:')}} {{7-10=aa}} {{15-18=bb}} {{none}}
   }
 }
+
+// SR-13135: Type inference regression in Swift 5.3 - can't infer a type of @autoclosure result.
+func sr13135() {
+  struct Foo {
+    var bar: [Int] = []
+  }
+
+  let baz: Int? = nil
+
+  func foo<T: Equatable>(
+    _ a: @autoclosure () throws -> T,
+    _ b: @autoclosure () throws -> T
+  ) {}
+
+  foo(Foo().bar, [baz])
+}
+
+// SR-13240
+func twoargs(_ x: String, _ y: String) {}
+
+func test() {
+  let x = 1
+  twoargs(x, x) // expected-error 2 {{cannot convert value of type 'Int' to expected argument type 'String'}}
+}
+
+infix operator ---
+
+func --- (_ lhs: String, _ rhs: String) -> Bool { true }
+
+let x = 1
+x --- x // expected-error 2 {{cannot convert value of type 'Int' to expected argument type 'String'}}

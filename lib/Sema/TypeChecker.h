@@ -144,6 +144,9 @@ enum ContextualTypePurpose {
                         ///< `if`, `for`, `while` etc.
   CTP_ForEachStmt,      ///< "expression/sequence" associated with 'for-in' loop
                         ///< is expected to conform to 'Sequence' protocol.
+  CTP_WrappedProperty,  ///< Property type expected to match 'wrappedValue' type
+  CTP_ComposedPropertyWrapper, ///< Composed wrapper type expected to match
+                               ///< former 'wrappedValue' type
 
   CTP_CannotFail,       ///< Conversion can never fail. abort() if it does.
 };
@@ -161,12 +164,17 @@ enum class TypeCheckExprFlags {
   /// not all type variables have been determined.  In this case, the constraint
   /// system is not applied to the expression AST, but the ConstraintSystem is
   /// left in-tact.
-  AllowUnresolvedTypeVariables = 0x08,
+  AllowUnresolvedTypeVariables = 0x02,
 
   /// If set, this expression isn't embedded in a larger expression or
   /// statement. This should only be used for syntactic restrictions, and should
   /// not affect type checking itself.
-  IsExprStmt = 0x20,
+  IsExprStmt = 0x04,
+
+  /// Don't try to type check closure expression bodies, and leave them
+  /// unchecked. This is used by source tooling functionalities such as code
+  /// completion.
+  LeaveClosureBodyUnchecked = 0x08,
 };
 
 using TypeCheckExprOptions = OptionSet<TypeCheckExprFlags>;
@@ -275,52 +283,6 @@ struct ParentConditionalConformance {
                            ArrayRef<ParentConditionalConformance> conformances);
 };
 
-/// An abstract interface that is used by `checkGenericArguments`.
-class GenericRequirementsCheckListener {
-public:
-  virtual ~GenericRequirementsCheckListener();
-
-  /// Callback invoked before trying to check generic requirement placed
-  /// between given types. Note: if either of the types assigned to the
-  /// requirement is generic parameter or dependent member, this callback
-  /// method is going to get their substitutions.
-  ///
-  /// \param kind The kind of generic requirement to check.
-  ///
-  /// \param first The left-hand side type assigned to the requirement,
-  /// possibly represented by its generic substitute.
-  ///
-  /// \param second The right-hand side type assigned to the requirement,
-  /// possibly represented by its generic substitute.
-  ///
-  ///
-  /// \returns true if it's ok to validate requirement, false otherwise.
-  virtual bool shouldCheck(RequirementKind kind, Type first, Type second);
-
-  /// Callback to report the result of a satisfied conformance requirement.
-  ///
-  /// \param depTy The dependent type, from the signature.
-  /// \param replacementTy The type \c depTy was replaced with.
-  /// \param conformance The conformance itself.
-  virtual void satisfiedConformance(Type depTy, Type replacementTy,
-                                    ProtocolConformanceRef conformance);
-
-  /// Callback to diagnose problem with unsatisfied generic requirement.
-  ///
-  /// \param req The unsatisfied generic requirement.
-  ///
-  /// \param first The left-hand side type assigned to the requirement,
-  /// possibly represented by its generic substitute.
-  ///
-  /// \param second The right-hand side type assigned to the requirement,
-  /// possibly represented by its generic substitute.
-  ///
-  /// \returns true if problem has been diagnosed, false otherwise.
-  virtual bool diagnoseUnsatisfiedRequirement(
-      const Requirement &req, Type first, Type second,
-      ArrayRef<ParentConditionalConformance> parents);
-};
-
 /// The result of `checkGenericRequirement`.
 enum class RequirementCheckResult {
   Success, Failure, SubstitutionFailure
@@ -341,6 +303,9 @@ enum class CheckedCastContextKind {
   IsPattern,
   /// An enum-element pattern.
   EnumElementPattern,
+  /// Coerce to checked cast. Used when we verify if it is possible to
+  /// suggest to convert a coercion to a checked cast.
+  Coercion,
 };
 
 namespace TypeChecker {
@@ -527,6 +492,9 @@ bool typesSatisfyConstraint(Type t1, Type t2, bool openArchetypes,
 /// of the function, set the result type of the expression to that sugar type.
 Expr *substituteInputSugarTypeForResult(ApplyExpr *E);
 
+void typeCheckASTNode(ASTNode &node, DeclContext *DC,
+                      bool LeaveBodyUnchecked = false);
+
 bool typeCheckAbstractFunctionBody(AbstractFunctionDecl *AFD);
 
 /// Try to apply the function builder transform of the given builder type
@@ -627,13 +595,10 @@ std::string gatherGenericParamBindingsText(
 /// \param requirements The requirements against which the generic arguments
 /// should be checked.
 /// \param substitutions Substitutions from interface types of the signature.
-/// \param listener The generic check listener used to pick requirements and
-/// notify callers about diagnosed errors.
 RequirementCheckResult checkGenericArguments(
     DeclContext *dc, SourceLoc loc, SourceLoc noteLoc, Type owner,
     TypeArrayView<GenericTypeParamType> genericParams,
     ArrayRef<Requirement> requirements, TypeSubstitutionFn substitutions,
-    GenericRequirementsCheckListener *listener = nullptr,
     SubstOptions options = None);
 
 /// Add any implicitly-defined constructors required for the given
@@ -672,26 +637,7 @@ Type typeCheckExpression(Expr *&expr, DeclContext *dc,
 
 Optional<constraints::SolutionApplicationTarget>
 typeCheckExpression(constraints::SolutionApplicationTarget &target,
-                    bool &unresolvedTypeExprs,
                     TypeCheckExprOptions options = TypeCheckExprOptions());
-
-/// Type check the given expression and return its type without
-/// applying the solution.
-///
-/// \param expr The expression to type-check.
-///
-/// \param referencedDecl Will be set to the declaration that is referenced by
-/// the expression.
-///
-/// \param allowFreeTypeVariables Whether free type variables are allowed in
-/// the solution, and what to do with them.
-///
-/// \returns the type of \p expr on success, Type() otherwise.
-/// FIXME: expr may still be modified...
-Type getTypeOfExpressionWithoutApplying(
-    Expr *&expr, DeclContext *dc, ConcreteDeclRef &referencedDecl,
-    FreeTypeVariableBinding allowFreeTypeVariables =
-        FreeTypeVariableBinding::Disallow);
 
 /// Return the type of operator function for specified LHS, or a null
 /// \c Type on error.
@@ -744,15 +690,6 @@ void checkSwitchExhaustiveness(const SwitchStmt *stmt, const DeclContext *DC,
 ///
 /// \returns true if an error occurred, false otherwise.
 bool typeCheckCondition(Expr *&expr, DeclContext *dc);
-
-/// Type check the given 'if', 'while', or 'guard' statement condition.
-///
-/// \param stmt The conditional statement to type-check, which will be modified
-/// in place.
-///
-/// \returns true if an error occurred, false otherwise.
-bool typeCheckConditionForStatement(LabeledConditionalStmt *stmt,
-                                    DeclContext *dc);
 
 /// Determine the semantics of a checked cast operation.
 ///
@@ -902,6 +839,17 @@ ProtocolConformanceRef conformsToProtocol(Type T, ProtocolDecl *Proto,
                                           DeclContext *DC,
                                           SourceLoc ComplainLoc = SourceLoc());
 
+/// This is similar to \c conformsToProtocol, but returns \c true for cases where
+/// the type \p T could be dynamically cast to \p Proto protocol, such as a non-final
+/// class where a subclass conforms to \p Proto.
+///
+/// \param DC The context in which to check conformance. This affects, for
+/// example, extension visibility.
+///
+///
+/// \returns True if \p T conforms to the protocol \p Proto, false otherwise.
+bool couldDynamicallyConformToProtocol(Type T, ProtocolDecl *Proto,
+                                       DeclContext *DC);
 /// Completely check the given conformance.
 void checkConformance(NormalProtocolConformance *conformance);
 
@@ -929,8 +877,9 @@ ValueDecl *deriveProtocolRequirement(DeclContext *DC,
 /// Derive an implicit type witness for the given associated type in
 /// the conformance of the given nominal type to some known
 /// protocol.
-Type deriveTypeWitness(DeclContext *DC, NominalTypeDecl *nominal,
-                       AssociatedTypeDecl *assocType);
+std::pair<Type, TypeDecl *>
+deriveTypeWitness(DeclContext *DC, NominalTypeDecl *nominal,
+                  AssociatedTypeDecl *assocType);
 
 /// \name Name lookup
 ///
@@ -1056,9 +1005,6 @@ ProtocolDecl *getLiteralProtocol(ASTContext &ctx, Expr *expr);
 
 DeclName getObjectLiteralConstructorName(ASTContext &ctx,
                                          ObjectLiteralExpr *expr);
-
-Type getObjectLiteralParameterType(ObjectLiteralExpr *expr,
-                                   ConstructorDecl *ctor);
 
 /// Get the module appropriate for looking up standard library types.
 ///
@@ -1422,8 +1368,7 @@ bool areGenericRequirementsSatisfied(const DeclContext *DC,
 /// Check for restrictions on the use of the @unknown attribute on a
 /// case statement.
 void checkUnknownAttrRestrictions(
-    ASTContext &ctx, CaseStmt *caseBlock, CaseStmt *fallthroughDest,
-    bool &limitExhaustivityChecks);
+    ASTContext &ctx, CaseStmt *caseBlock, bool &limitExhaustivityChecks);
 
 /// Bind all of the pattern variables that occur within a case statement and
 /// all of its case items to their "parent" pattern variables, forming chains
@@ -1444,7 +1389,7 @@ void checkUnknownAttrRestrictions(
 /// Each of the "x" variables must eventually have the same type, and agree on
 /// let vs. var. This function does not perform any of that validation, leaving
 /// it to later stages.
-void bindSwitchCasePatternVars(CaseStmt *stmt);
+void bindSwitchCasePatternVars(DeclContext *dc, CaseStmt *stmt);
 
 } // end namespace swift
 

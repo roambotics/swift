@@ -43,8 +43,10 @@ set(swift_runtime_sources
     Exclusivity.cpp
     ExistentialContainer.cpp
     Float16Support.cpp
+    FoundationSupport.cpp
     Heap.cpp
     HeapObject.cpp
+    ImageInspectionCommon.cpp
     ImageInspectionMachO.cpp
     ImageInspectionELF.cpp
     ImageInspectionCOFF.cpp

@@ -219,9 +219,7 @@ def validate_arguments(toolchain, args):
     targets_needing_toolchain = [
         'build_indexstoredb',
         'build_playgroundsupport',
-        'build_pythonkit',
         'build_sourcekitlsp',
-        'build_tensorflow_swift_apis',
         'build_toolchainbenchmarks',
         'build_swift_inspect',
         'tsan_libdispatch_test',
@@ -273,9 +271,7 @@ def apply_default_arguments(toolchain, args):
     ninja_required = (
         args.build_foundation or
         args.build_indexstoredb or
-        args.build_pythonkit or
         args.build_sourcekitlsp or
-        args.build_tensorflow_swift_apis or
         args.cmake_generator == 'Ninja'
     )
     if ninja_required and toolchain.ninja is None:
@@ -351,6 +347,18 @@ def apply_default_arguments(toolchain, args):
             if (target.platform.is_darwin and
                 target.arch in supported_archs)
         ]
+
+    # Filter out any macOS stdlib deployment targets that are not supported
+    # by the macOS SDK.
+    targets = StdlibDeploymentTarget.get_targets_by_name(
+        args.stdlib_deployment_targets)
+    args.stdlib_deployment_targets = [
+        target.name
+        for target in targets
+        if (not target.platform.is_darwin or
+            target.platform.sdk_supports_architecture(
+                target.arch, args.darwin_xcrun_toolchain))
+    ]
 
     # Include the Darwin module-only architectures in the CMake options.
     if args.swift_darwin_module_archs:
@@ -836,8 +844,11 @@ class BuildScriptInvocation(object):
         impl_product_classes = []
         if self.args.build_cmark:
             impl_product_classes.append(products.CMark)
-        if self.args.build_llvm:
-            impl_product_classes.append(products.LLVM)
+
+        # If --skip-build-llvm is passed in, LLVM cannot be completely disabled, as
+        # Swift still needs a few LLVM targets like tblgen to be built for it to be
+        # configured. Instead, handle this in build-script-impl for now.
+        impl_product_classes.append(products.LLVM)
         if self.args.build_libcxx:
             impl_product_classes.append(products.LibCXX)
         if self.args.build_libicu:
@@ -868,16 +879,14 @@ class BuildScriptInvocation(object):
             product_classes.append(products.SwiftSyntax)
         if self.args.build_skstresstester:
             product_classes.append(products.SKStressTester)
+        if self.args.build_swiftformat:
+            product_classes.append(products.SwiftFormat)
         if self.args.build_swiftevolve:
             product_classes.append(products.SwiftEvolve)
         if self.args.build_indexstoredb:
             product_classes.append(products.IndexStoreDB)
         if self.args.build_playgroundsupport:
             product_classes.append(products.PlaygroundSupport)
-        if self.args.build_pythonkit:
-            product_classes.append(products.PythonKit)
-        if self.args.build_tensorflow_swift_apis:
-            product_classes.append(products.TensorFlowSwiftAPIs)
         if self.args.build_sourcekitlsp:
             product_classes.append(products.SourceKitLSP)
         if self.args.build_toolchainbenchmarks:
@@ -1320,6 +1329,7 @@ def main_normal():
 
         if platform.system() == 'Darwin':
             prefix = targets.darwin_toolchain_prefix(args.install_prefix)
+            prefix = os.path.join(args.host_target, prefix.lstrip('/'))
         else:
             prefix = args.install_prefix
 
