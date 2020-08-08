@@ -1350,20 +1350,53 @@ ConstraintSystem::matchTupleTypes(TupleType *tuple1, TupleType *tuple2,
   return getTypeMatchSuccess();
 }
 
+// Determine whether conversion is allowed between two function types
+// based on their representations.
+static bool
+isConversionAllowedBetween(FunctionTypeRepresentation rep1,
+                           FunctionTypeRepresentation rep2) {
+  auto isThin = [](FunctionTypeRepresentation rep) {
+    return rep == FunctionTypeRepresentation::CFunctionPointer ||
+        rep == FunctionTypeRepresentation::Thin;
+  };
+  
+  // Allowing "thin" (c, thin) to "thin" conventions
+  if (isThin(rep1) && isThin(rep2))
+    return true;
+  
+  // Allowing all to "thick" (swift, block) conventions
+  // "thin" (c, thin) to "thick" or "thick" to "thick"
+  if (rep2 == FunctionTypeRepresentation::Swift ||
+      rep2 == FunctionTypeRepresentation::Block)
+    return true;
+  
+  return rep1 == rep2;
+}
+
 // Returns 'false' (i.e. no error) if it is legal to match functions with the
 // corresponding function type representations and the given match kind.
 static bool matchFunctionRepresentations(FunctionTypeRepresentation rep1,
                                          FunctionTypeRepresentation rep2,
-                                         ConstraintKind kind) {
+                                         ConstraintKind kind,
+                                         ConstraintLocatorBuilder locator) {
   switch (kind) {
   case ConstraintKind::Bind:
   case ConstraintKind::BindParam:
   case ConstraintKind::BindToPointerType:
   case ConstraintKind::Equal:
     return rep1 != rep2;
+      
+  case ConstraintKind::Subtype: {
+    auto last = locator.last();
+    if (!(last && last->is<LocatorPathElt::FunctionArgument>()))
+      return false;
+    
+    // Inverting the result because matchFunctionRepresentations
+    // returns false in conversions are allowed.
+    return !isConversionAllowedBetween(rep1, rep2);
+  }
 
   case ConstraintKind::OpaqueUnderlyingType:
-  case ConstraintKind::Subtype:
   case ConstraintKind::Conversion:
   case ConstraintKind::BridgingConversion:
   case ConstraintKind::ArgumentConversion:
@@ -1449,6 +1482,20 @@ assessRequirementFailureImpact(ConstraintSystem &cs, Type requirementType,
   if (!anchor)
     return impact;
 
+  // If this is a conditional requirement failure associated with a
+  // call, let's increase impact of the fix to show that such failure
+  // makes member/function unreachable in current context or with
+  // given arguments.
+  if (auto last = locator.last()) {
+    if (last->isConditionalRequirement()) {
+      if (auto *expr = getAsExpr(anchor)) {
+        auto *parent = cs.getParentExpr(expr);
+        if (parent && isa<ApplyExpr>(parent))
+          return 5;
+      }
+    }
+  }
+
   // If this requirement is associated with a member reference and it
   // was possible to check it before overload choice is bound, that means
   // types came from the context (most likely Self, or associated type(s))
@@ -1475,9 +1522,12 @@ assessRequirementFailureImpact(ConstraintSystem &cs, Type requirementType,
       return 10;
   }
 
-  // Increase the impact of a conformance fix for a standard library type,
-  // as it's unlikely to be a good suggestion. Also do the same for the builtin
-  // compiler types Any and AnyObject, which cannot conform to protocols.
+  // Increase the impact of a conformance fix for a standard library
+  // or foundation type, as it's unlikely to be a good suggestion.
+  //
+  // Also do the same for the builtin compiler types Any and AnyObject,
+  // which cannot conform to protocols.
+  //
   // FIXME: We ought not to have the is<TypeVariableType>() condition here, but
   // removing it currently regresses the diagnostic for the test case for
   // rdar://60727310. Once we better handle the separation of conformance fixes
@@ -1485,7 +1535,8 @@ assessRequirementFailureImpact(ConstraintSystem &cs, Type requirementType,
   // remove it from the condition.
   auto resolvedTy = cs.simplifyType(requirementType);
   if ((requirementType->is<TypeVariableType>() && resolvedTy->isStdlibType()) ||
-      resolvedTy->isAny() || resolvedTy->isAnyObject()) {
+      resolvedTy->isAny() || resolvedTy->isAnyObject() ||
+      getKnownFoundationEntity(resolvedTy->getString())) {
     if (auto last = locator.last()) {
       if (auto requirement = last->getAs<LocatorPathElt::AnyRequirement>()) {
         auto kind = requirement->getRequirementKind();
@@ -1658,7 +1709,7 @@ ConstraintSystem::matchFunctionTypes(FunctionType *func1, FunctionType *func2,
 
   if (matchFunctionRepresentations(func1->getExtInfo().getRepresentation(),
                                    func2->getExtInfo().getRepresentation(),
-                                   kind)) {
+                                   kind, locator)) {
     return getTypeMatchFailure(locator);
   }
 
@@ -2426,9 +2477,9 @@ ConstraintSystem::matchExistentialTypes(Type type1, Type type2,
 static bool isStringCompatiblePointerBaseType(ASTContext &ctx,
                                               Type baseType) {
   // Allow strings to be passed to pointer-to-byte or pointer-to-void types.
-  if (baseType->isEqual(TypeChecker::getInt8Type(ctx)))
+  if (baseType->isEqual(ctx.getInt8Decl()->getDeclaredInterfaceType()))
     return true;
-  if (baseType->isEqual(TypeChecker::getUInt8Type(ctx)))
+  if (baseType->isEqual(ctx.getUInt8Decl()->getDeclaredInterfaceType()))
     return true;
   if (baseType->isEqual(ctx.TheEmptyTupleType))
     return true;
@@ -3863,11 +3914,16 @@ bool ConstraintSystem::repairFailures(
     if (lhs->isTypeVariableOrMember() || rhs->isTypeVariableOrMember())
       break;
 
+    // If there is already a fix for contextual failure, let's not
+    // record a duplicate one.
+    if (hasFixFor(getConstraintLocator(locator)))
+      return true;
+
     auto purpose = getContextualTypePurpose(anchor);
     if (rhs->isVoid() &&
         (purpose == CTP_ReturnStmt || purpose == CTP_ReturnSingleExpr)) {
       conversionsOrFixes.push_back(
-          RemoveReturn::create(*this, getConstraintLocator(locator)));
+          RemoveReturn::create(*this, lhs, getConstraintLocator(locator)));
       return true;
     }
 
@@ -4926,7 +4982,8 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
                 // The pointer can be converted from a string, if the element
                 // type is compatible.
                 auto &ctx = getASTContext();
-                if (type1->isEqual(TypeChecker::getStringType(ctx))) {
+                if (type1->isEqual(
+                        ctx.getStringDecl()->getDeclaredInterfaceType())) {
                   auto baseTy = getFixedTypeRecursive(pointeeTy, false);
 
                   if (baseTy->isTypeVariableOrMember() ||
@@ -6889,6 +6946,7 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyMemberConstraint(
                                         TVO_CanBindToLValue |
                                         TVO_CanBindToNoEscape);
       Type optTy = TypeChecker::getOptionalType(SourceLoc(), innerTV);
+      assert(!optTy->hasError());
       SmallVector<Constraint *, 2> optionalities;
       auto nonoptionalResult = Constraint::createFixed(
           *this, ConstraintKind::Bind,
@@ -7222,6 +7280,24 @@ bool ConstraintSystem::resolveClosure(TypeVariableType *typeVar,
   auto *closure = castToExpr<ClosureExpr>(closureLocator->getAnchor());
   auto *inferredClosureType = getClosureType(closure);
 
+  // Determine whether a function builder will be applied.
+  Type functionBuilderType;
+  ConstraintLocator *calleeLocator = nullptr;
+  if (auto last = locator.last()) {
+    if (auto argToParam = last->getAs<LocatorPathElt::ApplyArgToParam>()) {
+      calleeLocator = getCalleeLocator(getConstraintLocator(locator));
+      functionBuilderType = getFunctionBuilderTypeFor(
+          *this, argToParam->getParamIdx(), calleeLocator);
+    }
+  }
+
+  // Determine whether to introduce one-way constraints between the parameter's
+  // type as seen in the body of the closure and the external parameter
+  // type.
+  bool oneWayConstraints =
+    getASTContext().TypeCheckerOpts.EnableOneWayClosureParameters ||
+    functionBuilderType;
+
   auto *paramList = closure->getParameters();
   SmallVector<AnyFunctionType::Param, 4> parameters;
   for (unsigned i = 0, n = paramList->size(); i != n; ++i) {
@@ -7235,9 +7311,6 @@ bool ConstraintSystem::resolveClosure(TypeVariableType *typeVar,
     }
 
     Type internalType;
-
-    bool oneWayConstraints =
-      getASTContext().TypeCheckerOpts.EnableOneWayClosureParameters;
     if (paramList->get(i)->getTypeRepr()) {
       // Internal type is the type used in the body of the closure,
       // so "external" type translates to it as follows:
@@ -7288,17 +7361,12 @@ bool ConstraintSystem::resolveClosure(TypeVariableType *typeVar,
                         inferredClosureType->getExtInfo());
   assignFixedType(typeVar, closureType, closureLocator);
 
-  if (auto last = locator.last()) {
-    if (auto argToParam = last->getAs<LocatorPathElt::ApplyArgToParam>()) {
-      auto *calleeLocator = getCalleeLocator(getConstraintLocator(locator));
-      if (auto functionBuilderType = getFunctionBuilderTypeFor(
-              *this, argToParam->getParamIdx(), calleeLocator)) {
-        if (auto result = matchFunctionBuilder(
-                closure, functionBuilderType, closureType->getResult(),
-                ConstraintKind::Conversion, calleeLocator, locator)) {
-          return result->isSuccess();
-        }
-      }
+  // If there is a function builder to apply, do so now.
+  if (functionBuilderType) {
+    if (auto result = matchFunctionBuilder(
+            closure, functionBuilderType, closureType->getResult(),
+            ConstraintKind::Conversion, calleeLocator, locator)) {
+      return result->isSuccess();
     }
   }
 
@@ -9212,11 +9280,11 @@ ConstraintSystem::simplifyRestrictedConstraintImpl(
         auto &ctx = getASTContext();
         auto int8Con = Constraint::create(*this, ConstraintKind::Bind,
                                           baseType2,
-                                          TypeChecker::getInt8Type(ctx),
+                                          ctx.getInt8Decl()->getDeclaredInterfaceType(),
                                           getConstraintLocator(locator));
         auto uint8Con = Constraint::create(*this, ConstraintKind::Bind,
                                            baseType2,
-                                           TypeChecker::getUInt8Type(ctx),
+                                           ctx.getUInt8Decl()->getDeclaredInterfaceType(),
                                            getConstraintLocator(locator));
         auto voidCon = Constraint::create(*this, ConstraintKind::Bind,
                                           baseType2, ctx.TheEmptyTupleType,

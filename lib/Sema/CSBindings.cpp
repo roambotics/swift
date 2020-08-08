@@ -69,6 +69,9 @@ void ConstraintSystem::inferTransitiveSupertypeBindings(
 
       auto type = binding.BindingType;
 
+      if (type->isHole())
+        continue;
+
       if (!existingTypes.insert(type->getCanonicalType()).second)
         continue;
 
@@ -1039,11 +1042,9 @@ bool TypeVarBindingProducer::computeNext() {
       // types, that's going to ensure that subtype relationship is
       // always preserved.
       auto *BGT = type->castTo<BoundGenericType>();
-      auto UGT = UnboundGenericType::get(BGT->getDecl(), BGT->getParent(),
-                                         BGT->getASTContext());
-
       auto dstLocator = TypeVar->getImpl().getLocator();
-      auto newType = CS.openUnboundGenericType(UGT, dstLocator)
+      auto newType = CS.openUnboundGenericType(BGT->getDecl(), BGT->getParent(),
+                                               dstLocator)
                          ->reconstituteSugar(/*recursive=*/false);
       addNewBinding(binding.withType(newType));
     }
@@ -1072,7 +1073,7 @@ bool TypeVariableBinding::attempt(ConstraintSystem &cs) const {
   auto *dstLocator = TypeVar->getImpl().getLocator();
 
   if (Binding.hasDefaultedLiteralProtocol()) {
-    type = cs.openUnboundGenericType(type, dstLocator);
+    type = cs.openUnboundGenericTypes(type, dstLocator);
     type = type->reconstituteSugar(/*recursive=*/false);
   }
 

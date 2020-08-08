@@ -1397,7 +1397,7 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
     auto resolution = TypeResolution::forContextual(DC, options);
     auto BaseTy = resolution.resolveType(InnerTypeRepr);
 
-    if (BaseTy && BaseTy->mayHaveMembers()) {
+    if (BaseTy->mayHaveMembers()) {
       auto lookupOptions = defaultMemberLookupOptions;
       if (isa<AbstractFunctionDecl>(DC) ||
           isa<AbstractClosureExpr>(DC))
@@ -2326,6 +2326,19 @@ TypeChecker::getTypeOfCompletionOperator(DeclContext *DC, Expr *LHS,
   default:
     llvm_unreachable("Invalid DeclRefKind for operator completion");
   }
+}
+
+void TypeChecker::typeCheckForCodeCompletion(
+    Expr *expr, DeclContext *DC, Type contextualType, ContextualTypePurpose CTP,
+    llvm::function_ref<void(const Solution &)> callback) {
+  auto &Context = DC->getASTContext();
+
+  FrontendStatsTracer StatsTracer(Context.Stats,
+                                  "typecheck-for-code-completion", expr);
+  PrettyStackTraceExpr stackTrace(Context, "code-completion", expr);
+
+  ConstraintSystem::solveForCodeCompletion(expr, DC, contextualType, CTP,
+                                           callback);
 }
 
 bool TypeChecker::typeCheckBinding(

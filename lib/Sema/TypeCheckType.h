@@ -97,9 +97,6 @@ enum class TypeResolverContext : uint8_t {
   /// tuple return values. See also: TypeResolutionFlags::Direct
   FunctionResult,
 
-  /// Whether we are in a protocol's where clause
-  ProtocolWhereClause,
-
   /// Whether this is a pattern binding entry.
   PatternBindingDecl,
 
@@ -210,7 +207,6 @@ public:
     case Context::FunctionInput:
     case Context::VariadicFunctionInput:
     case Context::FunctionResult:
-    case Context::ProtocolWhereClause:
     case Context::ExtensionBinding:
     case Context::SubscriptDecl:
     case Context::EnumElementDecl:
@@ -366,7 +362,7 @@ public:
   ///
   /// \param TyR The type representation to check.
   ///
-  /// \returns a well-formed type or an ErrorType in case of an error.
+  /// \returns A well-formed type that is never null, or an \c ErrorType in case of an error.
   Type resolveType(TypeRepr *TyR);
 
   /// Whether this type resolution uses archetypes (vs. generic parameters).

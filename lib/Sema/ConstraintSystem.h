@@ -1016,7 +1016,7 @@ public:
   llvm::SmallPtrSet<ConstraintLocator *, 2> DefaultedConstraints;
 
   /// The node -> type mappings introduced by this solution.
-  llvm::MapVector<ASTNode, Type> nodeTypes;
+  llvm::DenseMap<ASTNode, Type> nodeTypes;
 
   /// Contextual types introduced by this solution.
   std::vector<std::pair<ASTNode, ContextualTypeInfo>> contextualTypes;
@@ -3403,14 +3403,12 @@ public:
   /// Add implicit "load" expressions to the given expression.
   Expr *addImplicitLoadExpr(Expr *expr);
 
-  /// "Open" the given unbound type by introducing fresh type
-  /// variables for generic parameters and constructing a bound generic
-  /// type from these type variables.
-  ///
-  /// \param unbound The type to open.
+  /// "Open" the unbound generic type represented by the given declaration and
+  /// parent type by introducing fresh type variables for generic parameters
+  /// and constructing a bound generic type from these type variables.
   ///
   /// \returns The opened type.
-  Type openUnboundGenericType(UnboundGenericType *unbound,
+  Type openUnboundGenericType(GenericTypeDecl *decl, Type parentTy,
                               ConstraintLocatorBuilder locator);
 
   /// "Open" the given type by replacing any occurrences of unbound
@@ -3420,7 +3418,7 @@ public:
   /// \param type The type to open.
   ///
   /// \returns The opened type.
-  Type openUnboundGenericType(Type type, ConstraintLocatorBuilder locator);
+  Type openUnboundGenericTypes(Type type, ConstraintLocatorBuilder locator);
 
   /// "Open" the given type by replacing any occurrences of generic
   /// parameter types and dependent member types with fresh type variables.
@@ -4729,6 +4727,30 @@ public:
   Optional<Solution> solveSingle(FreeTypeVariableBinding allowFreeTypeVariables
                                  = FreeTypeVariableBinding::Disallow,
                                  bool allowFixes = false);
+
+  /// Construct and solve a system of constraints based on the given expression
+  /// and its contextual information.
+  ///
+  /// This method is designed to be used for code completion which means that
+  /// it doesn't mutate given expression, even if there is a single valid
+  /// solution, and constraint solver is allowed to produce partially correct
+  /// solutions. Such solutions can have any number of holes in them.
+  ///
+  /// \param expr The expression involved in code completion.
+  ///
+  /// \param DC The declaration context this expression is found in.
+  ///
+  /// \param contextualType The type \p expr is being converted to.
+  ///
+  /// \param CTP When contextualType is specified, this indicates what
+  /// the conversion is doing.
+  ///
+  /// \param callback The callback to be used to provide results to
+  /// code completion.
+  static void
+  solveForCodeCompletion(Expr *expr, DeclContext *DC, Type contextualType,
+                         ContextualTypePurpose CTP,
+                         llvm::function_ref<void(const Solution &)> callback);
 
 private:
   /// Solve the system of constraints.

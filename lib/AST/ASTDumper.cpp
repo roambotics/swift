@@ -121,15 +121,7 @@ void RequirementRepr::dump() const {
   llvm::errs() << "\n";
 }
 
-void RequirementRepr::printImpl(ASTPrinter &out, bool AsWritten) const {
-  auto printTy = [&](const TypeLoc &TyLoc) {
-    if (AsWritten && TyLoc.getTypeRepr()) {
-      TyLoc.getTypeRepr()->print(out, PrintOptions());
-    } else {
-      TyLoc.getType().print(out, PrintOptions());
-    }
-  };
-
+void RequirementRepr::printImpl(ASTPrinter &out) const {
   auto printLayoutConstraint =
       [&](const LayoutConstraintLoc &LayoutConstraintLoc) {
         LayoutConstraintLoc.getLayoutConstraint()->print(out, PrintOptions());
@@ -137,31 +129,41 @@ void RequirementRepr::printImpl(ASTPrinter &out, bool AsWritten) const {
 
   switch (getKind()) {
   case RequirementReprKind::LayoutConstraint:
-    printTy(getSubjectLoc());
+    if (auto *repr = getSubjectRepr()) {
+      repr->print(out, PrintOptions());
+    }
     out << " : ";
     printLayoutConstraint(getLayoutConstraintLoc());
     break;
 
   case RequirementReprKind::TypeConstraint:
-    printTy(getSubjectLoc());
+    if (auto *repr = getSubjectRepr()) {
+      repr->print(out, PrintOptions());
+    }
     out << " : ";
-    printTy(getConstraintLoc());
+    if (auto *repr = getConstraintRepr()) {
+      repr->print(out, PrintOptions());
+    }
     break;
 
   case RequirementReprKind::SameType:
-    printTy(getFirstTypeLoc());
+    if (auto *repr = getFirstTypeRepr()) {
+      repr->print(out, PrintOptions());
+    }
     out << " == ";
-    printTy(getSecondTypeLoc());
+    if (auto *repr = getSecondTypeRepr()) {
+      repr->print(out, PrintOptions());
+    }
     break;
   }
 }
 
 void RequirementRepr::print(raw_ostream &out) const {
   StreamPrinter printer(out);
-  printImpl(printer, /*AsWritten=*/true);
+  printImpl(printer);
 }
 void RequirementRepr::print(ASTPrinter &out) const {
-  printImpl(out, /*AsWritten=*/true);
+  printImpl(out);
 }
 
 static void printTrailingRequirements(ASTPrinter &Printer,
@@ -1882,6 +1884,10 @@ public:
 
   void visitCodeCompletionExpr(CodeCompletionExpr *E) {
     printCommon(E, "code_completion_expr");
+    if (E->getBase()) {
+      OS << '\n';
+      printRec(E->getBase());
+    }
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
@@ -3511,7 +3517,7 @@ namespace {
       if (T->getParent())
         printRec("parent", T->getParent());
 
-      for (auto arg : T->getInnermostGenericArgs())
+      for (const auto arg : T->getDirectGenericArgs())
         printRec(arg);
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }

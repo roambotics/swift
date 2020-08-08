@@ -29,29 +29,16 @@ namespace swift {
 // allocator. This is encoded in a header on each allocation when metadata
 // iteration is enabled, and allows tools to know where each allocation came
 // from.
-//
-// Some of these values are also declared in SwiftRemoteMirrorTypes.h. Those
-// values must be kept stable to preserve compatibility.
 enum MetadataAllocatorTags : uint16_t {
-  UnusedTag = 0,
-  BoxesTag,
-  ObjCClassWrappersTag,
-  FunctionTypesTag,
-  MetatypeTypesTag,
-  ExistentialMetatypeValueWitnessTablesTag,
-  ExistentialMetatypesTag,
-  ExistentialTypesTag,
-  OpaqueExistentialValueWitnessTablesTag,
-  ClassExistentialValueWitnessTablesTag,
-  ForeignWitnessTablesTag,
-  ResilientMetadataAllocatorTag,
-  MetadataTag,
-  TupleCacheTag,
-  GenericMetadataCacheTag,
-  ForeignMetadataCacheTag,
-  GenericWitnessTableCacheTag,
-  GenericClassMetadataTag,
-  GenericValueMetadataTag,
+#define TAG(name, value) name##Tag = value,
+#include "../../../stdlib/public/runtime/MetadataAllocatorTags.def"
+};
+
+template <typename Runtime> struct MetadataAllocationBacktraceHeader {
+  TargetPointer<Runtime, const void> Next;
+  TargetPointer<Runtime, void> Allocation;
+  uint32_t Count;
+  // Count backtrace pointers immediately follow.
 };
 
 /// The buffer used by a yield-once coroutine (such as the generalized

@@ -1384,26 +1384,12 @@ Type SugarType::getSinglyDesugaredTypeSlow() {
   return UnderlyingType;
 }
 
-SmallVector<Type, 2> TypeAliasType::getInnermostGenericArgs() const {
-  SmallVector<Type, 2> result;
+ArrayRef<Type> TypeAliasType::getDirectGenericArgs() const {
+  if (!typealias->isGeneric()) return { };
 
-  // If the typealias is not generic, there are no generic arguments
-  if (!typealias->isGeneric()) return result;
-
-  // If the substitution map is empty, bail out.
-  auto subMap = getSubstitutionMap();
-  if (subMap.empty()) return result;
-
-  // Retrieve the substitutions for the generic parameters (only).
-  auto genericSig = subMap.getGenericSignature();
-  unsigned numAllGenericParams = genericSig->getGenericParams().size();
-  unsigned numMyGenericParams = typealias->getGenericParams()->size();
-  result.reserve(numMyGenericParams);
-  unsigned startIndex = numAllGenericParams - numMyGenericParams;
-  for (auto gp : genericSig->getGenericParams().slice(startIndex)) {
-    result.push_back(Type(gp).subst(subMap));
-  }
-  return result;
+  // Otherwise, the innermost replacement types are the direct
+  // generic arguments.
+  return getSubstitutionMap().getInnermostReplacementTypes();
 }
 
 unsigned GenericTypeParamType::getDepth() const {
@@ -2208,6 +2194,16 @@ getObjCObjectRepresentable(Type type, const DeclContext *dc) {
 static std::pair<ForeignRepresentableKind, ProtocolConformance *>
 getForeignRepresentable(Type type, ForeignLanguage language,
                         const DeclContext *dc) {
+  // Local function that simply produces a failing result.
+  auto failure = []() -> std::pair<ForeignRepresentableKind,
+                                   ProtocolConformance *> {
+    return { ForeignRepresentableKind::None, nullptr };
+  };
+  
+  // If type has an error let's fail early.
+  if (type->hasError())
+    return failure();
+  
   // Look through one level of optional type, but remember that we did.
   bool wasOptional = false;
   if (auto valueType = type->getOptionalObjectType()) {
@@ -2221,12 +2217,6 @@ getForeignRepresentable(Type type, ForeignLanguage language,
     if (representable != ForeignRepresentableKind::None)
       return { representable, nullptr };
   }
-
-  // Local function that simply produces a failing result.
-  auto failure = []() -> std::pair<ForeignRepresentableKind,
-                                   ProtocolConformance *> {
-    return { ForeignRepresentableKind::None, nullptr };
-  };
 
   // Function types.
   if (auto functionType = type->getAs<FunctionType>()) {
