@@ -22,6 +22,7 @@
 #include "swift/AST/TypeWalker.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -987,8 +988,7 @@ void ConstraintSystem::shrink(Expr *expr) {
         // let's allow collector discover it with assigned contextual type
         // of coercion, which allows collections to be solved in parts.
         if (auto collectionExpr = dyn_cast<CollectionExpr>(childExpr)) {
-          auto castTypeLoc = coerceExpr->getCastTypeLoc();
-          auto typeRepr = castTypeLoc.getTypeRepr();
+          auto *const typeRepr = coerceExpr->getCastTypeRepr();
 
           if (typeRepr && isSuitableCollection(typeRepr)) {
             auto resolution = TypeResolution::forContextual(CS.DC, None);
@@ -1687,6 +1687,7 @@ void ConstraintSystem::ArgumentInfoCollector::walk(Type argType) {
       case ConstraintKind::ConformsTo:
       case ConstraintKind::Defaultable:
       case ConstraintKind::OneWayEqual:
+      case ConstraintKind::OneWayBindParam:
       case ConstraintKind::DefaultClosureType:
         break;
       }

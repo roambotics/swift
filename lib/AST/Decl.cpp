@@ -44,10 +44,11 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeLoc.h"
 #include "swift/AST/SwiftNameTranslation.h"
-#include "swift/Parse/Lexer.h"
+#include "swift/Parse/Lexer.h" // FIXME: Bad dependency
 #include "clang/Lex/MacroInfo.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/raw_ostream.h"
@@ -737,9 +738,6 @@ bool Decl::hasUnderscoredNaming() const {
   }
 
   if (const auto PD = dyn_cast<ProtocolDecl>(D)) {
-    if (PD->getAttrs().hasAttribute<ShowInInterfaceAttr>()) {
-      return false;
-    }
     StringRef NameStr = PD->getNameStr();
     if (NameStr.startswith("_Builtin")) {
       return true;
@@ -794,6 +792,10 @@ bool Decl::isPrivateStdlibDecl(bool treatNonBuiltinProtocolsAsPublic) const {
   if (isa<ProtocolDecl>(D)) {
     if (treatNonBuiltinProtocolsAsPublic)
       return false;
+  }
+
+  if (D->getAttrs().hasAttribute<ShowInInterfaceAttr>()) {
+    return false;
   }
 
   return hasUnderscoredNaming();
@@ -1858,7 +1860,7 @@ bool PatternBindingDecl::isDefaultInitializable(unsigned i) const {
   // If the pattern is typed as optional (or tuples thereof), it is
   // default initializable.
   if (const auto typedPattern = dyn_cast<TypedPattern>(entry.getPattern())) {
-    if (const auto typeRepr = typedPattern->getTypeLoc().getTypeRepr()) {
+    if (const auto typeRepr = typedPattern->getTypeRepr()) {
       if (::isDefaultInitializable(typeRepr, ctx))
         return true;
     } else if (typedPattern->isImplicit()) {
@@ -1868,11 +1870,15 @@ bool PatternBindingDecl::isDefaultInitializable(unsigned i) const {
       //
       // All lazy storage is implicitly default initializable, though, because
       // lazy backing storage is optional.
-      if (const auto *varDecl = typedPattern->getSingleVar())
+      if (const auto *varDecl = typedPattern->getSingleVar()) {
         // Lazy storage is never user accessible.
-        if (!varDecl->isUserAccessible())
-          if (typedPattern->getTypeLoc().getType()->getOptionalObjectType())
+        if (!varDecl->isUserAccessible()) {
+          if (typedPattern->hasType() &&
+              typedPattern->getType()->getOptionalObjectType()) {
             return true;
+          }
+        }
+      }
     }
   }
 
@@ -1911,7 +1917,7 @@ SourceRange IfConfigDecl::getSourceRange() const {
 }
 
 static bool isPolymorphic(const AbstractStorageDecl *storage) {
-  if (storage->isObjCDynamic())
+  if (storage->shouldUseObjCDispatch())
     return true;
 
 
@@ -2062,7 +2068,7 @@ getDirectReadWriteAccessStrategy(const AbstractStorageDecl *storage) {
     return AccessStrategy::getStorage();
   case ReadWriteImplKind::Stored: {
     // If the storage isDynamic (and not @objc) use the accessors.
-    if (storage->isNativeDynamic())
+    if (storage->shouldUseNativeDynamicDispatch())
       return AccessStrategy::getMaterializeToTemporary(
           getOpaqueReadAccessStrategy(storage, false),
           getOpaqueWriteAccessStrategy(storage, false));
@@ -2147,7 +2153,7 @@ AbstractStorageDecl::getAccessStrategy(AccessSemantics semantics,
       if (isPolymorphic(this))
         return getOpaqueAccessStrategy(this, accessKind, /*dispatch*/ true);
 
-      if (isNativeDynamic())
+      if (shouldUseNativeDynamicDispatch())
         return getOpaqueAccessStrategy(this, accessKind, /*dispatch*/ false);
 
       // If the storage is resilient from the given module and resilience
@@ -2810,7 +2816,7 @@ CanType ValueDecl::getOverloadSignatureType() const {
   // implementation of the swift::conflicting overload that deals with
   // overload types, in order to account for cases where the overload types
   // don't match, but the decls differ and therefore always conflict.
-
+  assert(isa<TypeDecl>(this));
   return CanType();
 }
 
@@ -2839,7 +2845,7 @@ OpaqueReturnTypeRepr *ValueDecl::getOpaqueResultTypeRepr() const {
           assert(NP->getDecl() == VD);
           (void) NP;
 
-          returnRepr = TP->getTypeLoc().getTypeRepr();
+          returnRepr = TP->getTypeRepr();
         }
       }
     } else {
@@ -2903,6 +2909,59 @@ bool ValueDecl::isDynamic() const {
   return evaluateOrDefault(ctx.evaluator,
     IsDynamicRequest{const_cast<ValueDecl *>(this)},
     getAttrs().hasAttribute<DynamicAttr>());
+}
+
+bool ValueDecl::isObjCDynamicInGenericClass() const {
+  if (!isObjCDynamic())
+    return false;
+
+  auto *DC = this->getDeclContext();
+  auto *classDecl = DC->getSelfClassDecl();
+  if (!classDecl)
+    return false;
+
+  return classDecl->isGenericContext() && !classDecl->usesObjCGenericsModel();
+}
+
+bool ValueDecl::shouldUseObjCMethodReplacement() const {
+  if (isNativeDynamic())
+    return false;
+
+  if (getModuleContext()->isImplicitDynamicEnabled() &&
+      isObjCDynamicInGenericClass())
+    return false;
+
+  return isObjCDynamic();
+}
+
+bool ValueDecl::shouldUseNativeMethodReplacement() const {
+  if (isNativeDynamic())
+    return true;
+
+  if (!isObjCDynamicInGenericClass())
+    return false;
+
+  auto *replacedDecl = getDynamicallyReplacedDecl();
+  if (replacedDecl)
+    return false;
+
+  return getModuleContext()->isImplicitDynamicEnabled();
+}
+
+bool ValueDecl::isNativeMethodReplacement() const {
+  // Is this a @_dynamicReplacement(for:) that use the native dynamic function
+  // replacement mechanism.
+  auto *replacedDecl = getDynamicallyReplacedDecl();
+  if (!replacedDecl)
+    return false;
+
+  if (isNativeDynamic())
+    return true;
+
+  if (isObjCDynamicInGenericClass())
+    return replacedDecl->getModuleContext()->isImplicitDynamicEnabled();
+
+  return false;
 }
 
 void ValueDecl::setIsDynamic(bool value) {
@@ -5035,7 +5094,7 @@ ProtocolDecl::setLazyRequirementSignature(LazyMemberLoader *lazyLoader,
   ++NumLazyRequirementSignatures;
   // FIXME: (transitional) increment the redundant "always-on" counter.
   if (auto *Stats = getASTContext().Stats)
-    Stats->getFrontendCounters().NumLazyRequirementSignatures++;
+    ++Stats->getFrontendCounters().NumLazyRequirementSignatures;
 }
 
 ArrayRef<Requirement> ProtocolDecl::getCachedRequirementSignature() const {
@@ -5131,7 +5190,7 @@ bool AbstractStorageDecl::hasDidSetOrWillSetDynamicReplacement() const {
 
 bool AbstractStorageDecl::hasAnyNativeDynamicAccessors() const {
   for (auto accessor : getAllAccessors()) {
-    if (accessor->isNativeDynamic())
+    if (accessor->shouldUseNativeDynamicDispatch())
       return true;
   }
   return false;
@@ -5195,7 +5254,7 @@ AbstractStorageDecl::AccessorRecord::create(ASTContext &ctx,
       case AccessorKind::ID:                  \
         if (!has##ID) {                       \
           has##ID = true;                     \
-          numMissingOpaque--;                 \
+          --numMissingOpaque;                 \
         }                                     \
         continue;
 #include "swift/AST/AccessorKinds.def"
@@ -5531,7 +5590,7 @@ SourceRange VarDecl::getTypeSourceRangeForDiagnostics() const {
   if (auto *VP = dyn_cast<VarPattern>(Pat))
     Pat = VP->getSubPattern();
   if (auto *TP = dyn_cast<TypedPattern>(Pat))
-    if (auto typeRepr = TP->getTypeLoc().getTypeRepr())
+    if (auto typeRepr = TP->getTypeRepr())
       return typeRepr->getSourceRange();
 
   return SourceRange();
@@ -6114,8 +6173,8 @@ ParamDecl::ParamDecl(SourceLoc specifierLoc,
 
 ParamDecl *ParamDecl::cloneWithoutType(const ASTContext &Ctx, ParamDecl *PD) {
   auto *Clone = new (Ctx) ParamDecl(
-      PD->getSpecifierLoc(), PD->getArgumentNameLoc(), PD->getArgumentName(),
-      PD->getArgumentNameLoc(), PD->getParameterName(), PD->getDeclContext());
+      SourceLoc(), SourceLoc(), PD->getArgumentName(),
+      SourceLoc(), PD->getParameterName(), PD->getDeclContext());
   Clone->DefaultValueAndFlags.setPointerAndInt(
       nullptr, PD->DefaultValueAndFlags.getInt());
   Clone->Bits.ParamDecl.defaultArgumentKind =
@@ -6456,7 +6515,7 @@ ParamDecl::getDefaultValueStringRepresentation(
       if (wrapperAttrs.size() > 0) {
         auto attr = wrapperAttrs.front();
         if (auto arg = attr->getArg()) {
-          SourceRange fullRange(attr->getTypeLoc().getSourceRange().Start,
+          SourceRange fullRange(attr->getTypeRepr()->getSourceRange().Start,
                                 arg->getEndLoc());
           auto charRange = Lexer::getCharSourceRangeFromSourceRange(
               getASTContext().SourceMgr, fullRange);
