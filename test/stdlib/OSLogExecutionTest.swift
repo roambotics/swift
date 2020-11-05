@@ -1,10 +1,13 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-build-swift %s -swift-version 5 -DPTR_SIZE_%target-ptrsize -o %t/OSLogExecutionTest
+// RUN: %target-codesign %t/OSLogExecutionTest
 // RUN: %target-run %t/OSLogExecutionTest
 //
 // RUN: %target-build-swift %s -O -swift-version 5 -DPTR_SIZE_%target-ptrsize -o %t/OSLogExecutionTest
+// RUN: %target-codesign %t/OSLogExecutionTest
 // RUN: %target-run %t/OSLogExecutionTest
 // REQUIRES: executable_test
+// REQUIRES: foundation
 //
 // REQUIRES: VENDOR=apple
 
@@ -75,7 +78,7 @@ internal struct OSLogBufferChecker {
   /// This occupies four most significant bits of the first byte of the
   /// argument header.
   internal enum ArgumentType: UInt8 {
-    case scalar = 0, count, string, pointer, object
+    case scalar = 0, count = 1, string = 2, pointer = 3, object = 4, mask = 7
     // TODO: include wide string and errno here if needed.
   }
 
@@ -140,13 +143,13 @@ internal struct OSLogBufferChecker {
   /// Check whether the bytes starting from `startIndex` contain the encoding for a count.
   internal func checkCount(
     startIndex: Int,
-    flag: ArgumentFlag,
-    expectedCount: Int
+    expectedCount: Int,
+    precision: Bool
   ) {
     checkNumeric(
       startIndex: startIndex,
-      flag: flag,
-      type: .count,
+      flag: .autoFlag,
+      type: precision ? .count : .scalar,
       expectedValue: CInt(expectedCount))
   }
 
@@ -612,8 +615,8 @@ InterpolationTestSuite.test("Integer formatting with precision") {
     bufferChecker.checkArguments(
      { bufferChecker.checkCount(
          startIndex: $0,
-         flag: .autoFlag,
-         expectedCount: 10)
+         expectedCount: 10,
+         precision: true)
      },
      { bufferChecker.checkInt(
          startIndex: $0,
@@ -652,13 +655,13 @@ InterpolationTestSuite.test("Integer formatting with precision and alignment") {
     bufferChecker.checkArguments(
      { bufferChecker.checkCount(
          startIndex: $0,
-         flag: .autoFlag,
-         expectedCount: 7)
+         expectedCount: 7,
+         precision: false)
      },
      { bufferChecker.checkCount(
          startIndex: $0,
-         flag: .autoFlag,
-         expectedCount: 10)
+         expectedCount: 10,
+         precision: true)
      },
      { bufferChecker.checkInt(
          startIndex: $0,

@@ -1,10 +1,9 @@
 // RUN: %target-typecheck-verify-swift
 
 protocol P1 where A == Never {
-  associatedtype A // expected-note {{protocol requires nested type 'A'}}
+  associatedtype A
 }
-// FIXME: Should this infer A := Never?
-struct S1: P1 {} // expected-error {{type 'S1' does not conform to protocol 'P1'}}
+struct S1: P1 {} // OK, A := Never
 
 protocol P2a {
   associatedtype A
@@ -54,22 +53,19 @@ protocol P7b: P7a where A == Bool {}
 struct S7: P7b {}
 
 protocol P8 where A == Bool {
-  associatedtype A // expected-note {{protocol requires nested type 'A'}}
+  associatedtype A
 }
-// expected-error@+2 {{type 'S8' does not conform to protocol 'P7a'}}
-// expected-error@+1 {{type 'S8' does not conform to protocol 'P8'}}
+// expected-error@+2 {{'P7a' requires the types 'S8.A' (aka 'Bool') and 'Never' be equivalent}}
+// expected-note@+1 {{requirement specified as 'Self.A' == 'Never' [with Self = S8]}}
 struct S8: P8, P7a {}
 
 protocol P9a where A == Never {
   associatedtype A
 }
 protocol P9b: P9a {
-  associatedtype A // expected-note {{protocol requires nested type 'A'}}
+  associatedtype A
 }
-// FIXME: Associated type restatement sabotages the conformance.
-// expected-error@+2 {{type 'S9a' does not conform to protocol 'P9a'}}
-// expected-error@+1 {{type 'S9a' does not conform to protocol 'P9b'}}
-struct S9a: P9b {}
+struct S9a: P9b {} // OK, A := Never
 // expected-error@+2 {{'P9a' requires the types 'S9b.A' (aka 'Bool') and 'Never' be equivalent}}
 // expected-note@+1 {{requirement specified as 'Self.A' == 'Never' [with Self = S9b]}}
 struct S9b: P9b {
@@ -103,3 +99,24 @@ protocol Q11 {
 // expected-error@+2 {{type 'S11' does not conform to protocol 'P11a'}}
 // expected-error@+1 {{type 'S11' does not conform to protocol 'P11b'}}
 struct S11: Q11, P11b {}
+
+protocol P12 where A == B {
+  associatedtype A
+  associatedtype B
+  func foo(arg: A)
+}
+struct S12: P12 { // OK, A == B == Never
+  func foo(arg: Never) {}
+}
+
+protocol P13a {
+  associatedtype A
+  func foo(arg: A)
+}
+protocol P13b {
+  associatedtype B
+}
+protocol P13c: P13a, P13b where A == B {}
+struct S13: P13c { // OK, A == B == Never
+  func foo(arg: Never) {}
+}

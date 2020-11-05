@@ -131,9 +131,9 @@ static void updateSSAForUseOfValue(
   assert(Res->getType() == MappedValue->getType() && "The types must match");
 
   insertedPhis.clear();
-  updater.Initialize(Res->getType());
-  updater.AddAvailableValue(Header, Res);
-  updater.AddAvailableValue(EntryCheckBlock, MappedValue);
+  updater.initialize(Res->getType());
+  updater.addAvailableValue(Header, Res);
+  updater.addAvailableValue(EntryCheckBlock, MappedValue);
 
   // Because of the way that phi nodes are represented we have to collect all
   // uses before we update SSA. Modifying one phi node can invalidate another
@@ -155,7 +155,7 @@ static void updateSSAForUseOfValue(
 
     assert(user->getParent() != EntryCheckBlock
            && "The entry check block should dominate the header");
-    updater.RewriteUse(*use);
+    updater.rewriteUse(*use);
   }
   // Canonicalize inserted phis to avoid extra BB Args.
   for (SILPhiArgument *arg : insertedPhis) {
@@ -409,10 +409,13 @@ bool swift::rotateLoop(SILLoop *loop, DominanceInfo *domInfo,
   header->moveAfter(latch);
 
   // Merge the old latch with the old header if possible.
-  mergeBasicBlockWithSuccessor(latch, domInfo, loopInfo);
+  if (mergeBasicBlockWithSuccessor(latch, domInfo, loopInfo))
+    newHeader = latch; // The old Header is gone. Latch is now the Header.
 
-  // Create a new preheader.
-  splitIfCriticalEdge(preheader, newHeader, domInfo, loopInfo);
+  // Cloning the header into the preheader created critical edges from the
+  // preheader and original header to both the new header and loop exit.
+  splitCriticalEdgesFrom(preheader, domInfo, loopInfo);
+  splitCriticalEdgesFrom(newHeader, domInfo, loopInfo);
 
   if (shouldVerify) {
     domInfo->verify();

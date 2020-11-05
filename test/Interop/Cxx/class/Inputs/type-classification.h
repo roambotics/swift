@@ -155,4 +155,27 @@ struct StructDeletedDestructor {
   ~StructDeletedDestructor() = delete;
 };
 
+struct StructWithCopyConstructorAndValue {
+  int value;
+  StructWithCopyConstructorAndValue() : value(0) {}
+  StructWithCopyConstructorAndValue(int value) : value(value) {}
+  StructWithCopyConstructorAndValue(
+      const StructWithCopyConstructorAndValue &other)
+      : value(other.value) {}
+};
+
+struct StructWithSubobjectCopyConstructorAndValue {
+  StructWithCopyConstructorAndValue member;
+};
+
+struct StructWithCopyConstructorAndSubobjectCopyConstructorAndValue {
+  StructWithCopyConstructorAndValue member;
+  StructWithCopyConstructorAndSubobjectCopyConstructorAndValue(
+      StructWithCopyConstructorAndValue member)
+      : member(member) {}
+  StructWithCopyConstructorAndSubobjectCopyConstructorAndValue(
+      const StructWithCopyConstructorAndSubobjectCopyConstructorAndValue &other)
+      : member(other.member) {}
+};
+
 #endif

@@ -24,6 +24,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "dead-object-elim"
+#include "swift/Basic/IndexTrie.h"
 #include "swift/AST/ResilienceExpansion.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/DebugUtils.h"
@@ -38,7 +39,6 @@
 #include "swift/SILOptimizer/Analysis/ArraySemantic.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
-#include "swift/SILOptimizer/Utils/IndexTrie.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "swift/SILOptimizer/Utils/SILSSAUpdater.h"
 #include "swift/SILOptimizer/Utils/ValueLifetime.h"
@@ -535,10 +535,10 @@ static void insertReleases(ArrayRef<StoreInst*> Stores,
   assert(!Stores.empty());
   SILValue StVal = Stores.front()->getSrc();
 
-  SSAUp.Initialize(StVal->getType());
+  SSAUp.initialize(StVal->getType());
 
   for (auto *Store : Stores)
-    SSAUp.AddAvailableValue(Store->getParent(), Store->getSrc());
+    SSAUp.addAvailableValue(Store->getParent(), Store->getSrc());
 
   SILLocation Loc = Stores[0]->getLoc();
   for (auto *RelPoint : ReleasePoints) {
@@ -547,7 +547,7 @@ static void insertReleases(ArrayRef<StoreInst*> Stores,
     // the right thing for local uses. We have already ensured a single store
     // per block, and all release points occur after all stores. Therefore we
     // can simply ask SSAUpdater for the reaching store.
-    SILValue RelVal = SSAUp.GetValueAtEndOfBlock(RelPoint->getParent());
+    SILValue RelVal = SSAUp.getValueAtEndOfBlock(RelPoint->getParent());
     if (StVal->getType().isReferenceCounted(RelPoint->getModule()))
       B.createStrongRelease(Loc, RelVal, B.getDefaultAtomicity());
     else
@@ -573,9 +573,9 @@ static bool removeAndReleaseArray(SingleValueInstruction *NewArrayValue,
     auto *TupleElt = dyn_cast<TupleExtractInst>(Op->getUser());
     if (!TupleElt)
       return false;
-    if (TupleElt->getFieldNo() == 0 && !ArrayDef) {
+    if (TupleElt->getFieldIndex() == 0 && !ArrayDef) {
       ArrayDef = TupleElt;
-    } else if (TupleElt->getFieldNo() == 1 && !StorageAddress) {
+    } else if (TupleElt->getFieldIndex() == 1 && !StorageAddress) {
       StorageAddress = TupleElt;
     } else {
       return false;

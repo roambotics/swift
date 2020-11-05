@@ -157,15 +157,6 @@ def disable_target_os_checking :
 def crosscheck_unqualified_lookup : Flag<["-"], "crosscheck-unqualified-lookup">,
   HelpText<"Compare legacy DeclContext- to ASTScope-based unqualified name lookup (for debugging)">;
 
-def stress_astscope_lookup : Flag<["-"], "stress-astscope-lookup">,
-  HelpText<"Stress ASTScope-based unqualified name lookup (for testing)">;
-  
-def warn_if_astscope_lookup : Flag<["-"], "warn-if-astscope-lookup">,
-  HelpText<"Print a warning if ASTScope lookup is used">;
-  
-def lazy_astscopes : Flag<["-"], "lazy-astscopes">,
-  HelpText<"Build ASTScopes lazily">;
-
 def use_clang_function_types : Flag<["-"], "use-clang-function-types">,
   HelpText<"Use stored Clang function types for computing canonical types.">;
 
@@ -184,36 +175,6 @@ def autolink_library : Separate<["-"], "autolink-library">,
 def disable_typo_correction : Flag<["-"], "disable-typo-correction">,
   HelpText<"Disable typo correction">;
 
-} // end let Flags = [FrontendOption, NoDriverOption]
-
-def debug_crash_Group : OptionGroup<"<automatic crashing options>">;
-class DebugCrashOpt : Group<debug_crash_Group>;
-
-
-// Flags that are saved into module interfaces
-let Flags = [FrontendOption, NoDriverOption, HelpHidden, ModuleInterfaceOption] in {
-
-def enable_objc_interop :
-  Flag<["-"], "enable-objc-interop">,
-  HelpText<"Enable Objective-C interop code generation and config directives">;
-
-def disable_objc_interop :
-  Flag<["-"], "disable-objc-interop">,
-  HelpText<"Disable Objective-C interop code generation and config directives">;
-
-def enable_objc_attr_requires_foundation_module :
-  Flag<["-"], "enable-objc-attr-requires-foundation-module">,
-  HelpText<"Enable requiring uses of @objc to require importing the "
-           "Foundation module">;
-
-def disable_objc_attr_requires_foundation_module :
-  Flag<["-"], "disable-objc-attr-requires-foundation-module">,
-  HelpText<"Disable requiring uses of @objc to require importing the "
-           "Foundation module">;
-
-def enable_resilience : Flag<["-"], "enable-resilience">,
-   HelpText<"Deprecated, use -enable-library-evolution instead">;
-
 def disable_implicit_swift_modules: Flag<["-"], "disable-implicit-swift-modules">,
   HelpText<"Disable building Swift modules explicitly by the compiler">;
 
@@ -228,8 +189,46 @@ def explict_swift_module_map
 def placeholder_dependency_module_map
   : Separate<["-"], "placeholder-dependency-module-map-file">, MetaVarName<"<path>">,
     HelpText<"Specify a JSON file containing information of external Swift module dependencies">;
-}
 
+def batch_scan_input_file
+  : Separate<["-"], "batch-scan-input-file">, MetaVarName<"<path>">,
+    HelpText<"Specify a JSON file containing modules to perform batch dependencies scanning">;
+
+def import_prescan : Flag<["-"], "import-prescan">,
+   HelpText<"When performing a dependency scan, only dentify all imports of the main Swift module sources">;
+
+} // end let Flags = [FrontendOption, NoDriverOption]
+
+def debug_crash_Group : OptionGroup<"<automatic crashing options>">;
+class DebugCrashOpt : Group<debug_crash_Group>;
+
+
+// Flags that are saved into module interfaces
+let Flags = [FrontendOption, NoDriverOption, HelpHidden, ModuleInterfaceOption] in {
+  def enable_objc_interop :
+    Flag<["-"], "enable-objc-interop">,
+    HelpText<"Enable Objective-C interop code generation and config directives">;
+
+  def disable_objc_interop :
+    Flag<["-"], "disable-objc-interop">,
+    HelpText<"Disable Objective-C interop code generation and config directives">;
+
+  def enable_objc_attr_requires_foundation_module :
+    Flag<["-"], "enable-objc-attr-requires-foundation-module">,
+    HelpText<"Enable requiring uses of @objc to require importing the "
+             "Foundation module">;
+
+  def disable_objc_attr_requires_foundation_module :
+    Flag<["-"], "disable-objc-attr-requires-foundation-module">,
+    HelpText<"Disable requiring uses of @objc to require importing the "
+             "Foundation module">;
+
+def enable_experimental_concurrency :
+  Flag<["-"], "enable-experimental-concurrency">,
+  HelpText<"Enable experimental concurrency model">;
+  def enable_resilience : Flag<["-"], "enable-resilience">,
+     HelpText<"Deprecated, use -enable-library-evolution instead">;
+}
 
 // HIDDEN FLAGS
 let Flags = [FrontendOption, NoDriverOption, HelpHidden] in {
@@ -255,6 +254,9 @@ def debug_generic_signatures : Flag<["-"], "debug-generic-signatures">,
 def debug_forbid_typecheck_prefix : Separate<["-"], "debug-forbid-typecheck-prefix">,
   HelpText<"Triggers llvm fatal_error if typechecker tries to typecheck a decl "
            "with the provided prefix name">;
+
+def debug_emit_invalid_swiftinterface_syntax : Flag<["-"], "debug-emit-invalid-swiftinterface-syntax">,
+  HelpText<"Write an invalid declaration into swiftinterface files">;
 
 def debug_cycles : Flag<["-"], "debug-cycles">,
   HelpText<"Print out debug dumps when cycles are detected in evaluation">;
@@ -388,10 +390,6 @@ def enable_experimental_static_assert :
   Flag<["-"], "enable-experimental-static-assert">,
   HelpText<"Enable experimental #assert">;
 
-def enable_experimental_concurrency :
-  Flag<["-"], "enable-experimental-concurrency">,
-  HelpText<"Enable experimental concurrency model">;
-
 def enable_subst_sil_function_types_for_function_values :
   Flag<["-"], "enable-subst-sil-function-types-for-function-values">,
   HelpText<"Use substituted function types for SIL type lowering of function values">;
@@ -482,10 +480,6 @@ def enable_operator_designated_types :
   Flag<["-"], "enable-operator-designated-types">,
   HelpText<"Enable operator designated types">;
 
-def solver_enable_operator_designated_types :
-  Flag<["-"], "solver-enable-operator-designated-types">,
-  HelpText<"Enable operator designated types in constraint solver">;
-
 def enable_invalid_ephemeralness_as_error :
   Flag<["-"], "enable-invalid-ephemeralness-as-error">,
   HelpText<"Diagnose invalid ephemeral to non-ephemeral conversions as errors">;
@@ -513,6 +507,9 @@ def enable_throw_without_try : Flag<["-"], "enable-throw-without-try">,
 
 def import_module : Separate<["-"], "import-module">,
   HelpText<"Implicitly import the specified module">;
+
+def testable_import_module : Separate<["-"], "testable-import-module">,
+  HelpText<"Implicitly import the specified module with @testable">;
 
 def print_stats : Flag<["-"], "print-stats">,
   HelpText<"Print various statistics">;
@@ -579,6 +576,11 @@ def sil_debug_serialization : Flag<["-"], "sil-debug-serialization">,
   HelpText<"Do not eliminate functions in Mandatory Inlining/SILCombine dead "
            "functions. (for debugging only)">;
 
+def sil_stop_optzns_before_lowering_ownership :
+  Flag<["-"], "sil-stop-optzns-before-lowering-ownership">,
+  HelpText<"Stop optimizing at SIL time before we lower ownership from SIL. "
+           "Intended only for SIL ossa tests">;
+
 def print_inst_counts : Flag<["-"], "print-inst-counts">,
   HelpText<"Before IRGen, count all the various SIL instructions. Must be used "
            "in conjunction with -print-stats.">;
@@ -593,6 +595,9 @@ def print_llvm_inline_tree : Flag<["-"], "print-llvm-inline-tree">,
 def disable_incremental_llvm_codegeneration :
   Flag<["-"], "disable-incremental-llvm-codegen">,
        HelpText<"Disable incremental llvm code generation.">;
+
+def ignore_always_inline : Flag<["-"], "ignore-always-inline">,
+  HelpText<"Ignore @inline(__always) attributes.">;
 
 def emit_sorted_sil : Flag<["-"], "emit-sorted-sil">,
   HelpText<"When printing SIL, print out all sil entities sorted by name to "
@@ -641,6 +646,11 @@ def build_module_from_parseable_interface :
   Alias<compile_module_from_interface>,
   ModeOpt;
 
+def typecheck_module_from_interface :
+  Flag<["-"], "typecheck-module-from-interface">,
+  HelpText<"Treat the (single) input as a swiftinterface and typecheck it">,
+  ModeOpt;
+
 def module_interface_preserve_types_as_written :
   Flag<["-"], "module-interface-preserve-types-as-written">,
   HelpText<"When emitting a module interface, preserve types as they were "
@@ -650,10 +660,13 @@ def experimental_spi_imports :
   Flag<["-"], "experimental-spi-imports">,
   HelpText<"Enable experimental support for SPI imports">;
 
+// [FIXME: Clang-type-plumbing] Make this a SIL-only option once we start
+// unconditionally emitting non-canonical Clang types in swiftinterfaces.
 def experimental_print_full_convention :
  Flag<["-"], "experimental-print-full-convention">,
- HelpText<"When emitting a module interface, emit additional @convention "
-          "arguments, regardless of whether they were written in the source">;
+ HelpText<"When emitting a module interface or SIL, emit additional @convention"
+          " arguments, regardless of whether they were written in the source."
+          " Also requires -use-clang-function-types to be enabled.">;
 
 def experimental_one_way_closure_params :
   Flag<["-"], "experimental-one-way-closure-params">,
@@ -745,4 +758,8 @@ def candidate_module_file
 def use_static_resource_dir
   : Flag<["-"], "use-static-resource-dir">,
     HelpText<"Use resources in the static resource directory">;
+
+def disable_building_interface
+  : Flag<["-"], "disable-building-interface">,
+    HelpText<"Disallow building binary module from textual interface">;
 } // end let Flags = [FrontendOption, NoDriverOption, HelpHidden]
