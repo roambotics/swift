@@ -690,6 +690,18 @@ protected:
   getDiagnosticFor(ContextualTypePurpose context, Type contextualType);
 };
 
+/// Diagnose errors related to using an array literal where a
+/// dictionary is expected.
+class ArrayLiteralToDictionaryConversionFailure final : public ContextualFailure {
+public:
+  ArrayLiteralToDictionaryConversionFailure(const Solution &solution,
+                                            Type arrayTy, Type dictTy,
+                                            ConstraintLocator *locator)
+      : ContextualFailure(solution, arrayTy, dictTy, locator) {}
+
+  bool diagnoseAsError() override;
+};
+
 /// Diagnose errors related to converting function type which
 /// isn't explicitly '@escaping' to some other type.
 class NoEscapeFuncToTypeConversionFailure final : public ContextualFailure {
@@ -792,6 +804,27 @@ public:
     auto fnType1 = fromType->castTo<FunctionType>();
     auto fnType2 = toType->castTo<FunctionType>();
     assert(fnType1->isThrowing() != fnType2->isThrowing());
+  }
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose failures related to conversion between 'async' function type
+/// and a synchronous one e.g.
+///
+/// ```swift
+/// func foo<T>(_ t: T) async -> Void {}
+/// let _: (Int) -> Void = foo // `foo` can't be implictly converted to
+///                            // synchronous function type `(Int) -> Void`
+/// ```
+class AsyncFunctionConversionFailure final : public ContextualFailure {
+public:
+  AsyncFunctionConversionFailure(const Solution &solution, Type fromType,
+                                 Type toType, ConstraintLocator *locator)
+      : ContextualFailure(solution, fromType, toType, locator) {
+    auto fnType1 = fromType->castTo<FunctionType>();
+    auto fnType2 = toType->castTo<FunctionType>();
+    assert(fnType1->isAsync() != fnType2->isAsync());
   }
 
   bool diagnoseAsError() override;
@@ -1927,12 +1960,15 @@ protected:
   bool diagnoseMisplacedMissingArgument() const;
 };
 
-/// Replace a coercion ('as') with a forced checked cast ('as!').
-class MissingForcedDowncastFailure final : public ContextualFailure {
+/// Replace a coercion ('as') with a runtime checked cast ('as!' or 'as?').
+class InvalidCoercionFailure final : public ContextualFailure {
+  bool UseConditionalCast;
+
 public:
-  MissingForcedDowncastFailure(const Solution &solution, Type fromType,
-                               Type toType, ConstraintLocator *locator)
-      : ContextualFailure(solution, fromType, toType, locator) {}
+  InvalidCoercionFailure(const Solution &solution, Type fromType, Type toType,
+                         bool useConditionalCast, ConstraintLocator *locator)
+      : ContextualFailure(solution, fromType, toType, locator),
+        UseConditionalCast(useConditionalCast) {}
 
   ASTNode getAnchor() const override;
 
@@ -2292,6 +2328,26 @@ public:
   ReferenceToInvalidDeclaration(const Solution &solution,
                                 ConstraintLocator *locator)
       : FailureDiagnostic(solution, locator) {}
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose use of `return` statements in a body of a result builder.
+///
+/// \code
+/// struct S : Builder {
+///   var foo: some Builder {
+///     return EmptyBuilder()
+///   }
+/// }
+/// \endcode
+class InvalidReturnInResultBuilderBody final : public FailureDiagnostic {
+  Type BuilderType;
+
+public:
+  InvalidReturnInResultBuilderBody(const Solution &solution, Type builderTy,
+                                   ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator), BuilderType(builderTy) {}
 
   bool diagnoseAsError() override;
 };

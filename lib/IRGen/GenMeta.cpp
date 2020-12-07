@@ -301,11 +301,15 @@ static void buildMethodDescriptorFields(IRGenModule &IGM,
 void IRGenModule::emitNonoverriddenMethodDescriptor(const SILVTable *VTable,
                                                     SILDeclRef declRef) {
   auto entity = LinkEntity::forMethodDescriptor(declRef);
-  auto *var = cast<llvm::GlobalVariable>(getAddrOfLLVMVariable(entity, ConstantInit(), DebugTypeInfo()));
+  auto *var = cast<llvm::GlobalVariable>(
+      getAddrOfLLVMVariable(entity, ConstantInit(), DebugTypeInfo()));
   if (!var->isDeclaration()) {
     assert(IRGen.isLazilyReemittingNominalTypeDescriptor(VTable->getClass()));
     return;
   }
+
+  var->setConstant(true);
+  setTrueConstGlobal(var);
 
   ConstantInitBuilder ib(*this);
   ConstantStructBuilder sb(ib.beginStruct(MethodDescriptorStructTy));
@@ -1540,8 +1544,11 @@ namespace {
       MetadataLayout = &IGM.getClassMetadataLayout(Type);
 
       if (auto superclassDecl = getType()->getSuperclassDecl()) {
-        if (MetadataLayout && MetadataLayout->hasResilientSuperclass())
+        if (MetadataLayout && MetadataLayout->hasResilientSuperclass()) {
+          assert(!getType()->isRootDefaultActor() &&
+                 "root default actor has a resilient superclass?");
           ResilientSuperClassRef = IGM.getTypeEntityReference(superclassDecl);
+        }
       }
 
       addVTableEntries(getType());
@@ -1770,7 +1777,7 @@ namespace {
     void addLayoutInfo() {
 
       // TargetRelativeDirectPointer<Runtime, const char> SuperclassType;
-      if (auto superclassType = getType()->getSuperclass()) {
+      if (auto superclassType = getSuperclassForMetadata(IGM, getType())) {
         GenericSignature genericSig = getType()->getGenericSignature();
         B.addRelativeAddress(IGM.getTypeRef(superclassType, genericSig,
                                             MangledTypeRefRole::Metadata)
@@ -2935,12 +2942,15 @@ namespace {
       }
     }
 
-    llvm::Constant *getSuperclassMetadata() {
-      Type type = Target->mapTypeIntoContext(Target->getSuperclass());
-      auto *metadata =
-          tryEmitConstantHeapMetadataRef(IGM, type->getCanonicalType(),
-                                         /*allowUninit*/ false);
-      return metadata;
+    CanType getSuperclassTypeForMetadata() {
+      if (auto superclass = getSuperclassForMetadata(IGM, Target))
+        return Target->mapTypeIntoContext(superclass)->getCanonicalType();
+      return CanType();
+    }
+
+    llvm::Constant *getSuperclassMetadata(CanType superclass) {
+      return tryEmitConstantHeapMetadataRef(IGM, superclass,
+                                            /*allowUninit*/ false);
     }
 
     bool shouldAddNullSuperclass() {
@@ -2964,7 +2974,8 @@ namespace {
       }
 
       // If this is a root class, use SwiftObject as our formal parent.
-      if (!Target->hasSuperclass()) {
+      CanType superclass = asImpl().getSuperclassTypeForMetadata();
+      if (!superclass) {
         // This is only required for ObjC interoperation.
         if (!IGM.ObjCInterop) {
           B.addNullPointer(IGM.TypeMetadataPtrTy);
@@ -2980,8 +2991,10 @@ namespace {
         return;
       }
 
-      auto *metadata = asImpl().getSuperclassMetadata();
-      assert(metadata != nullptr);
+      // This should succeed because the cases where it doesn't should
+      // lead to shouldAddNullSuperclass returning true above.
+      auto metadata = asImpl().getSuperclassMetadata(superclass);
+      assert(metadata);
       B.add(metadata);
     }
 
@@ -3119,8 +3132,12 @@ namespace {
       // The class is fragile. Emit a direct reference to the vtable entry.
       llvm::Constant *ptr;
       if (entry) {
-        ptr = IGM.getAddrOfSILFunction(entry->getImplementation(),
-                                       NotForDefinition);
+        if (entry->getImplementation()->isAsync()) {
+          ptr = IGM.getAddrOfAsyncFunctionPointer(entry->getImplementation());
+        } else {
+          ptr = IGM.getAddrOfSILFunction(entry->getImplementation(),
+                                         NotForDefinition);
+        }
       } else {
         // The method is removed by dead method elimination.
         // It should be never called. We add a pointer to an error function.
@@ -3662,11 +3679,13 @@ namespace {
 
     bool shouldAddNullSuperclass() { return false; }
 
-    llvm::Constant *getSuperclassMetadata() {
-      Type superclass = type->getSuperclass(/*useArchetypes=*/false);
-      auto *metadata =
-          IGM.getAddrOfTypeMetadata(superclass->getCanonicalType());
-      return metadata;
+    CanType getSuperclassTypeForMetadata() {
+      return getSuperclassForMetadata(IGM, type, /*useArchetypes=*/false);
+    }
+
+    llvm::Constant *getSuperclassMetadata(CanType superclass) {
+      // We know that this is safe (???)
+      return IGM.getAddrOfTypeMetadata(superclass);
     }
 
     uint64_t getClassDataPointerHasSwiftMetadataBits() {
@@ -3790,23 +3809,44 @@ void irgen::emitClassMetadata(IRGenModule &IGM, ClassDecl *classDecl,
   if (IGM.ObjCInterop) {
     switch (strategy) {
     case ClassMetadataStrategy::Resilient:
-      // Even non-@objc classes can have Objective-C categories attached, so
-      // we always emit a resilient class stub as long as -enable-objc-interop
-      // is set.
+      // We always emit a resilient class stub as long as -enable-objc-interop
+      // is set. You can define @objc members in an extension of a resilient
+      // class across a module boundary, and this category is attached to the
+      // class stub.
       if (IGM.hasObjCResilientClassStub(classDecl)) {
-        IGM.emitObjCResilientClassStub(classDecl);
+        auto *stub = IGM.emitObjCResilientClassStub(
+            classDecl, /*isPublic=*/true);
 
-        if (classDecl->isObjC()) {
-          auto *stub = IGM.getAddrOfObjCResilientClassStub(
-              classDecl, NotForDefinition,
-              TypeMetadataAddress::AddressPoint);
+        // If the class has Objective-C ancestry but does *not* have generic
+        // ancestry, it appears in the generated header. We emit an Objective-C
+        // class symbol aliased to the class stub for Clang to reference.
+        if (classDecl->isObjC())
           emitObjCClassSymbol(IGM, classDecl, stub);
 
+        // Note that if the class has generic ancestry, isObjC() is false.
+        // This is because such classes cannot appear in the generated header,
+        // because their generic superclasses cannot appear in the generated
+        // header either. However, we still want to emit the class stub in
+        // the __objc_stublist section of the binary, so that they are visited
+        // by objc_copyClassList().
+        if (classDecl->checkAncestry(AncestryFlags::ObjC))
+          IGM.addObjCClassStub(stub);
+      }
+      break;
+
+    case ClassMetadataStrategy::Singleton:
+      // If the class has Objective-C ancestry, we emit the class stub and
+      // add it to the __obj_stublist. Note that the stub is not public in
+      // this case, since there is no reason to reference directly; it only
+      // exists so that objc_copyClassList() can find it.
+      if (IGM.hasObjCResilientClassStub(classDecl)) {
+        if (classDecl->checkAncestry(AncestryFlags::ObjC)) {
+          auto *stub = IGM.emitObjCResilientClassStub(
+              classDecl, /*isPublic=*/false);
           IGM.addObjCClassStub(stub);
         }
       }
-      break;
-    case ClassMetadataStrategy::Singleton:
+
       break;
     
     case ClassMetadataStrategy::Update:
@@ -3816,7 +3856,7 @@ void irgen::emitClassMetadata(IRGenModule &IGM, ClassDecl *classDecl,
         emitObjCClassSymbol(IGM, classDecl, var);
 
       IGM.addObjCClass(var,
-                classDecl->getAttrs().hasAttribute<ObjCNonLazyRealizationAttr>());
+          classDecl->getAttrs().hasAttribute<ObjCNonLazyRealizationAttr>());
       break;
     }
   }
@@ -4135,13 +4175,18 @@ namespace {
                                  ConstantStructBuilder &B)
       : super(IGM, theStruct, B) {}
 
+    Size getExtraDataSize(StructMetadataLayout &layout) {
+      auto extraSize = layout.getSize().getOffsetToEnd() -
+                       IGM.getOffsetOfStructTypeSpecificMetadataMembers();
+      return extraSize;
+    }
+
     llvm::Value *emitAllocateMetadata(IRGenFunction &IGF,
                                       llvm::Value *descriptor,
                                       llvm::Value *arguments,
                                       llvm::Value *templatePointer) {
       auto &layout = IGM.getMetadataLayout(Target);
-      auto extraSize = layout.getSize().getOffsetToEnd()
-                         - IGM.getOffsetOfStructTypeSpecificMetadataMembers();
+      auto extraSize = getExtraDataSize(layout);
       auto extraSizeV = IGM.getSize(extraSize);
 
       // Sign the descriptor.
@@ -4209,6 +4254,7 @@ namespace {
     PartialPattern buildExtraDataPattern() {
       ConstantInitBuilder builder(IGM);
       auto init = builder.beginStruct();
+      init.setPacked(true);
 
       struct Scanner : StructMetadataScanner<Scanner> {
         GenericStructMetadataBuilder &Outer;
@@ -4253,10 +4299,9 @@ namespace {
       Offset zeroingEnd = offsetUpToTrailingFlags 
                             ? layout.getTrailingFlagsOffset()
                             : layout.getFieldOffsetVectorOffset();
-      return { global,
-               zeroingEnd.getStatic()
-                 - zeroingStart,
-               structSize };
+      auto offset = zeroingEnd.getStatic() - zeroingStart;
+      assert((offset + structSize) == getExtraDataSize(layout));
+      return {global, offset, structSize};
     }
 
     bool hasCompletionFunction() {
@@ -4532,13 +4577,18 @@ namespace {
                                ConstantStructBuilder &B)
       : super(IGM, theEnum, B) {}
 
+    Size getExtraDataSize(EnumMetadataLayout &layout) {
+      auto size = layout.getSize().getOffsetToEnd() -
+                  IGM.getOffsetOfEnumTypeSpecificMetadataMembers();
+      return size;
+    }
+
     llvm::Value *emitAllocateMetadata(IRGenFunction &IGF,
                                       llvm::Value *descriptor,
                                       llvm::Value *arguments,
                                       llvm::Value *templatePointer) {
       auto &layout = IGM.getMetadataLayout(Target);
-      auto extraSize = layout.getSize().getOffsetToEnd()
-                         - IGM.getOffsetOfEnumTypeSpecificMetadataMembers();
+      auto extraSize = getExtraDataSize(layout);
       auto extraSizeV = IGM.getSize(extraSize);
 
       // Sign the descriptor.
@@ -4577,6 +4627,7 @@ namespace {
     PartialPattern buildExtraDataPattern() {
       ConstantInitBuilder builder(IGM);
       auto init = builder.beginStruct();
+      init.setPacked(true);
 
       auto &layout = IGM.getMetadataLayout(Target);
 
@@ -4598,10 +4649,9 @@ namespace {
       Offset zeroingEnd = offsetUpToTrailingFlags 
                             ? layout.getTrailingFlagsOffset()
                             : layout.getPayloadSizeOffset();
-      return { global,
-               zeroingEnd.getStatic()
-                 - zeroingStart,
-               structSize };
+      auto offset = zeroingEnd.getStatic() - zeroingStart;
+      assert((offset + structSize) == getExtraDataSize(layout));
+      return {global, offset, structSize};
     }
 
     llvm::Constant *emitNominalTypeDescriptor() {
@@ -4807,7 +4857,7 @@ namespace {
 
       // Emit a reference to the superclass.
       auto superclass = IGF.emitAbstractTypeMetadataRef(
-                                   Target->getSuperclass()->getCanonicalType());
+                          getSuperclassForMetadata(IGM, Target));
 
       // Dig out the address of the superclass field and store.
       auto &layout = IGF.IGM.getForeignMetadataLayout(Target);
@@ -5280,4 +5330,17 @@ bool irgen::methodRequiresReifiedVTableEntry(IRGenModule &IGM,
              method.print(llvm::dbgs());
              llvm::dbgs() << " can be elided\n");
   return false;
+}
+
+llvm::GlobalValue *irgen::emitAsyncFunctionPointer(IRGenModule &IGM,
+                                                   SILFunction *function,
+                                                   Size size) {
+  ConstantInitBuilder initBuilder(IGM);
+  ConstantStructBuilder builder(
+      initBuilder.beginStruct(IGM.AsyncFunctionPointerTy));
+  builder.addRelativeAddress(
+      IGM.getAddrOfSILFunction(function, NotForDefinition));
+  builder.addInt32(size.getValue());
+  return cast<llvm::GlobalValue>(IGM.defineAsyncFunctionPointer(
+      function, builder.finishAndCreateFuture()));
 }

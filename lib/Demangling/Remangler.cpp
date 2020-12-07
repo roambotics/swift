@@ -743,6 +743,10 @@ void Remangler::mangleBuiltinTypeName(Node *node) {
     Buffer << 'o';
   } else if (text == BUILTIN_TYPE_NAME_RAWPOINTER) {
     Buffer << 'p';
+  } else if (text == BUILTIN_TYPE_NAME_RAWUNSAFECONTINUATION) {
+    Buffer << 'c';
+  } else if (text == BUILTIN_TYPE_NAME_JOB) {
+    Buffer << 'j';
   } else if (text == BUILTIN_TYPE_NAME_SILTOKEN) {
     Buffer << 't';
   } else if (text == BUILTIN_TYPE_NAME_INTLITERAL) {
@@ -803,6 +807,11 @@ void Remangler::mangleConstructor(Node *node) {
 void Remangler::mangleCoroutineContinuationPrototype(Node *node) {
   mangleChildNodes(node);
   Buffer << "TC";
+}
+
+void Remangler::manglePredefinedObjCAsyncCompletionHandlerImpl(Node *node) {
+  mangleChildNodes(node);
+  Buffer << "TZ";
 }
 
 void Remangler::mangleObjCAsyncCompletionHandlerImpl(Node *node) {

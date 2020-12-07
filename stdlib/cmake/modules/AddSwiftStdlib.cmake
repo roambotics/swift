@@ -261,6 +261,18 @@ function(_add_target_variant_c_compile_flags)
     endif()
   endif()
 
+  # The concurrency library uses double-word atomics.  MSVC's std::atomic
+  # uses a spin lock for this, so to get reasonable behavior we have to
+  # implement it ourselves using _InterlockedCompareExchange128.
+  # clang-cl requires us to enable the `cx16` feature to use this intrinsic.
+  if(SWIFT_HOST_VARIANT_ARCH STREQUAL x86_64)
+    if(SWIFT_COMPILER_IS_MSVC_LIKE)
+      list(APPEND result /clang:-mcx16)
+    else()
+      list(APPEND result -mcx16)
+    endif()
+  endif()
+
   if(${CFLAGS_SDK} STREQUAL ANDROID)
     if(${CFLAGS_ARCH} STREQUAL x86_64)
       # NOTE(compnerd) Android NDK 21 or lower will generate library calls to
@@ -402,10 +414,10 @@ function(_add_target_variant_link_flags)
     list(APPEND library_search_directories
          ${CMAKE_BINARY_DIR}/winsdk_lib_${LFLAGS_ARCH}_symlinks)
   elseif("${LFLAGS_SDK}" STREQUAL "HAIKU")
-    list(APPEND link_libraries "bsd" "atomic")
+    list(APPEND link_libraries "bsd")
     list(APPEND result "-Wl,-Bsymbolic")
   elseif("${LFLAGS_SDK}" STREQUAL "ANDROID")
-    list(APPEND link_libraries "dl" "log" "atomic")
+    list(APPEND link_libraries "dl" "log")
     # We need to add the math library, which is linked implicitly by libc++
     list(APPEND result "-lm")
 
@@ -1291,6 +1303,10 @@ function(_add_swift_target_library_single target name)
         endif()
       endif()
     endif()
+
+    # Silence warnings about global initializers. We already have clang
+    # emitting warnings about global initializers when it compiles the code.
+    list(APPEND swiftlib_link_flags_all "-Xlinker -no_warn_inits")
   endif()
   target_link_libraries(${target} PRIVATE
     ${link_libraries})
@@ -1655,6 +1671,12 @@ function(add_swift_target_library name)
 
   if(NOT SWIFT_BUILD_RUNTIME_WITH_HOST_COMPILER AND NOT BUILD_STANDALONE)
     list(APPEND SWIFTLIB_DEPENDS clang)
+  endif()
+
+  # Turn off implicit import of _Concurrency when building libraries
+  if(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY)
+    list(APPEND SWIFTLIB_SWIFT_COMPILE_FLAGS 
+                      "-Xfrontend;-disable-implicit-concurrency-module-import")
   endif()
 
   # If we are building this library for targets, loop through the various

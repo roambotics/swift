@@ -80,6 +80,7 @@ set(SWIFT_BENCH_MODULES
     single-source/DictionaryRemove
     single-source/DictionarySubscriptDefault
     single-source/DictionarySwap
+    single-source/Differentiation
     single-source/Diffing
     single-source/DiffingMyers
     single-source/DropFirst
@@ -98,6 +99,7 @@ set(SWIFT_BENCH_MODULES
     single-source/Hash
     single-source/Histogram
     single-source/HTTP2StateMachine
+    single-source/IndexPathTest
     single-source/InsertCharacter
     single-source/IntegerParsing
     single-source/Integrate
@@ -188,6 +190,7 @@ set(SWIFT_BENCH_MODULES
     single-source/Walsh
     single-source/WordCount
     single-source/XorLoop
+    cxx-source/CreateObjects
 )
 
 set(SWIFT_MULTISOURCE_SWIFT_BENCHES

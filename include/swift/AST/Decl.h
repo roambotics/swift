@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -242,14 +242,10 @@ struct OverloadSignature {
   /// Whether this declaration has an opaque return type.
   unsigned HasOpaqueReturnType : 1;
 
-  /// Whether this declaration is 'async'
-  unsigned HasAsync : 1;
-
   OverloadSignature()
       : UnaryOperator(UnaryOperatorKind::None), IsInstanceMember(false),
         IsVariable(false), IsFunction(false), InProtocolExtension(false),
-        InExtensionOfGenericType(false), HasOpaqueReturnType(false),
-        HasAsync(false) {}
+        InExtensionOfGenericType(false), HasOpaqueReturnType(false) { }
 };
 
 /// Determine whether two overload signatures conflict.
@@ -391,7 +387,7 @@ protected:
   SWIFT_INLINE_BITFIELD(SubscriptDecl, VarDecl, 2,
     StaticSpelling : 2
   );
-  SWIFT_INLINE_BITFIELD(AbstractFunctionDecl, ValueDecl, 3+8+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(AbstractFunctionDecl, ValueDecl, 3+8+1+1+1+1+1+1+1,
     /// \see AbstractFunctionDecl::BodyKind
     BodyKind : 3,
 
@@ -415,7 +411,11 @@ protected:
     Synthesized : 1,
 
     /// Whether this member's body consists of a single expression.
-    HasSingleExpressionBody : 1
+    HasSingleExpressionBody : 1,
+
+    /// Whether peeking into this function detected nested type declarations.
+    /// This is set when skipping over the decl at parsing.
+    HasNestedTypeDeclarations : 1
   );
 
   SWIFT_INLINE_BITFIELD(FuncDecl, AbstractFunctionDecl, 1+1+2+1+1+2+1,
@@ -3455,6 +3455,10 @@ enum class AncestryFlags : uint8_t {
 
   /// The class or one of its superclasses requires stored property initializers.
   RequiresStoredPropertyInits = (1<<6),
+
+  /// The class uses the ObjC object model (reference counting,
+  /// isa encoding, etc.).
+  ObjCObjectModel = (1<<7),
 };
 
 /// Return type of ClassDecl::checkAncestry(). Describes a set of interesting
@@ -3620,6 +3624,30 @@ public:
 
   /// Whether the class is an actor.
   bool isActor() const;
+
+  /// Whether the class is (known to be) a default actor.
+  bool isDefaultActor() const;
+
+  /// Whether the class is known to be a *root* default actor,
+  /// i.e. the first class in its hierarchy that is a default actor.
+  bool isRootDefaultActor() const;
+
+  /// Does this class explicitly declare any of the methods that
+  /// would prevent it from being a default actor?
+  bool hasExplicitCustomActorMethods() const;
+
+  /// Is this the NSObject class type?
+  bool isNSObject() const;
+
+  /// Whether the class directly inherits from NSObject but should use
+  /// Swift's native object model.
+  bool isNativeNSObjectSubclass() const;
+
+  /// Whether the class uses the ObjC object model (reference counting,
+  /// allocation, etc.) instead of the Swift model.
+  bool usesObjCObjectModel() const {
+    return checkAncestry(AncestryFlags::ObjCObjectModel);
+  }
 
   /// Returns true if the class has designated initializers that are not listed
   /// in its members.
@@ -5544,6 +5572,7 @@ protected:
     Bits.AbstractFunctionDecl.Throws = Throws;
     Bits.AbstractFunctionDecl.Synthesized = false;
     Bits.AbstractFunctionDecl.HasSingleExpressionBody = false;
+    Bits.AbstractFunctionDecl.HasNestedTypeDeclarations = false;
   }
 
   void setBodyKind(BodyKind K) {
@@ -5659,13 +5688,14 @@ public:
   /// Set a new body for the function.
   void setBody(BraceStmt *S, BodyKind NewBodyKind);
 
-  /// Note that the body was skipped for this function.  Function body
+  /// Note that the body was skipped for this function. Function body
   /// cannot be attached after this call.
   void setBodySkipped(SourceRange bodyRange) {
-    // FIXME: Remove 'Parsed' from this once we can delay parsing function
-    //        bodies. Right now -experimental-skip-non-inlinable-function-bodies
-    //        requires being able to change the state from Parsed to Skipped,
-    //        because we're still eagerly parsing function bodies.
+    // FIXME: Remove 'Parsed' from this list once we can always delay
+    //        parsing bodies. The -experimental-skip-*-function-bodies options
+    //        do currently skip parsing, unless disabled through other means in
+    //        SourceFile::hasDelayedBodyParsing (eg. needing to build the full
+    //        syntax tree due to -verify-syntax-tree).
     assert(getBodyKind() == BodyKind::None ||
            getBodyKind() == BodyKind::Unparsed ||
            getBodyKind() == BodyKind::Parsed);
@@ -5687,6 +5717,16 @@ public:
   /// Provide the parsed body for the function.
   void setBodyParsed(BraceStmt *S) {
     setBody(S, BodyKind::Parsed);
+  }
+
+  /// Was there a nested type declaration detected when parsing this
+  /// function was skipped?
+  bool hasNestedTypeDeclarations() const {
+    return Bits.AbstractFunctionDecl.HasNestedTypeDeclarations;
+  }
+
+  void setHasNestedTypeDeclarations(bool value) {
+    Bits.AbstractFunctionDecl.HasNestedTypeDeclarations = value;
   }
 
   /// Note that parsing for the body was delayed.
@@ -6507,6 +6547,13 @@ public:
                   ParameterList *BodyParams,
                   GenericParamList *GenericParams, 
                   DeclContext *Parent);
+
+  static ConstructorDecl *
+  createImported(ASTContext &ctx, ClangNode clangNode, DeclName name,
+                 SourceLoc constructorLoc, bool failable,
+                 SourceLoc failabilityLoc, bool throws, SourceLoc throwsLoc,
+                 ParameterList *bodyParams, GenericParamList *genericParams,
+                 DeclContext *parent);
 
   SourceLoc getConstructorLoc() const { return getNameLoc(); }
   SourceLoc getStartLoc() const { return getConstructorLoc(); }

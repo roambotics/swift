@@ -11,12 +11,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SIL/BasicBlockUtils.h"
+#include "swift/Basic/STLExtras.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/LoopInfo.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILFunction.h"
+#include "swift/SIL/TerminatorUtils.h"
+#include "llvm/ADT/STLExtras.h"
 
 using namespace swift;
 
@@ -97,6 +100,12 @@ static SILBasicBlock *getNthEdgeBlock(SwitchInstTy *S, unsigned edgeIdx) {
   return S->getCase(edgeIdx).second;
 }
 
+static SILBasicBlock *getNthEdgeBlock(SwitchEnumTermInst S, unsigned edgeIdx) {
+  if (S.getNumCases() == edgeIdx)
+    return S.getDefaultBB();
+  return S.getCase(edgeIdx).second;
+}
+
 void swift::getEdgeArgs(TermInst *T, unsigned edgeIdx, SILBasicBlock *newEdgeBB,
                         llvm::SmallVectorImpl<SILValue> &args) {
   switch (T->getKind()) {
@@ -125,9 +134,8 @@ void swift::getEdgeArgs(TermInst *T, unsigned edgeIdx, SILBasicBlock *newEdgeBB,
       // GetAsyncContinuation, or no argument if the operand is
       // GetAsyncContinuationAddr
       if (auto contOperand = dyn_cast<GetAsyncContinuationInst>(AACI->getOperand())) {
-        args.push_back(
-         newEdgeBB->createPhiArgument(contOperand->getLoweredResumeType(),
-                                      ValueOwnershipKind::Owned));
+        args.push_back(newEdgeBB->createPhiArgument(
+            contOperand->getLoweredResumeType(), OwnershipKind::Owned));
       }
       return;
         
@@ -137,8 +145,8 @@ void swift::getEdgeArgs(TermInst *T, unsigned edgeIdx, SILBasicBlock *newEdgeBB,
       auto errorTy = C.getErrorDecl()->getDeclaredType();
       auto errorSILTy = SILType::getPrimitiveObjectType(errorTy->getCanonicalType());
       // error BB. this takes the error value argument
-      args.push_back(newEdgeBB->createPhiArgument(errorSILTy,
-                                                  ValueOwnershipKind::Owned));
+      args.push_back(
+          newEdgeBB->createPhiArgument(errorSILTy, OwnershipKind::Owned));
       return;
     }
         
@@ -159,13 +167,13 @@ void swift::getEdgeArgs(TermInst *T, unsigned edgeIdx, SILBasicBlock *newEdgeBB,
   // destination block to figure this out.
   case SILInstructionKind::SwitchEnumInst:
   case SILInstructionKind::SwitchEnumAddrInst: {
-    auto SEI = cast<SwitchEnumInstBase>(T);
-    auto *succBB = getNthEdgeBlock(SEI, edgeIdx);
+    SwitchEnumTermInst branch(T);
+    auto *succBB = getNthEdgeBlock(branch, edgeIdx);
     assert(succBB->getNumArguments() < 2 && "Can take at most one argument");
     if (!succBB->getNumArguments())
       return;
     args.push_back(newEdgeBB->createPhiArgument(
-        succBB->getArgument(0)->getType(), ValueOwnershipKind::Owned));
+        succBB->getArgument(0)->getType(), OwnershipKind::Owned));
     return;
   }
 
@@ -177,7 +185,7 @@ void swift::getEdgeArgs(TermInst *T, unsigned edgeIdx, SILBasicBlock *newEdgeBB,
     if (!succBB->getNumArguments())
       return;
     args.push_back(newEdgeBB->createPhiArgument(
-        succBB->getArgument(0)->getType(), ValueOwnershipKind::Owned));
+        succBB->getArgument(0)->getType(), OwnershipKind::Owned));
     return;
   }
 
@@ -188,7 +196,7 @@ void swift::getEdgeArgs(TermInst *T, unsigned edgeIdx, SILBasicBlock *newEdgeBB,
     if (!succBB->getNumArguments())
       return;
     args.push_back(newEdgeBB->createPhiArgument(
-        succBB->getArgument(0)->getType(), ValueOwnershipKind::Owned));
+        succBB->getArgument(0)->getType(), OwnershipKind::Owned));
     return;
   }
   case SILInstructionKind::CheckedCastAddrBranchInst: {
@@ -197,7 +205,7 @@ void swift::getEdgeArgs(TermInst *T, unsigned edgeIdx, SILBasicBlock *newEdgeBB,
     if (!succBB->getNumArguments())
       return;
     args.push_back(newEdgeBB->createPhiArgument(
-        succBB->getArgument(0)->getType(), ValueOwnershipKind::Owned));
+        succBB->getArgument(0)->getType(), OwnershipKind::Owned));
     return;
   }
   case SILInstructionKind::CheckedCastValueBranchInst: {
@@ -206,7 +214,7 @@ void swift::getEdgeArgs(TermInst *T, unsigned edgeIdx, SILBasicBlock *newEdgeBB,
     if (!succBB->getNumArguments())
       return;
     args.push_back(newEdgeBB->createPhiArgument(
-        succBB->getArgument(0)->getType(), ValueOwnershipKind::Owned));
+        succBB->getArgument(0)->getType(), OwnershipKind::Owned));
     return;
   }
 
@@ -216,7 +224,7 @@ void swift::getEdgeArgs(TermInst *T, unsigned edgeIdx, SILBasicBlock *newEdgeBB,
     if (!succBB->getNumArguments())
       return;
     args.push_back(newEdgeBB->createPhiArgument(
-        succBB->getArgument(0)->getType(), ValueOwnershipKind::Owned));
+        succBB->getArgument(0)->getType(), OwnershipKind::Owned));
     return;
   }
 
@@ -371,4 +379,112 @@ void DeadEndBlocks::compute() {
     for (SILBasicBlock *Pred : BB->getPredecessorBlocks())
       ReachableBlocks.insert(Pred);
   }
+}
+
+//===----------------------------------------------------------------------===//
+//                  Post Dominance Set Completion Utilities
+//===----------------------------------------------------------------------===//
+
+void JointPostDominanceSetComputer::findJointPostDominatingSet(
+    SILBasicBlock *dominatingBlock, ArrayRef<SILBasicBlock *> dominatedBlockSet,
+    function_ref<void(SILBasicBlock *)> foundInputBlocksNotInJointPostDomSet,
+    function_ref<void(SILBasicBlock *)> foundJointPostDomSetCompletionBlocks,
+    function_ref<void(SILBasicBlock *)> foundInputBlocksInJointPostDomSet) {
+  // If our reachable block set is empty, assert. This is most likely programmer
+  // error.
+  assert(dominatedBlockSet.size() != 0);
+
+  // If we have a reachable block set with a single block and that block is
+  // dominatingBlock, then we return success since a block post-doms its self so
+  // it is already complete.
+  if (dominatedBlockSet.size() == 1) {
+    if (dominatingBlock == dominatedBlockSet[0]) {
+      if (foundInputBlocksInJointPostDomSet)
+        foundInputBlocksInJointPostDomSet(dominatingBlock);
+      return;
+    }
+  }
+
+  // At the top of where we for sure are going to use state... make sure we
+  // always clean up any resources that we use!
+  SWIFT_DEFER { clear(); };
+
+  // Otherwise, we need to compute our joint post dominating set. We do this by
+  // performing a backwards walk up the CFG tracking back liveness until we find
+  // our dominating block. As we walk up, we keep track of any successor blocks
+  // that we need to visit before the walk completes lest we leak. After we
+  // finish the walk, these leaking blocks are a valid (albeit not unique)
+  // completion of the post dom set.
+  for (auto *block : dominatedBlockSet) {
+    // Skip dead end blocks.
+    if (deadEndBlocks.isDeadEnd(block))
+      continue;
+
+    // We require dominatedBlockSet to be a set and thus assert if we hit it to
+    // flag user error to our caller.
+    bool succeededInserting = visitedBlocks.insert(block).second;
+    (void)succeededInserting;
+    assert(succeededInserting &&
+           "Repeat Elt: dominatedBlockSet should be a set?!");
+    initialBlocks.insert(block);
+    worklist.push_back(block);
+  }
+
+  // Then until we run out of blocks...
+  while (!worklist.empty()) {
+    auto *block = worklist.pop_back_val();
+
+    // First remove block from blocksThatLeakIfNeverVisited if it is there since
+    // we know that it isn't leaking since we are visiting it now.
+    blocksThatLeakIfNeverVisited.remove(block);
+
+    // Then if our block is not one of our initial blocks, add the block's
+    // successors to blocksThatLeakIfNeverVisited.
+    if (!initialBlocks.count(block)) {
+      for (auto *succBlock : block->getSuccessorBlocks()) {
+        if (visitedBlocks.count(succBlock))
+          continue;
+        if (deadEndBlocks.isDeadEnd(succBlock))
+          continue;
+        blocksThatLeakIfNeverVisited.insert(succBlock);
+      }
+    }
+
+    // If we are the dominating block, we are done.
+    if (dominatingBlock == block)
+      continue;
+
+    // Otherwise for each predecessor that we have, first check if it was one of
+    // our initial blocks (signaling a loop) and then add it to the worklist if
+    // we haven't visited it already.
+    for (auto *predBlock : block->getPredecessorBlocks()) {
+      if (initialBlocks.count(predBlock)) {
+        reachableInputBlocks.push_back(predBlock);
+      }
+      if (visitedBlocks.insert(predBlock).second)
+        worklist.push_back(predBlock);
+    }
+  }
+
+  // After our worklist has emptied, any blocks left in
+  // blocksThatLeakIfNeverVisited are "leaking blocks".
+  for (auto *leakingBlock : blocksThatLeakIfNeverVisited)
+    foundJointPostDomSetCompletionBlocks(leakingBlock);
+
+  // Then unique our list of reachable input blocks and pass them to our
+  // callback.
+  sortUnique(reachableInputBlocks);
+  for (auto *block : reachableInputBlocks)
+    foundInputBlocksNotInJointPostDomSet(block);
+
+  // Then if were asked to find the subset of our input blocks that are in the
+  // joint-postdominance set, compute that.
+  if (!foundInputBlocksInJointPostDomSet)
+    return;
+
+  // Pass back the reachable input blocks that were not reachable from other
+  // input blocks to.
+  for (auto *block : dominatedBlockSet)
+    if (lower_bound(reachableInputBlocks, block) == reachableInputBlocks.end())
+      foundInputBlocksInJointPostDomSet(block);
 }

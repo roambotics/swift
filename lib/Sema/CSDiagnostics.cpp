@@ -841,6 +841,27 @@ bool LabelingFailure::diagnoseAsNote() {
   return false;
 }
 
+bool ArrayLiteralToDictionaryConversionFailure::diagnoseAsError() {
+  ArrayExpr *AE = getAsExpr<ArrayExpr>(getAnchor());
+  assert(AE);
+
+  if (AE->getNumElements() == 0) {
+    emitDiagnostic(diag::should_use_empty_dictionary_literal)
+      .fixItInsertAfter(getLoc(), ":");
+    return true;
+  }
+
+  auto CTP = getConstraintSystem().getContextualTypePurpose(AE);
+  emitDiagnostic(diag::should_use_dictionary_literal,
+                 getToType()->lookThroughAllOptionalTypes(),
+                 CTP == CTP_Initialization);
+
+  auto diagnostic = emitDiagnostic(diag::meant_dictionary_lit);
+  if (AE->getNumElements() == 1)
+    diagnostic.fixItInsertAfter(AE->getElement(0)->getEndLoc(), ": <#value#>");
+  return true;
+}
+
 bool NoEscapeFuncToTypeConversionFailure::diagnoseAsError() {
   if (diagnoseParameterUse())
     return true;
@@ -943,20 +964,29 @@ bool NoEscapeFuncToTypeConversionFailure::diagnoseParameterUse() const {
   return true;
 }
 
-ASTNode MissingForcedDowncastFailure::getAnchor() const {
+ASTNode InvalidCoercionFailure::getAnchor() const {
   auto anchor = FailureDiagnostic::getAnchor();
   if (auto *assignExpr = getAsExpr<AssignExpr>(anchor))
     return assignExpr->getSrc();
   return anchor;
 }
 
-bool MissingForcedDowncastFailure::diagnoseAsError() {
+bool InvalidCoercionFailure::diagnoseAsError() {
   auto fromType = getFromType();
   auto toType = getToType();
 
-  emitDiagnostic(diag::missing_forced_downcast, fromType, toType)
-      .highlight(getSourceRange())
-      .fixItReplace(getLoc(), "as!");
+  emitDiagnostic(diag::cannot_coerce_to_type, fromType, toType);
+
+  if (UseConditionalCast) {
+    emitDiagnostic(diag::missing_optional_downcast)
+        .highlight(getSourceRange())
+        .fixItReplace(getLoc(), "as?");
+  } else {
+    emitDiagnostic(diag::missing_forced_downcast)
+        .highlight(getSourceRange())
+        .fixItReplace(getLoc(), "as!");
+  }
+
   return true;
 }
 
@@ -1030,10 +1060,19 @@ bool MissingExplicitConversionFailure::diagnoseAsError() {
   if (needsParensOutside)
     insertAfter += ")";
 
-  auto diagID =
-      useAs ? diag::missing_explicit_conversion : diag::missing_forced_downcast;
-  auto diag = emitDiagnostic(diagID, fromType, toType);
+  auto diagnose = [&]() {
+    if (useAs) {
+      return emitDiagnostic(diag::missing_explicit_conversion, fromType,
+                            toType);
+    } else {
+      // Emit error diagnostic.
+      emitDiagnostic(diag::cannot_coerce_to_type, fromType, toType);
+      // Emit and return note suggesting as! where the fix-it will be placed.
+      return emitDiagnostic(diag::missing_forced_downcast);
+    }
+  };
 
+  auto diag = diagnose();
   if (!insertBefore.empty()) {
     diag.fixItInsert(getSourceRange().Start, insertBefore);
   }
@@ -5129,16 +5168,27 @@ bool CollectionElementContextualFailure::diagnoseAsError() {
   auto eltType = getFromType();
   auto contextualType = getToType();
 
-  Optional<InFlightDiagnostic> diagnostic;
-  if (isExpr<ArrayExpr>(anchor)) {
-    if (diagnoseMergedLiteralElements())
-      return true;
+  auto isFixedToDictionary = [&](ArrayExpr *anchor) {
+    return llvm::any_of(getSolution().Fixes, [&](ConstraintFix *fix) {
+      auto *fixAnchor = getAsExpr<ArrayExpr>(fix->getAnchor());
+      return fixAnchor && fixAnchor == anchor &&
+        fix->getKind() == FixKind::TreatArrayLiteralAsDictionary;
+    });
+  };
 
-    diagnostic.emplace(emitDiagnostic(diag::cannot_convert_array_element,
-                                      eltType, contextualType));
+  bool treatAsDictionary = false;
+  Optional<InFlightDiagnostic> diagnostic;
+  if (auto *AE = getAsExpr<ArrayExpr>(anchor)) {
+    if (!(treatAsDictionary = isFixedToDictionary(AE))) {
+      if (diagnoseMergedLiteralElements())
+        return true;
+
+      diagnostic.emplace(emitDiagnostic(diag::cannot_convert_array_element,
+                                        eltType, contextualType));
+    }
   }
 
-  if (isExpr<DictionaryExpr>(anchor)) {
+  if (treatAsDictionary || isExpr<DictionaryExpr>(anchor)) {
     auto eltLoc = locator->castLastElementTo<LocatorPathElt::TupleElement>();
     switch (eltLoc.getIndex()) {
     case 0: // key
@@ -5708,6 +5758,12 @@ bool InvalidTupleSplatWithSingleParameterFailure::diagnoseAsError() {
 
 bool ThrowingFunctionConversionFailure::diagnoseAsError() {
   emitDiagnostic(diag::throws_functiontype_mismatch, getFromType(),
+                 getToType());
+  return true;
+}
+
+bool AsyncFunctionConversionFailure::diagnoseAsError() {
+  emitDiagnostic(diag::async_functiontype_mismatch, getFromType(),
                  getToType());
   return true;
 }
@@ -7018,5 +7074,24 @@ bool ReferenceToInvalidDeclaration::diagnoseAsError() {
 
   emitDiagnostic(diag::reference_to_invalid_decl, decl->getName());
   emitDiagnosticAt(decl, diag::decl_declared_here, decl->getName());
+  return true;
+}
+
+bool InvalidReturnInResultBuilderBody::diagnoseAsError() {
+  auto *closure = castToExpr<ClosureExpr>(getAnchor());
+
+  auto returnStmts = TypeChecker::findReturnStatements(closure);
+  assert(!returnStmts.empty());
+
+  auto loc = returnStmts.front()->getReturnLoc();
+  emitDiagnosticAt(loc, diag::result_builder_disabled_by_return, BuilderType);
+
+  // Note that one can remove all of the return statements.
+  {
+    auto diag = emitDiagnosticAt(loc, diag::result_builder_remove_returns);
+    for (auto returnStmt : returnStmts)
+      diag.fixItRemove(returnStmt->getReturnLoc());
+  }
+
   return true;
 }

@@ -53,3 +53,15 @@ module ClassTemplateNonTypeParameter {
 module ClassTemplateTemplateParameter {
   header "class-template-template-parameter.h"
 }
+
+module ClassTemplateWithTypedef {
+  header "class-template-with-typedef.h"
+}
+
+module ClassTemplateInNamespace {
+  header "class-template-in-namespace.h"
+}
+
+module MemberTemplates {
+  header "member-templates.h"
+}

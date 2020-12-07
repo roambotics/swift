@@ -52,8 +52,9 @@ void SILGenFunction::emitDestroyingDestructor(DestructorDecl *dd) {
   SILValue resultSelfValue;
   SILType objectPtrTy = SILType::getNativeObjectType(F.getASTContext());
   SILType classTy = selfValue->getType();
-  if (cd->hasSuperclass()) {
-    Type superclassTy = dd->mapTypeIntoContext(cd->getSuperclass());
+  if (cd->hasSuperclass() && !cd->isNativeNSObjectSubclass()) {
+    Type superclassTy =
+      dd->mapTypeIntoContext(cd->getSuperclass());
     ClassDecl *superclass = superclassTy->getClassOrBoundGenericClass();
     auto superclassDtorDecl = superclass->getDestructor();
     SILDeclRef dtorConstant =
@@ -92,11 +93,10 @@ void SILGenFunction::emitDestroyingDestructor(DestructorDecl *dd) {
     resultSelfValue =
         B.createUncheckedRefCast(cleanupLoc, resultSelfValue, objectPtrTy);
   }
-  if (resultSelfValue.getOwnershipKind() != ValueOwnershipKind::Owned) {
-    assert(resultSelfValue.getOwnershipKind() ==
-           ValueOwnershipKind::Guaranteed);
+  if (resultSelfValue.getOwnershipKind() != OwnershipKind::Owned) {
+    assert(resultSelfValue.getOwnershipKind() == OwnershipKind::Guaranteed);
     resultSelfValue = B.createUncheckedOwnershipConversion(
-        cleanupLoc, resultSelfValue, ValueOwnershipKind::Owned);
+        cleanupLoc, resultSelfValue, OwnershipKind::Owned);
   }
   B.createReturn(returnLoc, resultSelfValue);
 }
@@ -245,7 +245,7 @@ void SILGenFunction::emitObjCDestructor(SILDeclRef dtor) {
   // Call the superclass's -dealloc.
   SILType superclassSILTy = getLoweredLoadableType(superclassTy);
   SILValue superSelf = B.createUpcast(cleanupLoc, selfValue, superclassSILTy);
-  assert(superSelf.getOwnershipKind() == ValueOwnershipKind::Owned);
+  assert(superSelf.getOwnershipKind() == OwnershipKind::Owned);
 
   auto subMap
     = superclassTy->getContextSubstitutionMap(SGM.M.getSwiftModule(),

@@ -220,7 +220,8 @@ types where the metadata itself has unknown layout.)
   global ::= entity                      // some identifiable thing
   global ::= from-type to-type generic-signature? 'TR'  // reabstraction thunk
   global ::= from-type to-type generic-signature? 'TR'  // reabstraction thunk
-  global ::= impl-function-type 'Tz'     // objc-to-swift-async completion handler block implementation
+  global ::= impl-function-type type 'Tz'     // objc-to-swift-async completion handler block implementation
+  global ::= impl-function-type type 'TZ'     // objc-to-swift-async completion handler block implementation (predefined by runtime)
   global ::= from-type to-type self-type generic-signature? 'Ty'  // reabstraction thunk with dynamic 'Self' capture
   global ::= from-type to-type generic-signature? 'Tr'  // obsolete mangling for reabstraction thunk
   global ::= entity generic-signature? type type* 'TK' // key path getter
@@ -491,9 +492,11 @@ Types
 
   type ::= 'Bb'                              // Builtin.BridgeObject
   type ::= 'BB'                              // Builtin.UnsafeValueBuffer
+  type ::= 'Bc'                              // Builtin.RawUnsafeContinuation
   type ::= 'Bf' NATURAL '_'                  // Builtin.Float<n>
   type ::= 'Bi' NATURAL '_'                  // Builtin.Int<n>
   type ::= 'BI'                              // Builtin.IntLiteral
+  type ::= 'Bj'                              // Builtin.Job
   type ::= 'BO'                              // Builtin.UnknownObject (no longer a distinct type, but still used for AnyObject)
   type ::= 'Bo'                              // Builtin.NativeObject
   type ::= 'Bp'                              // Builtin.RawPointer

@@ -2505,6 +2505,22 @@ public:
     printCommon(E, name);
     PrintWithColorRAII(OS, DiscriminatorColor)
       << " discriminator=" << E->getDiscriminator();
+
+    switch (auto isolation = E->getActorIsolation()) {
+    case ClosureActorIsolation::Independent:
+      break;
+
+    case ClosureActorIsolation::ActorInstance:
+      PrintWithColorRAII(OS, CapturesColor) << " actor-isolated="
+        << isolation.getActorInstance()->printRef();
+      break;
+
+    case ClosureActorIsolation::GlobalActor:
+      PrintWithColorRAII(OS, CapturesColor) << " global-actor-isolated="
+        << isolation.getGlobalActor().getString();
+      break;
+    }
+
     if (!E->getCaptureInfo().isTrivial()) {
       OS << " ";
       E->getCaptureInfo().print(PrintWithColorRAII(OS, CapturesColor).getOS());
@@ -3544,7 +3560,9 @@ namespace {
     }
 
     TRIVIAL_TYPE_PRINTER(BuiltinIntegerLiteral, builtin_integer_literal)
+    TRIVIAL_TYPE_PRINTER(BuiltinJob, builtin_job)
     TRIVIAL_TYPE_PRINTER(BuiltinRawPointer, builtin_raw_pointer)
+    TRIVIAL_TYPE_PRINTER(BuiltinRawUnsafeContinuation, builtin_raw_unsafe_continuation)
     TRIVIAL_TYPE_PRINTER(BuiltinNativeObject, builtin_native_object)
     TRIVIAL_TYPE_PRINTER(BuiltinBridgeObject, builtin_bridge_object)
     TRIVIAL_TYPE_PRINTER(BuiltinUnsafeValueBuffer, builtin_unsafe_value_buffer)

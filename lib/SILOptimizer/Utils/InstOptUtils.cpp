@@ -138,6 +138,12 @@ swift::createDecrementBefore(SILValue ptr, SILInstruction *insertPt) {
   return builder.createReleaseValue(loc, ptr, builder.getDefaultAtomicity());
 }
 
+static bool isOSSAEndScopeWithNoneOperand(SILInstruction *i) {
+  if (!isa<EndBorrowInst>(i) && !isa<DestroyValueInst>(i))
+    return false;
+  return i->getOperand(0).getOwnershipKind() == OwnershipKind::None;
+}
+
 /// Perform a fast local check to see if the instruction is dead.
 ///
 /// This routine only examines the state of the instruction at hand.
@@ -176,6 +182,15 @@ bool swift::isInstructionTriviallyDead(SILInstruction *inst) {
   // These invalidate enums so "write" memory, but that is not an essential
   // operation so we can remove these if they are trivially dead.
   if (isa<UncheckedTakeEnumDataAddrInst>(inst))
+    return true;
+
+  // An ossa end scope instruction is trivially dead if its operand has
+  // OwnershipKind::None. This can occur after CFG simplification in the
+  // presence of non-payloaded or trivial payload cases of non-trivial enums.
+  //
+  // Examples of ossa end_scope instructions: end_borrow, destroy_value.
+  if (inst->getFunction()->hasOwnership() &&
+      isOSSAEndScopeWithNoneOperand(inst))
     return true;
 
   if (!inst->mayHaveSideEffects())
@@ -403,10 +418,10 @@ static void destroyConsumedOperandOfDeadInst(Operand &operand) {
   assert(!isEndOfScopeMarker(deadInst) && !isa<DestroyValueInst>(deadInst) &&
          !isa<DestroyAddrInst>(deadInst) &&
          "lifetime ending instruction is deleted without its operand");
-  if (operand.isConsumingUse()) {
+  if (operand.isLifetimeEnding()) {
     // Since deadInst cannot be an end-of-scope instruction (asserted above),
     // this must be a consuming use of an owned value.
-    assert(operandValue.getOwnershipKind() == ValueOwnershipKind::Owned);
+    assert(operandValue.getOwnershipKind() == OwnershipKind::Owned);
     SILBuilderWithScope builder(deadInst);
     builder.emitDestroyValueOperation(deadInst->getLoc(), operandValue);
   }
@@ -1000,7 +1015,7 @@ swift::castValueToABICompatibleType(SILBuilder *builder, SILLocation loc,
     auto *curBB = builder->getInsertionPoint()->getParent();
 
     auto *contBB = curBB->split(builder->getInsertionPoint());
-    contBB->createPhiArgument(destTy, ValueOwnershipKind::Owned);
+    contBB->createPhiArgument(destTy, OwnershipKind::Owned);
 
     SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 1> caseBBs;
     caseBBs.push_back(std::make_pair(someDecl, someBB));

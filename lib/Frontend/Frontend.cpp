@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -321,10 +321,21 @@ void CompilerInstance::setupDependencyTrackerIfNeeded() {
   DepTracker = std::make_unique<DependencyTracker>(*collectionMode);
 }
 
+void CompilerInstance::setUpModuleDependencyCacheIfNeeded() {
+  const auto &Invocation = getInvocation();
+  const auto &opts = Invocation.getFrontendOptions();
+  if (opts.RequestedAction == FrontendOptions::ActionType::ScanDependencies ||
+      opts.RequestedAction == FrontendOptions::ActionType::ScanClangDependencies) {
+    ModDepCache = std::make_unique<ModuleDependenciesCache>();
+  }
+}
+
 bool CompilerInstance::setup(const CompilerInvocation &Invok) {
   Invocation = Invok;
 
   setupDependencyTrackerIfNeeded();
+
+  setUpModuleDependencyCacheIfNeeded();
 
   // If initializing the overlay file system fails there's no sense in
   // continuing because the compiler will read the wrong files.
@@ -588,17 +599,23 @@ bool CompilerInstance::setUpInputs() {
 
   const auto &Inputs =
       Invocation.getFrontendOptions().InputsAndOutputs.getAllInputs();
+  const bool shouldRecover = Invocation.getFrontendOptions()
+                                 .InputsAndOutputs.shouldRecoverMissingInputs();
+
+  bool hasFailed = false;
   for (const InputFile &input : Inputs) {
     bool failed = false;
-    Optional<unsigned> bufferID = getRecordedBufferID(input, failed);
-    if (failed)
-      return true;
+    Optional<unsigned> bufferID =
+        getRecordedBufferID(input, shouldRecover, failed);
+    hasFailed |= failed;
 
     if (!bufferID.hasValue() || !input.isPrimary())
       continue;
 
     recordPrimaryInputBuffer(*bufferID);
   }
+  if (hasFailed)
+    return true;
 
   // Set the primary file to the code-completion point if one exists.
   if (codeCompletionBufferID.hasValue() &&
@@ -610,8 +627,9 @@ bool CompilerInstance::setUpInputs() {
   return false;
 }
 
-Optional<unsigned> CompilerInstance::getRecordedBufferID(const InputFile &input,
-                                                         bool &failed) {
+Optional<unsigned>
+CompilerInstance::getRecordedBufferID(const InputFile &input,
+                                      const bool shouldRecover, bool &failed) {
   if (!input.getBuffer()) {
     if (Optional<unsigned> existingBufferID =
             SourceMgr.getIDForBufferIdentifier(input.getFileName())) {
@@ -619,6 +637,13 @@ Optional<unsigned> CompilerInstance::getRecordedBufferID(const InputFile &input,
     }
   }
   auto buffers = getInputBuffersIfPresent(input);
+
+  // Recover by dummy buffer if requested.
+  if (!buffers.hasValue() && shouldRecover &&
+      input.getType() == file_types::TY_Swift && !input.isPrimary()) {
+    buffers = ModuleBuffers(llvm::MemoryBuffer::getMemBuffer(
+        "// missing file\n", input.getFileName()));
+  }
 
   if (!buffers.hasValue()) {
     failed = true;
@@ -708,7 +733,10 @@ CompilerInstance::openModuleDoc(const InputFile &input) {
 }
 
 bool CompilerInvocation::shouldImportSwiftConcurrency() const {
-  return getLangOptions().EnableExperimentalConcurrency;
+  return getLangOptions().EnableExperimentalConcurrency
+      && !getLangOptions().DisableImplicitConcurrencyModuleImport &&
+      getFrontendOptions().InputMode !=
+        FrontendOptions::ParseInputMode::SwiftModuleInterface;
 }
 
 /// Implicitly import the SwiftOnoneSupport module in non-optimized
@@ -1039,8 +1067,11 @@ CompilerInstance::getSourceFileParsingOptions(bool forPrimary) const {
   }
 
   if (forPrimary || isWholeModuleCompilation()) {
-    // Disable delayed body parsing for primaries and in WMO.
-    opts |= SourceFile::ParsingFlags::DisableDelayedBodies;
+    // Disable delayed body parsing for primaries and in WMO, unless
+    // forcefully skipping function bodies
+    auto typeOpts = getASTContext().TypeCheckerOpts;
+    if (typeOpts.SkipFunctionBodies == FunctionBodySkipping::None)
+      opts |= SourceFile::ParsingFlags::DisableDelayedBodies;
   } else {
     // Suppress parse warnings for non-primaries, as they'll get parsed multiple
     // times.
@@ -1136,7 +1167,8 @@ static void countStatsPostSILOpt(UnifiedStatsReporter &Stats,
 }
 
 bool CompilerInstance::performSILProcessing(SILModule *silModule) {
-  if (performMandatorySILPasses(Invocation, silModule))
+  if (performMandatorySILPasses(Invocation, silModule) &&
+      !Invocation.getFrontendOptions().AllowModuleWithCompilerErrors)
     return true;
 
   {

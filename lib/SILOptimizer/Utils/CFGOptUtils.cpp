@@ -23,16 +23,9 @@
 
 using namespace swift;
 
-/// Adds a new argument to an edge between a branch and a destination
-/// block.
-///
-/// \param branch The terminator to add the argument to.
-/// \param dest The destination block of the edge.
-/// \param val The value to the arguments of the branch.
-/// \return The created branch. The old branch is deleted.
-/// The argument is appended at the end of the argument tuple.
 TermInst *swift::addNewEdgeValueToBranch(TermInst *branch, SILBasicBlock *dest,
-                                         SILValue val) {
+                                         SILValue val,
+                                         const InstModCallbacks &callbacks) {
   SILBuilderWithScope builder(branch);
   TermInst *newBr = nullptr;
 
@@ -59,6 +52,7 @@ TermInst *swift::addNewEdgeValueToBranch(TermInst *branch, SILBasicBlock *dest,
         cbi->getLoc(), cbi->getCondition(), cbi->getTrueBB(), trueArgs,
         cbi->getFalseBB(), falseArgs, cbi->getTrueBBCount(),
         cbi->getFalseBBCount());
+    callbacks.createdNewInst(newBr);
   } else if (auto *bi = dyn_cast<BranchInst>(branch)) {
     SmallVector<SILValue, 8> args;
 
@@ -68,13 +62,13 @@ TermInst *swift::addNewEdgeValueToBranch(TermInst *branch, SILBasicBlock *dest,
     args.push_back(val);
     assert(args.size() == dest->getNumArguments());
     newBr = builder.createBranch(bi->getLoc(), bi->getDestBB(), args);
+    callbacks.createdNewInst(newBr);
   } else {
     // At the moment we can only add arguments to br and cond_br.
     llvm_unreachable("Can't add argument to terminator");
   }
 
-  branch->dropAllReferences();
-  branch->eraseFromParent();
+  callbacks.deleteInst(branch);
 
   return newBr;
 }
@@ -494,6 +488,17 @@ bool swift::isCriticalEdge(TermInst *t, unsigned edgeIdx) {
   return true;
 }
 
+SILBasicBlock *swift::createSplitBranchTarget(SILBasicBlock *targetBlock,
+                                              SILBuilder &builder,
+                                              SILLocation loc) {
+  auto *function = targetBlock->getParent();
+  auto *edgeBB = function->createBasicBlockBefore(targetBlock);
+  SILBuilderWithScope(edgeBB, builder.getBuilderContext(),
+                      builder.getCurrentDebugScope())
+      .createBranch(loc, targetBlock);
+  return edgeBB;
+}
+
 /// Splits the basic block at the iterator with an unconditional branch and
 /// updates the dominator tree and loop info.
 SILBasicBlock *swift::splitBasicBlockAndBranch(SILBuilder &builder,
@@ -590,9 +595,10 @@ bool swift::hasCriticalEdges(SILFunction &f, bool onlyNonCondBr) {
     if (isa<BranchInst>(bb.getTerminator()))
       continue;
 
-    for (unsigned idx = 0, e = bb.getSuccessors().size(); idx != e; ++idx)
-      if (isCriticalEdge(bb.getTerminator(), idx))
+    for (SILBasicBlock *succBB : bb.getSuccessorBlocks()) {
+      if (!isNonCriticalEdge(&bb, succBB))
         return true;
+    }
   }
   return false;
 }

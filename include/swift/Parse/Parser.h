@@ -136,13 +136,6 @@ public:
 
   void recordTokenHash(StringRef token);
 
-  /// DisabledVars is a list of variables for whom local name lookup is
-  /// disabled.  This is used when parsing a PatternBindingDecl to reject self
-  /// uses and to disable uses of the bound variables in a let/else block.  The
-  /// diagnostic to emit is stored in DisabledVarReason.
-  ArrayRef<VarDecl *> DisabledVars;
-  Diag<> DisabledVarReason;
-  
   enum {
     /// InVarOrLetPattern has this value when not parsing a pattern.
     IVOLP_NotInVarOrLet,
@@ -560,14 +553,13 @@ public:
     return Tok.getLoc().getAdvancedLoc(-LeadingTrivia.getLength());
   }
 
-  SourceLoc consumeIdentifier(Identifier *Result = nullptr,
-                              bool allowDollarIdentifier = false) {
+  SourceLoc consumeIdentifier(Identifier &Result, bool diagnoseDollarPrefix) {
     assert(Tok.isAny(tok::identifier, tok::kw_self, tok::kw_Self));
-    if (Result)
-      *Result = Context.getIdentifier(Tok.getText());
+    assert(Result.empty());
+    Result = Context.getIdentifier(Tok.getText());
 
     if (Tok.getText()[0] == '$')
-      diagnoseDollarIdentifier(Tok, allowDollarIdentifier);
+      diagnoseDollarIdentifier(Tok, diagnoseDollarPrefix);
 
     return consumeToken();
   }
@@ -580,15 +572,17 @@ public:
       Result = Context.getIdentifier(Tok.getText());
 
       if (Tok.getText()[0] == '$')
-        diagnoseDollarIdentifier(Tok);
+        diagnoseDollarIdentifier(Tok, /*diagnoseDollarPrefix=*/true);
     }
     return consumeToken();
   }
 
   /// When we have a token that is an identifier starting with '$',
   /// diagnose it if not permitted in this mode.
+  /// \param diagnoseDollarPrefix Whether to diagnose dollar-prefixed
+  /// identifiers in addition to a standalone '$'.
   void diagnoseDollarIdentifier(const Token &tok,
-                                bool allowDollarIdentifier = false) {
+                                bool diagnoseDollarPrefix) {
     assert(tok.getText()[0] == '$');
 
     // If '$' is not guarded by backticks, offer
@@ -599,7 +593,7 @@ public:
       return;
     }
 
-    if (allowDollarIdentifier)
+    if (!diagnoseDollarPrefix)
       return;
 
     if (tok.getText().size() == 1 || Context.LangOpts.EnableDollarIdentifiers ||
@@ -687,7 +681,10 @@ public:
 
   /// Skip a braced block (e.g. function body). The current token must be '{'.
   /// Returns \c true if the parser hit the eof before finding matched '}'.
-  bool skipBracedBlock();
+  ///
+  /// Set \c HasNestedTypeDeclarations to true if a token for a type
+  /// declaration is detected in the skipped block.
+  bool skipBracedBlock(bool &HasNestedTypeDeclarations);
 
   /// Skip over SIL decls until we encounter the start of a Swift decl or eof.
   void skipSILUntilSwiftDecl();
@@ -710,6 +707,11 @@ public:
   /// \param DiagText name for the string literal in the diagnostic.
   Optional<StringRef>
   getStringLiteralIfNotInterpolated(SourceLoc Loc, StringRef DiagText);
+  
+  /// Returns true when body elements are eligible as single-expression implicit returns.
+  ///
+  /// \param Body elements to search for implicit single-expression returns.
+  bool shouldReturnSingleExpressionElement(ArrayRef<ASTNode> Body); 
 
   /// Returns true to indicate that experimental concurrency syntax should be
   /// parsed if the parser is generating only a syntax tree or if the user has
@@ -782,23 +784,6 @@ public:
   consumeStartingCharacterOfCurrentToken(tok Kind = tok::oper_binary_unspaced,
                                          size_t Len = 1);
 
-  swift::ScopeInfo &getScopeInfo() { return State->getScopeInfo(); }
-
-  /// Add the given Decl to the current scope.
-  void addToScope(ValueDecl *D, bool diagnoseRedefinitions = true) {
-    if (Context.LangOpts.DisableParserLookup)
-      return;
-
-    getScopeInfo().addToScope(D, *this, diagnoseRedefinitions);
-  }
-
-  ValueDecl *lookupInScope(DeclNameRef Name) {
-    if (Context.LangOpts.DisableParserLookup)
-          return nullptr;
-
-    return getScopeInfo().lookupValueName(Name);
-  }
-
   //===--------------------------------------------------------------------===//
   // Primitive Parsing
 
@@ -806,24 +791,20 @@ public:
   /// its name in \p Result.  Otherwise, emit an error.
   ///
   /// \returns false on success, true on error.
-  bool parseIdentifier(Identifier &Result, SourceLoc &Loc, const Diagnostic &D);
-  
+  bool parseIdentifier(Identifier &Result, SourceLoc &Loc, const Diagnostic &D,
+                       bool diagnoseDollarPrefix);
+
   /// Consume an identifier with a specific expected name.  This is useful for
   /// contextually sensitive keywords that must always be present.
   bool parseSpecificIdentifier(StringRef expected, SourceLoc &Loc,
                                const Diagnostic &D);
 
   template<typename ...DiagArgTypes, typename ...ArgTypes>
-  bool parseIdentifier(Identifier &Result, Diag<DiagArgTypes...> ID,
-                       ArgTypes... Args) {
-    SourceLoc L;
-    return parseIdentifier(Result, L, Diagnostic(ID, Args...));
-  }
-
-  template<typename ...DiagArgTypes, typename ...ArgTypes>
   bool parseIdentifier(Identifier &Result, SourceLoc &L,
-                       Diag<DiagArgTypes...> ID, ArgTypes... Args) {
-    return parseIdentifier(Result, L, Diagnostic(ID, Args...));
+                       bool diagnoseDollarPrefix, Diag<DiagArgTypes...> ID,
+                       ArgTypes... Args) {
+    return parseIdentifier(Result, L, Diagnostic(ID, Args...),
+                           diagnoseDollarPrefix);
   }
   
   template<typename ...DiagArgTypes, typename ...ArgTypes>
@@ -836,19 +817,14 @@ public:
   /// Consume an identifier or operator if present and return its name
   /// in \p Result.  Otherwise, emit an error and return true.
   bool parseAnyIdentifier(Identifier &Result, SourceLoc &Loc,
-                          const Diagnostic &D);
+                          const Diagnostic &D, bool diagnoseDollarPrefix);
 
   template<typename ...DiagArgTypes, typename ...ArgTypes>
-  bool parseAnyIdentifier(Identifier &Result, Diag<DiagArgTypes...> ID,
-                          ArgTypes... Args) {
-    SourceLoc L;
-    return parseAnyIdentifier(Result, L, Diagnostic(ID, Args...));
-  }
-
-  template<typename ...DiagArgTypes, typename ...ArgTypes>
-  bool parseAnyIdentifier(Identifier &Result, SourceLoc &L,
+  bool parseAnyIdentifier(Identifier &Result, bool diagnoseDollarPrefix,
                           Diag<DiagArgTypes...> ID, ArgTypes... Args) {
-    return parseAnyIdentifier(Result, L, Diagnostic(ID, Args...));
+    SourceLoc L;
+    return parseAnyIdentifier(Result, L, Diagnostic(ID, Args...),
+                              diagnoseDollarPrefix);
   }
 
   /// \brief Parse an unsigned integer and returns it in \p Result. On failure
@@ -957,7 +933,7 @@ public:
                                bool IsAtStartOfLineOrPreviousHadSemi,
                                llvm::function_ref<void(Decl*)> Handler);
 
-  std::pair<std::vector<Decl *>, Optional<std::string>>
+  std::pair<std::vector<Decl *>, Optional<Fingerprint>>
   parseDeclListDelayed(IterableDeclContext *IDC);
 
   bool parseMemberDeclList(SourceLoc &LBLoc, SourceLoc &RBLoc,
@@ -1101,7 +1077,7 @@ public:
   ParserStatus parseDeclItem(bool &PreviousHadSemi,
                              ParseDeclOptions Options,
                              llvm::function_ref<void(Decl*)> handler);
-  std::pair<std::vector<Decl *>, Optional<std::string>>
+  std::pair<std::vector<Decl *>, Optional<Fingerprint>>
   parseDeclList(SourceLoc LBLoc, SourceLoc &RBLoc, Diag<> ErrorDiag,
                 ParseDeclOptions Options, IterableDeclContext *IDC,
                 bool &hadError);
@@ -1163,9 +1139,6 @@ public:
   ParserResult<DestructorDecl>
   parseDeclDeinit(ParseDeclOptions Flags, DeclAttributes &Attributes);
 
-  void addPatternVariablesToScope(ArrayRef<Pattern *> Patterns);
-  void addParametersToScope(ParameterList *PL);
-
   ParserResult<OperatorDecl> parseDeclOperator(ParseDeclOptions Flags,
                                                DeclAttributes &Attributes);
   ParserResult<OperatorDecl> parseDeclOperatorImpl(SourceLoc OperatorLoc,
@@ -1216,8 +1189,7 @@ public:
   ParserResult<TypeRepr> parseOldStyleProtocolComposition();
   ParserResult<TypeRepr> parseAnyType();
   ParserResult<TypeRepr> parseSILBoxType(GenericParamList *generics,
-                                         const TypeAttributes &attrs,
-                                         Optional<Scope> &GenericsScope);
+                                         const TypeAttributes &attrs);
   
   ParserResult<TypeRepr> parseTypeTupleBody();
   ParserResult<TypeRepr> parseTypeArray(TypeRepr *Base);
@@ -1681,8 +1653,9 @@ public:
   parseFreestandingGenericWhereClause(GenericContext *genCtx);
 
   ParserStatus parseGenericWhereClause(
-      SourceLoc &WhereLoc, SmallVectorImpl<RequirementRepr> &Requirements,
-      bool &FirstTypeInComplete, bool AllowLayoutConstraints = false);
+      SourceLoc &WhereLoc, SourceLoc &EndLoc,
+      SmallVectorImpl<RequirementRepr> &Requirements,
+      bool AllowLayoutConstraints = false);
 
   ParserStatus
   parseProtocolOrAssociatedTypeWhereClause(TrailingWhereClause *&trailingWhere,

@@ -1179,6 +1179,14 @@ NodePointer Demangler::demangleBuiltinType() {
       Ty = createNode(Node::Kind::BuiltinTypeName,
                                BUILTIN_TYPE_NAME_RAWPOINTER);
       break;
+    case 'j':
+      Ty = createNode(Node::Kind::BuiltinTypeName,
+                               BUILTIN_TYPE_NAME_JOB);
+      break;
+    case 'c':
+      Ty = createNode(Node::Kind::BuiltinTypeName,
+                               BUILTIN_TYPE_NAME_RAWUNSAFECONTINUATION);
+      break;
     case 't':
       Ty = createNode(Node::Kind::BuiltinTypeName, BUILTIN_TYPE_NAME_SILTOKEN);
       break;
@@ -2266,9 +2274,14 @@ NodePointer Demangler::popProtocolConformance() {
       NodePointer type = popNode(Node::Kind::Type);
       return createWithChild(Node::Kind::CoroutineContinuationPrototype, type);
     }
-    case 'z': {
-      NodePointer implType = popNode(Node::Kind::ImplFunctionType);
-      return createWithChild(Node::Kind::ObjCAsyncCompletionHandlerImpl, implType);
+    case 'z':
+    case 'Z': {
+      NodePointer resultType = popNode(Node::Kind::Type);
+      NodePointer implType = popNode(Node::Kind::Type);
+      return createWithChildren(c == 'z'
+                                  ? Node::Kind::ObjCAsyncCompletionHandlerImpl
+                                  : Node::Kind::PredefinedObjCAsyncCompletionHandlerImpl,
+                                implType, resultType);
     }
     case 'V': {
       NodePointer Base = popNode(isEntity);

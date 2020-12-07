@@ -159,9 +159,6 @@ void Parser::performCodeCompletionSecondPassImpl(
   // Set the parser position to the start of the delayed decl or the body.
   restoreParserPosition(getParserPosition(startLoc, prevLoc));
 
-  // Re-enter the lexical scope.
-  Scope S(this, info.takeScope());
-
   DeclContext *DC = info.ParentContext;
 
   switch (info.Kind) {
@@ -906,12 +903,12 @@ bool Parser::StructureMarkerRAII::pushStructureMarker(
 //===----------------------------------------------------------------------===//
 
 bool Parser::parseIdentifier(Identifier &Result, SourceLoc &Loc,
-                             const Diagnostic &D) {
+                             const Diagnostic &D, bool diagnoseDollarPrefix) {
   switch (Tok.getKind()) {
   case tok::kw_self:
   case tok::kw_Self:
   case tok::identifier:
-    Loc = consumeIdentifier(&Result);
+    Loc = consumeIdentifier(Result, diagnoseDollarPrefix);
     return false;
   default:
     checkForInputIncomplete();
@@ -933,9 +930,10 @@ bool Parser::parseSpecificIdentifier(StringRef expected, SourceLoc &loc,
 /// parseAnyIdentifier - Consume an identifier or operator if present and return
 /// its name in Result.  Otherwise, emit an error and return true.
 bool Parser::parseAnyIdentifier(Identifier &Result, SourceLoc &Loc,
-                                const Diagnostic &D) {
+                                const Diagnostic &D,
+                                bool diagnoseDollarPrefix) {
   if (Tok.is(tok::identifier)) {
-    Loc = consumeIdentifier(&Result);
+    Loc = consumeIdentifier(Result, diagnoseDollarPrefix);
     return false;
   }
 
@@ -1183,6 +1181,31 @@ Parser::getStringLiteralIfNotInterpolated(SourceLoc Loc,
 
   return SourceMgr.extractText(CharSourceRange(Segments.front().Loc,
                                                Segments.front().Length));
+}
+
+bool Parser::shouldReturnSingleExpressionElement(ArrayRef<ASTNode> Body) {
+  // If the body consists of an #if declaration with a single
+  // expression active clause, find a single expression.
+  if (Body.size() == 2) {
+    if (auto *D = Body.front().dyn_cast<Decl *>()) {
+      // Step into nested active clause.
+      while (auto *ICD = dyn_cast<IfConfigDecl>(D)) {
+        auto ACE = ICD->getActiveClauseElements();
+        if (ACE.size() == 1) {
+          assert(Body.back() == ACE.back() &&
+                 "active clause not found in body");
+          return true;
+        } else if (ACE.size() == 2) {
+          if (auto *ND = ACE.front().dyn_cast<Decl *>()) {
+            D = ND;
+            continue;
+          }
+        }
+        break;
+      }
+    }
+  }
+  return Body.size() == 1;
 }
 
 struct ParserUnit::Implementation {

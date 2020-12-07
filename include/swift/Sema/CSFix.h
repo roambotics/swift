@@ -285,6 +285,10 @@ enum class FixKind : uint8_t {
   /// Allow expressions to reference invalid declarations by turning
   /// them into holes.
   AllowRefToInvalidDecl,
+
+  /// Treat empty and single-element array literals as if they were incomplete
+  /// dictionary literals when used as such.
+  TreatArrayLiteralAsDictionary,
 };
 
 class ConstraintFix {
@@ -551,6 +555,25 @@ public:
                                     ConstraintLocator *locator);
 };
 
+class TreatArrayLiteralAsDictionary final : public ContextualMismatch {
+  TreatArrayLiteralAsDictionary(ConstraintSystem &cs, Type dictionaryTy,
+                                Type arrayTy, ConstraintLocator *locator)
+      : ContextualMismatch(cs, FixKind::TreatArrayLiteralAsDictionary,
+                           dictionaryTy, arrayTy, locator) {
+      }
+
+public:
+  std::string getName() const override {
+    return "treat array literal as dictionary";
+  }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static TreatArrayLiteralAsDictionary *create(ConstraintSystem &cs,
+                                               Type dictionaryTy, Type arrayTy,
+                                               ConstraintLocator *loc);
+};
+
 /// Mark function type as explicitly '@escaping'.
 class MarkExplicitlyEscaping final : public ContextualMismatch {
   MarkExplicitlyEscaping(ConstraintSystem &cs, Type lhs, Type rhs,
@@ -605,6 +628,26 @@ public:
                                      FunctionType *fromType,
                                      FunctionType *toType,
                                      ConstraintLocator *locator);
+};
+
+/// This is a contextual mismatch between async and non-async
+/// function types, repair it by dropping `async` attribute.
+class DropAsyncAttribute final : public ContextualMismatch {
+  DropAsyncAttribute(ConstraintSystem &cs, FunctionType *fromType,
+                     FunctionType *toType, ConstraintLocator *locator)
+      : ContextualMismatch(cs, fromType, toType, locator) {
+    assert(fromType->isAsync() != toType->isAsync());
+  }
+
+public:
+  std::string getName() const override { return "drop 'async' attribute"; }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static DropAsyncAttribute *create(ConstraintSystem &cs,
+                                    FunctionType *fromType,
+                                    FunctionType *toType,
+                                    ConstraintLocator *locator);
 };
 
 /// Append 'as! T' to force a downcast to the specified type.
@@ -1705,20 +1748,25 @@ public:
                              Type expectedType, ConstraintLocator *locator);
 };
 
-/// Replace a coercion ('as') with a forced checked cast ('as!').
+/// Replace a coercion ('as') with runtime checked cast ('as!' or 'as?').
 class CoerceToCheckedCast final : public ContextualMismatch {
   CoerceToCheckedCast(ConstraintSystem &cs, Type fromType, Type toType,
-                      ConstraintLocator *locator)
+                      bool useConditionalCast, ConstraintLocator *locator)
       : ContextualMismatch(cs, FixKind::CoerceToCheckedCast, fromType, toType,
-                           locator) {}
+                           locator),
+        UseConditionalCast(useConditionalCast) {}
+  bool UseConditionalCast = false;
 
 public:
-  std::string getName() const override { return "as to as!"; }
+  std::string getName() const override {
+    return UseConditionalCast ? "as to as?" : "as to as!";
+  }
 
   bool diagnose(const Solution &solution, bool asNote = false) const override;
 
   static CoerceToCheckedCast *attempt(ConstraintSystem &cs, Type fromType,
-                                      Type toType, ConstraintLocator *locator);
+                                      Type toType, bool useConditionalCast,
+                                      ConstraintLocator *locator);
 };
 
 class RemoveInvalidCall final : public ConstraintFix {
@@ -2000,7 +2048,8 @@ public:
                                                ConstraintLocator *locator);
 };
 
-class IgnoreInvalidResultBuilderBody final : public ConstraintFix {
+class IgnoreInvalidResultBuilderBody : public ConstraintFix {
+protected:
   enum class ErrorInPhase {
     PreCheck,
     ConstraintGeneration,
@@ -2037,6 +2086,22 @@ public:
 private:
   static IgnoreInvalidResultBuilderBody *
   create(ConstraintSystem &cs, ErrorInPhase phase, ConstraintLocator *locator);
+};
+
+class IgnoreResultBuilderWithReturnStmts final
+    : public IgnoreInvalidResultBuilderBody {
+  Type BuilderType;
+
+  IgnoreResultBuilderWithReturnStmts(ConstraintSystem &cs, Type builderTy,
+                                     ConstraintLocator *locator)
+      : IgnoreInvalidResultBuilderBody(cs, ErrorInPhase::PreCheck, locator),
+        BuilderType(builderTy) {}
+
+public:
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static IgnoreResultBuilderWithReturnStmts *
+  create(ConstraintSystem &cs, Type builderTy, ConstraintLocator *locator);
 };
 
 class SpecifyContextualTypeForNil final : public ConstraintFix {

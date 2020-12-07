@@ -654,7 +654,9 @@ static_assert(sizeof(checkSourceLocType(&ID##Decl::getLoc)) == 2, \
   // When the decl is context-free, we should get loc from source buffer.
   if (!getDeclContext())
     return getLocFromSource();
-  auto *File = cast<FileUnit>(getDeclContext()->getModuleScopeContext());
+  FileUnit *File = dyn_cast<FileUnit>(getDeclContext()->getModuleScopeContext());
+  if (!File)
+    return getLocFromSource();
   switch(File->getKind()) {
   case FileUnitKind::Source:
     return getLocFromSource();
@@ -684,7 +686,7 @@ Expr *AbstractFunctionDecl::getSingleExpressionBody() const {
   assert(hasSingleExpressionBody() && "Not a single-expression body");
   auto braceStmt = getBody();
   assert(braceStmt != nullptr && "No body currently available.");
-  auto body = getBody()->getFirstElement();
+  auto body = getBody()->getLastElement();
   if (auto *stmt = body.dyn_cast<Stmt *>()) {
     if (auto *returnStmt = dyn_cast<ReturnStmt>(stmt)) {
       return returnStmt->getResult();
@@ -701,7 +703,7 @@ Expr *AbstractFunctionDecl::getSingleExpressionBody() const {
 
 void AbstractFunctionDecl::setSingleExpressionBody(Expr *NewBody) {
   assert(hasSingleExpressionBody() && "Not a single-expression body");
-  auto body = getBody()->getFirstElement();
+  auto body = getBody()->getLastElement();
   if (auto *stmt = body.dyn_cast<Stmt *>()) {
     if (auto *returnStmt = dyn_cast<ReturnStmt>(stmt)) {
       returnStmt->setResult(NewBody);
@@ -717,7 +719,7 @@ void AbstractFunctionDecl::setSingleExpressionBody(Expr *NewBody) {
       return;
     }
   }
-  getBody()->setFirstElement(NewBody);
+  getBody()->setLastElement(NewBody);
 }
 
 bool AbstractStorageDecl::isTransparent() const {
@@ -2401,10 +2403,6 @@ bool swift::conflicting(const OverloadSignature& sig1,
              (sig2.IsVariable && !sig1.Name.getArgumentNames().empty()));
   }
 
-  // If one is asynchronous and the other is not, they can't conflict.
-  if (sig1.HasAsync != sig2.HasAsync)
-    return false;
-
   // Note that we intentionally ignore the HasOpaqueReturnType bit here.
   // For declarations that can't be overloaded by type, we want them to be
   // considered conflicting independent of their type.
@@ -2628,8 +2626,6 @@ OverloadSignature ValueDecl::getOverloadSignature() const {
   signature.IsTypeAlias = isa<TypeAliasDecl>(this);
   signature.HasOpaqueReturnType =
                        !signature.IsVariable && (bool)getOpaqueResultTypeDecl();
-  signature.HasAsync = isa<AbstractFunctionDecl>(this) &&
-    cast<AbstractFunctionDecl>(this)->hasAsync();
 
   // Unary operators also include prefix/postfix.
   if (auto func = dyn_cast<FuncDecl>(this)) {
@@ -4185,6 +4181,13 @@ bool ClassDecl::isActor() const {
                            false);
 }
 
+bool ClassDecl::isDefaultActor() const {
+  auto mutableThis = const_cast<ClassDecl *>(this);
+  return evaluateOrDefault(getASTContext().evaluator,
+                           IsDefaultActorRequest{mutableThis},
+                           false);
+}
+
 bool ClassDecl::hasMissingDesignatedInitializers() const {
   return evaluateOrDefault(
       getASTContext().evaluator,
@@ -4234,6 +4237,7 @@ ClassAncestryFlagsRequest::evaluate(Evaluator &evaluator,
                                     ClassDecl *value) const {
   AncestryOptions result;
   const ClassDecl *CD = value;
+  const ClassDecl *PreviousCD = nullptr;
   auto *M = value->getParentModule();
 
   do {
@@ -4248,8 +4252,16 @@ ClassAncestryFlagsRequest::evaluate(Evaluator &evaluator,
     if (CD->getAttrs().hasAttribute<ObjCMembersAttr>())
       result |= AncestryFlags::ObjCMembers;
 
-    if (CD->hasClangNode())
+    if (CD->hasClangNode()) {
       result |= AncestryFlags::ClangImported;
+
+      // Inheriting from an ObjC-defined class generally forces the use
+      // of the ObjC object model, but certain classes that directly
+      // inherit from NSObject can change that.
+      if (!PreviousCD ||
+          !(CD->isNSObject() && PreviousCD->isNativeNSObjectSubclass()))
+        result |= AncestryFlags::ObjCObjectModel;
+    }
 
     if (CD->hasResilientMetadata())
       result |= AncestryFlags::Resilient;
@@ -4260,6 +4272,7 @@ ClassAncestryFlagsRequest::evaluate(Evaluator &evaluator,
     if (CD->getAttrs().hasAttribute<RequiresStoredPropertyInitsAttr>())
       result |= AncestryFlags::RequiresStoredPropertyInits;
 
+    PreviousCD = CD;
     CD = CD->getSuperclassDecl();
   } while (CD != nullptr);
 
@@ -7524,6 +7537,20 @@ ConstructorDecl::ConstructorDecl(DeclName Name, SourceLoc ConstructorLoc,
   assert(Name.getBaseName() == DeclBaseName::createConstructor());
 }
 
+ConstructorDecl *ConstructorDecl::createImported(
+    ASTContext &ctx, ClangNode clangNode, DeclName name,
+    SourceLoc constructorLoc, bool failable, SourceLoc failabilityLoc,
+    bool throws, SourceLoc throwsLoc, ParameterList *bodyParams,
+    GenericParamList *genericParams, DeclContext *parent) {
+  void *declPtr = allocateMemoryForDecl<ConstructorDecl>(
+      ctx, sizeof(ConstructorDecl), true);
+  auto ctor = ::new (declPtr)
+      ConstructorDecl(name, constructorLoc, failable, failabilityLoc, throws,
+                      throwsLoc, bodyParams, genericParams, parent);
+  ctor->setClangNode(clangNode);
+  return ctor;
+}
+
 bool ConstructorDecl::isObjCZeroParameterWithLongSelector() const {
   // The initializer must have a single, non-empty argument name.
   if (getName().getArgumentNames().size() != 1 ||
@@ -7878,6 +7905,46 @@ Type TypeBase::getSwiftNewtypeUnderlyingType() {
         return varDecl->getType();
 
   return {};
+}
+
+bool ClassDecl::hasExplicitCustomActorMethods() const {
+  auto &ctx = getASTContext();
+  for (auto member: getMembers()) {
+    if (member->isImplicit()) continue;
+
+    // Methods called enqueue(partialTask:)
+    if (auto func = dyn_cast<FuncDecl>(member)) {
+      if (FuncDecl::isEnqueuePartialTaskName(ctx, func->getName()))
+        return true;
+    }
+  }
+
+  return false;
+}
+
+bool ClassDecl::isRootDefaultActor() const {
+  if (!isDefaultActor()) return false;
+  auto superclass = getSuperclassDecl();
+  return (!superclass || superclass->isNSObject());
+}
+
+bool ClassDecl::isNativeNSObjectSubclass() const {
+  // Only if we inherit from NSObject.
+  auto superclass = getSuperclassDecl();
+  if (!superclass || !superclass->isNSObject())
+    return false;
+
+  // For now, only actors (regardless of whether they're default actors).
+  // Eventually we should roll this out to more classes, but we have to
+  // do it with ABI compatibility.
+  return isActor();
+}
+
+bool ClassDecl::isNSObject() const {
+  if (!getName().is("NSObject")) return false;
+  ASTContext &ctx = getASTContext();
+  return (getModuleContext()->getName() == ctx.Id_Foundation ||
+          getModuleContext()->getName() == ctx.Id_ObjectiveC);
 }
 
 Type ClassDecl::getSuperclass() const {
