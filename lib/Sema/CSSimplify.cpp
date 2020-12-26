@@ -3722,14 +3722,15 @@ bool ConstraintSystem::repairFailures(
         if (lhs->is<FunctionType>() && rhs->is<FunctionType>())
           return false;
 
-        // If either object type is a bound generic or existential it means
-        // that follow-up to value-to-optional is going to be:
+        // If either object type is a generic, nominal or existential type
+        // it means that follow-up to value-to-optional is going to be:
         //
         // 1. "deep equality" check, which is handled by generic argument(s)
-        //    mismatch fix, or
+        //    or contextual mismatch fix, or
         // 2. "existential" check, which is handled by a missing conformance
         //    fix.
         if ((lhs->is<BoundGenericType>() && rhs->is<BoundGenericType>()) ||
+            (lhs->is<NominalType>() && rhs->is<NominalType>()) ||
             rhs->isAnyExistentialType())
           return false;
       }
@@ -7290,7 +7291,7 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyMemberConstraint(
   }
 
   if (!result.UnviableCandidates.empty()) {
-    // Generate constraints for unvailable choices if they have a fix,
+    // Generate constraints for unavailable choices if they have a fix,
     // and disable them by default, they'd get picked up in the "salvage" mode.
     generateConstraints(
         candidates, memberTy, result.UnviableCandidates, useDC, locator,
@@ -7299,6 +7300,19 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyMemberConstraint(
           return fixMemberRef(*this, baseTy, member, choice, locator,
                               result.UnviableReasons[idx]);
         });
+  }
+
+  // Attempt to record a warning where the unresolved member could be
+  // ambiguous with optional member. e.g.
+  //  enum Foo {
+  //    case none
+  //  }
+  //
+  //  let _: Foo? = .none // Although base is inferred as Optional.none
+  //  it could be also Foo.none.
+  if (auto *fix = SpecifyBaseTypeForOptionalUnresolvedMember::attempt(
+          *this, kind, baseObjTy, member, functionRefKind, result, locator)) {
+    (void)recordFix(fix);
   }
 
   if (!candidates.empty()) {
@@ -10234,7 +10248,8 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyFixConstraint(
   case FixKind::AllowKeyPathWithoutComponents:
   case FixKind::IgnoreInvalidResultBuilderBody:
   case FixKind::SpecifyContextualTypeForNil:
-  case FixKind::AllowRefToInvalidDecl: {
+  case FixKind::AllowRefToInvalidDecl:
+  case FixKind::SpecifyBaseTypeForOptionalUnresolvedMember: {
     return recordFix(fix) ? SolutionKind::Error : SolutionKind::Solved;
   }
 
@@ -10341,7 +10356,7 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyFixConstraint(
     if (auto *fnType1 = type1->getAs<FunctionType>()) {
       // If this is a contextual mismatch between two
       // function types which we couldn't find a more
-      // speficit fix for. Let's assume that such types
+      // specific fix for. Let's assume that such types
       // are competely disjoint and adjust impact of
       // the fix accordingly.
       if (auto *fnType2 = type2->getAs<FunctionType>()) {

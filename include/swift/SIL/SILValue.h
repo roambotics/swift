@@ -226,6 +226,8 @@ struct OwnershipKind {
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const OwnershipKind &kind);
 
+struct OperandOwnership;
+
 /// A value representing the specific ownership semantics that a SILValue may
 /// have.
 struct ValueOwnershipKind {
@@ -285,6 +287,11 @@ struct ValueOwnershipKind {
     }
     llvm_unreachable("covered switch");
   }
+
+  /// Return the OperandOwnership for a forwarded operand when the forwarded
+  /// result has this ValueOwnershipKind. \p allowUnowned is true for a subset
+  /// of forwarding operations that are allowed to propagate Unowned values.
+  OperandOwnership getForwardingOperandOwnership(bool allowUnowned) const;
 
   /// Returns true if \p Other can be merged successfully with this, implying
   /// that the two ownership kinds are "compatibile".
@@ -564,7 +571,7 @@ public:
   ValueOwnershipKind getOwnershipKind() const;
 
   /// Verify that this SILValue and its uses respects ownership invariants.
-  void verifyOwnership(DeadEndBlocks *DEBlocks = nullptr) const;
+  void verifyOwnership(DeadEndBlocks *DEBlocks) const;
 };
 
 inline bool ValueOwnershipKind::isCompatibleWith(SILValue other) const {
@@ -597,12 +604,6 @@ public:
     return lifetimeConstraint;
   }
 
-  /// Return a constraint that is appropriate for an operand that can accept a
-  /// value with any ownership kind without ending said value's lifetime.
-  static OwnershipConstraint any() {
-    return {OwnershipKind::Any, UseLifetimeConstraint::NonLifetimeEnding};
-  }
-
   bool satisfiedBy(const Operand *use) const;
 
   bool satisfiesConstraint(ValueOwnershipKind testKind) const {
@@ -617,6 +618,165 @@ public:
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
                               OwnershipConstraint constraint);
+
+/// Categorize all uses in terms of their ownership effect.
+///
+/// Used to verify completeness of the ownership use model and exhaustively
+/// switch over any category of ownership use. Implies ownership constraints and
+/// lifetime constraints.
+struct OperandOwnership {
+  enum innerty : uint8_t {
+    /// Uses of ownership None. These uses are incompatible with values that
+    /// have ownership but are otherwise not verified.
+    None,
+
+    /// Use the value only for the duration of the operation, which may have
+    /// side effects. Requires an owned or guaranteed value.
+    /// (single-instruction apply with @guaranteed argument)
+    InstantaneousUse,
+
+    /// MARK: Uses of Any ownership values:
+
+    /// Use a value without requiring or propagating ownership. The operation
+    /// may not have side-effects that could affect ownership. This is limited
+    /// to a small number of operations that are allowed to take Unowned values.
+    /// (copy_value, single-instruction apply with @unowned argument))
+    UnownedInstantaneousUse,
+
+    /// Forwarding instruction with an Unowned result. Its operands may have any
+    /// ownership.
+    ForwardingUnowned,
+
+    // Escape a pointer into a value which cannot be tracked or verified.
+    //
+    // TODO: Eliminate the PointerEscape category. All pointer escapes should be
+    // InteriorPointer, guarded by a borrow scope, and verified.
+    PointerEscape,
+
+    /// Bitwise escape. Escapes the nontrivial contents of the value.
+    /// OSSA does not enforce the lifetime of the escaping bits.
+    /// The programmer must explicitly force lifetime extension.
+    /// (ref_to_unowned, unchecked_trivial_bitcast)
+    BitwiseEscape,
+
+    /// MARK: Uses of Owned values:
+
+    /// Borrow. Propagates the owned value within a scope, without consuming it.
+    /// (begin_borrow, begin_apply with @guaranteed argument)
+    Borrow,
+    /// Destroying Consume. Destroys the owned value immediately.
+    /// (store, destroy, @owned destructure).
+    DestroyingConsume,
+    /// Forwarding Consume. Consumes the owned value indirectly via a move.
+    /// (br, destructure, tuple, struct, cast, switch).
+    ForwardingConsume,
+
+    /// MARK: Uses of Guaranteed values:
+
+    /// Nested Borrow. Propagates the guaranteed value within a nested borrow
+    /// scope, without ending the outer borrow scope, following stack
+    /// discipline.
+    /// (begin_borrow, begin_apply with @guaranteed).
+    NestedBorrow,
+    /// Interior Pointer. Propagates a trivial value (e.g. address, pointer, or
+    /// no-escape closure) that depends on the guaranteed value within the
+    /// base's borrow scope. The verifier checks that all uses of the trivial
+    /// value are in scope.
+    /// (ref_element_addr, open_existential_box)
+    InteriorPointer,
+    /// Forwarded Borrow. Propagates the guaranteed value within the base's
+    /// borrow scope.
+    /// (tuple_extract, struct_extract, cast, switch)
+    ForwardingBorrow,
+    /// End Borrow. End the borrow scope opened directly by the operand.
+    /// The operand must be a begin_borrow, begin_apply, or function argument.
+    /// (end_borrow, end_apply)
+    EndBorrow,
+    // Reborrow. Ends the borrow scope opened directly by the operand and begins
+    // one or multiple disjoint borrow scopes. If a forwarded value is
+    // reborrowed, then its base must also be reborrowed at the same point.
+    // (br, FIXME: should also include destructure, tuple, struct)
+    Reborrow
+  } value;
+
+  OperandOwnership(innerty newValue) : value(newValue) {}
+  OperandOwnership(const OperandOwnership &other): value(other.value) {}
+
+  OperandOwnership &operator=(const OperandOwnership &other) {
+    value = other.value;
+    return *this;
+  }
+
+  OperandOwnership &operator=(OperandOwnership::innerty other) {
+    value = other;
+    return *this;
+  }
+
+  operator innerty() const { return value; }
+
+  StringRef asString() const;
+
+  /// Return the OwnershipConstraint corresponding to this OperandOwnership.
+  OwnershipConstraint getOwnershipConstraint();
+};
+
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                              const OperandOwnership &operandOwnership);
+
+/// Defined inline so the switch is eliminated for constant OperandOwnership.
+inline OwnershipConstraint OperandOwnership::getOwnershipConstraint() {
+  switch (value) {
+  case OperandOwnership::None:
+    return {OwnershipKind::None, UseLifetimeConstraint::NonLifetimeEnding};
+  case OperandOwnership::InstantaneousUse:
+  case OperandOwnership::UnownedInstantaneousUse:
+  case OperandOwnership::ForwardingUnowned:
+  case OperandOwnership::PointerEscape:
+  case OperandOwnership::BitwiseEscape:
+    return {OwnershipKind::Any, UseLifetimeConstraint::NonLifetimeEnding};
+  case OperandOwnership::Borrow:
+    return {OwnershipKind::Owned, UseLifetimeConstraint::NonLifetimeEnding};
+  case OperandOwnership::DestroyingConsume:
+  case OperandOwnership::ForwardingConsume:
+    return {OwnershipKind::Owned, UseLifetimeConstraint::LifetimeEnding};
+  case OperandOwnership::NestedBorrow:
+  case OperandOwnership::InteriorPointer:
+  case OperandOwnership::ForwardingBorrow:
+    return {OwnershipKind::Guaranteed,
+            UseLifetimeConstraint::NonLifetimeEnding};
+  case OperandOwnership::EndBorrow:
+  case OperandOwnership::Reborrow:
+    return {OwnershipKind::Guaranteed, UseLifetimeConstraint::LifetimeEnding};
+  }
+}
+
+/// Return the OperandOwnership for a forwarded operand when the forwarded
+/// result has this ValueOwnershipKind. \p allowUnowned is true for a subset
+/// of forwarding operations that are allowed to propagate Unowned values.
+///
+/// The ownership of a forwarded value is derived from the forwarding
+/// instruction's constant ownership attribute. If the result is owned, then the
+/// instruction moves owned operand to its result, ending its lifetime. If the
+/// result is guaranteed value, then the instruction propagates the lifetime of
+/// its borrows operand through its result.
+inline OperandOwnership
+ValueOwnershipKind::getForwardingOperandOwnership(bool allowUnowned) const {
+  switch (value) {
+  case OwnershipKind::Any:
+    llvm_unreachable("invalid value ownership");
+  case OwnershipKind::Unowned:
+    if (allowUnowned) {
+      return OperandOwnership::ForwardingUnowned;
+    }
+    llvm_unreachable("invalid value ownership");
+  case OwnershipKind::None:
+    return OperandOwnership::None;
+  case OwnershipKind::Guaranteed:
+    return OperandOwnership::ForwardingBorrow;
+  case OwnershipKind::Owned:
+    return OperandOwnership::ForwardingConsume;
+  }
+}
 
 /// A formal SIL reference to a value, suitable for use as a stored
 /// operand.
@@ -695,24 +855,29 @@ public:
   /// Return which operand this is in the operand list of the using instruction.
   unsigned getOperandNumber() const;
 
-  /// Return the ownership constraint that restricts what types of values this
-  /// Operand can contain. Returns none if the operand is a type dependent
-  /// operand.
+  /// Return the use ownership of this operand.
   ///
   /// NOTE: This is implemented in OperandOwnership.cpp.
-  Optional<OwnershipConstraint> getOwnershipConstraint() const;
+  OperandOwnership getOperandOwnership() const;
+
+  /// Return the ownership constraint that restricts what types of values this
+  /// Operand can contain.
+  OwnershipConstraint getOwnershipConstraint() const {
+    return getOperandOwnership().getOwnershipConstraint();
+  }
 
   /// Returns true if changing the operand to use a value with the given
-  /// ownership kind would not cause the operand to violate the operand's
-  /// ownership constraints. Returns false otherwise.
+  /// ownership kind, without rewriting the instruction, would not cause the
+  /// operand to violate the operand's ownership constraints.
   bool canAcceptKind(ValueOwnershipKind kind) const;
 
   /// Returns true if this operand and its value satisfy the operand's
   /// operand constraint.
   bool satisfiesConstraints() const;
 
-  /// Returns true if this operand acts as a use that consumes its associated
-  /// value.
+  /// Returns true if this operand acts as a use that ends the lifetime its
+  /// associated value, either by consuming the owned value or ending the
+  /// guaranteed scope.
   bool isLifetimeEnding() const;
 
   SILBasicBlock *getParentBlock() const;
@@ -720,15 +885,18 @@ public:
 
 private:
   void removeFromCurrent() {
-    if (!Back) return;
+    if (!Back)
+      return;
     *Back = NextUse;
-    if (NextUse) NextUse->Back = Back;
+    if (NextUse)
+      NextUse->Back = Back;
   }
 
   void insertIntoCurrent() {
     Back = &TheValue->FirstUse;
     NextUse = TheValue->FirstUse;
-    if (NextUse) NextUse->Back = &NextUse;
+    if (NextUse)
+      NextUse->Back = &NextUse;
     TheValue->FirstUse = this;
   }
 

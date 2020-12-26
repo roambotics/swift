@@ -25,25 +25,28 @@ public struct PartialAsyncTask {
 public struct UnsafeContinuation<T> {
   @usableFromInline internal var context: Builtin.RawUnsafeContinuation
 
-  public func resume(returning: __owned T) { }
-
   @_alwaysEmitIntoClient
   internal init(_ context: Builtin.RawUnsafeContinuation) {
     self.context = context
   }
+
+  @_silgen_name("swift_continuation_resume")
+  public func resume(returning value: __owned T)
 }
 
 @frozen
 public struct UnsafeThrowingContinuation<T> {
   @usableFromInline internal var context: Builtin.RawUnsafeContinuation
 
-  public func resume(returning: __owned T) { }
-  public func resume(throwing: __owned Error) { }
-
   @_alwaysEmitIntoClient
   internal init(_ context: Builtin.RawUnsafeContinuation) {
     self.context = context
   }
+
+  @_silgen_name("swift_continuation_throwingResume")
+  public func resume(returning: __owned T)
+  @_silgen_name("swift_continuation_throwingResumeWithError")
+  public func resume(throwing: __owned Error)
 }
 
 #if _runtime(_ObjC)
@@ -76,7 +79,9 @@ internal func _resumeUnsafeThrowingContinuationWithError<T>(
 
 #endif
 
-// Wrappers around unsafe continuation builtins
+/// The operation functions must resume the continuation *exactly once*.
+///
+/// The continuation will not begin executing until the operation function returns.
 @_alwaysEmitIntoClient
 public func withUnsafeContinuation<T>(
   _ fn: (UnsafeContinuation<T>) -> Void
@@ -86,6 +91,9 @@ public func withUnsafeContinuation<T>(
   }
 }
 
+/// The operation functions must resume the continuation *exactly once*.
+///
+/// The continuation will not begin executing until the operation function returns.
 @_alwaysEmitIntoClient
 public func withUnsafeThrowingContinuation<T>(
   _ fn: (UnsafeThrowingContinuation<T>) -> Void

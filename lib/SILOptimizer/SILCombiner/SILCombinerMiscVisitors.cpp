@@ -85,8 +85,7 @@ SILCombiner::visitAllocExistentialBoxInst(AllocExistentialBoxInst *AEBI) {
   //      retain_value %value    // must insert the release after this retain
   //      strong_release %box
   Builder.setInsertionPoint(singleRelease);
-  Builder.createReleaseValue(AEBI->getLoc(), boxedValue,
-                             singleRelease->getAtomicity());
+  Builder.emitDestroyValueOperation(AEBI->getLoc(), boxedValue);
 
   eraseInstIncludingUsers(AEBI);
   return nullptr;
@@ -681,11 +680,6 @@ SILInstruction *SILCombiner::visitAllocStackInst(AllocStackInst *AS) {
 }
 
 SILInstruction *SILCombiner::visitAllocRefInst(AllocRefInst *AR) {
-  if (AR->getFunction()->hasOwnership())
-    return nullptr;
-
-  if (!AR)
-    return nullptr;
   // Check if the only uses are deallocating stack or deallocating.
   SmallPtrSet<SILInstruction *, 16> ToDelete;
   bool HasNonRemovableUses = false;
@@ -1850,17 +1844,17 @@ SILInstruction *SILCombiner::visitTupleExtractInst(TupleExtractInst *TEI) {
   return nullptr;
 }
 
-SILInstruction *SILCombiner::visitFixLifetimeInst(FixLifetimeInst *FLI) {
-  if (FLI->getFunction()->hasOwnership())
-    return nullptr;
-
+SILInstruction *SILCombiner::visitFixLifetimeInst(FixLifetimeInst *fli) {
   // fix_lifetime(alloc_stack) -> fix_lifetime(load(alloc_stack))
-  Builder.setCurrentDebugScope(FLI->getDebugScope());
-  if (auto *AI = dyn_cast<AllocStackInst>(FLI->getOperand())) {
-    if (FLI->getOperand()->getType().isLoadable(*FLI->getFunction())) {
-      auto Load = Builder.createLoad(FLI->getLoc(), AI,
-                                     LoadOwnershipQualifier::Unqualified);
-      return Builder.createFixLifetime(FLI->getLoc(), Load);
+  Builder.setCurrentDebugScope(fli->getDebugScope());
+  if (auto *ai = dyn_cast<AllocStackInst>(fli->getOperand())) {
+    if (fli->getOperand()->getType().isLoadable(*fli->getFunction())) {
+      // load when ossa is disabled
+      auto load = Builder.emitLoadBorrowOperation(fli->getLoc(), ai);
+      Builder.createFixLifetime(fli->getLoc(), load);
+      // no-op when ossa is disabled
+      Builder.emitEndBorrowOperation(fli->getLoc(), load);
+      return eraseInstFromFunction(*fli);
     }
   }
   return nullptr;

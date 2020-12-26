@@ -207,6 +207,7 @@ types where the metadata itself has unknown layout.)
   global ::= global 'TD'                 // dynamic dispatch thunk
   global ::= global 'Td'                 // direct method reference thunk
   global ::= global 'TI'                 // implementation of a dynamic_replaceable function
+  global :== global 'Tu'                 // async function pointer of a function
   global ::= global 'TX'                 // function pointer of a dynamic_replaceable function
   global ::= entity entity 'TV'          // vtable override thunk, derived followed by base
   global ::= type label-list? 'D'        // type mangling for the debugger with label list for function types.
@@ -493,6 +494,7 @@ Types
   type ::= 'Bb'                              // Builtin.BridgeObject
   type ::= 'BB'                              // Builtin.UnsafeValueBuffer
   type ::= 'Bc'                              // Builtin.RawUnsafeContinuation
+  type ::= 'BD'                              // Builtin.DefaultActorStorage
   type ::= 'Bf' NATURAL '_'                  // Builtin.Float<n>
   type ::= 'Bi' NATURAL '_'                  // Builtin.Int<n>
   type ::= 'BI'                              // Builtin.IntLiteral
@@ -1008,6 +1010,8 @@ Function Specializations
 ::
 
   specialization ::= type '_' type* 'Tg' SPEC-INFO     // Generic re-abstracted specialization
+  specialization ::= type '_' type* 'TB' SPEC-INFO     // Alternative mangling for generic re-abstracted specializations,
+                                                       // used for functions with re-abstracted resilient parameter types.
   specialization ::= type '_' type* 'Ts' SPEC-INFO     // Generic re-abstracted prespecialization
   specialization ::= type '_' type* 'TG' SPEC-INFO     // Generic not re-abstracted specialization
   specialization ::= type '_' type* 'Ti' SPEC-INFO     // Inlined function with generic substitutions.

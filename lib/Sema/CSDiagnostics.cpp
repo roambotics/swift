@@ -2120,7 +2120,9 @@ bool ContextualFailure::diagnoseAsError() {
     }
 
     if (isExpr<AssignExpr>(anchor)) {
-      emitDiagnostic(diag::cannot_convert_assign, getFromType(), getToType());
+      auto diagnostic = emitDiagnostic(diag::cannot_convert_assign,
+                                       getFromType(), getToType());
+      tryIntegerCastFixIts(diagnostic);
       return true;
     }
 
@@ -2729,6 +2731,15 @@ bool ContextualFailure::tryIntegerCastFixIts(
   auto fromType = getFromType();
   auto toType = getToType();
 
+  auto anchor = getAnchor();
+  auto exprRange = getSourceRange();
+
+  if (auto *assignment = getAsExpr<AssignExpr>(anchor)) {
+    toType = toType->lookThroughAllOptionalTypes();
+    anchor = assignment->getSrc();
+    exprRange = assignment->getSrc()->getSourceRange();
+  }
+
   if (!isIntegerType(fromType) || !isIntegerType(toType))
     return false;
 
@@ -2747,8 +2758,8 @@ bool ContextualFailure::tryIntegerCastFixIts(
     return parenE->getSubExpr();
   };
 
-  if (auto *anchor = getAsExpr(getAnchor())) {
-    if (Expr *innerE = getInnerCastedExpr(anchor)) {
+  if (auto *expr = getAsExpr(anchor)) {
+    if (Expr *innerE = getInnerCastedExpr(expr)) {
       Type innerTy = getType(innerE);
       if (TypeChecker::isConvertibleTo(innerTy, toType, getDC())) {
         // Remove the unnecessary cast.
@@ -2763,7 +2774,6 @@ bool ContextualFailure::tryIntegerCastFixIts(
   std::string convWrapBefore = toType.getString();
   convWrapBefore += "(";
   std::string convWrapAfter = ")";
-  SourceRange exprRange = getSourceRange();
   diagnostic.fixItInsert(exprRange.Start, convWrapBefore);
   diagnostic.fixItInsertAfter(exprRange.End, convWrapAfter);
   return true;
@@ -7093,5 +7103,57 @@ bool InvalidReturnInResultBuilderBody::diagnoseAsError() {
       diag.fixItRemove(returnStmt->getReturnLoc());
   }
 
+  return true;
+}
+
+bool MemberMissingExplicitBaseTypeFailure::diagnoseAsError() {
+  auto UME = castToExpr<UnresolvedMemberExpr>(getAnchor());
+  auto memberName = UME->getName().getBaseIdentifier().str();
+  auto &DE = getASTContext().Diags;
+  auto &solution = getSolution();
+
+  auto selected = solution.getOverloadChoice(getLocator());
+  auto baseType =
+      resolveType(selected.choice.getBaseType()->getMetatypeInstanceType());
+
+  SmallVector<Type, 4> optionals;
+  auto baseTyUnwrapped = baseType->lookThroughAllOptionalTypes(optionals);
+
+  if (!optionals.empty()) {
+    auto baseTyName = baseType->getCanonicalType().getString();
+    auto baseTyUnwrappedName = baseTyUnwrapped->getString();
+    auto loc = UME->getLoc();
+    auto startLoc = UME->getStartLoc();
+
+    DE.diagnoseWithNotes(
+        DE.diagnose(loc, diag::optional_ambiguous_case_ref, baseTyName,
+                    baseTyUnwrappedName, memberName),
+        [&]() {
+          DE.diagnose(UME->getDotLoc(), diag::optional_fixit_ambiguous_case_ref)
+              .fixItInsert(startLoc, "Optional");
+          DE.diagnose(UME->getDotLoc(),
+                      diag::type_fixit_optional_ambiguous_case_ref,
+                      baseTyUnwrappedName, memberName)
+              .fixItInsert(startLoc, baseTyUnwrappedName);
+        });
+  } else {
+    auto baseTypeName = baseType->getCanonicalType().getString();
+    auto baseOptionalTypeName =
+        OptionalType::get(baseType)->getCanonicalType().getString();
+
+    DE.diagnoseWithNotes(
+        DE.diagnose(UME->getLoc(), diag::optional_ambiguous_case_ref,
+                    baseTypeName, baseOptionalTypeName, memberName),
+        [&]() {
+          DE.diagnose(UME->getDotLoc(),
+                      diag::type_fixit_optional_ambiguous_case_ref,
+                      baseOptionalTypeName, memberName)
+              .fixItInsert(UME->getDotLoc(), baseOptionalTypeName);
+          DE.diagnose(UME->getDotLoc(),
+                      diag::type_fixit_optional_ambiguous_case_ref,
+                      baseTypeName, memberName)
+              .fixItInsert(UME->getDotLoc(), baseTypeName);
+        });
+  }
   return true;
 }
