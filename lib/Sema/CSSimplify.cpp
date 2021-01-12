@@ -4269,11 +4269,16 @@ bool ConstraintSystem::repairFailures(
       break;
     }
 
-    if (repairByUsingRawValueOfRawRepresentableType(lhs, rhs))
-      break;
-
     if (repairViaOptionalUnwrap(*this, lhs, rhs, matchKind, conversionsOrFixes,
                                 locator))
+      break;
+
+    // Let's wait until both sides are of the same optionality before
+    // attempting `.rawValue` fix.
+    if (hasConversionOrRestriction(ConversionRestrictionKind::ValueToOptional))
+      break;
+
+    if (repairByUsingRawValueOfRawRepresentableType(lhs, rhs))
       break;
 
     // If there are any restrictions here we need to wait and let
@@ -5716,9 +5721,6 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyConformsToConstraint(
   /// Record the given conformance as the result, adding any conditional
   /// requirements if necessary.
   auto recordConformance = [&](ProtocolConformanceRef conformance) {
-    // Record the conformance.
-    CheckedConformances.push_back({loc, conformance});
-
     if (isConformanceUnavailable(conformance, loc))
       increaseScore(SK_Unavailable);
 
@@ -5726,11 +5728,15 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyConformsToConstraint(
     // those requirements as constraints too.
     if (conformance.isConcrete()) {
       unsigned index = 0;
+      auto *conformanceLoc = getConstraintLocator(
+          loc,
+          LocatorPathElt::ConformanceRequirement(conformance.getConcrete()));
+
       for (const auto &req : conformance.getConditionalRequirements()) {
-        addConstraint(req,
-                      locator.withPathElement(
-                          LocatorPathElt::ConditionalRequirement(
-                              index++, req.getKind())));
+        addConstraint(
+            req, getConstraintLocator(conformanceLoc,
+                                      LocatorPathElt::ConditionalRequirement(
+                                          index++, req.getKind())));
       }
     }
 

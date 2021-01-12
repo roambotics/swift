@@ -481,10 +481,12 @@ if(SWIFT_PATH_TO_CMARK_BUILD)
 endif()
 message(STATUS "")
 
-if("${SWIFT_NATIVE_LLVM_TOOLS_PATH}" STREQUAL "")
-  set(SWIFT_CROSS_COMPILING FALSE)
+# Check if a prebuilt clang path was passed in, as this variable will be
+# assigned if not, in SwiftSharedCMakeConfig.
+if("${SWIFT_NATIVE_CLANG_TOOLS_PATH}" STREQUAL "")
+  set(SWIFT_PREBUILT_CLANG FALSE)
 else()
-  set(SWIFT_CROSS_COMPILING TRUE)
+  set(SWIFT_PREBUILT_CLANG TRUE)
 endif()
 
 include(SwiftSharedCMakeConfig)
@@ -776,7 +778,7 @@ elseif("${SWIFT_HOST_VARIANT_SDK}" MATCHES "(OSX|IOS*|TVOS*|WATCHOS*)")
   #
   # Primary variant is always OSX; even on iOS hosts.
   set(SWIFT_PRIMARY_VARIANT_SDK_default "OSX")
-  set(SWIFT_PRIMARY_VARIANT_ARCH_default "x86_64")
+  set(SWIFT_PRIMARY_VARIANT_ARCH_default "${CMAKE_HOST_SYSTEM_PROCESSOR}")
 
 endif()
 
