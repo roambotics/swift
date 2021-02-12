@@ -81,6 +81,10 @@ getClangBuiltinTypeFromKind(const clang::ASTContext &context,
   case clang::BuiltinType::Id:                                                 \
     return context.SingletonId;
 #include "clang/Basic/AArch64SVEACLETypes.def"
+#define PPC_VECTOR_TYPE(Name, Id, Size)                                        \
+  case clang::BuiltinType::Id:                                                 \
+    return context.Id##Ty;
+#include "clang/Basic/PPCTypes.def"
   }
 
   // Not a valid BuiltinType.
@@ -860,12 +864,15 @@ ClangTypeConverter::getClangTemplateArguments(
     const clang::TemplateParameterList *templateParams,
     ArrayRef<Type> genericArgs,
     SmallVectorImpl<clang::TemplateArgument> &templateArgs) {
+  assert(templateArgs.size() == 0);
+  assert(genericArgs.size() == templateParams->size());
+
   // Keep track of the types we failed to convert so we can return a useful
   // error.
   SmallVector<Type, 2> failedTypes;
   for (clang::NamedDecl *param : *templateParams) {
     // Note: all template parameters must be template type parameters. This is
-    // verified when we import the clang decl.
+    // verified when we import the Clang decl.
     auto templateParam = cast<clang::TemplateTypeParmDecl>(param);
     auto replacement = genericArgs[templateParam->getIndex()];
     auto qualType = convert(replacement);
@@ -878,6 +885,9 @@ ClangTypeConverter::getClangTemplateArguments(
   }
   if (failedTypes.empty())
     return nullptr;
+  // Clear "templateArgs" to prevent the clients from accidently reading a
+  // partially converted set of template arguments.
+  templateArgs.clear();
   auto errorInfo = std::make_unique<TemplateInstantiationError>();
   llvm::for_each(failedTypes, [&errorInfo](auto type) {
     errorInfo->failedTypes.push_back(type);

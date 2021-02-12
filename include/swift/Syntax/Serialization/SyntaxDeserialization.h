@@ -150,9 +150,9 @@ template <> struct MappingTraits<swift::RC<swift::RawSyntax>> {
     if (description.hasValue) {
       swift::tok tokenKind = description.Kind;
       StringRef text = description.Text;
-      std::vector<swift::TriviaPiece> leadingTrivia;
+      StringRef leadingTrivia;
       in.mapRequired("leadingTrivia", leadingTrivia);
-      std::vector<swift::TriviaPiece> trailingTrivia;
+      StringRef trailingTrivia;
       in.mapRequired("trailingTrivia", trailingTrivia);
       swift::SourcePresence presence;
       in.mapRequired("presence", presence);
@@ -162,9 +162,9 @@ template <> struct MappingTraits<swift::RC<swift::RawSyntax>> {
       StringRef nodeIdString;
       in.mapRequired("id", nodeIdString);
       unsigned nodeId = std::atoi(nodeIdString.data());
-      value = swift::RawSyntax::make(
-          tokenKind, swift::OwnedString::makeRefCounted(text), leadingTrivia,
-          trailingTrivia, presence, /*Arena=*/nullptr, nodeId);
+      value = swift::RawSyntax::makeAndCalcLength(
+          tokenKind, text, leadingTrivia, trailingTrivia, presence,
+          swift::SyntaxArena::make(), nodeId);
     } else {
       swift::SyntaxKind kind;
       in.mapRequired("kind", kind);
@@ -178,8 +178,8 @@ template <> struct MappingTraits<swift::RC<swift::RawSyntax>> {
       StringRef nodeIdString;
       in.mapRequired("id", nodeIdString);
       unsigned nodeId = std::atoi(nodeIdString.data());
-      value = swift::RawSyntax::make(kind, layout, presence, /*Arena=*/nullptr,
-                                     nodeId);
+      value = swift::RawSyntax::makeAndCalcLength(
+          kind, layout, presence, swift::SyntaxArena::make(), nodeId);
     }
   }
 };
@@ -198,7 +198,7 @@ public:
   llvm::Optional<swift::SourceFileSyntax> getSourceFileSyntax() {
     swift::RC<swift::RawSyntax> raw;
     Input >> raw;
-    return swift::make<swift::SourceFileSyntax>(raw);
+    return swift::makeRoot<swift::SourceFileSyntax>(raw);
   }
 };
 } // namespace json

@@ -18,6 +18,7 @@
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILCloner.h"
+#include "swift/SIL/SILBitfield.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
@@ -86,9 +87,9 @@ static bool useCaptured(Operand *UI) {
 
 // Is any successor of BB in the LiveIn set?
 static bool successorHasLiveIn(SILBasicBlock *BB,
-                               SmallPtrSetImpl<SILBasicBlock *> &LiveIn) {
+                               BasicBlockSetVector<16> &LiveIn) {
   for (auto &Succ : BB->getSuccessors())
-    if (LiveIn.count(Succ))
+    if (LiveIn.contains(Succ))
       return true;
 
   return false;
@@ -96,7 +97,7 @@ static bool successorHasLiveIn(SILBasicBlock *BB,
 
 // Propagate liveness backwards from an initial set of blocks in our
 // LiveIn set.
-static void propagateLiveness(SmallPtrSetImpl<SILBasicBlock *> &LiveIn,
+static void propagateLiveness(BasicBlockSetVector<16> &LiveIn,
                               SILBasicBlock *DefBB) {
 
   // First populate a worklist of predecessors.
@@ -111,7 +112,7 @@ static void propagateLiveness(SmallPtrSetImpl<SILBasicBlock *> &LiveIn,
 
     // If it's already in the set, then we've already queued and/or
     // processed the predecessors.
-    if (BB == DefBB || !LiveIn.insert(BB).second)
+    if (BB == DefBB || !LiveIn.insert(BB))
       continue;
 
     for (auto Pred : BB->getPredecessorBlocks())
@@ -142,8 +143,9 @@ static bool addLastRelease(SILValue V, SILBasicBlock *BB,
 // loop.
 static bool getFinalReleases(SILValue Box,
                              SmallVectorImpl<SILInstruction *> &Releases) {
-  SmallPtrSet<SILBasicBlock *, 16> LiveIn;
-  SmallPtrSet<SILBasicBlock *, 16> UseBlocks;
+  SILFunction *function = Box->getFunction();
+  BasicBlockSetVector<16> LiveIn(function);
+  BasicBlockSetVector<16> UseBlocks(function);
 
   auto *DefBB = Box->getParentBlock();
 
@@ -553,7 +555,7 @@ static bool rewriteAllocBoxAsAllocStack(AllocBoxInst *ABI) {
   auto &Lowering = ABI->getFunction()->getTypeLowering(
       getSILBoxFieldType(TypeExpansionContext(*ABI->getFunction()),
                          ABI->getBoxType(), ABI->getModule().Types, 0));
-  auto Loc = CleanupLocation::get(ABI->getLoc());
+  auto Loc = CleanupLocation(ABI->getLoc());
 
   for (auto LastRelease : FinalReleases) {
     SILBuilderWithScope Builder(LastRelease);
@@ -886,7 +888,7 @@ specializeApplySite(SILOptFunctionBuilder &FuncBuilder, ApplySite Apply,
                     AllocBoxToStackState &pass) {
   auto *FRI = cast<FunctionRefInst>(Apply.getCallee());
   assert(FRI && "Expected a direct ApplySite");
-  auto *F = FRI->getReferencedFunctionOrNull();
+  auto *F = FRI->getReferencedFunction();
   assert(F && "Expected a referenced function!");
 
   IsSerialized_t Serialized = IsNotSerialized;
@@ -1095,8 +1097,7 @@ class AllocBoxToStack : public SILFunctionTransform {
       auto Count = rewritePromotedBoxes(pass);
       NumStackPromoted += Count;
       if (Count) {
-        StackNesting SN;
-        if (SN.correctStackNesting(getFunction()) == StackNesting::Changes::CFG)
+        if (StackNesting::fixNesting(getFunction()) == StackNesting::Changes::CFG)
           pass.CFGChanged = true;
       }
 

@@ -35,6 +35,7 @@
 #include "swift/AST/Pattern.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
@@ -47,11 +48,10 @@
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Strings.h"
-
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
-#include "clang/AST/DeclObjCCommon.h"
 #include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclObjCCommon.h"
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/Specifiers.h"
 #include "clang/Basic/TargetInfo.h"
@@ -2569,7 +2569,7 @@ namespace {
     /// Create a swift_newtype struct corresponding to a typedef. Returns
     /// nullptr if unable.
     Decl *importSwiftNewtype(const clang::TypedefNameDecl *decl,
-                             clang::SwiftNewtypeAttr *newtypeAttr,
+                             clang::SwiftNewTypeAttr *newtypeAttr,
                              DeclContext *dc, Identifier name);
 
     Decl *VisitTypedefNameDecl(const clang::TypedefNameDecl *Decl) {
@@ -3300,12 +3300,19 @@ namespace {
 
       // Create the struct declaration and record it.
       auto name = importedName.getDeclName().getBaseIdentifier();
-      auto result = Impl.createDeclWithClangNode<StructDecl>(decl,
-                                 AccessLevel::Public,
-                                 Impl.importSourceLoc(decl->getBeginLoc()),
-                                 name,
-                                 Impl.importSourceLoc(decl->getLocation()),
-                                 None, nullptr, dc);
+      StructDecl *result = nullptr;
+      // Try to find an already-imported struct. This case happens any time
+      // there are nested structs. The "Parent" struct will import the "Child"
+      // struct at which point it attempts to import its decl context which is
+      // the "Parent" struct. Without trying to look up already-imported structs
+      // this will cause an infinite loop.
+      auto alreadyImportedResult =
+          Impl.ImportedDecls.find({decl->getCanonicalDecl(), getVersion()});
+      if (alreadyImportedResult != Impl.ImportedDecls.end())
+        return alreadyImportedResult->second;
+      result = Impl.createDeclWithClangNode<StructDecl>(
+          decl, AccessLevel::Public, Impl.importSourceLoc(decl->getBeginLoc()),
+          name, Impl.importSourceLoc(decl->getLocation()), None, nullptr, dc);
       Impl.ImportedDecls[{decl->getCanonicalDecl(), getVersion()}] = result;
 
       // FIXME: Figure out what to do with superclasses in C++. One possible
@@ -3316,6 +3323,7 @@ namespace {
       SmallVector<VarDecl *, 4> members;
       SmallVector<FuncDecl *, 4> methods;
       SmallVector<ConstructorDecl *, 4> ctors;
+      SmallVector<TypeDecl *, 4> nestedTypes;
 
       // FIXME: Import anonymous union fields and support field access when
       // it is nested in a struct.
@@ -3374,27 +3382,13 @@ namespace {
           continue;
         }
 
-        if (isa<TypeDecl>(member)) {
+        if (auto nestedType = dyn_cast<TypeDecl>(member)) {
           // Only import definitions. Otherwise, we might add the same member
           // twice.
           if (auto tagDecl = dyn_cast<clang::TagDecl>(nd))
             if (tagDecl->getDefinition() != tagDecl)
               continue;
-          // A struct nested inside another struct will either be logically
-          // a sibling of the outer struct, or contained inside of it, depending
-          // on if it has a declaration name or not.
-          //
-          // struct foo { struct bar { ... } baz; } // sibling
-          // struct foo { struct { ... } baz; } // child
-          //
-          // In the latter case, we add the imported type as a nested type
-          // of the parent.
-          //
-          // TODO: C++ types have different rules.
-          if (auto nominalDecl = dyn_cast<NominalTypeDecl>(member->getDeclContext())) {
-            assert(nominalDecl == result && "interesting nesting of C types?");
-            nominalDecl->addMember(member);
-          }
+          nestedTypes.push_back(nestedType);
           continue;
         }
 
@@ -3417,7 +3411,30 @@ namespace {
         }
 
         members.push_back(VD);
+      }
 
+      for (auto nestedType : nestedTypes) {
+        // A struct nested inside another struct will either be logically
+        // a sibling of the outer struct, or contained inside of it, depending
+        // on if it has a declaration name or not.
+        //
+        // struct foo { struct bar { ... } baz; } // sibling
+        // struct foo { struct { ... } baz; } // child
+        //
+        // In the latter case, we add the imported type as a nested type
+        // of the parent.
+        //
+        // TODO: C++ types have different rules.
+        if (auto nominalDecl =
+                dyn_cast<NominalTypeDecl>(nestedType->getDeclContext())) {
+          assert(nominalDecl == result && "interesting nesting of C types?");
+          nominalDecl->addMember(nestedType);
+        }
+      }
+
+      bool hasReferenceableFields = !members.empty();
+      for (auto member : members) {
+        auto nd = cast<clang::NamedDecl>(member->getClangDecl());
         // Bitfields are imported as computed properties with Clang-generated
         // accessors.
         bool isBitField = false;
@@ -3428,36 +3445,32 @@ namespace {
             hasUnreferenceableStorage = true;
             isBitField = true;
 
-            makeBitFieldAccessors(Impl,
-                                  const_cast<clang::RecordDecl *>(decl),
-                                  result,
-                                  const_cast<clang::FieldDecl *>(field),
-                                  VD);
+            makeBitFieldAccessors(Impl, const_cast<clang::RecordDecl *>(decl),
+                                  result, const_cast<clang::FieldDecl *>(field),
+                                  member);
           }
         }
 
         if (auto ind = dyn_cast<clang::IndirectFieldDecl>(nd)) {
           // Indirect fields are created as computed property accessible the
           // fields on the anonymous field from which they are injected.
-          makeIndirectFieldAccessors(Impl, ind, members, result, VD);
+          makeIndirectFieldAccessors(Impl, ind, members, result, member);
         } else if (decl->isUnion() && !isBitField) {
           // Union fields should only be available indirectly via a computed
           // property. Since the union is made of all of the fields at once,
           // this is a trivial accessor that casts self to the correct
           // field type.
-          makeUnionFieldAccessors(Impl, result, VD);
+          makeUnionFieldAccessors(Impl, result, member);
 
           // Create labeled initializers for unions that take one of the
           // fields, which only initializes the data for that field.
-          auto valueCtor =
-              createValueConstructor(Impl, result, VD,
-                                     /*want param names*/true,
-                                     /*wantBody=*/true);
+          auto valueCtor = createValueConstructor(Impl, result, member,
+                                                  /*want param names*/ true,
+                                                  /*wantBody=*/true);
           ctors.push_back(valueCtor);
         }
+        result->addMember(member);
       }
-
-      bool hasReferenceableFields = !members.empty();
 
       const clang::CXXRecordDecl *cxxRecordDecl =
           dyn_cast<clang::CXXRecordDecl>(decl);
@@ -3468,6 +3481,11 @@ namespace {
         ctors.push_back(createDefaultConstructor(Impl, result));
       }
 
+      // We can assume that it is possible to correctly construct the object by
+      // simply initializing its member variables to arbitrary supplied values
+      // only when the same is possible in C++. While we could check for that
+      // exactly, checking whether the C++ class is an aggregate
+      // (C++ [dcl.init.aggr]) has the same effect.
       bool isAggregate = !cxxRecordDecl || cxxRecordDecl->isAggregate();
       if (hasReferenceableFields && hasMemberwiseInitializer && isAggregate) {
         // The default zero initializer suppresses the implicit value
@@ -3486,10 +3504,6 @@ namespace {
         ctors.push_back(valueCtor);
       }
 
-      for (auto member : members) {
-        result->addMember(member);
-      }
-
       for (auto ctor : ctors) {
         result->addMember(ctor);
       }
@@ -3504,8 +3518,14 @@ namespace {
         result->setIsCxxNonTrivial(!cxxRecordDecl->isTriviallyCopyable());
 
         for (auto ctor : cxxRecordDecl->ctors()) {
-          if (ctor->isCopyConstructor() &&
-              (ctor->isDeleted() || ctor->getAccess() != clang::AS_public)) {
+          if (ctor->isCopyConstructor()) {
+            // If we have no way of copying the type we can't import the class
+            // at all because we cannot express the correct semantics as a swift
+            // struct.
+            if (ctor->isDeleted() || ctor->getAccess() != clang::AS_public)
+              return nullptr;
+          }
+          if (ctor->getAccess() != clang::AS_public) {
             result->setIsCxxNonTrivial(true);
             break;
           }
@@ -3531,19 +3551,45 @@ namespace {
         return VisitRecordDecl(decl);
 
       auto &clangSema = Impl.getClangSema();
-      // Make Clang define the implicit default constructor if the class needs
-      // it. Make sure we only do this if the class has been fully defined and
-      // we're not in a dependent context (this is equivalent to the logic in
-      // CanDeclareSpecialMemberFunction in Clang's SemaLookup.cpp).
+      // Make Clang define any implicit constructors it may need (copy,
+      // default). Make sure we only do this if the class has been fully defined
+      // and we're not in a dependent context (this is equivalent to the logic
+      // in CanDeclareSpecialMemberFunction in Clang's SemaLookup.cpp).
       if (decl->getDefinition() && !decl->isBeingDefined() &&
-          !decl->isDependentContext() &&
-          decl->needsImplicitDefaultConstructor()) {
-        clang::CXXConstructorDecl *ctor =
-            clangSema.DeclareImplicitDefaultConstructor(
-                const_cast<clang::CXXRecordDecl *>(decl->getDefinition()));
-        if (!ctor->isDeleted())
-          clangSema.DefineImplicitDefaultConstructor(clang::SourceLocation(),
-                                                     ctor);
+          !decl->isDependentContext()) {
+        if (decl->needsImplicitDefaultConstructor()) {
+          clang::CXXConstructorDecl *ctor =
+              clangSema.DeclareImplicitDefaultConstructor(
+                  const_cast<clang::CXXRecordDecl *>(decl->getDefinition()));
+          if (!ctor->isDeleted())
+            clangSema.DefineImplicitDefaultConstructor(clang::SourceLocation(),
+                                                       ctor);
+        }
+        clang::CXXConstructorDecl *copyCtor = nullptr;
+        if (decl->needsImplicitCopyConstructor()) {
+          copyCtor = clangSema.DeclareImplicitCopyConstructor(
+              const_cast<clang::CXXRecordDecl *>(decl));
+        } else {
+          // We may have a defaulted copy constructor that needs to be defined.
+          // Try to find it.
+          for (auto methods : decl->methods()) {
+            if (auto declCtor = dyn_cast<clang::CXXConstructorDecl>(methods)) {
+              if (declCtor->isCopyConstructor() && declCtor->isDefaulted() &&
+                  declCtor->getAccess() == clang::AS_public &&
+                  !declCtor->isDeleted() &&
+                  // Note: we use "doesThisDeclarationHaveABody" here because
+                  // that's what "DefineImplicitCopyConstructor" checks.
+                  !declCtor->doesThisDeclarationHaveABody()) {
+                copyCtor = declCtor;
+                break;
+              }
+            }
+          }
+        }
+        if (copyCtor) {
+          clangSema.DefineImplicitCopyConstructor(clang::SourceLocation(),
+                                                  copyCtor);
+        }
       }
 
       return VisitRecordDecl(decl);
@@ -3566,13 +3612,6 @@ namespace {
           decl->getDefinition());
       assert(def && "Class template instantiation didn't have definition");
 
-      // If this type is fully specialized (i.e. "Foo<>" or "Foo<int, int>"),
-      // bail to prevent a crash.
-      // TODO: we should be able to support fully specialized class templates.
-      // See SR-13775 for more info.
-      if (def->getTypeAsWritten())
-        return nullptr;
-
       // FIXME: This will instantiate all members of the specialization (and detect
       // instantiation failures in them), which can be more than is necessary
       // and is more than what Clang does. As a result we reject some C++
@@ -3581,19 +3620,6 @@ namespace {
           def->getLocation(), def, clang::TSK_ExplicitInstantiationDefinition);
 
       return VisitCXXRecordDecl(def);
-    }
-
-    Decl *VisitClassTemplateDecl(const clang::ClassTemplateDecl *decl) {
-      // When loading a namespace's sub-decls, we won't add template
-      // specilizations, so make sure to do that here.
-      for (auto spec : decl->specializations()) {
-        if (auto importedSpec = Impl.importDecl(spec, getVersion())) {
-          if (auto namespaceDecl =
-                  dyn_cast<EnumDecl>(importedSpec->getDeclContext()))
-            namespaceDecl->addMember(importedSpec);
-        }
-      }
-      return nullptr;
     }
 
     Decl *VisitClassTemplatePartialSpecializationDecl(
@@ -4122,7 +4148,7 @@ namespace {
                 clangVar->getEvaluatedValue()->getInt().getZExtValue()));
       } else if (evaluated->isFloat()) {
         auto floatStr = evaluated->getAsString(Impl.getClangASTContext(),
-                                               clang::QualType());
+                                               clangVar->getType());
         auto floatIdent = Impl.SwiftContext.getIdentifier(floatStr);
         value = new (Impl.SwiftContext)
             FloatLiteralExpr(floatIdent.str(), SourceLoc());
@@ -4245,6 +4271,43 @@ namespace {
         return nullptr;
       return importFunctionDecl(decl->getAsFunction(), importedName,
                                 correctSwiftName, None, decl);
+    }
+
+    Decl *VisitClassTemplateDecl(const clang::ClassTemplateDecl *decl) {
+      // When loading a namespace's sub-decls, we won't add template
+      // specilizations, so make sure to do that here.
+      for (auto spec : decl->specializations()) {
+        if (auto importedSpec = Impl.importDecl(spec, getVersion())) {
+          if (auto namespaceDecl =
+                  dyn_cast<EnumDecl>(importedSpec->getDeclContext()))
+            namespaceDecl->addMember(importedSpec);
+        }
+      }
+
+      Optional<ImportedName> correctSwiftName;
+      auto importedName = importFullName(decl, correctSwiftName);
+      auto name = importedName.getDeclName().getBaseIdentifier();
+      if (name.empty())
+        return nullptr;
+      auto loc = Impl.importSourceLoc(decl->getLocation());
+      auto dc = Impl.importDeclContextOf(
+          decl, importedName.getEffectiveContext());
+
+      SmallVector<GenericTypeParamDecl *, 4> genericParams;
+      for (auto &param : *decl->getTemplateParameters()) {
+        auto genericParamDecl = Impl.createDeclWithClangNode<GenericTypeParamDecl>(
+            param, AccessLevel::Public, dc,
+            Impl.SwiftContext.getIdentifier(param->getName()),
+            Impl.importSourceLoc(param->getLocation()),
+            /*depth*/ 0, /*index*/ genericParams.size());
+        genericParams.push_back(genericParamDecl);
+      }
+      auto genericParamList = GenericParamList::create(
+          Impl.SwiftContext, loc, genericParams, loc);
+
+      auto structDecl = Impl.createDeclWithClangNode<StructDecl>(
+        decl, AccessLevel::Public, loc, name, loc, None, genericParamList, dc);
+      return structDecl;
     }
 
     Decl *VisitUsingDecl(const clang::UsingDecl *decl) {
@@ -5083,7 +5146,8 @@ namespace {
                                                         AccessLevel::Public,
                                                         SourceLoc(), name,
                                                         SourceLoc(), None,
-                                                        nullptr, dc);
+                                                        nullptr, dc,
+                                                        /*isActor*/false);
         Impl.ImportedDecls[{decl->getCanonicalDecl(), getVersion()}] = result;
         result->setSuperclass(Type());
         result->setAddedImplicitInitializers(); // suppress all initializers
@@ -5173,7 +5237,8 @@ namespace {
       // Create the class declaration and record it.
       auto result = Impl.createDeclWithClangNode<ClassDecl>(
           decl, access, Impl.importSourceLoc(decl->getBeginLoc()), name,
-          Impl.importSourceLoc(decl->getLocation()), None, nullptr, dc);
+          Impl.importSourceLoc(decl->getLocation()), None, nullptr, dc,
+          /*isActor*/false);
 
       // Import generic arguments, if any.
       if (auto gpImportResult = importObjCGenericParams(decl, dc)) {
@@ -5632,7 +5697,7 @@ SwiftDeclConverter::importCFClassType(const clang::TypedefNameDecl *decl,
 
   auto theClass = Impl.createDeclWithClangNode<ClassDecl>(
       decl, AccessLevel::Public, SourceLoc(), className, SourceLoc(), None,
-      nullptr, dc);
+      nullptr, dc, /*isActor*/false);
   theClass->setSuperclass(superclass);
   theClass->setAddedImplicitInitializers(); // suppress all initializers
   theClass->setHasMissingVTableEntries(false);
@@ -5771,7 +5836,7 @@ static bool conformsToProtocolInOriginalModule(NominalTypeDecl *nominal,
 
 Decl *
 SwiftDeclConverter::importSwiftNewtype(const clang::TypedefNameDecl *decl,
-                                       clang::SwiftNewtypeAttr *newtypeAttr,
+                                       clang::SwiftNewTypeAttr *newtypeAttr,
                                        DeclContext *dc, Identifier name) {
   // The only (current) difference between swift_newtype(struct) and
   // swift_newtype(enum), until we can get real enum support, is that enums
@@ -5780,12 +5845,12 @@ SwiftDeclConverter::importSwiftNewtype(const clang::TypedefNameDecl *decl,
   bool unlabeledCtor = false;
 
   switch (newtypeAttr->getNewtypeKind()) {
-  case clang::SwiftNewtypeAttr::NK_Enum:
+  case clang::SwiftNewTypeAttr::NK_Enum:
     unlabeledCtor = false;
     // TODO: import as enum instead
     break;
 
-  case clang::SwiftNewtypeAttr::NK_Struct:
+  case clang::SwiftNewTypeAttr::NK_Struct:
     unlabeledCtor = true;
     break;
     // No other cases yet
@@ -7856,6 +7921,11 @@ void ClangImporter::Implementation::importAttributes(
     if (maybeDefinition.getValue())
       ClangDecl = cast<clang::NamedDecl>(maybeDefinition.getValue());
 
+  // Determine whether this is an async import.
+  bool isAsync = false;
+  if (auto func = dyn_cast<AbstractFunctionDecl>(MappedDecl))
+    isAsync = func->hasAsync();
+
   // Scan through Clang attributes and map them onto Swift
   // equivalents.
   bool AnyUnavailable = MappedDecl->getAttrs().isUnavailable(C);
@@ -7960,12 +8030,18 @@ void ClangImporter::Implementation::importAttributes(
       llvm::VersionTuple deprecated = avail->getDeprecated();
 
       if (!deprecated.empty()) {
-        if (platformAvailability.treatDeprecatedAsUnavailable(ClangDecl,
-                                                              deprecated)) {
+        if (platformAvailability.treatDeprecatedAsUnavailable(
+                ClangDecl, deprecated, isAsync)) {
           AnyUnavailable = true;
           PlatformAgnostic = PlatformAgnosticAvailabilityKind::Unavailable;
-          if (message.empty())
-            message = platformAvailability.deprecatedAsUnavailableMessage;
+          if (message.empty()) {
+            if (isAsync) {
+              message =
+                  platformAvailability.asyncDeprecatedAsUnavailableMessage;
+            } else {
+              message = platformAvailability.deprecatedAsUnavailableMessage;
+            }
+          }
         }
       }
 
@@ -8944,7 +9020,12 @@ ClangImporter::Implementation::createConstant(Identifier name, DeclContext *dc,
 
   // Mark the function transparent so that we inline it away completely.
   func->getAttrs().add(new (C) TransparentAttr(/*implicit*/ true));
-  
+  // If we're in concurrency mode, mark the constant as @actorIndependent
+  if (SwiftContext.LangOpts.EnableExperimentalConcurrency) {
+    auto actorIndependentAttr = new (C) ActorIndependentAttr(SourceLoc(),
+        SourceRange(), ActorIndependentKind::Safe);
+    var->getAttrs().add(actorIndependentAttr);
+  }
   // Set the function up as the getter.
   makeComputed(var, func, nullptr);
 
@@ -9033,7 +9114,9 @@ ClangImporter::Implementation::loadAllMembers(Decl *D, uint64_t extra) {
         if (!member)
           continue;
 
-        enumDecl->addMember(member);
+        // TODO: remove this change when #34706 lands.
+        if (!member->NextDecl)
+          enumDecl->addMember(member);
       }
     }
     return;

@@ -19,22 +19,19 @@ using namespace swift;
 using namespace swift::syntax;
 
 static bool shouldCacheNode(tok TokKind, size_t TextSize,
-                            ArrayRef<TriviaPiece> LeadingTrivia,
-                            ArrayRef<TriviaPiece> TrailingTrivia) {
+                            StringRef LeadingTrivia, StringRef TrailingTrivia) {
   // Is string_literal with >16 length.
   if (TokKind == tok::string_literal && TextSize > 16) {
     return false;
   }
 
-  // Has leading comment trivia et al.
-  if (any_of(LeadingTrivia,
-             [](const syntax::TriviaPiece &T) { return T.getText().size(); })) {
+  // Has a lot of leading comment trivia like comments.
+  if (LeadingTrivia.size() > 4) {
     return false;
   }
 
-  // Has trailing comment trivia et al.
-  if (any_of(TrailingTrivia,
-             [](const syntax::TriviaPiece &T) { return T.getText().size(); })) {
+  // Has a lot of trailing trivia
+  if (TrailingTrivia.size() > 4) {
     return false;
   }
 
@@ -42,16 +39,15 @@ static bool shouldCacheNode(tok TokKind, size_t TextSize,
   return true;
 }
 
-RC<RawSyntax>
-RawSyntaxTokenCache::getToken(RC<SyntaxArena> &Arena, tok TokKind,
-                              OwnedString Text,
-                              ArrayRef<TriviaPiece> LeadingTrivia,
-                              ArrayRef<TriviaPiece> TrailingTrivia) {
+RC<RawSyntax> RawSyntaxTokenCache::getToken(RC<SyntaxArena> &Arena, tok TokKind,
+                                            size_t TextLength, StringRef Text,
+                                            StringRef LeadingTrivia,
+                                            StringRef TrailingTrivia) {
   // Determine whether this token is worth to cache.
   if (!shouldCacheNode(TokKind, Text.size(), LeadingTrivia, TrailingTrivia)) {
     // Do not use cache.
-    return RawSyntax::make(TokKind, Text, LeadingTrivia, TrailingTrivia,
-                           SourcePresence::Present, Arena);
+    return RawSyntax::make(TokKind, Text, TextLength, LeadingTrivia,
+                           TrailingTrivia, SourcePresence::Present, Arena);
   }
 
   // This node is cacheable. Get or create.
@@ -65,8 +61,8 @@ RawSyntaxTokenCache::getToken(RC<SyntaxArena> &Arena, tok TokKind,
   }
 
   // Could not found in the cache. Create it.
-  auto Raw = RawSyntax::make(TokKind, Text, LeadingTrivia, TrailingTrivia,
-                             SourcePresence::Present, Arena);
+  auto Raw = RawSyntax::make(TokKind, Text, TextLength, LeadingTrivia,
+                             TrailingTrivia, SourcePresence::Present, Arena);
   auto IDRef = ID.Intern(Arena->getAllocator());
   auto CacheNode = new (Arena) RawSyntaxCacheNode(Raw, IDRef);
   // Keep track of the created RawSyntaxCacheNode so that we can destruct it

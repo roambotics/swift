@@ -465,6 +465,7 @@ ConstraintSystem::SolverScope::SolverScope(ConstraintSystem &cs)
   numFixes = cs.Fixes.size();
   numFixedRequirements = cs.FixedRequirements.size();
   numDisjunctionChoices = cs.DisjunctionChoices.size();
+  numAppliedDisjunctions = cs.AppliedDisjunctions.size();
   numTrailingClosureMatchingChoices = cs.trailingClosureMatchingChoices.size();
   numOpenedTypes = cs.OpenedTypes.size();
   numOpenedExistentialTypes = cs.OpenedExistentialTypes.size();
@@ -518,6 +519,9 @@ ConstraintSystem::SolverScope::~SolverScope() {
 
   // Remove any disjunction choices.
   truncate(cs.DisjunctionChoices, numDisjunctionChoices);
+
+  // Remove any applied disjunctions.
+  truncate(cs.AppliedDisjunctions, numAppliedDisjunctions);
 
   // Remove any trailing closure matching choices;
   truncate(
@@ -2063,6 +2067,97 @@ static void existingOperatorBindingsForDisjunction(ConstraintSystem &CS,
   }
 }
 
+void ConstraintSystem::partitionGenericOperators(ArrayRef<Constraint *> constraints,
+                                                 SmallVectorImpl<unsigned>::iterator first,
+                                                 SmallVectorImpl<unsigned>::iterator last,
+                                                 ConstraintLocator *locator) {
+  auto *argFnType = AppliedDisjunctions[locator];
+  if (!isOperatorBindOverload(constraints[0]) || !argFnType)
+    return;
+
+  auto operatorName = constraints[0]->getOverloadChoice().getName();
+  if (!operatorName.getBaseIdentifier().isArithmeticOperator())
+    return;
+
+  SmallVector<unsigned, 4> concreteOverloads;
+  SmallVector<unsigned, 4> numericOverloads;
+  SmallVector<unsigned, 4> sequenceOverloads;
+  SmallVector<unsigned, 4> otherGenericOverloads;
+
+  auto refinesOrConformsTo = [&](NominalTypeDecl *nominal, KnownProtocolKind kind) -> bool {
+    if (!nominal)
+      return false;
+
+    auto *protocol = TypeChecker::getProtocol(getASTContext(), SourceLoc(), kind);
+
+    if (auto *refined = dyn_cast<ProtocolDecl>(nominal))
+      return refined->inheritsFrom(protocol);
+
+    return (bool)TypeChecker::conformsToProtocol(nominal->getDeclaredType(), protocol,
+                                                 nominal->getDeclContext());
+  };
+
+  // Gather Numeric and Sequence overloads into separate buckets.
+  for (auto iter = first; iter != last; ++iter) {
+    unsigned index = *iter;
+    auto *decl = constraints[index]->getOverloadChoice().getDecl();
+    auto *nominal = decl->getDeclContext()->getSelfNominalTypeDecl();
+    if (!decl->getInterfaceType()->is<GenericFunctionType>()) {
+      concreteOverloads.push_back(index);
+    } else if (refinesOrConformsTo(nominal, KnownProtocolKind::AdditiveArithmetic)) {
+      numericOverloads.push_back(index);
+    } else if (refinesOrConformsTo(nominal, KnownProtocolKind::Sequence)) {
+      sequenceOverloads.push_back(index);
+    } else {
+      otherGenericOverloads.push_back(index);
+    }
+  }
+
+  auto sortPartition = [&](SmallVectorImpl<unsigned> &partition) {
+    llvm::sort(partition, [&](unsigned lhs, unsigned rhs) -> bool {
+      auto *declA = dyn_cast<ValueDecl>(constraints[lhs]->getOverloadChoice().getDecl());
+      auto *declB = dyn_cast<ValueDecl>(constraints[rhs]->getOverloadChoice().getDecl());
+
+      return TypeChecker::isDeclRefinementOf(declA, declB);
+    });
+  };
+
+  // Sort sequence overloads so that refinements are attempted first.
+  // If the solver finds a solution with an overload, it can then skip
+  // subsequent choices that the successful choice is a refinement of.
+  sortPartition(sequenceOverloads);
+
+  // Attempt concrete overloads first.
+  first = std::copy(concreteOverloads.begin(), concreteOverloads.end(), first);
+
+  // Check if any of the known argument types conform to one of the standard
+  // arithmetic protocols. If so, the sovler should attempt the corresponding
+  // overload choices first.
+  for (auto arg : argFnType->getParams()) {
+    auto argType = arg.getPlainType();
+    argType = getFixedTypeRecursive(argType, /*wantRValue=*/true);
+
+    if (argType->isTypeVariableOrMember())
+      continue;
+
+    if (conformsToKnownProtocol(DC, argType, KnownProtocolKind::AdditiveArithmetic)) {
+      first = std::copy(numericOverloads.begin(), numericOverloads.end(), first);
+      numericOverloads.clear();
+      break;
+    }
+
+    if (conformsToKnownProtocol(DC, argType, KnownProtocolKind::Sequence)) {
+      first = std::copy(sequenceOverloads.begin(), sequenceOverloads.end(), first);
+      sequenceOverloads.clear();
+      break;
+    }
+  }
+
+  first = std::copy(otherGenericOverloads.begin(), otherGenericOverloads.end(), first);
+  first = std::copy(numericOverloads.begin(), numericOverloads.end(), first);
+  first = std::copy(sequenceOverloads.begin(), sequenceOverloads.end(), first);
+}
+
 void ConstraintSystem::partitionDisjunction(
     ArrayRef<Constraint *> Choices, SmallVectorImpl<unsigned> &Ordering,
     SmallVectorImpl<unsigned> &PartitionBeginning) {
@@ -2153,6 +2248,12 @@ void ConstraintSystem::partitionDisjunction(
     });
   }
 
+  // Gather the remaining options.
+  forEachChoice(Choices, [&](unsigned index, Constraint *constraint) -> bool {
+    everythingElse.push_back(index);
+    return true;
+  });
+
   // Local function to create the next partition based on the options
   // passed in.
   PartitionAppendCallback appendPartition =
@@ -2163,16 +2264,9 @@ void ConstraintSystem::partitionDisjunction(
         }
       };
 
-  // Gather the remaining options.
-  forEachChoice(Choices, [&](unsigned index, Constraint *constraint) -> bool {
-    everythingElse.push_back(index);
-    return true;
-  });
   appendPartition(favored);
   appendPartition(everythingElse);
   appendPartition(simdOperators);
-
-  // Now create the remaining partitions from what we previously collected.
   appendPartition(unavailable);
   appendPartition(disabled);
 
@@ -2193,28 +2287,39 @@ Constraint *ConstraintSystem::selectDisjunction() {
   auto cs = this;
   auto minDisjunction = std::min_element(disjunctions.begin(), disjunctions.end(),
       [&](Constraint *first, Constraint *second) -> bool {
+        unsigned firstActive = first->countActiveNestedConstraints();
+        unsigned secondActive = second->countActiveNestedConstraints();
         unsigned firstFavored = first->countFavoredNestedConstraints();
         unsigned secondFavored = second->countFavoredNestedConstraints();
 
         if (!isOperatorBindOverload(first->getNestedConstraints().front()) ||
             !isOperatorBindOverload(second->getNestedConstraints().front()))
-          return first->countActiveNestedConstraints() < second->countActiveNestedConstraints();
+          return firstActive < secondActive;
 
         if (firstFavored == secondFavored) {
-          // Look for additional choices to favor
+          // Look for additional choices that are "favored"
           SmallVector<unsigned, 4> firstExisting;
           SmallVector<unsigned, 4> secondExisting;
 
           existingOperatorBindingsForDisjunction(*cs, first->getNestedConstraints(), firstExisting);
-          firstFavored = firstExisting.size() ? firstExisting.size() : first->countActiveNestedConstraints();
+          firstFavored += firstExisting.size();
           existingOperatorBindingsForDisjunction(*cs, second->getNestedConstraints(), secondExisting);
-          secondFavored = secondExisting.size() ? secondExisting.size() : second->countActiveNestedConstraints();
-
-          return firstFavored < secondFavored;
+          secondFavored += secondExisting.size();
         }
 
-        firstFavored = firstFavored ? firstFavored : first->countActiveNestedConstraints();
-        secondFavored = secondFavored ? secondFavored : second->countActiveNestedConstraints();
+        // Everything else equal, choose the disjunction with the greatest
+        // number of resoved argument types. The number of resolved argument
+        // types is always zero for disjunctions that don't represent applied
+        // overloads.
+        if (firstFavored == secondFavored) {
+          if (firstActive != secondActive)
+            return firstActive < secondActive;
+
+          return (first->countResolvedArgumentTypes(*this) > second->countResolvedArgumentTypes(*this));
+        }
+
+        firstFavored = firstFavored ? firstFavored : firstActive;
+        secondFavored = secondFavored ? secondFavored : secondActive;
         return firstFavored < secondFavored;
       });
 

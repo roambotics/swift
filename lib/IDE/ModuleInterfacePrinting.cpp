@@ -172,7 +172,9 @@ printTypeInterface(ModuleDecl *M, Type Ty, ASTPrinter &Printer,
   }
   Ty = Ty->getRValueType();
   if (auto ND = Ty->getNominalOrBoundGenericNominal()) {
-    PrintOptions Options = PrintOptions::printTypeInterface(Ty.getPointer());
+    PrintOptions Options = PrintOptions::printTypeInterface(
+        Ty.getPointer(),
+        Ty->getASTContext().TypeCheckerOpts.PrintFullConvention);
     ND->print(Printer, Options);
     printTypeNameToString(Ty, TypeName);
     return false;
@@ -361,8 +363,9 @@ static bool printModuleInterfaceDecl(Decl *D,
               Opened |= ET.Ext->print(Printer, Options);
               if (ET.IsSynthesized)
                 Options.clearSynthesizedExtension();
-              if (Options.BracketOptions.shouldCloseExtension(ET.Ext))
+              if (Options.BracketOptions.shouldCloseExtension(ET.Ext)) {
                 Printer << "\n";
+              }
             }
           });
         Options.BracketOptions = BracketOptions();
@@ -422,7 +425,7 @@ getDeclsFromCrossImportOverlay(ModuleDecl *Overlay, ModuleDecl *Declaring,
         return false;
 
       // Ignore an imports of modules also imported by the underlying module.
-      if (PrevImported.find(Imported) != PrevImported.end())
+      if (PrevImported.contains(Imported))
         return false;
     }
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
@@ -607,8 +610,14 @@ void swift::ide::printModuleInterface(
     }
 
     auto ShouldPrintImport = [&](ImportDecl *ImportD) -> bool {
+      if (ImportD->getAttrs().hasAttribute<ImplementationOnlyAttr>())
+        return false;
+
       if (!TargetClangMod)
         return true;
+      if (ImportD->getModule() == TargetMod)
+        return false;
+
       auto ImportedMod = ImportD->getClangModule();
       if (!ImportedMod)
         return true;

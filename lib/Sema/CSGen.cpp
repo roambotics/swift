@@ -38,12 +38,7 @@ using namespace swift;
 using namespace swift::constraints;
 
 static bool isArithmeticOperatorDecl(ValueDecl *vd) {
-  return vd && 
-  (vd->getBaseName() == "+" ||
-   vd->getBaseName() == "-" ||
-   vd->getBaseName() == "*" ||
-   vd->getBaseName() == "/" ||
-   vd->getBaseName() == "%");
+  return vd && vd->getBaseIdentifier().isArithmeticOperator();
 }
 
 static bool mergeRepresentativeEquivalenceClasses(ConstraintSystem &CS,
@@ -2476,7 +2471,7 @@ namespace {
       // the type variable for the pattern `i`.
       struct CollectVarRefs : public ASTWalker {
         ConstraintSystem &cs;
-        llvm::SmallVector<TypeVariableType *, 4> varRefs;
+        llvm::SmallPtrSet<TypeVariableType *, 4> varRefs;
         bool hasErrorExprs = false;
 
         CollectVarRefs(ConstraintSystem &cs) : cs(cs) { }
@@ -2525,7 +2520,7 @@ namespace {
       closure->walk(collectVarRefs);
 
       // If walker discovered error expressions, let's fail constraint
-      // genreation only if closure is going to participate
+      // generation only if closure is going to participate
       // in the type-check. This allows us to delay validation of
       // multi-statement closures until body is opened.
       if (shouldTypeCheckInEnclosingExpression(closure) &&
@@ -2537,10 +2532,12 @@ namespace {
       if (!inferredType || inferredType->hasError())
         return Type();
 
-      CS.addUnsolvedConstraint(
-          Constraint::create(CS, ConstraintKind::DefaultClosureType,
-                             closureType, inferredType, locator,
-                             collectVarRefs.varRefs));
+      SmallVector<TypeVariableType *, 4> referencedVars{
+          collectVarRefs.varRefs.begin(), collectVarRefs.varRefs.end()};
+
+      CS.addUnsolvedConstraint(Constraint::create(
+          CS, ConstraintKind::DefaultClosureType, closureType, inferredType,
+          locator, referencedVars));
 
       CS.setClosureType(closure, inferredType);
       return closureType;
@@ -3655,6 +3652,7 @@ generateForEachStmtConstraints(
     ConstraintSystem &cs, SolutionApplicationTarget target, Expr *sequence) {
   auto forEachStmtInfo = target.getForEachStmtInfo();
   ForEachStmt *stmt = forEachStmtInfo.stmt;
+  bool isAsync = stmt->getAwaitLoc().isValid();
 
   auto locator = cs.getConstraintLocator(sequence);
   auto contextualLocator =
@@ -3662,7 +3660,9 @@ generateForEachStmtConstraints(
 
   // The expression type must conform to the Sequence protocol.
   auto sequenceProto = TypeChecker::getProtocol(
-      cs.getASTContext(), stmt->getForLoc(), KnownProtocolKind::Sequence);
+      cs.getASTContext(), stmt->getForLoc(), 
+      isAsync ? 
+      KnownProtocolKind::AsyncSequence : KnownProtocolKind::Sequence);
   if (!sequenceProto) {
     return None;
   }
@@ -3708,18 +3708,22 @@ generateForEachStmtConstraints(
 
   // Determine the iterator type.
   auto iteratorAssocType =
-      sequenceProto->getAssociatedType(cs.getASTContext().Id_Iterator);
+      sequenceProto->getAssociatedType(isAsync ? 
+        cs.getASTContext().Id_AsyncIterator : cs.getASTContext().Id_Iterator);
   Type iteratorType = DependentMemberType::get(sequenceType, iteratorAssocType);
 
   // The iterator type must conform to IteratorProtocol.
   ProtocolDecl *iteratorProto = TypeChecker::getProtocol(
       cs.getASTContext(), stmt->getForLoc(),
-      KnownProtocolKind::IteratorProtocol);
+      isAsync ? 
+        KnownProtocolKind::AsyncIteratorProtocol : KnownProtocolKind::IteratorProtocol);
   if (!iteratorProto)
     return None;
 
   // Reference the makeIterator witness.
-  FuncDecl *makeIterator = ctx.getSequenceMakeIterator();
+  FuncDecl *makeIterator = isAsync ? 
+    ctx.getAsyncSequenceMakeAsyncIterator() : ctx.getSequenceMakeIterator();
+  
   Type makeIteratorType =
       cs.createTypeVariable(locator, TVO_CanBindToNoEscape);
   cs.addValueWitnessConstraint(

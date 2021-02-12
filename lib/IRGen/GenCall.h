@@ -329,7 +329,8 @@ namespace irgen {
   void addByvalArgumentAttributes(IRGenModule &IGM,
                                   llvm::AttributeList &attrs,
                                   unsigned argIndex,
-                                  Alignment align);
+                                  Alignment align,
+                                  llvm::Type *storageType);
 
   /// Add signext or zeroext attribute set for an argument that needs
   /// extending.
@@ -414,7 +415,9 @@ namespace irgen {
   Address emitAllocAsyncContext(IRGenFunction &IGF, llvm::Value *sizeValue);
   void emitDeallocAsyncContext(IRGenFunction &IGF, Address context);
 
-  void emitAsyncFunctionEntry(IRGenFunction &IGF, SILFunction *asyncFunc);
+  void emitAsyncFunctionEntry(IRGenFunction &IGF,
+                              const AsyncContextLayout &layout,
+                              LinkEntity asyncFunction);
 
   /// Yield the given values from the current continuation.
   ///

@@ -94,11 +94,11 @@ DerivativeRegistrationTests.testWithLeakChecking("InstanceMethod") {
 
 extension Wrapper {
   subscript(_ x: Tracked<Float>) -> Tracked<Float> {
-    @differentiable
+    @differentiable(reverse)
     @_semantics("autodiff.opaque")
     get { float * x }
 
-    @differentiable
+    @differentiable(reverse)
     set {}
   }
 
@@ -120,10 +120,10 @@ DerivativeRegistrationTests.testWithLeakChecking("SubscriptGetter") {
 
 extension Wrapper {
   subscript() -> Tracked<Float> {
-    @differentiable
+    @differentiable(reverse)
     get { float }
 
-    @differentiable
+    @differentiable(reverse)
     set { float = newValue }
   }
 
@@ -198,7 +198,7 @@ DerivativeRegistrationTests.testWithLeakChecking("ComputedPropertySetter") {
 }
 
 struct Generic<T> {
-  @differentiable // derivative generic signature: none
+  @differentiable(reverse) // derivative generic signature: none
   func instanceMethod(_ x: Tracked<Float>) -> Tracked<Float> {
     x
   }
@@ -217,12 +217,13 @@ DerivativeRegistrationTests.testWithLeakChecking("DerivativeGenericSignature") {
   expectEqual(1000, dx)
 }
 
+#if REQUIRES_SR14042
 // When non-canonicalized generic signatures are used to compare derivative configurations, the
 // `@differentiable` and `@derivative` attributes create separate derivatives, and we get a
 // duplicate symbol error in TBDGen.
 public protocol RefinesDifferentiable: Differentiable {}
 extension Float: RefinesDifferentiable {}
-@differentiable(where T: Differentiable, T: RefinesDifferentiable)
+@differentiable(reverse where T: Differentiable, T: RefinesDifferentiable)
 public func nonCanonicalizedGenSigComparison<T>(_ t: T) -> T { t }
 @derivative(of: nonCanonicalizedGenSigComparison)
 public func dNonCanonicalizedGenSigComparison<T: RefinesDifferentiable>(_ t: T)
@@ -236,6 +237,7 @@ DerivativeRegistrationTests.testWithLeakChecking("NonCanonicalizedGenericSignatu
   // give a gradient of 1).
   expectEqual(0, dx)
 }
+#endif
 
 // Test derivatives of default implementations.
 protocol HasADefaultImplementation {

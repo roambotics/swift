@@ -111,7 +111,7 @@ SILGenModule::emitVTableMethod(ClassDecl *theClass,
   bool baseLessVisibleThanDerived =
     (!usesObjCDynamicDispatch &&
      !derivedDecl->isFinal() &&
-     derivedDecl->isEffectiveLinkageMoreVisibleThan(baseDecl));
+     derivedDecl->isMoreVisibleThan(baseDecl));
 
   // Determine the derived thunk type by lowering the derived type against the
   // abstraction pattern of the base.
@@ -1038,7 +1038,7 @@ public:
 
     // Build a vtable if this is a class.
     if (auto theClass = dyn_cast<ClassDecl>(theType)) {
-      for (Decl *member : theClass->getSemanticMembers())
+      for (Decl *member : theClass->getABIMembers())
         visit(member);
 
       SILGenVTable genVTable(SGM, theClass);

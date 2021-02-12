@@ -694,6 +694,8 @@ public:
   Optional<BasicDeclLocs> getBasicDeclLocsForDecl(const Decl *D) const;
   Identifier getDiscriminatorForPrivateValue(const ValueDecl *D);
   Optional<Fingerprint> loadFingerprint(const IterableDeclContext *IDC) const;
+  void collectBasicSourceFileInfo(
+      llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const;
 
 
   // MARK: Deserialization interface
@@ -803,8 +805,11 @@ public:
   llvm::Expected<NormalProtocolConformance *>
   readNormalConformanceChecked(serialization::NormalConformanceID id);
 
-  /// Reads a foreign error conformance from \c DeclTypeCursor, if present.
+  /// Reads a foreign error convention from \c DeclTypeCursor, if present.
   Optional<ForeignErrorConvention> maybeReadForeignErrorConvention();
+
+  /// Reads a foreign async convention from \c DeclTypeCursor, if present.
+  Optional<ForeignAsyncConvention> maybeReadForeignAsyncConvention();
 
   /// Reads inlinable body text from \c DeclTypeCursor, if present.
   Optional<StringRef> maybeReadInlinableBodyText();

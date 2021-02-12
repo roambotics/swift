@@ -335,10 +335,19 @@ def create_argument_parser():
            help='enable code coverage analysis in Swift (false, not-merged, '
                 'merged).')
 
+    option('--swift-disable-dead-stripping', toggle_true, 
+           help="Turn off Darwin-specific dead stripping for Swift host tools")
+
     option('--build-subdir', store,
            metavar='PATH',
            help='name of the directory under $SWIFT_BUILD_ROOT where the '
                 'build products will be placed')
+    option('--relocate-xdg-cache-home-under-build-subdir',
+           store_true,
+           help='relocate $XDG_CACHE_HOME to the same location '
+                'where build products will be placed; '
+                'this supports having multiple runs for different branches '
+                'in CI bots for Linux')
     option('--install-prefix', store_path,
            default=targets.install_prefix(),
            help='The installation prefix. This is where built Swift products '
@@ -989,6 +998,7 @@ def create_argument_parser():
            help='skip testing iOS simulator targets')
     option('--skip-test-ios-32bit-simulator',
            toggle_false('test_ios_32bit_simulator'),
+           default=False,
            help='skip testing iOS 32 bit simulator targets')
     option('--skip-test-ios-host',
            toggle_false('test_ios_host'),

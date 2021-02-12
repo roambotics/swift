@@ -240,6 +240,10 @@ public:
                       StringRef relatedEntityKind,
                       llvm::function_ref<void(TypeDecl *)> receiver) override;
 
+  StructDecl *
+  instantiateCXXClassTemplate(clang::ClassTemplateDecl *decl,
+                      ArrayRef<clang::TemplateArgument> arguments) override;
+
   /// Just like Decl::getClangNode() except we look through to the 'Code'
   /// enum of an error wrapper struct.
   ClangNode getEffectiveClangNode(const Decl *decl) const;
@@ -487,6 +491,9 @@ ImportDecl *createImportDecl(ASTContext &Ctx, DeclContext *DC, ClangNode ClangN,
 /// building a ModuleInterfaceLoader.
 std::string
 getModuleCachePathFromClang(const clang::CompilerInstance &Instance);
+
+/// Whether the given parameter name identifies a completion handler.
+bool isCompletionHandlerParamName(StringRef paramName);
 
 } // end namespace swift
 

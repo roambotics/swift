@@ -362,8 +362,6 @@ public:
   std::string getModuleOutputPathForAtMostOnePrimary() const;
   std::string
   getReferenceDependenciesFilePathForPrimary(StringRef filename) const;
-  std::string getSwiftRangesFilePathForPrimary(StringRef filename) const;
-  std::string getCompiledSourceFilePathForPrimary(StringRef filename) const;
   std::string getSerializedDiagnosticsPathForAtMostOnePrimary() const;
 
   /// TBDPath only makes sense in whole module compilation mode,
@@ -469,7 +467,9 @@ public:
   DiagnosticEngine &getDiags() { return Diagnostics; }
   const DiagnosticEngine &getDiags() const { return Diagnostics; }
 
-  llvm::vfs::FileSystem &getFileSystem() { return *SourceMgr.getFileSystem(); }
+  llvm::vfs::FileSystem &getFileSystem() const {
+    return *SourceMgr.getFileSystem();
+  }
 
   ASTContext &getASTContext() { return *Context; }
   const ASTContext &getASTContext() const { return *Context; }
@@ -560,8 +560,11 @@ private:
   bool setUpInputs();
   bool setUpASTContextIfNeeded();
   void setupStatsReporter();
-  void setupDiagnosticVerifierIfNeeded();
   void setupDependencyTrackerIfNeeded();
+
+  /// \return false if successsful, true on error.
+  bool setupDiagnosticVerifierIfNeeded();
+
   Optional<unsigned> setUpCodeCompletionBuffer();
 
   /// Find a buffer for a given input file and ensure it is recorded in
@@ -651,16 +654,6 @@ public:
   getPrimarySpecificPathsForAtMostOnePrimary() const;
   const PrimarySpecificPaths &
   getPrimarySpecificPathsForSourceFile(const SourceFile &SF) const;
-
-  /// Write out the unparsed (delayed) source ranges
-  /// Return true for error
-  bool emitSwiftRanges(DiagnosticEngine &diags, SourceFile *primaryFile,
-                       StringRef outputPath) const;
-
-  /// Return true for error
-  bool emitCompiledSource(DiagnosticEngine &diags,
-                          const SourceFile *primaryFile,
-                          StringRef outputPath) const;
 };
 
 } // namespace swift

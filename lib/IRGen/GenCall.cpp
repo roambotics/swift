@@ -20,6 +20,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/Runtime/Config.h"
+#include "swift/IRGen/Linking.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILType.h"
 #include "clang/AST/ASTContext.h"
@@ -379,7 +380,7 @@ llvm::CallInst *IRGenFunction::emitSuspendAsyncCall(ArrayRef<llvm::Value *> args
   auto *calleeContext = Builder.CreateExtractValue(id,
       (unsigned)AsyncFunctionArgumentIndex::Context);
   llvm::Constant *projectFn = cast<llvm::Constant>(args[1])->stripPointerCasts();
-  // Get the caller context from the calle context.
+  // Get the caller context from the callee context.
   llvm::Value *context = Builder.CreateCall(projectFn, {calleeContext});
   context = Builder.CreateBitCast(context, IGM.SwiftContextPtrTy);
   Builder.CreateStore(context, asyncContextLocation);
@@ -476,12 +477,15 @@ llvm::CallingConv::ID irgen::expandCallingConv(IRGenModule &IGM,
 
 static void addIndirectResultAttributes(IRGenModule &IGM,
                                         llvm::AttributeList &attrs,
-                                        unsigned paramIndex, bool allowSRet) {
+                                        unsigned paramIndex, bool allowSRet,
+                                        llvm::Type *storageType) {
   llvm::AttrBuilder b;
   b.addAttribute(llvm::Attribute::NoAlias);
   b.addAttribute(llvm::Attribute::NoCapture);
-  if (allowSRet)
-    b.addAttribute(llvm::Attribute::StructRet);
+  if (allowSRet) {
+    assert(storageType);
+    b.addStructRetAttr(storageType);
+  }
   attrs = attrs.addAttributes(IGM.getLLVMContext(),
                               paramIndex + llvm::AttributeList::FirstArgIndex,
                               b);
@@ -525,9 +529,10 @@ void IRGenModule::addSwiftErrorAttributes(llvm::AttributeList &attrs,
 
 void irgen::addByvalArgumentAttributes(IRGenModule &IGM,
                                        llvm::AttributeList &attrs,
-                                       unsigned argIndex, Alignment align) {
+                                       unsigned argIndex, Alignment align,
+                                       llvm::Type *storageType) {
   llvm::AttrBuilder b;
-  b.addAttribute(llvm::Attribute::ByVal);
+  b.addByValAttr(storageType);
   b.addAttribute(llvm::Attribute::getWithAlignment(
       IGM.getLLVMContext(), llvm::Align(align.getValue())));
   attrs = attrs.addAttributes(IGM.getLLVMContext(),
@@ -628,8 +633,10 @@ llvm::Type *SignatureExpansion::addIndirectResult() {
   auto resultType = getSILFuncConventions().getSILResultType(
       IGM.getMaximalTypeExpansionContext());
   const TypeInfo &resultTI = IGM.getTypeInfo(resultType);
-  addIndirectResultAttributes(IGM, Attrs, ParamIRTypes.size(), claimSRet());
-  addPointerParameter(resultTI.getStorageType());
+  auto storageTy = resultTI.getStorageType();
+  addIndirectResultAttributes(IGM, Attrs, ParamIRTypes.size(), claimSRet(),
+                              storageTy);
+  addPointerParameter(storageTy);
   return IGM.VoidTy;
 }
 
@@ -660,8 +667,16 @@ void SignatureExpansion::expandResult() {
   // Expand the indirect results.
   for (auto indirectResultType :
        fnConv.getIndirectSILResultTypes(IGM.getMaximalTypeExpansionContext())) {
-    addIndirectResultAttributes(IGM, Attrs, ParamIRTypes.size(), claimSRet());
-    addPointerParameter(IGM.getStorageType(indirectResultType));
+    auto storageTy = IGM.getStorageType(indirectResultType);
+    auto useSRet = claimSRet();
+    // We need to use opaque types or non fixed size storage types because llvm
+    // does type based analysis based on the type of sret arguments.
+    if (useSRet && !isa<FixedTypeInfo>(IGM.getTypeInfo(indirectResultType))) {
+      storageTy = IGM.OpaqueTy;
+    }
+    addIndirectResultAttributes(IGM, Attrs, ParamIRTypes.size(), useSRet,
+                                storageTy);
+    addPointerParameter(storageTy);
   }
 }
 
@@ -817,6 +832,8 @@ void SignatureExpansion::addAsyncParameters() {
   //   void (AsyncTask *, ExecutorRef, AsyncContext *);
   ParamIRTypes.push_back(IGM.SwiftTaskPtrTy);
   ParamIRTypes.push_back(IGM.SwiftExecutorPtrTy);
+  Attrs = Attrs.addParamAttribute(IGM.getLLVMContext(), getCurParamIndex(),
+                                  llvm::Attribute::SwiftAsync);
   ParamIRTypes.push_back(IGM.SwiftContextPtrTy);
 }
 
@@ -1219,11 +1236,17 @@ namespace {
       case clang::BuiltinType::OCLIntelSubgroupAVCImeDualRefStreamin:
         llvm_unreachable("OpenCL type in ABI lowering");
 
-      // We should never see the SVE types at all.
+      // We should never see ARM SVE types at all.
 #define SVE_TYPE(Name, Id, ...) \
       case clang::BuiltinType::Id:
 #include "clang/Basic/AArch64SVEACLETypes.def"
-        llvm_unreachable("SVE type in ABI lowering");
+        llvm_unreachable("ARM SVE type in ABI lowering");
+
+      // We should never see PPC MMA types at all.
+#define PPC_VECTOR_TYPE(Name, Id, Size) \
+      case clang::BuiltinType::Id:
+#include "clang/Basic/PPCTypes.def"
+        llvm_unreachable("PPC MMA type in ABI lowering");
 
       // Handle all the integer types as opaque values.
 #define BUILTIN_TYPE(Id, SingletonId)
@@ -1532,9 +1555,12 @@ void SignatureExpansion::expandExternalSignatureTypes() {
       case clang::ParameterABI::SwiftErrorResult:
         IGM.addSwiftErrorAttributes(Attrs, getCurParamIndex());
         break;
-      case clang::ParameterABI::SwiftIndirectResult:
-        addIndirectResultAttributes(IGM, Attrs, getCurParamIndex(),claimSRet());
+      case clang::ParameterABI::SwiftIndirectResult: {
+        auto *coercedTy = AI.getCoerceToType();
+        addIndirectResultAttributes(IGM, Attrs, getCurParamIndex(), claimSRet(),
+                                    coercedTy->getPointerElementType());
         break;
+      }
       }
 
       // If the coercion type is a struct which can be flattened, we need to
@@ -1555,6 +1581,8 @@ void SignatureExpansion::expandExternalSignatureTypes() {
       ParamIRTypes.append(types.begin(), types.end());
       break;
     }
+    case clang::CodeGen::ABIArgInfo::IndirectAliased:
+      llvm_unreachable("not implemented");
     case clang::CodeGen::ABIArgInfo::Indirect: {
       assert(i >= clangToSwiftParamOffset &&
              "Unexpected index for indirect byval argument");
@@ -1562,10 +1590,12 @@ void SignatureExpansion::expandExternalSignatureTypes() {
       auto paramTy = getSILFuncConventions().getSILType(
           param, IGM.getMaximalTypeExpansionContext());
       auto &paramTI = cast<FixedTypeInfo>(IGM.getTypeInfo(paramTy));
-      if (AI.getIndirectByVal())
+      if (AI.getIndirectByVal()) {
         addByvalArgumentAttributes(
             IGM, Attrs, getCurParamIndex(),
-            Alignment(AI.getIndirectAlign().getQuantity()));
+            Alignment(AI.getIndirectAlign().getQuantity()),
+            paramTI.getStorageType());
+      }
       addPointerParameter(paramTI.getStorageType());
       break;
     }
@@ -2546,8 +2576,20 @@ void CallEmission::emitToUnmappedMemory(Address result) {
   Args[0] = result.getAddress();
   SILFunctionConventions FnConv(CurCallee.getSubstFunctionType(),
                                 IGF.getSILModule());
-  addIndirectResultAttributes(IGF.IGM, CurCallee.getMutableAttributes(),
-                              0, FnConv.getNumIndirectSILResults() <= 1);
+
+  llvm::Type *storageTy = Args[0]->getType()->getPointerElementType();;
+  if (FnConv.getNumIndirectSILResults() == 1) {
+    for (auto indirectResultType : FnConv.getIndirectSILResultTypes(
+             IGF.IGM.getMaximalTypeExpansionContext())) {
+      bool isFixedSize =
+          isa<FixedTypeInfo>(IGF.IGM.getTypeInfo(indirectResultType));
+      storageTy = isFixedSize ? IGF.IGM.getStorageType(indirectResultType)
+                              : IGF.IGM.OpaqueTy;
+    }
+  }
+  addIndirectResultAttributes(IGF.IGM, CurCallee.getMutableAttributes(), 0,
+                              FnConv.getNumIndirectSILResults() <= 1,
+                              storageTy);
 #ifndef NDEBUG
   LastArgWritten = 0; // appease an assert
 #endif
@@ -2620,6 +2662,27 @@ llvm::CallInst *CallEmission::emitCallSite() {
   return call;
 }
 
+static llvm::AttributeList
+fixUpTypesInByValAndStructRetAttributes(llvm::FunctionType *fnType,
+                                        llvm::AttributeList attrList) {
+  auto &context = fnType->getContext();
+  for (unsigned i = 0; i < fnType->getNumParams(); ++i) {
+    auto paramTy = fnType->getParamType(i);
+    auto attrListIndex = llvm::AttributeList::FirstArgIndex + i;
+    if (attrList.hasParamAttr(i, llvm::Attribute::StructRet) &&
+        paramTy->getPointerElementType() != attrList.getParamStructRetType(i))
+      attrList = attrList.replaceAttributeType(
+          context, attrListIndex, llvm::Attribute::StructRet,
+          paramTy->getPointerElementType());
+    if (attrList.hasParamAttr(i, llvm::Attribute::ByVal) &&
+        paramTy->getPointerElementType() != attrList.getParamByValType(i))
+      attrList = attrList.replaceAttributeType(
+          context, attrListIndex, llvm::Attribute::ByVal,
+          paramTy->getPointerElementType());
+  }
+  return attrList;
+}
+
 llvm::CallInst *IRBuilder::CreateCall(const FunctionPointer &fn,
                                       ArrayRef<llvm::Value*> args) {
   assert(fn.getKind() == FunctionPointer::KindTy::Function);
@@ -2634,11 +2697,12 @@ llvm::CallInst *IRBuilder::CreateCall(const FunctionPointer &fn,
   }
 
   assert(!isTrapIntrinsic(fn.getRawPointer()) && "Use CreateNonMergeableTrap");
-  llvm::CallInst *call = IRBuilderBase::CreateCall(
-      cast<llvm::FunctionType>(
-          fn.getRawPointer()->getType()->getPointerElementType()),
-      fn.getRawPointer(), args, bundles);
-  call->setAttributes(fn.getAttributes());
+  auto fnTy = cast<llvm::FunctionType>(
+      fn.getRawPointer()->getType()->getPointerElementType());
+  llvm::CallInst *call =
+      IRBuilderBase::CreateCall(fnTy, fn.getRawPointer(), args, bundles);
+  call->setAttributes(
+      fixUpTypesInByValAndStructRetAttributes(fnTy, fn.getAttributes()));
   call->setCallingConv(fn.getCallingConv());
   return call;
 }
@@ -3316,6 +3380,8 @@ static void externalizeArguments(IRGenFunction &IGF, const Callee &callee,
       emitDirectExternalArgument(IGF, paramType, AI, in, out, isOutlined);
       break;
     }
+    case clang::CodeGen::ABIArgInfo::IndirectAliased:
+      llvm_unreachable("not implemented");
     case clang::CodeGen::ABIArgInfo::Indirect: {
       auto &ti = cast<LoadableTypeInfo>(IGF.getTypeInfo(paramType));
 
@@ -3506,6 +3572,8 @@ void irgen::emitForeignParameter(IRGenFunction &IGF, Explosion &params,
     emitDirectForeignParameter(IGF, params, AI, paramExplosion, paramTy,
                                paramTI);
     return;
+  case clang::CodeGen::ABIArgInfo::IndirectAliased:
+      llvm_unreachable("not implemented");
   case clang::CodeGen::ABIArgInfo::Indirect: {
     Address address = paramTI.getAddressForPointer(params.claimNext());
     paramTI.loadAsTake(IGF, address, paramExplosion);
@@ -3584,9 +3652,10 @@ emitRetconCoroutineEntry(IRGenFunction &IGF, CanSILFunctionType fnType,
 }
 
 void irgen::emitAsyncFunctionEntry(IRGenFunction &IGF,
-                                   SILFunction *asyncFunction) {
+                                   const AsyncContextLayout &layout,
+                                   LinkEntity asyncFunction) {
   auto &IGM = IGF.IGM;
-  auto size = getAsyncContextLayout(IGM, asyncFunction).getSize();
+  auto size = layout.getSize();
   auto asyncFuncPointer = IGF.Builder.CreateBitOrPointerCast(
       IGM.getAddrOfAsyncFunctionPointer(asyncFunction), IGM.Int8PtrTy);
   auto *id = IGF.Builder.CreateIntrinsicCall(
@@ -4158,7 +4227,10 @@ Explosion NativeConventionSchema::mapFromNative(IRGenModule &IGM,
       if (explosionTy != elt->getType()) {
         if (isa<llvm::IntegerType>(explosionTy) &&
             isa<llvm::IntegerType>(elt->getType())) {
-          elt = IGF.Builder.CreateTrunc(elt, explosionTy);
+          // [HACK: Atomic-Bool-IRGen] In the case of _Atomic(_Bool), Clang
+          // treats it as i8 whereas Swift works with i1, so we need to zext
+          // in that case.
+          elt = IGF.Builder.CreateZExtOrTrunc(elt, explosionTy);
         } else {
           elt = IGF.coerceValue(elt, explosionTy, DataLayout);
         }
@@ -4290,10 +4362,14 @@ Explosion NativeConventionSchema::mapIntoNative(IRGenModule &IGM,
       auto *elt = fromNonNative.claimNext();
       if (nativeTy != elt->getType()) {
         if (isa<llvm::IntegerType>(nativeTy) &&
-            isa<llvm::IntegerType>(elt->getType()))
-          elt = IGF.Builder.CreateZExt(elt, nativeTy);
-        else
+            isa<llvm::IntegerType>(elt->getType())) {
+          // [HACK: Atomic-Bool-IRGen] In the case of _Atomic(_Bool), Clang
+          // treats it as i8 whereas Swift works with i1, so we need to trunc
+          // in that case.
+          elt = IGF.Builder.CreateZExtOrTrunc(elt, nativeTy);
+        } else {
           elt = IGF.coerceValue(elt, nativeTy, DataLayout);
+        }
       }
       nativeExplosion.add(elt);
       return nativeExplosion;

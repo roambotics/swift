@@ -348,11 +348,11 @@ OpaqueTypeDecl *ModuleFile::lookupOpaqueResultType(StringRef MangledName) {
 
   if (!Core->OpaqueReturnTypeDecls)
     return nullptr;
-  
+
   auto iter = Core->OpaqueReturnTypeDecls->find(MangledName);
   if (iter == Core->OpaqueReturnTypeDecls->end())
     return nullptr;
-  
+
   return cast<OpaqueTypeDecl>(getDecl(*iter));
 }
 
@@ -499,6 +499,10 @@ void ModuleFile::getImportDecls(SmallVectorImpl<Decl *> &Results) {
       if (Dep.isExported())
         ID->getAttrs().add(
             new (Ctx) ExportedAttr(/*IsImplicit=*/false));
+      if (Dep.isImplementationOnly())
+        ID->getAttrs().add(
+            new (Ctx) ImplementationOnlyAttr(/*IsImplicit=*/false));
+
       ImportDecls.push_back(ID);
     }
     Bits.ComputedImportDecls = true;
@@ -754,7 +758,7 @@ void ModuleFile::lookupClassMember(ImportPath::Access accessPath,
         auto vd = cast<ValueDecl>(getDecl(item.second));
         if (!vd->getName().matchesRef(name))
           continue;
-        
+
         auto dc = vd->getDeclContext();
         while (!dc->getParent()->isModuleScopeContext())
           dc = dc->getParent();
@@ -957,6 +961,46 @@ Optional<CommentInfo> ModuleFile::getCommentForDecl(const Decl *D) const {
     return None;
 
   return getCommentForDeclByUSR(USRBuffer.str());
+}
+
+void ModuleFile::collectBasicSourceFileInfo(
+    llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const {
+  if (Core->SourceFileListData.empty())
+    return;
+  assert(!Core->SourceLocsTextData.empty());
+
+  auto *Cursor = Core->SourceFileListData.bytes_begin();
+  auto *End = Core->SourceFileListData.bytes_end();
+  while (Cursor < End) {
+    // FilePath (byte offset in 'SourceLocsTextData').
+    auto fileID = endian::readNext<uint32_t, little, unaligned>(Cursor);
+    // InterfaceHash (fixed length string).
+    auto fpStr = StringRef{reinterpret_cast<const char *>(Cursor),
+                           Fingerprint::DIGEST_LENGTH};
+    Cursor += Fingerprint::DIGEST_LENGTH;
+    // LastModified (nanoseconds since epoch).
+    auto timestamp = endian::readNext<uint64_t, little, unaligned>(Cursor);
+    // FileSize (num of bytes).
+    auto fileSize = endian::readNext<uint64_t, little, unaligned>(Cursor);
+
+    assert(fileID < Core->SourceLocsTextData.size());
+    auto filePath = Core->SourceLocsTextData.substr(fileID);
+    size_t terminatorOffset = filePath.find('\0');
+    filePath = filePath.slice(0, terminatorOffset);
+
+    BasicSourceFileInfo info;
+    info.FilePath = filePath;
+    if (auto fingerprint = Fingerprint::fromString(fpStr))
+      info.InterfaceHash = fingerprint.getValue();
+    else {
+      llvm::errs() << "Unconvertable fingerprint '" << fpStr << "'\n";
+      abort();
+    }
+    info.LastModified =
+        llvm::sys::TimePoint<>(std::chrono::nanoseconds(timestamp));
+    info.FileSize = fileSize;
+    callback(info);
+  }
 }
 
 Optional<BasicDeclLocs>

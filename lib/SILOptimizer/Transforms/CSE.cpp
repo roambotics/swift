@@ -109,7 +109,8 @@ public:
   }
 
   hash_code visitValueToBridgeObjectInst(ValueToBridgeObjectInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getOperand());
+    return llvm::hash_combine(X->getKind(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
   hash_code visitRefToBridgeObjectInst(RefToBridgeObjectInst *X) {
@@ -138,12 +139,12 @@ public:
   }
 
   hash_code visitUncheckedAddrCastInst(UncheckedAddrCastInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getType(), X->getOperand());
+    return llvm::hash_combine(X->getKind(), X->getType(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
   hash_code visitFunctionRefInst(FunctionRefInst *X) {
-    return llvm::hash_combine(X->getKind(),
-                              X->getInitiallyReferencedFunction());
+    return llvm::hash_combine(X->getKind(), X->getReferencedFunction());
   }
 
   hash_code visitGlobalAddrInst(GlobalAddrInst *X) {
@@ -159,11 +160,14 @@ public:
   }
 
   hash_code visitRefElementAddrInst(RefElementAddrInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getOperand(), X->getField());
+    return llvm::hash_combine(X->getKind(),
+                              lookThroughOwnershipInsts(X->getOperand()),
+                              X->getField());
   }
 
   hash_code visitRefTailAddrInst(RefTailAddrInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getOperand());
+    return llvm::hash_combine(X->getKind(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
   hash_code visitProjectBoxInst(ProjectBoxInst *X) {
@@ -177,7 +181,8 @@ public:
   }
 
   hash_code visitRawPointerToRefInst(RawPointerToRefInst *X) {
-    return llvm::hash_combine(X->getKind(), X->getOperand());
+    return llvm::hash_combine(X->getKind(),
+                              lookThroughOwnershipInsts(X->getOperand()));
   }
 
 #define LOADABLE_REF_STORAGE(Name, ...) \
@@ -583,7 +588,7 @@ public:
 
   DeadEndBlocks &DeadEndBBs;
 
-  OwnershipFixupContext &FixupCtx;
+  OwnershipFixupContext &RAUWFixupContext;
 
   /// The set of calls to lazy property getters which can be replace by a direct
   /// load of the property value.
@@ -591,9 +596,10 @@ public:
 
   CSE(bool RunsOnHighLevelSil, SideEffectAnalysis *SEA,
       SILOptFunctionBuilder &FuncBuilder, DeadEndBlocks &DeadEndBBs,
-      OwnershipFixupContext &FixupCtx)
+      OwnershipFixupContext &RAUWFixupContext)
       : SEA(SEA), FuncBuilder(FuncBuilder), DeadEndBBs(DeadEndBBs),
-        FixupCtx(FixupCtx), RunsOnHighLevelSil(RunsOnHighLevelSil) {}
+        RAUWFixupContext(RAUWFixupContext),
+        RunsOnHighLevelSil(RunsOnHighLevelSil) {}
 
   bool processFunction(SILFunction &F, DominanceInfo *DT);
 
@@ -628,20 +634,20 @@ private:
   class StackNode {
    public:
     StackNode(ScopedHTType *availableValues, DominanceInfoNode *n,
-              DominanceInfoNode::iterator child,
-              DominanceInfoNode::iterator end)
+              DominanceInfoNode::const_iterator child,
+              DominanceInfoNode::const_iterator end)
         : Node(n), ChildIter(child), EndIter(end), Scopes(availableValues),
       Processed(false) {}
 
     // Accessors.
     DominanceInfoNode *node() { return Node; }
-    DominanceInfoNode::iterator childIter() { return ChildIter; }
+    DominanceInfoNode::const_iterator childIter() { return ChildIter; }
     DominanceInfoNode *nextChild() {
       DominanceInfoNode *child = *ChildIter;
       ++ChildIter;
       return child;
     }
-    DominanceInfoNode::iterator end() { return EndIter; }
+    DominanceInfoNode::const_iterator end() { return EndIter; }
     bool isProcessed() { return Processed; }
     void process() { Processed = true; }
 
@@ -651,8 +657,8 @@ private:
 
     // Members.
     DominanceInfoNode *Node;
-    DominanceInfoNode::iterator ChildIter;
-    DominanceInfoNode::iterator EndIter;
+    DominanceInfoNode::const_iterator ChildIter;
+    DominanceInfoNode::const_iterator EndIter;
     NodeScope Scopes;
     bool Processed;
   };
@@ -937,7 +943,6 @@ static bool isLazyPropertyGetter(ApplyInst *ai) {
 
 bool CSE::processNode(DominanceInfoNode *Node) {
   SILBasicBlock *BB = Node->getBlock();
-  InstModCallbacks callbacks;
   bool Changed = false;
 
   // See if any instructions in the block can be eliminated.  If so, do it.  If
@@ -961,12 +966,12 @@ bool CSE::processNode(DominanceInfoNode *Node) {
 
     // If the instruction can be simplified (e.g. X+0 = X) then replace it with
     // its simpler value.
-    if (SILValue V = simplifyInstruction(Inst)) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "SILCSE SIMPLIFY: " << *Inst << "  to: " << *V << '\n');
-      nextI = replaceAllSimplifiedUsesAndErase(Inst, V, callbacks, &DeadEndBBs);
-      Changed = true;
+    InstModCallbacks callbacks;
+    nextI = simplifyAndReplaceAllSimplifiedUsesAndErase(Inst, callbacks,
+                                                        &DeadEndBBs);
+    if (callbacks.hadCallbackInvocation()) {
       ++NumSimplify;
+      Changed = true;
       continue;
     }
 
@@ -1018,14 +1023,14 @@ bool CSE::processNode(DominanceInfoNode *Node) {
         // extend it here as well
         if (!isa<SingleValueInstruction>(Inst))
           continue;
-        if (!OwnershipFixupContext::canFixUpOwnershipForRAUW(
-                cast<SingleValueInstruction>(Inst),
-                cast<SingleValueInstruction>(AvailInst)))
+
+        OwnershipRAUWHelper helper(RAUWFixupContext,
+                                   cast<SingleValueInstruction>(Inst),
+                                   cast<SingleValueInstruction>(AvailInst));
+        if (!helper.isValid())
           continue;
         // Replace SingleValueInstruction using OSSA RAUW here
-        nextI = FixupCtx.replaceAllUsesAndEraseFixingOwnership(
-            cast<SingleValueInstruction>(Inst),
-            cast<SingleValueInstruction>(AvailInst));
+        nextI = helper.perform();
         Changed = true;
         ++NumCSE;
         continue;
@@ -1397,9 +1402,8 @@ class SILCSE : public SILFunctionTransform {
 
     auto *Fn = getFunction();
     DeadEndBlocks DeadEndBBs(Fn);
-    JointPostDominanceSetComputer Computer(DeadEndBBs);
     InstModCallbacks callbacks;
-    OwnershipFixupContext FixupCtx{callbacks, DeadEndBBs, Computer};
+    OwnershipFixupContext FixupCtx{callbacks, DeadEndBBs};
     CSE C(RunsOnHighLevelSil, SEA, FuncBuilder, DeadEndBBs, FixupCtx);
     bool Changed = false;
 

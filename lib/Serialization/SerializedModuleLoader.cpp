@@ -1001,7 +1001,8 @@ SerializedModuleLoaderBase::loadModule(SourceLoc importLoc,
     // Don't record cached artifacts as dependencies.
     if (!isCached(DepPath)) {
       if (M->hasIncrementalInfo()) {
-        dependencyTracker->addIncrementalDependency(DepPath);
+        dependencyTracker->addIncrementalDependency(DepPath,
+                                                    M->getFingerprint());
       } else {
         dependencyTracker->addDependency(DepPath, /*isSystem=*/false);
       }
@@ -1326,4 +1327,9 @@ SerializedASTFile::getDiscriminatorForPrivateValue(const ValueDecl *D) const {
   Identifier discriminator = File.getDiscriminatorForPrivateValue(D);
   assert(!discriminator.empty() && "no discriminator found for value");
   return discriminator;
+}
+
+void SerializedASTFile::collectBasicSourceFileInfo(
+    llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const {
+  File.collectBasicSourceFileInfo(callback);
 }

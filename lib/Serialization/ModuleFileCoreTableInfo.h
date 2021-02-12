@@ -457,7 +457,7 @@ public:
       int32_t nameLength = endian::readNext<int32_t, little, unaligned>(data);
       std::string mangledName(reinterpret_cast<const char *>(data), nameLength);
       data += nameLength;
-      result.push_back({mangledName, genSigId});
+      result.push_back({std::string(mangledName), genSigId});
     }
     return result;
   }
@@ -602,7 +602,10 @@ public:
     using namespace llvm::support;
     auto str = llvm::StringRef{reinterpret_cast<const char *>(data),
                                Fingerprint::DIGEST_LENGTH};
-    return Fingerprint::fromString(str);
+    if (auto fp = Fingerprint::fromString(str))
+      return fp.getValue();
+    llvm::errs() << "Unconvertable fingerprint '" << str << "'\n";
+    abort();
   }
 };
 

@@ -590,9 +590,9 @@ void IRGenModule::emitRuntimeRegistration() {
     return;
   
   // Find the entry point.
-  SILFunction *EntryPoint =
-    getSILModule().lookUpFunction(SWIFT_ENTRY_POINT_FUNCTION);
-  
+  SILFunction *EntryPoint = getSILModule().lookUpFunction(
+      getSILModule().getASTContext().getEntryPointFunctionName());
+
   // If we're debugging (and not in the REPL), we don't have a
   // main. Find a function marked with the LLDBDebuggerFunction
   // attribute instead.
@@ -943,6 +943,7 @@ std::string IRGenModule::GetObjCSectionName(StringRef Section,
   assert(Section.substr(0, 2) == "__" && "expected the name to begin with __");
 
   switch (TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("must know the object file format");
   case llvm::Triple::MachO:
@@ -963,6 +964,7 @@ std::string IRGenModule::GetObjCSectionName(StringRef Section,
 void IRGenModule::SetCStringLiteralSection(llvm::GlobalVariable *GV,
                                            ObjCLabelType Type) {
   switch (TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("must know the object file format");
   case llvm::Triple::MachO:
@@ -1541,6 +1543,7 @@ void IRGenerator::noteUseOfOpaqueTypeDescriptor(OpaqueTypeDecl *opaque) {
 static std::string getDynamicReplacementSection(IRGenModule &IGM) {
   std::string sectionName;
   switch (IGM.TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("Don't know how to emit field records table for "
                      "the selected object format.");
@@ -1562,6 +1565,7 @@ static std::string getDynamicReplacementSection(IRGenModule &IGM) {
 static std::string getDynamicReplacementSomeSection(IRGenModule &IGM) {
   std::string sectionName;
   switch (IGM.TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("Don't know how to emit field records table for "
                      "the selected object format.");
@@ -1874,6 +1878,7 @@ void IRGenModule::emitVTableStubs() {
 static std::string getEntryPointSection(IRGenModule &IGM) {
   std::string sectionName;
   switch (IGM.TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("Don't know how to emit field records table for "
                      "the selected object format.");
@@ -1894,7 +1899,8 @@ static std::string getEntryPointSection(IRGenModule &IGM) {
 
 void IRGenerator::emitEntryPointInfo() {
   SILFunction *entrypoint = nullptr;
-  if (!(entrypoint = SIL.lookUpFunction(SWIFT_ENTRY_POINT_FUNCTION))) {
+  if (!(entrypoint = SIL.lookUpFunction(
+            SIL.getASTContext().getEntryPointFunctionName()))) {
     return;
   }
   auto &IGM = *getGenModule(entrypoint);
@@ -2604,7 +2610,8 @@ void IRGenModule::createReplaceableProlog(IRGenFunction &IGF, SILFunction *f) {
   auto authInfo = PointerAuthInfo::emit(IGF, schema, fnPtrAddr, authEntity);
 
   auto *Res = IGF.Builder.CreateCall(
-      FunctionPointer(silFunctionType, realReplFn, authInfo, signature),
+      FunctionPointer(silFunctionType, realReplFn, authInfo, signature)
+          .getAsFunction(IGF),
       forwardedArgs);
   Res->setTailCall();
   if (IGF.CurFn->getReturnType()->isVoidTy())
@@ -2786,20 +2793,10 @@ void IRGenModule::emitDynamicReplacementOriginalFunctionThunk(SILFunction *f) {
     IGF.Builder.CreateRet(Res);
 }
 
-/// If the calling convention for `ctor` doesn't match the calling convention
-/// that we assumed for it when we imported it as `initializer`, emit and
-/// return a thunk that conforms to the assumed calling convention. The thunk
-/// is marked `alwaysinline`, so it doesn't generate any runtime overhead.
-/// If the assumed calling convention was correct, just return `ctor`.
-///
-/// See also comments in CXXMethodConventions in SIL/IR/SILFunctionType.cpp.
-static llvm::Constant *
-emitCXXConstructorThunkIfNeeded(IRGenModule &IGM, SILFunction *initializer,
-                                const clang::CXXConstructorDecl *ctor,
-                                const LinkEntity &entity,
-                                llvm::Constant *ctorAddress) {
-  Signature signature = IGM.getSignature(initializer->getLoweredFunctionType());
-
+llvm::Constant *swift::irgen::emitCXXConstructorThunkIfNeeded(
+    IRGenModule &IGM, Signature signature,
+    const clang::CXXConstructorDecl *ctor, StringRef name,
+    llvm::Constant *ctorAddress) {
   llvm::FunctionType *assumedFnType = signature.getType();
   llvm::FunctionType *ctorFnType =
       cast<llvm::FunctionType>(ctorAddress->getType()->getPointerElementType());
@@ -2807,13 +2804,6 @@ emitCXXConstructorThunkIfNeeded(IRGenModule &IGM, SILFunction *initializer,
   if (assumedFnType == ctorFnType) {
     return ctorAddress;
   }
-
-  // The thunk has private linkage, so it doesn't need to have a predictable
-  // mangled name -- we just need to make sure the name is unique.
-  llvm::SmallString<32> name;
-  llvm::raw_svector_ostream stream(name);
-  stream << "__swift_cxx_ctor";
-  entity.mangle(stream);
 
   llvm::Function *thunk = llvm::Function::Create(
       assumedFnType, llvm::Function::PrivateLinkage, name, &IGM.Module);
@@ -2890,11 +2880,20 @@ llvm::Function *IRGenModule::getAddrOfSILFunction(
     } else {
       auto globalDecl = getClangGlobalDeclForFunction(clangDecl);
       clangAddr = getAddrOfClangGlobalDecl(globalDecl, forDefinition);
+    }
 
-      if (auto ctor = dyn_cast<clang::CXXConstructorDecl>(clangDecl)) {
-        clangAddr =
-            emitCXXConstructorThunkIfNeeded(*this, f, ctor, entity, clangAddr);
-      }
+    if (auto ctor = dyn_cast<clang::CXXConstructorDecl>(clangDecl)) {
+      Signature signature = getSignature(f->getLoweredFunctionType());
+
+      // The thunk has private linkage, so it doesn't need to have a predictable
+      // mangled name -- we just need to make sure the name is unique.
+      llvm::SmallString<32> name;
+      llvm::raw_svector_ostream stream(name);
+      stream << "__swift_cxx_ctor";
+      entity.mangle(stream);
+
+      clangAddr = emitCXXConstructorThunkIfNeeded(*this, signature, ctor, name,
+                                                  clangAddr);
     }
   }
 
@@ -3491,6 +3490,7 @@ llvm::Constant *IRGenModule::emitSwiftProtocols() {
 
   StringRef sectionName;
   switch (TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("Don't know how to emit protocols for "
                      "the selected object format.");
@@ -3551,6 +3551,7 @@ llvm::Constant *IRGenModule::emitProtocolConformances() {
 
   StringRef sectionName;
   switch (TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("Don't know how to emit protocol conformances for "
                      "the selected object format.");
@@ -3591,6 +3592,7 @@ llvm::Constant *IRGenModule::emitTypeMetadataRecords() {
   case llvm::Triple::COFF:
     sectionName = ".sw5tymd$B";
     break;
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("Don't know how to emit type metadata table for "
                      "the selected object format.");
@@ -3660,6 +3662,7 @@ llvm::Constant *IRGenModule::emitFieldDescriptors() {
   case llvm::Triple::COFF:
     sectionName = ".sw5flmd$B";
     break;
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("Don't know how to emit field records table for "
                      "the selected object format.");

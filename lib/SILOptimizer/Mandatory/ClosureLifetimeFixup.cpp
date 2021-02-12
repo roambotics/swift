@@ -18,6 +18,7 @@
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/SILBitfield.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
@@ -103,7 +104,7 @@ static SILInstruction *getDeinitSafeClosureDestructionPoint(SILBasicBlock *bb) {
 static void findReachableExitBlocks(SILInstruction *i,
                                     SmallVectorImpl<SILBasicBlock *> &result) {
   SmallVector<SILBasicBlock *, 32> worklist;
-  SmallPtrSet<SILBasicBlock *, 8> visitedBlocks;
+  BasicBlockSet visitedBlocks(i->getFunction());
 
   visitedBlocks.insert(i->getParent());
   worklist.push_back(i->getParent());
@@ -116,7 +117,7 @@ static void findReachableExitBlocks(SILInstruction *i,
     }
     llvm::copy_if(bb->getSuccessorBlocks(), std::back_inserter(worklist),
                   [&](SILBasicBlock *bb) {
-      return visitedBlocks.insert(bb).second;
+      return visitedBlocks.insert(bb);
     });
   }
 }
@@ -245,7 +246,9 @@ static void extendLifetimeToEndOfFunction(SILFunction &fn,
   // lifetime respecting loops.
   SmallVector<SILPhiArgument *, 8> insertedPhis;
   SILSSAUpdater updater(&insertedPhis);
-  updater.initialize(optionalEscapingClosureTy);
+  updater.initialize(optionalEscapingClosureTy, fn.hasOwnership()
+                                                    ? OwnershipKind::Owned
+                                                    : OwnershipKind::None);
 
   // Create an Optional<() -> ()>.none in the entry block of the function and
   // add it as an available value to the SSAUpdater.
@@ -850,7 +853,9 @@ static bool fixupCopyBlockWithoutEscaping(CopyBlockWithoutEscapingInst *cb,
 
   SmallVector<SILPhiArgument *, 8> insertedPhis;
   SILSSAUpdater updater(&insertedPhis);
-  updater.initialize(optionalEscapingClosureTy);
+  updater.initialize(optionalEscapingClosureTy, fn.hasOwnership()
+                                                    ? OwnershipKind::Owned
+                                                    : OwnershipKind::None);
 
   // Create the Optional.none as the beginning available value.
   SILValue entryBlockOptionalNone;
@@ -1003,9 +1008,8 @@ class ClosureLifetimeFixup : public SILFunctionTransform {
 
     if (fixupClosureLifetimes(*getFunction(), checkStackNesting, modifiedCFG)) {
       if (checkStackNesting){
-        StackNesting sn;
         modifiedCFG |=
-            sn.correctStackNesting(getFunction()) == StackNesting::Changes::CFG;
+          StackNesting::fixNesting(getFunction()) == StackNesting::Changes::CFG;
       }
       if (modifiedCFG)
         invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);

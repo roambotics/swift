@@ -38,6 +38,7 @@
 
 using namespace swift;
 using namespace constraints;
+using namespace inference;
 
 #define DEBUG_TYPE "ConstraintSystem"
 
@@ -85,6 +86,8 @@ ConstraintSystem::ConstraintSystem(DeclContext *dc,
       DC->getParentModule()->isMainModule()) {
     Options |= ConstraintSystemFlags::DebugConstraints;
   }
+  if (Context.LangOpts.UseClangFunctionTypes)
+    Options |= ConstraintSystemFlags::UseClangFunctionTypes;
 }
 
 ConstraintSystem::~ConstraintSystem() {
@@ -139,23 +142,16 @@ void ConstraintSystem::mergeEquivalenceClasses(TypeVariableType *typeVar1,
 bool ConstraintSystem::typeVarOccursInType(TypeVariableType *typeVar,
                                            Type type,
                                            bool *involvesOtherTypeVariables) {
-  SmallVector<TypeVariableType *, 4> typeVars;
+  SmallPtrSet<TypeVariableType *, 4> typeVars;
   type->getTypeVariables(typeVars);
-  bool result = false;
-  for (auto referencedTypeVar : typeVars) {
-    if (referencedTypeVar == typeVar) {
-      result = true;
-      if (!involvesOtherTypeVariables || *involvesOtherTypeVariables)
-        break;
 
-      continue;
-    }
-
-    if (involvesOtherTypeVariables)
-      *involvesOtherTypeVariables = true;
+  bool occurs = typeVars.count(typeVar);
+  if (involvesOtherTypeVariables) {
+    *involvesOtherTypeVariables =
+        occurs ? typeVars.size() > 1 : !typeVars.empty();
   }
 
-  return result;
+  return occurs;
 }
 
 void ConstraintSystem::assignFixedType(TypeVariableType *typeVar, Type type,
@@ -1904,6 +1900,7 @@ static std::pair<Type, Type> getTypeOfReferenceWithSpecialTypeCheckingSemantics(
     auto bodyClosure = FunctionType::get(arg, result,
                                          FunctionType::ExtInfoBuilder()
                                              .withNoEscape(true)
+                                             .withAsync(true)
                                              .withThrows(true)
                                              .build());
     FunctionType::Param args[] = {
@@ -1914,6 +1911,7 @@ static std::pair<Type, Type> getTypeOfReferenceWithSpecialTypeCheckingSemantics(
     auto refType = FunctionType::get(args, result,
                                      FunctionType::ExtInfoBuilder()
                                          .withNoEscape(false)
+                                         .withAsync(true)
                                          .withThrows(true)
                                          .build());
     return {refType, refType};
@@ -2297,6 +2295,13 @@ FunctionType::ExtInfo ConstraintSystem::closureEffects(ClosureExpr *expr) {
         return { false, stmt };
       }
 
+      if (auto forEach = dyn_cast<ForEachStmt>(stmt)) {
+        if (forEach->getTryLoc().isValid()) {
+          FoundThrow = true;
+          return { false, nullptr };
+        }
+      }
+
       return { true, stmt };
     }
 
@@ -2332,6 +2337,17 @@ FunctionType::ExtInfo ConstraintSystem::closureEffects(ClosureExpr *expr) {
         return false;
 
       return true;
+    }
+
+    std::pair<bool, Stmt *> walkToStmtPre(Stmt *stmt) override { 
+      if (auto forEach = dyn_cast<ForEachStmt>(stmt)) {
+        if (forEach->getAwaitLoc().isValid()) {
+          FoundAsync = true;
+          return { false, nullptr };
+        }
+      }
+
+      return { true, stmt };
     }
 
   public:
@@ -2799,8 +2815,7 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
     increaseScore(SK_DisfavoredOverload);
   }
 
-  if (choice.getKind() == OverloadChoiceKind::DeclViaUnwrappedOptional &&
-      locator->isLastElement<LocatorPathElt::UnresolvedMember>()) {
+  if (choice.isFallbackMemberOnUnwrappedBase()) {
     increaseScore(SK_UnresolvedMemberViaOptional);
   }
 }
@@ -5296,8 +5311,7 @@ bool ConstraintSystem::isReadOnlyKeyPathComponent(
   return false;
 }
 
-TypeVarBindingProducer::TypeVarBindingProducer(
-    ConstraintSystem::PotentialBindings &bindings)
+TypeVarBindingProducer::TypeVarBindingProducer(PotentialBindings &bindings)
     : BindingProducer(bindings.CS, bindings.TypeVar->getImpl().getLocator()),
       TypeVar(bindings.TypeVar), CanBeNil(bindings.canBeNil()) {
   if (bindings.isDirectHole()) {
@@ -5407,7 +5421,7 @@ bool TypeVarBindingProducer::requiresOptionalAdjustment(
   return false;
 }
 
-ConstraintSystem::PotentialBinding
+PotentialBinding
 TypeVarBindingProducer::getDefaultBinding(Constraint *constraint) const {
   assert(constraint->getKind() == ConstraintKind::Defaultable ||
          constraint->getKind() == ConstraintKind::DefaultClosureType);

@@ -327,6 +327,17 @@ static bool checkObjCWithGenericParams(const ValueDecl *VD, ObjCReason Reason) {
     return true;
   }
 
+  if (GC->getTrailingWhereClause()) {
+    // Diagnose this problem, if asked to.
+    if (Diagnose) {
+      VD->diagnose(diag::objc_invalid_with_generic_requirements,
+                   VD->getDescriptiveKind(), getObjCDiagnosticAttrKind(Reason));
+      describeObjCReason(VD, Reason);
+    }
+
+    return true;
+  }
+
   return false;
 }
 
@@ -377,6 +388,14 @@ static bool checkObjCActorIsolation(const ValueDecl *VD,
 
   switch (auto restriction = ActorIsolationRestriction::forDeclaration(
               const_cast<ValueDecl *>(VD))) {
+  case ActorIsolationRestriction::CrossActorSelf:
+    if (Diagnose) {
+      // FIXME: Substitution map?
+      diagnoseNonConcurrentTypesInReference(
+          const_cast<ValueDecl *>(VD), VD->getDeclContext(), VD->getLoc(),
+          ConcurrentReferenceKind::CrossActor);
+    }
+    return false;
   case ActorIsolationRestriction::ActorSelf:
     // Actor-isolated functions cannot be @objc.
     if (Diagnose) {
@@ -389,6 +408,7 @@ static bool checkObjCActorIsolation(const ValueDecl *VD,
     }
     return true;
 
+  case ActorIsolationRestriction::CrossGlobalActor:
   case ActorIsolationRestriction::GlobalActor:
     // FIXME: Consider whether to limit @objc on global-actor-qualified
     // declarations.
@@ -742,7 +762,8 @@ bool swift::isRepresentableInObjC(
 
     asyncConvention = ForeignAsyncConvention(
         completionHandlerType->getCanonicalType(), completionHandlerParamIndex,
-        completionHandlerErrorParamIndex);
+        completionHandlerErrorParamIndex,
+        /* no flag argument */ None, false);
   } else if (AFD->hasThrows()) {
     // Synchronous throwing functions must map to a particular error convention.
     DeclContext *dc = const_cast<AbstractFunctionDecl *>(AFD);
@@ -1452,6 +1473,9 @@ static void markAsObjC(ValueDecl *D, ObjCReason reason,
 
 
 bool IsObjCRequest::evaluate(Evaluator &evaluator, ValueDecl *VD) const {
+  // Access notes may add attributes that affect this calculus.
+  (void)evaluateOrDefault(evaluator, ApplyAccessNoteRequest{VD}, {});
+
   auto dc = VD->getDeclContext();
   Optional<ObjCReason> isObjC;
   if (dc->getSelfClassDecl() && !isa<TypeDecl>(VD)) {
@@ -1795,11 +1819,8 @@ void markAsObjC(ValueDecl *D, ObjCReason reason,
 
     // Attach the foreign async convention.
     if (inheritedAsyncConvention) {
-      if (!method->hasAsync())
-        method->diagnose(diag::satisfy_async_objc,
-                         isa<ConstructorDecl>(method));
-      else
-        method->setForeignAsyncConvention(*inheritedAsyncConvention);
+      assert(method->hasAsync() && "async objc req offered for sync witness?");
+      method->setForeignAsyncConvention(*inheritedAsyncConvention);
 
     } else if (method->hasAsync()) {
       assert(asyncConvention && "Missing async convention");

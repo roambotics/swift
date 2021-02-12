@@ -50,7 +50,7 @@ static bool canInlineBeginApply(BeginApplyInst *BA) {
   // potentially after the resumption site when there are un-mergeable
   // values alive across it.
   bool hasYield = false;
-  for (auto &B : BA->getReferencedFunctionOrNull()->getBlocks()) {
+  for (auto &B : *BA->getReferencedFunctionOrNull()) {
     if (isa<YieldInst>(B.getTerminator())) {
       if (hasYield) return false;
       hasYield = true;
@@ -314,8 +314,7 @@ protected:
     // of the input location.
     return Loc.hasValue()
                ? Loc.getValue()
-               : MandatoryInlinedLocation::getMandatoryInlinedLocation(
-                     (Decl *)nullptr);
+               : MandatoryInlinedLocation();
   }
 
   const SILDebugScope *remapScope(const SILDebugScope *DS) {
@@ -392,10 +391,10 @@ SILInlineCloner::SILInlineCloner(
   // Compute the SILLocation which should be used by all the inlined
   // instructions.
   if (IKind == InlineKind::PerformanceInline)
-    Loc = InlinedLocation::getInlinedLocation(apply.getLoc());
+    Loc = InlinedLocation(apply.getLoc());
   else {
     assert(IKind == InlineKind::MandatoryInline && "Unknown InlineKind.");
-    Loc = MandatoryInlinedLocation::getMandatoryInlinedLocation(apply.getLoc());
+    Loc = MandatoryInlinedLocation(apply.getLoc());
   }
 
   auto applyScope = apply.getDebugScope();

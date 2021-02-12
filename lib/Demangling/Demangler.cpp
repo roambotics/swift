@@ -765,6 +765,7 @@ recur:
       }
 
     case 'I': return demangleImplFunctionType();
+    case 'J': return createNode(Node::Kind::ConcurrentFunctionType);
     case 'K': return createNode(Node::Kind::ThrowsAnnotation);
     case 'L': return demangleLocalIdentifier();
     case 'M': return demangleMetatype();
@@ -1251,6 +1252,7 @@ NodePointer Demangler::popFunctionType(Node::Kind kind, bool hasClangType) {
   }
   addChild(FuncType, ClangType);
   addChild(FuncType, popNode(Node::Kind::ThrowsAnnotation));
+  addChild(FuncType, popNode(Node::Kind::ConcurrentFunctionType));
   addChild(FuncType, popNode(Node::Kind::AsyncAnnotation));
 
   FuncType = addChild(FuncType, popFunctionParams(Node::Kind::ArgumentTuple));
@@ -1286,6 +1288,9 @@ NodePointer Demangler::popFunctionParamLabels(NodePointer Type) {
   unsigned FirstChildIdx = 0;
   if (FuncType->getChild(FirstChildIdx)->getKind()
         == Node::Kind::ThrowsAnnotation)
+    ++FirstChildIdx;
+  if (FuncType->getChild(FirstChildIdx)->getKind()
+        == Node::Kind::ConcurrentFunctionType)
     ++FirstChildIdx;
   if (FuncType->getChild(FirstChildIdx)->getKind()
         == Node::Kind::AsyncAnnotation)
@@ -1760,12 +1765,12 @@ NodePointer Demangler::demangleImplResultConvention(Node::Kind ConvKind) {
                          createNode(Node::Kind::ImplConvention, attr));
 }
 
-NodePointer Demangler::demangleImplDifferentiability() {
+NodePointer Demangler::demangleImplParameterResultDifferentiability() {
   // Empty string represents default differentiability.
   const char *attr = "";
   if (nextIf('w'))
     attr = "@noDerivative";
-  return createNode(Node::Kind::ImplDifferentiability, attr);
+  return createNode(Node::Kind::ImplParameterResultDifferentiability, attr);
 }
 
 NodePointer Demangler::demangleClangType() {
@@ -1821,10 +1826,19 @@ NodePointer Demangler::demangleImplFunctionType() {
   if (nextIf('e'))
     type->addChild(createNode(Node::Kind::ImplEscaping), *this);
 
-  if (nextIf('d'))
-    type->addChild(createNode(Node::Kind::ImplDifferentiable), *this);
-  if (nextIf('l'))
-    type->addChild(createNode(Node::Kind::ImplLinear), *this);
+  switch ((MangledDifferentiabilityKind)peekChar()) {
+  case MangledDifferentiabilityKind::Normal:  // 'd'
+  case MangledDifferentiabilityKind::Linear:  // 'l'
+  case MangledDifferentiabilityKind::Forward: // 'f'
+  case MangledDifferentiabilityKind::Reverse: // 'r'
+    type->addChild(
+        createNode(
+            Node::Kind::ImplDifferentiabilityKind, (Node::IndexType)nextChar()),
+        *this);
+    break;
+  default:
+    break;
+  }
 
   const char *CAttr = nullptr;
   switch (nextChar()) {
@@ -1872,6 +1886,11 @@ NodePointer Demangler::demangleImplFunctionType() {
   if (CoroAttr)
     type->addChild(createNode(Node::Kind::ImplFunctionAttribute, CoroAttr), *this);
 
+  if (nextIf('h')) {
+    type->addChild(createNode(Node::Kind::ImplFunctionAttribute, "@concurrent"),
+                   *this);
+  }
+
   if (nextIf('H')) {
     type->addChild(createNode(Node::Kind::ImplFunctionAttribute, "@async"),
                    *this);
@@ -1883,14 +1902,14 @@ NodePointer Demangler::demangleImplFunctionType() {
   while (NodePointer Param =
              demangleImplParamConvention(Node::Kind::ImplParameter)) {
     type = addChild(type, Param);
-    if (NodePointer Diff = demangleImplDifferentiability())
+    if (NodePointer Diff = demangleImplParameterResultDifferentiability())
       Param = addChild(Param, Diff);
     ++NumTypesToAdd;
   }
   while (NodePointer Result = demangleImplResultConvention(
                                                     Node::Kind::ImplResult)) {
     type = addChild(type, Result);
-    if (NodePointer Diff = demangleImplDifferentiability())
+    if (NodePointer Diff = demangleImplParameterResultDifferentiability())
       Result = addChild(Result, Diff);
     ++NumTypesToAdd;
   }

@@ -21,6 +21,7 @@
 #ifndef SWIFT_SILOPTIMIZER_PASSMANAGER_SILCOMBINER_H
 #define SWIFT_SILOPTIMIZER_PASSMANAGER_SILCOMBINER_H
 
+#include "swift/Basic/Defer.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
@@ -32,6 +33,7 @@
 #include "swift/SILOptimizer/Utils/CastOptimizer.h"
 #include "swift/SILOptimizer/Utils/Existential.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/SILOptimizer/Utils/OwnershipOptUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -87,6 +89,13 @@ class SILCombiner :
   /// Centralized InstModCallback that we use for certain utility methods.
   InstModCallbacks instModCallbacks;
 
+  /// Dead end blocks cache. SILCombine is already not allowed to mess with CFG
+  /// edges so it is safe to use this here.
+  DeadEndBlocks deBlocks;
+
+  /// External context struct used by \see ownershipRAUWHelper.
+  OwnershipFixupContext ownershipFixupContext;
+
 public:
   SILCombiner(SILOptFunctionBuilder &FuncBuilder, SILBuilder &B,
               AliasAnalysis *AA, DominanceAnalysis *DA,
@@ -117,7 +126,9 @@ public:
             [&](Operand *use, SILValue newValue) {
               use->set(newValue);
               Worklist.add(use->getUser());
-            }) {}
+            }),
+        deBlocks(&B.getFunction()),
+        ownershipFixupContext(instModCallbacks, deBlocks) {}
 
   bool runOnFunction(SILFunction &F);
 
@@ -177,6 +188,12 @@ public:
     return Worklist.replaceInstUsesWith(I, V);
   }
 
+  /// Perform use->set(value) and add use->user to the worklist.
+  void setUseValue(Operand *use, SILValue value) {
+    use->set(value);
+    Worklist.add(use->getUser());
+  }
+
   // This method is to be used when a value is found to be dead,
   // replaceable with another preexisting expression. Here we add all
   // uses of oldValue to the worklist, replace all uses of oldValue
@@ -232,6 +249,8 @@ public:
   SILInstruction *visitBuiltinInst(BuiltinInst *BI);
   SILInstruction *visitCondFailInst(CondFailInst *CFI);
   SILInstruction *visitStrongRetainInst(StrongRetainInst *SRI);
+  SILInstruction *visitCopyValueInst(CopyValueInst *cvi);
+  SILInstruction *visitDestroyValueInst(DestroyValueInst *dvi);
   SILInstruction *visitRefToRawPointerInst(RefToRawPointerInst *RRPI);
   SILInstruction *visitUpcastInst(UpcastInst *UCI);
 
@@ -293,6 +312,8 @@ public:
   SILInstruction *optimizeBuiltinIsConcrete(BuiltinInst *I);
 
   SILInstruction *optimizeBuiltinCOWBufferForReading(BuiltinInst *BI);
+  SILInstruction *optimizeBuiltinCOWBufferForReadingNonOSSA(BuiltinInst *BI);
+  SILInstruction *optimizeBuiltinCOWBufferForReadingOSSA(BuiltinInst *BI);
 
   // Optimize the "trunc_N1_M2" builtin. if N1 is a result of "zext_M1_*" and
   // the following holds true: N1 > M1 and M2>= M1
@@ -316,6 +337,12 @@ public:
   bool tryOptimizeKeypathKVCString(ApplyInst *AI, FuncDecl *calleeFn,
                                   KeyPathInst *kp);
 
+  /// Sinks owned forwarding instructions to their uses if they do not have
+  /// non-debug non-consuming uses. Deletes any debug_values and destroy_values
+  /// when this is done. Returns true if we deleted svi and thus we should not
+  /// try to visit it.
+  bool trySinkOwnedForwardingInst(SingleValueInstruction *svi);
+
   // Optimize concatenation of string literals.
   // Constant-fold concatenation of string literals known at compile-time.
   SILInstruction *optimizeConcatenationOfStringLiterals(ApplyInst *AI);
@@ -324,9 +351,22 @@ public:
   bool optimizeIdentityCastComposition(ApplyInst *FInverse,
                                        StringRef FInverseName, StringRef FName);
 
-private:
+  /// Let \p user and \p value be two forwarding single value instructions  with
+  /// the property that \p value is the value that \p user forwards. In this
+  /// case, this helper routine will eliminate \p value if it can rewrite user
+  /// in terms of \p newValue. This is intended to handle cases where we have
+  /// completely different types so we need to actually create a new instruction
+  /// with a different result type.
+  ///
+  /// \param newValueGenerator Generator that produces the new value to
+  /// use. Conditionally called if we can perform the optimization.
+  SILInstruction *tryFoldComposedUnaryForwardingInstChain(
+      SingleValueInstruction *user, SingleValueInstruction *value,
+      function_ref<SILValue()> newValueGenerator);
+
   InstModCallbacks &getInstModCallbacks() { return instModCallbacks; }
 
+private:
   // Build concrete existential information using findInitExistential.
   Optional<ConcreteOpenedExistentialInfo>
   buildConcreteOpenedExistentialInfo(Operand &ArgOperand);
@@ -392,6 +432,10 @@ private:
   /// Returns true if the results of a try_apply are not used.
   static bool isTryApplyResultNotUsed(UserListTy &AcceptedUses,
                                       TryApplyInst *TAI);
+
+  bool hasOwnership() const {
+    return Builder.hasOwnership();
+  }
 };
 
 } // end namespace swift

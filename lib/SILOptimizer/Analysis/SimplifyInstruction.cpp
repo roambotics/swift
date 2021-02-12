@@ -70,6 +70,7 @@ namespace {
     SILValue visitPointerToThinFunctionInst(PointerToThinFunctionInst *PTTFI);
     SILValue visitBeginAccessInst(BeginAccessInst *BAI);
     SILValue visitMetatypeInst(MetatypeInst *MTI);
+    SILValue visitConvertFunctionInst(ConvertFunctionInst *cfi);
 
     SILValue simplifyOverflowBuiltin(BuiltinInst *BI);
   };
@@ -300,14 +301,6 @@ SILValue InstSimplifier::visitAddressToPointerInst(AddressToPointerInst *ATPI) {
 }
 
 SILValue InstSimplifier::visitPointerToAddressInst(PointerToAddressInst *PTAI) {
-  // (pointer_to_address strict (address_to_pointer x)) -> x
-  //
-  // NOTE: We can not perform this optimization in OSSA without dealing with
-  // interior pointers since we may be escaping an interior pointer address from
-  // a borrow scope.
-  if (PTAI->getFunction()->hasOwnership())
-    return SILValue();
-
   // If this address is not strict, then it cannot be replaced by an address
   // that may be strict.
   if (auto *ATPI = dyn_cast<AddressToPointerInst>(PTAI->getOperand()))
@@ -348,8 +341,13 @@ static SILValue simplifyDeadCast(SingleValueInstruction *Cast) {
   for (Operand *op : Cast->getUses()) {
     switch (op->getUser()->getKind()) {
       case SILInstructionKind::DestroyValueInst:
+        break;
       case SILInstructionKind::StrongReleaseInst:
       case SILInstructionKind::StrongRetainInst:
+        // ref-casts can cast from an Optional<Classtype>. But strong_retain/
+        // strong_release don't accept an optional.
+        if (!Cast->getOperand(0)->getType().isReferenceCounted(Cast->getModule()))
+          return SILValue();
         break;
       default:
         return SILValue();
@@ -487,6 +485,19 @@ SILValue InstSimplifier::visitBeginAccessInst(BeginAccessInst *BAI) {
       })) {
     return BAI->getOperand();
   }
+  return SILValue();
+}
+
+SILValue InstSimplifier::visitConvertFunctionInst(ConvertFunctionInst *cfi) {
+  // Eliminate round trip convert_function. Non round-trip is performed in
+  // SILCombine.
+  //
+  // (convert_function Y->X (convert_function x X->Y)) -> x
+  SILValue convertedValue = lookThroughOwnershipInsts(cfi->getConverted());
+  if (auto *subCFI = dyn_cast<ConvertFunctionInst>(convertedValue))
+    if (subCFI->getConverted()->getType() == cfi->getType())
+      return lookThroughOwnershipInsts(subCFI->getConverted());
+
   return SILValue();
 }
 
@@ -735,31 +746,6 @@ case BuiltinValueKind::id:
 //                           Top Level Entrypoints
 //===----------------------------------------------------------------------===//
 
-SILBasicBlock::iterator
-swift::replaceAllUsesAndErase(SingleValueInstruction *svi, SILValue newValue,
-                              InstModCallbacks &callbacks) {
-  assert(svi != newValue && "Cannot RAUW a value with itself");
-  SILBasicBlock::iterator nextii = std::next(svi->getIterator());
-
-  // Only SingleValueInstructions are currently simplified.
-  while (!svi->use_empty()) {
-    Operand *use = *svi->use_begin();
-    SILInstruction *user = use->getUser();
-    // Erase the end of scope marker.
-    if (isEndOfScopeMarker(user)) {
-      if (&*nextii == user)
-        ++nextii;
-      callbacks.deleteInst(user);
-      continue;
-    }
-    callbacks.setUseValue(use, newValue);
-  }
-
-  callbacks.deleteInst(svi);
-
-  return nextii;
-}
-
 /// Replace an instruction with a simplified result, including any debug uses,
 /// and erase the instruction. If the instruction initiates a scope, do not
 /// replace the end of its scope; it will be deleted along with its parent.
@@ -778,9 +764,9 @@ swift::replaceAllSimplifiedUsesAndErase(SILInstruction *i, SILValue result,
   assert(svi != result && "Cannot RAUW a value with itself");
 
   if (svi->getFunction()->hasOwnership()) {
-    JointPostDominanceSetComputer computer(*deadEndBlocks);
-    OwnershipFixupContext ctx{callbacks, *deadEndBlocks, computer};
-    return ctx.replaceAllUsesAndEraseFixingOwnership(svi, result);
+    OwnershipFixupContext ctx{callbacks, *deadEndBlocks};
+    OwnershipRAUWHelper helper(ctx, svi, result);
+    return helper.perform();
   }
   return replaceAllUsesAndErase(svi, result, callbacks);
 }
@@ -804,19 +790,38 @@ SILValue swift::simplifyOverflowBuiltinInstruction(BuiltinInst *BI) {
 ///
 /// NOTE: We assume that the insertion point associated with the SILValue must
 /// dominate \p i.
-SILValue swift::simplifyInstruction(SILInstruction *i) {
-  SILValue result = InstSimplifier().visit(i);
-  if (!result)
-    return SILValue();
+static SILValue simplifyInstruction(SILInstruction *i) {
+  return InstSimplifier().visit(i);
+}
 
-  // If we have a result, we know that we must have a single value instruction
-  // by assumption since we have not implemented support in the rest of inst
-  // simplify for non-single value instructions. We put the cast here so that
-  // this code is not updated at this point in time.
-  auto *svi = cast<SingleValueInstruction>(i);
-  if (svi->getFunction()->hasOwnership())
-    if (!OwnershipFixupContext::canFixUpOwnershipForRAUW(svi, result))
-      return SILValue();
+SILBasicBlock::iterator swift::simplifyAndReplaceAllSimplifiedUsesAndErase(
+    SILInstruction *i, InstModCallbacks &callbacks,
+    DeadEndBlocks *deadEndBlocks) {
+  auto next = std::next(i->getIterator());
+  auto *svi = dyn_cast<SingleValueInstruction>(i);
+  if (!svi)
+    return next;
+  SILValue result = simplifyInstruction(i);
 
-  return result;
+  // If we fail to simplify or the simplified value returned is our passed in
+  // value, just return std::next since we can't simplify.
+  if (!result || svi == result)
+    return next;
+
+  if (!svi->getFunction()->hasOwnership())
+    return replaceAllUsesAndErase(svi, result, callbacks);
+
+  // If we weren't passed a dead end blocks, we can't optimize without ownership
+  // enabled.
+  if (!deadEndBlocks)
+    return next;
+
+  OwnershipFixupContext ctx{callbacks, *deadEndBlocks};
+  OwnershipRAUWHelper helper(ctx, svi, result);
+
+  // If our RAUW helper is invalid, we do not support RAUWing this case, so
+  // just return next.
+  if (!helper.isValid())
+    return next;
+  return helper.perform();
 }

@@ -1,8 +1,9 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency) | %FileCheck %s --dump-input always
+// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency -parse-as-library) | %FileCheck %s
 // REQUIRES: executable_test
 // REQUIRES: concurrency
-// REQUIRES: OS=macosx
-// REQUIRES: CPU=x86_64
+// XFAIL: windows
+// XFAIL: linux
+// XFAIL: openbsd
 
 import Dispatch
 
@@ -40,4 +41,8 @@ func test_taskGroup_isEmpty() async {
   }
 }
 
-runAsyncAndBlock(test_taskGroup_isEmpty)
+@main struct Main {
+  static func main() async {
+    await test_taskGroup_isEmpty()
+  }
+}

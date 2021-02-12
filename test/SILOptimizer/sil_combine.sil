@@ -821,6 +821,20 @@ bb0(%0 : $C1):
   return %0 : $C1
 }
 
+// strong_retain/strong_release don't accept an Optional<reference>.
+//
+// CHECK-LABEL: sil @dontOptimizeRefCastOfOptional
+// CHECK:   %1 = unchecked_ref_cast %0
+// CHECK:   strong_retain %1
+// CHECK: } // end sil function 'dontOptimizeRefCastOfOptional'
+sil @dontOptimizeRefCastOfOptional : $@convention(thin) (@guaranteed Optional<C1>) -> () {
+bb0(%0 : $Optional<C1>):
+  %1 = unchecked_ref_cast %0 : $Optional<C1> to $C1
+  strong_retain %1 : $C1
+  %3 = tuple ()
+  return %3 : $()
+}
+
 // CHECK-LABEL: sil @dead_end_cow_mutation
 // CHECK: bb0
 // CHECK-NEXT: strong_retain %0
@@ -2942,13 +2956,17 @@ struct OtherError: Error {
   var payload: AnyObject
 }
 
-// CHECK-LABEL: sil @unconditional_existential_box_cast
+// CHECK-LABEL: sil @unconditional_existential_box_cast :
+// CHECK-NOT: unconditional_checked_cast_addr
+// CHECK:      retain_value %0
+// CHECK-NOT: unconditional_checked_cast_addr
 // CHECK:      [[E:%[0-9]+]] = alloc_stack $Error
+// CHECK-NOT: unconditional_checked_cast_addr
 // CHECK:      [[T:%[0-9]+]] = alloc_stack $TestError
-// CHECK-NEXT: retain_value %0
 // CHECK-NEXT: destroy_addr [[E]]
 // CHECK-NEXT: store %0 to [[T]]
 // CHECK-NEXT: struct_element_addr
+// CHECK-NOT: unconditional_checked_cast_addr
 // CHECK:   } // end sil function 'unconditional_existential_box_cast'
 sil @unconditional_existential_box_cast : $@convention(thin) (@guaranteed TestError) -> @owned AnyObject {
 bb0(%0 : $TestError):
@@ -3114,13 +3132,14 @@ bb0(%0 : $TestError):
   return %11 : $AnyObject
 }
 
-// CHECK-LABEL: sil @unconditional_existential_box_cast_not_dominating
+// CHECK-LABEL: sil @unconditional_existential_box_cast_not_dominating :
+// CHECK:      retain_value %0
 // CHECK:      [[E:%[0-9]+]] = alloc_stack $Error
 // CHECK:      [[T:%[0-9]+]] = alloc_stack $TestError
-// CHECK-NEXT: retain_value %0
 // CHECK-NEXT: destroy_addr [[E]]
 // CHECK-NEXT: store %0 to [[T]]
 // CHECK-NEXT: struct_element_addr
+// CHECK-NOT: unconditional_checked_cast_addr
 // CHECK:   } // end sil function 'unconditional_existential_box_cast_not_dominating'
 sil @unconditional_existential_box_cast_not_dominating : $@convention(thin) (@guaranteed TestError) -> @owned AnyObject {
 bb0(%0 : $TestError):
@@ -3152,12 +3171,13 @@ bb4:
 }
 
 // CHECK-LABEL: sil @conditional_existential_box_cast
+// CHECK:      retain_value %0
 // CHECK:      [[E:%[0-9]+]] = alloc_stack $Error
 // CHECK:      [[T:%[0-9]+]] = alloc_stack $TestError
-// CHECK-NEXT: retain_value %0
 // CHECK-NEXT: store %0 to [[T]]
 // CHECK-NEXT: [[I:%[0-9]+]] = integer_literal $Builtin.Int1, -1
 // CHECK-NEXT: cond_br [[I]], bb1, bb2
+// CHECK-NOT: checked_cast_addr_br
 // CHECK:   } // end sil function 'conditional_existential_box_cast'
 sil @conditional_existential_box_cast : $@convention(thin) (@guaranteed TestError) -> @owned AnyObject {
 bb0(%0 : $TestError):
@@ -3186,13 +3206,14 @@ bb2:
 }
 
 // CHECK-LABEL: sil @taking_conditional_existential_box_cast
+// CHECK:      retain_value %0
 // CHECK:      [[E:%[0-9]+]] = alloc_stack $Error
 // CHECK:      [[T:%[0-9]+]] = alloc_stack $TestError
-// CHECK-NEXT: retain_value %0
 // CHECK-NEXT: destroy_addr [[E]]
 // CHECK-NEXT: store %0 to [[T]]
 // CHECK-NEXT: [[I:%[0-9]+]] = integer_literal $Builtin.Int1, -1
 // CHECK-NEXT: cond_br [[I]], bb1, bb2
+// CHECK-NOT: checked_cast_addr_br
 // CHECK:   } // end sil function 'taking_conditional_existential_box_cast'
 sil @taking_conditional_existential_box_cast : $@convention(thin) (@guaranteed TestError) -> @owned AnyObject {
 bb0(%0 : $TestError):
@@ -3818,6 +3839,79 @@ bb0(%0 : $Builtin.Int64):
   return %2 : $Builtin.BridgeObject
 }
 
+struct MyStringObj {
+  @_hasStorage var a: UInt64
+  @_hasStorage var b: Builtin.BridgeObject
+}
+
+struct MyStringGuts {
+  @_hasStorage var o: MyStringObj
+}
+
+struct MyString {
+  @_hasStorage var g: MyStringGuts
+}
+
+// CHECK-LABEL: sil @optimize_arc_with_value_to_bridge_object2
+// CHECK:      bb0(%0 : $UInt64):
+// CHECK-NEXT:   tuple
+// CHECK-NEXT:   return
+// CHECK:      } // end sil function 'optimize_arc_with_value_to_bridge_object2'
+sil @optimize_arc_with_value_to_bridge_object2 : $@convention(thin) (UInt64) -> () {
+bb0(%0 : $UInt64):
+  %1 = integer_literal $Builtin.Int64, -1945555039024054272
+  %2 = value_to_bridge_object %1 : $Builtin.Int64
+  %3 = struct $MyStringObj (%0 : $UInt64, %2 : $Builtin.BridgeObject)
+  %4 = struct $MyStringGuts (%3 : $MyStringObj)
+  %5 = struct $MyString (%4 : $MyStringGuts)
+  release_value %5 : $MyString
+  %7 = tuple ()
+  return %7 : $()
+}
+
+enum EnumWithPayload {
+  case A(UInt64)
+  case B(AnyObject)
+  case C
+}
+
+// CHECK-LABEL: sil @optimize_arc_with_trivial_payload_enum
+// CHECK:       bb0(%0 : $UInt64):
+// CHECK-NEXT:    tuple
+// CHECK-NEXT:    return
+// CHECK:       } // end sil function 'optimize_arc_with_trivial_payload_enum'
+sil @optimize_arc_with_trivial_payload_enum : $@convention(thin) (UInt64) -> () {
+bb0(%0 : $UInt64):
+  %1 = enum $EnumWithPayload, #EnumWithPayload.A!enumelt, %0 : $UInt64
+  release_value %1 : $EnumWithPayload
+  %7 = tuple ()
+  return %7 : $()
+}
+
+// CHECK-LABEL: sil @optimize_arc_with_trivial_enum
+// CHECK:       bb0:
+// CHECK-NEXT:    tuple
+// CHECK-NEXT:    return
+// CHECK:       } // end sil function 'optimize_arc_with_trivial_enum'
+sil @optimize_arc_with_trivial_enum : $@convention(thin) () -> () {
+bb0:
+  %1 = enum $EnumWithPayload, #EnumWithPayload.C!enumelt
+  release_value %1 : $EnumWithPayload
+  %7 = tuple ()
+  return %7 : $()
+}
+
+// CHECK-LABEL: sil @dont_remove_release_of_nontrivial_enum
+// CHECK:         strong_release %0
+// CHECK:       } // end sil function 'dont_remove_release_of_nontrivial_enum'
+sil @dont_remove_release_of_nontrivial_enum : $@convention(thin) (@guaranteed AnyObject) -> () {
+bb0(%0 : $AnyObject):
+  %1 = enum $EnumWithPayload, #EnumWithPayload.B!enumelt, %0 : $AnyObject
+  release_value %1 : $EnumWithPayload
+  %7 = tuple ()
+  return %7 : $()
+}
+
 // CHECK-LABEL: sil @optimize_stringObject_bit_operations
 // CHECK:      bb0:
 // CHECK-NEXT:   %0 = integer_literal $Builtin.Int64, 4611686018427387904
@@ -4067,17 +4161,4 @@ bb0:
   %0 = global_addr @initialized_var_global : $*Int64
   %1 = load %0 : $*Int64
   return %1 : $Int64
-}
-
-// Check for disabled optimization of unchecked_bitwise_cast to unchecked_ref_cast in ossa
-// This test can be optimized when ossa is supported in the SILCombine for unchecked_bitwise_cast
-// CHECK-LABEL: sil [ossa] @refcast :
-// CHECK: unchecked_bitwise_cast
-// CHECK-LABEL: } // end sil function 'refcast'
-sil [ossa] @refcast : $@convention(thin) (@owned Klass) -> @owned Optional<Klass> {
-bb0(%0 : @owned $Klass):
-  %1 = unchecked_bitwise_cast %0 : $Klass to $Optional<Klass>
-  %2 = copy_value %1 : $Optional<Klass>
-  destroy_value %0 : $Klass
-  return %2 : $Optional<Klass>
 }

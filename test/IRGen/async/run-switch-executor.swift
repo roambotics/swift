@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-build-swift -Xfrontend -enable-experimental-concurrency %s -module-name main -o %t/main
+// RUN: %target-build-swift -Xfrontend -enable-experimental-concurrency %s -parse-as-library -module-name main -o %t/main
 // RUN: %target-codesign %t/main
 // RUN: %target-run %t/main | %FileCheck %s
 
@@ -11,10 +11,12 @@
 // UNSUPPORTED: CPU=arm64e
 // UNSUPPORTED: OS=windows-msvc
 
+// REQUIRES: rdar72893124
+
 // Currently this test just checks if nothing crashes.
 // TODO: also check if the current executor is the correct one.
 
-final actor class MyActor {
+final actor MyActor {
   var p: Int
 
   @inline(never)
@@ -48,12 +50,14 @@ final actor class MyActor {
 // CHECK: switch back
 // CHECK: 66
 
-// FIXME: this breaks if we release the actor during the runAsyncAndBlock
+// FIXME: this breaks if we release the actor during the async main
 // because we don't switch off it before dropping the actor reference.
 let a = MyActor(p: 27)
-runAsyncAndBlock {
-  print("run")
-  await print(a.testit())
+@main struct Main {
+  static func main() async {
+    print("run")
+    await print(a.testit())
+  }
 }
 
 

@@ -26,6 +26,7 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeWalker.h"
 #include "swift/AST/Types.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Statistic.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -1528,4 +1529,25 @@ FrontendStatsTracer::getTraceFormatter<const ProtocolConformance *>() {
 void swift::simple_display(llvm::raw_ostream &out,
                            const ProtocolConformance *conf) {
   conf->printName(out);
+}
+
+SourceLoc swift::extractNearestSourceLoc(const ProtocolConformance *conformance) {
+  return extractNearestSourceLoc(conformance->getDeclContext());
+}
+
+void swift::simple_display(llvm::raw_ostream &out, ProtocolConformanceRef conformanceRef) {
+  if (conformanceRef.isAbstract()) {
+    simple_display(out, conformanceRef.getAbstract());
+  } else if (conformanceRef.isConcrete()) {
+    simple_display(out, conformanceRef.getConcrete());
+  }
+}
+
+SourceLoc swift::extractNearestSourceLoc(const ProtocolConformanceRef conformanceRef) {
+  if (conformanceRef.isAbstract()) {
+    return extractNearestSourceLoc(conformanceRef.getAbstract());
+  } else if (conformanceRef.isConcrete()) {
+    return extractNearestSourceLoc(conformanceRef.getConcrete());
+  }
+  return SourceLoc();
 }

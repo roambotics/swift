@@ -58,7 +58,7 @@ using llvm::SmallDenseSet;
 using llvm::SmallMapVector;
 using llvm::SmallSet;
 
-/// This flag enables experimental `@differentiable(linear)` function
+/// This flag enables experimental `@differentiable(_linear)` function
 /// transposition.
 static llvm::cl::opt<bool> EnableExperimentalLinearMapTransposition(
     "enable-experimental-linear-map-transposition", llvm::cl::init(false));
@@ -163,7 +163,7 @@ static bool diagnoseNoReturn(ADContext &context, SILFunction *original,
 static bool diagnoseUnsupportedControlFlow(ADContext &context,
                                            SILFunction *original,
                                            DifferentiationInvoker invoker) {
-  if (original->getBlocks().size() <= 1)
+  if (original->size() <= 1)
     return false;
   // Diagnose unsupported branching terminators.
   for (auto &bb : *original) {
@@ -416,7 +416,7 @@ static SILValue reapplyFunctionConversion(
     // `differentiable_function` of the function-typed thunk argument.
     auto isReabstractionThunkCallee = [&]() -> bool {
       auto *fri = dyn_cast<FunctionRefInst>(oldFunc);
-      return fri && fri->getReferencedFunctionOrNull()->isThunk() ==
+      return fri && fri->getReferencedFunction()->isThunk() ==
                         IsReabstractionThunk;
     };
     if (isReabstractionThunkCallee()) {
@@ -513,8 +513,7 @@ emitDerivativeFunctionReference(
   if (auto *originalFRI =
           peerThroughFunctionConversions<FunctionRefInst>(original)) {
     auto loc = originalFRI->getLoc();
-    auto *originalFn = originalFRI->getReferencedFunctionOrNull();
-    assert(originalFn);
+    auto *originalFn = originalFRI->getReferencedFunction();
     auto originalFnTy = originalFn->getLoweredFunctionType();
     auto *desiredParameterIndices = desiredConfig.parameterIndices;
     auto *desiredResultIndices = desiredConfig.resultIndices;
@@ -926,7 +925,7 @@ bool DifferentiationTransformer::canonicalizeDifferentiabilityWitness(
         !witness->getVJP()) {
       // JVP and differential generation do not currently support functions with
       // multiple basic blocks.
-      if (witness->getOriginalFunction()->getBlocks().size() > 1) {
+      if (witness->getOriginalFunction()->size() > 1) {
         context.emitNondifferentiabilityError(
             witness->getOriginalFunction()->getLocation().getSourceLoc(),
             invoker, diag::autodiff_jvp_control_flow_not_supported);
@@ -1005,7 +1004,7 @@ static SILValue promoteCurryThunkApplicationToDifferentiableFunction(
   auto *thunkRef = dyn_cast<FunctionRefInst>(ai->getCallee());
   if (!thunkRef)
     return nullptr;
-  auto *thunk = thunkRef->getReferencedFunctionOrNull();
+  auto *thunk = thunkRef->getReferencedFunction();
   auto thunkTy = thunk->getLoweredFunctionType();
   auto thunkResult = thunkTy->getSingleResult();
   auto resultFnTy = thunkResult.getInterfaceType()->getAs<SILFunctionType>();
@@ -1023,7 +1022,7 @@ static SILValue promoteCurryThunkApplicationToDifferentiableFunction(
   auto diffResultFnTy = resultFnTy->getWithExtInfo(
       resultFnTy->getExtInfo()
           .intoBuilder()
-          .withDifferentiabilityKind(DifferentiabilityKind::Normal)
+          .withDifferentiabilityKind(DifferentiabilityKind::Reverse)
           .build());
   auto newThunkResult = thunkResult.getWithInterfaceType(diffResultFnTy);
   auto thunkType = SILFunctionType::get(
@@ -1292,7 +1291,7 @@ void DifferentiationTransformer::foldDifferentiableFunctionExtraction(
 bool DifferentiationTransformer::processDifferentiableFunctionInst(
     DifferentiableFunctionInst *dfi) {
   PrettyStackTraceSILNode dfiTrace("canonicalizing `differentiable_function`",
-                                   cast<SILInstruction>(dfi));
+                                   dfi);
   PrettyStackTraceSILFunction fnTrace("...in", dfi->getFunction());
   LLVM_DEBUG({
     auto &s = getADDebugStream() << "Processing DifferentiableFunctionInst:\n";
@@ -1332,8 +1331,7 @@ bool DifferentiationTransformer::processDifferentiableFunctionInst(
 
 bool DifferentiationTransformer::processLinearFunctionInst(
     LinearFunctionInst *lfi) {
-  PrettyStackTraceSILNode dfiTrace("canonicalizing `linear_function`",
-                                   cast<SILInstruction>(lfi));
+  PrettyStackTraceSILNode dfiTrace("canonicalizing `linear_function`", lfi);
   PrettyStackTraceSILFunction fnTrace("...in", lfi->getFunction());
   LLVM_DEBUG({
     auto &s = getADDebugStream() << "Processing LinearFunctionInst:\n";

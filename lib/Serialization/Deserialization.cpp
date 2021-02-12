@@ -18,6 +18,7 @@
 #include "swift/AST/AutoDiff.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/Expr.h"
+#include "swift/AST/ForeignAsyncConvention.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Initializer.h"
@@ -34,6 +35,7 @@
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Statistic.h"
+#include "clang/AST/DeclTemplate.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
@@ -1239,6 +1241,7 @@ static void filterValues(Type expectedTy, ModuleDecl *expectedModule,
   values.erase(newEnd, values.end());
 }
 
+/// Look for nested types in all files of \p extensionModule except from the \p thisFile.
 static TypeDecl *
 findNestedTypeDeclInModule(FileUnit *thisFile, ModuleDecl *extensionModule,
                            Identifier name, NominalTypeDecl *parent)  {
@@ -1252,6 +1255,13 @@ findNestedTypeDeclInModule(FileUnit *thisFile, ModuleDecl *extensionModule,
     }
   }
   return nullptr;
+}
+
+/// Look for nested types in all files of \p extensionModule.
+static TypeDecl *
+findNestedTypeDeclInModule(ModuleDecl *extensionModule,
+                           Identifier name, NominalTypeDecl *parent)  {
+  return findNestedTypeDeclInModule(nullptr, extensionModule, name, parent);
 }
 
 Expected<Decl *>
@@ -1500,10 +1510,11 @@ ModuleFile::resolveCrossReference(ModuleID MID, uint32_t pathLen) {
           extensionModule = baseType->getModuleContext();
 
         // Fault in extensions, then ask every file in the module.
+        // We include the current file in the search because the cross reference
+        // may involve a nested type of this file.
         (void)baseType->getExtensions();
         auto *nestedType =
-            findNestedTypeDeclInModule(getFile(), extensionModule,
-                                       memberName, baseType);
+            findNestedTypeDeclInModule(extensionModule, memberName, baseType);
 
         // For clang module units, also search tables in the overlays.
         if (!nestedType) {
@@ -2221,6 +2232,28 @@ getActualAutoDiffDerivativeFunctionKind(uint8_t raw) {
   return None;
 }
 
+/// Translate from the Serialization differentiability kind enum values to the
+/// AST strongly-typed enum.
+///
+/// The former is guaranteed to be stable, but may not reflect this version of
+/// the AST.
+static Optional<swift::DifferentiabilityKind>
+getActualDifferentiabilityKind(uint8_t diffKind) {
+  switch (diffKind) {
+#define CASE(THE_DK) \
+  case (uint8_t)serialization::DifferentiabilityKind::THE_DK: \
+    return swift::DifferentiabilityKind::THE_DK;
+  CASE(NonDifferentiable)
+  CASE(Forward)
+  CASE(Reverse)
+  CASE(Normal)
+  CASE(Linear)
+#undef CASE
+  default:
+    return None;
+  }
+}
+
 void ModuleFile::configureStorage(AbstractStorageDecl *decl,
                                   uint8_t rawOpaqueReadOwnership,
                                   uint8_t rawReadImplKind,
@@ -2696,6 +2729,8 @@ public:
 
     if (auto errorConvention = MF.maybeReadForeignErrorConvention())
       ctor->setForeignErrorConvention(*errorConvention);
+    if (auto asyncConvention = MF.maybeReadForeignAsyncConvention())
+      ctor->setForeignAsyncConvention(*asyncConvention);
 
     if (auto bodyText = MF.maybeReadInlinableBodyText())
       ctor->setBodyStringRepresentation(*bodyText);
@@ -3181,6 +3216,8 @@ public:
 
     if (auto errorConvention = MF.maybeReadForeignErrorConvention())
       fn->setForeignErrorConvention(*errorConvention);
+    if (auto asyncConvention = MF.maybeReadForeignAsyncConvention())
+      fn->setForeignAsyncConvention(*asyncConvention);
 
     if (auto bodyText = MF.maybeReadInlinableBodyText())
       fn->setBodyStringRepresentation(*bodyText);
@@ -3547,6 +3584,7 @@ public:
     IdentifierID nameID;
     DeclContextID contextID;
     bool isImplicit, isObjC;
+    bool isExplicitActorDecl;
     bool inheritsSuperclassInitializers;
     bool hasMissingDesignatedInits;
     GenericSignatureID genericSigID;
@@ -3556,6 +3594,7 @@ public:
     ArrayRef<uint64_t> rawInheritedAndDependencyIDs;
     decls_block::ClassLayout::readRecord(scratch, nameID, contextID,
                                          isImplicit, isObjC,
+                                         isExplicitActorDecl,
                                          inheritsSuperclassInitializers,
                                          hasMissingDesignatedInits,
                                          genericSigID, superclassID,
@@ -3584,7 +3623,8 @@ public:
       return declOrOffset;
 
     auto theClass = MF.createDecl<ClassDecl>(SourceLoc(), name, SourceLoc(),
-                                             None, genericParams, DC);
+                                             None, genericParams, DC,
+                                             isExplicitActorDecl);
     declOrOffset = theClass;
 
     theClass->setGenericSignature(MF.getGenericSignature(genericSigID));
@@ -4378,20 +4418,24 @@ llvm::Error DeclDeserializer::deserializeDeclAttributes() {
 
       case decls_block::Differentiable_DECL_ATTR: {
         bool isImplicit;
-        bool linear;
+        uint64_t rawDiffKind;
         GenericSignatureID derivativeGenSigId;
         ArrayRef<uint64_t> parameters;
 
         serialization::decls_block::DifferentiableDeclAttrLayout::readRecord(
-            scratch, isImplicit, linear, derivativeGenSigId, parameters);
+            scratch, isImplicit, rawDiffKind, derivativeGenSigId,
+            parameters);
 
+        auto diffKind = getActualDifferentiabilityKind(rawDiffKind);
+        if (!diffKind)
+          MF.fatal();
         auto derivativeGenSig = MF.getGenericSignature(derivativeGenSigId);
         llvm::SmallBitVector parametersBitVector(parameters.size());
         for (unsigned i : indices(parameters))
           parametersBitVector[i] = parameters[i];
         auto *indices = IndexSubset::get(ctx, parametersBitVector);
         auto *diffAttr = DifferentiableAttr::create(
-            ctx, isImplicit, SourceLoc(), SourceRange(), linear,
+            ctx, isImplicit, SourceLoc(), SourceRange(), *diffKind,
             /*parsedParameters*/ {}, /*trailingWhereClause*/ nullptr);
 
         // Cache parameter indices so that they can set later.
@@ -4642,26 +4686,6 @@ getActualFunctionTypeRepresentation(uint8_t rep) {
   CASE(Block)
   CASE(Thin)
   CASE(CFunctionPointer)
-#undef CASE
-  default:
-    return None;
-  }
-}
-
-/// Translate from the Serialization differentiability kind enum values to the
-/// AST strongly-typed enum.
-///
-/// The former is guaranteed to be stable, but may not reflect this version of
-/// the AST.
-static Optional<swift::DifferentiabilityKind>
-getActualDifferentiabilityKind(uint8_t rep) {
-  switch (rep) {
-#define CASE(THE_CC) \
-  case (uint8_t)serialization::DifferentiabilityKind::THE_CC: \
-    return swift::DifferentiabilityKind::THE_CC;
-  CASE(NonDifferentiable)
-  CASE(Normal)
-  CASE(Linear)
 #undef CASE
   default:
     return None;
@@ -5035,19 +5059,19 @@ public:
                                             bool isGeneric) {
     TypeID resultID;
     uint8_t rawRepresentation, rawDiffKind;
-    bool noescape = false, async, throws;
+    bool noescape = false, concurrent, async, throws;
     GenericSignature genericSig;
     TypeID clangTypeID;
 
     if (!isGeneric) {
       decls_block::FunctionTypeLayout::readRecord(
           scratch, resultID, rawRepresentation, clangTypeID,
-          noescape, async, throws, rawDiffKind);
+          noescape, concurrent, async, throws, rawDiffKind);
     } else {
       GenericSignatureID rawGenericSig;
       decls_block::GenericFunctionTypeLayout::readRecord(
-          scratch, resultID, rawRepresentation, async, throws, rawDiffKind,
-          rawGenericSig);
+          scratch, resultID, rawRepresentation, concurrent, async, throws,
+          rawDiffKind, rawGenericSig);
       genericSig = MF.getGenericSignature(rawGenericSig);
       clangTypeID = 0;
     }
@@ -5070,6 +5094,7 @@ public:
 
     auto info = FunctionType::ExtInfoBuilder(*representation, noescape, throws,
                                              *diffKind, clangFunctionType)
+                    .withConcurrent(concurrent)
                     .withAsync(async)
                     .build();
 
@@ -5353,6 +5378,31 @@ public:
       genericArgs.push_back(argTy.get());
     }
 
+    if (auto clangDecl = nominal->getClangDecl()) {
+      if (auto ctd = dyn_cast<clang::ClassTemplateDecl>(clangDecl)) {
+        auto clangImporter = static_cast<ClangImporter *>(
+            nominal->getASTContext().getClangModuleLoader());
+
+        SmallVector<Type, 2> typesOfGenericArgs;
+        for (auto arg : genericArgs) {
+          typesOfGenericArgs.push_back(arg);
+        }
+
+        SmallVector<clang::TemplateArgument, 2> templateArguments;
+        std::unique_ptr<TemplateInstantiationError> error =
+            ctx.getClangTemplateArguments(ctd->getTemplateParameters(),
+                                          typesOfGenericArgs,
+                                          templateArguments);
+
+        auto instantiation = clangImporter->instantiateCXXClassTemplate(
+            const_cast<clang::ClassTemplateDecl *>(ctd), templateArguments);
+
+        instantiation->setTemplateInstantiationType(
+            BoundGenericType::get(nominal, parentTy, genericArgs));
+        return instantiation->getDeclaredInterfaceType();
+      }
+    }
+
     return BoundGenericType::get(nominal, parentTy, genericArgs);
   }
 
@@ -5407,6 +5457,7 @@ public:
     uint8_t rawRepresentation;
     uint8_t rawDiffKind;
     bool pseudogeneric = false;
+    bool concurrent;
     bool noescape;
     bool hasErrorResult;
     unsigned numParams;
@@ -5419,6 +5470,7 @@ public:
     ClangTypeID clangFunctionTypeID;
 
     decls_block::SILFunctionTypeLayout::readRecord(scratch,
+                                             concurrent,
                                              async,
                                              rawCoroutineKind,
                                              rawCalleeConvention,
@@ -5456,7 +5508,7 @@ public:
 
     auto extInfo =
         SILFunctionType::ExtInfoBuilder(*representation, pseudogeneric,
-                                        noescape, async, *diffKind, 
+                                        noescape, concurrent, async, *diffKind,
                                         clangFunctionType)
             .build();
 
@@ -6447,4 +6499,59 @@ Optional<ForeignErrorConvention> ModuleFile::maybeReadForeignErrorConvention() {
   }
 
   llvm_unreachable("Unhandled ForeignErrorConvention in switch.");
+}
+
+Optional<ForeignAsyncConvention> ModuleFile::maybeReadForeignAsyncConvention() {
+  using namespace decls_block;
+
+  SmallVector<uint64_t, 8> scratch;
+
+  BCOffsetRAII restoreOffset(DeclTypeCursor);
+
+  llvm::BitstreamEntry next =
+      fatalIfUnexpected(DeclTypeCursor.advance(AF_DontPopBlockAtEnd));
+  if (next.Kind != llvm::BitstreamEntry::Record)
+    return None;
+
+  unsigned recKind =
+      fatalIfUnexpected(DeclTypeCursor.readRecord(next.ID, scratch));
+  switch (recKind) {
+  case FOREIGN_ASYNC_CONVENTION:
+    restoreOffset.reset();
+    break;
+
+  default:
+    return None;
+  }
+
+  TypeID completionHandlerTypeID;
+  unsigned completionHandlerParameterIndex;
+  unsigned rawErrorParameterIndex;
+  unsigned rawErrorFlagParameterIndex;
+  bool errorFlagPolarity;
+  ForeignAsyncConventionLayout::readRecord(scratch,
+                                           completionHandlerTypeID,
+                                           completionHandlerParameterIndex,
+                                           rawErrorParameterIndex,
+                                           rawErrorFlagParameterIndex,
+                                           errorFlagPolarity);
+
+  Type completionHandlerType = getType(completionHandlerTypeID);
+  CanType canCompletionHandlerType;
+  if (completionHandlerType)
+    canCompletionHandlerType = completionHandlerType->getCanonicalType();
+
+  // Decode the error and flag parameters.
+  Optional<unsigned> completionHandlerErrorParamIndex;
+  if (rawErrorParameterIndex > 0)
+    completionHandlerErrorParamIndex = rawErrorParameterIndex - 1;
+  Optional<unsigned> completionHandlerErrorFlagParamIndex;
+  if (rawErrorFlagParameterIndex > 0)
+    completionHandlerErrorFlagParamIndex = rawErrorFlagParameterIndex - 1;
+
+  return ForeignAsyncConvention(
+      canCompletionHandlerType, completionHandlerParameterIndex,
+      completionHandlerErrorParamIndex,
+      completionHandlerErrorFlagParamIndex,
+      errorFlagPolarity);
 }

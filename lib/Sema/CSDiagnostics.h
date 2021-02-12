@@ -703,19 +703,29 @@ public:
 };
 
 /// Diagnose errors related to converting function type which
-/// isn't explicitly '@escaping' to some other type.
-class NoEscapeFuncToTypeConversionFailure final : public ContextualFailure {
+/// isn't explicitly '@escaping' or '@concurrent' to some other type.
+class AttributedFuncToTypeConversionFailure final : public ContextualFailure {
 public:
-  NoEscapeFuncToTypeConversionFailure(const Solution &solution, Type fromType,
-                                      Type toType, ConstraintLocator *locator)
-      : ContextualFailure(solution, fromType, toType, locator) {}
+  enum AttributeKind {
+    Escaping,
+    Concurrent,
+  };
+
+  const AttributeKind attributeKind;
+
+  AttributedFuncToTypeConversionFailure(const Solution &solution, Type fromType,
+                                        Type toType, ConstraintLocator *locator,
+                                        AttributeKind attributeKind)
+      : ContextualFailure(solution, fromType, toType, locator),
+        attributeKind(attributeKind) {}
 
   bool diagnoseAsError() override;
 
 private:
-  /// Emit tailored diagnostics for no-escape parameter conversions e.g.
-  /// passing such parameter as an @escaping argument, or trying to
-  /// assign it to a variable which expects @escaping function.
+  /// Emit tailored diagnostics for no-escape/non-concurrent parameter
+  /// conversions e.g. passing such parameter as an @escaping or @concurrent
+  /// argument, or trying to assign it to a variable which expects @escaping
+  /// or @concurrent function.
   bool diagnoseParameterUse() const;
 };
 
@@ -2377,6 +2387,86 @@ public:
                                        DeclNameRef member,
                                        ConstraintLocator *locator)
       : FailureDiagnostic(solution, locator), Member(member) {}
+
+  bool diagnoseAsError() override;
+};
+
+class CheckedCastBaseFailure : public ContextualFailure {
+protected:
+  CheckedCastKind CastKind;
+  CheckedCastExpr *CastExpr;
+
+public:
+  CheckedCastBaseFailure(const Solution &solution, Type fromType, Type toType,
+                         CheckedCastKind kind, ConstraintLocator *locator)
+      : ContextualFailure(solution, fromType, toType, locator), CastKind(kind) {
+    CastExpr = castToExpr<CheckedCastExpr>(locator->getAnchor());
+  }
+
+  bool isCastTypeIUO() const;
+
+  SourceRange getCastRange() const;
+
+protected:
+  SourceRange getFromRange() const {
+    return CastExpr->getSubExpr()->getSourceRange();
+  }
+
+  SourceRange getToRange() const {
+    return CastExpr->getCastTypeRepr()->getSourceRange();
+  }
+};
+
+/// Warn situations where the compiler can statically know a runtime
+/// optional checked cast involved in checked cast are coercible.
+class CoercibleOptionalCheckedCastFailure final
+    : public CheckedCastBaseFailure {
+public:
+  CoercibleOptionalCheckedCastFailure(const Solution &solution, Type fromType,
+                                      Type toType, CheckedCastKind kind,
+                                      ConstraintLocator *locator)
+      : CheckedCastBaseFailure(solution, fromType, toType, kind, locator) {}
+
+  bool diagnoseAsError() override;
+
+private:
+  std::tuple<Type, Type, unsigned> unwrapedTypes() const;
+
+  bool diagnoseIfExpr() const;
+
+  bool diagnoseForcedCastExpr() const;
+
+  bool diagnoseConditionalCastExpr() const;
+};
+
+/// Warn situations where the compiler can statically know a runtime
+/// checked cast always succeed.
+class AlwaysSucceedCheckedCastFailure final : public CheckedCastBaseFailure {
+public:
+  AlwaysSucceedCheckedCastFailure(const Solution &solution, Type fromType,
+                                  Type toType, CheckedCastKind kind,
+                                  ConstraintLocator *locator)
+      : CheckedCastBaseFailure(solution, fromType, toType, kind, locator) {}
+
+  bool diagnoseAsError() override;
+
+private:
+  bool diagnoseIfExpr() const;
+
+  bool diagnoseForcedCastExpr() const;
+
+  bool diagnoseConditionalCastExpr() const;
+};
+
+/// Warn situations where the compiler can statically know a runtime
+/// check is not supported.
+class UnsupportedRuntimeCheckedCastFailure final
+    : public CheckedCastBaseFailure {
+public:
+  UnsupportedRuntimeCheckedCastFailure(const Solution &solution, Type fromType,
+                                       Type toType, CheckedCastKind kind,
+                                       ConstraintLocator *locator)
+      : CheckedCastBaseFailure(solution, fromType, toType, kind, locator) {}
 
   bool diagnoseAsError() override;
 };

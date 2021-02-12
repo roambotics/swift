@@ -499,9 +499,12 @@ Address irgen::projectBlockStorageCapture(IRGenFunction &IGF,
 }
 
 const TypeInfo *TypeConverter::convertFunctionType(SILFunctionType *T) {
-  // Handle `@differentiable` and `@differentiable(linear)` functions.
+  // Handle `@differentiable` functions.
   switch (T->getDifferentiabilityKind()) {
+  // TODO: Ban `Normal` and `Forward` cases.
   case DifferentiabilityKind::Normal:
+  case DifferentiabilityKind::Reverse:
+  case DifferentiabilityKind::Forward:
     return convertNormalDifferentiableFunctionType(T);
   case DifferentiabilityKind::Linear:
     return convertLinearDifferentiableFunctionType(T);
@@ -820,6 +823,7 @@ public:
 
     // Forward the indirect return values. We might have to reabstract the
     // return value.
+    bool useSRet = true;
     if (nativeResultSchema.requiresIndirect()) {
       assert(origNativeSchema.requiresIndirect());
       auto resultAddr = origParams.claimNext();
@@ -827,6 +831,7 @@ public:
           resultAddr, IGM.getStoragePointerType(origConv.getSILResultType(
                           IGM.getMaximalTypeExpansionContext())));
       args.add(resultAddr);
+      useSRet = false;
     } else if (origNativeSchema.requiresIndirect()) {
       assert(!nativeResultSchema.requiresIndirect());
       auto stackAddr = outResultTI.allocateStack(
@@ -838,14 +843,22 @@ public:
           resultValueAddr, IGM.getStoragePointerType(origConv.getSILResultType(
                                IGM.getMaximalTypeExpansionContext())));
       args.add(resultAddr.getAddress());
+      useSRet = false;
+    } else if (!origNativeSchema.empty()) {
+      useSRet = false;
     }
-
+    useSRet = useSRet && origConv.getNumIndirectSILResults() == 1;
     for (auto resultType : origConv.getIndirectSILResultTypes(
              IGM.getMaximalTypeExpansionContext())) {
       auto addr = origParams.claimNext();
       addr = subIGF.Builder.CreateBitCast(
           addr, IGM.getStoragePointerType(resultType));
+      auto useOpaque =
+          useSRet && !isa<FixedTypeInfo>(IGM.getTypeInfo(resultType));
+      if (useOpaque)
+        addr = subIGF.Builder.CreateBitCast(addr, IGM.OpaquePtrTy);
       args.add(addr);
+      useSRet = false;
     }
 
     // Reemit the parameters as unsubstituted.
@@ -2385,7 +2398,7 @@ void irgen::emitBlockHeader(IRGenFunction &IGF,
 
 llvm::Function *IRGenFunction::getOrCreateResumePrjFn() {
   auto name = "__swift_async_resume_project_context";
-  return cast<llvm::Function>(IGM.getOrCreateHelperFunction(
+  auto Fn = cast<llvm::Function>(IGM.getOrCreateHelperFunction(
       name, IGM.Int8PtrTy, {IGM.Int8PtrTy},
       [&](IRGenFunction &IGF) {
         auto it = IGF.CurFn->arg_begin();
@@ -2398,9 +2411,30 @@ llvm::Function *IRGenFunction::getOrCreateResumePrjFn() {
               PointerAuthInfo::emit(IGF, schema, addr, PointerAuthEntity());
           callerContext = emitPointerAuthAuth(IGF, callerContext, authInfo);
         }
+        // TODO: remove this once all platforms support lowering the intrinsic.
+        // At the time of this writing only arm64 supports it.
+        if (IGM.TargetInfo.canUseSwiftAsyncContextAddrIntrinsic()) {
+          llvm::Value *storedCallerContext = callerContext;
+          auto contextLocationInExtendedFrame =
+              Address(Builder.CreateIntrinsicCall(
+                          llvm::Intrinsic::swift_async_context_addr, {}),
+                      IGM.getPointerAlignment());
+          // On arm64e we need to sign this pointer address discriminated
+          // with 0xc31a and process dependent key.
+          if (auto schema = IGF.IGM.getOptions()
+                                .PointerAuth.AsyncContextExtendedFrameEntry) {
+            auto authInfo = PointerAuthInfo::emit(
+                IGF, schema, contextLocationInExtendedFrame.getAddress(),
+                PointerAuthEntity());
+            storedCallerContext = emitPointerAuthSign(IGF, storedCallerContext, authInfo);
+          }
+          Builder.CreateStore(storedCallerContext, contextLocationInExtendedFrame);
+        }
         Builder.CreateRet(callerContext);
       },
       false /*isNoInline*/));
+  Fn->addFnAttr(llvm::Attribute::AlwaysInline);
+  return Fn;
 }
 llvm::Function *
 IRGenFunction::createAsyncDispatchFn(const FunctionPointer &fnPtr,
@@ -2538,6 +2572,11 @@ llvm::Function *IRGenFunction::createAsyncSuspendFn() {
   auto *resumeAddr = Builder.CreateStructGEP(task, 4);
   Builder.CreateStore(resumeFunction, Address(resumeAddr, ptrAlign));
   auto *contextAddr = Builder.CreateStructGEP(task, 5);
+  if (auto schema = IGM.getOptions().PointerAuth.TaskResumeContext) {
+    auto authInfo = PointerAuthInfo::emit(suspendIGF, schema, contextAddr,
+                                          PointerAuthEntity());
+    context = emitPointerAuthSign(suspendIGF, context, authInfo);
+  }
   Builder.CreateStore(context, Address(contextAddr, ptrAlign));
   auto *suspendCall = Builder.CreateCall(
       IGM.getTaskSwitchFuncFn(),

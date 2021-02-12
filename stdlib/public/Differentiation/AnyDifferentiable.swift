@@ -24,7 +24,6 @@ import Swift
 internal protocol _AnyDifferentiableBox {
   // `Differentiable` requirements.
   mutating func _move(along direction: AnyDerivative)
-  var _zeroTangentVectorInitializer: () -> AnyDerivative { get }
 
   /// The underlying base value, type-erased to `Any`.
   var _typeErasedBase: Any { get }
@@ -60,10 +59,6 @@ internal struct _ConcreteDifferentiableBox<T: Differentiable>: _AnyDifferentiabl
     }
     _base.move(along: directionBase)
   }
-
-  var _zeroTangentVectorInitializer: () -> AnyDerivative {
-    { AnyDerivative(_base.zeroTangentVector) }
-  }
 }
 
 public struct AnyDifferentiable: Differentiable {
@@ -79,7 +74,7 @@ public struct AnyDifferentiable: Differentiable {
   }
 
   /// Creates a type-erased derivative from the given derivative.
-  @differentiable
+  @differentiable(reverse)
   public init<T: Differentiable>(_ base: T) {
     self._box = _ConcreteDifferentiableBox<T>(base)
   }
@@ -107,10 +102,6 @@ public struct AnyDifferentiable: Differentiable {
 
   public mutating func move(along direction: TangentVector) {
     _box._move(along: direction)
-  }
-
-  public var zeroTangentVectorInitializer: () -> TangentVector {
-    _box._zeroTangentVectorInitializer
   }
 }
 
@@ -263,7 +254,7 @@ public struct AnyDerivative: Differentiable & AdditiveArithmetic {
 
   /// Creates a type-erased derivative from the given derivative.
   @inlinable
-  @differentiable
+  @differentiable(reverse)
   public init<T>(_ base: T) where T: Differentiable, T.TangentVector == T {
     self._box = _ConcreteDerivativeBox<T>(base)
   }

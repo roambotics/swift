@@ -1163,7 +1163,7 @@ llvm::SmallString<32> getTargetDependentLibraryOption(const llvm::Triple &T,
   llvm::SmallString<32> buffer;
 
   if (T.isWindowsMSVCEnvironment() || T.isWindowsItaniumEnvironment()) {
-    bool quote = library.find(' ') != StringRef::npos;
+    bool quote = library.contains(' ');
 
     buffer += "/DEFAULTLIB:";
     if (quote)
@@ -1174,7 +1174,7 @@ llvm::SmallString<32> getTargetDependentLibraryOption(const llvm::Triple &T,
     if (quote)
       buffer += '"';
   } else if (T.isPS4()) {
-    bool quote = library.find(' ') != StringRef::npos;
+    bool quote = library.contains(' ');
 
     buffer += "\01";
     if (quote)
@@ -1569,6 +1569,16 @@ bool IRGenModule::finalize() {
   if (DebugInfo)
     DebugInfo->finalize();
   cleanupClangCodeGenMetadata();
+
+  // Clean up DSOLocal & DLLImport attributes, they cannot be applied together.
+  // The imported declarations are marked as DSO local by default.
+  for (auto &GV : Module.globals())
+    if (GV.hasDLLImportStorageClass())
+      GV.setDSOLocal(false);
+
+  for (auto &F : Module.functions())
+    if (F.hasDLLImportStorageClass())
+      F.setDSOLocal(false);
 
   return true;
 }

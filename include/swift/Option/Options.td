@@ -108,12 +108,6 @@ def driver_show_incremental : Flag<["-"], "driver-show-incremental">,
 def driver_show_job_lifecycle : Flag<["-"], "driver-show-job-lifecycle">,
   InternalDebugOpt,
   HelpText<"Show every step in the lifecycle of driver jobs">;
-def driver_dump_swift_ranges : Flag<["-"], "driver-dump-swift-ranges">,
-  InternalDebugOpt,
-  HelpText<"Show the unparsed ranges read upon startup">;
-def driver_dump_compiled_source_diffs : Flag<["-"], "driver-dump-compiled-source-diffs">,
-  InternalDebugOpt,
-  HelpText<"Show the compiled source diffs read upon startup">;
 def driver_use_filelists : Flag<["-"], "driver-use-filelists">,
   InternalDebugOpt, HelpText<"Pass input files as filelists whenever possible">;
 def driver_filelist_threshold : Separate<["-"], "driver-filelist-threshold">,
@@ -146,26 +140,6 @@ Flag<["-"], "enable-only-one-dependency-file">, Flags<[DoesNotAffectIncrementalB
 def disable_only_one_dependency_file :
 Flag<["-"], "disable-only-one-dependency-file">, Flags<[DoesNotAffectIncrementalBuild]>,
  HelpText<"Disables incremental build optimization that only produces one dependencies file">;
-
-
-def enable_source_range_dependencies :
-Flag<["-"], "enable-source-range-dependencies">, Flags<[]>,
-HelpText<"Try using source range information">;
-
-
-def driver_compare_incremental_schemes :
-Flag<["-"], "driver-compare-incremental-schemes">, Flags<[DoesNotAffectIncrementalBuild]>,
-HelpText<"Print a simple message comparing dependencies with source ranges (w/ fallback)">;
-
-def driver_compare_incremental_schemes_path :
-Separate<["-"], "driver-compare-incremental-schemes-path">, Flags<[ArgumentIsPath,DoesNotAffectIncrementalBuild]>,
-HelpText<"Path to use for machine-readable comparison">,
-MetaVarName<"<path>">;
-
-def driver_compare_incremental_schemes_path_EQ :
-Joined<["-"], "driver-compare-incremental-schemes-path=">, Flags<[]>,
-Alias<driver_compare_incremental_schemes_path>;
-
 
 def driver_verify_fine_grained_dependency_graph_after_every_import :
 Flag<["-"], "driver-verify-fine-grained-dependency-graph-after-every-import">,
@@ -551,6 +525,13 @@ def lto : Joined<["-"], "lto=">,
   Flags<[FrontendOption, NoInteractiveOption]>,
   HelpText<"Specify the LTO type to either 'llvm-thin' or 'llvm-full'">;
 
+def access_notes_path : Separate<["-"], "access-notes-path">,
+  Flags<[FrontendOption, ArgumentIsPath]>,
+  HelpText<"Specify YAML file to override attributes on Swift declarations in this module">;
+def access_notes_path_EQ : Joined<["-"], "access-notes-path=">,
+  Flags<[FrontendOption, ArgumentIsPath]>,
+  Alias<access_notes_path>;
+
 // Experimental feature options
 
 // Note: this flag will be removed when JVP/differential generation in the
@@ -793,7 +774,7 @@ def debug_info_store_invocation : Flag<["-"], "debug-info-store-invocation">,
 
 // Assert configuration identifiers.
 def AssertConfig : Separate<["-"], "assert-config">,
-  Flags<[FrontendOption]>,
+  Flags<[FrontendOption, ModuleInterfaceOption]>,
   HelpText<"Specify the assert_configuration replacement. "
            "Possible values are Debug, Release, Unchecked, DisableReplacement.">;
 
@@ -1184,5 +1165,16 @@ def disable_autolinking_runtime_compatibility_dynamic_replacements
       Flags<[ FrontendOption ]>,
       HelpText<"Do not use autolinking for the dynamic replacement runtime "
                "compatibility library">;
+
+def emit_symbol_graph: Flag<["-"], "emit-symbol-graph">,
+  Flags<[FrontendOption, NoInteractiveOption, DoesNotAffectIncrementalBuild,
+         SupplementaryOutput, HelpHidden]>,
+  HelpText<"Emit a symbol graph">;
+
+def emit_symbol_graph_dir : Separate<["-"], "emit-symbol-graph-dir">,
+  Flags<[FrontendOption, NoInteractiveOption, DoesNotAffectIncrementalBuild,
+         ArgumentIsPath, SupplementaryOutput, HelpHidden]>,
+  HelpText<"Emit a symbol graph to directory <dir>">,
+  MetaVarName<"<dir>">;
 
 include "FrontendOptions.td"

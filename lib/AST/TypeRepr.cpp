@@ -151,11 +151,25 @@ void AttributedTypeRepr::printAttrs(ASTPrinter &Printer,
     Printer.printSimpleAttr("@noDerivative") << " ";
 
   if (hasAttr(TAK_differentiable)) {
-    if (Attrs.isLinear()) {
-      Printer.printSimpleAttr("@differentiable(linear)") << " ";
-    } else {
-      Printer.printSimpleAttr("@differentiable") << " ";
+    Printer.callPrintStructurePre(PrintStructureKind::BuiltinAttribute);
+    Printer.printAttrName("@differentiable");
+    switch (Attrs.differentiabilityKind) {
+    case DifferentiabilityKind::Normal:
+      break;
+    case DifferentiabilityKind::Forward:
+      Printer << "(_forward)";
+      break;
+    case DifferentiabilityKind::Reverse:
+      Printer << "(reverse)";
+      break;
+    case DifferentiabilityKind::Linear:
+      Printer << "(_linear)";
+      break;
+    case DifferentiabilityKind::NonDifferentiable:
+      llvm_unreachable("Unexpected case 'NonDifferentiable'");
     }
+    Printer << ' ';
+    Printer.printStructurePost(PrintStructureKind::BuiltinAttribute);
   }
 
   if (hasAttr(TAK_thin))
@@ -225,6 +239,10 @@ void FunctionTypeRepr::printImpl(ASTPrinter &Printer,
                                  const PrintOptions &Opts) const {
   Printer.callPrintStructurePre(PrintStructureKind::FunctionType);
   printTypeRepr(ArgsTy, Printer, Opts);
+  if (isAsync()) {
+    Printer << " ";
+    Printer.printKeyword("async", Opts);
+  }
   if (isThrowing()) {
     Printer << " ";
     Printer.printKeyword("throws", Opts);

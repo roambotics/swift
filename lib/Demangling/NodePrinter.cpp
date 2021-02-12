@@ -400,11 +400,10 @@ private:
     case Node::Kind::Index:
     case Node::Kind::IVarInitializer:
     case Node::Kind::IVarDestroyer:
-    case Node::Kind::ImplDifferentiable:
-    case Node::Kind::ImplLinear:
+    case Node::Kind::ImplDifferentiabilityKind:
     case Node::Kind::ImplEscaping:
     case Node::Kind::ImplConvention:
-    case Node::Kind::ImplDifferentiability:
+    case Node::Kind::ImplParameterResultDifferentiability:
     case Node::Kind::ImplFunctionAttribute:
     case Node::Kind::ImplFunctionConvention:
     case Node::Kind::ImplFunctionConventionName:
@@ -518,6 +517,7 @@ private:
     case Node::Kind::ReflectionMetadataSuperclassDescriptor:
     case Node::Kind::ResilientProtocolWitnessTable:
     case Node::Kind::GenericTypeParamDecl:
+    case Node::Kind::ConcurrentFunctionType:
     case Node::Kind::AsyncAnnotation:
     case Node::Kind::ThrowsAnnotation:
     case Node::Kind::EmptyList:
@@ -762,7 +762,7 @@ private:
   }
 
   void printFunctionType(NodePointer LabelList, NodePointer node) {
-    if (node->getNumChildren() < 2 || node->getNumChildren() > 5) {
+    if (node->getNumChildren() < 2 || node->getNumChildren() > 6) {
       setInvalid();
       return;
     }
@@ -802,15 +802,15 @@ private:
     case Node::Kind::EscapingDifferentiableFunctionType:
       Printer << "@escaping @differentiable "; break;
     case Node::Kind::LinearFunctionType:
-      Printer << "@differentiable(linear) "; break;
+      Printer << "@differentiable(_linear) "; break;
     case Node::Kind::EscapingLinearFunctionType:
-      Printer << "@escaping @differentiable(linear) "; break;
+      Printer << "@escaping @differentiable(_linear) "; break;
     default:
       assert(false && "Unhandled function type in printFunctionType!");
     }
 
     unsigned startIndex = 0;
-    bool isAsync = false, isThrows = false;
+    bool isConcurrent = false, isAsync = false, isThrows = false;
     if (node->getChild(startIndex)->getKind() == Node::Kind::ClangType) {
       // handled earlier
       ++startIndex;
@@ -819,10 +819,18 @@ private:
       ++startIndex;
       isThrows = true;
     }
+    if (node->getChild(startIndex)->getKind()
+            == Node::Kind::ConcurrentFunctionType) {
+      ++startIndex;
+      isConcurrent = true;
+    }
     if (node->getChild(startIndex)->getKind() == Node::Kind::AsyncAnnotation) {
       ++startIndex;
       isAsync = true;
     }
+
+    if (isConcurrent)
+      Printer << "@concurrent ";
 
     printFunctionParameters(LabelList, node->getChild(startIndex),
                             Options.ShowFunctionArgumentTypes);
@@ -2168,11 +2176,23 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     return nullptr;
   case Node::Kind::LabelList:
     return nullptr;
-  case Node::Kind::ImplDifferentiable:
+  case Node::Kind::ImplDifferentiabilityKind:
     Printer << "@differentiable";
-    return nullptr;
-  case Node::Kind::ImplLinear:
-    Printer << "@differentiable(linear)";
+    switch ((MangledDifferentiabilityKind)Node->getIndex()) {
+    case MangledDifferentiabilityKind::Normal:
+      break;
+    case MangledDifferentiabilityKind::Linear:
+      Printer << "(_linear)";
+      break;
+    case MangledDifferentiabilityKind::Forward:
+      Printer << "(_forward)";
+      break;
+    case MangledDifferentiabilityKind::Reverse:
+      Printer << "(reverse)";
+      break;
+    case MangledDifferentiabilityKind::NonDifferentiable:
+      assert(false && "Impossible case 'NonDifferentiable'");
+    }
     return nullptr;
   case Node::Kind::ImplEscaping:
     Printer << "@escaping";
@@ -2180,7 +2200,7 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
   case Node::Kind::ImplConvention:
     Printer << Node->getText();
     return nullptr;
-  case Node::Kind::ImplDifferentiability:
+  case Node::Kind::ImplParameterResultDifferentiability:
     // Skip if text is empty.
     if (Node->getText().empty())
       return nullptr;
@@ -2398,6 +2418,9 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     print(Node->getChild(0));
     return nullptr;
 
+  case Node::Kind::ConcurrentFunctionType:
+    Printer<< "@concurrent ";
+    return nullptr;
   case Node::Kind::AsyncAnnotation:
     Printer<< " async ";
     return nullptr;

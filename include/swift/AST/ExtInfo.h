@@ -169,6 +169,45 @@ enum class SILFunctionTypeRepresentation : uint8_t {
   Closure,
 };
 
+/// Returns true if the function with this convention doesn't carry a context.
+constexpr bool
+isThinRepresentation(FunctionTypeRepresentation rep) {
+  switch (rep) {
+    case FunctionTypeRepresentation::Swift:
+    case FunctionTypeRepresentation::Block:
+      return false;
+    case FunctionTypeRepresentation::Thin:
+    case FunctionTypeRepresentation::CFunctionPointer:
+      return true;
+  }
+  llvm_unreachable("Unhandled FunctionTypeRepresentation in switch.");
+}
+
+/// Returns true if the function with this convention doesn't carry a context.
+constexpr bool
+isThinRepresentation(SILFunctionTypeRepresentation rep) {
+  switch (rep) {
+  case SILFunctionTypeRepresentation::Thick:
+  case SILFunctionTypeRepresentation::Block:
+    return false;
+  case SILFunctionTypeRepresentation::Thin:
+  case SILFunctionTypeRepresentation::Method:
+  case SILFunctionTypeRepresentation::ObjCMethod:
+  case SILFunctionTypeRepresentation::WitnessMethod:
+  case SILFunctionTypeRepresentation::CFunctionPointer:
+  case SILFunctionTypeRepresentation::Closure:
+    return true;
+  }
+  llvm_unreachable("Unhandled SILFunctionTypeRepresentation in switch.");
+}
+
+/// Returns true if the function with this convention carries a context.
+template <typename Repr>
+constexpr bool
+isThickRepresentation(Repr repr) {
+  return !isThinRepresentation(repr);
+}
+
 constexpr SILFunctionTypeRepresentation
 convertRepresentation(FunctionTypeRepresentation rep) {
   switch (rep) {
@@ -250,20 +289,21 @@ class ASTExtInfoBuilder {
   friend AnyFunctionType;
   friend ASTExtInfo;
 
-  // If bits are added or removed, then TypeBase::AnyFunctionTypeBits
+  // If bits are added or removed, then TypeBase::NumAFTExtInfoBits
   // and NumMaskBits must be updated, and they must match.
   //
-  //   |representation|noEscape|async|throws|differentiability|
-  //   |    0 .. 3    |    4   |  5  |   6  |      7 .. 8     |
+  //   |representation|noEscape|concurrent|async|throws|differentiability|
+  //   |    0 .. 3    |    4   |    5     |  6  |   7  |     8 .. 10    |
   //
   enum : unsigned {
     RepresentationMask = 0xF << 0,
     NoEscapeMask = 1 << 4,
-    AsyncMask = 1 << 5,
-    ThrowsMask = 1 << 6,
-    DifferentiabilityMaskOffset = 7,
-    DifferentiabilityMask = 0x3 << DifferentiabilityMaskOffset,
-    NumMaskBits = 9
+    ConcurrentMask = 1 << 5,
+    AsyncMask = 1 << 6,
+    ThrowsMask = 1 << 7,
+    DifferentiabilityMaskOffset = 8,
+    DifferentiabilityMask = 0x7 << DifferentiabilityMaskOffset,
+    NumMaskBits = 11
   };
 
   unsigned bits; // Naturally sized for speed.
@@ -311,6 +351,8 @@ public:
 
   constexpr bool isNoEscape() const { return bits & NoEscapeMask; }
 
+  constexpr bool isConcurrent() const { return bits & ConcurrentMask; }
+
   constexpr bool isAsync() const { return bits & AsyncMask; }
 
   constexpr bool isThrowing() const { return bits & ThrowsMask; }
@@ -350,19 +392,7 @@ public:
 
   /// True if the function representation carries context.
   constexpr bool hasContext() const {
-    switch (getSILRepresentation()) {
-    case SILFunctionTypeRepresentation::Thick:
-    case SILFunctionTypeRepresentation::Block:
-      return true;
-    case SILFunctionTypeRepresentation::Thin:
-    case SILFunctionTypeRepresentation::Method:
-    case SILFunctionTypeRepresentation::ObjCMethod:
-    case SILFunctionTypeRepresentation::WitnessMethod:
-    case SILFunctionTypeRepresentation::CFunctionPointer:
-    case SILFunctionTypeRepresentation::Closure:
-      return false;
-    }
-    llvm_unreachable("Unhandled SILFunctionTypeRepresentation in switch.");
+    return isThickRepresentation(getSILRepresentation());
   }
 
   // Note that we don't have setters. That is by design, use
@@ -377,6 +407,12 @@ public:
   ASTExtInfoBuilder withNoEscape(bool noEscape = true) const {
     return ASTExtInfoBuilder(noEscape ? (bits | NoEscapeMask)
                                       : (bits & ~NoEscapeMask),
+                             clangTypeInfo);
+  }
+  LLVM_NODISCARD
+  ASTExtInfoBuilder withConcurrent(bool concurrent = true) const {
+    return ASTExtInfoBuilder(concurrent ? (bits | ConcurrentMask)
+                                        : (bits & ~ConcurrentMask),
                              clangTypeInfo);
   }
   LLVM_NODISCARD
@@ -470,6 +506,8 @@ public:
 
   constexpr bool isNoEscape() const { return builder.isNoEscape(); }
 
+  constexpr bool isConcurrent() const { return builder.isConcurrent(); }
+
   constexpr bool isAsync() const { return builder.isAsync(); }
 
   constexpr bool isThrowing() const { return builder.isThrowing(); }
@@ -500,6 +538,14 @@ public:
   LLVM_NODISCARD
   ASTExtInfo withNoEscape(bool noEscape = true) const {
     return builder.withNoEscape(noEscape).build();
+  }
+
+  /// Helper method for changing only the concurrent field.
+  ///
+  /// Prefer using \c ASTExtInfoBuilder::withConcurrent for chaining.
+  LLVM_NODISCARD
+  ASTExtInfo withConcurrent(bool concurrent = true) const {
+    return builder.withConcurrent(concurrent).build();
   }
 
   /// Helper method for changing only the throws field.
@@ -569,17 +615,18 @@ class SILExtInfoBuilder {
   // If bits are added or removed, then TypeBase::SILFunctionTypeBits
   // and NumMaskBits must be updated, and they must match.
 
-  //   |representation|pseudogeneric| noescape | async | differentiability|
-  //   |    0 .. 3    |      4      |     5    |   6   |      7 .. 8     |
+  //   |representation|pseudogeneric| noescape | concurrent | async |differentiability|
+  //   |    0 .. 3    |      4      |     5    |     6      |   7   |     8 .. 10     |
   //
   enum : unsigned {
     RepresentationMask = 0xF << 0,
     PseudogenericMask = 1 << 4,
     NoEscapeMask = 1 << 5,
-    AsyncMask = 1 << 6,
-    DifferentiabilityMaskOffset = 7,
-    DifferentiabilityMask = 0x3 << DifferentiabilityMaskOffset,
-    NumMaskBits = 9
+    ConcurrentMask = 1 << 6,
+    AsyncMask = 1 << 7,
+    DifferentiabilityMaskOffset = 8,
+    DifferentiabilityMask = 0x7 << DifferentiabilityMaskOffset,
+    NumMaskBits = 11
   };
 
   unsigned bits; // Naturally sized for speed.
@@ -593,10 +640,13 @@ class SILExtInfoBuilder {
       : bits(bits), clangTypeInfo(clangTypeInfo.getCanonical()) {}
 
   static constexpr unsigned makeBits(Representation rep, bool isPseudogeneric,
-                                     bool isNoEscape, bool isAsync,
+                                     bool isNoEscape, bool isConcurrent,
+                                     bool isAsync,
                                      DifferentiabilityKind diffKind) {
     return ((unsigned)rep) | (isPseudogeneric ? PseudogenericMask : 0) |
-           (isNoEscape ? NoEscapeMask : 0) | (isAsync ? AsyncMask : 0) |
+           (isNoEscape ? NoEscapeMask : 0) |
+           (isConcurrent ? ConcurrentMask : 0) |
+           (isAsync ? AsyncMask : 0) |
            (((unsigned)diffKind << DifferentiabilityMaskOffset) &
             DifferentiabilityMask);
   }
@@ -606,21 +656,22 @@ public:
   /// non-pseudogeneric, non-differentiable.
   SILExtInfoBuilder()
       : SILExtInfoBuilder(makeBits(SILFunctionTypeRepresentation::Thick, false,
-                                   false, false,
+                                   false, false, false,
                                    DifferentiabilityKind::NonDifferentiable),
                           ClangTypeInfo(nullptr)) {}
 
   SILExtInfoBuilder(Representation rep, bool isPseudogeneric, bool isNoEscape,
-                    bool isAsync, DifferentiabilityKind diffKind,
-                    const clang::Type *type)
-      : SILExtInfoBuilder(makeBits(rep, isPseudogeneric, isNoEscape, isAsync,
-                                   diffKind),
+                    bool isConcurrent, bool isAsync,
+                    DifferentiabilityKind diffKind, const clang::Type *type)
+      : SILExtInfoBuilder(makeBits(rep, isPseudogeneric, isNoEscape,
+                                   isConcurrent, isAsync, diffKind),
                           ClangTypeInfo(type)) {}
 
   // Constructor for polymorphic type.
   SILExtInfoBuilder(ASTExtInfoBuilder info, bool isPseudogeneric)
       : SILExtInfoBuilder(makeBits(info.getSILRepresentation(), isPseudogeneric,
-                                   info.isNoEscape(), info.isAsync(),
+                                   info.isNoEscape(), info.isConcurrent(),
+                                   info.isAsync(),
                                    info.getDifferentiabilityKind()),
                           info.getClangTypeInfo()) {}
 
@@ -644,6 +695,8 @@ public:
 
   // Is this function guaranteed to be no-escape by the type system?
   constexpr bool isNoEscape() const { return bits & NoEscapeMask; }
+
+  constexpr bool isConcurrent() const { return bits & ConcurrentMask; }
 
   constexpr bool isAsync() const { return bits & AsyncMask; }
 
@@ -714,6 +767,12 @@ public:
                              clangTypeInfo);
   }
   LLVM_NODISCARD
+  SILExtInfoBuilder withConcurrent(bool isConcurrent = true) const {
+    return SILExtInfoBuilder(isConcurrent ? (bits | ConcurrentMask)
+                                          : (bits & ~ConcurrentMask),
+                             clangTypeInfo);
+  }
+  LLVM_NODISCARD
   SILExtInfoBuilder withAsync(bool isAsync = true) const {
     return SILExtInfoBuilder(isAsync ? (bits | AsyncMask) : (bits & ~AsyncMask),
                              clangTypeInfo);
@@ -776,7 +835,7 @@ public:
   /// A default ExtInfo but with a Thin convention.
   static SILExtInfo getThin() {
     return SILExtInfoBuilder(SILExtInfoBuilder::Representation::Thin, false,
-                             false, false,
+                             false, false, false,
                              DifferentiabilityKind::NonDifferentiable, nullptr)
         .build();
   }
@@ -799,6 +858,8 @@ public:
   constexpr bool isPseudogeneric() const { return builder.isPseudogeneric(); }
 
   constexpr bool isNoEscape() const { return builder.isNoEscape(); }
+
+  constexpr bool isConcurrent() const { return builder.isConcurrent(); }
 
   constexpr bool isAsync() const { return builder.isAsync(); }
 
@@ -828,6 +889,9 @@ public:
     return builder.withNoEscape(noEscape).build();
   }
   
+  SILExtInfo withConcurrent(bool isConcurrent = true) const {
+    return builder.withConcurrent(isConcurrent).build();
+  }
 
   SILExtInfo withAsync(bool isAsync = true) const {
     return builder.withAsync(isAsync).build();

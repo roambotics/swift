@@ -18,6 +18,11 @@ module ConstructorsObjC {
   requires cplusplus
 }
 
+module Destructors {
+  header "destructors.h"
+  requires cplusplus
+}
+
 module LoadableTypes {
   header "loadable-types.h"
   requires cplusplus
@@ -56,4 +61,8 @@ module DebugInfo {
 module NestedRecords {
   header "nested-records.h"
   requires cplusplus
+}
+
+module LinkedRecords {
+  header "linked-records.h"
 }

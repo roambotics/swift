@@ -804,7 +804,7 @@ CanSILFunctionType SILFunctionType::getAutoDiffDerivativeFunctionType(
     auto fnParamType = dyn_cast<SILFunctionType>(fnParam.getInterfaceType());
     assert(fnParamType);
     auto diffFnType = fnParamType->getWithDifferentiability(
-        DifferentiabilityKind::Normal, parameterIndices, resultIndices);
+        DifferentiabilityKind::Reverse, parameterIndices, resultIndices);
     newParameters.back() = fnParam.getWithInterfaceType(diffFnType);
   }
 
@@ -1464,7 +1464,7 @@ static bool isClangTypeMoreIndirectThanSubstType(TypeConverter &TC,
 
     // swift_newtypes are always passed directly
     if (auto typedefTy = clangTy->getAs<clang::TypedefType>()) {
-      if (typedefTy->getDecl()->getAttr<clang::SwiftNewtypeAttr>())
+      if (typedefTy->getDecl()->getAttr<clang::SwiftNewTypeAttr>())
         return false;
     }
 
@@ -2106,7 +2106,10 @@ static CanSILFunctionType getSILFunctionType(
   assert(
       (!foreignInfo.Async || substFnInterfaceType->getExtInfo().isAsync())
       && "foreignAsync was set but function type is not async?");
-  
+
+  // Map '@concurrent' to the appropriate `@concurrent` modifier.
+  bool isConcurrent = substFnInterfaceType->getExtInfo().isConcurrent();
+
   // Map 'async' to the appropriate `@async` modifier.
   bool isAsync = false;
   if (substFnInterfaceType->getExtInfo().isAsync() && !foreignInfo.Async) {
@@ -2137,9 +2140,6 @@ static CanSILFunctionType getSILFunctionType(
                                  substFormalResultType);
 
   bool shouldBuildSubstFunctionType = [&]{
-    if (!TC.Context.LangOpts.EnableSubstSILFunctionTypesForFunctionValues)
-      return false;
-
     // We always use substituted function types for coroutines that are
     // being lowered in the context of another coroutine, which is to say,
     // for class override thunks.  This is required to make the yields
@@ -2224,6 +2224,7 @@ static CanSILFunctionType getSILFunctionType(
   }
   auto silExtInfo = extInfoBuilder.withClangFunctionType(clangType)
                         .withIsPseudogeneric(pseudogeneric)
+                        .withConcurrent(isConcurrent)
                         .withAsync(isAsync)
                         .build();
 
@@ -2485,7 +2486,7 @@ static CanSILFunctionType getNativeSILFunctionType(
   case SILFunctionType::Representation::Method:
   case SILFunctionType::Representation::Closure:
   case SILFunctionType::Representation::WitnessMethod: {
-    switch (constant ? constant->kind : SILDeclRef::Kind::Func) {
+    switch (origConstant ? origConstant->kind : SILDeclRef::Kind::Func) {
     case SILDeclRef::Kind::Initializer:
     case SILDeclRef::Kind::EnumElement:
       return getSILFunctionTypeForConventions(DefaultInitializerConventions());

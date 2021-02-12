@@ -1,8 +1,9 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency) | %FileCheck %s --dump-input=always
+// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency -parse-as-library) | %FileCheck %s --dump-input=always
 // REQUIRES: executable_test
 // REQUIRES: concurrency
-// REQUIRES: OS=macosx
-// REQUIRES: CPU=x86_64
+// XFAIL: windows
+// XFAIL: linux
+// XFAIL: openbsd
 
 import func Foundation.sleep
 
@@ -14,13 +15,15 @@ func test_skipCallingNext() async {
       print("group.add { \(n) }")
       await group.add { () async -> Int in
         sleep(1)
-        print("  inside group.add { \(n) } (canceled: \(await Task.isCancelled()))")
+        let c = await Task.__unsafeCurrentAsync().isCancelled
+        print("  inside group.add { \(n) } (canceled: \(c))")
         return n
       }
     }
 
     // return immediately; the group should wait on the tasks anyway
-    print("return immediately 0 (canceled: \(await Task.isCancelled()))")
+    let c = await Task.__unsafeCurrentAsync().isCancelled
+    print("return immediately 0 (canceled: \(c))")
     return 0
   }
 
@@ -36,5 +39,9 @@ func test_skipCallingNext() async {
   assert(result == 0)
 }
 
-runAsyncAndBlock(test_skipCallingNext)
+@main struct Main {
+  static func main() async {
+    await test_skipCallingNext()
+  }
+}
 

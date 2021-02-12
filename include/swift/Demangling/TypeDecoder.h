@@ -19,14 +19,19 @@
 #define SWIFT_DEMANGLING_TYPEDECODER_H
 
 #include "TypeLookupError.h"
-#include "swift/ABI/MetadataValues.h"
 #include "swift/Basic/LLVM.h"
+#include "swift/ABI/MetadataValues.h"
+#include "swift/AST/LayoutConstraintKind.h"
+#include "swift/AST/RequirementBase.h"
+#include "swift/Basic/Unreachable.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/NamespaceMacros.h"
 #include "swift/Runtime/Portability.h"
-#include "swift/Basic/Unreachable.h"
 #include "swift/Strings.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/PointerIntPair.h"
+#include "llvm/ADT/StringSwitch.h"
 #include <vector>
 
 namespace swift {
@@ -232,60 +237,71 @@ enum class ImplFunctionRepresentation {
 
 enum class ImplFunctionDifferentiabilityKind {
   NonDifferentiable,
+  Forward,
+  Reverse,
   Normal,
-  Linear
+  Linear,
 };
 
 class ImplFunctionTypeFlags {
   unsigned Rep : 3;
   unsigned Pseudogeneric : 1;
   unsigned Escaping : 1;
+  unsigned Concurrent : 1;
   unsigned Async : 1;
-  unsigned DifferentiabilityKind : 2;
+  unsigned DifferentiabilityKind : 3;
 
 public:
   ImplFunctionTypeFlags()
-      : Rep(0), Pseudogeneric(0), Escaping(0), Async(0),
+      : Rep(0), Pseudogeneric(0), Escaping(0), Concurrent(0), Async(0),
         DifferentiabilityKind(0) {}
 
   ImplFunctionTypeFlags(ImplFunctionRepresentation rep, bool pseudogeneric,
-                        bool noescape, bool async,
+                        bool noescape, bool concurrent, bool async,
                         ImplFunctionDifferentiabilityKind diffKind)
       : Rep(unsigned(rep)), Pseudogeneric(pseudogeneric), Escaping(noescape),
-        Async(async), DifferentiabilityKind(unsigned(diffKind)) {}
+        Concurrent(concurrent), Async(async),
+        DifferentiabilityKind(unsigned(diffKind)) {}
 
   ImplFunctionTypeFlags
   withRepresentation(ImplFunctionRepresentation rep) const {
     return ImplFunctionTypeFlags(
-        rep, Pseudogeneric, Escaping, Async,
+        rep, Pseudogeneric, Escaping, Concurrent, Async,
         ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
+  }
+
+  ImplFunctionTypeFlags
+  withConcurrent() const {
+    return ImplFunctionTypeFlags(
+        ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, true,
+        Async, ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
   }
 
   ImplFunctionTypeFlags
   withAsync() const {
     return ImplFunctionTypeFlags(
-        ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, true,
-        ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
+        ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, Concurrent,
+        true, ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
   }
 
   ImplFunctionTypeFlags
   withEscaping() const {
     return ImplFunctionTypeFlags(
-        ImplFunctionRepresentation(Rep), Pseudogeneric, true, Async,
+        ImplFunctionRepresentation(Rep), Pseudogeneric, true, Concurrent, Async,
         ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
   }
   
   ImplFunctionTypeFlags
   withPseudogeneric() const {
     return ImplFunctionTypeFlags(
-        ImplFunctionRepresentation(Rep), true, Escaping, Async,
+        ImplFunctionRepresentation(Rep), true, Escaping, Concurrent, Async,
         ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
   }
 
   ImplFunctionTypeFlags
   withDifferentiabilityKind(ImplFunctionDifferentiabilityKind diffKind) const {
     return ImplFunctionTypeFlags(ImplFunctionRepresentation(Rep), Pseudogeneric,
-                                 Escaping, Async, diffKind);
+                                 Escaping, Concurrent, Async, diffKind);
   }
 
   ImplFunctionRepresentation getRepresentation() const {
@@ -295,6 +311,8 @@ public:
   bool isAsync() const { return Async; }
 
   bool isEscaping() const { return Escaping; }
+
+  bool isConcurrent() const { return Concurrent; }
 
   bool isPseudogeneric() const { return Pseudogeneric; }
 
@@ -330,11 +348,97 @@ getObjCClassOrProtocolName(NodePointer node) {
 }
 #endif
 
+template <typename BuiltType, typename BuiltRequirement,
+          typename BuiltLayoutConstraint, typename BuilderType>
+void decodeRequirement(NodePointer node,
+                       llvm::SmallVectorImpl<BuiltRequirement> &requirements,
+                       BuilderType &Builder) {
+  for (auto &child : *node) {
+    if (child->getKind() == Demangle::Node::Kind::DependentGenericParamCount)
+      continue;
+
+    if (child->getNumChildren() != 2)
+      return;
+    auto subjectType = Builder.decodeMangledType(child->getChild(0));
+    if (!subjectType)
+      return;
+
+    BuiltType constraintType;
+    if (child->getKind() ==
+            Demangle::Node::Kind::DependentGenericConformanceRequirement ||
+        child->getKind() ==
+            Demangle::Node::Kind::DependentGenericSameTypeRequirement) {
+      constraintType = Builder.decodeMangledType(child->getChild(1));
+      if (!constraintType)
+        return;
+    }
+
+    switch (child->getKind()) {
+    case Demangle::Node::Kind::DependentGenericConformanceRequirement: {
+      requirements.push_back(BuiltRequirement(
+          Builder.isExistential(constraintType) ? RequirementKind::Conformance
+                                                : RequirementKind::Superclass,
+          subjectType, constraintType));
+      break;
+    }
+    case Demangle::Node::Kind::DependentGenericSameTypeRequirement: {
+      requirements.push_back(BuiltRequirement(RequirementKind::SameType,
+                                              subjectType, constraintType));
+      break;
+    }
+    case Demangle::Node::Kind::DependentGenericLayoutRequirement: {
+      auto kindChild = child->getChild(1);
+      if (kindChild->getKind() != Demangle::Node::Kind::Identifier)
+        return;
+
+      auto kind =
+          llvm::StringSwitch<llvm::Optional<LayoutConstraintKind>>(
+              kindChild->getText())
+              .Case("U", LayoutConstraintKind::UnknownLayout)
+              .Case("R", LayoutConstraintKind::RefCountedObject)
+              .Case("N", LayoutConstraintKind::NativeRefCountedObject)
+              .Case("C", LayoutConstraintKind::Class)
+              .Case("D", LayoutConstraintKind::NativeClass)
+              .Case("T", LayoutConstraintKind::Trivial)
+              .Cases("E", "e", LayoutConstraintKind::TrivialOfExactSize)
+              .Cases("M", "m", LayoutConstraintKind::TrivialOfAtMostSize)
+              .Default(None);
+
+      if (!kind)
+        return;
+
+      BuiltLayoutConstraint layout;
+
+      if (kind != LayoutConstraintKind::TrivialOfExactSize &&
+          kind != LayoutConstraintKind::TrivialOfAtMostSize) {
+        layout = Builder.getLayoutConstraint(*kind);
+      } else {
+        auto size = child->getChild(2)->getIndex();
+        auto alignment = 0;
+
+        if (child->getNumChildren() == 4)
+          alignment = child->getChild(3)->getIndex();
+
+        layout =
+            Builder.getLayoutConstraintWithSizeAlign(*kind, size, alignment);
+      }
+
+      requirements.push_back(
+          BuiltRequirement(RequirementKind::Layout, subjectType, layout));
+      break;
+    }
+    default:
+      break;
+    }
+  }
+}
+
 #define MAKE_NODE_TYPE_ERROR(Node, Fmt, ...)                                   \
-  TypeLookupError("TypeDecoder.h:%d: Node kind %u \"%.*s\" - " Fmt, __LINE__,  \
-                  Node->getKind(),                                             \
-                  Node->hasText() ? (int)Node->getText().size() : 0,           \
-                  Node->hasText() ? Node->getText().data() : "", __VA_ARGS__)
+  TYPE_LOOKUP_ERROR_FMT("TypeDecoder.h:%u: Node kind %u \"%.*s\" - " Fmt,      \
+                        __LINE__, (unsigned)Node->getKind(),                   \
+                        Node->hasText() ? (int)Node->getText().size() : 0,     \
+                        Node->hasText() ? Node->getText().data() : "",         \
+                        __VA_ARGS__)
 
 #define MAKE_NODE_TYPE_ERROR0(Node, Str) MAKE_NODE_TYPE_ERROR(Node, "%s", Str)
 
@@ -345,6 +449,10 @@ class TypeDecoder {
   using BuiltType = typename BuilderType::BuiltType;
   using BuiltTypeDecl = typename BuilderType::BuiltTypeDecl;
   using BuiltProtocolDecl = typename BuilderType::BuiltProtocolDecl;
+  using Field = typename BuilderType::BuiltSILBoxField;
+  using BuiltSubstitution = typename BuilderType::BuiltSubstitution;
+  using BuiltRequirement = typename BuilderType::BuiltRequirement;
+  using BuiltLayoutConstraint = typename BuilderType::BuiltLayoutConstraint;
   using NodeKind = Demangle::Node::Kind;
 
   BuilderType &Builder;
@@ -406,7 +514,7 @@ public:
     case NodeKind::BoundGenericOtherNominalType: {
       if (Node->getNumChildren() < 2)
         return MAKE_NODE_TYPE_ERROR(Node,
-                                    "fewer children (%u) than required (2)",
+                                    "fewer children (%zu) than required (2)",
                                     Node->getNumChildren());
 
       llvm::SmallVector<BuiltType, 8> args;
@@ -469,13 +577,13 @@ public:
       // so that the parent type becomes 'S' and not 'P'.
       if (Node->getNumChildren() < 2)
         return MAKE_NODE_TYPE_ERROR(Node,
-                                    "fewer children (%u) than required (2)",
+                                    "fewer children (%zu) than required (2)",
                                     Node->getNumChildren());
 
       const auto &genericArgs = Node->getChild(1);
       if (genericArgs->getNumChildren() != 1)
         return MAKE_NODE_TYPE_ERROR(genericArgs,
-                                    "expected 1 generic argument, saw %u",
+                                    "expected 1 generic argument, saw %zu",
                                     genericArgs->getNumChildren());
 
       return decodeMangledType(genericArgs->getChild(0));
@@ -550,7 +658,7 @@ public:
       if (Node->getKind() == NodeKind::ProtocolListWithClass) {
         if (Node->getNumChildren() < 2)
           return MAKE_NODE_TYPE_ERROR(Node,
-                                      "fewer children (%u) than required (2)",
+                                      "fewer children (%zu) than required (2)",
                                       Node->getNumChildren());
 
         auto superclassNode = Node->getChild(1);
@@ -579,7 +687,7 @@ public:
     }
     case NodeKind::DynamicSelf: {
       if (Node->getNumChildren() != 1)
-        return MAKE_NODE_TYPE_ERROR(Node, "expected 1 child, saw %u",
+        return MAKE_NODE_TYPE_ERROR(Node, "expected 1 child, saw %zu",
                                     Node->getNumChildren());
 
       auto selfType = decodeMangledType(Node->getChild(0));
@@ -607,7 +715,7 @@ public:
     case NodeKind::FunctionType: {
       if (Node->getNumChildren() < 2)
         return MAKE_NODE_TYPE_ERROR(Node,
-                                    "fewer children (%u) than required (2)",
+                                    "fewer children (%zu) than required (2)",
                                     Node->getNumChildren());
 
       FunctionTypeFlags flags;
@@ -623,7 +731,7 @@ public:
                Node->getKind() ==
                    NodeKind::EscapingDifferentiableFunctionType) {
         flags = flags.withDifferentiabilityKind(
-            FunctionMetadataDifferentiabilityKind::Normal);
+            FunctionMetadataDifferentiabilityKind::Reverse);
       } else if (Node->getKind() == NodeKind::LinearFunctionType ||
                  Node->getKind() == NodeKind::EscapingLinearFunctionType) {
         flags = flags.withDifferentiabilityKind(
@@ -644,6 +752,13 @@ public:
         ++firstChildIdx;
       }
 
+      bool isConcurrent = false;
+      if (Node->getChild(firstChildIdx)->getKind()
+            == NodeKind::ConcurrentFunctionType) {
+        isConcurrent = true;
+        ++firstChildIdx;
+      }
+
       bool isAsync = false;
       if (Node->getChild(firstChildIdx)->getKind()
             == NodeKind::AsyncAnnotation) {
@@ -651,11 +766,12 @@ public:
         ++firstChildIdx;
       }
 
-      flags = flags.withAsync(isAsync).withThrows(isThrow);
+      flags = flags.withConcurrent(isConcurrent)
+          .withAsync(isAsync).withThrows(isThrow);
 
       if (Node->getNumChildren() < firstChildIdx + 2)
         return MAKE_NODE_TYPE_ERROR(Node,
-                                    "fewer children (%u) than required (%u)",
+                                    "fewer children (%zu) than required (%u)",
                                     Node->getNumChildren(), firstChildIdx + 2);
 
       bool hasParamFlags = false;
@@ -722,15 +838,25 @@ public:
         } else if (child->getKind() == NodeKind::ImplFunctionAttribute) {
           if (!child->hasText())
             return MAKE_NODE_TYPE_ERROR0(child, "expected text");
-          if (child->getText() == "@async") {
+          if (child->getText() == "@concurrent") {
+            flags = flags.withConcurrent();
+          } else if (child->getText() == "@async") {
             flags = flags.withAsync();
           }
-        } else if (child->getKind() == NodeKind::ImplDifferentiable) {
-          flags = flags.withDifferentiabilityKind(
-              ImplFunctionDifferentiabilityKind::Normal);
-        } else if (child->getKind() == NodeKind::ImplLinear) {
-          flags = flags.withDifferentiabilityKind(
-              ImplFunctionDifferentiabilityKind::Linear);
+        } else if (child->getKind() == NodeKind::ImplDifferentiabilityKind) {
+          ImplFunctionDifferentiabilityKind implDiffKind;
+          switch ((MangledDifferentiabilityKind)child->getIndex()) {
+          #define SIMPLE_CASE(CASE) \
+              case MangledDifferentiabilityKind::CASE: \
+                implDiffKind = ImplFunctionDifferentiabilityKind::CASE; break;
+          SIMPLE_CASE(NonDifferentiable)
+          SIMPLE_CASE(Normal)
+          SIMPLE_CASE(Linear)
+          SIMPLE_CASE(Forward)
+          SIMPLE_CASE(Reverse)
+          #undef SIMPLE_CASE
+          }
+          flags = flags.withDifferentiabilityKind(implDiffKind);
         } else if (child->getKind() == NodeKind::ImplEscaping) {
           flags = flags.withEscaping();
         } else if (child->getKind() == NodeKind::ImplParameter) {
@@ -828,7 +954,7 @@ public:
       if (Node->getChild(0)->getKind() == NodeKind::TupleElementName) {
         if (Node->getNumChildren() < 2)
           return MAKE_NODE_TYPE_ERROR(Node,
-                                      "fewer children (%u) than required (2)",
+                                      "fewer children (%zu) than required (2)",
                                       Node->getNumChildren());
 
         return decodeMangledType(Node->getChild(1));
@@ -838,7 +964,7 @@ public:
     case NodeKind::DependentGenericType: {
       if (Node->getNumChildren() < 2)
         return MAKE_NODE_TYPE_ERROR(Node,
-                                    "fewer children (%u) than required (2)",
+                                    "fewer children (%zu) than required (2)",
                                     Node->getNumChildren());
 
       return decodeMangledType(Node->getChild(1));
@@ -846,7 +972,7 @@ public:
     case NodeKind::DependentMemberType: {
       if (Node->getNumChildren() < 2)
         return MAKE_NODE_TYPE_ERROR(Node,
-                                    "fewer children (%u) than required (2)",
+                                    "fewer children (%zu) than required (2)",
                                     Node->getNumChildren());
 
       auto base = decodeMangledType(Node->getChild(0));
@@ -866,7 +992,7 @@ public:
     case NodeKind::DependentAssociatedTypeRef: {
       if (Node->getNumChildren() < 2)
         return MAKE_NODE_TYPE_ERROR(Node,
-                                    "fewer children (%u) than required (2)",
+                                    "fewer children (%zu) than required (2)",
                                     Node->getNumChildren());
 
       return decodeMangledType(Node->getChild(1));
@@ -908,9 +1034,88 @@ public:
       return Builder.createSILBoxType(base.getType());
     }
     case NodeKind::SILBoxTypeWithLayout: {
-      // TODO: Implement SILBoxTypeRefs with layout. As a stopgap, specify the
-      // NativeObject type ref.
-      return Builder.createBuiltinType("Builtin.NativeObject", "Bo");
+      llvm::SmallVector<Field, 4> fields;
+      llvm::SmallVector<BuiltSubstitution, 4> substitutions;
+      llvm::SmallVector<BuiltRequirement, 4> requirements;
+
+      if (Node->getNumChildren() < 1)
+        return MAKE_NODE_TYPE_ERROR0(Node, "no children");
+
+      auto fieldsNode = Node->getChild(0);
+      if (fieldsNode->getKind() != NodeKind::SILBoxLayout)
+        return MAKE_NODE_TYPE_ERROR0(fieldsNode, "expected layout");
+      for (auto *fieldNode : *fieldsNode) {
+        bool isMutable;
+        switch (fieldNode->getKind()) {
+        case NodeKind::SILBoxMutableField: isMutable = true; break;
+        case NodeKind::SILBoxImmutableField: isMutable = false; break;
+        default:
+          return MAKE_NODE_TYPE_ERROR0(fieldNode, "unhandled field type");
+        }
+        if (fieldNode->getNumChildren() < 1)
+          return MAKE_NODE_TYPE_ERROR0(fieldNode, "no children");
+        auto type = decodeMangledType(fieldNode->getChild(0));
+        if (type.isError())
+          return type;
+        fields.emplace_back(type.getType(), isMutable);
+      }
+
+      if (Node->getNumChildren() > 1) {
+        auto *substNode = Node->getChild(2);
+        if (substNode->getKind() != NodeKind::TypeList)
+          return MAKE_NODE_TYPE_ERROR0(substNode, "expected type list");
+
+        auto *dependentGenericSignatureNode = Node->getChild(1);
+        if (dependentGenericSignatureNode->getKind() !=
+            NodeKind::DependentGenericSignature)
+          return MAKE_NODE_TYPE_ERROR0(dependentGenericSignatureNode,
+                                       "expected dependent generic signature");
+        if (dependentGenericSignatureNode->getNumChildren() < 1)
+          return MAKE_NODE_TYPE_ERROR(
+              dependentGenericSignatureNode,
+              "fewer children (%zu) than required (1)",
+              dependentGenericSignatureNode->getNumChildren());
+        decodeRequirement<BuiltType, BuiltRequirement, BuiltLayoutConstraint,
+                          BuilderType>(
+            dependentGenericSignatureNode, requirements, Builder/*,
+            [&](NodePointer Node) -> BuiltType {
+              return decodeMangledType(Node).getType();
+            },
+            [&](LayoutConstraintKind Kind) -> BuiltLayoutConstraint {
+              return {}; // Not implemented!
+            },
+            [&](LayoutConstraintKind Kind, unsigned SizeInBits,
+                unsigned Alignment) -> BuiltLayoutConstraint {
+              return {}; // Not Implemented!
+              }*/);
+        // The number of generic parameters at each depth are in a mini
+        // state machine and come first.
+        llvm::SmallVector<unsigned, 4> genericParamsAtDepth;
+        for (auto *reqNode : *dependentGenericSignatureNode)
+          if (reqNode->getKind() == NodeKind::DependentGenericParamCount)
+            if (reqNode->hasIndex())
+              genericParamsAtDepth.push_back(reqNode->getIndex());
+        unsigned depth = 0;
+        unsigned index = 0;
+        for (auto *subst : *substNode) {
+          if (depth >= genericParamsAtDepth.size())
+            return MAKE_NODE_TYPE_ERROR0(
+                dependentGenericSignatureNode,
+                "more substitutions than generic params");
+          while (index >= genericParamsAtDepth[depth])
+            ++depth, index = 0;
+          auto substTy = decodeMangledType(subst);
+          if (substTy.isError())
+            return substTy;
+          substitutions.emplace_back(
+              Builder.createGenericTypeParameterType(depth, index),
+              substTy.getType());
+          ++index;
+        }
+      }
+
+      return Builder.createSILBoxTypeWithLayout(fields, substitutions,
+                                                requirements);
     }
     case NodeKind::SugaredOptional: {
       if (Node->getNumChildren() < 1)
@@ -935,7 +1140,7 @@ public:
     case NodeKind::SugaredDictionary: {
       if (Node->getNumChildren() < 2)
         return MAKE_NODE_TYPE_ERROR(Node,
-                                    "fewer children (%u) than required (2)",
+                                    "fewer children (%zu) than required (2)",
                                     Node->getNumChildren());
 
       auto key = decodeMangledType(Node->getChild(0));
@@ -961,7 +1166,7 @@ public:
     case NodeKind::OpaqueType: {
       if (Node->getNumChildren() < 3)
         return MAKE_NODE_TYPE_ERROR(Node,
-                                    "fewer children (%u) than required (3)",
+                                    "fewer children (%zu) than required (3)",
                                     Node->getNumChildren());
       auto descriptor = Node->getChild(0);
       auto ordinalNode = Node->getChild(1);
@@ -1052,7 +1257,8 @@ private:
     auto diffKind = T::DifferentiabilityType::DifferentiableOrNotApplicable;
     if (node->getNumChildren() == 3) {
       auto diffKindNode = node->getChild(1);
-      if (diffKindNode->getKind() != Node::Kind::ImplDifferentiability)
+      if (diffKindNode->getKind() !=
+          Node::Kind::ImplParameterResultDifferentiability)
         return true;
       auto optDiffKind =
           T::getDifferentiabilityFromString(diffKindNode->getText());
@@ -1079,7 +1285,7 @@ private:
     } else {
       if (node->getNumChildren() < 2)
         return MAKE_NODE_TYPE_ERROR(
-            node, "Number of node children (%u) less than required (2)",
+            node, "Number of node children (%zu) less than required (2)",
             node->getNumChildren());
 
       auto parentContext = node->getChild(0);
@@ -1097,7 +1303,7 @@ private:
         // Decode the type being extended.
         if (parentContext->getNumChildren() < 2)
           return MAKE_NODE_TYPE_ERROR(parentContext,
-                                      "Number of parentContext children (%u) "
+                                      "Number of parentContext children (%zu) "
                                       "less than required (2)",
                                       node->getNumChildren());
         parentContext = parentContext->getChild(1);

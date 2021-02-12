@@ -57,6 +57,7 @@ _SUPPORTED_XCODE_BUILDS = [
     ("12.2 Release Candidate", "12B5044c"),
     ("12.2", "12B45b"),
     ("12.3", "12C33"),
+    ("12.4", "12D4e"),
 ]
 
 # -----------------------------------------------------------------------------
@@ -336,6 +337,13 @@ def apply_default_arguments(toolchain, args):
         args.build_subdir = \
             workspace.compute_build_subdir(args)
 
+    if args.relocate_xdg_cache_home_under_build_subdir:
+        cache_under_build_subdir = os.path.join(
+            SWIFT_BUILD_ROOT, args.build_subdir, '.cache')
+        if args.verbose_build:
+            print("Relocating XDG_CACHE_HOME to {}".format(cache_under_build_subdir))
+        workspace.relocate_xdg_cache_home_under(cache_under_build_subdir)
+
     if args.install_destdir is None:
         args.install_destdir = os.path.join(
             SWIFT_BUILD_ROOT, args.build_subdir,
@@ -600,6 +608,9 @@ class BuildScriptInvocation(object):
             impl_args += ["--skip-build"]
         if not args.build_benchmarks:
             impl_args += ["--skip-build-benchmarks"]
+
+        if args.swift_disable_dead_stripping:
+            args.extra_cmake_options.append('-DSWIFT_DISABLE_DEAD_STRIPPING:BOOL=TRUE')
 
         # Then add subproject install flags that either skip building them /or/
         # if we are going to build them and install_all is set, we also install

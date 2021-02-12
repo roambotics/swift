@@ -242,6 +242,9 @@ void addHighLevelLoopOptPasses(SILPassPipelinePlan &P) {
   P.addSimplifyCFG();
   // Optimize access markers for better LICM: might merge accesses
   // It will also set the no_nested_conflict for dynamic accesses
+  // AccessEnforcementReleaseSinking results in non-canonical OSSA.
+  // It is only used to expose opportunities in AccessEnforcementOpts
+  // before CanonicalOSSA re-hoists destroys.
   P.addAccessEnforcementReleaseSinking();
   P.addAccessEnforcementOpts();
   P.addHighLevelLICM();
@@ -250,6 +253,9 @@ void addHighLevelLoopOptPasses(SILPassPipelinePlan &P) {
   // LICM might have added new merging potential by hoisting
   // we don't want to restart the pipeline - ignore the
   // potential of merging out of two loops
+  // AccessEnforcementReleaseSinking results in non-canonical OSSA.
+  // It is only used to expose opportunities in AccessEnforcementOpts
+  // before CanonicalOSSA re-hoists destroys.
   P.addAccessEnforcementReleaseSinking();
   P.addAccessEnforcementOpts();
   // Start of loop unrolling passes.
@@ -302,11 +308,6 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   // Promote stack allocations to values.
   P.addMem2Reg();
 
-  // We earlier eliminated ownership if we are not compiling the stdlib. Now
-  // handle the stdlib functions, re-simplifying, eliminating ARC as we do.
-  P.addSemanticARCOpts();
-  P.addNonTransparentFunctionOwnershipModelEliminator();
-
   // Run the existential specializer Pass.
   P.addExistentialSpecializer();
 
@@ -343,6 +344,12 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   // Run devirtualizer after the specializer, because many
   // class_method/witness_method instructions may use concrete types now.
   P.addDevirtualizer();
+
+  // We earlier eliminated ownership if we are not compiling the stdlib. Now
+  // handle the stdlib functions, re-simplifying, eliminating ARC as we do.
+  P.addCopyPropagation();
+  P.addSemanticARCOpts();
+  P.addNonTransparentFunctionOwnershipModelEliminator();
 
   switch (OpLevel) {
   case OptimizationLevelKind::HighLevel:
@@ -384,6 +391,8 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   } else {
     P.addRedundantLoadElimination();
   }
+  // Optimize copies created during RLE.
+  P.addSemanticARCOpts();
 
   P.addCOWOpts();
   P.addPerformanceConstantPropagation();
@@ -442,11 +451,12 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
 
   // Get rid of apparently dead functions as soon as possible so that
   // we do not spend time optimizing them.
-  P.addDeadFunctionElimination();
+  P.addDeadFunctionAndGlobalElimination();
 
   // Cleanup after SILGen: remove trivial copies to temporaries.
   P.addTempRValueOpt();
   // Cleanup after SILGen: remove unneeded borrows/copies.
+  P.addCopyPropagation();
   P.addSemanticARCOpts();
 
   // Devirtualizes differentiability witnesses into functions that reference them.
@@ -515,7 +525,7 @@ static void addHighLevelFunctionPipeline(SILPassPipelinePlan &P) {
 // one round of module passes.
 static void addHighLevelModulePipeline(SILPassPipelinePlan &P) {
   P.startPipeline("HighLevel,Module+StackPromote");
-  P.addDeadFunctionElimination();
+  P.addDeadFunctionAndGlobalElimination();
   P.addPerformanceSILLinker();
   P.addDeadObjectElimination();
   P.addGlobalPropertyOpt();
@@ -562,7 +572,7 @@ static void addMidLevelFunctionPipeline(SILPassPipelinePlan &P) {
 
 static void addClosureSpecializePassPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("ClosureSpecialize");
-  P.addDeadFunctionElimination();
+  P.addDeadFunctionAndGlobalElimination();
   P.addDeadStoreElimination();
   P.addDeadObjectElimination();
 
@@ -629,7 +639,7 @@ static void addLateLoopOptPassPipeline(SILPassPipelinePlan &P) {
   // Delete dead code and drop the bodies of shared functions.
   // Also, remove externally available witness tables. They are not needed
   // anymore after the last devirtualizer run.
-  P.addLateDeadFunctionElimination();
+  P.addLateDeadFunctionAndGlobalElimination();
 
   // Perform the final lowering transformations.
   P.addCodeSinking();
@@ -690,7 +700,8 @@ static void addLastChanceOptPassPipeline(SILPassPipelinePlan &P) {
   // Only has an effect if opt-remark is enabled.
   P.addOptRemarkGenerator();
 
-  P.addPruneVTables();
+  // FIXME: rdar://72935649 (Miscompile on combining PruneVTables with WMO)
+  // P.addPruneVTables();
 }
 
 static void addSILDebugInfoGeneratorPipeline(SILPassPipelinePlan &P) {
@@ -719,9 +730,8 @@ SILPassPipelinePlan::getIRGenPreparePassPipeline(const SILOptions &Options) {
   // Hoist generic alloc_stack instructions to the entry block to enable better
   // llvm-ir generation for dynamic alloca instructions.
   P.addAllocStackHoisting();
-  if (Options.EnableLargeLoadableTypes) {
-    P.addLoadableByAddress();
-  }
+  P.addLoadableByAddress();
+
   return P;
 }
 

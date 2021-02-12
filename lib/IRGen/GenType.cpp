@@ -1420,8 +1420,9 @@ TypeConverter::TypeConverter(IRGenModule &IGM)
   }
 
   bool error = readLegacyTypeInfo(*fs, path);
-  if (error)
-    llvm::report_fatal_error("Cannot read '" + path + "'");
+  if (error) {
+    IGM.error(SourceLoc(), "Cannot read legacy layout file at '" + path + "'");
+  }
 }
 
 TypeConverter::~TypeConverter() {
@@ -2021,7 +2022,9 @@ convertPrimitiveBuiltin(IRGenModule &IGM, CanType canTy) {
       = convertPrimitiveBuiltin(IGM,
                                 vecTy->getElementType()->getCanonicalType());
 
-    auto llvmVecTy = llvm::FixedVectorType::get(elementTy, vecTy->getNumElements());
+    auto llvmVecTy =
+        llvm::FixedVectorType::get(elementTy, vecTy->getNumElements());
+
     unsigned bitSize = size.getValue() * vecTy->getNumElements() * 8;
     if (!llvm::isPowerOf2_32(bitSize))
       bitSize = llvm::NextPowerOf2(bitSize);

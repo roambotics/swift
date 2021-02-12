@@ -260,9 +260,18 @@ bool RecordTypeInfo::readExtraInhabitantIndex(remote::MemoryReader &reader,
                                               int *extraInhabitantIndex) const {
   switch (SubKind) {
   case RecordKind::Invalid:
-  case RecordKind::OpaqueExistential:
   case RecordKind::ClosureContext:
     return false;
+
+  case RecordKind::OpaqueExistential: {
+    if (Fields.size() != 1) {
+      return false;
+    }
+    auto metadata = Fields[0];
+    auto metadataFieldAddress = address + metadata.Offset;
+    return metadata.TI.readExtraInhabitantIndex(
+      reader, metadataFieldAddress, extraInhabitantIndex);
+  }
 
   case RecordKind::ThickFunction: {
     if (Fields.size() != 2) {
@@ -1556,6 +1565,10 @@ public:
     return true;
   }
 
+  bool visitSILBoxTypeWithLayoutTypeRef(const SILBoxTypeWithLayoutTypeRef *SB) {
+    return true;
+  }
+
   bool
   visitForeignClassTypeRef(const ForeignClassTypeRef *F) {
     return true;
@@ -1676,6 +1689,11 @@ public:
 
   MetatypeRepresentation
   visitSILBoxTypeRef(const SILBoxTypeRef *SB) {
+    return MetatypeRepresentation::Thin;
+  }
+
+  MetatypeRepresentation
+  visitSILBoxTypeWithLayoutTypeRef(const SILBoxTypeWithLayoutTypeRef *SB) {
     return MetatypeRepresentation::Thin;
   }
 
@@ -2175,6 +2193,12 @@ public:
 #include "swift/AST/ReferenceStorage.def"
 
   const TypeInfo *visitSILBoxTypeRef(const SILBoxTypeRef *SB) {
+    return TC.getReferenceTypeInfo(ReferenceKind::Strong,
+                                   ReferenceCounting::Native);
+  }
+
+  const TypeInfo *
+  visitSILBoxTypeWithLayoutTypeRef(const SILBoxTypeWithLayoutTypeRef *SB) {
     return TC.getReferenceTypeInfo(ReferenceKind::Strong,
                                    ReferenceCounting::Native);
   }

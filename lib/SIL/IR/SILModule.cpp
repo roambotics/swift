@@ -167,6 +167,9 @@ void SILModule::checkForLeaks() const {
 }
 
 void SILModule::checkForLeaksAfterDestruction() {
+// Disabled in release (non-assert) builds because this check fails in rare
+// cases in lldb, causing crashes. rdar://70826934
+#ifndef NDEBUG
   int numAllocated = SILInstruction::getNumCreatedInstructions() -
                      SILInstruction::getNumDeletedInstructions();
 
@@ -174,6 +177,7 @@ void SILModule::checkForLeaksAfterDestruction() {
     llvm::errs() << "Leaking " << numAllocated << " instructions!\n";
     llvm_unreachable("leaking instructions");
   }
+#endif
 }
 
 std::unique_ptr<SILModule> SILModule::createEmptyModule(
@@ -366,10 +370,6 @@ const BuiltinInfo &SILModule::getBuiltinInfo(Identifier ID) {
     Info.ID = BuiltinValueKind::ApplyDerivative;
   else if (OperationName.startswith("applyTranspose_"))
     Info.ID = BuiltinValueKind::ApplyTranspose;
-  else if (OperationName.startswith("differentiableFunction_"))
-    Info.ID = BuiltinValueKind::DifferentiableFunction;
-  else if (OperationName.startswith("linearFunction_"))
-    Info.ID = BuiltinValueKind::LinearFunction;
   else
     Info.ID = llvm::StringSwitch<BuiltinValueKind>(OperationName)
 #define BUILTIN(id, name, attrs) .Case(name, BuiltinValueKind::id)
@@ -515,9 +515,8 @@ void SILModule::eraseFunction(SILFunction *F) {
 
   // This opens dead-function-removal opportunities for called functions.
   // (References are not needed anymore.)
-  F->dropAllReferences();
+  F->clear();
   F->dropDynamicallyReplacedFunction();
-  F->getBlocks().clear();
   // Drop references for any _specialize(target:) functions.
   F->clearSpecializeAttrs();
 }

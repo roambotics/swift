@@ -104,8 +104,8 @@ static bool shouldRunAsSubcommand(StringRef ExecName,
   // Otherwise, we have a program argument. If it looks like an option or a
   // path, then invoke in interactive mode with the arguments as given.
   StringRef FirstArg(Args[1]);
-  if (FirstArg.startswith("-") || FirstArg.find('.') != StringRef::npos ||
-      FirstArg.find('/') != StringRef::npos)
+  if (FirstArg.startswith("-") || FirstArg.contains('.') ||
+      FirstArg.contains('/'))
     return false;
 
   // Otherwise, we should have some sort of subcommand. Get the subcommand name
@@ -199,10 +199,15 @@ static int run_driver(StringRef ExecName,
       }
       subCommandArgs.insert(subCommandArgs.end(), argv.begin() + 1, argv.end());
 
+      // Push these non-op frontend arguments so the build log can indicate
+      // the new driver is used.
+      subCommandArgs.push_back("-Xfrontend");
+      subCommandArgs.push_back("-new-driver-path");
+      subCommandArgs.push_back("-Xfrontend");
+      subCommandArgs.push_back(NewDriverPath.c_str());
+
       // Execute the subcommand.
       subCommandArgs.push_back(nullptr);
-      Diags.diagnose(SourceLoc(), diag::remark_forwarding_to_new_driver,
-                     NewDriverPath);
       ExecuteInPlace(NewDriverPath.c_str(), subCommandArgs.data());
 
       // If we reach here then an error occurred (typically a missing path).
@@ -270,9 +275,8 @@ int main(int argc_, const char **argv_) {
   }
 
   std::vector<const char *> utf8CStrs;
-  std::transform(utf8Args.begin(), utf8Args.end(),
-                 std::back_inserter(utf8CStrs),
-                 std::mem_fn(&std::string::c_str));
+  llvm::transform(utf8Args, std::back_inserter(utf8CStrs),
+                  std::mem_fn(&std::string::c_str));
   argv_ = utf8CStrs.data();
 #endif
   // Expand any response files in the command line argument vector - arguments
@@ -281,12 +285,7 @@ int main(int argc_, const char **argv_) {
   SmallVector<const char *, 256> ExpandedArgs(&argv_[0], &argv_[argc_]);
   llvm::BumpPtrAllocator Allocator;
   llvm::StringSaver Saver(Allocator);
-  llvm::cl::ExpandResponseFiles(
-      Saver,
-      llvm::Triple(llvm::sys::getProcessTriple()).isOSWindows()
-          ? llvm::cl::TokenizeWindowsCommandLine
-          : llvm::cl::TokenizeGNUCommandLine,
-      ExpandedArgs);
+  swift::driver::ExpandResponseFilesWithRetry(Saver, ExpandedArgs);
 
   // Initialize the stack trace using the parsed argument vector with expanded
   // response files.

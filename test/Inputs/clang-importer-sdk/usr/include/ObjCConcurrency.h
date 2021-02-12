@@ -51,6 +51,12 @@ typedef void (^CompletionHandler)(NSString * _Nullable, NSString * _Nullable_res
 // rdar://72604599
 - (void)stopRecordingWithHandler:(nullable void (^)(NSObject *_Nullable_result x, NSError *_Nullable error))handler __attribute__((swift_async_name("stopRecording()"))) __attribute__((swift_async(not_swift_private, 1)));
 
+// rdar://73798726
+- (void)getSomeObjectWithCompletionHandler:(nullable void (^)(NSObject *_Nullable x, NSError *_Nullable error))handler;
+
+-(void)oldAPIWithCompletionHandler:(void (^ _Nonnull)(NSString *_Nullable, NSError *_Nullable))handler __attribute__((availability(macosx, deprecated=10.14)));
+
+-(void)someAsyncMethodWithBlock:(void (^ _Nonnull)(NSString *_Nullable, NSError *_Nullable))completionHandler;
 @end
 
 @protocol RefrigeratorDelegate<NSObject>
@@ -76,5 +82,36 @@ typedef void (^CompletionHandler)(NSString * _Nullable, NSString * _Nullable_res
 @optional
 -(void)missingAtAttributeMethod __attribute__((__swift_attr__("asyncHandler")));
 @end
+
+@protocol OptionalObserver <NSObject>
+@optional
+- (void)hello:(NSObject *)session completion:(void (^)(BOOL answer))completion;
+- (BOOL)hello:(NSObject *)session;
+@end
+
+@protocol RequiredObserverOnlyCompletion <NSObject>
+- (void)hello:(void (^)(BOOL answer))completion;
+@end
+
+@protocol RequiredObserver <RequiredObserverOnlyCompletion>
+- (BOOL)hello;
+@end
+
+@protocol Rollable <NSObject>
+- (void)rollWithCompletionHandler: (void (^)(void))completionHandler;
+@end
+
+typedef void ( ^ObjCErrorHandler )( NSError * _Nullable inError );
+
+@protocol ObjCClub
+- (void) activateWithCompletion:(ObjCErrorHandler) inCompletion;
+@end
+
+@protocol LabellyProtocol
+  - (void) myMethod:(NSInteger)value1 newFoo:(NSInteger)value2 completion:(ObjCErrorHandler)completion;
+  - (void) myMethod:(NSInteger)value1 foo:(NSInteger)value2;
+@end
+
+#define MAGIC_NUMBER 42
 
 #pragma clang assume_nonnull end

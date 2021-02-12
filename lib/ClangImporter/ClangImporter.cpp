@@ -821,7 +821,8 @@ bool ClangImporter::canReadPCH(StringRef PCHFilename) {
                              &Impl.Instance->getModuleCache());
   auto invocation =
       std::make_shared<clang::CompilerInvocation>(*Impl.Invocation);
-  invocation->getPreprocessorOpts().DisablePCHValidation = false;
+  invocation->getPreprocessorOpts().DisablePCHOrModuleValidation =
+      clang::DisableValidationForModuleKind::None;
   invocation->getPreprocessorOpts().AllowPCHWithCompilerErrors = false;
   invocation->getHeaderSearchOpts().ModulesValidateSystemHeaders = true;
   invocation->getLangOpts()->NeededByPCHOrCompilationUsesPCH = true;
@@ -1941,17 +1942,25 @@ PlatformAvailability::PlatformAvailability(const LangOptions &langOpts)
   case PlatformKind::tvOSApplicationExtension:
     deprecatedAsUnavailableMessage =
         "APIs deprecated as of iOS 7 and earlier are unavailable in Swift";
+    asyncDeprecatedAsUnavailableMessage =
+      "APIs deprecated as of iOS 12 and earlier are not imported as 'async'";
     break;
 
   case PlatformKind::watchOS:
   case PlatformKind::watchOSApplicationExtension:
     deprecatedAsUnavailableMessage = "";
+    asyncDeprecatedAsUnavailableMessage =
+      "APIs deprecated as of watchOS 5 and earlier are not imported as "
+      "'async'";
     break;
 
   case PlatformKind::macOS:
   case PlatformKind::macOSApplicationExtension:
     deprecatedAsUnavailableMessage =
         "APIs deprecated as of macOS 10.9 and earlier are unavailable in Swift";
+    asyncDeprecatedAsUnavailableMessage =
+      "APIs deprecated as of macOS 10.14 and earlier are not imported as "
+      "'async'";
     break;
 
   case PlatformKind::OpenBSD:
@@ -2008,7 +2017,8 @@ bool PlatformAvailability::isPlatformRelevant(StringRef name) const {
 }
 
 bool PlatformAvailability::treatDeprecatedAsUnavailable(
-    const clang::Decl *clangDecl, const llvm::VersionTuple &version) const {
+    const clang::Decl *clangDecl, const llvm::VersionTuple &version,
+    bool isAsync) const {
   assert(!version.empty() && "Must provide version when deprecated");
   unsigned major = version.getMajor();
   Optional<unsigned> minor = version.getMinor();
@@ -2019,6 +2029,13 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
 
   case PlatformKind::macOS:
   case PlatformKind::macOSApplicationExtension:
+    // Anything deprecated by macOS 10.14 is unavailable for async import
+    // in Swift.
+    if (isAsync && !clangDecl->hasAttr<clang::SwiftAsyncAttr>()) {
+      return major < 10 ||
+          (major == 10 && (!minor.hasValue() || minor.getValue() <= 14));
+    }
+
     // Anything deprecated in OSX 10.9.x and earlier is unavailable in Swift.
     return major < 10 ||
            (major == 10 && (!minor.hasValue() || minor.getValue() <= 9));
@@ -2027,6 +2044,12 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
   case PlatformKind::iOSApplicationExtension:
   case PlatformKind::tvOS:
   case PlatformKind::tvOSApplicationExtension:
+    // Anything deprecated by iOS 12 is unavailable for async import
+    // in Swift.
+    if (isAsync && !clangDecl->hasAttr<clang::SwiftAsyncAttr>()) {
+      return major <= 12;
+    }
+
     // Anything deprecated in iOS 7.x and earlier is unavailable in Swift.
     return major <= 7;
 
@@ -2037,6 +2060,12 @@ bool PlatformAvailability::treatDeprecatedAsUnavailable(
 
   case PlatformKind::watchOS:
   case PlatformKind::watchOSApplicationExtension:
+    // Anything deprecated by watchOS 5.0 is unavailable for async import
+    // in Swift.
+    if (isAsync && !clangDecl->hasAttr<clang::SwiftAsyncAttr>()) {
+      return major <= 5;
+    }
+
     // No deprecation filter on watchOS
     return false;
 
@@ -4149,4 +4178,26 @@ clang::FunctionDecl *ClangImporter::instantiateCXXFunctionTemplate(
                                                    clang::SourceLocation());
   sema.InstantiateFunctionDefinition(clang::SourceLocation(), spec);
   return spec;
+}
+
+StructDecl *
+ClangImporter::instantiateCXXClassTemplate(
+    clang::ClassTemplateDecl *decl,
+    ArrayRef<clang::TemplateArgument> arguments) {
+  void *InsertPos = nullptr;
+  auto *ctsd = decl->findSpecialization(arguments, InsertPos);
+  if (!ctsd) {
+    ctsd = clang::ClassTemplateSpecializationDecl::Create(
+        decl->getASTContext(), decl->getTemplatedDecl()->getTagKind(),
+        decl->getDeclContext(), decl->getTemplatedDecl()->getBeginLoc(),
+        decl->getLocation(), decl, arguments, nullptr);
+    decl->AddSpecialization(ctsd, InsertPos);
+  }
+
+  auto CanonType = decl->getASTContext().getTypeDeclType(ctsd);
+  assert(isa<clang::RecordType>(CanonType) &&
+          "type of non-dependent specialization is not a RecordType");
+
+  return dyn_cast_or_null<StructDecl>(
+      Impl.importDecl(ctsd, Impl.CurrentVersion));
 }

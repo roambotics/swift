@@ -633,6 +633,10 @@ void Remangler::mangleValueWitnessTable(Node *node) {
   mangleSingleChildNode(node); // type
 }
 
+void Remangler::mangleConcurrentFunctionType(Node *node) {
+  Buffer << "y";
+}
+
 void Remangler::mangleAsyncAnnotation(Node *node) {
   Buffer << "Z";
 }
@@ -740,7 +744,7 @@ void Remangler::mangleReabstractionThunk(Node *node) {
   Buffer << "<reabstraction-thunk>";
 }
 
-void Remangler::mangleAutoDiffFunction(Node *node) {
+void Remangler::mangleAutoDiffFunction(Node *node, EntityContext &ctx) {
   Buffer << "<autodiff-function>";
 }
 
@@ -1267,6 +1271,8 @@ void Remangler::mangleImplFunctionAttribute(Node *node) {
     Buffer << "A";
   } else if (text == "@yield_many") {
     Buffer << "G";
+  } else if (text == "@concurrent") {
+    Buffer << "h";
   } else if (text == "@async") {
     Buffer << "H";
   } else {
@@ -1319,14 +1325,9 @@ void Remangler::mangleImplYield(Node *node) {
   mangleChildNodes(node); // impl convention, type
 }
 
-void Remangler::mangleImplDifferentiable(Node *node) {
+void Remangler::mangleImplDifferentiabilityKind(Node *node) {
   // TODO(TF-750): Check if this code path actually triggers and add a test.
-  Buffer << 'd';
-}
-
-void Remangler::mangleImplLinear(Node *node) {
-  // TODO(TF-750): Check if this code path actually triggers and add a test.
-  Buffer << 'l';
+  Buffer << (char)node->getIndex();
 }
 
 void Remangler::mangleImplEscaping(Node *node) {
@@ -1367,8 +1368,8 @@ void Remangler::mangleImplConvention(Node *node) {
   }
 }
 
-void Remangler::mangleImplDifferentiability(Node *node) {
-  assert(node->getKind() == Node::Kind::ImplDifferentiability);
+void Remangler::mangleImplParameterResultDifferentiability(Node *node) {
+  assert(node->getKind() == Node::Kind::ImplDifferentiabilityKind);
   StringRef text = node->getText();
   // Empty string represents default differentiability.
   if (text.empty())

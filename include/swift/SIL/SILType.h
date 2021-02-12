@@ -429,6 +429,13 @@ public:
   SILType getEnumElementType(EnumElementDecl *elt, SILModule &M,
                              TypeExpansionContext context) const;
 
+  /// Given that this is an enum type, return the lowered type of the
+  /// data for the given element.  Applies substitutions as necessary.
+  /// The result will have the same value category as the base type.
+  ///
+  /// NOTE: Takes the type expansion context from \p fn.
+  SILType getEnumElementType(EnumElementDecl *elt, SILFunction *fn) const;
+
   /// Given that this is an enum type, return true if this type is effectively
   /// exhausted.
   bool isEffectivelyExhaustiveEnumType(SILFunction *f);
@@ -557,6 +564,13 @@ public:
 
   /// Returns true if this SILType is a differentiable type.
   bool isDifferentiable(SILModule &M) const;
+
+  /// If this is a SILBoxType, return getSILBoxFieldType(). Otherwise, return
+  /// SILType().
+  ///
+  /// \p field Return the type of the ith field of the box. Default set to 0
+  /// since we only support one field today. This is just future proofing.
+  SILType getSILBoxFieldType(const SILFunction *f, unsigned field = 0);
 
   /// Returns the hash code for the SILType.
   llvm::hash_code getHashCode() const {

@@ -10,6 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#define DEBUG_TYPE "sil-function"
+
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILFunction.h"
@@ -24,12 +26,15 @@
 #include "swift/Basic/OptimizationMode.h"
 #include "swift/Basic/Statistic.h"
 #include "llvm/ADT/Optional.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/GraphWriter.h"
 #include "clang/AST/Decl.h"
 
 using namespace swift;
 using namespace Lowering;
+
+STATISTIC(MaxBitfieldID, "Max value of SILFunction::currentBitfieldID");
 
 SILSpecializeAttr::SILSpecializeAttr(bool exported, SpecializationKind kind,
                                      GenericSignature specializedSig,
@@ -210,6 +215,10 @@ SILFunction::~SILFunction() {
 
   assert(RefCount == 0 &&
          "Function cannot be deleted while function_ref's still exist");
+  assert(!newestAliveBitfield &&
+         "Not all BasicBlockBitfields deleted at function destruction");
+  if (currentBitfieldID > MaxBitfieldID)
+    MaxBitfieldID = currentBitfieldID;
 }
 
 void SILFunction::createProfiler(ASTNode Root, SILDeclRef forDecl,
@@ -244,10 +253,10 @@ void SILFunction::numberValues(llvm::DenseMap<const SILNode*, unsigned> &
     for (auto &I : BB) {
       auto results = I.getResults();
       if (results.empty()) {
-        ValueToNumberMap[&I] = idx++;
+        ValueToNumberMap[I.asSILNode()] = idx++;
       } else {
         // Assign the instruction node the first result ID.
-        ValueToNumberMap[&I] = idx;
+        ValueToNumberMap[I.asSILNode()] = idx;
         for (auto result : results) {
           ValueToNumberMap[result] = idx++;
         }
@@ -357,17 +366,29 @@ bool SILFunction::isWeakImported() const {
 }
 
 SILBasicBlock *SILFunction::createBasicBlock() {
-  return new (getModule()) SILBasicBlock(this, nullptr, false);
+  SILBasicBlock *newBlock = new (getModule()) SILBasicBlock(this);
+  BlockList.push_back(newBlock);
+  return newBlock;
 }
 
 SILBasicBlock *SILFunction::createBasicBlockAfter(SILBasicBlock *afterBB) {
-  assert(afterBB);
-  return new (getModule()) SILBasicBlock(this, afterBB, /*after*/ true);
+  SILBasicBlock *newBlock = new (getModule()) SILBasicBlock(this);
+  BlockList.insertAfter(afterBB->getIterator(), newBlock);
+  return newBlock;
 }
 
 SILBasicBlock *SILFunction::createBasicBlockBefore(SILBasicBlock *beforeBB) {
-  assert(beforeBB);
-  return new (getModule()) SILBasicBlock(this, beforeBB, /*after*/ false);
+  SILBasicBlock *newBlock = new (getModule()) SILBasicBlock(this);
+  BlockList.insert(beforeBB->getIterator(), newBlock);
+  return newBlock;
+}
+
+void SILFunction::moveBlockBefore(SILBasicBlock *BB, SILFunction::iterator IP) {
+  assert(BB->getParent() == this);
+  if (SILFunction::iterator(BB) == IP)
+    return;
+  BlockList.remove(BB);
+  BlockList.insert(IP, BB);
 }
 
 //===----------------------------------------------------------------------===//
@@ -642,10 +663,9 @@ bool SILFunction::isExternallyUsedSymbol() const {
                                          getModule().isWholeModule());
 }
 
-void SILFunction::convertToDeclaration() {
-  assert(isDefinition() && "Can only convert definitions to declarations");
+void SILFunction::clear() {
   dropAllReferences();
-  getBlocks().clear();
+  BlockList.clear();
 }
 
 SubstitutionMap SILFunction::getForwardingSubstitutionMap() {

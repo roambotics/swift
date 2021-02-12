@@ -52,8 +52,6 @@ UID_KEYS = [
     KEY('SourceText', 'key.sourcetext'),
     KEY('EnableSyntaxMap', 'key.enablesyntaxmap'),
     KEY('SyntaxTreeTransferMode', 'key.syntaxtreetransfermode'),
-    KEY('SyntaxTreeSerializationFormat',
-        'key.syntax_tree_serialization_format'),
     KEY('EnableStructure', 'key.enablesubstructure'),
     KEY('Description', 'key.description'),
     KEY('TypeName', 'key.typename'),
@@ -108,6 +106,7 @@ UID_KEYS = [
     KEY('IsDeprecated', 'key.is_deprecated'),
     KEY('IsUnavailable', 'key.is_unavailable'),
     KEY('IsOptional', 'key.is_optional'),
+    KEY('IsAsync', 'key.is_async'),
     KEY('Message', 'key.message'),
     KEY('Introduced', 'key.introduced'),
     KEY('Deprecated', 'key.deprecated'),
@@ -161,6 +160,7 @@ UID_KEYS = [
     KEY('RetrieveRefactorActions', 'key.retrieve_refactor_actions'),
     KEY('SymbolGraph', 'key.symbol_graph'),
     KEY('RetrieveSymbolGraph', 'key.retrieve_symbol_graph'),
+    KEY('ParentContexts', 'key.parent_contexts'),
     KEY('ActionUID', 'key.actionuid'),
     KEY('ActionUnavailableReason', 'key.actionunavailablereason'),
     KEY('CompileID', 'key.compileid'),
@@ -245,7 +245,8 @@ UID_REQUESTS = [
             'source.request.enable-compile-notifications'),
     REQUEST('TestNotification', 'source.request.test_notification'),
     REQUEST('CollectExpressionType', 'source.request.expression.type'),
-    REQUEST('GlobalConfiguration', 'source.request.configuration.global')
+    REQUEST('GlobalConfiguration', 'source.request.configuration.global'),
+    REQUEST('DependencyUpdated', 'source.request.dependency_updated'),
 ]
 
 
@@ -451,8 +452,4 @@ UID_KINDS = [
     KIND('SyntaxTreeOff', 'source.syntaxtree.transfer.off'),
     KIND('SyntaxTreeIncremental', 'source.syntaxtree.transfer.incremental'),
     KIND('SyntaxTreeFull', 'source.syntaxtree.transfer.full'),
-    KIND('SyntaxTreeSerializationJSON',
-         'source.syntaxtree.serialization.format.json'),
-    KIND('SyntaxTreeSerializationByteTree',
-         'source.syntaxtree.serialization.format.bytetree'),
 ]

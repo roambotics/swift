@@ -33,6 +33,7 @@
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/PostOrder.h"
 #include "swift/SIL/PrettyStackTrace.h"
+#include "swift/SIL/SILBitfield.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILModule.h"
@@ -1133,10 +1134,22 @@ public:
                         UseLifetimeConstraint::NonLifetimeEnding,
                 "In non-ossa all non-type dependent operands must have a "
                 "constraint of Any, NonLifetimeEnding");
+      } else {
+        // Perform some structural checks on the operand if we have ownership.
+
+        // Make sure that our operand constraint isn't Unowned. There do not
+        // exist in SIL today any instructions that require an Unowned
+        // value. This is because we want to always allow for guaranteed and
+        // owned values to be passed as values to operands that take unowned.
+        auto constraint = operand.getOwnershipConstraint();
+        require(constraint.getPreferredKind() != OwnershipKind::Unowned,
+                "Operand constraint should never have an unowned preferred "
+                "kind since guaranteed and owned values can always be passed "
+                "in unowned positions");
       }
     }
 
-    if (isa<OwnershipForwardingInst>(I)) {
+    if (OwnershipForwardingMixin::isa(I)) {
       checkOwnershipForwardingInst(I);
     }
   }
@@ -1148,14 +1161,14 @@ public:
   void checkOwnershipForwardingInst(SILInstruction *i) {
     if (auto *o = dyn_cast<OwnedFirstArgForwardingSingleValueInst>(i)) {
       ValueOwnershipKind kind = OwnershipKind::Owned;
-      require(kind.isCompatibleWith(o->getOwnershipKind()),
+      require(kind.isCompatibleWith(o->getForwardingOwnershipKind()),
               "OwnedFirstArgForwardingSingleValueInst's ownership kind must be "
               "compatible with owned");
     }
 
     if (auto *o = dyn_cast<GuaranteedFirstArgForwardingSingleValueInst>(i)) {
       ValueOwnershipKind kind = OwnershipKind::Guaranteed;
-      require(kind.isCompatibleWith(o->getOwnershipKind()),
+      require(kind.isCompatibleWith(o->getForwardingOwnershipKind()),
               "GuaranteedFirstArgForwardingSingleValueInst's ownership kind "
               "must be compatible with guaranteed");
     }
@@ -1658,13 +1671,24 @@ public:
     SILFunctionConventions substConv(substTy, F.getModule());
     unsigned appliedArgStartIdx =
         substConv.getNumSILArguments() - PAI->getNumArguments();
-    for (unsigned i = 0, size = PAI->getArguments().size(); i < size; ++i) {
+    bool isConcurrentAndStageIsCanonical =
+        PAI->getFunctionType()->isConcurrent() &&
+        F.getModule().getStage() >= SILStage::Canonical;
+    for (auto p : llvm::enumerate(PAI->getArguments())) {
       requireSameType(
-          PAI->getArguments()[i]->getType(),
-          substConv.getSILArgumentType(appliedArgStartIdx + i,
+          p.value()->getType(),
+          substConv.getSILArgumentType(appliedArgStartIdx + p.index(),
                                        F.getTypeExpansionContext()),
           "applied argument types do not match suffix of function type's "
           "inputs");
+
+      // TODO: Expand this to also be true for address only types.
+      if (isConcurrentAndStageIsCanonical)
+        require(
+            !p.value()->getType().getASTType()->is<SILBoxType>() ||
+                p.value()->getType().getSILBoxFieldType(&F).isAddressOnly(F),
+            "Concurrent partial apply in canonical SIL with a loadable box "
+            "type argument?!");
     }
 
     // The arguments to the result function type must match the prefix of the
@@ -2984,7 +3008,7 @@ public:
       // compatible with our destructure_struct's ownership kind /and/ that if
       // our destructure ownership kind is non-trivial then all non-trivial
       // results must have the same ownership kind as our operand.
-      auto parentKind = DSI->getOwnershipKind();
+      auto parentKind = DSI->getForwardingOwnershipKind();
       for (const DestructureStructResult &result : DSI->getAllResultsBuffer()) {
         require(parentKind.isCompatibleWith(result.getOwnershipKind()),
                 "destructure result with ownership that is incompatible with "
@@ -3003,7 +3027,7 @@ public:
       // compatible with our destructure_struct's ownership kind /and/ that if
       // our destructure ownership kind is non-trivial then all non-trivial
       // results must have the same ownership kind as our operand.
-      auto parentKind = dti->getOwnershipKind();
+      auto parentKind = dti->getForwardingOwnershipKind();
       for (const auto &result : dti->getAllResultsBuffer()) {
         require(parentKind.isCompatibleWith(result.getOwnershipKind()),
                 "destructure result with ownership that is incompatible with "
@@ -4394,7 +4418,7 @@ public:
           if (!dest->getArgument(0)->getType().isTrivial(*SOI->getFunction())) {
             require(
                 dest->getArgument(0)->getOwnershipKind().isCompatibleWith(
-                    SOI->getOwnershipKind()),
+                    SOI->getForwardingOwnershipKind()),
                 "Switch enum non-trivial destination arg must have ownership "
                 "kind that is compatible with the switch_enum's operand");
           }
@@ -4892,15 +4916,19 @@ public:
       DifferentiableFunctionExtractInst *dfei) {
     auto fnTy = dfei->getOperand()->getType().getAs<SILFunctionType>();
     require(fnTy, "The function operand must have a function type");
-    require(fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Normal,
-            "The function operand must be a '@differentiable' function");
+    // TODO: Ban 'Normal' and 'Forward'.
+    require(
+        fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Reverse ||
+        fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Normal ||
+        fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Forward,
+        "The function operand must be a '@differentiable(reverse)' function");
   }
 
   void checkLinearFunctionExtractInst(LinearFunctionExtractInst *lfei) {
     auto fnTy = lfei->getOperand()->getType().getAs<SILFunctionType>();
     require(fnTy, "The function operand must have a function type");
     require(fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Linear,
-            "The function operand must be a '@differentiable(linear)' "
+            "The function operand must be a '@differentiable(_linear)' "
             "function");
   }
 
@@ -5098,7 +5126,7 @@ public:
   }
 
   bool isUnreachableAlongAllPathsStartingAt(
-      SILBasicBlock *StartBlock, SmallPtrSetImpl<SILBasicBlock *> &Visited) {
+      SILBasicBlock *StartBlock, BasicBlockSet &Visited) {
     if (isa<UnreachableInst>(StartBlock->getTerminator()))
       return true;
     else if (isa<ReturnInst>(StartBlock->getTerminator()))
@@ -5108,7 +5136,7 @@ public:
 
     // Recursively check all successors.
     for (auto *SuccBB : StartBlock->getSuccessorBlocks())
-      if (!Visited.insert(SuccBB).second)
+      if (!Visited.insert(SuccBB))
         if (!isUnreachableAlongAllPathsStartingAt(SuccBB, Visited))
           return false;
 
@@ -5292,7 +5320,7 @@ public:
             // this successor bb.  (FIXME: Why? Infinite loops should still
             // preserve consistency...)
             auto isUnreachable = [&] {
-              SmallPtrSet<SILBasicBlock *, 16> visited;
+              BasicBlockSet visited(F);
               return isUnreachableAlongAllPathsStartingAt(succBB, visited);
             };
             
@@ -5459,7 +5487,7 @@ public:
     // This ensures that any open_existential instructions, which
     // open archetypes, are seen before the uses of these archetypes.
     llvm::ReversePostOrderTraversal<SILFunction *> RPOT(F);
-    llvm::DenseSet<SILBasicBlock *> VisitedBBs;
+    BasicBlockSet VisitedBBs(F);
     for (auto Iter = RPOT.begin(), E = RPOT.end(); Iter != E; ++Iter) {
       auto *BB = *Iter;
       VisitedBBs.insert(BB);
@@ -5469,7 +5497,7 @@ public:
     // Visit all basic blocks that were not visited during the RPOT traversal,
     // e.g. unreachable basic blocks.
     for (auto &BB : *F) {
-      if (VisitedBBs.count(&BB))
+      if (VisitedBBs.contains(&BB))
         continue;
       visitSILBasicBlock(&BB);
     }
@@ -5516,7 +5544,7 @@ public:
     }
 
     // Otherwise, verify the body of the function.
-    verifyEntryBlock(&*F->getBlocks().begin());
+    verifyEntryBlock(F->getEntryBlock());
     verifyEpilogBlocks(F);
     verifyFlowSensitiveRules(F);
     verifyBranches(F);
@@ -5548,11 +5576,21 @@ public:
 //===----------------------------------------------------------------------===//
 
 static bool verificationEnabled(const SILModule &M) {
-#ifdef NDEBUG
-  if (!M.getOptions().VerifyAll)
+  // If we are asked to never verify, return false early.
+  if (M.getOptions().VerifyNone)
     return false;
+
+  // Otherwise, if verify all is set, we always verify.
+  if (M.getOptions().VerifyAll)
+    return true;
+
+#ifndef NDEBUG
+  // Otherwise if we do have asserts enabled, always verify...
+  return true;
+#else
+  // And if we don't never verify.
+  return false;
 #endif
-  return !M.getOptions().VerifyNone;
 }
 
 /// verify - Run the SIL verifier to make sure that the SILFunction follows

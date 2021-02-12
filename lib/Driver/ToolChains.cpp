@@ -278,6 +278,7 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
       options::OPT_disable_fuzzy_forward_scan_trailing_closure_matching);
   inputArgs.AddLastArg(arguments,
                        options::OPT_verify_incremental_dependencies);
+  inputArgs.AddLastArg(arguments, options::OPT_access_notes_path);
 
   // Pass on any build config options
   inputArgs.AddAllArgs(arguments, options::OPT_D);
@@ -556,6 +557,11 @@ ToolChain::constructInvocation(const CompileJobAction &job,
       options::
           OPT_disable_autolinking_runtime_compatibility_dynamic_replacements);
 
+  if (context.OI.CompilerMode == OutputInfo::Mode::SingleCompile) {
+    context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph);
+    context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph_dir);
+  }
+
   return II;
 }
 
@@ -622,8 +628,6 @@ const char *ToolChain::JobContext::computeFrontendModeForCompile() const {
   case file_types::TY_Image:
   case file_types::TY_SwiftDeps:
   case file_types::TY_ExternalSwiftDeps:
-  case file_types::TY_SwiftRanges:
-  case file_types::TY_CompiledSource:
   case file_types::TY_ModuleTrace:
   case file_types::TY_TBD:
   case file_types::TY_YAMLOptRecord:
@@ -768,10 +772,6 @@ void ToolChain::JobContext::addFrontendSupplementaryOutputArguments(
                    "-emit-dependencies-path");
   addOutputsOfType(arguments, Output, Args, file_types::TY_SwiftDeps,
                    "-emit-reference-dependencies-path");
-  addOutputsOfType(arguments, Output, Args, file_types::TY_SwiftRanges,
-                   "-emit-swift-ranges-path");
-  addOutputsOfType(arguments, Output, Args, file_types::TY_CompiledSource,
-                   "-emit-compiled-source-path");
   addOutputsOfType(arguments, Output, Args, file_types::TY_ModuleTrace,
                    "-emit-loaded-module-trace-path");
   addOutputsOfType(arguments, Output, Args, file_types::TY_TBD,
@@ -885,8 +885,6 @@ ToolChain::constructInvocation(const BackendJobAction &job,
     case file_types::TY_Image:
     case file_types::TY_SwiftDeps:
     case file_types::TY_ExternalSwiftDeps:
-    case file_types::TY_SwiftRanges:
-    case file_types::TY_CompiledSource:
     case file_types::TY_Remapping:
     case file_types::TY_ModuleTrace:
     case file_types::TY_YAMLOptRecord:
@@ -1046,6 +1044,9 @@ ToolChain::constructInvocation(const MergeModuleJobAction &job,
                    file_types::TY_ObjCHeader, "-emit-objc-header-path");
   addOutputsOfType(Arguments, context.Output, context.Args, file_types::TY_TBD,
                    "-emit-tbd-path");
+
+  context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph);
+  context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph_dir);
 
   context.Args.AddLastArg(Arguments, options::OPT_import_objc_header);
 

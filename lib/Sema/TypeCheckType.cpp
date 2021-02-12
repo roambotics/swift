@@ -17,6 +17,7 @@
 
 #include "TypeChecker.h"
 #include "TypeCheckAvailability.h"
+#include "TypeCheckConcurrency.h"
 #include "TypeCheckProtocol.h"
 #include "TypeCheckType.h"
 #include "TypoCorrection.h"
@@ -44,6 +45,9 @@
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/Strings.h"
 #include "swift/Subsystems.h"
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/DeclBase.h"
+#include "clang/AST/DeclTemplate.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
@@ -833,6 +837,46 @@ static Type applyGenericArguments(Type type, TypeResolution resolution,
     else
       diags.diagnose(loc, diag::use_of_void_pointer, "").
         fixItReplace(generic->getSourceRange(), "UnsafeRawPointer");
+  }
+
+  if (auto clangDecl = decl->getClangDecl()) {
+    if (auto classTemplateDecl =
+            dyn_cast<clang::ClassTemplateDecl>(clangDecl)) {
+      SmallVector<Type, 2> typesOfGenericArgs;
+      for (auto typeRepr : generic->getGenericArgs()) {
+        typesOfGenericArgs.push_back(resolution.resolveType(typeRepr));
+      }
+
+      SmallVector<clang::TemplateArgument, 2> templateArguments;
+      std::unique_ptr<TemplateInstantiationError> error =
+          ctx.getClangTemplateArguments(
+              classTemplateDecl->getTemplateParameters(), typesOfGenericArgs,
+              templateArguments);
+
+      if (error) {
+        std::string failedTypesStr;
+        llvm::raw_string_ostream failedTypesStrStream(failedTypesStr);
+        llvm::interleaveComma(error->failedTypes, failedTypesStrStream);
+        // TODO: This error message should not reference implementation details.
+        // See: https://github.com/apple/swift/pull/33053#discussion_r477003350
+        ctx.Diags.diagnose(
+            loc, diag::unable_to_convert_generic_swift_types.ID,
+            {classTemplateDecl->getName(), StringRef(failedTypesStr)});
+        return ErrorType::get(ctx);
+      }
+
+      auto *clangModuleLoader = decl->getASTContext().getClangModuleLoader();
+      auto instantiatedDecl = clangModuleLoader->instantiateCXXClassTemplate(
+          const_cast<clang::ClassTemplateDecl *>(classTemplateDecl),
+          templateArguments);
+      if (instantiatedDecl) {
+        instantiatedDecl->setTemplateInstantiationType(result);
+        return instantiatedDecl->getDeclaredInterfaceType();
+      } else {
+        diags.diagnose(loc, diag::cxx_class_instantiation_failed);
+        return ErrorType::get(ctx);
+      }
+    }
   }
   return result;
 }
@@ -1768,6 +1812,7 @@ namespace {
                            AnyFunctionType::Representation representation =
                                AnyFunctionType::Representation::Swift,
                            bool noescape = false,
+                           bool concurrent = false,
                            const clang::Type *parsedClangFunctionType = nullptr,
                            DifferentiabilityKind diffKind =
                                DifferentiabilityKind::NonDifferentiable);
@@ -2106,7 +2151,8 @@ TypeResolver::resolveAttributedType(TypeAttributes &attrs, TypeRepr *repr,
   static const TypeAttrKind FunctionAttrs[] = {
     TAK_convention, TAK_pseudogeneric,
     TAK_callee_owned, TAK_callee_guaranteed, TAK_noescape, TAK_autoclosure,
-    TAK_differentiable, TAK_escaping, TAK_yield_once, TAK_yield_many, TAK_async
+    TAK_differentiable, TAK_escaping, TAK_concurrent,
+    TAK_yield_once, TAK_yield_many, TAK_async
   };
 
   auto checkUnsupportedAttr = [&](TypeAttrKind attr) {
@@ -2233,8 +2279,7 @@ TypeResolver::resolveAttributedType(TypeAttributes &attrs, TypeRepr *repr,
       if (attrs.has(TAK_differentiable)) {
         auto *SF = getDeclContext()->getParentSourceFile();
         if (SF && isDifferentiableProgrammingEnabled(*SF)) {
-          diffKind = attrs.linear ? DifferentiabilityKind::Linear
-                                  : DifferentiabilityKind::Normal;
+          diffKind = attrs.differentiabilityKind;
         } else {
           diagnoseInvalid(
               repr, attrs.getLoc(TAK_differentiable),
@@ -2247,7 +2292,8 @@ TypeResolver::resolveAttributedType(TypeAttributes &attrs, TypeRepr *repr,
 
       auto extInfoBuilder = SILFunctionType::ExtInfoBuilder(
           rep, attrs.has(TAK_pseudogeneric), attrs.has(TAK_noescape),
-          attrs.has(TAK_async), diffKind, parsedClangFunctionType);
+          attrs.has(TAK_concurrent), attrs.has(TAK_async), diffKind,
+          parsedClangFunctionType);
 
       ty =
           resolveSILFunctionType(fnRepr, options, coroutineKind, extInfoBuilder,
@@ -2282,8 +2328,7 @@ TypeResolver::resolveAttributedType(TypeAttributes &attrs, TypeRepr *repr,
       if (attrs.has(TAK_differentiable)) {
         auto *SF = getDeclContext()->getParentSourceFile();
         if (SF && isDifferentiableProgrammingEnabled(*SF)) {
-          diffKind = attrs.linear ? DifferentiabilityKind::Linear
-                                  : DifferentiabilityKind::Normal;
+          diffKind = attrs.differentiabilityKind;
         } else {
           diagnoseInvalid(
               repr, attrs.getLoc(TAK_differentiable),
@@ -2294,8 +2339,20 @@ TypeResolver::resolveAttributedType(TypeAttributes &attrs, TypeRepr *repr,
         }
       }
 
+      bool concurrent = false;
+      if (attrs.has(TAK_concurrent)) {
+        if (getASTContext().LangOpts.EnableExperimentalConcurrency) {
+          concurrent = true;
+        } else {
+          diagnoseInvalid(repr, attrs.getLoc(TAK_concurrent),
+                          diag::attr_requires_concurrency,
+                          TypeAttributes::getAttrName(TAK_concurrent),
+                          false);
+        }
+      }
+
       ty = resolveASTFunctionType(fnRepr, options, rep, /*noescape=*/false,
-                                  parsedClangFunctionType,
+                                  concurrent, parsedClangFunctionType,
                                   diffKind);
       if (!ty || ty->hasError())
         return ty;
@@ -2595,14 +2652,14 @@ TypeResolver::resolveASTFunctionTypeParams(TupleTypeRepr *inputRepr,
     elements.emplace_back(ty, Identifier(), paramFlags);
   }
 
-  // All non-`@noDerivative` parameters of `@differentiable` and
-  // `@differentiable(linear)` function types must be differentiable.
+  // All non-`@noDerivative` parameters of `@differentiable` function types must
+  // be differentiable.
   if (diffKind != DifferentiabilityKind::NonDifferentiable &&
       resolution.getStage() != TypeResolutionStage::Structural) {
     bool isLinear = diffKind == DifferentiabilityKind::Linear;
     // Emit `@noDerivative` fixit only if there is at least one valid
-    // differentiability/linearity parameter. Otherwise, adding `@noDerivative`
-    // produces an ill-formed function type.
+    // differentiability parameter. Otherwise, adding `@noDerivative` produces
+    // an ill-formed function type.
     auto hasValidDifferentiabilityParam =
         llvm::find_if(elements, [&](AnyFunctionType::Param param) {
           if (param.isNoDerivative())
@@ -2687,7 +2744,7 @@ TypeResolver::resolveOpaqueReturnType(TypeRepr *repr, StringRef mangledName,
 NeverNullType TypeResolver::resolveASTFunctionType(
     FunctionTypeRepr *repr, TypeResolutionOptions parentOptions,
     AnyFunctionType::Representation representation, bool noescape,
-    const clang::Type *parsedClangFunctionType,
+    bool concurrent, const clang::Type *parsedClangFunctionType,
     DifferentiabilityKind diffKind) {
 
   Optional<llvm::SaveAndRestore<GenericParamList *>> saveGenericParams;
@@ -2749,6 +2806,7 @@ NeverNullType TypeResolver::resolveASTFunctionType(
         getASTContext().getClangFunctionType(params, outputTy, representation);
 
   auto extInfo = extInfoBuilder.withRepresentation(representation)
+                     .withConcurrent(concurrent)
                      .withAsync(repr->isAsync())
                      .withClangFunctionType(clangFnType)
                      .build();
@@ -2789,8 +2847,7 @@ NeverNullType TypeResolver::resolveASTFunctionType(
     break;
   }
 
-  // `@differentiable` and `@differentiable(linear)` function types must return
-  // a differentiable type.
+  // `@differentiable` function types must return a differentiable type.
   if (extInfo.isDifferentiable() &&
       resolution.getStage() != TypeResolutionStage::Structural) {
     bool isLinear = diffKind == DifferentiabilityKind::Linear;
@@ -3859,6 +3916,12 @@ public:
                            proto->getName());
         T->setInvalid();
       }
+      if (proto->isMarkerProtocol()) {
+        Ctx.Diags.diagnose(comp->getNameLoc(),
+                           diag::marker_protocol_value,
+                           proto->getName());
+        T->setInvalid();
+      }
     } else if (auto *alias = dyn_cast_or_null<TypeAliasDecl>(comp->getBoundDecl())) {
       auto type = Type(alias->getDeclaredInterfaceType()->getDesugaredType());
       type.findIf([&](Type type) -> bool {
@@ -3868,6 +3931,14 @@ public:
           auto layout = type->getExistentialLayout();
           for (auto *proto : layout.getProtocols()) {
             auto *protoDecl = proto->getDecl();
+
+            if (protoDecl->isMarkerProtocol()) {
+              Ctx.Diags.diagnose(comp->getNameLoc(),
+                                 diag::marker_protocol_value,
+                                 protoDecl->getName());
+              T->setInvalid();
+              continue;
+            }
 
             if (protoDecl->existentialTypeSupported())
               continue;
@@ -3970,12 +4041,26 @@ Type CustomAttrTypeRequest::evaluate(Evaluator &eval, CustomAttr *attr,
     };
   }
 
-  ASTContext &ctx = dc->getASTContext();
   const auto type = TypeResolution::forContextual(dc, options, unboundTyOpener)
                         .resolveType(attr->getTypeRepr());
 
-  // We always require the type to resolve to a nominal type.
-  if (!type->getAnyNominal()) {
+  // We always require the type to resolve to a nominal type. If the type was
+  // not a nominal type, we should have already diagnosed an error via
+  // CustomAttrNominalRequest.
+  auto checkType = [](Type type) -> bool {
+    while (auto *genericDecl = type->getAnyGeneric()) {
+      if (isa<NominalTypeDecl>(genericDecl))
+        return true;
+
+      auto *aliasDecl = cast<TypeAliasDecl>(genericDecl);
+      type = aliasDecl->getUnderlyingType();
+    }
+
+    return false;
+  };
+
+  if (!checkType(type)) {
+    ASTContext &ctx = dc->getASTContext();
     assert(ctx.Diags.hadAnyError());
     return ErrorType::get(ctx);
   }

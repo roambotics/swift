@@ -758,11 +758,19 @@ ArrayRef<Decl *> IterableDeclContext::getParsedMembers() const {
     .members;
 }
 
-ArrayRef<Decl *> IterableDeclContext::getSemanticMembers() const {
+ArrayRef<Decl *> IterableDeclContext::getABIMembers() const {
   ASTContext &ctx = getASTContext();
   return evaluateOrDefault(
       ctx.evaluator,
-      SemanticMembersRequest{const_cast<IterableDeclContext *>(this)},
+      ABIMembersRequest{const_cast<IterableDeclContext *>(this)},
+      ArrayRef<Decl *>());
+}
+
+ArrayRef<Decl *> IterableDeclContext::getAllMembers() const {
+  ASTContext &ctx = getASTContext();
+  return evaluateOrDefault(
+      ctx.evaluator,
+      AllMembersRequest{const_cast<IterableDeclContext *>(this)},
       ArrayRef<Decl *>());
 }
 
@@ -1050,16 +1058,14 @@ getPrivateDeclContext(const DeclContext *DC, const SourceFile *useSF) {
   return lastExtension ? lastExtension : DC;
 }
 
-AccessScope::AccessScope(const DeclContext *DC, bool isPrivate, bool isSPI)
-    : Value(DC, isPrivate || isSPI) {
+AccessScope::AccessScope(const DeclContext *DC, bool isPrivate)
+    : Value(DC, isPrivate) {
   if (isPrivate) {
     DC = getPrivateDeclContext(DC, DC->getParentSourceFile());
     Value.setPointer(DC);
   }
   if (!DC || isa<ModuleDecl>(DC))
     assert(!isPrivate && "public or internal scope can't be private");
-  if (DC)
-    assert(!isSPI && "only public scopes can be SPI");
 }
 
 bool AccessScope::isFileScope() const {

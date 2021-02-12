@@ -1,8 +1,8 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency) | %FileCheck %s --dump-input always
+// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency -parse-as-library) | %FileCheck %s
 // REQUIRES: executable_test
 // REQUIRES: concurrency
-// REQUIRES: OS=macosx
-// REQUIRES: CPU=x86_64
+
+// REQUIRES: rdar73154198
 
 import Dispatch
 
@@ -41,4 +41,8 @@ func test_taskGroup_throws_rethrows() async {
 
 // CHECK: error caught and rethrown in group: Boom()
 // CHECK: rethrown: Boom()
-runAsyncAndBlock(test_taskGroup_throws_rethrows)
+@main struct Main {
+  static func main() async {
+    await test_taskGroup_throws_rethrows()
+  }
+}

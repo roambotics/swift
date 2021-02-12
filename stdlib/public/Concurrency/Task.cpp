@@ -21,6 +21,13 @@
 #include "swift/Runtime/HeapObject.h"
 #include "TaskPrivate.h"
 #include "AsyncCall.h"
+#include "Debug.h"
+
+#include <dispatch/dispatch.h>
+
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 
 using namespace swift;
 using FutureFragment = AsyncTask::FutureFragment;
@@ -162,11 +169,14 @@ static FullMetadata<HeapMetadata> taskHeapMetadata = {
   }
 };
 
+const void *const swift::_swift_concurrency_debug_asyncTaskMetadata =
+    static_cast<Metadata *>(&taskHeapMetadata);
+
 /// The function that we put in the context of a simple task
 /// to handle the final return.
 SWIFT_CC(swift)
 static void completeTask(AsyncTask *task, ExecutorRef executor,
-                         AsyncContext *context) {
+                         SWIFT_ASYNC_CONTEXT AsyncContext *context) {
   // Tear down the task-local allocator immediately;
   // there's no need to wait for the object to be destroyed.
   _swift_task_alloc_destroy(task);
@@ -299,7 +309,7 @@ AsyncTaskAndContext swift::swift_task_create_future_f(
 
 void swift::swift_task_future_wait(
     AsyncTask *waitingTask, ExecutorRef executor,
-    AsyncContext *rawContext) {
+    SWIFT_ASYNC_CONTEXT AsyncContext *rawContext) {
   // Suspend the waiting task.
   waitingTask->ResumeTask = rawContext->ResumeParent;
   waitingTask->ResumeContext = rawContext;
@@ -396,7 +406,7 @@ using RunAndBlockCalleeContext =
 /// Second half of the runAndBlock async function.
 SWIFT_CC(swiftasync)
 static void runAndBlock_finish(AsyncTask *task, ExecutorRef executor,
-                               AsyncContext *_context) {
+                               SWIFT_ASYNC_CONTEXT AsyncContext *_context) {
   auto calleeContext = static_cast<RunAndBlockCalleeContext*>(_context);
   auto context = popAsyncContext(task, calleeContext);
 
@@ -408,7 +418,7 @@ static void runAndBlock_finish(AsyncTask *task, ExecutorRef executor,
 /// First half of the runAndBlock async function.
 SWIFT_CC(swiftasync)
 static void runAndBlock_start(AsyncTask *task, ExecutorRef executor,
-                              AsyncContext *_context) {
+                              SWIFT_ASYNC_CONTEXT AsyncContext *_context) {
   auto callerContext = static_cast<RunAndBlockContext*>(_context);
 
   size_t calleeContextSize;
@@ -420,14 +430,22 @@ static void runAndBlock_start(AsyncTask *task, ExecutorRef executor,
   if (functionContext) {
     function = reinterpret_cast<RunAndBlockSignature::FunctionType*>(
                    const_cast<void*>(callerContext->Function));
+    function = swift_auth_code(
+        function, SpecialPointerAuthDiscriminators::AsyncRunAndBlockFunction);
     calleeContextSize =
       static_cast<ThickAsyncFunctionContext*>(functionContext)
         ->ExpectedContextSize;
 
   // Otherwise, the function pointer is an async function pointer.
   } else {
-    auto fnPtr = reinterpret_cast<const RunAndBlockSignature::FunctionPointer*>(
-                   callerContext->Function);
+    auto fnPtr =
+        reinterpret_cast<const RunAndBlockSignature::FunctionPointer *>(
+            const_cast<void *>(callerContext->Function));
+#if SWIFT_PTRAUTH
+    fnPtr = (const RunAndBlockSignature::FunctionPointer *)ptrauth_auth_data(
+        (void *)fnPtr, ptrauth_key_process_independent_code,
+        SpecialPointerAuthDiscriminators::AsyncRunAndBlockFunction);
+#endif
     function = fnPtr->Function;
     calleeContextSize = fnPtr->ExpectedContextSize;
   }
@@ -527,4 +545,45 @@ bool swift::swift_task_isCancelled(AsyncTask *task) {
 SWIFT_CC(swift)
 void swift::swift_continuation_logFailedCheck(const char *message) {
   swift_reportError(0, message);
+}
+
+void swift::swift_task_asyncMainDrainQueue() {
+#if SWIFT_CONCURRENCY_COOPERATIVE_GLOBAL_EXECUTOR
+  bool Finished = false;
+  donateThreadToGlobalExecutorUntil([](void *context) {
+    return *reinterpret_cast<bool*>(context);
+  }, &Finished);
+#else
+#if defined(_WIN32)
+  static void(FAR *pfndispatch_main)(void) = NULL;
+
+  if (pfndispatch_main)
+    return pfndispatch_main();
+
+  HMODULE hModule = LoadLibraryW(L"dispatch.dll");
+  if (hModule == NULL)
+    abort();
+
+  pfndispatch_main =
+      reinterpret_cast<void (FAR *)(void)>(GetProcAddress(hModule,
+                                                          "dispatch_main"));
+  if (pfndispatch_main == NULL)
+    abort();
+
+  pfndispatch_main();
+#else
+  // CFRunLoop is not available on non-Darwin targets.  Foundation has an
+  // implementation, but CoreFoundation is not meant to be exposed.  We can only
+  // assume the existence of `CFRunLoopRun` on Darwin platforms, where the
+  // system provides an implementation of CoreFoundation.
+#if defined(__APPLE__)
+  auto runLoop =
+      reinterpret_cast<void (*)(void)>(dlsym(RTLD_DEFAULT, "CFRunLoopRun"));
+  if (runLoop)
+    return runLoop();
+#endif
+
+    dispatch_main();
+#endif
+#endif
 }

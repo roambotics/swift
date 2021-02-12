@@ -19,7 +19,7 @@ import Swift
 /// which involves enqueuing new partial tasks to be executed at some
 /// point. Actor classes implicitly conform to this protocol as part of their
 /// primary class definition.
-public protocol Actor: AnyObject {
+public protocol Actor: AnyObject, ConcurrentValue {
   /// Enqueue a new partial task that will be executed in the actor's context.
   func enqueue(partialTask: PartialAsyncTask)
 }
@@ -39,16 +39,16 @@ public func _defaultActorDestroy(_ actor: AnyObject)
 public func _defaultActorEnqueue(partialTask: PartialAsyncTask,
                                  actor: AnyObject)
 
+/// FIXME: only exists for the quick-and-dirty MainActor implementation.
+@_silgen_name("swift_MainActor_register")
+fileprivate func _registerMainActor(actor: AnyObject)
+
 /// A singleton actor whose executor is equivalent to 
 /// \c DispatchQueue.main, which is the main dispatch queue.
 @globalActor public final class MainActor {
   public static let shared = _Impl()
   
-  public actor class _Impl {
-    @actorIndependent
-    public func enqueue(partialTask: PartialAsyncTask) {
-      // TODO: implement this.
-      _ = (nil as String?)! + "MainActor is not implemented yet."
-    }
+  public actor _Impl {
+    init() { _registerMainActor(actor: self) }
   }
 }

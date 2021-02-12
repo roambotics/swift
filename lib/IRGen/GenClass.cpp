@@ -2143,6 +2143,7 @@ namespace {
       case llvm::Triple::Wasm:
         var->setSection(".data");
         break;
+      case llvm::Triple::GOFF:
       case llvm::Triple::UnknownObjectFormat:
         llvm_unreachable("Don't know how to emit private global constants for "
                          "the selected object format.");
@@ -2414,7 +2415,8 @@ ClassDecl *IRGenModule::getObjCRuntimeBaseClass(Identifier name,
   auto SwiftRootClass = new (Context) ClassDecl(SourceLoc(), name, SourceLoc(),
                                            ArrayRef<TypeLoc>(),
                                            /*generics*/ nullptr,
-                                           Context.TheBuiltinModule);
+                                           Context.TheBuiltinModule,
+                                           /*isActor*/false);
   SwiftRootClass->setIsObjC(Context.LangOpts.EnableObjCInterop);
   SwiftRootClass->getAttrs().add(ObjCAttr::createNullary(Context, objcName,
     /*isNameImplicit=*/true));

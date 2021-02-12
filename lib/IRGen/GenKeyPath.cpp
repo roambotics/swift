@@ -191,7 +191,9 @@ getAccessorForComputedComponent(IRGenModule &IGM,
     accessorThunk->addAttribute(2, llvm::Attribute::NoCapture);
     accessorThunk->addAttribute(2, llvm::Attribute::NoAlias);
     // Output is sret.
-    accessorThunk->addAttribute(1, llvm::Attribute::StructRet);
+    accessorThunk->addAttribute(
+        1, llvm::Attribute::getWithStructRetType(
+               IGM.getLLVMContext(), thunkParams[0]->getPointerElementType()));
     break;
   case Setter:
     // Original accessor's args should be @in or @out, meaning they won't be
@@ -920,7 +922,7 @@ emitKeyPathComponent(IRGenModule &IGM,
       idKind = KeyPathComponentHeader::Pointer;
       // FIXME: Does this need to be signed?
       auto idRef = IGM.getAddrOfLLVMVariableOrGOTEquivalent(
-        LinkEntity::forSILFunction(id.getFunction(), false));
+        LinkEntity::forSILFunction(id.getFunction()));
       
       idValue = idRef.getValue();
       // If we got an indirect reference, we'll need to resolve it at

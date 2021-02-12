@@ -60,15 +60,16 @@ toolchain as a one-off, there are a couple of differences:
 
 1. Create a directory for the whole project:
    ```sh
-   mkdir -p swift-project/swift
-   cd swift-project/swift
+   mkdir swift-project
+   cd swift-project
    ```
 2. Clone the sources:
    - Via SSH (recommended):
      If you plan on contributing regularly, cloning over SSH provides a better
      experience. After you've [uploaded your SSH keys to GitHub][]:
      ```sh
-     git clone git@github.com:apple/swift.git .
+     git clone git@github.com:apple/swift.git swift
+     cd swift
      utils/update-checkout --clone-with-ssh
      ```
    - Via HTTPS:
@@ -76,7 +77,8 @@ toolchain as a one-off, there are a couple of differences:
      or are not familiar with setting up SSH,
      you can use HTTPS instead:
      ```sh
-     git clone https://github.com/apple/swift.git .
+     git clone https://github.com/apple/swift.git swift
+     cd swift
      utils/update-checkout --clone
      ```
    **Note:** If you've already forked the project on GitHub at this stage,
@@ -125,6 +127,8 @@ Double-check that running `pwd` prints a path ending with `swift`.
 ## Installing dependencies
 
 ### macOS
+
+⚠️ Since version 0.2.14, `sccache` no longer caches compile commands issued by `build-script` because of [sccache PR 898](https://github.com/mozilla/sccache/pull/898), since `build-script` adds the `-arch x86_64` argument twice. The instructions below may install `sccache` 0.2.14 or newer. You may want to instead download and install an older release from their [Releases page](https://github.com/mozilla/sccache/releases) until this issue is resolved.
 
 1. Install [Xcode 12.3][Xcode] or newer:
    The required version of Xcode changes frequently and is often a beta release.
@@ -246,13 +250,13 @@ Phew, that's a lot to digest! Now let's proceed to the actual build itself!
      ```sh
      utils/build-script --skip-build-benchmarks \
        --skip-ios --skip-watchos --skip-tvos --swift-darwin-supported-archs "$(uname -m)" \
-       --sccache --release-debuginfo --test
+       --sccache --release-debuginfo --swift-disable-dead-stripping --test
      ```
    - Via Xcode:
      ```sh
      utils/build-script --skip-build-benchmarks \
        --skip-ios --skip-watchos --skip-tvos --swift-darwin-supported-archs "$(uname -m)" \
-       --sccache --release-debuginfo --test \
+       --sccache --release-debuginfo --swift-disable-dead-stripping --test \
        --xcode
      ```
    This will create a directory

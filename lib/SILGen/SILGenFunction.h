@@ -601,9 +601,9 @@ public:
         DebugScopeStack.size() ? DebugScopeStack.back().getPointer() : F.getDebugScope();
     auto *DS = Parent;
     // Don't nest a scope for Loc under Parent unless it's actually different.
-    if (DS->getLoc().getAsRegularLocation() != Loc.getAsRegularLocation()) {
+    if (RegularLocation(DS->getLoc()) != RegularLocation(Loc)) {
       DS = new (SGM.M)
-          SILDebugScope(Loc.getAsRegularLocation(), &getFunction(), DS);
+          SILDebugScope(RegularLocation(Loc), &getFunction(), DS);
     }
     DebugScopeStack.emplace_back(DS, isGuardScope);
     B.setCurrentDebugScope(DS);
@@ -856,21 +856,20 @@ public:
   // Concurrency
   //===--------------------------------------------------------------------===//
 
-  /// Generates code into the given SGF that obtains the callee function's 
-  /// executor, if the function is actor-isolated.
-  /// @returns a SILValue representing the executor, if an executor exists.
-  static Optional<SILValue> EmitLoadActorExecutorForCallee(
-                                                  SILGenFunction *SGF, 
-                                                  ValueDecl *calleeVD,
-                                                  ArrayRef<ManagedValue> args);
+  /// Generates code to obtain the callee function's executor, if the function
+  /// is actor-isolated.
+  ///
+  /// \returns a SILValue representing the executor, if an executor exists.
+  Optional<SILValue> emitLoadActorExecutorForCallee(ValueDecl *calleeVD,
+                                                    ArrayRef<ManagedValue> args);
 
   /// Generates code to obtain the executor given the actor's decl.
-  /// @returns a SILValue representing the executor.
+  /// \returns a SILValue representing the executor.
   SILValue emitLoadActorExecutor(VarDecl *actorDecl);
 
   /// Generates the code to obtain the executor for the shared instance 
   /// of the \p globalActor based on the type.
-  /// @returns a SILValue representing the executor.
+  /// \returns a SILValue representing the executor.
   SILValue emitLoadGlobalActorExecutor(Type globalActor);
 
   //===--------------------------------------------------------------------===//

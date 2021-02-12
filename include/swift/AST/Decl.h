@@ -86,9 +86,11 @@ namespace swift {
   struct PropertyWrapperTypeInfo;
   struct PropertyWrapperMutability;
   class ProtocolDecl;
+  class ProtocolRethrowsRequirementList;
   class ProtocolType;
   struct RawComment;
   enum class ResilienceExpansion : unsigned;
+  enum class FunctionRethrowingKind : uint8_t;
   class TrailingWhereClause;
   class TypeAliasDecl;
   class Stmt;
@@ -333,7 +335,7 @@ protected:
     NumElements : 32
   );
 
-  SWIFT_INLINE_BITFIELD(ValueDecl, Decl, 1+1+1,
+  SWIFT_INLINE_BITFIELD(ValueDecl, Decl, 1+1+1+1,
     AlreadyInLookupTable : 1,
 
     /// Whether we have already checked whether this declaration is a 
@@ -342,7 +344,11 @@ protected:
 
     /// Whether the decl can be accessed by swift users; for instance,
     /// a.storage for lazy var a is a decl that cannot be accessed.
-    IsUserAccessible : 1
+    IsUserAccessible : 1,
+
+    /// Whether this member was synthesized as part of a derived
+    /// protocol conformance.
+    Synthesized : 1
   );
 
   SWIFT_INLINE_BITFIELD(AbstractStorageDecl, ValueDecl, 1,
@@ -387,7 +393,7 @@ protected:
   SWIFT_INLINE_BITFIELD(SubscriptDecl, VarDecl, 2,
     StaticSpelling : 2
   );
-  SWIFT_INLINE_BITFIELD(AbstractFunctionDecl, ValueDecl, 3+8+1+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(AbstractFunctionDecl, ValueDecl, 3+8+1+1+1+1+1+1,
     /// \see AbstractFunctionDecl::BodyKind
     BodyKind : 3,
 
@@ -405,10 +411,6 @@ protected:
 
     /// Whether the function body throws.
     Throws : 1,
-
-    /// Whether this member was synthesized as part of a derived
-    /// protocol conformance.
-    Synthesized : 1,
 
     /// Whether this member's body consists of a single expression.
     HasSingleExpressionBody : 1,
@@ -544,7 +546,7 @@ protected:
     NumRequirementsInSignature : 16
   );
 
-  SWIFT_INLINE_BITFIELD(ClassDecl, NominalTypeDecl, 1+1+2+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(ClassDecl, NominalTypeDecl, 1+1+2+1+1+1+1+1+1,
     /// Whether this class inherits its superclass's convenience initializers.
     InheritsSuperclassInits : 1,
     ComputedInheritsSuperclassInits : 1,
@@ -560,7 +562,10 @@ protected:
 
     /// Whether instances of this class are incompatible
     /// with weak and unowned references.
-    IsIncompatibleWithWeakReferences : 1
+    IsIncompatibleWithWeakReferences : 1,
+
+    /// Set when the class represents an actor
+    IsActor : 1
   );
 
   SWIFT_INLINE_BITFIELD(
@@ -866,7 +871,7 @@ public:
   }
 
   /// \returns the unparsed comment attached to this declaration.
-  RawComment getRawComment(bool SerializedOK = false) const;
+  RawComment getRawComment(bool SerializedOK = true) const;
 
   Optional<StringRef> getGroupName() const;
 
@@ -2020,6 +2025,7 @@ protected:
     Bits.ValueDecl.AlreadyInLookupTable = false;
     Bits.ValueDecl.CheckedRedeclaration = false;
     Bits.ValueDecl.IsUserAccessible = true;
+    Bits.ValueDecl.Synthesized = false;
   }
 
   // MemberLookupTable borrows a bit from this type
@@ -2055,6 +2061,14 @@ public:
 
   bool isUserAccessible() const {
     return Bits.ValueDecl.IsUserAccessible;
+  }
+
+  bool isSynthesized() const {
+    return Bits.ValueDecl.Synthesized;
+  }
+
+  void setSynthesized(bool value = true) {
+    Bits.ValueDecl.Synthesized = value;
   }
 
   bool hasName() const { return bool(Name); }
@@ -2310,10 +2324,8 @@ public:
   /// dynamic methods on generic classes (see above).
   bool isNativeMethodReplacement() const;
 
-  bool isEffectiveLinkageMoreVisibleThan(ValueDecl *other) const {
-    return (std::min(getEffectiveAccess(), AccessLevel::Public) >
-            std::min(other->getEffectiveAccess(), AccessLevel::Public));
-  }
+  /// Returns if this declaration has more visible formal access than 'other'.
+  bool isMoreVisibleThan(ValueDecl *other) const;
 
   /// Set whether this type is 'dynamic' or not.
   void setIsDynamic(bool value);
@@ -3188,6 +3200,17 @@ public:
   /// declaration, or \c nullptr if it doesn't have one.
   ConstructorDecl *getDefaultInitializer() const;
 
+  /// Force the synthesis of all members named \c member requiring semantic
+  /// analysis and install them in the member list of this nominal type.
+  ///
+  /// \Note The use of this method in the compiler signals an architectural
+  /// problem with the caller. Use \c TypeChecker::lookup* instead of
+  /// introducing new usages.
+  ///
+  /// FIXME: This method presents a problem with respect to the consistency
+  /// and idempotency of lookups in the compiler. If we instead had a model
+  /// where lookup requests would explicitly return semantic members or parsed
+  /// members this function could disappear.
   void synthesizeSemanticMembersIfNeeded(DeclName member);
 
   /// Retrieves the static 'shared' property of a global actor type, which
@@ -3393,6 +3416,42 @@ public:
 class StructDecl final : public NominalTypeDecl {
   SourceLoc StructLoc;
 
+  // We import C++ class templates as generic structs. Then when in Swift code
+  // we want to substitude generic parameters with actual arguments, we
+  // convert the arguments to C++ equivalents and ask Clang to instantiate the
+  // C++ template. Then we import the C++ class template instantiation
+  // as a non-generic structs with a name prefixed with `__CxxTemplateInst`.
+  //
+  // To reiterate:
+  // 1) We need to have a C++ class template declaration in the Clang AST. This
+  //    declaration is simply imported from a Clang module.
+  // 2) We need a Swift generic struct in the Swift AST. This will provide
+  //    template arguments to Clang.
+  // 3) We produce a C++ class template instantiation in the Clang AST
+  //    using 1) and 2). This declaration does not exist in the Clang module
+  //    AST initially in the general case, it's added there on instantiation.
+  // 4) We import the instantiation as a Swift struct, with the name prefixed
+  //    with `__CxxTemplateInst`.
+  //
+  // This causes a problem for serialization/deserialization of the Swift
+  // module. Imagine the Swift struct from 4) is used in the function return
+  // type. We cannot just serialize the non generic Swift struct, because on
+  // deserialization we would need to find its backing Clang declaration
+  // (the C++ class template instantiation), and it won't be found in the
+  // general case. Only the C++ class template from step 1) is in the Clang
+  // AST.
+  //
+  // What we need is to serialize enough information to be
+  // able to instantiate C++ class template on deserialization. It turns out
+  // that all that information is conveniently covered by the BoundGenericType,
+  // which we store in this field. The field is set during the typechecking at
+  // the time when we instantiate the C++ class template.
+  //
+  // Alternative, and likely better solution long term, is to serialize the
+  // C++ class template instantiation into a synthetic Clang module, and load
+  // this Clang module on deserialization.
+  Type TemplateInstantiationType = Type();
+
 public:
   StructDecl(SourceLoc StructLoc, Identifier Name, SourceLoc NameLoc,
              ArrayRef<TypeLoc> Inherited,
@@ -3436,6 +3495,9 @@ public:
   bool isCxxNonTrivial() const { return Bits.StructDecl.IsCxxNonTrivial; }
 
   void setIsCxxNonTrivial(bool v) { Bits.StructDecl.IsCxxNonTrivial = v; }
+
+  Type getTemplateInstantiationType() const { return TemplateInstantiationType; }
+  void setTemplateInstantiationType(Type t) { TemplateInstantiationType = t; }
 };
 
 /// This is the base type for AncestryOptions. Each flag describes possible
@@ -3532,14 +3594,15 @@ class ClassDecl final : public NominalTypeDecl {
 
   friend class SuperclassDeclRequest;
   friend class SuperclassTypeRequest;
-  friend class SemanticMembersRequest;
+  friend class ABIMembersRequest;
   friend class HasMissingDesignatedInitializersRequest;
   friend class InheritsSuperclassInitializersRequest;
 
 public:
   ClassDecl(SourceLoc ClassLoc, Identifier Name, SourceLoc NameLoc,
             ArrayRef<TypeLoc> Inherited,
-            GenericParamList *GenericParams, DeclContext *DC);
+            GenericParamList *GenericParams, DeclContext *DC,
+            bool isActor);
 
   SourceLoc getStartLoc() const { return ClassLoc; }
   SourceRange getSourceRange() const {
@@ -3638,6 +3701,9 @@ public:
   /// Whether the class is known to be a *root* default actor,
   /// i.e. the first class in its hierarchy that is a default actor.
   bool isRootDefaultActor() const;
+
+  /// Whether the class was explicitly declared with the `actor` keyword.
+  bool isExplicitActor() const { return Bits.ClassDecl.IsActor; }
 
   /// Does this class explicitly declare any of the methods that
   /// would prevent it from being a default actor?
@@ -4050,6 +4116,13 @@ public:
   /// all the members do not contain any associated types, and do not
   /// contain 'Self' in 'parameter' or 'other' position.
   bool existentialTypeSupported() const;
+
+  ProtocolRethrowsRequirementList getRethrowingRequirements() const;
+  bool isRethrowingProtocol() const;
+
+  /// Determine whether this is a "marker" protocol, meaning that is indicates
+  /// semantics but has no corresponding witness table.
+  bool isMarkerProtocol() const;
 
 private:
   void computeKnownProtocolKind() const;
@@ -5577,7 +5650,6 @@ protected:
     Bits.AbstractFunctionDecl.Overridden = false;
     Bits.AbstractFunctionDecl.Async = Async;
     Bits.AbstractFunctionDecl.Throws = Throws;
-    Bits.AbstractFunctionDecl.Synthesized = false;
     Bits.AbstractFunctionDecl.HasSingleExpressionBody = false;
     Bits.AbstractFunctionDecl.HasNestedTypeDeclarations = false;
   }
@@ -5646,6 +5718,11 @@ public:
   /// type of the function will be `async` as well.
   bool hasAsync() const { return Bits.AbstractFunctionDecl.Async; }
 
+  /// Determine whether the given function is concurrent.
+  ///
+  /// A function is concurrent if it has the @concurrent attribute.
+  bool isConcurrent() const;
+
   /// Returns true if the function is a suitable 'async' context.
   ///
   /// Functions that are an 'async' context can make calls to 'async' functions.
@@ -5662,6 +5739,8 @@ public:
 
   /// Returns true if the function body throws.
   bool hasThrows() const { return Bits.AbstractFunctionDecl.Throws; }
+
+  FunctionRethrowingKind getRethrowingKind() const;
 
   // FIXME: Hack that provides names with keyword arguments for accessors.
   DeclName getEffectiveFullName() const;
@@ -5783,14 +5862,6 @@ public:
   /// For a method of a class, checks whether it will require a new entry in the
   /// vtable.
   bool needsNewVTableEntry() const;
-
-  bool isSynthesized() const {
-    return Bits.AbstractFunctionDecl.Synthesized;
-  }
-
-  void setSynthesized(bool value = true) {
-    Bits.AbstractFunctionDecl.Synthesized = value;
-  }
 
 public:
   /// Retrieve the source range of the function body.

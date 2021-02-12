@@ -1,8 +1,9 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency) | %FileCheck %s --dump-input=always
+// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-concurrency -parse-as-library) | %FileCheck %s --dump-input=always
 // REQUIRES: executable_test
 // REQUIRES: concurrency
-// REQUIRES: OS=macosx
-// REQUIRES: CPU=x86_64
+// XFAIL: windows
+// XFAIL: linux
+// XFAIL: openbsd
 
 import Dispatch
 
@@ -15,7 +16,7 @@ func test_skipCallingNext_butInvokeCancelAll() async {
       await group.add { () async -> Int in
         sleep(1)
         print("  inside group.add { \(n) }")
-        let cancelled = await Task.isCancelled()
+        let cancelled = await Task.__unsafeCurrentAsync().isCancelled
         print("  inside group.add { \(n) } (canceled: \(cancelled))")
         return n
       }
@@ -24,7 +25,8 @@ func test_skipCallingNext_butInvokeCancelAll() async {
     group.cancelAll()
 
     // return immediately; the group should wait on the tasks anyway
-    print("return immediately 0 (canceled: \(await Task.isCancelled()))")
+    let c = await Task.__unsafeCurrentAsync().isCancelled
+    print("return immediately 0 (canceled: \(c))")
     return 0
   }
 
@@ -43,4 +45,8 @@ func test_skipCallingNext_butInvokeCancelAll() async {
   assert(result == 0)
 }
 
-runAsyncAndBlock(test_skipCallingNext_butInvokeCancelAll)
+@main struct Main {
+  static func main() async {
+    await test_skipCallingNext_butInvokeCancelAll()
+  }
+}

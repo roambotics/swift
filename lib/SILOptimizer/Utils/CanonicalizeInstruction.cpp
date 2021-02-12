@@ -26,6 +26,7 @@
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SILOptimizer/Analysis/SimplifyInstruction.h"
+#include "swift/SILOptimizer/Utils/DebugOptUtils.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Debug.h"
 
@@ -81,24 +82,16 @@ killInstAndIncidentalUses(SingleValueInstruction *inst,
 // intruction that wasn't erased.
 static Optional<SILBasicBlock::iterator>
 simplifyAndReplace(SILInstruction *inst, CanonicalizeInstruction &pass) {
-  SILValue result = simplifyInstruction(inst);
-  if (!result)
-    return None;
-
-  ++NumSimplified;
-
-  LLVM_DEBUG(llvm::dbgs() << "Simplify Old = " << *inst
-                          << "    New = " << *result << '\n');
-
   // Erase the simplified instruction and any instructions that end its
   // scope. Nothing needs to be added to the worklist except for Result,
   // because the instruction and all non-replaced users will be deleted.
-  auto nextII = replaceAllSimplifiedUsesAndErase(inst, result, pass.callbacks,
-                                                 &pass.deadEndBlocks);
+  pass.callbacks.resetHadCallbackInvocation();
+  auto result = simplifyAndReplaceAllSimplifiedUsesAndErase(
+      inst, pass.callbacks, &pass.deadEndBlocks);
+  if (!pass.callbacks.hadCallbackInvocation())
+    return None;
 
-  // Push the new instruction and any users onto the worklist.
-  pass.notifyHasNewUsers(result);
-  return nextII;
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -529,7 +522,7 @@ eliminateUnneededForwardingUnarySingleValueInst(SingleValueInstruction *inst,
   for (auto *use : getNonDebugUses(inst))
     if (!isa<DestroyValueInst>(use->getUser()))
       return next;
-  deleteAllDebugUses(inst);
+  deleteAllDebugUses(inst, pass.callbacks);
   SILValue op = inst->getOperand(0);
   inst->replaceAllUsesWith(op);
   pass.notifyHasNewUsers(op);
@@ -539,7 +532,7 @@ eliminateUnneededForwardingUnarySingleValueInst(SingleValueInstruction *inst,
 static Optional<SILBasicBlock::iterator>
 tryEliminateUnneededForwardingInst(SILInstruction *i,
                                    CanonicalizeInstruction &pass) {
-  assert(isa<OwnershipForwardingInst>(i) &&
+  assert(OwnershipForwardingMixin::isa(i) &&
          "Must be an ownership forwarding inst");
   if (auto *svi = dyn_cast<SingleValueInstruction>(i))
     if (svi->getNumOperands() == 1)
@@ -576,7 +569,7 @@ CanonicalizeInstruction::canonicalize(SILInstruction *inst) {
   // diagnostics.
   auto *fn = inst->getFunction();
   if (fn->hasOwnership() && fn->getModule().getStage() != SILStage::Raw) {
-    if (isa<OwnershipForwardingInst>(inst))
+    if (OwnershipForwardingMixin::isa(inst))
       if (auto newNext = tryEliminateUnneededForwardingInst(inst, *this))
         return *newNext;
   }

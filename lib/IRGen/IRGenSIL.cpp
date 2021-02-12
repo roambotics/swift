@@ -26,11 +26,13 @@
 #include "swift/Basic/ExternalUnion.h"
 #include "swift/Basic/Range.h"
 #include "swift/Basic/STLExtras.h"
+#include "swift/IRGen/Linking.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/PrettyStackTrace.h"
+#include "swift/SIL/SILBitfield.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILLinkage.h"
@@ -1629,10 +1631,13 @@ static ArrayRef<SILArgument *> emitEntryPointIndirectReturn(
     auto &paramTI = IGF.IGM.getTypeInfo(inContextResultType);
 
     // The parameter's type might be different due to looking through opaque
-    // archetypes.
+    // archetypes or for non-fixed types (llvm likes to do type based analysis
+    // for sret arguments and so we use opaque storage types for them).
     llvm::Value *ptr = emission.getIndirectResult(idx);
-    if (paramTI.getStorageType() != retTI.getStorageType()) {
-      assert(inContextResultType.getASTType()->hasOpaqueArchetype());
+    bool isFixedSize = isa<FixedTypeInfo>(paramTI);
+    if (paramTI.getStorageType() != retTI.getStorageType() || !isFixedSize) {
+      assert(!isFixedSize ||
+             inContextResultType.getASTType()->hasOpaqueArchetype());
       ptr = IGF.Builder.CreateBitCast(ptr,
                                       retTI.getStorageType()->getPointerTo());
     }
@@ -1720,7 +1725,9 @@ static void emitEntryPointArgumentsNativeCC(IRGenSILFunction &IGF,
   }
 
   if (funcTy->isAsync()) {
-    emitAsyncFunctionEntry(IGF, IGF.CurSILFn);
+    emitAsyncFunctionEntry(IGF,
+                           getAsyncContextLayout(IGF.IGM, IGF.CurSILFn),
+                           LinkEntity::forSILFunction(IGF.CurSILFn));
   }
 
   SILFunctionConventions conv(funcTy, IGF.getSILModule());
@@ -1942,9 +1949,12 @@ void IRGenSILFunction::emitSILFunction() {
     IGM.IRGen.addDynamicReplacement(CurSILFn);
 
   auto funcTy = CurSILFn->getLoweredFunctionType();
-  if (funcTy->isAsync() && funcTy->getLanguage() == SILFunctionLanguage::Swift)
-    emitAsyncFunctionPointer(IGM, CurSILFn,
+  if (funcTy->isAsync() && funcTy->getLanguage() == SILFunctionLanguage::Swift) {
+    emitAsyncFunctionPointer(IGM,
+                             CurFn,
+                             LinkEntity::forSILFunction(CurSILFn),
                              getAsyncContextLayout(*this).getSize());
+  }
 
   // Configure the dominance resolver.
   // TODO: consider re-using a dom analysis from the PassManager
@@ -2007,7 +2017,7 @@ void IRGenSILFunction::emitSILFunction() {
 
   // Invariant: for every block in the work queue, we have visited all
   // of its dominators.
-  llvm::SmallPtrSet<SILBasicBlock*, 8> visitedBlocks;
+  BasicBlockSet visitedBlocks(CurSILFn);
   SmallVector<SILBasicBlock*, 8> workQueue; // really a stack
 
   // Queue up the entry block, for which the invariant trivially holds.
@@ -2042,7 +2052,7 @@ void IRGenSILFunction::emitSILFunction() {
     // Therefore the invariant holds of all the successors, and we can
     // queue them up if we haven't already visited them.
     for (auto *succBB : bb->getSuccessorBlocks()) {
-      if (visitedBlocks.insert(succBB).second)
+      if (visitedBlocks.insert(succBB))
         workQueue.push_back(succBB);
     }
   }
@@ -2050,7 +2060,7 @@ void IRGenSILFunction::emitSILFunction() {
   // If there are dead blocks in the SIL function, we might have left
   // invalid blocks in the IR.  Do another pass and kill them off.
   for (SILBasicBlock &bb : *CurSILFn)
-    if (!visitedBlocks.count(&bb))
+    if (!visitedBlocks.contains(&bb))
       LoweredBBs[&bb].bb->eraseFromParent();
 
 }
@@ -2277,14 +2287,14 @@ void IRGenSILFunction::visitFunctionRefBaseInst(FunctionRefBaseInst *i) {
   auto *fnPtr = IGM.getAddrOfSILFunction(
       fn, NotForDefinition, false /*isDynamicallyReplaceableImplementation*/,
       isa<PreviousDynamicFunctionRefInst>(i));
-  llvm::Value *value;
+  llvm::Constant *value;
   auto isSpecialAsyncWithoutCtxtSize =
       fn->isAsync() && (
           fn->getName().equals("swift_task_future_wait") ||
           fn->getName().equals("swift_task_group_wait_next"));
   if (fn->isAsync() && !isSpecialAsyncWithoutCtxtSize) {
     value = IGM.getAddrOfAsyncFunctionPointer(fn);
-    value = Builder.CreateBitCast(value, fnPtr->getType());
+    value = llvm::ConstantExpr::getBitCast(value, fnPtr->getType());
   } else {
     value = fnPtr;
   }
@@ -2682,6 +2692,7 @@ void IRGenSILFunction::visitBuiltinInst(swift::BuiltinInst *i) {
 
   auto argValues = i->getArguments();
   Explosion args;
+  SmallVector<SILType, 4> argTypes;
 
   for (auto idx : indices(argValues)) {
     auto argValue = argValues[idx];
@@ -2689,11 +2700,13 @@ void IRGenSILFunction::visitBuiltinInst(swift::BuiltinInst *i) {
     // Builtin arguments should never be substituted, so use the value's type
     // as the parameter type.
     emitApplyArgument(*this, argValue, argValue->getType(), args);
+
+    argTypes.push_back(argValue->getType());
   }
   
   Explosion result;
   emitBuiltinCall(*this, builtin, i->getName(), i->getType(),
-                  args, result, i->getSubstitutions());
+                  argTypes, args, result, i->getSubstitutions());
   
   setLoweredExplosion(i, result);
 }
@@ -3162,6 +3175,10 @@ void IRGenSILFunction::visitStringLiteralInst(swift::StringLiteralInst *i) {
 }
 
 void IRGenSILFunction::visitUnreachableInst(swift::UnreachableInst *i) {
+  if (isAsync()) {
+    emitCoroutineOrAsyncExit();
+    return;
+  }
   Builder.CreateUnreachable();
 }
 
@@ -4346,26 +4363,23 @@ void IRGenSILFunction::visitDebugValueAddrInst(DebugValueAddrInst *i) {
       (IsLoadablyByAddress) ? DirectValue : IndirectValue;
   VarInfo->Name = getVarName(i, IsAnonymous);
   auto *Addr = getLoweredAddress(SILVal).getAddress();
-  if (CurSILFn->isAsync() && VarInfo->ArgNo) {
-#ifndef NDEBUG
-    llvm::Value *Storage = Addr;
-    while (Storage) {
-      if (auto *LdInst = dyn_cast<llvm::LoadInst>(Storage))
-        Storage = LdInst->getOperand(0);
-      else if (auto *GEPInst = dyn_cast<llvm::GetElementPtrInst>(Storage))
-        Storage = GEPInst->getOperand(0);
-      else if (auto *BCInst = dyn_cast<llvm::BitCastInst>(Storage))
-        Storage = BCInst->getOperand(0);
-      else 
-        break;
-    }
-    assert(llvm::isa<llvm::Argument>(Storage) &&
-           "arg expected to be load from inside %swift.context");
-#endif
-    Indirection = CoroIndirectValue;
-  }
   SILType SILTy = SILVal->getType();
   auto RealType = SILTy.getASTType();
+  if (CurSILFn->isAsync() && VarInfo->ArgNo) {
+    if (IGM.DebugInfo)
+      assert(IGM.DebugInfo->verifyCoroutineArgument(Addr) &&
+             "arg expected to be load from inside %swift.context");
+    Indirection = CoroIndirectValue;
+    if (auto *PBI = dyn_cast<ProjectBoxInst>(i->getOperand())) {
+      // Usually debug info only ever describes the *result* of a projectBox
+      // call. To allow the debugger to display a boxed parameter of an async
+      // continuation object, however, the debug info can only describe the box
+      // itself and thus also needs to emit a box type for it so the debugger
+      // knows to call into Remote Mirrors to unbox the value.
+      RealType = PBI->getOperand()->getType().getASTType();
+      assert(isa<SILBoxType>(RealType));
+    }
+  }
 
   auto DbgTy = DebugTypeInfo::getLocalVariable(
       Decl, RealType, getTypeInfo(SILVal->getType()));
@@ -6122,14 +6136,22 @@ void IRGenSILFunction::visitWitnessMethodInst(swift::WitnessMethodInst *i) {
   CanType baseTy = i->getLookupType();
   ProtocolConformanceRef conformance = i->getConformance();
   SILDeclRef member = i->getMember();
+  auto fnType = IGM.getSILTypes().getConstantFunctionType(
+      IGM.getMaximalTypeExpansionContext(), member);
 
   assert(member.requiresNewWitnessTableEntry());
 
   if (IGM.isResilient(conformance.getRequirement(),
                       ResilienceExpansion::Maximal)) {
-    auto *fnPtr = IGM.getAddrOfDispatchThunk(member, NotForDefinition);
-    auto fnType = IGM.getSILTypes().getConstantFunctionType(
-        IGM.getMaximalTypeExpansionContext(), member);
+    llvm::Constant *fnPtr = IGM.getAddrOfDispatchThunk(member, NotForDefinition);
+
+    if (fnType->isAsync()) {
+      auto *fnPtrType = fnPtr->getType();
+      fnPtr = IGM.getAddrOfAsyncFunctionPointer(
+          LinkEntity::forDispatchThunk(member));
+      fnPtr = llvm::ConstantExpr::getBitCast(fnPtr, fnPtrType);
+    }
+
     auto sig = IGM.getSignature(fnType);
     auto fn = FunctionPointer::forDirect(fnType, fnPtr, sig);
 
@@ -6329,7 +6351,15 @@ void IRGenSILFunction::visitClassMethodInst(swift::ClassMethodInst *i) {
   auto *classDecl = cast<ClassDecl>(method.getDecl()->getDeclContext());
   if (IGM.hasResilientMetadata(classDecl,
                                ResilienceExpansion::Maximal)) {
-    auto *fnPtr = IGM.getAddrOfDispatchThunk(method, NotForDefinition);
+    llvm::Constant *fnPtr = IGM.getAddrOfDispatchThunk(method, NotForDefinition);
+
+    if (methodType->isAsync()) {
+      auto *fnPtrType = fnPtr->getType();
+      fnPtr = IGM.getAddrOfAsyncFunctionPointer(
+          LinkEntity::forDispatchThunk(method));
+      fnPtr = llvm::ConstantExpr::getBitCast(fnPtr, fnPtrType);
+    }
+
     auto sig = IGM.getSignature(methodType);
     FunctionPointer fn(methodType, fnPtr, sig);
 
@@ -6387,17 +6417,8 @@ void IRGenModule::emitSILStaticInitializers() {
       continue;
     }
 
-    // Set the IR global's initializer to the constant for this SIL
-    // struct.
-    if (auto *SI = dyn_cast<StructInst>(InitValue)) {
-      IRGlobal->setInitializer(emitConstantStruct(*this, SI));
-      continue;
-    }
-
-    // Set the IR global's initializer to the constant for this SIL
-    // tuple.
-    auto *TI = cast<TupleInst>(InitValue);
-    IRGlobal->setInitializer(emitConstantTuple(*this, TI));
+    IRGlobal->setInitializer(
+      emitConstantValue(*this, cast<SingleValueInstruction>(InitValue)));
   }
 }
 

@@ -60,19 +60,6 @@ def emit_reference_dependencies_path
   : Separate<["-"], "emit-reference-dependencies-path">, MetaVarName<"<path>">,
     HelpText<"Output Swift-style dependencies file to <path>">;
 
-
-def emit_swift_ranges : Flag<["-"], "emit-swift-ranges">,
-  HelpText<"Emit unparsed source ranges">;
-def emit_swift_ranges_path
-  : Separate<["-"], "emit-swift-ranges-path">, MetaVarName<"<path>">,
-    HelpText<"Output unparsed ranges to <path>">;
-
-def emit_compiled_source : Flag<["-"], "emit-compiled-source">,
-  HelpText<"Emit compiled source">;
-def emit_compiled_source_path
-  : Separate<["-"], "emit-compiled-source-path">, MetaVarName<"<path>">,
-    HelpText<"Output compiled source to <path>">;
-
 def emit_fixits_path
   : Separate<["-"], "emit-fixits-path">, MetaVarName<"<path>">,
     HelpText<"Output compiler fixits as source edits to <path>">;
@@ -114,6 +101,8 @@ def tbd_is_installapi: Flag<["-"], "tbd-is-installapi">,
 def verify : Flag<["-"], "verify">,
   HelpText<"Verify diagnostics against expected-{error|warning|note} "
            "annotations">;
+def verify_additional_file : Separate<["-"], "verify-additional-file">,
+  HelpText<"Verify diagnostics in this file in addition to source files">;
 def verify_apply_fixes : Flag<["-"], "verify-apply-fixes">,
   HelpText<"Like -verify, but updates the original source file">;
 def verify_ignore_unknown: Flag<["-"], "verify-ignore-unknown">,
@@ -178,7 +167,7 @@ def disable_typo_correction : Flag<["-"], "disable-typo-correction">,
   HelpText<"Disable typo correction">;
 
 def disable_implicit_swift_modules: Flag<["-"], "disable-implicit-swift-modules">,
-  HelpText<"Disable building Swift modules explicitly by the compiler">;
+  HelpText<"Disable building Swift modules implicitly by the compiler">;
 
 def swift_module_file
   : Separate<["-"], "swift-module-file">, MetaVarName<"<path>">,
@@ -232,7 +221,16 @@ let Flags = [FrontendOption, NoDriverOption, HelpHidden, ModuleInterfaceOption] 
 def enable_experimental_concurrency :
   Flag<["-"], "enable-experimental-concurrency">,
   HelpText<"Enable experimental concurrency model">;
-  def enable_resilience : Flag<["-"], "enable-resilience">,
+
+def enable_experimental_concurrent_value_checking :
+  Flag<["-"], "enable-experimental-concurrent-value-checking">,
+  HelpText<"Enable ConcurrentValue checking">;
+
+def enable_experimental_flow_sensitive_concurrent_captures :
+  Flag<["-"], "enable-experimental-flow-sensitive-concurrent-captures">,
+  HelpText<"Enable flow-sensitive concurrent captures">;
+
+def enable_resilience : Flag<["-"], "enable-resilience">,
      HelpText<"Deprecated, use -enable-library-evolution instead">;
 }
 
@@ -389,17 +387,10 @@ def suppress_static_exclusivity_swap : Flag<["-"], "suppress-static-exclusivity-
 def enable_sil_opaque_values : Flag<["-"], "enable-sil-opaque-values">,
   HelpText<"Enable SIL Opaque Values">;
   
-def enable_large_loadable_types : Flag<["-"], "enable-large-loadable-types">,
-  HelpText<"Enable Large Loadable types IRGen pass">;
-
 def enable_experimental_static_assert :
   Flag<["-"], "enable-experimental-static-assert">,
   HelpText<"Enable experimental #assert">;
 
-def enable_subst_sil_function_types_for_function_values :
-  Flag<["-"], "enable-subst-sil-function-types-for-function-values">,
-  HelpText<"Use substituted function types for SIL type lowering of function values">;
-  
 def enable_deserialization_recovery :
   Flag<["-"], "enable-deserialization-recovery">,
   HelpText<"Attempt to recover from missing xrefs (etc) in swiftmodules">;
@@ -418,9 +409,6 @@ def enable_conformance_availability_errors : Flag<["-"],
 def disable_conformance_availability_errors : Flag<["-"],
   "disable-conformance-availability-errors">,
   HelpText<"Diagnose conformance availability violations as warnings">;
-
-def report_errors_to_debugger : Flag<["-"], "report-errors-to-debugger">,
-  HelpText<"Deprecated, will be removed in future versions.">;
 
 def enable_infer_import_as_member :
   Flag<["-"], "enable-infer-import-as-member">,
@@ -756,6 +744,9 @@ def disable_interface_lockfile : Flag<["-"], "disable-interface-lock">,
 def bridging_header_directory_for_print: Separate<["-"], "bridging-header-directory-for-print">, MetaVarName<"<path>">,
     HelpText<"Directory for bridging header to be printed in compatibility header">;
 
+def entry_point_function_name: Separate<["-"], "entry-point-function-name">, MetaVarName<"<string>">, 
+    HelpText<"Name of the entry point function">;
+
 def target_sdk_version : Separate<["-"], "target-sdk-version">,
   HelpText<"The version of target SDK used for compilation">;
 
@@ -786,4 +777,27 @@ def experimental_allow_module_with_compiler_errors:
   Flags<[HelpHidden]>,
   HelpText<"Attempt to output .swiftmodule, regardless of compilation errors">;
 
+def bad_file_descriptor_retry_count:
+  Separate<["-"], "bad-file-descriptor-retry-count">,
+  HelpText<"Number of retrying opening a file if previous open returns a bad "
+           "file descriptor error.">;
+
+def enable_ast_verifier : Flag<["-"], "enable-ast-verifier">,
+  HelpText<"Run the AST verifier during compilation. NOTE: This lets the user "
+           "override the default behavior on whether or not the ASTVerifier "
+           "is run. The default behavior is to run the verifier when asserts "
+           "are enabled and not run it when asserts are disabled. NOTE: "
+           "Can not be used if disable-ast-verifier is used as well">;
+
+def disable_ast_verifier : Flag<["-"], "disable-ast-verifier">,
+  HelpText<"Do not run the AST verifier during compilation. NOTE: This lets "
+           "the user override the default behavior on whether or not the "
+           "ASTVerifier is run. The default behavior is to run the verifier "
+           "when asserts are enabled and not run it when asserts are "
+           "disabled. NOTE: Can not be used if enable-ast-verifier is used "
+           "as well">;
+
+def new_driver_path
+  : Separate<["-"], "new-driver-path">, MetaVarName<"<path>">,
+  HelpText<"Path of the new driver to be used">;
 } // end let Flags = [FrontendOption, NoDriverOption, HelpHidden]

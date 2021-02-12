@@ -424,10 +424,6 @@ static bool shouldShowAKA(Type type, StringRef typeName) {
   if (type->isCanonical())
     return false;
 
-  // Don't show generic type parameters.
-  if (type->getCanonicalType()->hasTypeParameter())
-    return false;
-
   // Only show 'aka' if there's a typealias involved; other kinds of sugar
   // are easy enough for people to read on their own.
   if (!type.findIf(isInterestingTypealias))
@@ -446,17 +442,31 @@ static bool shouldShowAKA(Type type, StringRef typeName) {
 /// with the same string representation, it should be qualified during
 /// formatting.
 static bool typeSpellingIsAmbiguous(Type type,
-                                    ArrayRef<DiagnosticArgument> Args) {
+                                    ArrayRef<DiagnosticArgument> Args,
+                                    PrintOptions &PO) {
   for (auto arg : Args) {
     if (arg.getKind() == DiagnosticArgumentKind::Type) {
       auto argType = arg.getAsType();
       if (argType && !argType->isEqual(type) &&
-          argType->getWithoutParens().getString() == type.getString()) {
+          argType->getWithoutParens().getString(PO) == type.getString(PO)) {
         return true;
       }
     }
   }
   return false;
+}
+
+/// Walks the type recursivelly desugaring  types to display, but skipping
+/// `GenericTypeParamType` because we would lose association with its original
+/// declaration and end up presenting the parameter in τ_0_0 format on
+/// diagnostic.
+static Type getAkaTypeForDisplay(Type type) {
+  return type.transform([](Type visitTy) -> Type {
+    if (isa<SugarType>(visitTy.getPointer()) &&
+        !isa<GenericTypeParamType>(visitTy.getPointer()))
+      return getAkaTypeForDisplay(visitTy->getDesugaredType());
+    return visitTy;
+  });
 }
 
 /// Format a single diagnostic argument and write it to the given
@@ -534,12 +544,22 @@ static void formatDiagnosticArgument(StringRef Modifier,
     Type type;
     bool needsQualification = false;
 
+    // TODO: We should use PrintOptions::printForDiagnostic here, or we should
+    // rename that method.
+    PrintOptions printOptions{};
+
     if (Arg.getKind() == DiagnosticArgumentKind::Type) {
       type = Arg.getAsType()->getWithoutParens();
-      needsQualification = typeSpellingIsAmbiguous(type, Args);
+      if (type->getASTContext().TypeCheckerOpts.PrintFullConvention)
+        printOptions.PrintFunctionRepresentationAttrs =
+            PrintOptions::FunctionRepresentationMode::Full;
+      needsQualification = typeSpellingIsAmbiguous(type, Args, printOptions);
     } else {
       assert(Arg.getKind() == DiagnosticArgumentKind::FullyQualifiedType);
       type = Arg.getAsFullyQualifiedType().getType()->getWithoutParens();
+      if (type->getASTContext().TypeCheckerOpts.PrintFullConvention)
+        printOptions.PrintFunctionRepresentationAttrs =
+            PrintOptions::FunctionRepresentationMode::Full;
       needsQualification = true;
     }
 
@@ -565,19 +585,19 @@ static void formatDiagnosticArgument(StringRef Modifier,
       auto descriptiveKind = opaqueTypeDecl->getDescriptiveKind();
 
       Out << llvm::format(FormatOpts.OpaqueResultFormatString.c_str(),
-                          type->getString().c_str(),
+                          type->getString(printOptions).c_str(),
                           Decl::getDescriptiveKindName(descriptiveKind).data(),
                           NamingDeclText.c_str());
 
     } else {
-      auto printOptions = PrintOptions();
       printOptions.FullyQualifiedTypes = needsQualification;
       std::string typeName = type->getString(printOptions);
 
       if (shouldShowAKA(type, typeName)) {
         llvm::SmallString<256> AkaText;
         llvm::raw_svector_ostream OutAka(AkaText);
-        OutAka << type->getCanonicalType();
+
+        OutAka << getAkaTypeForDisplay(type);
         Out << llvm::format(FormatOpts.AKAFormatString.c_str(),
                             typeName.c_str(), AkaText.c_str());
       } else {
@@ -1006,8 +1026,11 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
           // Pretty-print the declaration we've picked.
           llvm::raw_svector_ostream out(buffer);
           TrackingPrinter printer(entries, out, bufferAccessLevel);
-          ppDecl->print(printer,
-                        PrintOptions::printForDiagnostics(bufferAccessLevel));
+          ppDecl->print(
+              printer,
+              PrintOptions::printForDiagnostics(
+                  bufferAccessLevel,
+                  decl->getASTContext().TypeCheckerOpts.PrintFullConvention));
         }
 
         // Build a buffer with the pretty-printed declaration.
@@ -1039,18 +1062,21 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
 void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
   if (auto info = diagnosticInfoForDiagnostic(diagnostic)) {
     SmallVector<DiagnosticInfo, 1> childInfo;
-    TinyPtrVector<DiagnosticInfo *> childInfoPtrs;
     auto childNotes = diagnostic.getChildNotes();
-    for (unsigned idx = 0; idx < childNotes.size(); ++idx) {
-      if (auto child = diagnosticInfoForDiagnostic(childNotes[idx])) {
-        childInfo.push_back(*child);
-        childInfoPtrs.push_back(&childInfo[idx]);
-      }
+    for (unsigned i : indices(childNotes)) {
+      auto child = diagnosticInfoForDiagnostic(childNotes[i]);
+      assert(child);
+      assert(child->Kind == DiagnosticKind::Note &&
+             "Expected child diagnostics to all be notes?!");
+      childInfo.push_back(*child);
+    }
+    TinyPtrVector<DiagnosticInfo *> childInfoPtrs;
+    for (unsigned i : indices(childInfo)) {
+      childInfoPtrs.push_back(&childInfo[i]);
     }
     info->ChildDiagnosticInfo = childInfoPtrs;
-    
-    SmallVector<std::string, 1> educationalNotePaths;
 
+    SmallVector<std::string, 1> educationalNotePaths;
     auto associatedNotes = educationalNotes[(uint32_t)diagnostic.getID()];
     while (associatedNotes && *associatedNotes) {
       SmallString<128> notePath(getDiagnosticDocumentationPath());

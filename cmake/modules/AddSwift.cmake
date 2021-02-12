@@ -82,6 +82,10 @@ function(_add_host_variant_c_compile_link_flags name)
     set(DEPLOYMENT_VERSION "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_DEPLOYMENT_VERSION}")
   endif()
 
+  if(SWIFT_HOST_VARIANT_SDK STREQUAL ANDROID)
+    set(DEPLOYMENT_VERSION ${SWIFT_ANDROID_API_LEVEL})
+  endif()
+
   # MSVC, clang-cl, gcc don't understand -target.
   if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT SWIFT_COMPILER_IS_MSVC_LIKE)
     get_target_triple(target target_variant "${SWIFT_HOST_VARIANT_SDK}" "${SWIFT_HOST_VARIANT_ARCH}"
@@ -114,8 +118,7 @@ function(_add_host_variant_c_compile_link_flags name)
     # side effects are introduced should a new search path be added.
     target_compile_options(${name} PRIVATE
       -arch ${SWIFT_HOST_VARIANT_ARCH}
-      "-F${SWIFT_SDK_${SWIFT_HOST_VARIANT_ARCH}_PATH}/../../../Developer/Library/Frameworks"
-      "-m${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_VERSION_MIN_NAME}-version-min=${DEPLOYMENT_VERSION}")
+      "-F${SWIFT_SDK_${SWIFT_HOST_VARIANT_ARCH}_PATH}/../../../Developer/Library/Frameworks")
   endif()
 
   _compute_lto_flag("${SWIFT_TOOLS_ENABLE_LTO}" _lto_flag_out)
@@ -272,18 +275,6 @@ function(_add_host_variant_c_compile_flags target)
     target_compile_options(${target} PRIVATE -funwind-tables)
   endif()
 
-  if(SWIFT_HOST_VARIANT_SDK STREQUAL ANDROID)
-    target_compile_options(${target} PRIVATE -nostdinc++)
-    swift_android_libcxx_include_paths(CFLAGS_CXX_INCLUDES)
-    swift_android_include_for_arch("${SWIFT_HOST_VARIANT_ARCH}"
-      "${SWIFT_HOST_VARIANT_ARCH}_INCLUDE")
-    target_include_directories(${target} SYSTEM PRIVATE
-      ${CFLAGS_CXX_INCLUDES}
-      ${${SWIFT_HOST_VARIANT_ARCH}_INCLUDE})
-    target_compile_definitions(${target} PRIVATE
-      __ANDROID_API__=${SWIFT_ANDROID_API_LEVEL})
-  endif()
-
   if(SWIFT_HOST_VARIANT_SDK STREQUAL "LINUX")
     if(SWIFT_HOST_VARIANT_ARCH STREQUAL x86_64)
       # this is the minimum architecture that supports 16 byte CAS, which is
@@ -351,7 +342,7 @@ function(_add_host_variant_link_flags target)
     target_link_libraries(${target} PRIVATE
       ${cxx_link_libraries})
 
-    swift_android_lib_for_arch(${SWIFT_HOST_VARIANT_ARCH}
+    swift_android_libgcc_for_arch_cross_compile(${SWIFT_HOST_VARIANT_ARCH}
       ${SWIFT_HOST_VARIANT_ARCH}_LIB)
     target_link_directories(${target} PRIVATE
       ${${SWIFT_HOST_VARIANT_ARCH}_LIB})
@@ -381,8 +372,8 @@ function(_add_host_variant_link_flags target)
   #
   # TODO: Evaluate/enable -f{function,data}-sections --gc-sections for bfd,
   # gold, and lld.
-  if(NOT CMAKE_BUILD_TYPE STREQUAL Debug)
-    if(CMAKE_SYSTEM_NAME MATCHES Darwin)
+  if(NOT CMAKE_BUILD_TYPE STREQUAL Debug AND CMAKE_SYSTEM_NAME MATCHES Darwin)
+    if (NOT SWIFT_DISABLE_DEAD_STRIPPING)
       # See rdar://48283130: This gives 6MB+ size reductions for swift and
       # SourceKitService, and much larger size reductions for sil-opt etc.
       target_link_options(${target} PRIVATE
@@ -436,14 +427,15 @@ function(add_swift_host_library name)
   endif()
 
   if(XCODE)
-    get_filename_component(dir ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)
-
+    get_filename_component(base_dir ${CMAKE_CURRENT_SOURCE_DIR} NAME)
+  
     file(GLOB_RECURSE ASHL_HEADERS
-      ${SWIFT_SOURCE_DIR}/include/swift${dir}/*.h
-      ${SWIFT_SOURCE_DIR}/include/swift${dir}/*.def
+      ${SWIFT_SOURCE_DIR}/include/swift/${base_dir}/*.h
+      ${SWIFT_SOURCE_DIR}/include/swift/${base_dir}/*.def
+      ${CMAKE_CURRENT_SOURCE_DIR}/*.h
       ${CMAKE_CURRENT_SOURCE_DIR}/*.def)
     file(GLOB_RECURSE ASHL_TDS
-      ${SWIFT_SOURCE_DIR}/include/swift${dir}/*.td)
+      ${SWIFT_SOURCE_DIR}/include/swift${base_dir}/*.td)
 
     set_source_files_properties(${ASHL_HEADERS} ${ASHL_TDS} PROPERTIES
       HEADER_FILE_ONLY true)

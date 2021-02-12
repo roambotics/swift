@@ -287,10 +287,6 @@ SupplementaryOutputPathsComputer::getSupplementaryOutputPathsFromArguments()
       options::OPT_emit_dependencies_path);
   auto referenceDependenciesFile = getSupplementaryFilenamesFromArguments(
       options::OPT_emit_reference_dependencies_path);
-  auto swiftRangesFile = getSupplementaryFilenamesFromArguments(
-      options::OPT_emit_swift_ranges_path);
-  auto compiledSourceFile = getSupplementaryFilenamesFromArguments(
-      options::OPT_emit_compiled_source_path);
   auto serializedDiagnostics = getSupplementaryFilenamesFromArguments(
       options::OPT_serialize_diagnostics_path);
   auto fixItsOutput = getSupplementaryFilenamesFromArguments(
@@ -326,8 +322,6 @@ SupplementaryOutputPathsComputer::getSupplementaryOutputPathsFromArguments()
     sop.ModuleDocOutputPath = (*moduleDocOutput)[i];
     sop.DependenciesFilePath = (*dependenciesFile)[i];
     sop.ReferenceDependenciesFilePath = (*referenceDependenciesFile)[i];
-    sop.SwiftRangesFilePath = (*swiftRangesFile)[i];
-    sop.CompiledSourceFilePath = (*compiledSourceFile)[i];
     sop.SerializedDiagnosticsPath = (*serializedDiagnostics)[i];
     sop.FixItsOutputPath = (*fixItsOutput)[i];
     sop.LoadedModuleTracePath = (*loadedModuleTrace)[i];
@@ -393,16 +387,6 @@ SupplementaryOutputPathsComputer::computeOutputPathsForOneInput(
       file_types::TY_SwiftDeps, "",
       defaultSupplementaryOutputPathExcludingExtension);
 
-  auto swiftRangesFilePath = determineSupplementaryOutputFilename(
-      OPT_emit_swift_ranges, pathsFromArguments.SwiftRangesFilePath,
-      file_types::TY_SwiftRanges, "",
-      defaultSupplementaryOutputPathExcludingExtension);
-
-  auto compiledSourceFilePath = determineSupplementaryOutputFilename(
-      OPT_emit_compiled_source, pathsFromArguments.CompiledSourceFilePath,
-      file_types::TY_CompiledSource, "",
-      defaultSupplementaryOutputPathExcludingExtension);
-
   auto serializedDiagnosticsPath = determineSupplementaryOutputFilename(
       OPT_serialize_diagnostics, pathsFromArguments.SerializedDiagnosticsPath,
       file_types::TY_SerializedDiagnostics, "",
@@ -462,8 +446,6 @@ SupplementaryOutputPathsComputer::computeOutputPathsForOneInput(
   sop.ModuleDocOutputPath = moduleDocOutputPath;
   sop.DependenciesFilePath = dependenciesFilePath;
   sop.ReferenceDependenciesFilePath = referenceDependenciesFilePath;
-  sop.SwiftRangesFilePath = swiftRangesFilePath;
-  sop.CompiledSourceFilePath = compiledSourceFilePath;
   sop.SerializedDiagnosticsPath = serializedDiagnosticsPath;
   sop.FixItsOutputPath = fixItsOutputPath;
   sop.LoadedModuleTracePath = loadedModuleTracePath;
@@ -547,8 +529,6 @@ createFromTypeToPathMap(const TypeToPathMap *map) {
       {file_types::TY_SwiftSourceInfoFile, paths.ModuleSourceInfoOutputPath},
       {file_types::TY_Dependencies, paths.DependenciesFilePath},
       {file_types::TY_SwiftDeps, paths.ReferenceDependenciesFilePath},
-      {file_types::TY_SwiftRanges, paths.SwiftRangesFilePath},
-      {file_types::TY_CompiledSource, paths.CompiledSourceFilePath},
       {file_types::TY_SerializedDiagnostics, paths.SerializedDiagnosticsPath},
       {file_types::TY_ModuleTrace, paths.LoadedModuleTracePath},
       {file_types::TY_TBD, paths.TBDPath},
@@ -556,7 +536,8 @@ createFromTypeToPathMap(const TypeToPathMap *map) {
        paths.ModuleInterfaceOutputPath},
       {file_types::TY_SwiftModuleSummaryFile, paths.ModuleSummaryOutputPath},
       {file_types::TY_PrivateSwiftModuleInterfaceFile,
-       paths.PrivateModuleInterfaceOutputPath}};
+       paths.PrivateModuleInterfaceOutputPath},
+  };
   for (const std::pair<file_types::ID, std::string &> &typeAndString :
        typesAndStrings) {
     auto const out = map->find(typeAndString.first);
@@ -573,14 +554,14 @@ SupplementaryOutputPathsComputer::readSupplementaryOutputFileMap() const {
         options::OPT_emit_module_doc_path,
         options::OPT_emit_dependencies_path,
         options::OPT_emit_reference_dependencies_path,
-        options::OPT_emit_swift_ranges_path,
         options::OPT_serialize_diagnostics_path,
         options::OPT_emit_loaded_module_trace_path,
         options::OPT_emit_module_interface_path,
         options::OPT_emit_private_module_interface_path,
         options::OPT_emit_module_source_info_path,
         options::OPT_emit_tbd_path,
-        options::OPT_emit_ldadd_cfile_path)) {
+        options::OPT_emit_ldadd_cfile_path,
+        options::OPT_emit_symbol_graph_dir)) {
     Diags.diagnose(SourceLoc(),
                    diag::error_cannot_have_supplementary_outputs,
                    A->getSpelling(), "-supplementary-output-file-map");
@@ -588,15 +569,31 @@ SupplementaryOutputPathsComputer::readSupplementaryOutputFileMap() const {
   }
   const StringRef supplementaryFileMapPath =
       Args.getLastArgValue(options::OPT_supplementary_output_file_map);
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
-      llvm::MemoryBuffer::getFile(supplementaryFileMapPath);
+
+  unsigned BadFileDescriptorRetryCount = 0;
+  if (const Arg *A = Args.getLastArg(options::OPT_bad_file_descriptor_retry_count)) {
+    if (StringRef(A->getValue()).getAsInteger(10, BadFileDescriptorRetryCount)) {
+      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
+                     A->getAsString(Args), A->getValue());
+      return None;
+    }
+  }
+
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer = nullptr;
+  for (unsigned I = 0; I < BadFileDescriptorRetryCount + 1; ++I) {
+    buffer = llvm::MemoryBuffer::getFile(supplementaryFileMapPath);
+    if (buffer)
+      break;
+    if (buffer.getError().value() != EBADF)
+      break;
+  }
   if (!buffer) {
     Diags.diagnose(SourceLoc(), diag::cannot_open_file,
                    supplementaryFileMapPath, buffer.getError().message());
     return None;
   }
   llvm::Expected<OutputFileMap> OFM =
-      OutputFileMap::loadFromBuffer(std::move(buffer.get()), "", false);
+      OutputFileMap::loadFromBuffer(std::move(buffer.get()), "");
   if (auto Err = OFM.takeError()) {
     Diags.diagnose(SourceLoc(),
                    diag::error_unable_to_load_supplementary_output_file_map,

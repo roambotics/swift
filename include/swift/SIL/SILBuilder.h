@@ -201,6 +201,8 @@ public:
   bool isInsertingIntoGlobal() const { return F == nullptr; }
 
   TypeExpansionContext getTypeExpansionContext() const {
+    if (!F)
+      return TypeExpansionContext::minimal();
     return TypeExpansionContext(getFunction());
   }
 
@@ -353,25 +355,6 @@ public:
   //===--------------------------------------------------------------------===//
   // CFG Manipulation
   //===--------------------------------------------------------------------===//
-
-  /// moveBlockTo - Move a block to immediately before the given iterator.
-  void moveBlockTo(SILBasicBlock *BB, SILFunction::iterator IP) {
-    assert(SILFunction::iterator(BB) != IP && "moving block before itself?");
-    SILFunction *F = BB->getParent();
-    auto &Blocks = F->getBlocks();
-    Blocks.remove(BB);
-    Blocks.insert(IP, BB);
-  }
-
-  /// moveBlockTo - Move \p BB to immediately before \p Before.
-  void moveBlockTo(SILBasicBlock *BB, SILBasicBlock *Before) {
-    moveBlockTo(BB, Before->getIterator());
-  }
-
-  /// moveBlockToEnd - Reorder a block to the end of its containing function.
-  void moveBlockToEnd(SILBasicBlock *BB) {
-    moveBlockTo(BB, BB->getParent()->end());
-  }
 
   /// Move the insertion point to the end of the given block.
   ///
@@ -1046,7 +1029,7 @@ public:
                                              SILType Ty,
                                              bool WithoutActuallyEscaping) {
     return insert(ConvertFunctionInst::create(getSILDebugLocation(Loc), Op, Ty,
-                                              getFunction(), C.OpenedArchetypes,
+                                              getModule(), F, C.OpenedArchetypes,
                                               WithoutActuallyEscaping));
   }
 
@@ -1176,7 +1159,7 @@ public:
   ThinToThickFunctionInst *createThinToThickFunction(SILLocation Loc,
                                                      SILValue Op, SILType Ty) {
     return insert(ThinToThickFunctionInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes));
+        getSILDebugLocation(Loc), Op, Ty, getModule(), F, C.OpenedArchetypes));
   }
 
   ThickToObjCMetatypeInst *createThickToObjCMetatype(SILLocation Loc,

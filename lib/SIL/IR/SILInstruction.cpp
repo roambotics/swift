@@ -36,12 +36,6 @@ using namespace Lowering;
 // Instruction-specific properties on SILValue
 //===----------------------------------------------------------------------===//
 
-SILLocation SILInstruction::getLoc() const { return Location.getLocation(); }
-
-const SILDebugScope *SILInstruction::getDebugScope() const {
-  return Location.getScope();
-}
-
 void SILInstruction::setDebugScope(const SILDebugScope *DS) {
   if (getDebugScope() && getDebugScope()->InlinedCallSite)
     assert(DS->InlinedCallSite && "throwing away inlined scope info");
@@ -49,7 +43,7 @@ void SILInstruction::setDebugScope(const SILDebugScope *DS) {
   assert(DS->getParentFunction() == getFunction() &&
          "scope belongs to different function");
 
-  Location = SILDebugLocation(getLoc(), DS);
+  debugScope = DS;
 }
 
 //===----------------------------------------------------------------------===//
@@ -99,13 +93,10 @@ transferNodesFromList(llvm::ilist_traits<SILInstruction> &L2,
 
 // Assert that all subclasses of ValueBase implement classof.
 #define NODE(CLASS, PARENT) \
-  ASSERT_IMPLEMENTS_STATIC(CLASS, PARENT, classof, bool(const SILNode*));
+  ASSERT_IMPLEMENTS_STATIC(CLASS, PARENT, classof, bool(SILNodePointer));
 #include "swift/SIL/SILNodes.def"
 
-SILFunction *SILInstruction::getFunction() {
-  return getParent()->getParent();
-}
-const SILFunction *SILInstruction::getFunction() const {
+SILFunction *SILInstruction::getFunction() const {
   return getParent()->getParent();
 }
 
@@ -484,8 +475,7 @@ namespace {
 
     bool visitFunctionRefInst(const FunctionRefInst *RHS) {
       auto *X = cast<FunctionRefInst>(LHS);
-      return X->getInitiallyReferencedFunction() ==
-             RHS->getInitiallyReferencedFunction();
+      return X->getReferencedFunction() == RHS->getReferencedFunction();
     }
     bool visitDynamicFunctionRefInst(const DynamicFunctionRefInst *RHS) {
       auto *X = cast<DynamicFunctionRefInst>(LHS);
@@ -552,8 +542,6 @@ namespace {
     bool visitRefElementAddrInst(RefElementAddrInst *RHS) {
       auto *X = cast<RefElementAddrInst>(LHS);
       if (X->getField() != RHS->getField())
-        return false;
-      if (X->getOperand() != RHS->getOperand())
         return false;
       return true;
     }
@@ -1126,6 +1114,8 @@ bool SILInstruction::mayRelease() const {
   case SILInstructionKind::YieldInst:
   case SILInstructionKind::DestroyAddrInst:
   case SILInstructionKind::StrongReleaseInst:
+#define UNCHECKED_REF_STORAGE(Name, ...)                                       \
+  case SILInstructionKind::Name##ReleaseValueInst:
 #define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
   case SILInstructionKind::Name##ReleaseInst:
 #include "swift/AST/ReferenceStorage.def"
@@ -1134,11 +1124,11 @@ bool SILInstruction::mayRelease() const {
     return true;
 
   case SILInstructionKind::DestroyValueInst:
-    assert(!SILModuleConventions(getModule()).useLoweredAddresses());
     return true;
 
   case SILInstructionKind::UnconditionalCheckedCastAddrInst:
   case SILInstructionKind::UnconditionalCheckedCastValueInst:
+  case SILInstructionKind::UncheckedOwnershipConversionInst:
     return true;
 
   case SILInstructionKind::CheckedCastAddrBranchInst: {
@@ -1541,7 +1531,7 @@ MultipleValueInstruction::getIndexOfResult(SILValue Target) const {
 MultipleValueInstructionResult::MultipleValueInstructionResult(
     ValueKind valueKind, unsigned index, SILType type,
     ValueOwnershipKind ownershipKind)
-    : ValueBase(valueKind, type, IsRepresentative::No) {
+    : ValueBase(valueKind, type) {
   setOwnershipKind(ownershipKind);
   setIndex(index);
 }

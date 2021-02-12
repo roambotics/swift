@@ -138,18 +138,6 @@ SimpleMathTests.test("CaptureGlobal") {
   expectEqual(30, gradient(at: 0, in: foo))
 }
 
-var foo_diffable: @differentiable (Float) -> (Float)
-  = differentiableFunction { x in (x * x, { v in 2 * x * v }) }
-SimpleMathTests.test("GlobalDiffableFunc") {
-  expectEqual(2, gradient(at: 1, in: foo_diffable))
-  expectEqual(2, gradient(at: 1, in: { x in foo_diffable(x) }))
-  expectEqual(1, gradient(at: 1, in: { (x: Float) -> Float in
-    foo_diffable = { x in x + 1 }
-    return foo_diffable(x)
-  }))
-  expectEqual(1, gradient(at: 1, in: foo_diffable))
-}
-
 SimpleMathTests.test("Mutation") {
   func fourthPower(x: Float) -> Float {
     var a = x
@@ -243,7 +231,7 @@ SimpleMathTests.test("TupleNonDifferentiableElements") {
   expectEqual((16, 8), valueWithGradient(at: 4, in: nested))
 
   struct Wrapper<T> {
-    @differentiable(where T : Differentiable)
+    @differentiable(reverse where T : Differentiable)
     func baz(_ x: T) -> T {
       var tuple = (1, 1, x, 1)
       tuple.0 = 1
@@ -294,7 +282,7 @@ SimpleMathTests.test("StructMemberwiseInitializer") {
     var x: Float
 
     // Custom initializer with `@differentiable`.
-    @differentiable
+    @differentiable(reverse)
     init(x: Float) {
       self.x = x
     }
@@ -313,12 +301,12 @@ SimpleMathTests.test("StructConstantStoredProperty") {
     var x: Float
     @noDerivative let constant = Float(2)
 
-    @differentiable
+    @differentiable(reverse)
     init(x: Float) {
       self.x = x
     }
 
-    @differentiable(wrt: (self, input))
+    @differentiable(reverse, wrt: (self, input))
     func applied(to input: Float) -> Float {
       return x * constant * input
     }
@@ -413,12 +401,12 @@ SimpleMathTests.test("StructWithNoDerivativeProperty") {
 }
 
 SimpleMathTests.test("SubsetIndices") {
-  func grad(_ lossFunction: @differentiable (Float, Float) -> Float) -> Float {
+  func grad(_ lossFunction: @differentiable(reverse) (Float, Float) -> Float) -> Float {
     return gradient(at: 1) { x in lossFunction(x * x, 10.0) }
   }
   expectEqual(2, grad { x, y in x + y })
 
-  func gradWRTNonDiff(_ lossFunction: @differentiable (Float, @noDerivative Int) -> Float) -> Float {
+  func gradWRTNonDiff(_ lossFunction: @differentiable(reverse) (Float, @noDerivative Int) -> Float) -> Float {
     return gradient(at: 2) { x in lossFunction(x * x, 10) }
   }
   expectEqual(4, gradWRTNonDiff { x, y in x + Float(y) })
@@ -438,7 +426,7 @@ SimpleMathTests.test("Adjoint value accumulation for aggregate lhs and concrete 
   // TF-943: Test adjoint value accumulation for aggregate lhs and concrete rhs.
   struct SmallTestModel : Differentiable {
     public var stored: Float = 3.0
-    @differentiable public func callAsFunction() -> Float { return stored }
+    @differentiable(reverse) public func callAsFunction() -> Float { return stored }
   }
 
   func doubled(_ model: SmallTestModel) -> Float{

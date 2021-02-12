@@ -99,6 +99,7 @@ class TBDGenVisitor : public ASTVisitor<TBDGenVisitor> {
                  SymbolKind kind = SymbolKind::GlobalSymbol);
 
   void addSymbol(SILDeclRef declRef);
+  void addAsyncFunctionPointerSymbol(AbstractFunctionDecl *AFD);
 
   void addSymbol(LinkEntity entity);
 
@@ -164,7 +165,8 @@ public:
     // TBD for, and not for any statically linked libraries.
     // FIXME: We should have a SymbolSource for main.
     if (file->hasEntryPoint() && file->getParentModule() == SwiftModule)
-      addSymbol("main", SymbolSource::forUnknown());
+      addSymbol(SwiftModule->getASTContext().getEntryPointFunctionName(),
+                SymbolSource::forUnknown());
   }
 
   /// Adds the global symbols associated with the first file.

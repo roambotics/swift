@@ -68,6 +68,14 @@ protected:
   std::function<bool (SymbolicReferent)> CanSymbolicReference;
   
   bool canSymbolicReference(SymbolicReferent referent) {
+    // Marker protocols cannot ever be symbolically referenced.
+    if (auto nominal = referent.dyn_cast<const NominalTypeDecl *>()) {
+      if (auto proto = dyn_cast<ProtocolDecl>(nominal)) {
+        if (proto->isMarkerProtocol())
+          return false;
+      }
+    }
+
     return AllowSymbolicReferences
       && (!CanSymbolicReference || CanSymbolicReference(referent));
   }
@@ -222,7 +230,7 @@ public:
                                       GenericSignature signature,
                                       ResilienceExpansion expansion);
 
-  std::string mangleTypeForDebugger(Type decl, const DeclContext *DC);
+  std::string mangleTypeForDebugger(Type decl, GenericSignature sig);
 
   /// Create a mangled name to be used for _typeName constant propagation.
   std::string mangleTypeForTypeName(Type type);
@@ -282,9 +290,7 @@ protected:
   void appendOpWithGenericParamIndex(StringRef,
                                      const GenericTypeParamType *paramTy);
 
-  void bindGenericParameters(const DeclContext *DC);
-
-  void bindGenericParameters(CanGenericSignature sig);
+  void bindGenericParameters(GenericSignature sig);
 
   /// Mangles a sugared type iff we are mangling for the debugger.
   template <class T> void appendSugaredType(Type type,

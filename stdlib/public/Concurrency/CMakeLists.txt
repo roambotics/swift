@@ -27,8 +27,8 @@ if(SWIFT_CONCURRENCY_USES_DISPATCH)
     # FIXME: we can't rely on libdispatch having been built for the
     # target at this point in the process.  Currently, we're relying
     # on soft-linking.
-    #list(APPEND swift_concurrency_link_libraries
-    #  dispatch)
+    list(APPEND swift_concurrency_link_libraries
+      dispatch)
   endif()
 endif()
 
@@ -38,11 +38,13 @@ add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
   Actor.swift
   CheckedContinuation.swift
   GlobalExecutor.cpp
+  Executor.swift
+  AsyncIteratorProtocol.swift
+  AsyncSequence.swift
   PartialAsyncTask.swift
   Task.cpp
   Task.swift
   TaskCancellation.swift
-  _TimeTypes.swift
   TaskAlloc.cpp
   TaskStatus.cpp
   TaskGroup.cpp

@@ -59,7 +59,6 @@ namespace swift {
   struct EnumElementInfo;
   
   namespace syntax {
-    class AbsolutePosition;
     class RawSyntax;
     enum class SyntaxKind;
   }// end of syntax namespace
@@ -127,7 +126,7 @@ public:
 
   /// The current token hash, or \c None if the parser isn't computing a hash
   /// for the token stream.
-  Optional<llvm::MD5> CurrentTokenHash;
+  Optional<StableHasher> CurrentTokenHash;
 
   void recordTokenHash(const Token Tok) {
     if (!Tok.getText().empty())
@@ -208,13 +207,13 @@ public:
   /// This is the current token being considered by the parser.
   Token Tok;
 
-  /// leading trivias for \c Tok.
+  /// Leading trivia for \c Tok.
   /// Always empty if !SF.shouldBuildSyntaxTree().
-  ParsedTrivia LeadingTrivia;
+  StringRef LeadingTrivia;
 
-  /// trailing trivias for \c Tok.
+  /// Trailing trivia for \c Tok.
   /// Always empty if !SF.shouldBuildSyntaxTree().
-  ParsedTrivia TrailingTrivia;
+  StringRef TrailingTrivia;
 
   /// The receiver to collect all consumed tokens.
   ConsumeTokenReceiver *TokReceiver;
@@ -550,7 +549,7 @@ public:
   }
 
   SourceLoc leadingTriviaLoc() {
-    return Tok.getLoc().getAdvancedLoc(-LeadingTrivia.getLength());
+    return Tok.getLoc().getAdvancedLoc(-LeadingTrivia.size());
   }
 
   SourceLoc consumeIdentifier(Identifier &Result, bool diagnoseDollarPrefix) {
@@ -1017,7 +1016,8 @@ public:
 
   /// Parse the arguments inside the @differentiable attribute.
   bool parseDifferentiableAttributeArguments(
-      bool &linear, SmallVectorImpl<ParsedAutoDiffParameter> &params,
+      DifferentiabilityKind &diffKind,
+      SmallVectorImpl<ParsedAutoDiffParameter> &params,
       TrailingWhereClause *&whereClause);
 
   /// Parse a differentiability parameters clause, i.e. the 'wrt:' clause in
@@ -1817,14 +1817,10 @@ bool isKeywordPossibleDeclStart(const Token &Tok);
 
 /// Lex and return a vector of `TokenSyntax` tokens, which include
 /// leading and trailing trivia.
-std::vector<std::pair<RC<syntax::RawSyntax>,
-                                 syntax::AbsolutePosition>>
-tokenizeWithTrivia(const LangOptions &LangOpts,
-                   const SourceManager &SM,
-                   unsigned BufferID,
-                   unsigned Offset = 0,
-                   unsigned EndOffset = 0,
-                   DiagnosticEngine *Diags = nullptr);
+std::vector<std::pair<RC<syntax::RawSyntax>, syntax::AbsoluteOffsetPosition>>
+tokenizeWithTrivia(const LangOptions &LangOpts, const SourceManager &SM,
+                   unsigned BufferID, unsigned Offset = 0,
+                   unsigned EndOffset = 0, DiagnosticEngine *Diags = nullptr);
 } // end namespace swift
 
 #endif

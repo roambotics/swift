@@ -54,6 +54,7 @@ TYPE_ATTR(escaping)
 TYPE_ATTR(differentiable)
 TYPE_ATTR(noDerivative)
 TYPE_ATTR(async)
+TYPE_ATTR(concurrent)
 
 // SIL-specific attributes
 TYPE_ATTR(block_storage)
@@ -359,6 +360,10 @@ SIMPLE_DECL_ATTR(rethrows, Rethrows,
   RejectByParser |
   ABIStableToAdd | ABIStableToRemove | APIStableToAdd | APIStableToRemove,
   57)
+SIMPLE_DECL_ATTR(rethrows, AtRethrows,
+  OnProtocol |
+  ABIStableToAdd | ABIStableToRemove | APIStableToAdd | APIStableToRemove,
+  58)
 DECL_ATTR(_swift_native_objc_runtime_base, SwiftNativeObjCRuntimeBase,
   OnClass |
   UserInaccessible |
@@ -534,7 +539,7 @@ SIMPLE_DECL_ATTR(IBSegueAction, IBSegueAction,
 
 DECL_ATTR(_originallyDefinedIn, OriginallyDefinedIn,
   OnNominalType | OnFunc | OnVar | OnExtension | UserInaccessible |
-  AllowMultipleAttributes |
+  AllowMultipleAttributes | LongAttribute |
   ABIBreakingToAdd | ABIBreakingToRemove | APIStableToAdd | APIStableToRemove,
   96)
 
@@ -565,6 +570,7 @@ SIMPLE_DECL_ATTR(asyncHandler, AsyncHandler,
   ABIStableToAdd | ABIStableToRemove | APIStableToAdd | APIStableToRemove,
   101)
 
+// TODO: Remove this once we don't need to support 'actor' as a modifier
 CONTEXTUAL_SIMPLE_DECL_ATTR(actor, Actor,
   DeclModifier | OnClass | ConcurrencyOnly |
   ABIBreakingToAdd | ABIBreakingToRemove |
@@ -594,6 +600,18 @@ CONTEXTUAL_SIMPLE_DECL_ATTR(async, Async,
   ABIBreakingToAdd | ABIBreakingToRemove |
   APIBreakingToAdd | APIBreakingToRemove,
   106)
+
+SIMPLE_DECL_ATTR(concurrent, Concurrent,
+  OnFunc | OnConstructor | OnAccessor | ConcurrencyOnly |
+  ABIStableToAdd | ABIStableToRemove |
+  APIBreakingToAdd | APIBreakingToRemove,
+  107)
+
+SIMPLE_DECL_ATTR(_marker, Marker,
+  OnProtocol | UserInaccessible |
+  ABIBreakingToAdd | ABIBreakingToRemove |
+  APIBreakingToAdd | APIBreakingToRemove,
+  108)
 
 #undef TYPE_ATTR
 #undef DECL_ATTR_ALIAS

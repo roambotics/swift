@@ -154,11 +154,11 @@ AllocStackInst::AllocStackInst(SILDebugLocation Loc, SILType elementType,
                                bool hasDynamicLifetime)
     : InstructionBase(Loc, elementType.getAddressType()),
     dynamicLifetime(hasDynamicLifetime) {
-  SILInstruction::Bits.AllocStackInst.NumOperands =
+  SILNode::Bits.AllocStackInst.NumOperands =
     TypeDependentOperands.size();
-  assert(SILInstruction::Bits.AllocStackInst.NumOperands ==
+  assert(SILNode::Bits.AllocStackInst.NumOperands ==
          TypeDependentOperands.size() && "Truncation");
-  SILInstruction::Bits.AllocStackInst.VarInfo =
+  SILNode::Bits.AllocStackInst.VarInfo =
     TailAllocatedDebugVariable(Var, getTrailingObjects<char>()).getRawValue();
   TrailingOperandsList::InitOperandsList(getAllOperands().begin(), this,
                                          TypeDependentOperands);
@@ -205,10 +205,10 @@ AllocRefInstBase::AllocRefInstBase(SILInstructionKind Kind,
                                    bool objc, bool canBeOnStack,
                                    ArrayRef<SILType> ElementTypes)
     : AllocationInst(Kind, Loc, ObjectType) {
-  SILInstruction::Bits.AllocRefInstBase.ObjC = objc;
-  SILInstruction::Bits.AllocRefInstBase.OnStack = canBeOnStack;
-  SILInstruction::Bits.AllocRefInstBase.NumTailTypes = ElementTypes.size();
-  assert(SILInstruction::Bits.AllocRefInstBase.NumTailTypes ==
+  SILNode::Bits.AllocRefInstBase.ObjC = objc;
+  SILNode::Bits.AllocRefInstBase.OnStack = canBeOnStack;
+  SILNode::Bits.AllocRefInstBase.NumTailTypes = ElementTypes.size();
+  assert(SILNode::Bits.AllocRefInstBase.NumTailTypes ==
          ElementTypes.size() && "Truncation");
   assert(!objc || ElementTypes.empty());
 }
@@ -616,7 +616,7 @@ SILType DifferentiableFunctionInst::getDifferentiableFunctionType(
     IndexSubset *ResultIndices) {
   assert(!ResultIndices->isEmpty());
   auto fnTy = OriginalFunction->getType().castTo<SILFunctionType>();
-  auto diffTy = fnTy->getWithDifferentiability(DifferentiabilityKind::Normal,
+  auto diffTy = fnTy->getWithDifferentiability(DifferentiabilityKind::Reverse,
                                                ParameterIndices, ResultIndices);
   return SILType::getPrimitiveObjectType(diffTy);
 }
@@ -707,7 +707,11 @@ SILType DifferentiableFunctionExtractInst::getExtracteeType(
     SILValue function, NormalDifferentiableFunctionTypeComponent extractee,
     SILModule &module) {
   auto fnTy = function->getType().castTo<SILFunctionType>();
-  assert(fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Normal);
+  // TODO: Ban 'Normal' and 'Forward'.
+  assert(
+      fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Reverse ||
+      fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Normal ||
+      fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Forward);
   auto originalFnTy = fnTy->getWithoutDifferentiability();
   auto kindOpt = extractee.getAsDerivativeFunctionKind();
   if (!kindOpt) {
@@ -892,7 +896,7 @@ static void *allocateLiteralInstWithBitSize(SILModule &M, unsigned bits) {
 IntegerLiteralInst::IntegerLiteralInst(SILDebugLocation Loc, SILType Ty,
                                        const llvm::APInt &Value)
     : InstructionBase(Loc, Ty) {
-  SILInstruction::Bits.IntegerLiteralInst.numBits = Value.getBitWidth();
+  SILNode::Bits.IntegerLiteralInst.numBits = Value.getBitWidth();
   std::uninitialized_copy_n(Value.getRawData(), Value.getNumWords(),
                             getTrailingObjects<llvm::APInt::WordType>());
 }
@@ -952,7 +956,7 @@ IntegerLiteralInst *IntegerLiteralInst::create(IntegerLiteralExpr *E,
 
 /// getValue - Return the APInt for the underlying integer literal.
 APInt IntegerLiteralInst::getValue() const {
-  auto numBits = SILInstruction::Bits.IntegerLiteralInst.numBits;
+  auto numBits = SILNode::Bits.IntegerLiteralInst.numBits;
   return APInt(numBits, {getTrailingObjects<llvm::APInt::WordType>(),
                          getWordsForBitWidth(numBits)});
 }
@@ -960,7 +964,7 @@ APInt IntegerLiteralInst::getValue() const {
 FloatLiteralInst::FloatLiteralInst(SILDebugLocation Loc, SILType Ty,
                                    const APInt &Bits)
     : InstructionBase(Loc, Ty) {
-  SILInstruction::Bits.FloatLiteralInst.numBits = Bits.getBitWidth();
+  SILNode::Bits.FloatLiteralInst.numBits = Bits.getBitWidth();
   std::uninitialized_copy_n(Bits.getRawData(), Bits.getNumWords(),
                             getTrailingObjects<llvm::APInt::WordType>());
 }
@@ -992,7 +996,7 @@ FloatLiteralInst *FloatLiteralInst::create(FloatLiteralExpr *E,
 }
 
 APInt FloatLiteralInst::getBits() const {
-  auto numBits = SILInstruction::Bits.FloatLiteralInst.numBits;
+  auto numBits = SILNode::Bits.FloatLiteralInst.numBits;
   return APInt(numBits, {getTrailingObjects<llvm::APInt::WordType>(),
                          getWordsForBitWidth(numBits)});
 }
@@ -1005,8 +1009,8 @@ APFloat FloatLiteralInst::getValue() const {
 StringLiteralInst::StringLiteralInst(SILDebugLocation Loc, StringRef Text,
                                      Encoding encoding, SILType Ty)
     : InstructionBase(Loc, Ty) {
-  SILInstruction::Bits.StringLiteralInst.TheEncoding = unsigned(encoding);
-  SILInstruction::Bits.StringLiteralInst.Length = Text.size();
+  SILNode::Bits.StringLiteralInst.TheEncoding = unsigned(encoding);
+  SILNode::Bits.StringLiteralInst.Length = Text.size();
   memcpy(getTrailingObjects<char>(), Text.data(), Text.size());
 }
 
@@ -1036,14 +1040,14 @@ CondFailInst *CondFailInst::create(SILDebugLocation DebugLoc, SILValue Operand,
 }
 
 uint64_t StringLiteralInst::getCodeUnitCount() {
-  return SILInstruction::Bits.StringLiteralInst.Length;
+  return SILNode::Bits.StringLiteralInst.Length;
 }
 
 StoreInst::StoreInst(
     SILDebugLocation Loc, SILValue Src, SILValue Dest,
     StoreOwnershipQualifier Qualifier = StoreOwnershipQualifier::Unqualified)
     : InstructionBase(Loc), Operands(this, Src, Dest) {
-  SILInstruction::Bits.StoreInst.OwnershipQualifier = unsigned(Qualifier);
+  SILNode::Bits.StoreInst.OwnershipQualifier = unsigned(Qualifier);
 }
 
 StoreBorrowInst::StoreBorrowInst(SILDebugLocation DebugLoc, SILValue Src,
@@ -1074,7 +1078,7 @@ StringRef swift::getSILAccessEnforcementName(SILAccessEnforcement enforcement) {
 AssignInst::AssignInst(SILDebugLocation Loc, SILValue Src, SILValue Dest,
                        AssignOwnershipQualifier Qualifier) :
     AssignInstBase(Loc, Src, Dest) {
-  SILInstruction::Bits.AssignInst.OwnershipQualifier = unsigned(Qualifier);
+  SILNode::Bits.AssignInst.OwnershipQualifier = unsigned(Qualifier);
 }
 
 AssignByWrapperInst::AssignByWrapperInst(SILDebugLocation Loc,
@@ -1084,7 +1088,7 @@ AssignByWrapperInst::AssignByWrapperInst(SILDebugLocation Loc,
                                           AssignOwnershipQualifier Qualifier) :
     AssignInstBase(Loc, Src, Dest, Initializer, Setter) {
   assert(Initializer->getType().is<SILFunctionType>());
-  SILInstruction::Bits.AssignByWrapperInst.OwnershipQualifier =
+  SILNode::Bits.AssignByWrapperInst.OwnershipQualifier =
       unsigned(Qualifier);
 }
 
@@ -1100,8 +1104,8 @@ CopyAddrInst::CopyAddrInst(SILDebugLocation Loc, SILValue SrcLValue,
                            SILValue DestLValue, IsTake_t isTakeOfSrc,
                            IsInitialization_t isInitializationOfDest)
     : InstructionBase(Loc), Operands(this, SrcLValue, DestLValue) {
-    SILInstruction::Bits.CopyAddrInst.IsTakeOfSrc = bool(isTakeOfSrc);
-    SILInstruction::Bits.CopyAddrInst.IsInitializationOfDest =
+    SILNode::Bits.CopyAddrInst.IsTakeOfSrc = bool(isTakeOfSrc);
+    SILNode::Bits.CopyAddrInst.IsInitializationOfDest =
       bool(isInitializationOfDest);
   }
 
@@ -1561,8 +1565,8 @@ CondBranchInst::CondBranchInst(SILDebugLocation Loc, SILValue Condition,
     : InstructionBaseWithTrailingOperands(Condition, Args, Loc),
       DestBBs{{{this, TrueBB, TrueBBCount}, {this, FalseBB, FalseBBCount}}} {
   assert(Args.size() == (NumTrue + NumFalse) && "Invalid number of args");
-  SILInstruction::Bits.CondBranchInst.NumTrueArgs = NumTrue;
-  assert(SILInstruction::Bits.CondBranchInst.NumTrueArgs == NumTrue &&
+  SILNode::Bits.CondBranchInst.NumTrueArgs = NumTrue;
+  assert(SILNode::Bits.CondBranchInst.NumTrueArgs == NumTrue &&
          "Truncation");
   assert(TrueBB != FalseBB && "Identical destinations");
 }
@@ -1646,7 +1650,7 @@ void CondBranchInst::swapSuccessors() {
 
   // Finally swap the number of arguments that we have. The number of false
   // arguments is derived from the number of true arguments, therefore:
-  SILInstruction::Bits.CondBranchInst.NumTrueArgs = getNumFalseArgs();
+  SILNode::Bits.CondBranchInst.NumTrueArgs = getNumFalseArgs();
 }
 
 SwitchValueInst::SwitchValueInst(SILDebugLocation Loc, SILValue Operand,
@@ -1654,7 +1658,7 @@ SwitchValueInst::SwitchValueInst(SILDebugLocation Loc, SILValue Operand,
                                  ArrayRef<SILValue> Cases,
                                  ArrayRef<SILBasicBlock *> BBs)
     : InstructionBaseWithTrailingOperands(Operand, Cases, Loc) {
-  SILInstruction::Bits.SwitchValueInst.HasDefault = bool(DefaultBB);
+  SILNode::Bits.SwitchValueInst.HasDefault = bool(DefaultBB);
   // Initialize the successor array.
   auto *succs = getSuccessorBuf();
   unsigned OperandBitWidth = 0;
@@ -2313,12 +2317,14 @@ UpcastInst *UpcastInst::create(SILDebugLocation DebugLoc, SILValue Operand,
 
 ThinToThickFunctionInst *
 ThinToThickFunctionInst::create(SILDebugLocation DebugLoc, SILValue Operand,
-                                SILType Ty, SILFunction &F,
+                                SILType Ty, SILModule &Mod, SILFunction *F,
                                 SILOpenedArchetypesState &OpenedArchetypes) {
-  SILModule &Mod = F.getModule();
   SmallVector<SILValue, 8> TypeDependentOperands;
-  collectTypeDependentOperands(TypeDependentOperands, OpenedArchetypes, F,
-                               Ty.getASTType());
+  if (F) {
+    assert(&F->getModule() == &Mod);
+    collectTypeDependentOperands(TypeDependentOperands, OpenedArchetypes, *F,
+                                 Ty.getASTType());
+  }
   unsigned size =
     totalSizeToAlloc<swift::Operand>(1 + TypeDependentOperands.size());
   void *Buffer = Mod.allocateInst(size, alignof(ThinToThickFunctionInst));
@@ -2342,12 +2348,15 @@ PointerToThinFunctionInst::create(SILDebugLocation DebugLoc, SILValue Operand,
 }
 
 ConvertFunctionInst *ConvertFunctionInst::create(
-    SILDebugLocation DebugLoc, SILValue Operand, SILType Ty, SILFunction &F,
+    SILDebugLocation DebugLoc, SILValue Operand, SILType Ty, SILModule &Mod,
+    SILFunction *F,
     SILOpenedArchetypesState &OpenedArchetypes, bool WithoutActuallyEscaping) {
-  SILModule &Mod = F.getModule();
   SmallVector<SILValue, 8> TypeDependentOperands;
-  collectTypeDependentOperands(TypeDependentOperands, OpenedArchetypes, F,
-                               Ty.getASTType());
+  if (F) {
+    assert(&F->getModule() == &Mod);
+    collectTypeDependentOperands(TypeDependentOperands, OpenedArchetypes, *F,
+                                 Ty.getASTType());
+  }
   unsigned size =
     totalSizeToAlloc<swift::Operand>(1 + TypeDependentOperands.size());
   void *Buffer = Mod.allocateInst(size, alignof(ConvertFunctionInst));
@@ -2358,14 +2367,14 @@ ConvertFunctionInst *ConvertFunctionInst::create(
   //
   // *NOTE* We purposely do not use an early return here to ensure that in
   // builds without assertions this whole if statement is optimized out.
-  if (F.getModule().getStage() != SILStage::Lowered) {
+  if (Mod.getStage() != SILStage::Lowered) {
     // Make sure we are not performing ABI-incompatible conversions.
     CanSILFunctionType opTI =
         CFI->getOperand()->getType().castTo<SILFunctionType>();
     (void)opTI;
     CanSILFunctionType resTI = CFI->getType().castTo<SILFunctionType>();
     (void)resTI;
-    assert(opTI->isABICompatibleWith(resTI, F).isCompatible() &&
+    assert((!F || opTI->isABICompatibleWith(resTI, *F).isCompatible()) &&
            "Can not convert in between ABI incompatible function types");
   }
   return CFI;

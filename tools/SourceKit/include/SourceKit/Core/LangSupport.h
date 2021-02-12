@@ -231,8 +231,6 @@ enum class SyntaxTreeTransferMode {
   Full
 };
 
-enum class SyntaxTreeSerializationFormat { JSON, ByteTree };
-
 class EditorConsumer {
   virtual void anchor();
 public:
@@ -378,6 +376,12 @@ struct RefactoringInfo {
   StringRef UnavailableReason;
 };
 
+struct ParentInfo {
+  StringRef Title;
+  StringRef KindName;
+  StringRef USR;
+};
+
 struct CursorInfoData {
   // If nonempty, a proper Info could not be resolved (and the rest of the Info
   // will be empty). Clients can potentially use this to show a diagnostic
@@ -421,6 +425,10 @@ struct CursorInfoData {
   ArrayRef<StringRef> ModuleGroupArray;
   /// All available actions on the code under cursor.
   ArrayRef<RefactoringInfo> AvailableActions;
+  /// Stores the Symbol Graph title, kind, and USR of the parent contexts of the
+  /// symbol under the cursor.
+  ArrayRef<ParentInfo> ParentContexts;
+
   bool IsSystem = false;
   llvm::Optional<unsigned> ParentNameOffset;
 };
@@ -497,6 +505,7 @@ struct DocEntityInfo {
   bool IsUnavailable = false;
   bool IsDeprecated = false;
   bool IsOptional = false;
+  bool IsAsync = false;
   swift::Type Ty;
 };
 
@@ -659,6 +668,8 @@ public:
   virtual ~LangSupport() { }
 
   virtual void globalConfigurationUpdated(std::shared_ptr<GlobalConfig> Config) {};
+
+  virtual void dependencyUpdated() {}
 
   virtual void indexSource(StringRef Filename,
                            IndexingConsumer &Consumer,
