@@ -4,19 +4,13 @@
 // REQUIRES: concurrency
 // REQUIRES: libdispatch
 
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#endif
-
 func asyncFunc() async -> Int { 42 }
 func asyncThrowsFunc() async throws -> Int { 42 }
 func asyncThrowsOnCancel() async throws -> Int {
   // terrible suspend-spin-loop -- do not do this
   // only for purposes of demonstration
   while Task.isCancelled {
-    sleep(1)
+    await Task.sleep(1_000_000_000)
   }
 
   throw Task.CancellationError()
@@ -37,36 +31,6 @@ func test_taskGroup_add() async throws -> Int {
       sum += v
     }
     return sum
-  } // implicitly awaits
-}
-
-func test_taskGroup_addHandles() async throws -> Int {
-  try await Task.withGroup(resultType: Int.self) { group in
-    let one = await group.add {
-      await asyncFunc()
-    }
-
-    let two = await group.add {
-      await asyncFunc()
-    }
-
-    _ = try await one.get()
-    _ = try await two.get()
-  } // implicitly awaits
-}
-
-func test_taskGroup_cancel_handles() async throws {
-  try await Task.withGroup(resultType: Int.self) { group in
-    let one = await group.add {
-      try await asyncThrowsOnCancel()
-    }
-
-    let two = await group.add {
-      await asyncFunc()
-    }
-
-    _ = try await one.get()
-    _ = try await two.get()
   } // implicitly awaits
 }
 
@@ -96,8 +60,8 @@ func first_allMustSucceed() async throws {
 }
 
 func first_ignoreFailures() async throws {
-  @concurrent func work() async -> Int { 42 }
-  @concurrent func boom() async throws -> Int { throw Boom() }
+  @Sendable func work() async -> Int { 42 }
+  @Sendable func boom() async throws -> Int { throw Boom() }
 
   let first: Int = try await Task.withGroup(resultType: Int.self) { group in
     await group.add { await work() }
@@ -134,7 +98,7 @@ func test_taskGroup_quorum_thenCancel() async {
     case yay
     case nay
   }
-  struct Follower {
+  struct Follower: Sendable {
     init(_ name: String) {}
     func vote() async throws -> Vote {
       // "randomly" vote yes or no
@@ -181,13 +145,13 @@ func test_taskGroup_quorum_thenCancel() async {
   _ = await gatherQuorum(followers: [Follower("A"), Follower("B"), Follower("C")])
 }
 
-extension Collection {
+extension Collection where Self: Sendable, Element: Sendable, Self.Index: Sendable {
 
   /// Just another example of how one might use task groups.
-  func map<T>(
+  func map<T: Sendable>(
     parallelism requestedParallelism: Int? = nil/*system default*/,
     // ordered: Bool = true, /
-    _ transform: (Element) async throws -> T
+    _ transform: @Sendable (Element) async throws -> T
   ) async throws -> [T] { // TODO: can't use rethrows here, maybe that's just life though; rdar://71479187 (rethrows is a bit limiting with async functions that use task groups)
     let defaultParallelism = 2
     let parallelism = requestedParallelism ?? defaultParallelism

@@ -16,26 +16,24 @@ public struct X {
     Builtin.cancelAsyncTask(task)
   }
 
-  // CHECK-LABEL: sil hidden [ossa] @$s4test1XV10launchTaskyyYF : $@convention(method) @async (X) -> ()
-  func launchTask() async {
-    // CHECK: builtin "createAsyncTask"([[FLAGS:%.*]] : $Int, [[PARENT:%.*]] : $Optional<Builtin.NativeObject>, [[FN:%.*]] : $@async @callee_guaranteed () -> @error Error) : $(Builtin.NativeObject, Builtin.RawPointer)
-    let task = Builtin.getCurrentAsyncTask()
-    let childTask = Builtin.createAsyncTask(0, task) {
-      await launchTask()
-      print("child is done")
+  // CHECK-LABEL: sil hidden [ossa] @$s4test1XV12launchFutureyyxlF : $@convention(method) <T> (@in_guaranteed T, X) -> ()
+  func launchFuture<T>(_ value: T) {
+    // CHECK: builtin "createAsyncTaskFuture"<T>([[ZERO:%.*]] : $Int, [[FN:%.*]] : $@async @callee_guaranteed @substituted <τ_0_0> () -> (@out τ_0_0, @error Error) for <T>) : $(Builtin.NativeObject, Builtin.RawPointer)
+    let task = Builtin.createAsyncTaskFuture(0) { () async throws -> T in
+      return value
     }
   }
 
-  // CHECK-LABEL: sil hidden [ossa] @$s4test1XV12launchFutureyyxlF : $@convention(method) <T> (@in_guaranteed T, X) -> ()
-  func launchFuture<T>(_ value: T) {
-    // CHECK: builtin "createAsyncTaskFuture"<T>([[ZERO:%.*]] : $Int, [[NIL:%.*]] : $Optional<Builtin.NativeObject>, [[FN:%.*]] : $@async @callee_guaranteed @substituted <τ_0_0> () -> (@out τ_0_0, @error Error) for <T>) : $(Builtin.NativeObject, Builtin.RawPointer)
-    let task = Builtin.createAsyncTaskFuture(0, nil) { () async throws -> T in
+  // CHECK-LABEL: sil hidden [ossa] @$s4test1XV16launchGroupChildyyxlF : $@convention(method) <T> (@in_guaranteed T, X) -> () {
+  func launchGroupChild<T>(_ value: T) {
+    // CHECK: builtin "createAsyncTaskGroupFuture"<T>([[ZERO:%.*]] : $Int, [[NIL:%.*]] : $Optional<Builtin.RawPointer>, [[FN:%.*]] : $@async @callee_guaranteed @substituted <τ_0_0> () -> (@out τ_0_0, @error Error) for <T>) : $(Builtin.NativeObject, Builtin.RawPointer)
+    let task = Builtin.createAsyncTaskGroupFuture(0, nil) { () async throws -> T in
       return value
     }
   }
 
   public func launchRocker<T>(closure: @escaping () async throws -> T) {
-    _ = Builtin.createAsyncTaskFuture(0, nil, closure)
+    _ = Builtin.createAsyncTaskFuture(0, closure)
   }
 }
 
@@ -117,4 +115,40 @@ public func usesWithUnsafeThrowingContinuation() async throws {
 // because it has captures and was formed by a partial_apply.
 public func usesWithUnsafeContinuationCaptures(fn: (Builtin.RawUnsafeContinuation) -> ()) async throws {
   let _: Int = await Builtin.withUnsafeContinuation { c in fn(c) }
+}
+
+// CHECK-LABEL: sil [ossa] @$s4test29resumeNonThrowingContinuationyyBc_SSntF
+public func resumeNonThrowingContinuation(_ cont: Builtin.RawUnsafeContinuation,
+                                          _ value: __owned String) {
+  // CHECK: bb0(%0 : $Builtin.RawUnsafeContinuation, %1 : @owned $String):
+  // CHECK:      [[BORROW:%.*]] = begin_borrow %1 : $String
+  // CHECK-NEXT: [[COPY:%.*]] = copy_value [[BORROW]] : $String
+  // CHECK-NEXT: builtin "resumeNonThrowingContinuationReturning"<String>(%0 : $Builtin.RawUnsafeContinuation, [[COPY]] : $String)
+  // CHECK-NEXT: end_borrow [[BORROW]] : $String
+  // CHECK-NEXT: destroy_value %1 : $String
+  Builtin.resumeNonThrowingContinuationReturning(cont, value)
+}
+
+// CHECK-LABEL: sil [ossa] @$s4test26resumeThrowingContinuationyyBc_SSntF
+public func resumeThrowingContinuation(_ cont: Builtin.RawUnsafeContinuation,
+                                       _ value: __owned String) {
+  // CHECK: bb0(%0 : $Builtin.RawUnsafeContinuation, %1 : @owned $String):
+  // CHECK:      [[BORROW:%.*]] = begin_borrow %1 : $String
+  // CHECK-NEXT: [[COPY:%.*]] = copy_value [[BORROW]] : $String
+  // CHECK-NEXT: builtin "resumeThrowingContinuationReturning"<String>(%0 : $Builtin.RawUnsafeContinuation, [[COPY]] : $String)
+  // CHECK-NEXT: end_borrow [[BORROW]] : $String
+  // CHECK-NEXT: destroy_value %1 : $String
+  Builtin.resumeThrowingContinuationReturning(cont, value)
+}
+
+// CHECK-LABEL: sil [ossa] @$s4test026resumeThrowingContinuationC0yyBc_s5Error_pntF
+public func resumeThrowingContinuationThrowing(_ cont: Builtin.RawUnsafeContinuation,
+                                               _ error: __owned Error) {
+  // CHECK: bb0(%0 : $Builtin.RawUnsafeContinuation, %1 : @owned $Error):
+  // CHECK:      [[BORROW:%.*]] = begin_borrow %1 : $Error
+  // CHECK-NEXT: [[COPY:%.*]] = copy_value [[BORROW]] : $Error
+  // CHECK-NEXT: builtin "resumeThrowingContinuationThrowing"(%0 : $Builtin.RawUnsafeContinuation, [[COPY]] : $Error)
+  // CHECK-NEXT: end_borrow [[BORROW]] : $Error
+  // CHECK-NEXT: destroy_value %1 : $Error
+  Builtin.resumeThrowingContinuationThrowing(cont, error)
 }

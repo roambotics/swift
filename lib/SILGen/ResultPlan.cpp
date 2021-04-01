@@ -524,17 +524,24 @@ public:
       handlerIsOptional = false;
       impFnTy = cast<SILFunctionType>(impTy.getASTType());
     }
+    auto env = SGF.F.getGenericEnvironment();
+    auto sig = env ? env->getGenericSignature()->getCanonicalSignature()
+                   : CanGenericSignature();
     SILFunction *impl = SGF.SGM
-      .getOrCreateForeignAsyncCompletionHandlerImplFunction(impFnTy,
-                                                continuationTy,
-                                                *calleeTypeInfo.foreign.async);
+      .getOrCreateForeignAsyncCompletionHandlerImplFunction(
+                  cast<SILFunctionType>(impFnTy->mapTypeOutOfContext()
+                                               ->getCanonicalType(sig)),
+                  continuationTy->mapTypeOutOfContext()->getCanonicalType(sig),
+                  sig,
+                  *calleeTypeInfo.foreign.async);
     auto impRef = SGF.B.createFunctionRef(loc, impl);
     
     // Initialize the block object for the completion handler.
     SILValue block = SGF.B.createInitBlockStorageHeader(loc, blockStorage,
-                          impRef, SILType::getPrimitiveObjectType(impFnTy), {});
+                          impRef, SILType::getPrimitiveObjectType(impFnTy),
+                          SGF.getForwardingSubstitutionMap());
     
-    // Wrap it in optional if the callee expects if.
+    // Wrap it in optional if the callee expects it.
     if (handlerIsOptional) {
       block = SGF.B.createOptionalSome(loc, block, impTy);
     }
@@ -627,8 +634,11 @@ public:
     auto &errorTL = SGF.getTypeLowering(errorType);
 
     // Allocate a temporary.
+    // It's flagged with "hasDynamicLifetime" because it's not possible to
+    // statically verify the lifetime of the value.
     SILValue errorTemp =
-        SGF.emitTemporaryAllocation(loc, errorTL.getLoweredType());
+        SGF.emitTemporaryAllocation(loc, errorTL.getLoweredType(),
+                                    /*hasDynamicLifetime*/ true);
 
     // Nil-initialize it.
     SGF.emitInjectOptionalNothingInto(loc, errorTemp, errorTL);

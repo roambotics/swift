@@ -76,7 +76,7 @@ Type QuerySubstitutionMap::operator()(SubstitutableType *type) const {
 }
 
 void TypeLoc::setType(Type Ty) {
-  assert(!Ty || !Ty->hasTypeVariable() || !Ty->hasHole());
+  assert(!Ty || !Ty->hasTypeVariable() || !Ty->hasPlaceholder());
   this->Ty = Ty;
 }
 
@@ -153,7 +153,9 @@ bool TypeBase::isAny() {
   return isEqual(getASTContext().TheAnyType);
 }
 
-bool TypeBase::isHole() { return getCanonicalType()->is<HoleType>(); }
+bool TypeBase::isPlaceholder() {
+  return getCanonicalType()->is<PlaceholderType>();
+}
 
 bool TypeBase::isAnyClassReferenceType() {
   return getCanonicalType().isAnyClassReferenceType();
@@ -210,6 +212,7 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::BuiltinRawPointer:
   case TypeKind::BuiltinRawUnsafeContinuation:
   case TypeKind::BuiltinJob:
+  case TypeKind::BuiltinExecutor:
   case TypeKind::BuiltinDefaultActorStorage:
   case TypeKind::BuiltinUnsafeValueBuffer:
   case TypeKind::BuiltinVector:
@@ -222,7 +225,7 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::LValue:
   case TypeKind::InOut:
   case TypeKind::TypeVariable:
-  case TypeKind::Hole:
+  case TypeKind::Placeholder:
   case TypeKind::BoundGenericEnum:
   case TypeKind::BoundGenericStruct:
   case TypeKind::SILToken:
@@ -356,6 +359,46 @@ bool CanType::isTypeErasedGenericClassTypeImpl(CanType type) {
   return false;
 }
 
+bool TypeBase::isActorType() {
+  // Nominal types: check whether the declaration is an actor.
+  if (auto nominal = getAnyNominal())
+    return nominal->isActor();
+
+  // Archetypes check for conformance to Actor.
+  if (auto archetype = getAs<ArchetypeType>()) {
+    auto actorProto = getASTContext().getProtocol(KnownProtocolKind::Actor);
+    if (!actorProto)
+      return false;
+
+    auto interfaceType = archetype->getInterfaceType();
+    auto genericEnv = archetype->getGenericEnvironment();
+    return genericEnv->getGenericSignature()->requiresProtocol(
+        interfaceType, actorProto);
+  }
+
+  // Existential types: check for Actor protocol.
+  if (isExistentialType()) {
+    auto actorProto = getASTContext().getProtocol(KnownProtocolKind::Actor);
+    if (!actorProto)
+      return false;
+
+    auto layout = getExistentialLayout();
+    if (auto superclass = layout.getSuperclass()) {
+      if (superclass->isActorType())
+        return true;
+    }
+
+    for (auto proto : layout.getProtocols()) {
+      if (proto->isActorType())
+        return true;
+    }
+
+    return false;
+  }
+
+  return false;
+}
+
 bool TypeBase::isSpecialized() {
   Type t = getCanonicalType();
 
@@ -440,9 +483,13 @@ Type TypeBase::addCurriedSelfType(const DeclContext *dc) {
 
   auto selfTy = dc->getSelfInterfaceType();
   auto selfParam = AnyFunctionType::Param(selfTy);
-  if (sig)
-    return GenericFunctionType::get(sig, {selfParam}, type);
-  return FunctionType::get({selfParam}, type);
+  // FIXME: Verify ExtInfo state is correct, not working by accident.
+  if (sig) {
+    GenericFunctionType::ExtInfo info;
+    return GenericFunctionType::get(sig, {selfParam}, type, info);
+  }
+  FunctionType::ExtInfo info;
+  return FunctionType::get({selfParam}, type, info);
 }
 
 void TypeBase::getTypeVariables(
@@ -766,6 +813,28 @@ bool TypeBase::isStdlibType() {
   return false;
 }
 
+bool TypeBase::isCGFloatType() {
+  auto *NTD = getAnyNominal();
+  if (!NTD)
+    return false;
+
+  auto *DC = NTD->getDeclContext();
+  if (!DC->isModuleScopeContext())
+    return false;
+
+  auto *module = DC->getParentModule();
+  // On macOS `CGFloat` is part of a `CoreGraphics` module,
+  // but on Linux it could be found in `Foundation`.
+  return (module->getName().is("CoreGraphics") ||
+          module->getName().is("Foundation")) &&
+         NTD->getName().is("CGFloat");
+}
+
+bool TypeBase::isDoubleType() {
+  auto *NTD = getAnyNominal();
+  return NTD ? NTD->getDecl() == getASTContext().getDoubleDecl() : false;
+}
+
 bool TypeBase::isKnownStdlibCollectionType() {
   if (auto *structType = getAs<BoundGenericStructType>()) {
     auto &ctx = getASTContext();
@@ -816,7 +885,6 @@ Type TypeBase::replaceCovariantResultType(Type newResultType,
 
     auto loadedTy = getWithoutSpecifierType();
     if (auto objectType = loadedTy->getOptionalObjectType()) {
-      assert(!newResultType->getOptionalObjectType());
       newResultType = OptionalType::get(
           objectType->replaceCovariantResultType(newResultType, uncurryLevel));
     }
@@ -867,11 +935,36 @@ static bool allowsUnlabeledTrailingClosureParameter(const ParamDecl *param) {
   return paramType->is<AnyFunctionType>();
 }
 
+/// Determine whether the parameter is contextually Sendable.
+static bool isParamUnsafeSendable(const ParamDecl *param) {
+  // Check for @_unsafeSendable.
+  if (param->getAttrs().hasAttribute<UnsafeSendableAttr>())
+    return true;
+
+  // Check that the parameter is of function type.
+  Type paramType = param->isVariadic() ? param->getVarargBaseTy()
+                                       : param->getInterfaceType();
+  paramType = paramType->getRValueType()->lookThroughAllOptionalTypes();
+  if (!paramType->is<FunctionType>())
+    return false;
+
+  // Check whether this function is known to have @_unsafeSendable function
+  // parameters.
+  auto func = dyn_cast<AbstractFunctionDecl>(param->getDeclContext());
+  if (!func)
+    return false;
+
+  return func->hasKnownUnsafeSendableFunctionParams();
+}
+
 ParameterListInfo::ParameterListInfo(
     ArrayRef<AnyFunctionType::Param> params,
     const ValueDecl *paramOwner,
     bool skipCurriedSelf) {
   defaultArguments.resize(params.size());
+  propertyWrappers.resize(params.size());
+  unsafeSendable.resize(params.size());
+  unsafeMainActor.resize(params.size());
 
   // No parameter owner means no parameter list means no default arguments
   // - hand back the zeroed bitvector.
@@ -919,6 +1012,18 @@ ParameterListInfo::ParameterListInfo(
     if (allowsUnlabeledTrailingClosureParameter(param)) {
       acceptsUnlabeledTrailingClosures.set(i);
     }
+
+    if (param->hasExternalPropertyWrapper()) {
+      propertyWrappers.set(i);
+    }
+
+    if (isParamUnsafeSendable(param)) {
+      unsafeSendable.set(i);
+    }
+
+    if (param->getAttrs().hasAttribute<UnsafeMainActorAttr>()) {
+      unsafeMainActor.set(i);
+    }
   }
 }
 
@@ -931,6 +1036,22 @@ bool ParameterListInfo::acceptsUnlabeledTrailingClosureArgument(
     unsigned paramIdx) const {
   return paramIdx >= acceptsUnlabeledTrailingClosures.size() ||
       acceptsUnlabeledTrailingClosures[paramIdx];
+}
+
+bool ParameterListInfo::hasExternalPropertyWrapper(unsigned paramIdx) const {
+  return paramIdx < propertyWrappers.size() ? propertyWrappers[paramIdx] : false;
+}
+
+bool ParameterListInfo::isUnsafeSendable(unsigned paramIdx) const {
+  return paramIdx < unsafeSendable.size()
+      ? unsafeSendable[paramIdx]
+      : false;
+}
+
+bool ParameterListInfo::isUnsafeMainActor(unsigned paramIdx) const {
+  return paramIdx < unsafeMainActor.size()
+      ? unsafeMainActor[paramIdx]
+      : false;
 }
 
 /// Turn a param list into a symbolic and printable representation that does not
@@ -1154,7 +1275,7 @@ CanType TypeBase::computeCanonicalType() {
   case TypeKind::Error:
   case TypeKind::Unresolved:
   case TypeKind::TypeVariable:
-  case TypeKind::Hole:
+  case TypeKind::Placeholder:
     llvm_unreachable("these types are always canonical");
 
 #define SUGARED_TYPE(id, parent) \
@@ -1253,7 +1374,9 @@ CanType TypeBase::computeCanonicalType() {
     getCanonicalParams(funcTy, genericSig, canParams);
     auto resultTy = funcTy->getResult()->getCanonicalType(genericSig);
 
-    auto extInfo = funcTy->getCanonicalExtInfo(useClangTypes(resultTy));
+    Optional<ASTExtInfo> extInfo = None;
+    if (funcTy->hasExtInfo())
+      extInfo = funcTy->getCanonicalExtInfo(useClangTypes(resultTy));
     if (genericSig) {
       Result = GenericFunctionType::get(genericSig, canParams, resultTy,
                                         extInfo);
@@ -1387,6 +1510,11 @@ ParenType::ParenType(Type baseType, RecursiveTypeProperties properties,
   : SugarType(TypeKind::Paren,
               flags.isInOut() ? InOutType::get(baseType) : baseType,
               properties) {
+  // In some situations (rdar://75740683) we appear to end up with ParenTypes
+  // that contain a nullptr baseType. Once this is eliminated, we can remove
+  // the checks for `type.isNull()` in the `DiagnosticArgumentKind::Type` case
+  // of `formatDiagnosticArgument`.
+  assert(baseType && "A ParenType should always wrap a non-null type");
   Bits.ParenType.Flags = flags.toRaw();
   if (flags.isInOut())
     assert(!baseType->is<InOutType>() && "caller did not pass a base type");
@@ -2011,7 +2139,7 @@ public:
       if (req.getKind() != RequirementKind::Conformance) continue;
 
       auto canTy = req.getFirstType()->getCanonicalType();
-      auto *proto = req.getSecondType()->castTo<ProtocolType>()->getDecl();
+      auto *proto = req.getProtocolDecl();
       auto origConf = origSubMap.lookupConformance(canTy, proto);
       auto substConf = substSubMap.lookupConformance(canTy, proto);
 
@@ -3424,6 +3552,17 @@ ClangTypeInfo AnyFunctionType::getClangTypeInfo() const {
   }
 }
 
+Type AnyFunctionType::getGlobalActor() const {
+  switch (getKind()) {
+  case TypeKind::Function:
+    return cast<FunctionType>(this)->getGlobalActor();
+  case TypeKind::GenericFunction:
+    return cast<GenericFunctionType>(this)->getGlobalActor();
+  default:
+    llvm_unreachable("Illegal type kind for AnyFunctionType.");
+  }
+}
+
 ClangTypeInfo AnyFunctionType::getCanonicalClangTypeInfo() const {
   return getClangTypeInfo().getCanonical();
 }
@@ -4057,6 +4196,13 @@ TypeBase::getContextSubstitutions(const DeclContext *dc,
       continue;
     }
 
+    // There are no subtitutions to apply if the type is still unbound,
+    // continue looking into the parent.
+    if (auto unboundGeneric = baseTy->getAs<UnboundGenericType>()) {
+      baseTy = unboundGeneric->getParent();
+      continue;
+    }
+
     // Assert and break to avoid hanging if we get an unexpected baseTy.
     assert(0 && "Bad base type");
     break;
@@ -4276,7 +4422,7 @@ case TypeKind::Id:
   case TypeKind::Error:
   case TypeKind::Unresolved:
   case TypeKind::TypeVariable:
-  case TypeKind::Hole:
+  case TypeKind::Placeholder:
   case TypeKind::GenericTypeParam:
   case TypeKind::SILToken:
   case TypeKind::Module:
@@ -4744,12 +4890,16 @@ case TypeKind::Id:
       if (isUnchanged) return *this;
 
       auto genericSig = genericFnType->getGenericSignature();
+      if (!function->hasExtInfo())
+        return GenericFunctionType::get(genericSig, substParams, resultTy);
       return GenericFunctionType::get(genericSig, substParams, resultTy,
                                       function->getExtInfo());
     }
 
     if (isUnchanged) return *this;
 
+    if (!function->hasExtInfo())
+      return FunctionType::get(substParams, resultTy);
     return FunctionType::get(substParams, resultTy,
                              function->getExtInfo());
   }
@@ -5019,6 +5169,7 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::BuiltinRawPointer:
   case TypeKind::BuiltinRawUnsafeContinuation:
   case TypeKind::BuiltinJob:
+  case TypeKind::BuiltinExecutor:
   case TypeKind::BuiltinDefaultActorStorage:
   case TypeKind::BuiltinUnsafeValueBuffer:
   case TypeKind::BuiltinVector:
@@ -5031,7 +5182,7 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::LValue:
   case TypeKind::InOut:
   case TypeKind::TypeVariable:
-  case TypeKind::Hole:
+  case TypeKind::Placeholder:
   case TypeKind::BoundGenericEnum:
   case TypeKind::BoundGenericStruct:
   case TypeKind::SILToken:
@@ -5339,7 +5490,10 @@ AnyFunctionType::getAutoDiffDerivativeFunctionLinearMapType(
     }
     auto differentialResult =
         hasInoutDiffParameter ? Type(ctx.TheEmptyTupleType) : resultTanType;
-    linearMapType = FunctionType::get(differentialParams, differentialResult);
+    // FIXME: Verify ExtInfo state is correct, not working by accident.
+    FunctionType::ExtInfo info;
+    linearMapType =
+        FunctionType::get(differentialParams, differentialResult, info);
     break;
   }
   case AutoDiffLinearMapKind::Pullback: {
@@ -5388,7 +5542,9 @@ AnyFunctionType::getAutoDiffDerivativeFunctionLinearMapType(
     auto flags = ParameterTypeFlags().withInOut(hasInoutDiffParameter);
     auto pullbackParam =
         AnyFunctionType::Param(resultTanType, Identifier(), flags);
-    linearMapType = FunctionType::get({pullbackParam}, pullbackResult);
+    // FIXME: Verify ExtInfo state is correct, not working by accident.
+    FunctionType::ExtInfo info;
+    linearMapType = FunctionType::get({pullbackParam}, pullbackResult, info);
     break;
   }
   }

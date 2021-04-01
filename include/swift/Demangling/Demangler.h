@@ -573,7 +573,9 @@ protected:
   NodePointer demangleAutoDiffFunctionKind();
   NodePointer demangleAutoDiffSubsetParametersThunk();
   NodePointer demangleAutoDiffSelfReorderingReabstractionThunk();
+  NodePointer demangleDifferentiabilityWitness();
   NodePointer demangleIndexSubset();
+  NodePointer demangleDifferentiableFunctionType();
 
   bool demangleBoundGenerics(Vector<NodePointer> &TypeListList,
                              NodePointer &RetroactiveConformances);

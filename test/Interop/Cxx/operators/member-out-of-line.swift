@@ -14,13 +14,49 @@ import StdlibUnittest
 
 var OperatorsTestSuite = TestSuite("Operators")
 
-OperatorsTestSuite.test("plus") {
-  var lhs = IntBox(value: 42)
-  let rhs = IntBox(value: 23)
+OperatorsTestSuite.test("LoadableIntWrapper.plus (out-of-line)") {
+  var lhs = LoadableIntWrapper(value: 42)
+  let rhs = LoadableIntWrapper(value: 23)
 
   let result = lhs + rhs
 
   expectEqual(65, result.value)
+}
+
+OperatorsTestSuite.test("LoadableIntWrapper.call (out-of-line)") {
+  var wrapper = LoadableIntWrapper(value: 42)
+
+  let resultNoArgs = wrapper()
+  let resultOneArg = wrapper(23)
+  let resultTwoArgs = wrapper(3, 5)
+
+  expectEqual(42, resultNoArgs)
+  expectEqual(65, resultOneArg)
+  expectEqual(57, resultTwoArgs)
+}
+
+OperatorsTestSuite.test("AddressOnlyIntWrapper.call (out-of-line)") {
+  var wrapper = AddressOnlyIntWrapper(42)
+
+  let resultNoArgs = wrapper()
+  let resultOneArg = wrapper(23)
+  let resultTwoArgs = wrapper(3, 5)
+
+  expectEqual(42, resultNoArgs)
+  expectEqual(65, resultOneArg)
+  expectEqual(57, resultTwoArgs)
+}
+
+OperatorsTestSuite.test("ReadWriteIntArray.subscript (out-of-line)") {
+  var arr = ReadWriteIntArray()
+
+  let resultBefore = arr[1]
+  expectEqual(2, resultBefore)
+
+  arr[1] = 234
+
+  let resultAfter = arr[1]
+  expectEqual(234, resultAfter)
 }
 
 runAllTests()

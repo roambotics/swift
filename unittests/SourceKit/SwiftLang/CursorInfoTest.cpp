@@ -72,6 +72,8 @@ class NullEditorConsumer : public EditorConsumer {
 
   void recordAffectedLineRange(unsigned Line, unsigned Length) override {}
 
+  bool diagnosticsEnabled() override { return false; }
+
   void setDiagnosticStage(UIdent DiagStage) override {}
   void handleDiagnostic(const DiagnosticEntryInfo &Info,
                         UIdent DiagStage) override {}
@@ -157,10 +159,13 @@ public:
           return;
         }
         const CursorInfoData &Info = Result.value();
-        TestInfo.Name = Info.Name.str();
-        TestInfo.Typename = Info.TypeName.str();
-        TestInfo.Filename = Info.Filename.str();
-        TestInfo.DeclarationLoc = Info.DeclarationLoc;
+        if (!Info.Symbols.empty()) {
+          const CursorSymbolInfo &MainSymbol = Info.Symbols[0];
+          TestInfo.Name = std::string(MainSymbol.Name.str());
+          TestInfo.Typename = MainSymbol.TypeName.str();
+          TestInfo.Filename = MainSymbol.Filename.str();
+          TestInfo.DeclarationLoc = MainSymbol.DeclarationLoc;
+        }
         sema.signal();
       });
 

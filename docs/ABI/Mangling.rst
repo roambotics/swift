@@ -147,6 +147,9 @@ Globals
   // TODO check this::
   global ::= mangled-name 'TA'                     // partial application forwarder
   global ::= mangled-name 'Ta'                     // ObjC partial application forwarder
+  global ::= mangled-name 'Tw' index               // async partial apply thunk for a non-constant function
+  global ::= mangled-name 'TQ' index               // Async await continuation partial function
+  global ::= mangled-name 'TY' index               // Async suspend continuation partial function
 
   global ::= type 'w' VALUE-WITNESS-KIND // value witness
 
@@ -166,6 +169,8 @@ Globals
   global ::= protocol-conformance assoc-type-list protocol 'WT' // associated type witness table accessor
   global ::= protocol-conformance protocol 'Wb' // base protocol witness table accessor
   global ::= type protocol-conformance 'Wl' // lazy protocol witness table accessor
+
+  global ::= global generic-signature? 'WJ' DIFFERENTIABILITY-KIND INDEX-SUBSET 'p' INDEX-SUBSET 'r' // differentiability witness
 
   global ::= type 'WV'                   // value witness table
   global ::= entity 'Wvd'                // field offset
@@ -207,7 +212,7 @@ types where the metadata itself has unknown layout.)
   global ::= global 'TD'                 // dynamic dispatch thunk
   global ::= global 'Td'                 // direct method reference thunk
   global ::= global 'TI'                 // implementation of a dynamic_replaceable function
-  global :== global 'Tu'                 // async function pointer of a function
+  global ::= global 'Tu'                 // async function pointer of a function
   global ::= global 'TX'                 // function pointer of a dynamic_replaceable function
   global ::= entity entity 'TV'          // vtable override thunk, derived followed by base
   global ::= type label-list? 'D'        // type mangling for the debugger with label list for function types.
@@ -220,8 +225,11 @@ types where the metadata itself has unknown layout.)
   global ::= global 'Tm'                 // merged function
   global ::= entity                      // some identifiable thing
   global ::= from-type to-type generic-signature? 'TR'  // reabstraction thunk
-  global ::= impl-function-type type 'Tz'     // objc-to-swift-async completion handler block implementation
-  global ::= impl-function-type type 'TZ'     // objc-to-swift-async completion handler block implementation (predefined by runtime)
+  global ::= impl-function-type type 'Tz' index? // objc-to-swift-async completion handler block implementation
+  global ::= impl-function-type type 'TZ' index? // objc-to-swift-async completion handler block implementation (predefined by runtime)
+  global ::= from-type to-type generic-signature? 'TR'  // reabstraction thunk
+  global ::= impl-function-type type generic-signature? 'Tz'     // objc-to-swift-async completion handler block implementation
+  global ::= impl-function-type type generic-signature? 'TZ'     // objc-to-swift-async completion handler block implementation (predefined by runtime)
   global ::= from-type to-type self-type generic-signature? 'Ty'  // reabstraction thunk with dynamic 'Self' capture
   global ::= from-type to-type generic-signature? 'Tr'  // obsolete mangling for reabstraction thunk
   global ::= entity generic-signature? type type* 'TK' // key path getter
@@ -320,6 +328,7 @@ Entities
   entity-spec ::= 'fA' INDEX                 // default argument N+1 generator
   entity-spec ::= 'fi'                       // non-local variable initializer
   entity-spec ::= 'fP'                       // property wrapper backing initializer
+  entity-spec ::= 'fW'                       // property wrapper init from projected value
   entity-spec ::= 'fD'                       // deallocating destructor; untyped
   entity-spec ::= 'fd'                       // non-deallocating destructor; untyped
   entity-spec ::= 'fE'                       // ivar destroyer; untyped
@@ -508,6 +517,7 @@ Types
   type ::= 'BB'                              // Builtin.UnsafeValueBuffer
   type ::= 'Bc'                              // Builtin.RawUnsafeContinuation
   type ::= 'BD'                              // Builtin.DefaultActorStorage
+  type ::= 'Be'                              // Builtin.ExecutorRef
   type ::= 'Bf' NATURAL '_'                  // Builtin.Float<n>
   type ::= 'Bi' NATURAL '_'                  // Builtin.Int<n>
   type ::= 'BI'                              // Builtin.IntLiteral
@@ -550,24 +560,24 @@ Types
   FUNCTION-KIND ::= 'zC' C-TYPE              // C function pointer type with with non-canonical C type
   FUNCTION-KIND ::= 'A'                      // @auto_closure function type (escaping)
   FUNCTION-KIND ::= 'E'                      // function type (noescape)
-  FUNCTION-KIND ::= 'F'                      // @differentiable function type
-  FUNCTION-KIND ::= 'G'                      // @differentiable function type (escaping)
-  FUNCTION-KIND ::= 'H'                      // @differentiable(_linear) function type
-  FUNCTION-KIND ::= 'I'                      // @differentiable(_linear) function type (escaping)
 
   C-TYPE is mangled according to the Itanium ABI, and prefixed with the length.
   Non-ASCII identifiers are preserved as-is; we do not use Punycode.
 
-  function-signature ::= params-type params-type async? concurrent? throws? // results and parameters
+  function-signature ::= params-type params-type async? sendable? throws? differentiable? // results and parameters
 
-  params-type ::= type 'z'? 'h'?              // tuple in case of multiple parameters or a single parameter with a single tuple type
+  params-type ::= type 'z'? 'h'?             // tuple in case of multiple parameters or a single parameter with a single tuple type
                                              // with optional inout convention, shared convention. parameters don't have labels,
                                              // they are mangled separately as part of the entity.
-  params-type ::= empty-list                  // shortcut for no parameters
+  params-type ::= empty-list                 // shortcut for no parameters
 
-  concurrent ::= 'J'                         // @concurrent on function types
+  sendable ::= 'J'                           // @Sendable on function types
   async ::= 'Y'                              // 'async' annotation on function types
   throws ::= 'K'                             // 'throws' annotation on function types
+  differentiable ::= 'jf'                    // @differentiable(_forward) on function type
+  differentiable ::= 'jr'                    // @differentiable(reverse) on function type
+  differentiable ::= 'jd'                    // @differentiable on function type
+  differentiable ::= 'jl'                    // @differentiable(_linear) on function type
 
   type-list ::= list-type '_' list-type*     // list of types
   type-list ::= empty-list
@@ -627,7 +637,7 @@ mangled in to disambiguate.
   impl-function-type ::= type* 'I' FUNC-ATTRIBUTES '_'
   impl-function-type ::= type* generic-signature 'I' FUNC-ATTRIBUTES '_'
 
-  FUNC-ATTRIBUTES ::= PATTERN-SUBS? INVOCATION-SUBS? PSEUDO-GENERIC? CALLEE-ESCAPE? DIFFERENTIABILITY-KIND? CALLEE-CONVENTION FUNC-REPRESENTATION? COROUTINE-KIND? CONCURRENT? ASYNC? (PARAM-CONVENTION PARAM-DIFFERENTIABILITY?)* RESULT-CONVENTION* ('Y' PARAM-CONVENTION)* ('z' RESULT-CONVENTION RESULT-DIFFERENTIABILITY?)?
+  FUNC-ATTRIBUTES ::= PATTERN-SUBS? INVOCATION-SUBS? PSEUDO-GENERIC? CALLEE-ESCAPE? DIFFERENTIABILITY-KIND? CALLEE-CONVENTION FUNC-REPRESENTATION? COROUTINE-KIND? SENDABLE? ASYNC? (PARAM-CONVENTION PARAM-DIFFERENTIABILITY?)* RESULT-CONVENTION* ('Y' PARAM-CONVENTION)* ('z' RESULT-CONVENTION RESULT-DIFFERENTIABILITY?)?
 
   PATTERN-SUBS ::= 's'                       // has pattern substitutions
   INVOCATION-SUB ::= 'I'                     // has invocation substitutions
@@ -657,7 +667,7 @@ mangled in to disambiguate.
   COROUTINE-KIND ::= 'A'                     // yield-once coroutine
   COROUTINE-KIND ::= 'G'                     // yield-many coroutine
 
-  CONCURRENT ::= 'h'                         // @concurrent
+  SENDABLE ::= 'h'                         // @Sendable
   ASYNC ::= 'H'                              // @async
 
   PARAM-CONVENTION ::= 'i'                   // indirect in

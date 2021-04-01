@@ -177,6 +177,19 @@ enum class ConstraintKind : char {
   /// - Handled specially by binding inference, specifically contributes
   ///   to the bindings only if there are no contextual types available.
   DefaultClosureType,
+  /// The first type represents a result of an unresolved member chain,
+  /// and the second type is its base type. This constraint acts almost
+  /// like `Equal` but also enforces following semantics:
+  ///
+  /// - It's possible to infer a base from a result type by looking through
+  ///   this constraint, but it's only solved when both types are bound.
+  ///
+  /// - If base is a protocol metatype, this constraint becomes a conformance
+  ///   check instead of an equality.
+  UnresolvedMemberChainBase,
+  /// The first type is a property wrapper with a wrapped-value type
+  /// equal to the second type.
+  PropertyWrapper,
 };
 
 /// Classification of the different kinds of constraints.
@@ -248,6 +261,12 @@ enum class ConversionRestrictionKind {
   /// Implicit conversion from an Objective-C class type to its
   /// toll-free-bridged CF type.
   ObjCTollFreeBridgeToCF,
+  /// Implicit conversion from a value of Double to a value of CGFloat type via
+  /// an implicit CGFloat initializer call.
+  DoubleToCGFloat,
+  /// Implicit conversion from a value of CGFloat type to a value of Double type
+  /// via an implicit Double initializer call passing a CGFloat value.
+  CGFloatToDouble,
 };
 
 /// Specifies whether a given conversion requires the creation of a temporary
@@ -570,11 +589,13 @@ public:
     case ConstraintKind::OneWayEqual:
     case ConstraintKind::OneWayBindParam:
     case ConstraintKind::DefaultClosureType:
+    case ConstraintKind::UnresolvedMemberChainBase:
       return ConstraintClassification::Relational;
 
     case ConstraintKind::ValueMember:
     case ConstraintKind::UnresolvedValueMember:
     case ConstraintKind::ValueWitness:
+    case ConstraintKind::PropertyWrapper:
       return ConstraintClassification::Member;
 
     case ConstraintKind::DynamicTypeOf:

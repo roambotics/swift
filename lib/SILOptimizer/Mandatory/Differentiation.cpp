@@ -266,8 +266,7 @@ static bool diagnoseUnsatisfiedRequirements(ADContext &context,
     }
     // Check conformance requirements.
     case RequirementKind::Conformance: {
-      auto protocolType = req.getSecondType()->castTo<ProtocolType>();
-      auto protocol = protocolType->getDecl();
+      auto *protocol = req.getProtocolDecl();
       assert(protocol && "Expected protocol in generic signature requirement");
       // If the first type does not conform to the second type in the current
       // module, then record the unsatisfied requirement.
@@ -534,8 +533,8 @@ emitDerivativeFunctionReference(
     // configuration.
     if (!minimalWitness)
       minimalWitness = getOrCreateMinimalASTDifferentiabilityWitness(
-          context.getModule(), originalFn, desiredParameterIndices,
-          desiredResultIndices);
+          context.getModule(), originalFn, DifferentiabilityKind::Reverse,
+          desiredParameterIndices, desiredResultIndices);
     // If no minimal witness exists, check non-differentiable cases before
     // creating a new private differentiability witness.
     if (!minimalWitness) {
@@ -600,8 +599,8 @@ emitDerivativeFunctionReference(
               LookUpConformanceInModule(context.getModule().getSwiftModule()));
       minimalWitness = SILDifferentiabilityWitness::createDefinition(
           context.getModule(), SILLinkage::Private, originalFn,
-          desiredParameterIndices, desiredResultIndices,
-          derivativeConstrainedGenSig, /*jvp*/ nullptr,
+          DifferentiabilityKind::Reverse, desiredParameterIndices,
+          desiredResultIndices, derivativeConstrainedGenSig, /*jvp*/ nullptr,
           /*vjp*/ nullptr, /*isSerialized*/ false);
       if (transformer.canonicalizeDifferentiabilityWitness(
               minimalWitness, invoker, IsNotSerialized))
@@ -1077,7 +1076,8 @@ static SILValue promoteCurryThunkApplicationToDifferentiableFunction(
   copyParameterArgumentsForApply(ai, newArgs, newArgsToDestroy,
                                  newBuffersToDealloc);
   auto *newApply = builder.createApply(
-      loc, newThunkRef, ai->getSubstitutionMap(), newArgs, ai->isNonThrowing());
+      loc, newThunkRef, ai->getSubstitutionMap(), newArgs,
+      ai->getApplyOptions());
   for (auto arg : newArgsToDestroy)
     builder.emitDestroyOperation(loc, arg);
   for (auto *alloc : newBuffersToDealloc)
@@ -1161,7 +1161,7 @@ SILValue DifferentiationTransformer::promoteToDifferentiableFunction(
       std::tie(thunk, interfaceSubs) =
           getOrCreateSubsetParametersThunkForDerivativeFunction(
               fb, origFnOperand, derivativeFn, derivativeFnKind, desiredConfig,
-              actualConfig);
+              actualConfig, context);
       auto *thunkFRI = builder.createFunctionRef(loc, thunk);
       if (auto genSig =
               thunk->getLoweredFunctionType()->getSubstGenericSignature()) {

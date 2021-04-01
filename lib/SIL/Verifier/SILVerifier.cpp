@@ -29,7 +29,6 @@
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "swift/SIL/MemAccessUtils.h"
-#include "swift/SIL/MemoryLifetime.h"
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/PostOrder.h"
 #include "swift/SIL/PrettyStackTrace.h"
@@ -1555,10 +1554,16 @@ public:
               "apply instruction cannot call function with error result");
     }
 
+    if (AI->isNonAsync()) {
+      require(calleeConv.funcTy->isAsync(),
+              "noasync flag used for sync callee");
+    } else {
+      require(!calleeConv.funcTy->isAsync() || AI->getFunction()->isAsync(),
+              "cannot call an async function from a non async function");
+    }
+
     require(!calleeConv.funcTy->isCoroutine(),
             "cannot call coroutine with normal apply");
-    require(!calleeConv.funcTy->isAsync() || AI->getFunction()->isAsync(),
-            "cannot call an async function from a non async function");
   }
 
   void checkTryApplyInst(TryApplyInst *AI) {
@@ -1569,8 +1574,13 @@ public:
     require(!calleeConv.funcTy->isCoroutine(),
             "cannot call coroutine with normal apply");
 
-    require(!calleeConv.funcTy->isAsync() || AI->getFunction()->isAsync(),
-            "cannot call an async function from a non async function");
+    if (AI->isNonAsync()) {
+      require(calleeConv.funcTy->isAsync(),
+              "noasync flag used for sync callee");
+    } else {
+      require(!calleeConv.funcTy->isAsync() || AI->getFunction()->isAsync(),
+              "cannot call an async function from a non async function");
+    }
 
     auto normalBB = AI->getNormalBB();
     require(normalBB->args_size() == 1,
@@ -1691,8 +1701,8 @@ public:
     SILFunctionConventions substConv(substTy, F.getModule());
     unsigned appliedArgStartIdx =
         substConv.getNumSILArguments() - PAI->getNumArguments();
-    bool isConcurrentAndStageIsCanonical =
-        PAI->getFunctionType()->isConcurrent() &&
+    bool isSendableAndStageIsCanonical =
+        PAI->getFunctionType()->isSendable() &&
         F.getModule().getStage() >= SILStage::Canonical;
     for (auto p : llvm::enumerate(PAI->getArguments())) {
       requireSameType(
@@ -1703,7 +1713,7 @@ public:
           "inputs");
 
       // TODO: Expand this to also be true for address only types.
-      if (isConcurrentAndStageIsCanonical)
+      if (isSendableAndStageIsCanonical)
         require(
             !p.value()->getType().getASTType()->is<SILBoxType>() ||
                 p.value()->getType().getSILBoxFieldType(&F).isAddressOnly(F),
@@ -1840,6 +1850,16 @@ public:
               isa<BuiltinNativeObjectType>(argType),
               "default-actor builtin can only operate on default actors");
       return;
+    }
+
+    if (builtinKind == BuiltinValueKind::BuildSerialExecutorRef) {
+      requireObjectType(BuiltinExecutorType, BI,
+                        "result of buildSerialExecutorRef");
+      auto arguments = BI->getArguments();
+      require(arguments.size() == 1,
+              "buildSerialExecutorRef expects one argument");
+      require(arguments[0]->getType().isObject(),
+              "operand of buildSerialExecutorRef should have object type");
     }
   }
   
@@ -2024,6 +2044,14 @@ public:
         "Inst with qualified ownership in a function that is not qualified");
   }
 
+  void checkEndLifetimeInst(EndLifetimeInst *I) {
+    require(!I->getOperand()->getType().isTrivial(*I->getFunction()),
+            "Source value should be non-trivial");
+    require(!fnConv.useLoweredAddresses() || F.hasOwnership(),
+            "end_lifetime is only valid in functions with qualified "
+            "ownership");
+  }
+
   void checkUncheckedValueCastInst(UncheckedValueCastInst *) {
     require(
         F.hasOwnership(),
@@ -2191,6 +2219,23 @@ public:
       break;
     }
     }
+  }
+
+  void checkStoreBorrowInst(StoreBorrowInst *SI) {
+    require(SI->getSrc()->getType().isObject(),
+            "Can't store from an address source");
+    require(!fnConv.useLoweredAddresses()
+                || SI->getSrc()->getType().isLoadable(*SI->getFunction()),
+            "Can't store a non loadable type");
+    require(SI->getDest()->getType().isAddress(),
+            "Must store to an address dest");
+    requireSameType(SI->getDest()->getType().getObjectType(),
+                    SI->getSrc()->getType(),
+                    "Store operand type and dest type mismatch");
+
+    // Note: This is the current implementation and the design is not final.
+    require(isa<AllocStackInst>(SI->getDest()),
+            "store_borrow destination can only be an alloc_stack");
   }
 
   void checkAssignInst(AssignInst *AI) {
@@ -2893,6 +2938,10 @@ public:
 
     require(EI->getFieldIndex() < operandTy->getNumElements(),
             "invalid field index for tuple_extract instruction");
+
+    require(EI->getForwardingOwnershipKind() == OwnershipKind::None ||
+                EI->getForwardingOwnershipKind() == OwnershipKind::Guaranteed,
+            "invalid forwarding ownership kind on tuple_extract instruction");
     if (EI->getModule().getStage() != SILStage::Lowered) {
       requireSameType(EI->getType().getASTType(),
                       operandTy.getElementType(EI->getFieldIndex()),
@@ -2918,6 +2967,10 @@ public:
 
     require(EI->getField()->getDeclContext() == sd,
             "struct_extract field is not a member of the struct");
+
+    require(EI->getForwardingOwnershipKind() == OwnershipKind::None ||
+                EI->getForwardingOwnershipKind() == OwnershipKind::Guaranteed,
+            "invalid forwarding ownership kind on tuple_extract instruction");
 
     if (EI->getModule().getStage() != SILStage::Lowered) {
       SILType loweredFieldTy = operandTy.getFieldType(
@@ -4729,6 +4782,15 @@ public:
           "result must match all parameters of invoke function but the first");
     }
   }
+
+  void checkHopToExecutorInst(HopToExecutorInst *HI) {
+    auto executor = HI->getTargetExecutor();
+    if (HI->getModule().getStage() == SILStage::Lowered) {
+      requireObjectType(BuiltinExecutorType, executor->getType(),
+                        "hop_to_executor instruction must take a "
+                        "Builtin.Executor in lowered SIL");
+    }
+  }
   
   void checkObjCProtocolInst(ObjCProtocolInst *OPI) {
     require(OPI->getProtocol()->isObjC(),
@@ -5425,12 +5487,7 @@ public:
     for (SILInstruction &SI : *BB) {
       if (SI.isMetaInstruction())
         continue;
-      LastSeenScope = SI.getDebugScope();
-      AlreadySeenScopes.insert(LastSeenScope);
-      break;
-    }
-    for (SILInstruction &SI : *BB) {
-      if (SI.isMetaInstruction())
+      if (SI.getLoc().getKind() == SILLocation::CleanupKind)
         continue;
 
       // If we haven't seen this debug scope yet, update the
@@ -5578,7 +5635,7 @@ public:
 
     if (F->hasOwnership() && F->shouldVerifyOwnership() &&
         !F->getModule().getASTContext().hadError()) {
-      verifyMemoryLifetime(F);
+      F->verifyMemoryLifetime();
     }
   }
 

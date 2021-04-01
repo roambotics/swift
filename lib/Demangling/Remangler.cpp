@@ -528,6 +528,7 @@ void Remangler::mangleGenericArgs(Node *node, char &Separator,
     case Node::Kind::DefaultArgumentInitializer:
     case Node::Kind::Initializer:
     case Node::Kind::PropertyWrapperBackingInitializer:
+    case Node::Kind::PropertyWrapperInitFromProjectedValue:
       if (!fullSubstitutionMap)
         break;
 
@@ -820,8 +821,12 @@ void Remangler::manglePredefinedObjCAsyncCompletionHandlerImpl(Node *node) {
 }
 
 void Remangler::mangleObjCAsyncCompletionHandlerImpl(Node *node) {
-  mangleChildNodes(node);
+  mangleChildNode(node, 0);
+  mangleChildNode(node, 1);
+  if (node->getNumChildren() == 4)
+    mangleChildNode(node, 3);
   Buffer << "Tz";
+  mangleChildNode(node, 2);
 }
 
 void Remangler::mangleDeallocator(Node *node) {
@@ -1253,26 +1258,6 @@ void Remangler::mangleFunctionType(Node *node) {
   Buffer << 'c';
 }
 
-void Remangler::mangleDifferentiableFunctionType(Node *node) {
-  mangleFunctionSignature(node);
-  Buffer << "XF";
-}
-
-void Remangler::mangleEscapingDifferentiableFunctionType(Node *node) {
-  mangleFunctionSignature(node);
-  Buffer << "XG";
-}
-
-void Remangler::mangleLinearFunctionType(Node *node) {
-  mangleFunctionSignature(node);
-  Buffer << "XH";
-}
-
-void Remangler::mangleEscapingLinearFunctionType(Node *node) {
-  mangleFunctionSignature(node);
-  Buffer << "XI";
-}
-
 void Remangler::mangleGenericProtocolWitnessTable(Node *node) {
   mangleSingleChildNode(node);
   Buffer << "WG";
@@ -1391,6 +1376,9 @@ void Remangler::mangleGlobal(Node *node) {
       case Node::Kind::DynamicallyReplaceableFunctionImpl:
       case Node::Kind::DynamicallyReplaceableFunctionVar:
       case Node::Kind::AsyncFunctionPointer:
+      case Node::Kind::AsyncNonconstantPartialApplyThunk:
+      case Node::Kind::AsyncAwaitResumePartialFunction:
+      case Node::Kind::AsyncSuspendResumePartialFunction:
         mangleInReverseOrder = true;
         break;
       default:
@@ -1595,7 +1583,7 @@ void Remangler::mangleImplFunctionType(Node *node) {
         char FuncAttr = llvm::StringSwitch<char>(Child->getText())
                         .Case("@yield_once", 'A')
                         .Case("@yield_many", 'G')
-                        .Case("@concurrent", 'h')
+                        .Case("@Sendable", 'h')
                         .Case("@async", 'H')
                         .Default(0);
         assert(FuncAttr && "invalid impl function attribute");
@@ -1702,6 +1690,11 @@ void Remangler::mangleInitializer(Node *node) {
 void Remangler::manglePropertyWrapperBackingInitializer(Node *node) {
   mangleChildNodes(node);
   Buffer << "fP";
+}
+
+void Remangler::manglePropertyWrapperInitFromProjectedValue(Node *node) {
+  mangleChildNodes(node);
+  Buffer << "fW";
 }
 
 void Remangler::mangleLazyProtocolWitnessTableAccessor(Node *node) {
@@ -1892,6 +1885,21 @@ void Remangler::mangleDynamicallyReplaceableFunctionKey(Node *node) {
 
 void Remangler::mangleDynamicallyReplaceableFunctionVar(Node *node) {
   Buffer << "TX";
+}
+
+void Remangler::mangleAsyncNonconstantPartialApplyThunk(Node *node) {
+  Buffer << "Tw";
+  mangleChildNode(node, 0);
+}
+
+void Remangler::mangleAsyncAwaitResumePartialFunction(Node *node) {
+  Buffer << "TQ";
+  mangleChildNode(node, 0);
+}
+
+void Remangler::mangleAsyncSuspendResumePartialFunction(Node *node) {
+  Buffer << "TY";
+  mangleChildNode(node, 0);
 }
 
 void Remangler::manglePostfixOperator(Node *node) {
@@ -2164,6 +2172,20 @@ void Remangler::mangleAutoDiffSubsetParametersThunk(Node *node) {
 
 void Remangler::mangleAutoDiffFunctionKind(Node *node) {
   Buffer << (char)node->getIndex();
+}
+
+void Remangler::mangleDifferentiabilityWitness(Node *node) {
+  auto childIt = node->begin();
+  while (childIt != node->end() && (*childIt)->getKind() != Node::Kind::Index)
+    mangle(*childIt++);
+  if (node->getLastChild()->getKind() ==
+          Node::Kind::DependentGenericSignature)
+    mangle(node->getLastChild());
+  Buffer << "WJ" << (char)(*childIt++)->getIndex();
+  mangle(*childIt++); // parameter indices
+  Buffer << 'p';
+  mangle(*childIt++); // result indices
+  Buffer << 'r';
 }
 
 void Remangler::mangleIndexSubset(Node *node) {
@@ -2449,6 +2471,10 @@ void Remangler::mangleConcurrentFunctionType(Node *node) {
 
 void Remangler::mangleAsyncAnnotation(Node *node) {
   Buffer << 'Y';
+}
+
+void Remangler::mangleDifferentiableFunctionType(Node *node) {
+  Buffer << 'j' << (char)node->getIndex(); // differentiability kind
 }
 
 void Remangler::mangleThrowsAnnotation(Node *node) {
@@ -2782,6 +2808,7 @@ bool Demangle::isSpecialized(Node *node) {
     case Node::Kind::ImplicitClosure:
     case Node::Kind::Initializer:
     case Node::Kind::PropertyWrapperBackingInitializer:
+    case Node::Kind::PropertyWrapperInitFromProjectedValue:
     case Node::Kind::DefaultArgumentInitializer:
     case Node::Kind::Getter:
     case Node::Kind::Setter:
@@ -2822,6 +2849,7 @@ NodePointer Demangle::getUnspecialized(Node *node, NodeFactory &Factory) {
     case Node::Kind::ImplicitClosure:
     case Node::Kind::Initializer:
     case Node::Kind::PropertyWrapperBackingInitializer:
+    case Node::Kind::PropertyWrapperInitFromProjectedValue:
     case Node::Kind::DefaultArgumentInitializer:
       NumToCopy = node->getNumChildren();
       LLVM_FALLTHROUGH;

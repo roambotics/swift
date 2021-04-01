@@ -34,6 +34,7 @@ endif()
 
 
 add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_STDLIB
+  ../CompatibilityOverride/CompatibilityOverride.cpp
   Actor.cpp
   Actor.swift
   CheckedContinuation.swift
@@ -65,6 +66,7 @@ add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
   TaskGroup.swift
   TaskLocal.cpp
   TaskLocal.swift
+  ThreadSanitizer.cpp
   Mutex.cpp
   ${swift_concurrency_objc_sources}
 

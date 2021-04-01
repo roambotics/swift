@@ -61,7 +61,7 @@
 /// that functions, methods, and properties imported from C and Objective-C
 /// have a consistent type interface.
 @frozen
-public struct Bool: ConcurrentValue {
+public struct Bool: Sendable {
   @usableFromInline
   internal var _value: Builtin.Int1
 
@@ -276,10 +276,10 @@ extension Bool {
   ///   - lhs: The left-hand side of the operation.
   ///   - rhs: The right-hand side of the operation.
   @_transparent
-  @inline(__always)
-  public static func && (lhs: Bool, rhs: @autoclosure () throws -> Bool) rethrows
+  @_alwaysEmitIntoClient
+  public static func && (lhs: Bool, rhs: @autoclosure () async throws -> Bool) reasync rethrows
       -> Bool {
-    return lhs ? try rhs() : false
+    return lhs ? try await rhs() : false
   }
 
   /// Performs a logical OR operation on two Boolean values.
@@ -316,8 +316,24 @@ extension Bool {
   ///   - lhs: The left-hand side of the operation.
   ///   - rhs: The right-hand side of the operation.
   @_transparent
-  @inline(__always)
-  public static func || (lhs: Bool, rhs: @autoclosure () throws -> Bool) rethrows
+  @_alwaysEmitIntoClient
+  public static func || (lhs: Bool, rhs: @autoclosure () async throws -> Bool) reasync rethrows
+      -> Bool {
+    return lhs ? true : try await rhs()
+  }
+
+  // We keep the old entry points around but mark them unavailable for
+  // ABI compatibility.
+  @usableFromInline
+  @available(*, unavailable)
+  internal static func && (lhs: Bool, rhs: @autoclosure () throws -> Bool) rethrows
+      -> Bool {
+    return lhs ? try rhs() : false
+  }
+
+  @usableFromInline
+  @available(*, unavailable)
+  internal static func || (lhs: Bool, rhs: @autoclosure () throws -> Bool) rethrows
       -> Bool {
     return lhs ? true : try rhs()
   }

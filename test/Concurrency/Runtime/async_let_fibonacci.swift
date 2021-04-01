@@ -4,11 +4,8 @@
 // REQUIRES: concurrency
 // REQUIRES: libdispatch
 
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#endif
+// rdar://76038845
+// UNSUPPORTED: use_os_stdlib
 
 func fib(_ n: Int) -> Int {
   var first = 0
@@ -30,12 +27,12 @@ func asyncFib(_ n: Int) async -> Int {
   async let second = await asyncFib(n-1)
 
   // Sleep a random amount of time waiting on the result producing a result.
-  usleep(UInt32.random(in: 0..<100) * 1000)
+  await Task.sleep(UInt64.random(in: 0..<100) * 1_000_000)
 
   let result = await first + second
 
   // Sleep a random amount of time before producing a result.
-  usleep(UInt32.random(in: 0..<100) * 1000)
+  await Task.sleep(UInt64.random(in: 0..<100) * 1_000_000)
 
   return result
 }

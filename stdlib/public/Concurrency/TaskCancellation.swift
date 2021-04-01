@@ -1,14 +1,14 @@
-////===----------------------------------------------------------------------===//
-////
-//// This source file is part of the Swift.org open source project
-////
-//// Copyright (c) 2020 Apple Inc. and the Swift project authors
-//// Licensed under Apache License v2.0 with Runtime Library Exception
-////
-//// See https://swift.org/LICENSE.txt for license information
-//// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
-////
-////===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2020 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
 
 import Swift
 @_implementationOnly import _SwiftConcurrencyShims
@@ -65,14 +65,23 @@ extension Task {
   ///
   /// Does not check for cancellation, and always executes the passed `operation`.
   ///
-  /// ### Suspension
   /// This function returns instantly and will never suspend.
-  /* @instantaneous */
   public static func withCancellationHandler<T>(
-    handler: @concurrent () -> (),
+    handler: @Sendable () -> (),
     operation: () async throws -> T
-  ) async throws -> T {
-      fatalError("\(#function) not implemented yet.")
+  ) async rethrows -> T {
+    let task = Builtin.getCurrentAsyncTask()
+
+    guard !_taskIsCancelled(task) else {
+      // If the current task is already cancelled, run the handler immediately.
+      handler()
+      return try await operation()
+    }
+
+    let record = _taskAddCancellationHandler(handler: handler)
+    defer { _taskRemoveCancellationHandler(record: record) }
+
+    return try await operation()
   }
 
   /// The default cancellation thrown when a task is cancelled.
@@ -85,3 +94,11 @@ extension Task {
   }
 
 }
+
+@_silgen_name("swift_task_addCancellationHandler")
+func _taskAddCancellationHandler(handler: @Sendable () -> ()) -> UnsafeRawPointer /*CancellationNotificationStatusRecord*/
+
+@_silgen_name("swift_task_removeCancellationHandler")
+func _taskRemoveCancellationHandler(
+  record: UnsafeRawPointer /*CancellationNotificationStatusRecord*/
+)

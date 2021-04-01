@@ -44,6 +44,7 @@ class ProtocolConformance;
 namespace constraints {
 
 class ConstraintSystem;
+enum class ConversionRestrictionKind;
 
 /// Locates a given constraint within the expression being
 /// type-checked, which may refer down into subexpressions and parts of
@@ -200,9 +201,13 @@ public:
   /// via key path dynamic member lookup.
   bool isForKeyPathDynamicMemberLookup() const;
 
-  /// Determine whether this locator points to one of the key path
-  /// components.
-  bool isForKeyPathComponent() const;
+  /// Determine whether this locator points to element inside
+  /// of a key path component.
+  bool isInKeyPathComponent() const;
+
+  /// Determine whether this locator points to a result type of
+  /// a key path component.
+  bool isForKeyPathComponentResult() const;
 
   /// Determine whether this locator points to the generic parameter.
   bool isForGenericParameter() const;
@@ -511,12 +516,14 @@ public:
   }
 };
 
-class LocatorPathElt::SynthesizedArgument final : public StoredIntegerElement<1> {
+class LocatorPathElt::SynthesizedArgument final : public StoredIntegerElement<2> {
 public:
-  SynthesizedArgument(unsigned index)
-      : StoredIntegerElement(ConstraintLocator::SynthesizedArgument, index) {}
+  SynthesizedArgument(unsigned index, bool afterCodeCompletionLoc = false)
+      : StoredIntegerElement(ConstraintLocator::SynthesizedArgument, index,
+                             afterCodeCompletionLoc) {}
 
-  unsigned getIndex() const { return getValue(); }
+  unsigned getIndex() const { return getValue<0>(); }
+  bool isAfterCodeCompletionLoc() const { return getValue<1>(); }
 
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::SynthesizedArgument;
@@ -741,7 +748,7 @@ public:
 
 class LocatorPathElt::ArgumentAttribute final : public StoredIntegerElement<1> {
 public:
-  enum Attribute : uint8_t { InOut, Escaping, Concurrent };
+  enum Attribute : uint8_t { InOut, Escaping, Concurrent, GlobalActor };
 
 private:
   ArgumentAttribute(Attribute attr)
@@ -762,6 +769,10 @@ public:
     return ArgumentAttribute(Attribute::Concurrent);
   }
 
+  static ArgumentAttribute forGlobalActor() {
+    return ArgumentAttribute(Attribute::GlobalActor);
+  }
+
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::ArgumentAttribute;
   }
@@ -778,6 +789,40 @@ public:
 
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::ConformanceRequirement;
+  }
+};
+
+class LocatorPathElt::PlaceholderType final
+    : public StoredPointerElement<PlaceholderTypeRepr> {
+public:
+  PlaceholderType(PlaceholderTypeRepr *placeholderRepr)
+      : StoredPointerElement(PathElementKind::PlaceholderType,
+                             placeholderRepr) {}
+
+  PlaceholderTypeRepr *getPlaceholderRepr() const { return getStoredPointer(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == ConstraintLocator::PlaceholderType;
+  }
+};
+
+class LocatorPathElt::ImplicitConversion final
+    : public StoredIntegerElement<1> {
+public:
+  ImplicitConversion(ConversionRestrictionKind kind)
+      : StoredIntegerElement(ConstraintLocator::ImplicitConversion,
+                             static_cast<unsigned>(kind)) {}
+
+  ConversionRestrictionKind getConversionKind() const {
+    return static_cast<ConversionRestrictionKind>(getValue());
+  }
+
+  bool is(ConversionRestrictionKind kind) const {
+    return getConversionKind() == kind;
+  }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == ConstraintLocator::ImplicitConversion;
   }
 };
 

@@ -16,7 +16,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "CFTypeInfo.h"
-#include "IAMInference.h"
 #include "ImporterImpl.h"
 #include "ClangDiagnosticConsumer.h"
 #include "swift/Subsystems.h"
@@ -447,34 +446,6 @@ StringRef importer::stripNotification(StringRef name) {
   if (name.size() <= notification.size() || !name.endswith(notification))
     return {};
   return name.drop_back(notification.size());
-}
-
-/// Whether the decl is from a module who requested import-as-member inference
-static bool moduleIsInferImportAsMember(const clang::NamedDecl *decl,
-                                        clang::Sema &clangSema) {
-  clang::Module *submodule;
-  if (auto m = decl->getImportedOwningModule()) {
-    submodule = m;
-  } else if (auto m = decl->getLocalOwningModule()) {
-    submodule = m;
-  } else if (auto m = clangSema.getPreprocessor().getCurrentModule()) {
-    submodule = m;
-  } else if (auto m = clangSema.getPreprocessor().getCurrentLexerSubmodule()) {
-    submodule = m;
-  } else {
-    return false;
-  }
-
-  while (submodule) {
-    if (submodule->IsSwiftInferImportAsMember) {
-      // HACK HACK HACK: This is a workaround for some module invalidation issue
-      // and inconsistency. This will go away soon.
-      return submodule->Name == "CoreGraphics";
-    }
-    submodule = submodule->Parent;
-  }
-
-  return false;
 }
 
 /// Match the name of the given Objective-C method to its enclosing class name
@@ -1497,8 +1468,23 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
           swiftAsyncAttr->getCompletionHandlerIndex().getASTIndex();
     }
     
-    // TODO: Check for the swift_async_error attribute here when Clang
-    // implements it
+    if (const auto *asyncErrorAttr = D->getAttr<clang::SwiftAsyncErrorAttr>()) {
+      switch (auto convention = asyncErrorAttr->getConvention()) {
+      // No flag parameter in these cases.
+      case clang::SwiftAsyncErrorAttr::NonNullError:
+      case clang::SwiftAsyncErrorAttr::None:
+        break;
+      
+      // Get the flag argument index and polarity from the attribute.
+      case clang::SwiftAsyncErrorAttr::NonZeroArgument:
+      case clang::SwiftAsyncErrorAttr::ZeroArgument:
+        // NB: Attribute is 1-based rather than 0-based.
+        completionHandlerFlagParamIndex = asyncErrorAttr->getHandlerParamIdx() - 1;
+        completionHandlerFlagIsZeroOnError =
+          convention == clang::SwiftAsyncErrorAttr::ZeroArgument;
+        break;
+      }
+    }
   }
 
   // FIXME: ugly to check here, instead perform unified check up front in
@@ -1673,35 +1659,6 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
 
       return result;
     }
-  } else if (swift3OrLaterName && (inferImportAsMember ||
-                                   moduleIsInferImportAsMember(D, clangSema)) &&
-             (isa<clang::VarDecl>(D) || isa<clang::FunctionDecl>(D)) &&
-             dc->isTranslationUnit()) {
-    auto inference = IAMResult::infer(swiftCtx, clangSema, D);
-    if (inference.isImportAsMember()) {
-      result.info.importAsMember = true;
-      result.declName = inference.name;
-      result.effectiveContext = inference.effectiveDC;
-
-      // Instance or static
-      if (inference.selfIndex) {
-        result.info.hasSelfIndex = true;
-        result.info.selfIndex = *inference.selfIndex;
-      }
-
-      // Property
-      if (inference.isGetter())
-        result.info.accessorKind = ImportedAccessorKind::PropertyGetter;
-      else if (inference.isSetter())
-        result.info.accessorKind = ImportedAccessorKind::PropertySetter;
-
-      // Inits are factory. These C functions are neither convenience nor
-      // designated, as they return a fully formed object of that type.
-      if (inference.isInit())
-        result.info.initKind = CtorInitializerKind::Factory;
-
-      return result;
-    }
   }
 
   // For empty names, there is nothing to do.
@@ -1742,6 +1699,13 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
 
   case clang::DeclarationName::CXXOperatorName: {
     auto op = D->getDeclName().getCXXOverloadedOperator();
+    auto functionDecl = dyn_cast<clang::FunctionDecl>(D);
+    if (!functionDecl) {
+      // This can happen for example for templated operators functions.
+      // We don't support those, yet.
+      return ImportedName();
+    }
+
     switch (op) {
     case clang::OverloadedOperatorKind::OO_Plus:
     case clang::OverloadedOperatorKind::OO_Minus:
@@ -1760,22 +1724,38 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
     case clang::OverloadedOperatorKind::OO_GreaterEqual:
     case clang::OverloadedOperatorKind::OO_AmpAmp:
     case clang::OverloadedOperatorKind::OO_PipePipe:
-      if (auto FD = dyn_cast<clang::FunctionDecl>(D)) {
-        baseName = clang::getOperatorSpelling(op);
-        isFunction = true;
-        argumentNames.resize(
-            FD->param_size() +
-            // C++ operators that are implemented as non-static member functions
-            // get imported into Swift as static member functions that use an
-            // additional parameter for the left-hand side operand instead of
-            // the receiver object.
-            (isa<clang::CXXMethodDecl>(D) ? 1 : 0));
-      } else {
-        // This can happen for example for templated operators functions.
-        // We don't support those, yet.
+      baseName = clang::getOperatorSpelling(op);
+      isFunction = true;
+      argumentNames.resize(
+          functionDecl->param_size() +
+              // C++ operators that are implemented as non-static member functions
+              // get imported into Swift as static member functions that use an
+              // additional parameter for the left-hand side operand instead of
+              // the receiver object.
+              (isa<clang::CXXMethodDecl>(D) ? 1 : 0));
+      break;
+    case clang::OverloadedOperatorKind::OO_Call:
+      baseName = "callAsFunction";
+      isFunction = true;
+      addEmptyArgNamesForClangFunction(functionDecl, argumentNames);
+      break;
+    case clang::OverloadedOperatorKind::OO_Subscript: {
+      auto returnType = functionDecl->getReturnType();
+      if (!returnType->isReferenceType()) {
+        // TODO: support non-reference return types (SR-14351)
         return ImportedName();
       }
+      if (returnType->getPointeeType().isConstQualified()) {
+        baseName = "__operatorSubscriptConst";
+        result.info.accessorKind = ImportedAccessorKind::SubscriptGetter;
+      } else {
+        baseName = "__operatorSubscript";
+        result.info.accessorKind = ImportedAccessorKind::SubscriptSetter;
+      }
+      isFunction = true;
+      addEmptyArgNamesForClangFunction(functionDecl, argumentNames);
       break;
+    }
     default:
       // We don't import these yet.
       return ImportedName();
@@ -2234,7 +2214,6 @@ bool NameImporter::forEachDistinctImportName(
     seenNames.push_back(key);
 
   activeVersion.forEachOtherImportNameVersion(
-      swiftCtx.LangOpts.EnableExperimentalConcurrency,
       [&](ImportNameVersion nameVersion) {
         // Check to see if the name is different.
         ImportedName newName = importName(decl, nameVersion);

@@ -23,6 +23,7 @@
 #include "swift/Basic/Sanitizers.h"
 #include "swift/Basic/OptionSet.h"
 #include "swift/Basic/OptimizationMode.h"
+#include "swift/Config.h"
 #include "clang/Basic/PointerAuthOptions.h"
 // FIXME: This include is just for llvm::SanitizerCoverageOptions. We should
 // split the header upstream so we don't include so much.
@@ -39,7 +40,10 @@ enum class IRGenOutputKind : unsigned {
   Module,
 
   /// Generate an LLVM module and write it out as LLVM assembly.
-  LLVMAssembly,
+  LLVMAssemblyBeforeOptimization,
+
+  /// Generate an LLVM module and write it out as LLVM assembly.
+  LLVMAssemblyAfterOptimization,
 
   /// Generate an LLVM module and write it out as LLVM bitcode.
   LLVMBitcode,
@@ -353,7 +357,8 @@ public:
   JITDebugArtifact DumpJIT = JITDebugArtifact::None;
 
   IRGenOptions()
-      : DWARFVersion(2), OutputKind(IRGenOutputKind::LLVMAssembly),
+      : DWARFVersion(2),
+        OutputKind(IRGenOutputKind::LLVMAssemblyAfterOptimization),
         Verify(true), OptMode(OptimizationMode::NotSet),
         Sanitizers(OptionSet<SanitizerKind>()),
         SanitizersWithRecoveryInstrumentation(OptionSet<SanitizerKind>()),
@@ -400,7 +405,8 @@ public:
     if (HasValueNamesSetting) {
       return ValueNames;
     } else {
-      return OutputKind == IRGenOutputKind::LLVMAssembly;
+      return OutputKind == IRGenOutputKind::LLVMAssemblyBeforeOptimization ||
+             OutputKind == IRGenOutputKind::LLVMAssemblyAfterOptimization;
     }
   }
 

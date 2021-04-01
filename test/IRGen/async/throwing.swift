@@ -1,11 +1,14 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-build-swift -Xfrontend -enable-experimental-concurrency %s -module-name main -o %t/main
+// RUN: %target-build-swift -Xfrontend -enable-experimental-concurrency -g %s -module-name main -o %t/main
 // RUN: %target-codesign %t/main
 // RUN: %target-run %t/main | %FileCheck %s
 
 // REQUIRES: executable_test
 // REQUIRES: concurrency
 // UNSUPPORTED: use_os_stdlib
+
+// https://bugs.swift.org/browse/SR-14333
+// UNSUPPORTED: OS=windows-msvc
 
 struct E : Error {}
 

@@ -198,6 +198,12 @@ SIMPLE_LOCATOR_PATH_ELT(UnresolvedMemberChainResult)
 /// The conformance requirement associated with a type.
 CUSTOM_LOCATOR_PATH_ELT(ConformanceRequirement)
 
+/// A source-specified placeholder.
+CUSTOM_LOCATOR_PATH_ELT(PlaceholderType)
+
+/// The implicit conversion applied at a given location.
+CUSTOM_LOCATOR_PATH_ELT(ImplicitConversion)
+
 #undef LOCATOR_PATH_ELT
 #undef CUSTOM_LOCATOR_PATH_ELT
 #undef SIMPLE_LOCATOR_PATH_ELT

@@ -662,7 +662,7 @@ public:
     auto funcNode = Dem.createNode(kind);
     if (F->getFlags().isThrowing())
       funcNode->addChild(Dem.createNode(Node::Kind::ThrowsAnnotation), Dem);
-    if (F->getFlags().isConcurrent()) {
+    if (F->getFlags().isSendable()) {
       funcNode->addChild(
           Dem.createNode(Node::Kind::ConcurrentFunctionType), Dem);
     }
@@ -992,7 +992,8 @@ public:
     auto SubstitutedResult = visit(F->getResult());
 
     return FunctionTypeRef::create(Builder, SubstitutedParams,
-                                   SubstitutedResult, F->getFlags());
+                                   SubstitutedResult, F->getFlags(),
+                                   F->getDifferentiabilityKind());
   }
 
   const TypeRef *
@@ -1111,7 +1112,8 @@ public:
     auto SubstitutedResult = visit(F->getResult());
 
     return FunctionTypeRef::create(Builder, SubstitutedParams,
-                                   SubstitutedResult, F->getFlags());
+                                   SubstitutedResult, F->getFlags(),
+                                   F->getDifferentiabilityKind());
   }
 
   const TypeRef *
