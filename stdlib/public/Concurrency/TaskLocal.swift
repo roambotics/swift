@@ -14,6 +14,7 @@ import Swift
 @_implementationOnly import _SwiftConcurrencyShims
 
 /// Namespace for declaring `TaskLocalKey`s.
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 public enum TaskLocalValues {}
 
 /// A `TaskLocalKey` is used to identify, bind and get a task local value from
@@ -21,6 +22,7 @@ public enum TaskLocalValues {}
 ///
 /// - SeeAlso: `Task.withLocal(_:boundTo:operation:)`
 /// - SeeAlso: `Task.local(_:)`
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 public protocol TaskLocalKey {
   /// The type of `Value` uniquely identified by this key.
   associatedtype Value
@@ -43,12 +45,14 @@ public protocol TaskLocalKey {
   static var inherit: TaskLocalInheritance { get }
 }
 
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 extension TaskLocalKey {
   public static var inherit: TaskLocalInheritance { .default }
 }
 
 /// Determines task local value behavior in child tasks.
 // TODO: should likely remain extensible
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 public enum TaskLocalInheritance: UInt8, Equatable {
   /// The default inheritance strategy.
   ///
@@ -62,6 +66,7 @@ public enum TaskLocalInheritance: UInt8, Equatable {
   case never = 1
 }
 
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 extension Task {
 
   /// Read a task-local value, bound to the specified key.
@@ -69,22 +74,25 @@ extension Task {
   /// - Parameter keyPath: key path to the `TaskLocalKey` to be used for lookup
   /// - Returns: the value bound to the key, or its default value it if was not
   ///            bound in the current (or any parent) tasks.
-  public static func local<Key>(_ keyPath: KeyPath<TaskLocalValues, Key>)
-    -> Key.Value where Key: TaskLocalKey {
-    guard let unsafeTask = Task.unsafeCurrent else {
-      return Key.defaultValue
-    }
+  public static func local<Key>(
+    _ keyPath: KeyPath<TaskLocalValues, Key>
+  ) -> Key.Value where Key: TaskLocalKey {
+    withUnsafeCurrentTask { current in
+      guard let task = current else {
+        return Key.defaultValue
+      }
 
-    let value = _taskLocalValueGet(
-      unsafeTask._task, keyType: Key.self, inheritance: Key.inherit.rawValue)
-    guard let rawValue = value else {
-      return Key.defaultValue
-    }
+      let value = _taskLocalValueGet(
+        task._task, keyType: Key.self, inheritance: Key.inherit.rawValue)
+      guard let rawValue = value else {
+        return Key.defaultValue
+      }
 
-    // Take the value; The type should be correct by construction
-    let storagePtr =
-      rawValue.bindMemory(to: Key.Value.self, capacity: 1)
-    return UnsafeMutablePointer<Key.Value>(mutating: storagePtr).pointee
+      // Take the value; The type should be correct by construction
+      let storagePtr =
+        rawValue.bindMemory(to: Key.Value.self, capacity: 1)
+      return UnsafeMutablePointer<Key.Value>(mutating: storagePtr).pointee
+    }
   }
 
   /// Bind the task local key to the given value for the scope of the `body` function.
@@ -100,7 +108,9 @@ extension Task {
     boundTo value: Key.Value,
     operation: () async throws -> BodyResult
   ) async rethrows -> BodyResult where Key: TaskLocalKey {
-    let _task = Task.unsafeCurrent!._task // !-safe, guaranteed to have task available inside async function
+    let _task = withUnsafeCurrentTask { current in
+      current!._task // !-safe, guaranteed to have task available inside async function
+    }
 
     _taskLocalValuePush(_task, keyType: Key.self, value: value)
     defer { _taskLocalValuePop(_task) }
@@ -112,6 +122,7 @@ extension Task {
 
 // ==== ------------------------------------------------------------------------
 
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 @_silgen_name("swift_task_localValuePush")
 public func _taskLocalValuePush<Value>(
   _ task: Builtin.NativeObject,
@@ -119,11 +130,13 @@ public func _taskLocalValuePush<Value>(
   value: __owned Value
 ) // where Key: TaskLocalKey
 
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 @_silgen_name("swift_task_localValuePop")
 public func _taskLocalValuePop(
   _ task: Builtin.NativeObject
 )
 
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 @_silgen_name("swift_task_localValueGet")
 public func _taskLocalValueGet(
   _ task: Builtin.NativeObject,

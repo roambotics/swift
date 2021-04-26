@@ -259,6 +259,9 @@ AvailabilityContext ASTContext::getSwift50Availability() {
     return AvailabilityContext(
                             VersionRange::allGTE(llvm::VersionTuple(12,2)));
   } else if (target.isWatchOS()) {
+    if (target.getArch() == llvm::Triple::ArchType::x86_64)
+      return AvailabilityContext::alwaysAvailable();
+
     return AvailabilityContext(
                             VersionRange::allGTE(llvm::VersionTuple(5,2)));
   } else {
@@ -324,7 +327,7 @@ ASTContext::getIntermodulePrespecializedGenericMetadataAvailability() {
 }
 
 AvailabilityContext ASTContext::getConcurrencyAvailability() {
-  return getSwiftFutureAvailability();
+  return getSwift55Availability();
 }
 
 AvailabilityContext ASTContext::getDifferentiationAvailability() {
@@ -408,6 +411,11 @@ AvailabilityContext ASTContext::getSwift54Availability() {
     return AvailabilityContext::alwaysAvailable();
   }
 }
+
+AvailabilityContext ASTContext::getSwift55Availability() {
+  return getSwiftFutureAvailability();
+}
+
 
 AvailabilityContext ASTContext::getSwiftFutureAvailability() {
   auto target = LangOpts.Target;

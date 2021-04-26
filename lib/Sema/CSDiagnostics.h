@@ -603,6 +603,8 @@ public:
       : FailureDiagnostic(solution, locator), CTP(purpose), RawFromType(lhs),
         RawToType(rhs) {}
 
+  SourceLoc getLoc() const override;
+
   Type getFromType() const { return resolve(RawFromType); }
 
   Type getToType() const { return resolve(RawToType); }
@@ -765,6 +767,16 @@ private:
   void offerDefaultValueUnwrapFixIt(DeclContext *DC, const Expr *expr) const;
   /// Suggest a force optional unwrap via `!`
   void offerForceUnwrapFixIt(const Expr *expr) const;
+};
+
+class WrappedValueMismatch final : public ContextualFailure {
+public:
+  WrappedValueMismatch(const Solution &solution, Type fromType,
+                       Type toType, ConstraintLocator *locator)
+      : ContextualFailure(solution, fromType, toType, locator) {
+  }
+
+  bool diagnoseAsError() override;
 };
 
 /// Diagnostics for mismatched generic arguments e.g

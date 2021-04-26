@@ -372,6 +372,18 @@ ContextualMismatch *ContextualMismatch::create(ConstraintSystem &cs, Type lhs,
   return new (cs.getAllocator()) ContextualMismatch(cs, lhs, rhs, locator);
 }
 
+bool AllowWrappedValueMismatch::diagnose(const Solution &solution, bool asError) const {
+  WrappedValueMismatch failure(solution, getFromType(), getToType(), getLocator());
+  return failure.diagnoseAsError();
+}
+
+AllowWrappedValueMismatch *AllowWrappedValueMismatch::create(ConstraintSystem &cs,
+                                                             Type lhs,
+                                                             Type rhs,
+                                                             ConstraintLocator *locator) {
+  return new (cs.getAllocator()) AllowWrappedValueMismatch(cs, lhs, rhs, locator);
+}
+
 /// Computes the contextual type information for a type mismatch of a
 /// component in a structural type (tuple or function type).
 ///
@@ -1734,14 +1746,26 @@ bool IgnoreInvalidResultBuilderBody::diagnose(const Solution &solution,
   class PreCheckWalker : public ASTWalker {
     DeclContext *DC;
     DiagnosticTransaction Transaction;
+    // Check whether expression(s) in the body of the
+    // result builder had any `ErrorExpr`s before pre-check.
+    bool FoundErrorExpr = false;
 
   public:
     PreCheckWalker(DeclContext *dc)
         : DC(dc), Transaction(dc->getASTContext().Diags) {}
 
     std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+      // This has to be checked before `preCheckExpression`
+      // because pre-check would convert invalid references
+      // into `ErrorExpr`s.
+      E->forEachChildExpr([&](Expr *expr) {
+        FoundErrorExpr |= isa<ErrorExpr>(expr);
+        return FoundErrorExpr ? nullptr : expr;
+      });
+
       auto hasError = ConstraintSystem::preCheckExpression(
           E, DC, /*replaceInvalidRefsWithErrors=*/true);
+
       return std::make_pair(false, hasError ? nullptr : E);
     }
 
@@ -1755,7 +1779,18 @@ bool IgnoreInvalidResultBuilderBody::diagnose(const Solution &solution,
     }
 
     bool diagnosed() const {
-      return Transaction.hasErrors();
+      // pre-check produced an error.
+      if (Transaction.hasErrors())
+        return true;
+
+      // If there were `ErrorExpr`s before pre-check
+      // they should have been diagnosed already by parser.
+      if (FoundErrorExpr) {
+        auto &DE = DC->getASTContext().Diags;
+        return DE.hadAnyError();
+      }
+
+      return false;
     }
   };
 
