@@ -178,7 +178,11 @@ static bool isBarrier(SILInstruction *inst) {
     case BuiltinValueKind::ConvertTaskToJob:
     case BuiltinValueKind::InitializeDefaultActor:
     case BuiltinValueKind::DestroyDefaultActor:
-    case BuiltinValueKind::BuildSerialExecutorRef:
+    case BuiltinValueKind::InitializeDistributedRemoteActor:
+    case BuiltinValueKind::DestroyDistributedActor:
+    case BuiltinValueKind::BuildOrdinarySerialExecutorRef:
+    case BuiltinValueKind::BuildDefaultActorExecutorRef:
+    case BuiltinValueKind::BuildMainActorExecutorRef:
     case BuiltinValueKind::ResumeNonThrowingContinuationReturning:
     case BuiltinValueKind::ResumeThrowingContinuationReturning:
     case BuiltinValueKind::ResumeThrowingContinuationThrowing:

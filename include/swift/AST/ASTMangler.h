@@ -85,10 +85,10 @@ protected:
 public:
   enum class SymbolKind {
     Default,
-    AsyncHandlerBody,
     DynamicThunk,
     SwiftAsObjCThunk,
     ObjCAsSwiftThunk,
+    DistributedThunk,
   };
 
   ASTMangler(bool DWARFMangling = false)
@@ -164,6 +164,7 @@ public:
   std::string mangleReabstractionThunkHelper(CanSILFunctionType ThunkType,
                                              Type FromType, Type ToType,
                                              Type SelfType,
+                                             Type GlobalActorBound,
                                              ModuleDecl *Module);
 
   /// Mangle a completion handler block implementation function, used for importing ObjC
@@ -186,7 +187,7 @@ public:
   std::string
   mangleAutoDiffDerivativeFunction(const AbstractFunctionDecl *originalAFD,
                                    AutoDiffDerivativeFunctionKind kind,
-                                   AutoDiffConfig config,
+                                   const AutoDiffConfig &config,
                                    bool isVTableThunk = false);
 
   /// Mangle the linear map (differential/pullback) for the given:
@@ -196,7 +197,7 @@ public:
   ///   derivative generic signature.
   std::string mangleAutoDiffLinearMap(const AbstractFunctionDecl *originalAFD,
                                       AutoDiffLinearMapKind kind,
-                                      AutoDiffConfig config);
+                                      const AutoDiffConfig &config);
 
   /// Mangle the linear map self parameter reordering thunk the given:
   /// - Mangled original function declaration.
@@ -210,7 +211,7 @@ public:
   /// Mangle a SIL differentiability witness.
   std::string mangleSILDifferentiabilityWitness(StringRef originalName,
                                                 DifferentiabilityKind kind,
-                                                AutoDiffConfig config);
+                                                const AutoDiffConfig &config);
 
   /// Mangle the AutoDiff generated declaration for the given:
   /// - Generated declaration kind: linear map struct or branching trace enum.
@@ -223,7 +224,7 @@ public:
   mangleAutoDiffGeneratedDeclaration(AutoDiffGeneratedDeclarationKind declKind,
                                      StringRef origFnName, unsigned bbId,
                                      AutoDiffLinearMapKind linearMapKind,
-                                     AutoDiffConfig config);
+                                     const AutoDiffConfig &config);
 
   std::string mangleKeyPathGetterThunkHelper(const AbstractStorageDecl *property,
                                              GenericSignature signature,
@@ -347,7 +348,6 @@ protected:
   enum FunctionManglingKind {
     NoFunctionMangling,
     FunctionMangling,
-    AsyncHandlerBodyMangling
   };
 
   void appendFunction(AnyFunctionType *fn,
@@ -433,7 +433,7 @@ protected:
 
   void appendEntity(const ValueDecl *decl, StringRef EntityOp, bool isStatic);
 
-  void appendEntity(const ValueDecl *decl, bool isAsyncHandlerBody = false);
+  void appendEntity(const ValueDecl *decl);
 
   void appendProtocolConformance(const ProtocolConformance *conformance);
   void appendProtocolConformanceRef(const RootProtocolConformance *conformance);
@@ -453,7 +453,7 @@ protected:
       const AbstractFunctionDecl *afd);
   void appendAutoDiffFunctionParts(StringRef op, 
                                    Demangle::AutoDiffFunctionKind kind,
-                                   AutoDiffConfig config);
+                                   const AutoDiffConfig &config);
   void appendIndexSubset(IndexSubset *indexSubset);
 };
 

@@ -19,6 +19,7 @@
 #define SWIFT_SEMA_DERIVEDCONFORMANCES_H
 
 #include "swift/Basic/LLVM.h"
+#include "swift/AST/Builtins.h"
 #include <utility>
 
 namespace swift {
@@ -27,6 +28,7 @@ class AccessorDecl;
 class AssociatedTypeDecl;
 class ASTContext;
 struct ASTNode;
+class CallExpr;
 class Decl;
 class DeclContext;
 class DeclRefExpr;
@@ -59,6 +61,9 @@ public:
   /// Retrieve the context in which the conformance is declared (either the
   /// nominal type, or an extension of it) as a \c DeclContext.
   DeclContext *getConformanceContext() const;
+
+  /// Retrieve the module in which the conformance is declared.
+  ModuleDecl *getParentModule() const;
 
   /// Add \c children as members of the context that declares the conformance.
   void addMembersToConformanceContext(ArrayRef<Decl *> children);
@@ -296,7 +301,23 @@ public:
   /// Derive a Decodable requirement for a struct type.
   ///
   /// \returns the derived member, which will also be added to the type.
-  ValueDecl *deriveDecodable(ValueDecl *requirement);
+  ValueDecl *deriveDecodable(ValueDecl *requirement);  
+
+  /// Whether we can derive the given DistributedActor requirement in the given context.
+  static bool canDeriveDistributedActor(NominalTypeDecl *nominal, DeclContext *dc);
+
+  /// Derive a DistributedActor requirement for an distributed actor.
+  ///
+  /// \returns the derived member, which will also be added to the type.
+  ValueDecl *deriveDistributedActor(ValueDecl *requirement);
+
+  /// Determine if \c Actor can be derived for the given type.
+  static bool canDeriveActor(DeclContext *DC, NominalTypeDecl *NTD);
+
+  /// Derive an Actor witness for an actor type.
+  ///
+  /// \returns the derived member, which will also be added to the type.
+  ValueDecl *deriveActor(ValueDecl *requirement);
 
   /// Declare a read-only property.
   std::pair<VarDecl *, PatternBindingDecl *>
@@ -315,6 +336,13 @@ public:
 
   /// Build a reference to the 'self' decl of a derived function.
   static DeclRefExpr *createSelfDeclRef(AbstractFunctionDecl *fn);
+
+  /// Build a builtin call.  By default, the call is assumed not to throw.
+  static CallExpr *createBuiltinCall(ASTContext &ctx,
+                                     BuiltinValueKind builtin,
+                                     ArrayRef<Type> typeArgs,
+                              ArrayRef<ProtocolConformanceRef> conformances,
+                                     ArrayRef<Expr *> args);
 
   /// Returns true if this derivation is trying to use a context that isn't
   /// appropriate for deriving.

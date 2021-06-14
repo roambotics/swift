@@ -648,7 +648,7 @@ let arr = [BottleLayout]()
 let layout = BottleLayout(count:1)
 let ix = arr.firstIndex(of:layout) // expected-error {{referencing instance method 'firstIndex(of:)' on 'Collection' requires that 'BottleLayout' conform to 'Equatable'}}
 
-let _: () -> UInt8 = { .init("a" as Unicode.Scalar) } // expected-error {{initializer 'init(_:)' requires that 'Unicode.Scalar' conform to 'BinaryInteger'}}
+let _: () -> UInt8 = { .init("a" as Unicode.Scalar) } // expected-error {{missing argument label 'ascii:' in call}}
 
 // https://bugs.swift.org/browse/SR-9068
 func compare<C: Collection, Key: Hashable, Value: Equatable>(c: C)
@@ -857,4 +857,51 @@ func rdar56212087() {
   }
 
   setValue(foo("", ""), forKey: "") // Ok (T is inferred as a `String` instead of `Any?`)
+}
+
+// rdar://77233864 - Ternary operator fails to deduce non-default literal type in SwiftUI preview
+func test_ternary_operator_with_regular_conformance_to_literal_protocol() {
+  // Note that in this case `ExpressibleByIntegerLiteral` is a non-literal requirement
+  func test<T: ExpressibleByIntegerLiteral>(_: T) -> T {
+    fatalError()
+  }
+
+  func bug(_: Float?) {}
+
+  bug(true ? test(0) : test(42)) // Ok - type is `CGFloat` for 0 and 42
+}
+
+// rdar://78623338 - crash due to leftover inactive constraints
+func rdar78623338() {
+  func any<T : Sequence>(_ sequence: T) -> AnySequence<T.Element> {
+    // expected-note@-1 {{required by local function 'any' where 'T' = '() -> ReversedCollection<(ClosedRange<Int>)>'}}
+    AnySequence(sequence.makeIterator)
+  }
+
+  let _ = [
+    any(0...3),
+    // TODO: It should be possible to suggest making a call to `reserved` here but we don't have machinery to do so
+    //       at the moment because there is no way to go from a requirement to the underlying argument/parameter location.
+    any((1...3).reversed) // expected-error {{type '() -> ReversedCollection<(ClosedRange<Int>)>' cannot conform to 'Sequence'}}
+    // expected-note@-1 {{only concrete types such as structs, enums and classes can conform to protocols}}
+  ]
+}
+
+// rdar://78781552 - crash in `getFunctionArgApplyInfo`
+func rdar78781552() {
+  struct Test<Data, Content> where Data : RandomAccessCollection {
+    // expected-note@-1 {{where 'Data' = '(((Int) throws -> Bool) throws -> [Int])?'}}
+    // expected-note@-2 {{'init(data:filter:)' declared here}}
+    // expected-note@-3 {{'Content' declared as parameter to type 'Test'}}
+    var data: [Data]
+    var filter: (Data.Element) -> Content
+  }
+
+  func test(data: [Int]?) {
+    Test(data?.filter)
+    // expected-error@-1 {{generic struct 'Test' requires that '(((Int) throws -> Bool) throws -> [Int])?' conform to 'RandomAccessCollection'}}
+    // expected-error@-2 {{generic parameter 'Content' could not be inferred}} expected-note@-2 {{explicitly specify the generic arguments to fix this issue}}
+    // expected-error@-3 {{cannot convert value of type '(((Int) throws -> Bool) throws -> [Int])?' to expected argument type '[(((Int) throws -> Bool) throws -> [Int])?]'}}
+    // expected-error@-4 {{missing argument for parameter 'filter' in call}}
+  }
 }

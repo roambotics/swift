@@ -90,46 +90,6 @@ void *operator new(size_t bytes, swift::constraints::ConstraintSystem& cs,
 
 namespace swift {
 
-/// This specifies the purpose of the contextual type, when specified to
-/// typeCheckExpression.  This is used for diagnostic generation to produce more
-/// specified error messages when the conversion fails.
-///
-enum ContextualTypePurpose {
-  CTP_Unused,           ///< No contextual type is specified.
-  CTP_Initialization,   ///< Pattern binding initialization.
-  CTP_ReturnStmt,       ///< Value specified to a 'return' statement.
-  CTP_ReturnSingleExpr, ///< Value implicitly returned from a function.
-  CTP_YieldByValue,     ///< By-value yield operand.
-  CTP_YieldByReference, ///< By-reference yield operand.
-  CTP_ThrowStmt,        ///< Value specified to a 'throw' statement.
-  CTP_EnumCaseRawValue, ///< Raw value specified for "case X = 42" in enum.
-  CTP_DefaultParameter, ///< Default value in parameter 'foo(a : Int = 42)'.
-
-  /// Default value in @autoclosure parameter
-  /// 'foo(a : @autoclosure () -> Int = 42)'.
-  CTP_AutoclosureDefaultParameter,
-
-  CTP_CalleeResult,     ///< Constraint is placed on the result of a callee.
-  CTP_CallArgument,     ///< Call to function or operator requires type.
-  CTP_ClosureResult,    ///< Closure result expects a specific type.
-  CTP_ArrayElement,     ///< ArrayExpr wants elements to have a specific type.
-  CTP_DictionaryKey,    ///< DictionaryExpr keys should have a specific type.
-  CTP_DictionaryValue,  ///< DictionaryExpr values should have a specific type.
-  CTP_CoerceOperand,    ///< CoerceExpr operand coerced to specific type.
-  CTP_AssignSource,     ///< AssignExpr source operand coerced to result type.
-  CTP_SubscriptAssignSource, ///< AssignExpr source operand coerced to subscript
-                             ///< result type.
-  CTP_Condition,        ///< Condition expression of various statements e.g.
-                        ///< `if`, `for`, `while` etc.
-  CTP_ForEachStmt,      ///< "expression/sequence" associated with 'for-in' loop
-                        ///< is expected to conform to 'Sequence' protocol.
-  CTP_WrappedProperty,  ///< Property type expected to match 'wrappedValue' type
-  CTP_ComposedPropertyWrapper, ///< Composed wrapper type expected to match
-                               ///< former 'wrappedValue' type
-
-  CTP_CannotFail,       ///< Conversion can never fail. abort() if it does.
-};
-
 /// Specify how we handle the binding of underconstrained (free) type variables
 /// within a solution to a constraint system.
 enum class FreeTypeVariableBinding {
@@ -395,6 +355,10 @@ public:
 
   /// Determine whether this type variable represents a closure result type.
   bool isClosureResultType() const;
+
+  /// Determine whether this type variable represents
+  /// a type of a key path expression.
+  bool isKeyPathType() const;
 
   /// Retrieve the representative of the equivalence class to which this
   /// type variable belongs.
@@ -3265,7 +3229,8 @@ public:
   /// subsequent solution would be worse than the best known solution.
   bool recordFix(ConstraintFix *fix, unsigned impact = 1);
 
-  void recordPotentialHole(Type type);
+  void recordPotentialHole(TypeVariableType *typeVar);
+  void recordAnyTypeVarAsPotentialHole(Type type);
 
   void recordMatchCallArgumentResult(ConstraintLocator *locator,
                                      MatchCallArgumentResult result);
@@ -4911,11 +4876,9 @@ private:
   /// \param diff The differences among the solutions.
   /// \param idx1 The index of the first solution.
   /// \param idx2 The index of the second solution.
-  /// \param isForCodeCompletion Whether solving for code completion.
   static SolutionCompareResult
   compareSolutions(ConstraintSystem &cs, ArrayRef<Solution> solutions,
-                   const SolutionDiff &diff, unsigned idx1, unsigned idx2,
-                   bool isForCodeCompletion);
+                   const SolutionDiff &diff, unsigned idx1, unsigned idx2);
 
 public:
   /// Increase the score of the given kind for the current (partial) solution
@@ -5034,6 +4997,13 @@ public:
   /// If we aren't certain that we've emitted a diagnostic, emit a fallback
   /// diagnostic.
   void maybeProduceFallbackDiagnostic(SolutionApplicationTarget target) const;
+
+  /// Check whether given AST node represents an argument of an application
+  /// of some sort (call, operator invocation, subscript etc.)
+  /// and return AST node representing and argument index. E.g. for regular
+  /// calls `test(42)` passing `42` should return node representing
+  /// entire call and index `0`.
+  Optional<std::pair<Expr *, unsigned>> isArgumentExpr(Expr *expr);
 
   SWIFT_DEBUG_DUMP;
   SWIFT_DEBUG_DUMPER(dump(Expr *));
@@ -5303,17 +5273,9 @@ bool hasAppliedSelf(ConstraintSystem &cs, const OverloadChoice &choice);
 bool hasAppliedSelf(const OverloadChoice &choice,
                     llvm::function_ref<Type(Type)> getFixedType);
 
-/// Check whether type conforms to a given known protocol.
-bool conformsToKnownProtocol(DeclContext *dc, Type type,
-                             KnownProtocolKind protocol);
-
-/// Check whether given type conforms to `RawPepresentable` protocol
+/// Check whether given type conforms to `RawRepresentable` protocol
 /// and return witness type.
 Type isRawRepresentable(ConstraintSystem &cs, Type type);
-/// Check whether given type conforms to a specific known kind
-/// `RawPepresentable` protocol and return witness type.
-Type isRawRepresentable(ConstraintSystem &cs, Type type,
-                        KnownProtocolKind rawRepresentableProtocol);
 
 /// Compute the type that shall stand in for dynamic 'Self' in a member
 /// reference with a base of the given object type.
@@ -5343,7 +5305,20 @@ public:
 
   bool attempt(ConstraintSystem &cs) const;
 
-  bool isDisabled() const { return Choice->isDisabled(); }
+  bool isDisabled() const {
+    if (!Choice->isDisabled())
+      return false;
+
+    // If solver is in a diagnostic mode, let's allow
+    // constraints that have fixes or have been disabled
+    // in attempt to produce a solution faster for
+    // well-formed expressions.
+    if (CS.shouldAttemptFixes()) {
+      return !(hasFix() || Choice->isDisabledInPerformanceMode());
+    }
+
+    return true;
+  }
 
   bool hasFix() const {
     return bool(Choice->getFix());
@@ -5620,6 +5595,11 @@ Type getConcreteReplacementForProtocolSelfType(ValueDecl *member);
 /// Determine whether given disjunction constraint represents a set
 /// of operator overload choices.
 bool isOperatorDisjunction(Constraint *disjunction);
+
+/// Find out whether closure body has any `async` or `await` expressions,
+/// declarations, or statements directly in its body (no in other closures
+/// or nested declarations).
+ASTNode findAsyncNode(ClosureExpr *closure);
 
 } // end namespace constraints
 

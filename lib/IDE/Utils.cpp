@@ -276,8 +276,8 @@ bool ide::initCompilerInvocation(
     DiagnosticEngine &Diags, StringRef UnresolvedPrimaryFile,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
     const std::string &runtimeResourcePath,
-    const std::string &diagnosticDocumentationPath,
-    bool shouldOptimizeForIDE, time_t sessionTimestamp, std::string &Error) {
+    const std::string &diagnosticDocumentationPath, time_t sessionTimestamp,
+    std::string &Error) {
   SmallVector<const char *, 16> Args;
   // Make sure to put '-resource-dir' and '-diagnostic-documentation-path' at
   // the top to allow overriding them with the passed in arguments.
@@ -294,30 +294,38 @@ bool ide::initCompilerInvocation(
   StreamDiagConsumer DiagConsumer(ErrOS);
   Diags.addConsumer(DiagConsumer);
 
-  bool HadError = driver::getSingleFrontendInvocationFromDriverArguments(
-      Args, Diags, [&](ArrayRef<const char *> FrontendArgs) {
-    return Invocation.parseArgs(FrontendArgs, Diags);
-  }, /*ForceNoOutputs=*/true);
+  bool InvocationCreationFailed =
+      driver::getSingleFrontendInvocationFromDriverArguments(
+          Args, Diags,
+          [&](ArrayRef<const char *> FrontendArgs) {
+            return Invocation.parseArgs(FrontendArgs, Diags);
+          },
+          /*ForceNoOutputs=*/true);
 
   // Remove the StreamDiagConsumer as it's no longer needed.
   Diags.removeConsumer(DiagConsumer);
 
-  if (HadError) {
-    Error = std::string(ErrOS.str());
+  Error = std::string(ErrOS.str());
+  if (InvocationCreationFailed) {
     return true;
   }
 
+  std::string SymlinkResolveError;
   Invocation.getFrontendOptions().InputsAndOutputs =
       resolveSymbolicLinksInInputs(
           Invocation.getFrontendOptions().InputsAndOutputs,
-          UnresolvedPrimaryFile, FileSystem, Error);
+          UnresolvedPrimaryFile, FileSystem, SymlinkResolveError);
 
   // SourceKit functionalities want to proceed even if there are missing inputs.
   Invocation.getFrontendOptions().InputsAndOutputs
       .setShouldRecoverMissingInputs();
 
-  if (!Error.empty())
+  if (!SymlinkResolveError.empty()) {
+    // resolveSymbolicLinksInInputs fails if the unresolved primary file is not
+    // in the input files. We can't recover from that.
+    Error += SymlinkResolveError;
     return true;
+  }
 
   ClangImporterOptions &ImporterOpts = Invocation.getClangImporterOptions();
   ImporterOpts.DetailedPreprocessingRecord = true;
@@ -347,15 +355,6 @@ bool ide::initCompilerInvocation(
 
   // We don't care about LLVMArgs
   FrontendOpts.LLVMArgs.clear();
-
-  // SwiftSourceInfo files provide source location information for decls coming
-  // from loaded modules. For most IDE use cases it either has an undesirable
-  // impact on performance with no benefit (code completion), results in stale
-  // locations being used instead of more up-to-date indexer locations (cursor
-  // info), or has no observable effect (diagnostics, which are filtered to just
-  // those with a location in the primary file, and everything else).
-  if (shouldOptimizeForIDE)
-    FrontendOpts.IgnoreSwiftSourceInfo = true;
 
   // To save the time for module validation, consider the lifetime of ASTManager
   // as a single build session.
@@ -1018,9 +1017,6 @@ accept(SourceManager &SM, RegionType Type, ArrayRef<Replacement> Replacements) {
   }
 }
 
-swift::ide::SourceEditTextConsumer::
-SourceEditTextConsumer(llvm::raw_ostream &OS) : OS(OS) { }
-
 void swift::ide::SourceEditTextConsumer::
 accept(SourceManager &SM, RegionType Type, ArrayRef<Replacement> Replacements) {
   for (const auto &Replacement: Replacements) {
@@ -1114,6 +1110,14 @@ accept(SourceManager &SM, RegionType RegionType,
 
   for (const auto &Replacement : Replacements) {
     Impl.accept(SM, Replacement.Range, Replacement.Text);
+  }
+}
+
+void swift::ide::BroadcastingSourceEditConsumer::accept(
+    SourceManager &SM, RegionType RegionType,
+    ArrayRef<Replacement> Replacements) {
+  for (auto &Consumer : Consumers) {
+    Consumer->accept(SM, RegionType, Replacements);
   }
 }
 

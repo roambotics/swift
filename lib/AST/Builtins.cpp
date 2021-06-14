@@ -1407,7 +1407,7 @@ static ValueDecl *getGetCurrentAsyncTask(ASTContext &ctx, Identifier id) {
 static ValueDecl *getGetCurrentExecutor(ASTContext &ctx, Identifier id) {
   return getBuiltinFunction(ctx, id, _async(_thin),
                             _parameters(),
-                            _executor);
+                            _optional(_executor));
 }
 
 static ValueDecl *getCancelAsyncTask(ASTContext &ctx, Identifier id) {
@@ -1459,6 +1459,13 @@ static ValueDecl *getDefaultActorInitDestroy(ASTContext &ctx,
                                              Identifier id) {
   return getBuiltinFunction(ctx, id, _thin,
                             _parameters(_nativeObject),
+                            _void);
+}
+
+static ValueDecl *getDistributedActorInitDestroy(ASTContext &ctx,
+                                                 Identifier id) {
+  return getBuiltinFunction(ctx, id, _thin,
+                            _parameters(_nativeObject), // TODO: no idea if to pass more here?
                             _void);
 }
 
@@ -1523,11 +1530,25 @@ static ValueDecl *getDestroyTaskGroup(ASTContext &ctx, Identifier id) {
                             _void);
 }
 
-static ValueDecl *getBuildSerialExecutorRef(ASTContext &ctx, Identifier id) {
-  // TODO: restrict the generic parameter to the SerialExecutor protocol
+static ValueDecl *getBuildMainActorExecutorRef(ASTContext &ctx,
+                                               Identifier id) {
+  return getBuiltinFunction(ctx, id, _thin, _parameters(), _executor);
+}
+
+static ValueDecl *getBuildDefaultActorExecutorRef(ASTContext &ctx,
+                                                  Identifier id) {
   return getBuiltinFunction(ctx, id, _thin,
                             _generics(_unrestricted,
                                       _layout(_typeparam(0), _classLayout())),
+                            _parameters(_typeparam(0)),
+                            _executor);
+}
+
+static ValueDecl *getBuildOrdinarySerialExecutorRef(ASTContext &ctx,
+                                                    Identifier id) {
+  return getBuiltinFunction(ctx, id, _thin,
+                            _generics(_unrestricted,
+                              _conformsTo(_typeparam(0), _serialExecutor)),
                             _parameters(_typeparam(0)),
                             _executor);
 }
@@ -1821,6 +1842,17 @@ static ValueDecl *getWithUnsafeContinuation(ASTContext &ctx,
   if (throws)
     builder.setThrows();
 
+  return builder.build(id);
+}
+
+static ValueDecl *getHopToActor(ASTContext &ctx, Identifier id) {
+  BuiltinFunctionBuilder builder(ctx);
+  auto *actorProto = ctx.getProtocol(KnownProtocolKind::Actor);
+  // Create type parameters and add conformance constraints.
+  auto actorParam = makeGenericParam();
+  builder.addParameter(actorParam);
+  builder.addConformanceRequirement(actorParam, actorProto);
+  builder.setResult(makeConcrete(TupleType::getEmpty(ctx)));
   return builder.build(id);
 }
 
@@ -2734,8 +2766,14 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
   case BuiltinValueKind::ConvertTaskToJob:
     return getConvertTaskToJob(Context, Id);
 
-  case BuiltinValueKind::BuildSerialExecutorRef:
-    return getBuildSerialExecutorRef(Context, Id);
+  case BuiltinValueKind::BuildMainActorExecutorRef:
+    return getBuildMainActorExecutorRef(Context, Id);
+
+  case BuiltinValueKind::BuildDefaultActorExecutorRef:
+    return getBuildDefaultActorExecutorRef(Context, Id);
+
+  case BuiltinValueKind::BuildOrdinarySerialExecutorRef:
+    return getBuildOrdinarySerialExecutorRef(Context, Id);
 
   case BuiltinValueKind::PoundAssert:
     return getPoundAssert(Context, Id);
@@ -2770,6 +2808,10 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
   case BuiltinValueKind::DestroyDefaultActor:
     return getDefaultActorInitDestroy(Context, Id);
 
+  case BuiltinValueKind::InitializeDistributedRemoteActor:
+  case BuiltinValueKind::DestroyDistributedActor:
+    return getDistributedActorInitDestroy(Context, Id);
+
   case BuiltinValueKind::StartAsyncLet:
     return getStartAsyncLet(Context, Id);
 
@@ -2794,6 +2836,9 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
 
   case BuiltinValueKind::WithUnsafeThrowingContinuation:
     return getWithUnsafeContinuation(Context, Id, /*throws=*/true);
+
+  case BuiltinValueKind::HopToActor:
+    return getHopToActor(Context, Id);
 
   case BuiltinValueKind::AutoDiffCreateLinearMapContext:
     return getAutoDiffCreateLinearMapContext(Context, Id);

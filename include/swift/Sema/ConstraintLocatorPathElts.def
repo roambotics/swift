@@ -61,7 +61,7 @@ CUSTOM_LOCATOR_PATH_ELT(ClosureBody)
 SIMPLE_LOCATOR_PATH_ELT(ConstructorMember)
 
 /// The desired contextual type passed in to the constraint system.
-SIMPLE_LOCATOR_PATH_ELT(ContextualType)
+CUSTOM_LOCATOR_PATH_ELT(ContextualType)
 
 /// A result of an expression involving dynamic lookup.
 SIMPLE_LOCATOR_PATH_ELT(DynamicLookupResult)
@@ -114,7 +114,7 @@ CUSTOM_LOCATOR_PATH_ELT(KeyPathDynamicMember)
 SIMPLE_LOCATOR_PATH_ELT(KeyPathRoot)
 
 /// The type of the key path expression.
-SIMPLE_LOCATOR_PATH_ELT(KeyPathType)
+CUSTOM_LOCATOR_PATH_ELT(KeyPathType)
 
 /// The value of a key path.
 SIMPLE_LOCATOR_PATH_ELT(KeyPathValue)

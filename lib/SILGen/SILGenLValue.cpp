@@ -1324,9 +1324,12 @@ namespace {
         if (!initInfo.hasInitFromWrappedValue())
           return false;
 
+        auto *fnDecl = SGF.FunctionDC->getAsDecl();
         bool isAssignmentToSelfParamInInit =
-            IsOnSelfParameter &&
-            isa<ConstructorDecl>(SGF.FunctionDC->getAsDecl());
+            IsOnSelfParameter && isa<ConstructorDecl>(fnDecl) &&
+            // Convenience initializers only contain assignments and not
+            // initializations.
+            !(cast<ConstructorDecl>(fnDecl)->isConvenienceInit());
 
         // Assignment to a wrapped property can only be re-written to initialization for
         // members of `self` in an initializer, and for local variables.
@@ -2695,6 +2698,7 @@ static AccessKind mapAccessKind(SGFAccessKind accessKind) {
   case SGFAccessKind::ReadWrite:
     return AccessKind::ReadWrite;
   }
+  llvm_unreachable("covered switch");
 }
 
 void LValue::addNonMemberVarComponent(SILGenFunction &SGF, SILLocation loc,

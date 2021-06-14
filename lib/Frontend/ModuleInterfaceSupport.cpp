@@ -56,6 +56,10 @@ static void printToolVersionAndFlagsComment(raw_ostream &out,
       << ToolsVersion << "\n";
   out << "// " SWIFT_MODULE_FLAGS_KEY ": "
       << Opts.Flags << "\n";
+  if (!Opts.IgnorableFlags.empty()) {
+    out << "// " SWIFT_MODULE_FLAGS_IGNORABLE_KEY ": "
+        << Opts.IgnorableFlags << "\n";
+  }
 }
 
 std::string
@@ -67,11 +71,6 @@ swift::getSwiftInterfaceCompilerVersionForCurrentCompiler(ASTContext &ctx) {
 llvm::Regex swift::getSwiftInterfaceFormatVersionRegex() {
   return llvm::Regex("^// " SWIFT_INTERFACE_FORMAT_VERSION_KEY
                      ": ([0-9\\.]+)$", llvm::Regex::Newline);
-}
-
-llvm::Regex swift::getSwiftInterfaceModuleFlagsRegex() {
-  return llvm::Regex("^// " SWIFT_MODULE_FLAGS_KEY ":(.*)$",
-                     llvm::Regex::Newline);
 }
 
 llvm::Regex swift::getSwiftInterfaceCompilerVersionRegex() {

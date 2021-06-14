@@ -4,8 +4,12 @@
 // REQUIRES: concurrency
 
 // UNSUPPORTED: OS=windows-msvc
+// UNSUPPORTED: back_deployment_runtime
+// UNSUPPORTED: use_os_stdlib
 
-@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+// REQUIRES: rdar_77671328
+
+@available(SwiftStdlib 5.5, *)
 func printWaitPrint(_ int: Int) async -> Int {
   print("start, cancelled:\(Task.isCancelled), id:\(int)")
   while !Task.isCancelled {
@@ -15,8 +19,12 @@ func printWaitPrint(_ int: Int) async -> Int {
   return int
 }
 
-@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+@available(SwiftStdlib 5.5, *)
 func test() async {
+  let h = detach {
+    await printWaitPrint(0)
+  }
+
   let handle = detach {
     print("detached run, cancelled:\(Task.isCancelled)")
 
@@ -25,6 +33,8 @@ func test() async {
     print("spawned: 1")
     async let two = printWaitPrint(2)
     print("spawned: 2")
+
+    h.cancel()
 
     let first = await one
     print("awaited: 1: \(first)")
@@ -39,7 +49,7 @@ func test() async {
     print("exit detach")
   }
 
-  await Task.sleep(2 * 1_000_000)
+  await h.get()
 
   print("cancel")
   handle.cancel()
@@ -60,7 +70,7 @@ func test() async {
   print("exit")
 }
 
-@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+@available(SwiftStdlib 5.5, *)
 @main struct Main {
   static func main() async {
     await test()

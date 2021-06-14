@@ -832,6 +832,15 @@ public:
             valueDescription + " cannot apply to a function type");
   }
 
+  /// Require the operand to be `$Optional<Builtin.Executor>`.
+  void requireOptionalExecutorType(SILValue value, const Twine &what) {
+    auto type = value->getType();
+    require(type.isObject(), what + " must be an object type");
+    auto objectType = type.getASTType().getOptionalObjectType();
+    require(objectType && objectType == M->getASTContext().TheExecutorType,
+            what + " must be Optional<Builtin.Executor>");
+  }
+
   /// Assert that two types are equal.
   void requireSameType(Type type1, Type type2, const Twine &complaint) {
     _require(type1->isEqual(type2), complaint,
@@ -1195,67 +1204,55 @@ public:
     }
   }
 
-  void checkInstructionsSILLocation(SILInstruction *I) {
-    // Check the debug scope.
-    auto *DS = I->getDebugScope();
-    if (DS && !maybeScopeless(*I))
-      require(DS, "instruction has a location, but no scope");
+  void checkInstructionsSILLocation(SILInstruction *inst) {
+    // First verify structural debug info information.
+    inst->verifyDebugInfo();
 
-    require(!DS || DS->getParentFunction() == I->getFunction(),
+    // Check the debug scope.
+    auto *debugScope = inst->getDebugScope();
+    if (debugScope && !maybeScopeless(*inst))
+      require(debugScope, "instruction has a location, but no scope");
+    require(!debugScope ||
+                debugScope->getParentFunction() == inst->getFunction(),
             "debug scope of instruction belongs to a different function");
 
-    // Check the location kind.
-    SILLocation L = I->getLoc();
-    SILLocation::LocationKind LocKind = L.getKind();
-    SILInstructionKind InstKind = I->getKind();
-
-    // Check that there is at most one debug variable defined
-    // for each argument slot. This catches SIL transformations
-    // that accidentally remove inline information (stored in the SILDebugScope)
-    // from debug-variable-carrying instructions.
-    if (!DS->InlinedCallSite) {
-      Optional<SILDebugVariable> VarInfo;
-      if (auto *DI = dyn_cast<AllocStackInst>(I))
-        VarInfo = DI->getVarInfo();
-      else if (auto *DI = dyn_cast<AllocBoxInst>(I))
-        VarInfo = DI->getVarInfo();
-      else if (auto *DI = dyn_cast<DebugValueInst>(I))
-        VarInfo = DI->getVarInfo();
-      else if (auto *DI = dyn_cast<DebugValueAddrInst>(I))
-        VarInfo = DI->getVarInfo();
-
-      if (VarInfo)
-        if (unsigned ArgNo = VarInfo->ArgNo) {
-          // It is a function argument.
-          if (ArgNo < DebugVars.size() && !DebugVars[ArgNo].empty() && !VarInfo->Name.empty()) {
-            require(
-                DebugVars[ArgNo] == VarInfo->Name,
-                "Scope contains conflicting debug variables for one function "
-                "argument");
-          } else {
-            // Reserve enough space.
-            while (DebugVars.size() <= ArgNo) {
-              DebugVars.push_back(StringRef());
-            }
-          }
-          DebugVars[ArgNo] = VarInfo->Name;
-      }
-    }
-
-    // Regular locations are allowed on all instructions.
-    if (LocKind == SILLocation::RegularKind)
+    // Check that there is at most one debug variable defined for each argument
+    // slot if our debug scope is not an inlined call site.
+    //
+    // This catches SIL transformations that accidentally remove inline
+    // information (stored in the SILDebugScope) from debug-variable-carrying
+    // instructions.
+    if (debugScope->InlinedCallSite)
       return;
 
-    if (LocKind == SILLocation::ReturnKind ||
-        LocKind == SILLocation::ImplicitReturnKind)
-      require(InstKind == SILInstructionKind::BranchInst ||
-              InstKind == SILInstructionKind::ReturnInst ||
-              InstKind == SILInstructionKind::UnreachableInst,
-        "return locations are only allowed on branch and return instructions");
+    Optional<SILDebugVariable> varInfo;
+    if (auto *di = dyn_cast<AllocStackInst>(inst))
+      varInfo = di->getVarInfo();
+    else if (auto *di = dyn_cast<AllocBoxInst>(inst))
+      varInfo = di->getVarInfo();
+    else if (auto *di = dyn_cast<DebugValueInst>(inst))
+      varInfo = di->getVarInfo();
+    else if (auto *di = dyn_cast<DebugValueAddrInst>(inst))
+      varInfo = di->getVarInfo();
 
-    if (LocKind == SILLocation::ArtificialUnreachableKind)
-      require(InstKind == SILInstructionKind::UnreachableInst,
-        "artificial locations are only allowed on Unreachable instructions");
+    if (!varInfo)
+      return;
+
+    if (unsigned argNum = varInfo->ArgNo) {
+      // It is a function argument.
+      if (argNum < DebugVars.size() && !DebugVars[argNum].empty() &&
+          !varInfo->Name.empty()) {
+        require(DebugVars[argNum] == varInfo->Name,
+                "Scope contains conflicting debug variables for one function "
+                "argument");
+      } else {
+        // Reserve enough space.
+        while (DebugVars.size() <= argNum) {
+          DebugVars.push_back(StringRef());
+        }
+      }
+      DebugVars[argNum] = varInfo->Name;
+    }
   }
 
   /// Check that the types of this value producer are all legal in the function
@@ -1822,6 +1819,7 @@ public:
     }
 
     auto builtinKind = BI->getBuiltinKind();
+    auto arguments = BI->getArguments();
 
     // Check that 'getCurrentAsyncTask' only occurs within an async function.
     if (builtinKind == BuiltinValueKind::GetCurrentAsyncTask) {
@@ -1832,25 +1830,43 @@ public:
 
     if (builtinKind == BuiltinValueKind::InitializeDefaultActor ||
         builtinKind == BuiltinValueKind::DestroyDefaultActor) {
-      auto arguments = BI->getArguments();
       require(arguments.size() == 1,
               "default-actor builtin can only operate on a single object");
       auto argType = arguments[0]->getType().getASTType();
       auto argClass = argType.getClassOrBoundGenericClass();
-      require((argClass && argClass->isRootDefaultActor()) ||
+      require((argClass && argClass->isRootDefaultActor(M,
+                                        F.getResilienceExpansion())) ||
               isa<BuiltinNativeObjectType>(argType),
               "default-actor builtin can only operate on default actors");
       return;
     }
 
-    if (builtinKind == BuiltinValueKind::BuildSerialExecutorRef) {
-      requireObjectType(BuiltinExecutorType, BI,
-                        "result of buildSerialExecutorRef");
-      auto arguments = BI->getArguments();
+    // Check that 'getCurrentAsyncTask' only occurs within an async function.
+    if (builtinKind == BuiltinValueKind::GetCurrentExecutor) {
+      require(F.isAsync(),
+              "getCurrentExecutor can only be used in an async function");
+      require(arguments.empty(), "getCurrentExecutor takes no arguments");
+      requireOptionalExecutorType(BI, "result of getCurrentExecutor");
+      return;
+    }
+
+    if (builtinKind == BuiltinValueKind::BuildOrdinarySerialExecutorRef ||
+        builtinKind == BuiltinValueKind::BuildDefaultActorExecutorRef) {
       require(arguments.size() == 1,
-              "buildSerialExecutorRef expects one argument");
+              "builtin expects one argument");
       require(arguments[0]->getType().isObject(),
-              "operand of buildSerialExecutorRef should have object type");
+              "operand of builtin should have object type");
+      requireObjectType(BuiltinExecutorType, BI,
+                        "result of build*ExecutorRef");
+      return;
+    }
+
+    if (builtinKind == BuiltinValueKind::BuildMainActorExecutorRef) {
+      require(arguments.size() == 0,
+              "buildMainActorExecutorRef expects no arguments");
+      requireObjectType(BuiltinExecutorType, BI,
+                        "result of build*ExecutorRef");
+      return;
     }
   }
   
@@ -4782,9 +4798,8 @@ public:
   void checkHopToExecutorInst(HopToExecutorInst *HI) {
     auto executor = HI->getTargetExecutor();
     if (HI->getModule().getStage() == SILStage::Lowered) {
-      requireObjectType(BuiltinExecutorType, executor->getType(),
-                        "hop_to_executor instruction must take a "
-                        "Builtin.Executor in lowered SIL");
+      requireOptionalExecutorType(executor,
+                                  "hop_to_executor operand in lowered SIL");
     }
   }
 
@@ -5843,6 +5858,7 @@ void SILVTable::verify(const SILModule &M) const {
         assert(!superEntry->isNonOverridden()
                && "vtable entry overrides an entry that claims to have no overrides");
         // TODO: Check the root vtable entry for the method too.
+
         break;
       }
     }

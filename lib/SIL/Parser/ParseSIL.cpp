@@ -1247,8 +1247,9 @@ bool SILParser::parseSILType(SILType &Result,
   // Parse attributes.
   ParamDecl::Specifier specifier;
   SourceLoc specifierLoc;
+  SourceLoc isolatedLoc;
   TypeAttributes attrs;
-  P.parseTypeAttributeList(specifier, specifierLoc, attrs);
+  P.parseTypeAttributeList(specifier, specifierLoc, isolatedLoc, attrs);
 
   // Global functions are implicitly @convention(thin) if not specified otherwise.
   if (IsFuncDecl && !attrs.has(TAK_convention)) {
@@ -1268,7 +1269,8 @@ bool SILParser::parseSILType(SILType &Result,
   
   // Apply attributes to the type.
   auto *attrRepr =
-      P.applyAttributeToType(TyR.get(), attrs, specifier, specifierLoc);
+      P.applyAttributeToType(
+        TyR.get(), attrs, specifier, specifierLoc, isolatedLoc);
   const auto Ty =
       performTypeResolution(attrRepr, /*IsSILType=*/true,
                             OuterGenericEnv, OuterGenericParams);
@@ -1397,7 +1399,7 @@ bool SILParser::parseSILDeclRef(SILDeclRef &Result,
 
   if (!P.consumeIf(tok::sil_exclamation)) {
     // Construct SILDeclRef.
-    Result = SILDeclRef(VD, Kind, IsObjC, DerivativeId);
+    Result = SILDeclRef(VD, Kind, IsObjC, /*distributed=*/false, DerivativeId);
     return false;
   }
 
@@ -1517,7 +1519,7 @@ bool SILParser::parseSILDeclRef(SILDeclRef &Result,
   } while (P.consumeIf(tok::period));
 
   // Construct SILDeclRef.
-  Result = SILDeclRef(VD, Kind, IsObjC, DerivativeId);
+  Result = SILDeclRef(VD, Kind, IsObjC, /*distributed=*/false, DerivativeId);
   return false;
 }
 
@@ -3022,7 +3024,6 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
     UNARY_INSTRUCTION(EndBorrow)
     UNARY_INSTRUCTION(DestructureStruct)
     UNARY_INSTRUCTION(DestructureTuple)
-    UNARY_INSTRUCTION(HopToExecutor)
     UNARY_INSTRUCTION(ExtractExecutor)
     REFCOUNTING_INSTRUCTION(UnmanagedReleaseValue)
     REFCOUNTING_INSTRUCTION(UnmanagedRetainValue)
@@ -3046,6 +3047,14 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
 #undef UNARY_INSTRUCTION
 #undef REFCOUNTING_INSTRUCTION
 
+  case SILInstructionKind::HopToExecutorInst: {
+    bool mandatory = false;
+    if (parseSILOptional(mandatory, *this, "mandatory")
+        || parseTypedValueRef(Val, B) || parseSILDebugLocation(InstLoc, B))
+      return true;
+    ResultVal = B.createHopToExecutor(InstLoc, Val, mandatory);
+    break;
+  }
   case SILInstructionKind::DestroyValueInst: {
     bool poisonRefs = false;
     if (parseSILOptional(poisonRefs, *this, "poison")

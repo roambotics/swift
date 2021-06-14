@@ -47,6 +47,9 @@ enum {
   /// in a default actor.
   NumWords_DefaultActor = 10,
 
+  /// The number of words in a task.
+  NumWords_AsyncTask = 16,
+
   /// The number of words in a task group.
   NumWords_TaskGroup = 32,
 
@@ -831,8 +834,10 @@ class TargetFunctionTypeFlags {
     ParamFlagsMask         = 0x02000000U,
     EscapingMask           = 0x04000000U,
     DifferentiableMask     = 0x08000000U,
+    GlobalActorMask        = 0x10000000U,
     AsyncMask              = 0x20000000U,
     SendableMask           = 0x40000000U,
+    // NOTE: The next bit will need to introduce a separate flags word.
   };
   int_type Data;
   
@@ -888,6 +893,12 @@ public:
         (isSendable ? SendableMask : 0));
   }
 
+  constexpr TargetFunctionTypeFlags<int_type>
+  withGlobalActor(bool globalActor) const {
+    return TargetFunctionTypeFlags<int_type>(
+        (Data & ~GlobalActorMask) | (globalActor ? GlobalActorMask : 0));
+  }
+
   unsigned getNumParameters() const { return Data & NumParametersMask; }
 
   FunctionMetadataConvention getConvention() const {
@@ -910,6 +921,10 @@ public:
 
   bool isDifferentiable() const {
     return bool (Data & DifferentiableMask);
+  }
+
+  bool hasGlobalActor() const {
+    return bool (Data & GlobalActorMask);
   }
 
   int_type getIntValue() const {
@@ -935,7 +950,8 @@ class TargetParameterTypeFlags {
     ValueOwnershipMask    = 0x7F,
     VariadicMask          = 0x80,
     AutoClosureMask       = 0x100,
-    NoDerivativeMask      = 0x200
+    NoDerivativeMask      = 0x200,
+    IsolatedMask          = 0x400,
   };
   int_type Data;
 
@@ -968,10 +984,17 @@ public:
         (Data & ~NoDerivativeMask) | (isNoDerivative ? NoDerivativeMask : 0));
   }
 
+  constexpr TargetParameterTypeFlags<int_type>
+  withIsolated(bool isIsolated) const {
+    return TargetParameterTypeFlags<int_type>(
+        (Data & ~IsolatedMask) | (isIsolated ? IsolatedMask : 0));
+  }
+
   bool isNone() const { return Data == 0; }
   bool isVariadic() const { return Data & VariadicMask; }
   bool isAutoClosure() const { return Data & AutoClosureMask; }
   bool isNoDerivative() const { return Data & NoDerivativeMask; }
+  bool isIsolated() const { return Data & IsolatedMask; }
 
   ValueOwnership getValueOwnership() const {
     return (ValueOwnership)(Data & ValueOwnershipMask);
@@ -1395,6 +1418,11 @@ class TypeContextDescriptorFlags : public FlagSet<uint16_t> {
 
     // Type-specific flags:
 
+    /// Set if the class is an actor.
+    ///
+    /// Only meaningful for class descriptors.
+    Class_IsActor = 7,
+
     /// Set if the class is a default actor class.  Note that this is
     /// based on the best knowledge available to the class; actor
     /// classes with resilient superclassess might be default actors
@@ -1485,6 +1513,9 @@ public:
   FLAGSET_DEFINE_FLAG_ACCESSORS(Class_IsDefaultActor,
                                 class_isDefaultActor,
                                 class_setIsDefaultActor)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Class_IsActor,
+                                class_isActor,
+                                class_setIsActor)
 
   FLAGSET_DEFINE_FIELD_ACCESSORS(Class_ResilientSuperclassReferenceKind,
                                  Class_ResilientSuperclassReferenceKind_width,
@@ -1975,7 +2006,8 @@ enum class JobKind : size_t {
 
   DefaultActorInline = First_Reserved,
   DefaultActorSeparate,
-  DefaultActorOverride
+  DefaultActorOverride,
+  NullaryContinuation
 };
 
 /// The priority of a job.  Higher priorities are larger values.
@@ -1991,7 +2023,7 @@ enum class JobPriority : size_t {
 };
 
 /// Flags for schedulable jobs.
-class JobFlags : public FlagSet<size_t> {
+class JobFlags : public FlagSet<uint32_t> {
 public:
   enum {
     Kind           = 0,
@@ -2007,9 +2039,10 @@ public:
     Task_IsChildTask      = 24,
     Task_IsFuture         = 25,
     Task_IsGroupChildTask = 26,
+    Task_IsContinuingAsyncTask      = 27,
   };
 
-  explicit JobFlags(size_t bits) : FlagSet(bits) {}
+  explicit JobFlags(uint32_t bits) : FlagSet(bits) {}
   JobFlags(JobKind kind) { setKind(kind); }
   JobFlags(JobKind kind, JobPriority priority) {
     setKind(kind);
@@ -2036,6 +2069,9 @@ public:
   FLAGSET_DEFINE_FLAG_ACCESSORS(Task_IsGroupChildTask,
                                 task_isGroupChildTask,
                                 task_setIsGroupChildTask)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Task_IsContinuingAsyncTask,
+                                task_isContinuingAsyncTask,
+                                task_setIsContinuingAsyncTask)
 };
 
 /// Kinds of task status record.
@@ -2185,20 +2221,6 @@ enum class ContinuationStatus : size_t {
 
   /// The continuation has already been resumed, but not yet awaited.
   Resumed = 2
-};
-
-/// Flags describing the executor implementation that are stored
-/// in the ExecutorRef.
-enum class ExecutorRefFlags : size_t {
-  // The number of bits available here is very limited because it's
-  // potentially just the alignment bits of a protocol witness table
-  // pointer
-
-  /// The executor is a default actor.
-  DefaultActor = 0x1,
-
-  /// TODO: remove this
-  MainActorIdentity = 0x2,
 };
 
 } // end namespace swift

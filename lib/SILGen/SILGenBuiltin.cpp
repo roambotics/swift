@@ -1570,6 +1570,14 @@ static ManagedValue emitBuiltinWithUnsafeThrowingContinuation(
                                            /*throws=*/true);
 }
 
+static ManagedValue emitBuiltinHopToActor(SILGenFunction &SGF, SILLocation loc,
+                                          SubstitutionMap subs,
+                                          ArrayRef<ManagedValue> args,
+                                          SGFContext C) {
+  SGF.emitHopToActorValue(loc, args[0]);
+  return ManagedValue::forUnmanaged(SGF.emitEmptyTuple(loc));
+}
+
 static ManagedValue emitBuiltinAutoDiffCreateLinearMapContext(
     SILGenFunction &SGF, SILLocation loc, SubstitutionMap subs,
     ArrayRef<ManagedValue> args, SGFContext C) {
@@ -1610,6 +1618,44 @@ static ManagedValue emitBuiltinAutoDiffAllocateSubcontext(
       subs,
       /*args*/ {args[0].borrow(SGF, loc).getValue(), args[1].getValue()});
   return ManagedValue::forUnmanaged(builtinApply);
+}
+
+// The only reason these need special attention is that we want these to
+// be borrowed arguments, but the default emitter doesn't handle borrowed
+// arguments correctly.
+static ManagedValue emitBuildExecutorRef(SILGenFunction &SGF, SILLocation loc,
+                                         SubstitutionMap subs,
+                                         ArrayRef<ManagedValue> args,
+                                         BuiltinValueKind builtin) {
+  ASTContext &ctx = SGF.getASTContext();
+  auto builtinID = ctx.getIdentifier(getBuiltinName(builtin));
+
+  SmallVector<SILValue,1> argValues;
+  if (!args.empty())
+    argValues.push_back(args[0].borrow(SGF, loc).getValue());
+
+  auto builtinApply = SGF.B.createBuiltin(loc, builtinID,
+      SILType::getPrimitiveObjectType(ctx.TheExecutorType),
+      subs, argValues);
+  return ManagedValue::forUnmanaged(builtinApply);
+}
+static ManagedValue emitBuiltinBuildOrdinarySerialExecutorRef(
+    SILGenFunction &SGF, SILLocation loc, SubstitutionMap subs,
+    ArrayRef<ManagedValue> args, SGFContext C) {
+  return emitBuildExecutorRef(SGF, loc, subs, args,
+                            BuiltinValueKind::BuildOrdinarySerialExecutorRef);
+}
+static ManagedValue emitBuiltinBuildDefaultActorExecutorRef(
+    SILGenFunction &SGF, SILLocation loc, SubstitutionMap subs,
+    ArrayRef<ManagedValue> args, SGFContext C) {
+  return emitBuildExecutorRef(SGF, loc, subs, args,
+                              BuiltinValueKind::BuildDefaultActorExecutorRef);
+}
+static ManagedValue emitBuiltinBuildMainActorExecutorRef(
+    SILGenFunction &SGF, SILLocation loc, SubstitutionMap subs,
+    ArrayRef<ManagedValue> args, SGFContext C) {
+  return emitBuildExecutorRef(SGF, loc, subs, args,
+                              BuiltinValueKind::BuildMainActorExecutorRef);
 }
 
 Optional<SpecializedEmitter>

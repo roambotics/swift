@@ -2507,14 +2507,16 @@ public:
   }
   void emitCallToUnmappedExplosion(llvm::CallInst *call, Explosion &out) override {
     // Bail out on a void result type.
+    auto &IGM = IGF.IGM;
     llvm::Value *result = call;
     auto *suspendResultTy = cast<llvm::StructType>(result->getType());
     auto numAsyncContextParams =
-        getCalleeFunctionPointer().getSignature().getAsyncContextIndex() + 1;
+        Signature::forAsyncReturn(IGM, getCallee().getSubstFunctionType())
+            .getAsyncContextIndex() +
+        1;
     if (suspendResultTy->getNumElements() == numAsyncContextParams)
       return;
 
-    auto &IGM = IGF.IGM;
     auto &Builder = IGF.Builder;
 
     auto resultTys =
@@ -2683,7 +2685,29 @@ void CallEmission::emitToUnmappedMemory(Address result) {
   LastArgWritten = 0; // appease an assert
 #endif
   
-  emitCallSite();
+  auto call = emitCallSite();
+
+  // Async calls need to store the error result that is passed as a parameter.
+  if (CurCallee.getSubstFunctionType()->isAsync()) {
+    auto &IGM = IGF.IGM;
+    auto &Builder = IGF.Builder;
+    auto numAsyncContextParams =
+        Signature::forAsyncReturn(IGM, CurCallee.getSubstFunctionType())
+            .getAsyncContextIndex() +
+        1;
+
+    auto substCalleeType = CurCallee.getSubstFunctionType();
+    SILFunctionConventions substConv(substCalleeType, IGF.getSILModule());
+    auto hasError = substCalleeType->hasErrorResult();
+    SILType errorType;
+    if (hasError) {
+      errorType =
+          substConv.getSILErrorType(IGM.getMaximalTypeExpansionContext());
+      auto result = Builder.CreateExtractValue(call, numAsyncContextParams);
+      Address errorAddr = IGF.getCalleeErrorResultSlot(errorType);
+      Builder.CreateStore(result, errorAddr);
+    }
+  }
 }
 
 /// The private routine to ultimately emit a call or invoke instruction.
@@ -4891,8 +4915,11 @@ IRGenFunction::getFunctionPointerForResumeIntrinsic(llvm::Value *resume) {
   auto *fnTy = llvm::FunctionType::get(
       IGM.VoidTy, {IGM.Int8PtrTy},
       false /*vaargs*/);
+  auto attrs = IGM.constructInitialAttributes();
+  attrs = attrs.addParamAttribute(IGM.getLLVMContext(), 0,
+                                  llvm::Attribute::SwiftAsync);
   auto signature =
-      Signature(fnTy, IGM.constructInitialAttributes(), IGM.SwiftAsyncCC);
+      Signature(fnTy, attrs, IGM.SwiftAsyncCC);
   auto fnPtr = FunctionPointer(
       FunctionPointer::Kind::Function,
       Builder.CreateBitOrPointerCast(resume, fnTy->getPointerTo()),

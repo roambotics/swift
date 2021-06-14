@@ -648,8 +648,8 @@ public:
                                   ConditionalEffectKind conditionalKind,
                                   PotentialEffectReason reason) {
     Classification result;
-
     for (auto k : kinds)
+
       result.merge(forEffect(k, conditionalKind, reason));
 
     return result;
@@ -774,6 +774,7 @@ public:
 
     // If the function doesn't have any effects, we're done here.
     if (!fnType->isThrowing() &&
+        !E->implicitlyThrows() &&
         !fnType->isAsync() &&
         !E->implicitlyAsync()) {
       return Classification();
@@ -793,8 +794,8 @@ public:
 
     auto classifyApplyEffect = [&](EffectKind kind) {
       if (!fnType->hasEffect(kind) &&
-          !(kind == EffectKind::Async &&
-            E->implicitlyAsync())) {
+          !(kind == EffectKind::Async && E->implicitlyAsync()) &&
+          !(kind == EffectKind::Throws && E->implicitlyThrows())) {
         return;
       }
 
@@ -2520,7 +2521,7 @@ private:
                                   PotentialEffectReason::forPropertyAccess()));
 
     } else if (E->isImplicitlyAsync()) {
-      checkThrowAsyncSite(E, /*requiresTry=*/false,
+      checkThrowAsyncSite(E, /*requiresTry=*/E->isImplicitlyThrows(),
             Classification::forUnconditional(EffectKind::Async,
                                    PotentialEffectReason::forPropertyAccess()));
 
@@ -2620,9 +2621,10 @@ private:
 
   void checkThrowAsyncSite(ASTNode E, bool requiresTry,
                            const Classification &classification) {
-    // Suppress all diagnostics when there's an un-analyzable throw site.
+    // Suppress all diagnostics when there's an un-analyzable throw/async site.
     if (classification.isInvalid()) {
       Flags.set(ContextFlags::HasAnyThrowSite);
+      Flags.set(ContextFlags::HasAnyAsyncSite);
       if (requiresTry) Flags.set(ContextFlags::HasTryThrowSite);
       return;
     }
@@ -2650,15 +2652,10 @@ private:
         Expr *expr = E.dyn_cast<Expr*>();
         Expr *anchor = walkToAnchor(expr, parentMap,
                                     CurContext.isWithinInterpolatedString());
-
-        auto key = uncoveredAsync.find(anchor);
-        if (key == uncoveredAsync.end()) {
-          uncoveredAsync.insert({anchor, {}});
+        if (uncoveredAsync.find(anchor) == uncoveredAsync.end())
           errorOrder.push_back(anchor);
-        }
-        uncoveredAsync[anchor].emplace_back(
-            *expr,
-            classification.getAsyncReason());
+        uncoveredAsync[anchor].emplace_back(*expr,
+                                            classification.getAsyncReason());
       }
     }
 
@@ -2691,7 +2688,7 @@ private:
         CurContext.diagnoseUnhandledThrowSite(Ctx.Diags, E, isTryCovered,
                                               classification.getThrowReason());
       } else if (!isTryCovered) {
-        CurContext.diagnoseUncoveredThrowSite(Ctx, E,
+        CurContext.diagnoseUncoveredThrowSite(Ctx, E, // we want this one to trigger
                                               classification.getThrowReason());
       }
       break;
@@ -2871,8 +2868,18 @@ private:
            }
           continue;
          }
-         Ctx.Diags.diagnose(diag.expr.getStartLoc(),
-                            diag::async_access_without_await, 0);
+
+         auto *call = dyn_cast<ApplyExpr>(&diag.expr);
+         if (call && call->implicitlyAsync()) {
+           // Emit a tailored note if the call is implicitly async, meaning the
+           // callee is isolated to an actor.
+           auto callee = call->getCalledValue();
+           Ctx.Diags.diagnose(diag.expr.getStartLoc(), diag::actor_isolated_sync_func,
+                              callee->getDescriptiveKind(), callee->getName());
+         } else {
+           Ctx.Diags.diagnose(diag.expr.getStartLoc(),
+                              diag::async_access_without_await, 0);
+         }
 
          continue;
         }

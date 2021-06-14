@@ -411,7 +411,7 @@ namespace {
       if (otherArgTy && otherArgTy->getAnyNominal()) {
         if (otherArgTy->isEqual(paramTy) &&
             TypeChecker::conformsToProtocol(
-                otherArgTy, literalProto, CS.DC)) {
+                otherArgTy, literalProto, CS.DC->getParentModule())) {
           return true;
         }
       } else if (Type defaultType =
@@ -1737,13 +1737,15 @@ namespace {
         if (!contextualType)
           return false;
 
+        auto *M = CS.DC->getParentModule();
+
         auto type = contextualType->lookThroughAllOptionalTypes();
-        if (conformsToKnownProtocol(
-                CS.DC, type, KnownProtocolKind::ExpressibleByArrayLiteral))
+        if (TypeChecker::conformsToKnownProtocol(
+                type, KnownProtocolKind::ExpressibleByArrayLiteral, M))
           return false;
 
-        return conformsToKnownProtocol(
-            CS.DC, type, KnownProtocolKind::ExpressibleByDictionaryLiteral);
+        return TypeChecker::conformsToKnownProtocol(
+            type, KnownProtocolKind::ExpressibleByDictionaryLiteral, M);
       };
 
       if (isDictionaryContextualType(contextualType)) {
@@ -3256,10 +3258,11 @@ namespace {
       // The result is a KeyPath from the root to the end component.
       // The type of key path depends on the overloads chosen for the key
       // path components.
-      auto typeLoc =
-          CS.getConstraintLocator(locator, ConstraintLocator::KeyPathType);
+      auto typeLoc = CS.getConstraintLocator(
+          locator, LocatorPathElt::KeyPathType(rvalueBase));
+
       Type kpTy = CS.createTypeVariable(typeLoc, TVO_CanBindToNoEscape |
-                                        TVO_CanBindToHole);
+                                                     TVO_CanBindToHole);
       CS.addKeyPathConstraint(kpTy, root, rvalueBase, componentTypeVars,
                               locator);
       return kpTy;
@@ -3466,7 +3469,7 @@ namespace {
 
         auto &CS = CG.getConstraintSystem();
         for (const auto &capture : captureList->getCaptureList()) {
-          SolutionApplicationTarget target(capture.Init);
+          SolutionApplicationTarget target(capture.PBD);
           if (CS.generateConstraints(target, FreeTypeVariableBinding::Disallow))
             return {false, nullptr};
         }
@@ -3626,8 +3629,10 @@ static bool generateWrappedPropertyTypeConstraints(
   }
 
   // The property type must be equal to the wrapped value type
-  cs.addConstraint(ConstraintKind::Equal, propertyType, wrappedValueType,
-      cs.getConstraintLocator(wrappedVar, LocatorPathElt::ContextualType()));
+  cs.addConstraint(
+      ConstraintKind::Equal, propertyType, wrappedValueType,
+      cs.getConstraintLocator(
+          wrappedVar, LocatorPathElt::ContextualType(CTP_WrappedProperty)));
   cs.setContextualType(wrappedVar, TypeLoc::withoutLoc(wrappedValueType),
                        CTP_WrappedProperty);
   return false;
@@ -3637,8 +3642,8 @@ static bool generateWrappedPropertyTypeConstraints(
 static bool generateInitPatternConstraints(
     ConstraintSystem &cs, SolutionApplicationTarget target, Expr *initializer) {
   auto pattern = target.getInitializationPattern();
-  auto locator =
-      cs.getConstraintLocator(initializer, LocatorPathElt::ContextualType());
+  auto locator = cs.getConstraintLocator(
+      initializer, LocatorPathElt::ContextualType(CTP_Initialization));
   Type patternType = cs.generateConstraints(
       pattern, locator, target.shouldBindPatternVarsOneWay(),
       target.getInitializationPatternBindingDecl(),
@@ -3669,8 +3674,8 @@ generateForEachStmtConstraints(
   bool isAsync = stmt->getAwaitLoc().isValid();
 
   auto locator = cs.getConstraintLocator(sequence);
-  auto contextualLocator =
-      cs.getConstraintLocator(sequence, LocatorPathElt::ContextualType());
+  auto contextualLocator = cs.getConstraintLocator(
+      sequence, LocatorPathElt::ContextualType(CTP_ForEachStmt));
 
   // The expression type must conform to the Sequence protocol.
   auto sequenceProto = TypeChecker::getProtocol(
@@ -3787,8 +3792,9 @@ bool ConstraintSystem::generateConstraints(
     if (target.isOptionalSomePatternInit()) {
       assert(!target.getExprContextualType() &&
              "some pattern cannot have contextual type pre-configured");
-      auto *convertTypeLocator =
-          getConstraintLocator(expr, LocatorPathElt::ContextualType());
+      auto *convertTypeLocator = getConstraintLocator(
+          expr, LocatorPathElt::ContextualType(
+                    target.getExprContextualTypePurpose()));
       Type var = createTypeVariable(convertTypeLocator, TVO_CanBindToNoEscape);
       target.setExprConversionType(TypeChecker::getOptionalType(expr->getLoc(), var));
     }
@@ -3810,7 +3816,7 @@ bool ConstraintSystem::generateConstraints(
       ContextualTypePurpose ctp = target.getExprContextualTypePurpose();
       bool isOpaqueReturnType = target.infersOpaqueReturnType();
       auto *convertTypeLocator =
-          getConstraintLocator(expr, LocatorPathElt::ContextualType());
+          getConstraintLocator(expr, LocatorPathElt::ContextualType(ctp));
 
       auto getLocator = [&](Type ty) -> ConstraintLocator * {
         // If we have a placeholder originating from a PlaceholderTypeRepr,
@@ -3973,11 +3979,10 @@ bool ConstraintSystem::generateConstraints(StmtCondition condition,
         return true;
       }
 
-      addConstraint(ConstraintKind::Conversion,
-                    getType(condExpr),
-                    boolTy,
-                    getConstraintLocator(condExpr,
-                                         LocatorPathElt::ContextualType()));
+      addConstraint(
+          ConstraintKind::Conversion, getType(condExpr), boolTy,
+          getConstraintLocator(condExpr,
+                               LocatorPathElt::ContextualType(CTP_Condition)));
       continue;
     }
 
@@ -4083,8 +4088,7 @@ ConstraintSystem::applyPropertyWrapperToParameter(
     if (!shouldAttemptFixes())
       return getTypeMatchFailure(locator);
 
-    if (paramType->hasTypeVariable())
-      recordPotentialHole(paramType);
+    recordAnyTypeVarAsPotentialHole(paramType);
 
     auto *loc = getConstraintLocator(locator);
     auto *fix = RemoveProjectedValueArgument::create(*this, wrapperType, param, loc);
@@ -4132,31 +4136,6 @@ void ConstraintSystem::optimizeConstraints(Expr *e) {
   // Optimize the constraints.
   ConstraintOptimizer optimizer(*this);
   e->walk(optimizer);
-}
-
-bool swift::areGenericRequirementsSatisfied(
-    const DeclContext *DC, GenericSignature sig,
-    SubstitutionMap Substitutions, bool isExtension) {
-
-  ConstraintSystemOptions Options;
-  ConstraintSystem CS(const_cast<DeclContext *>(DC), Options);
-  auto Loc = CS.getConstraintLocator({});
-
-  // For every requirement, add a constraint.
-  for (auto Req : sig->getRequirements()) {
-    if (auto resolved = Req.subst(
-          QuerySubstitutionMap{Substitutions},
-          LookUpConformanceInModule(DC->getParentModule()))) {
-      CS.addConstraint(*resolved, Loc);
-    } else if (isExtension) {
-      return false;
-    }
-    // Unresolved requirements are requirements of the function itself. This
-    // does not prevent it from being applied. E.g. func foo<T: Sequence>(x: T).
-  }
-
-  // Having a solution implies the requirements have been fulfilled.
-  return CS.solveSingle().hasValue();
 }
 
 struct ResolvedMemberResult::Implementation {

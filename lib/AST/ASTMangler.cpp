@@ -89,7 +89,7 @@ std::string ASTMangler::mangleClosureEntity(const AbstractClosureExpr *closure,
 
 std::string ASTMangler::mangleEntity(const ValueDecl *decl, SymbolKind SKind) {
   beginMangling();
-  appendEntity(decl, SKind == SymbolKind::AsyncHandlerBody);
+  appendEntity(decl);
   appendSymbolKind(SKind);
   return finalize();
 }
@@ -379,6 +379,7 @@ std::string ASTMangler::mangleReabstractionThunkHelper(
                                             Type FromType,
                                             Type ToType,
                                             Type SelfType,
+                                            Type GlobalActorBound,
                                             ModuleDecl *Module) {
   Mod = Module;
   assert(ThunkType->getPatternSubstitutions().empty() && "not implemented");
@@ -399,6 +400,11 @@ std::string ASTMangler::mangleReabstractionThunkHelper(
     appendOperator("Ty");
   else
     appendOperator("TR");
+  
+  if (GlobalActorBound) {
+    appendType(GlobalActorBound);
+    appendOperator("TU");
+  }
 
   return finalize();
 }
@@ -424,7 +430,7 @@ std::string ASTMangler::mangleObjCAsyncCompletionHandlerImpl(
 std::string ASTMangler::mangleAutoDiffDerivativeFunction(
     const AbstractFunctionDecl *originalAFD,
     AutoDiffDerivativeFunctionKind kind,
-    AutoDiffConfig config,
+    const AutoDiffConfig &config,
     bool isVTableThunk) {
   beginManglingWithAutoDiffOriginalFunction(originalAFD);
   appendAutoDiffFunctionParts(
@@ -434,7 +440,7 @@ std::string ASTMangler::mangleAutoDiffDerivativeFunction(
 
 std::string ASTMangler::mangleAutoDiffLinearMap(
     const AbstractFunctionDecl *originalAFD, AutoDiffLinearMapKind kind,
-    AutoDiffConfig config) {
+    const AutoDiffConfig &config) {
   beginManglingWithAutoDiffOriginalFunction(originalAFD);
   appendAutoDiffFunctionParts("TJ", getAutoDiffFunctionKind(kind), config);
   return finalize();
@@ -456,7 +462,7 @@ void ASTMangler::beginManglingWithAutoDiffOriginalFunction(
 
 void ASTMangler::appendAutoDiffFunctionParts(StringRef op,
                                              AutoDiffFunctionKind kind,
-                                             AutoDiffConfig config) {
+                                             const AutoDiffConfig &config) {
   if (auto sig = config.derivativeGenericSignature)
     appendGenericSignature(sig);
   auto kindCode = (char)kind;
@@ -486,8 +492,8 @@ void ASTMangler::appendIndexSubset(IndexSubset *indices) {
 }
 
 static NodePointer mangleSILDifferentiabilityWitnessAsNode(
-    StringRef originalName, DifferentiabilityKind kind, AutoDiffConfig config,
-    Demangler &demangler) {
+    StringRef originalName, DifferentiabilityKind kind,
+    const AutoDiffConfig &config, Demangler &demangler) {
   auto *diffWitnessNode = demangler.createNode(
       Node::Kind::DifferentiabilityWitness);
   auto origNode = demangler.demangleSymbol(originalName);
@@ -518,8 +524,9 @@ static NodePointer mangleSILDifferentiabilityWitnessAsNode(
   return diffWitnessNode;
 }
 
-std::string ASTMangler::mangleSILDifferentiabilityWitness(
-    StringRef originalName, DifferentiabilityKind kind, AutoDiffConfig config) {
+std::string ASTMangler::mangleSILDifferentiabilityWitness(StringRef originalName,
+                                              DifferentiabilityKind kind,
+                                              const AutoDiffConfig &config) {
   // If the original name was a mangled name, differentiability witnesses must
   // be mangled as node because they contain generic signatures which may repeat
   // entities in the original function name. Mangling as node will make sure the
@@ -545,7 +552,8 @@ std::string ASTMangler::mangleSILDifferentiabilityWitness(
 
 std::string ASTMangler::mangleAutoDiffGeneratedDeclaration(
     AutoDiffGeneratedDeclarationKind declKind, StringRef origFnName,
-    unsigned bbId, AutoDiffLinearMapKind linearMapKind, AutoDiffConfig config) {
+    unsigned bbId, AutoDiffLinearMapKind linearMapKind,
+    const AutoDiffConfig &config) {
   beginManglingWithoutPrefix();
 
   Buffer << "_AD__" << origFnName << "_bb" + std::to_string(bbId);
@@ -816,10 +824,10 @@ std::string ASTMangler::mangleGenericSignature(const GenericSignature sig) {
 void ASTMangler::appendSymbolKind(SymbolKind SKind) {
   switch (SKind) {
     case SymbolKind::Default: return;
-    case SymbolKind::AsyncHandlerBody: return;
     case SymbolKind::DynamicThunk: return appendOperator("TD");
     case SymbolKind::SwiftAsObjCThunk: return appendOperator("To");
     case SymbolKind::ObjCAsSwiftThunk: return appendOperator("TO");
+    case SymbolKind::DistributedThunk: return appendOperator("Td");
   }
 }
 
@@ -2447,7 +2455,7 @@ void ASTMangler::appendFunctionSignature(AnyFunctionType *fn,
                                         FunctionManglingKind functionMangling) {
   appendFunctionResultType(fn->getResult(), forDecl);
   appendFunctionInputType(fn->getParams(), forDecl);
-  if (fn->isAsync() || functionMangling == AsyncHandlerBodyMangling)
+  if (fn->isAsync())
     appendOperator("Ya");
   if (fn->isSendable())
     appendOperator("Yb");
@@ -2468,6 +2476,11 @@ void ASTMangler::appendFunctionSignature(AnyFunctionType *fn,
   case DifferentiabilityKind::Linear:
     appendOperator("Yjl");
     break;
+  }
+
+  if (Type globalActor = fn->getGlobalActor()) {
+    appendType(globalActor);
+    appendOperator("Yc");
   }
 }
 
@@ -2558,6 +2571,9 @@ void ASTMangler::appendTypeListElement(Identifier name, Type elementType,
     appendOperator("n");
     break;
   }
+  if (flags.isIsolated())
+    appendOperator("Yi");
+
   if (!name.empty())
     appendIdentifier(name.str());
   if (flags.isVariadic())
@@ -2868,18 +2884,6 @@ CanType ASTMangler::getDeclTypeForMangling(
 
   Type ty = decl->getInterfaceType()->getReferenceStorageReferent();
 
-  // Strip the global actor out of the mangling.
-  ty = ty.transform([](Type type) {
-    if (auto fnType = type->getAs<AnyFunctionType>()) {
-      if (fnType->getGlobalActor()) {
-        return Type(fnType->withExtInfo(
-            fnType->getExtInfo().withGlobalActor(Type())));
-      }
-    }
-
-    return type;
-  });
-
   auto canTy = ty->getCanonicalType();
 
   if (auto gft = dyn_cast<GenericFunctionType>(canTy)) {
@@ -2927,13 +2931,15 @@ void ASTMangler::appendDeclType(const ValueDecl *decl,
 
 bool ASTMangler::tryAppendStandardSubstitution(const GenericTypeDecl *decl) {
   // Bail out if our parent isn't the swift standard library.
-  if (!decl->isStdlibDecl())
+  auto dc = decl->getDeclContext();
+  if (!dc->isModuleScopeContext() ||
+      !dc->getParentModule()->hasStandardSubstitutions())
     return false;
 
   if (isa<NominalTypeDecl>(decl)) {
-    if (char Subst = getStandardTypeSubst(decl->getName().str())) {
-      if (!SubstMerging.tryMergeSubst(*this, Subst, /*isStandardSubst*/ true)) {
-        appendOperator("S", StringRef(&Subst, 1));
+    if (auto Subst = getStandardTypeSubst(decl->getName().str())) {
+      if (!SubstMerging.tryMergeSubst(*this, *Subst, /*isStandardSubst*/ true)){
+        appendOperator("S", *Subst);
       }
       return true;
     }
@@ -2996,7 +3002,7 @@ void ASTMangler::appendEntity(const ValueDecl *decl, StringRef EntityOp,
     appendOperator("Z");
 }
 
-void ASTMangler::appendEntity(const ValueDecl *decl, bool isAsyncHandlerBody) {
+void ASTMangler::appendEntity(const ValueDecl *decl) {
   assert(!isa<ConstructorDecl>(decl));
   assert(!isa<DestructorDecl>(decl));
   
@@ -3017,8 +3023,7 @@ void ASTMangler::appendEntity(const ValueDecl *decl, bool isAsyncHandlerBody) {
 
   appendContextOf(decl);
   appendDeclName(decl);
-  appendDeclType(decl, isAsyncHandlerBody ? AsyncHandlerBodyMangling
-                                          : FunctionMangling);
+  appendDeclType(decl, FunctionMangling);
   appendOperator("F");
   if (decl->isStatic())
     appendOperator("Z");
