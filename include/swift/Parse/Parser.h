@@ -1004,7 +1004,8 @@ public:
 
   /// Parse the optional modifiers before a declaration.
   bool parseDeclModifierList(DeclAttributes &Attributes, SourceLoc &StaticLoc,
-                             StaticSpellingKind &StaticSpelling);
+                             StaticSpellingKind &StaticSpelling,
+                             bool isFromClangAttribute = false);
 
   /// Parse an availability attribute of the form
   /// @available(*, introduced: 1.0, deprecated: 3.1).
@@ -1217,15 +1218,25 @@ public:
 
   //===--------------------------------------------------------------------===//
   // Type Parsing
-  
+
+  enum class ParseTypeReason {
+    /// Any type parsing context.
+    Unspecified,
+
+    /// Whether the type is for a closure attribute.
+    CustomAttribute,
+  };
+
   ParserResult<TypeRepr> parseType();
-  ParserResult<TypeRepr> parseType(Diag<> MessageID,
-                                   bool IsSILFuncDecl = false);
+  ParserResult<TypeRepr> parseType(
+      Diag<> MessageID,
+      ParseTypeReason reason = ParseTypeReason::Unspecified);
 
   ParserResult<TypeRepr>
-    parseTypeSimpleOrComposition(Diag<> MessageID);
+    parseTypeSimpleOrComposition(Diag<> MessageID, ParseTypeReason reason);
 
-  ParserResult<TypeRepr> parseTypeSimple(Diag<> MessageID);
+  ParserResult<TypeRepr> parseTypeSimple(
+      Diag<> MessageID, ParseTypeReason reason);
 
   /// Parse layout constraint.
   LayoutConstraint parseLayoutConstraint(Identifier LayoutConstraintID);

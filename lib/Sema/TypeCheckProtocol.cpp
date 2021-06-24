@@ -874,11 +874,16 @@ static Optional<RequirementMatch> findMissingGenericRequirementForSolutionFix(
   type = solution.simplifyType(type);
   missingType = solution.simplifyType(missingType);
 
-  missingType = missingType->mapTypeOutOfContext();
-  if (missingType->hasTypeParameter())
-    if (auto env = conformance->getGenericEnvironment())
-      if (auto assocType = env->mapTypeIntoContext(missingType))
-        missingType = assocType;
+  if (auto *env = conformance->getGenericEnvironment()) {
+    // We use subst() with LookUpConformanceInModule here, because
+    // associated type inference failures mean that we can end up
+    // here with a DependentMemberType with an ArchetypeType base.
+    missingType = missingType.subst(
+      [&](SubstitutableType *type) -> Type {
+        return env->mapTypeIntoContext(type->mapTypeOutOfContext());
+      },
+      LookUpConformanceInModule(conformance->getDeclContext()->getParentModule()));
+  }
 
   auto missingRequirementMatch = [&](Type type) -> RequirementMatch {
     Requirement requirement(requirementKind, type, missingType);
@@ -5846,6 +5851,31 @@ void TypeChecker::checkConformancesInContext(IterableDeclContext *idc) {
       }
     } else if (proto->isSpecificProtocol(KnownProtocolKind::Sendable)) {
       SendableConformance = conformance;
+    } else if (proto->isSpecificProtocol(KnownProtocolKind::DistributedActor)) {
+      if (auto classDecl = dyn_cast<ClassDecl>(nominal)) {
+        if (!classDecl->isDistributedActor()) {
+          if (classDecl->isActor()) {
+            dc->getSelfNominalTypeDecl()
+            ->diagnose(diag::distributed_actor_protocol_illegal_inheritance,
+                       dc->getSelfNominalTypeDecl()->getName())
+                       .fixItInsert(classDecl->getStartLoc(), "distributed ");
+          } else {
+            dc->getSelfNominalTypeDecl()
+            ->diagnose(diag::actor_protocol_illegal_inheritance,
+                       dc->getSelfNominalTypeDecl()->getName())
+                       .fixItReplace(nominal->getStartLoc(), "distributed actor");
+          }
+        }
+      }
+    } else if (proto->isSpecificProtocol(KnownProtocolKind::Actor)) {
+      if (auto classDecl = dyn_cast<ClassDecl>(nominal)) {
+        if (!classDecl->isExplicitActor()) {
+          dc->getSelfNominalTypeDecl()
+              ->diagnose(diag::actor_protocol_illegal_inheritance,
+                         dc->getSelfNominalTypeDecl()->getName())
+              .fixItReplace(nominal->getStartLoc(), "actor");
+        }
+      }
     } else if (proto->isSpecificProtocol(
                    KnownProtocolKind::UnsafeSendable)) {
       unsafeSendableConformance = conformance;

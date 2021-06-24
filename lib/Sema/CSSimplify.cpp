@@ -6310,12 +6310,23 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyConformsToConstraint(
         auto requirement = signature->getRequirements()[req->getIndex()];
 
         auto *memberLoc = getConstraintLocator(anchor, path.front());
-        auto *memberRef = findResolvedMemberRef(memberLoc);
+        auto overload = findSelectedOverloadFor(memberLoc);
 
         // To figure out what is going on here we need to wait until
         // member overload is set in the constraint system.
-        if (!memberRef)
+        if (!overload) {
+          // If it's not allowed to generate new constraints
+          // there is no way to control re-activation, so this
+          // check has to fail.
+          if (!flags.contains(TMF_GenerateConstraints))
+            return SolutionKind::Error;
+
           return formUnsolved(/*activate=*/true);
+        }
+
+        auto *memberRef = overload->choice.getDeclOrNull();
+        if (!memberRef)
+          return SolutionKind::Error;
 
         // If this is a `Self` conformance requirement from a static member
         // reference on a protocol metatype, let's produce a tailored diagnostic.
@@ -6549,7 +6560,9 @@ static ConstraintFix *maybeWarnAboutExtraneousCast(
   if (!castExpr)
     return nullptr;
 
-  unsigned extraOptionals = fromOptionals.size() - toOptionals.size();
+  // "from" could be less optional than "to" e.g. `0 as Any?`, so
+  // we need to store the difference as a signed integer.
+  int extraOptionals = fromOptionals.size() - toOptionals.size();
   // Removing the optionality from to type when the force cast expr is an IUO.
   const auto *const TR = castExpr->getCastTypeRepr();
   if (isExpr<ForcedCheckedCastExpr>(anchor) && TR &&
