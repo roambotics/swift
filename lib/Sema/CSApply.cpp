@@ -377,6 +377,7 @@ static bool buildObjCKeyPathString(KeyPathExpr *E,
     case KeyPathExpr::Component::Kind::Invalid:
     case KeyPathExpr::Component::Kind::UnresolvedProperty:
     case KeyPathExpr::Component::Kind::UnresolvedSubscript:
+    case KeyPathExpr::Component::Kind::CodeCompletion:
       // Don't bother building the key path string if the key path didn't even
       // resolve.
       return false;
@@ -546,7 +547,7 @@ namespace {
       }
 
       auto sig = gft->getGenericSignature();
-      auto *env = sig->getGenericEnvironment();
+      auto *env = sig.getGenericEnvironment();
 
       witnessType = FunctionType::get(gft->getParams(),
                                       gft->getResult(),
@@ -654,8 +655,8 @@ namespace {
                                                    ctx);
                     cs.setType(base, MetatypeType::get(baseTy));
 
-                    refExpr = new (ctx) DotSyntaxCallExpr(declRefExpr,
-                                                          SourceLoc(), base);
+                    refExpr = DotSyntaxCallExpr::create(ctx, declRefExpr,
+                                                        SourceLoc(), base);
                     auto refType = fullType->castTo<FunctionType>()->getResult();
                     cs.setType(refExpr, refType);
                   } else {
@@ -1066,7 +1067,7 @@ namespace {
         outerParamTypes.push_back(AnyFunctionType::Param(outerParamType,
                                                          Identifier(),
                                                          paramInfo[i].getParameterFlags()));
-        outerParam->setInterfaceType(outerParamType);
+        outerParam->setInterfaceType(outerParamType->mapTypeOutOfContext());
 
         if (fnDecl.getAbstractFunctionDecl())
           argLabels.push_back(innerParam->getArgumentName());
@@ -1091,8 +1092,8 @@ namespace {
       FunctionType::ExtInfo closureInfo;
       auto *autoClosureType =
           FunctionType::get(outerParamTypes, fnType->getResult(), closureInfo);
-      auto *autoClosure = new (context) AutoClosureExpr(fnCall, autoClosureType,
-                                                        discriminator, cs.DC);
+      auto *autoClosure = new (context)
+          AutoClosureExpr(fnCall, autoClosureType, discriminator, dc);
       autoClosure->setParameterList(outerParams);
       autoClosure->setThunkKind(AutoClosureExpr::Kind::SingleCurryThunk);
       cs.cacheType(autoClosure);
@@ -1125,9 +1126,8 @@ namespace {
 
       auto resultTy = selfFnTy->getResult();
       auto discriminator = AutoClosureExpr::InvalidDiscriminator;
-      auto closure =
-          new (context) AutoClosureExpr(/*set body later*/nullptr, resultTy,
-                                        discriminator, cs.DC);
+      auto closure = new (context) AutoClosureExpr(/*set body later*/ nullptr,
+                                                   resultTy, discriminator, dc);
       closure->setParameterList(params);
       closure->setType(selfFnTy);
       closure->setThunkKind(AutoClosureExpr::Kind::SingleCurryThunk);
@@ -1175,8 +1175,8 @@ namespace {
       }
 
       // (Self) -> ...
-      ApplyExpr *selfCall = new (context) DotSyntaxCallExpr(
-          ref, SourceLoc(), selfOpenedRef);
+      ApplyExpr *selfCall =
+          DotSyntaxCallExpr::create(context, ref, SourceLoc(), selfOpenedRef);
       selfCall->setType(refTy->getResult());
       cs.cacheType(selfCall);
 
@@ -1254,7 +1254,7 @@ namespace {
                                        /*implicit=*/true);
       }
 
-      auto argTy = AnyFunctionType::composeInput(context, calleeParams,
+      auto argTy = AnyFunctionType::composeTuple(context, calleeParams,
                                                  /*canonical*/false);
       closureArg->setType(argTy);
       cs.cacheType(closureArg);
@@ -1692,8 +1692,7 @@ namespace {
                                        memberLocator);
 
         auto outerClosure =
-            new (context) AutoClosureExpr(closure, selfFnTy,
-                                          discriminator, cs.DC);
+            new (context) AutoClosureExpr(closure, selfFnTy, discriminator, dc);
         outerClosure->setThunkKind(AutoClosureExpr::Kind::DoubleCurryThunk);
 
         outerClosure->setParameterList(outerParams);
@@ -1744,7 +1743,7 @@ namespace {
       if (isa<ConstructorDecl>(member)) {
         // FIXME: Provide type annotation.
         ref = forceUnwrapIfExpected(ref, choice, memberLocator);
-        apply = new (context) ConstructorRefCallExpr(ref, base);
+        apply = ConstructorRefCallExpr::create(context, ref, base);
       } else if (isUnboundInstanceMember) {
         auto refType = cs.simplifyType(openedType);
         if (!cs.getType(ref)->isEqual(refType)) {
@@ -1763,7 +1762,7 @@ namespace {
         assert((!baseIsInstance || member->isInstanceMember()) &&
                "can't call a static method on an instance");
         ref = forceUnwrapIfExpected(ref, choice, memberLocator);
-        apply = new (context) DotSyntaxCallExpr(ref, dotLoc, base);
+        apply = DotSyntaxCallExpr::create(context, ref, dotLoc, base);
         if (Implicit) {
           apply->setImplicit();
         }
@@ -2451,7 +2450,7 @@ namespace {
       auto subMap = SubstitutionMap::get(
           genericSig,
           [&](SubstitutableType *type) -> Type {
-            assert(type->isEqual(genericSig->getGenericParams()[0]));
+            assert(type->isEqual(genericSig.getGenericParams()[0]));
             return valueType;
           },
           [&](CanType origType, Type replacementType,
@@ -3153,8 +3152,8 @@ namespace {
       Expr *ctorRef = buildOtherConstructorRef(overload.openedFullType, callee,
                                                base, nameLoc, ctorLocator,
                                                implicit);
-      auto *call = new (cs.getASTContext()) DotSyntaxCallExpr(ctorRef, dotLoc,
-                                                              base);
+      auto *call =
+          DotSyntaxCallExpr::create(cs.getASTContext(), ctorRef, dotLoc, base);
 
       return finishApply(call, cs.getType(expr), locator, ctorLocator);
     }
@@ -4932,7 +4931,8 @@ namespace {
           }
           break;
         }
-        case KeyPathExpr::Component::Kind::Invalid: {
+        case KeyPathExpr::Component::Kind::Invalid:
+        case KeyPathExpr::Component::Kind::CodeCompletion: {
           auto component = origComponent;
           component.setComponentType(leafTy);
           resolvedComponents.push_back(component);
@@ -5808,7 +5808,7 @@ Expr *ExprRewriter::coerceCallArguments(
   ParameterListInfo paramInfo(params, callee.getDecl(), skipCurriedSelf);
 
   SmallVector<AnyFunctionType::Param, 8> args;
-  AnyFunctionType::decomposeInput(cs.getType(arg), args);
+  AnyFunctionType::decomposeTuple(cs.getType(arg), args);
 
   // If this application is an init(wrappedValue:) call that needs an injected
   // wrapped value placeholder, the first non-defaulted argument must be
@@ -5837,8 +5837,9 @@ Expr *ExprRewriter::coerceCallArguments(
   // Apply labels to arguments.
   AnyFunctionType::relabelParams(args, argLabels);
 
-  auto unlabeledTrailingClosureIndex =
+  auto oldTrailingClosureIndex =
       arg->getUnlabeledTrailingClosureIndexOfPackedArgument();
+  Optional<unsigned> newTrailingClosureIndex;
 
   // Determine the parameter bindings that were applied.
   auto *locatorPtr = cs.getConstraintLocator(locator);
@@ -5912,6 +5913,12 @@ Expr *ExprRewriter::coerceCallArguments(
         auto arg = getArg(argIdx);
         auto argType = cs.getType(arg);
 
+        // Update the trailing closure index if needed.
+        if (oldTrailingClosureIndex && *oldTrailingClosureIndex == argIdx) {
+          assert(!newTrailingClosureIndex);
+          newTrailingClosureIndex = newArgs.size();
+        }
+
         // If the argument type exactly matches, this just works.
         if (argType->isEqual(param.getPlainType())) {
           variadicArgs.push_back(arg);
@@ -5973,6 +5980,12 @@ Expr *ExprRewriter::coerceCallArguments(
     unsigned argIdx = parameterBindings[paramIdx].front();
     auto arg = getArg(argIdx);
     auto argType = cs.getType(arg);
+
+    // Update the trailing closure index if needed.
+    if (oldTrailingClosureIndex && *oldTrailingClosureIndex == argIdx) {
+      assert(!newTrailingClosureIndex);
+      newTrailingClosureIndex = newArgs.size();
+    }
 
     // Save the original label location.
     newLabelLocs.push_back(getLabelLoc(argIdx));
@@ -6054,14 +6067,15 @@ Expr *ExprRewriter::coerceCallArguments(
         bool isDefaultWrappedValue =
             target->propertyWrapperHasInitialWrappedValue();
         auto *placeholder = injectWrappedValuePlaceholder(
-            cs.buildAutoClosureExpr(arg, closureType, isDefaultWrappedValue),
+            cs.buildAutoClosureExpr(arg, closureType, dc,
+                                    isDefaultWrappedValue),
             /*isAutoClosure=*/true);
-        arg = CallExpr::createImplicit(ctx, placeholder, {}, {});
+        arg = CallExpr::createImplicitEmpty(ctx, placeholder);
         arg->setType(closureType->getResult());
         cs.cacheType(arg);
       }
 
-      convertedArg = cs.buildAutoClosureExpr(arg, closureType);
+      convertedArg = cs.buildAutoClosureExpr(arg, closureType, dc);
     } else {
       convertedArg = coerceToType(
           arg, paramType,
@@ -6088,6 +6102,9 @@ Expr *ExprRewriter::coerceCallArguments(
   assert(newArgs.size() == newParams.size());
   assert(newArgs.size() == newLabels.size());
   assert(newArgs.size() == newLabelLocs.size());
+  assert(oldTrailingClosureIndex.hasValue() ==
+         newTrailingClosureIndex.hasValue());
+  assert(!newTrailingClosureIndex || *newTrailingClosureIndex < newArgs.size());
 
   // This is silly. SILGen gets confused if a 'self' parameter is wrapped
   // in a ParenExpr sometimes.
@@ -6095,12 +6112,12 @@ Expr *ExprRewriter::coerceCallArguments(
       (params[0].getValueOwnership() == ValueOwnership::Default ||
        params[0].getValueOwnership() == ValueOwnership::InOut)) {
     assert(newArgs.size() == 1);
-    assert(!unlabeledTrailingClosureIndex);
+    assert(!newTrailingClosureIndex);
     return newArgs[0];
   }
 
   // Rebuild the argument list, sharing as much structure as possible.
-  auto paramType = AnyFunctionType::composeInput(ctx, newParams,
+  auto paramType = AnyFunctionType::composeTuple(ctx, newParams,
                                                  /*canonicalVararg=*/false);
   if (isa<ParenType>(paramType.getPointer())) {
     if (argParen) {
@@ -6110,7 +6127,7 @@ Expr *ExprRewriter::coerceCallArguments(
       bool isImplicit = arg->isImplicit();
       arg = new (ctx) ParenExpr(
           lParenLoc, newArgs[0], rParenLoc,
-          static_cast<bool>(unlabeledTrailingClosureIndex));
+          static_cast<bool>(newTrailingClosureIndex));
       arg->setImplicit(isImplicit);
     }
   } else {
@@ -6125,7 +6142,7 @@ Expr *ExprRewriter::coerceCallArguments(
     } else {
       // Build a new TupleExpr, re-using source location information.
       arg = TupleExpr::create(ctx, lParenLoc, rParenLoc, newArgs, newLabels,
-                              newLabelLocs, unlabeledTrailingClosureIndex,
+                              newLabelLocs, newTrailingClosureIndex,
                               /*implicit=*/arg->isImplicit());
     }
   }
@@ -6161,8 +6178,15 @@ static bool applyTypeToClosureExpr(ConstraintSystem &cs,
                                    Expr *expr, Type toType) {
   // Look through identity expressions, like parens.
   if (auto IE = dyn_cast<IdentityExpr>(expr)) {
-    if (!applyTypeToClosureExpr(cs, IE->getSubExpr(), toType)) return false;
-    cs.setType(IE, toType);
+    if (!applyTypeToClosureExpr(cs, IE->getSubExpr(), toType))
+      return false;
+
+    auto subExprTy = cs.getType(IE->getSubExpr());
+    if (isa<ParenExpr>(IE)) {
+      cs.setType(IE, ParenType::get(cs.getASTContext(), subExprTy));
+    } else {
+      cs.setType(IE, subExprTy);
+    }
     return true;
   }
 
@@ -7257,10 +7281,14 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
     return cs.cacheType(new (ctx) UnresolvedTypeConversionExpr(expr, toType));
 
   // Use an opaque type to abstract a value of the underlying concrete type.
-  if (toType->getAs<OpaqueTypeArchetypeType>()) {
+  // The full check here would be that `toType` and `fromType` are structually
+  // equal except in any position where `toType` has an opaque archetype. The
+  // below is just an approximate check since the above would be expensive to
+  // verify and still relies on the type checker ensuing `fromType` is
+  // compatible with any opaque archetypes.
+  if (toType->hasOpaqueArchetype())
     return cs.cacheType(new (ctx) UnderlyingToOpaqueExpr(expr, toType));
-  }
-  
+
   llvm_unreachable("Unhandled coercion");
 }
 
@@ -7638,7 +7666,7 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
                                                     {escapable}, {}, getType);
         cs.cacheSubExprTypes(callSubExpr);
         cs.setType(callSubExpr->getArg(),
-                   AnyFunctionType::composeInput(ctx,
+                   AnyFunctionType::composeTuple(ctx,
                                                  escapableParams, false));
         cs.setType(callSubExpr, resultType);
         
@@ -7890,6 +7918,15 @@ static std::pair<Expr *, unsigned> getPrecedenceParentAndIndex(Expr *expr,
   }
   Expr *parent = it->second;
 
+  // Look through an unresolved chain wrapper expr, as it has no effect on
+  // precedence.
+  if (isa<UnresolvedMemberChainResultExpr>(parent)) {
+    it = parentMap.find(parent);
+    if (it == parentMap.end())
+      return {nullptr, 0};
+    parent = it->second;
+  }
+
   // Handle all cases where the answer isn't just going to be { parent, 0 }.
   if (auto tuple = dyn_cast<TupleExpr>(parent)) {
     // Get index of expression in tuple.
@@ -7969,13 +8006,13 @@ bool swift::exprNeedsParensOutsideFollowingOperator(
   Expr *parent;
   unsigned index;
   std::tie(parent, index) = getPrecedenceParentAndIndex(expr, rootExpr);
-  if (!parent || isa<TupleExpr>(parent)) {
+  if (!parent)
     return false;
-  }
 
-  if (auto parenExp = dyn_cast<ParenExpr>(parent))
-    if (!parenExp->isImplicit())
+  if (isa<ParenExpr>(parent) || isa<TupleExpr>(parent)) {
+    if (!parent->isImplicit())
       return false;
+  }
 
   if (parent->isInfixOperator()) {
     auto parentPG = TypeChecker::lookupPrecedenceGroupForInfixOperator(DC,
@@ -8150,11 +8187,12 @@ namespace {
 
         if (auto *projectionVar = param->getPropertyWrapperProjectionVar()) {
           projectionVar->setInterfaceType(
-              solution.simplifyType(solution.getType(projectionVar)));
+              solution.simplifyType(solution.getType(projectionVar))->mapTypeOutOfContext());
         }
 
         auto *wrappedValueVar = param->getPropertyWrapperWrappedValueVar();
-        auto wrappedValueType = solution.simplifyType(solution.getType(wrappedValueVar));
+        auto wrappedValueType =
+            solution.simplifyType(solution.getType(wrappedValueVar))->mapTypeOutOfContext();
         wrappedValueVar->setInterfaceType(wrappedValueType->getWithoutSpecifierType());
 
         if (param->hasImplicitPropertyWrapper()) {
@@ -8322,13 +8360,12 @@ static Expr *wrapAsyncLetInitializer(
   auto closureType = FunctionType::get({ }, initializerType, extInfo);
   ASTContext &ctx = dc->getASTContext();
   Expr *autoclosureExpr = cs.buildAutoClosureExpr(
-      initializer, closureType, /*isDefaultWrappedValue=*/false,
+      initializer, closureType, dc, /*isDefaultWrappedValue=*/false,
       /*isAsyncLetWrapper=*/true);
 
   // Call the autoclosure so that the AST types line up. SILGen will ignore the
   // actual calls and translate them into a different mechanism.
-  auto autoclosureCall = CallExpr::createImplicit(
-      ctx, autoclosureExpr, { }, { });
+  auto autoclosureCall = CallExpr::createImplicitEmpty(ctx, autoclosureExpr);
   autoclosureCall->setType(initializerType);
   autoclosureCall->setThrows(throws);
 
@@ -8790,7 +8827,8 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
     // conversion.
     if (FunctionType *autoclosureParamType =
             target.getAsAutoclosureParamType()) {
-      resultExpr = cs.buildAutoClosureExpr(resultExpr, autoclosureParamType);
+      resultExpr = cs.buildAutoClosureExpr(resultExpr, autoclosureParamType,
+                                           target.getDeclContext());
     }
 
     solution.setExprTypes(resultExpr);
@@ -8897,6 +8935,12 @@ bool Solution::hasType(ASTNode node) const {
   return cs.hasType(node);
 }
 
+bool Solution::hasType(const KeyPathExpr *KP, unsigned ComponentIndex) const {
+  assert(KP && "Expected non-null key path parameter!");
+  return keyPathComponentTypes.find(std::make_pair(KP, ComponentIndex))
+            != keyPathComponentTypes.end();
+}
+
 Type Solution::getType(ASTNode node) const {
   auto result = nodeTypes.find(node);
   if (result != nodeTypes.end())
@@ -8904,6 +8948,11 @@ Type Solution::getType(ASTNode node) const {
 
   auto &cs = getConstraintSystem();
   return cs.getType(node);
+}
+
+Type Solution::getType(const KeyPathExpr *KP, unsigned I) const {
+  assert(hasType(KP, I) && "Expected type to have been set!");
+  return keyPathComponentTypes.find(std::make_pair(KP, I))->second;
 }
 
 Type Solution::getResolvedType(ASTNode node) const {

@@ -81,6 +81,8 @@ enum class ConcurrentReferenceKind {
   LocalCapture,
   /// Concurrent function
   ConcurrentFunction,
+  /// Nonisolated declaration.
+  Nonisolated,
 };
 
 /// The isolation restriction in effect for a given declaration that is
@@ -202,7 +204,8 @@ public:
   /// \param fromExpression Indicates that the reference is coming from an
   /// expression.
   static ActorIsolationRestriction forDeclaration(
-      ConcreteDeclRef declRef, bool fromExpression = true);
+      ConcreteDeclRef declRef, const DeclContext *fromDC,
+      bool fromExpression = true);
 
   operator Kind() const { return kind; };
 };
@@ -242,6 +245,9 @@ bool diagnoseNonConcurrentTypesInReference(
     ConcurrentReferenceKind refKind,
     DiagnosticBehavior behavior = DiagnosticBehavior::Unspecified);
 
+/// Produce a diagnostic for a missing conformance to Sendable.
+void diagnoseMissingSendableConformance(SourceLoc loc, Type type);
+
 /// How the concurrent value check should be performed.
 enum class SendableCheck {
   /// Sendable conformance was explicitly stated and should be
@@ -252,7 +258,7 @@ enum class SendableCheck {
   /// protocols that added Sendable after-the-fact.
   ImpliedByStandardProtocol,
 
-  /// Implicit conformance to Sendable for structs and enums.
+  /// Implicit conformance to Sendable.
   Implicit,
 };
 

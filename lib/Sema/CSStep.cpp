@@ -555,9 +555,9 @@ bool IsDeclRefinementOfRequest::evaluate(Evaluator &evaluator,
 
   // Substitute generic parameters with their archetypes in each generic function.
   Type substTypeA = typeA->substGenericArgs(
-      genericSignatureA->getGenericEnvironment()->getForwardingSubstitutionMap());
+      genericSignatureA.getGenericEnvironment()->getForwardingSubstitutionMap());
   Type substTypeB = typeB->substGenericArgs(
-      genericSignatureB->getGenericEnvironment()->getForwardingSubstitutionMap());
+      genericSignatureB.getGenericEnvironment()->getForwardingSubstitutionMap());
 
   // Attempt to substitute archetypes from the second type with archetypes in the
   // same structural position in the first type.
@@ -583,7 +583,7 @@ bool IsDeclRefinementOfRequest::evaluate(Evaluator &evaluator,
 
   auto result = TypeChecker::checkGenericArguments(
       declA->getDeclContext()->getParentModule(),
-      genericSignatureB->getRequirements(),
+      genericSignatureB.getRequirements(),
       QueryTypeSubstitutionMap{ substMap });
 
   if (result != RequirementCheckResult::Success)
@@ -636,59 +636,6 @@ bool DisjunctionStep::shouldSkip(const DisjunctionChoice &choice) const {
     if (declA->getBaseIdentifier().isArithmeticOperator() &&
         TypeChecker::isDeclRefinementOf(declA, declB)) {
       return skip("subtype");
-    }
-  }
-
-  // If the solver already found a solution with a choice that did not
-  // introduce any conversions (i.e., the score is not worse than the
-  // current score), we can skip any generic operators with conformance
-  // requirements that are not satisfied by any known argument types.
-  auto argFnType = CS.getAppliedDisjunctionArgumentFunction(Disjunction);
-  auto checkRequirementsEarly = [&]() -> bool {
-    auto bestScore = getBestScore(Solutions);
-    if (!(bestScore && choice.isGenericOperator() && argFnType))
-      return false;
-
-    auto currentScore = getCurrentScore();
-    for (unsigned i = 0; i < NumScoreKinds; ++i) {
-      if (i == SK_NonDefaultLiteral)
-        continue;
-
-      if (bestScore->Data[i] > currentScore.Data[i])
-        return false;
-    }
-
-    return true;
-  };
-  if (checkRequirementsEarly()) {
-    Constraint *constraint = choice;
-    auto *decl = constraint->getOverloadChoice().getDecl();
-    if (decl->getBaseIdentifier().isArithmeticOperator()) {
-      auto *useDC = constraint->getOverloadUseDC();
-      auto choiceType = CS.getEffectiveOverloadType(
-          constraint->getLocator(), constraint->getOverloadChoice(),
-          /*allowMembers=*/true, useDC);
-      auto choiceFnType = choiceType->getAs<FunctionType>();
-      auto genericFnType = decl->getInterfaceType()->getAs<GenericFunctionType>();
-      auto signature = genericFnType->getGenericSignature();
-
-      for (auto argParamPair : llvm::zip(argFnType->getParams(),
-                                         choiceFnType->getParams())) {
-        auto argType = std::get<0>(argParamPair).getPlainType();
-        auto paramType = std::get<1>(argParamPair).getPlainType();
-
-        // Only check argument types with no type variables that will be matched
-        // against a plain type parameter.
-        argType = argType->getCanonicalType()->getWithoutSpecifierType();
-        if (argType->hasTypeVariable() || !paramType->isTypeParameter())
-          continue;
-
-        for (auto *protocol : signature->getRequiredProtocols(paramType)) {
-          if (!TypeChecker::conformsToProtocol(argType, protocol,
-                                               useDC->getParentModule()))
-            return skip("unsatisfied");
-        }
-      }
     }
   }
 

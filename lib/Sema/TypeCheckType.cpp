@@ -29,7 +29,6 @@
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
-#include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PrettyStackTrace.h"
@@ -75,8 +74,7 @@ TypeResolution::forInterface(DeclContext *dc, TypeResolutionOptions options,
                              HandlePlaceholderTypeReprFn placeholderHandler) {
   TypeResolution result(dc, TypeResolutionStage::Interface, options,
                         unboundTyOpener, placeholderHandler);
-  result.complete.genericSig = dc->getGenericSignatureOfContext();
-  result.complete.builder = nullptr;
+  result.genericSig = dc->getGenericSignatureOfContext();
   return result;
 }
 
@@ -102,22 +100,12 @@ TypeResolution::forContextual(DeclContext *dc, GenericEnvironment *genericEnv,
 TypeResolution TypeResolution::withOptions(TypeResolutionOptions opts) const {
   TypeResolution result(dc, stage, opts, unboundTyOpener, placeholderHandler);
   result.genericEnv = genericEnv;
-  result.complete = complete;
+  result.genericSig = genericSig;
   return result;
 }
 
 ASTContext &TypeResolution::getASTContext() const {
   return dc->getASTContext();
-}
-
-GenericSignatureBuilder *TypeResolution::getGenericSignatureBuilder() const {
-  assert(stage == TypeResolutionStage::Interface);
-  if (!complete.builder) {
-    auto genericSig = getGenericSignature();
-    complete.builder = genericSig->getGenericSignatureBuilder();
-  }
-
-  return complete.builder;
 }
 
 GenericSignature TypeResolution::getGenericSignature() const {
@@ -126,8 +114,8 @@ GenericSignature TypeResolution::getGenericSignature() const {
     return dc->getGenericSignatureOfContext();
 
   case TypeResolutionStage::Interface:
-    if (complete.genericSig)
-      return complete.genericSig;
+    if (genericSig)
+      return genericSig;
 
     return dc->getGenericSignatureOfContext();
 
@@ -193,32 +181,24 @@ Type TypeResolution::resolveDependentMemberType(
   }
 
   assert(stage == TypeResolutionStage::Interface);
-  if (!getGenericSignature())
+  auto genericSig = getGenericSignature();
+  if (!genericSig)
     return ErrorType::get(baseTy);
-
-  auto builder = getGenericSignatureBuilder();
-  auto baseEquivClass =
-    builder->resolveEquivalenceClass(
-                                baseTy,
-                                ArchetypeResolutionKind::CompleteWellFormed);
-  if (!baseEquivClass)
-    return ErrorType::get(baseTy);
-
-  ASTContext &ctx = baseTy->getASTContext();
 
   // Look for a nested type with the given name.
-  if (auto nestedType =
-          baseEquivClass->lookupNestedType(*builder, refIdentifier)) {
+  if (auto nestedType = genericSig->lookupNestedType(baseTy, refIdentifier)) {
     // Record the type we found.
     ref->setValue(nestedType, nullptr);
   } else {
+    ASTContext &ctx = DC->getASTContext();
+
     // Resolve the base to a potential archetype.
     // Perform typo correction.
     TypoCorrectionResults corrections(ref->getNameRef(), ref->getNameLoc());
     TypeChecker::performTypoCorrection(DC, DeclRefKind::Ordinary,
                                        MetatypeType::get(baseTy),
                                        defaultMemberLookupOptions,
-                                       corrections, builder);
+                                       corrections, genericSig);
 
     // Check whether we have a single type result.
     auto singleType = cast_or_null<TypeDecl>(
@@ -257,13 +237,6 @@ Type TypeResolution::resolveDependentMemberType(
     return DependentMemberType::get(baseTy, assocType);
   }
 
-  // Otherwise, the nested type comes from a concrete type,
-  // or it's a typealias declared in protocol or protocol extension.
-  // Substitute the base type into it.
-
-  // Make sure that base type didn't get replaced along the way.
-  assert(baseTy->isTypeParameter());
-
   // There are two situations possible here:
   //
   // 1. Member comes from the protocol, which means that it has been
@@ -279,9 +252,12 @@ Type TypeResolution::resolveDependentMemberType(
   // end up using incorrect generic signature while attempting to form
   // a substituted type for the member we found.
   if (!concrete->getDeclContext()->getSelfProtocolDecl()) {
-    baseTy = baseEquivClass->concreteType ? baseEquivClass->concreteType
-                                          : baseEquivClass->superclass;
-    assert(baseTy);
+    if (auto concreteTy = genericSig->getConcreteType(baseTy))
+      baseTy = concreteTy;
+    else {
+      baseTy = genericSig->getSuperclassBound(baseTy);
+      assert(baseTy);
+    }
   }
 
   return TypeChecker::substMemberTypeWithBase(DC->getParentModule(), concrete,
@@ -304,16 +280,12 @@ Type TypeResolution::resolveSelfAssociatedType(Type baseTy,
   }
 
   assert(stage == TypeResolutionStage::Interface);
-  auto builder = getGenericSignatureBuilder();
-  auto baseEquivClass =
-    builder->resolveEquivalenceClass(
-                                baseTy,
-                                ArchetypeResolutionKind::CompleteWellFormed);
-  if (!baseEquivClass)
+  auto genericSig = getGenericSignature();
+  if (!genericSig)
     return ErrorType::get(baseTy);
 
   // Look for a nested type with the given name.
-  auto nestedType = baseEquivClass->lookupNestedType(*builder, name);
+  auto nestedType = genericSig->lookupNestedType(baseTy, name);
   assert(nestedType);
 
   // If the nested type has been resolved to an associated type, use it.
@@ -326,9 +298,12 @@ Type TypeResolution::resolveSelfAssociatedType(Type baseTy,
     // extension.
     //
     // Get the superclass of the 'Self' type parameter.
-    baseTy = (baseEquivClass->concreteType
-              ? baseEquivClass->concreteType
-              : baseEquivClass->superclass);
+    if (auto concreteTy = genericSig->getConcreteType(baseTy))
+      baseTy = concreteTy;
+    else {
+      baseTy = genericSig->getSuperclassBound(baseTy);
+      assert(baseTy);
+    }
     assert(baseTy);
   }
 
@@ -658,8 +633,8 @@ bool TypeChecker::checkContextualRequirements(GenericTypeDecl *decl,
     TypeChecker::checkGenericArguments(
         dc, loc, noteLoc,
         decl->getDeclaredInterfaceType(),
-        genericSig->getGenericParams(),
-        genericSig->getRequirements(),
+        genericSig.getGenericParams(),
+        genericSig.getRequirements(),
         QueryTypeSubstitutionMap{subMap});
 
   switch (result) {
@@ -914,22 +889,21 @@ Type TypeResolution::applyUnboundGenericArguments(
         return resultType;
 
       auto parentSig = decl->getDeclContext()->getGenericSignatureOfContext();
-      if (parentSig) {
-        for (auto gp : parentSig->getGenericParams())
-          subs[gp->getCanonicalType()->castTo<GenericTypeParamType>()] =
-              genericSig->getConcreteType(gp);
-      }
+      for (auto gp : parentSig.getGenericParams())
+        subs[gp->getCanonicalType()->castTo<GenericTypeParamType>()] =
+            genericSig->getConcreteType(gp);
     } else {
       subs = parentTy->getContextSubstitutions(decl->getDeclContext());
     }
 
     skipRequirementsCheck |= parentTy->hasTypeVariable();
-  } else if (auto genericEnv =
-                 decl->getDeclContext()->getGenericEnvironmentOfContext()) {
-    auto genericSig = genericEnv->getGenericSignature();
-    for (auto gp : genericSig->getGenericParams()) {
+  } else if (auto genericSig =
+                 decl->getDeclContext()->getGenericSignatureOfContext()) {
+    for (auto gp : genericSig.getGenericParams()) {
       subs[gp->getCanonicalType()->castTo<GenericTypeParamType>()] =
-          (usesArchetypes() ? genericEnv->mapTypeIntoContext(gp) : gp);
+          (usesArchetypes()
+           ? genericSig.getGenericEnvironment()->mapTypeIntoContext(gp)
+           : gp);
     }
   }
 
@@ -940,7 +914,7 @@ Type TypeResolution::applyUnboundGenericArguments(
   // Realize the types of the generic arguments and add them to the
   // substitution map.
   for (unsigned i = 0, e = genericArgs.size(); i < e; ++i) {
-    auto origTy = genericSig->getInnermostGenericParams()[i];
+    auto origTy = genericSig.getInnermostGenericParams()[i];
     auto substTy = genericArgs[i];
 
     // Enter a substitution.
@@ -959,7 +933,7 @@ Type TypeResolution::applyUnboundGenericArguments(
     auto result = TypeChecker::checkGenericArguments(
         getDeclContext(), loc, noteLoc,
         UnboundGenericType::get(decl, parentTy, getASTContext()),
-        genericSig->getGenericParams(), genericSig->getRequirements(),
+        genericSig.getGenericParams(), genericSig.getRequirements(),
         QueryTypeSubstitutionMap{subs});
 
     switch (result) {
@@ -2067,9 +2041,27 @@ NeverNullType TypeResolver::resolveType(TypeRepr *repr,
     return resolveProtocolType(cast<ProtocolTypeRepr>(repr), options);
 
   case TypeReprKind::OpaqueReturn: {
-    // Only valid as the return type of a function, which should be handled
-    // during function decl type checking.
+    // If the opaque type is in a valid position, e.g. part of a function return
+    // type, resolution should happen in the context of an `OpaqueTypeDecl`.
+    // This decl is implicit in the source and is created in such contexts by
+    // evaluation of an `OpaqueResultTypeRequest`.
     auto opaqueRepr = cast<OpaqueReturnTypeRepr>(repr);
+    auto *DC = getDeclContext();
+    if (isa<OpaqueTypeDecl>(DC)) {
+      auto opaqueDecl = cast<OpaqueTypeDecl>(DC);
+      auto outerGenericSignature = opaqueDecl->getNamingDecl()
+                                       ->getInnermostDeclContext()
+                                       ->getGenericSignatureOfContext();
+
+      SubstitutionMap subs;
+      if (outerGenericSignature)
+        subs = outerGenericSignature->getIdentitySubstitutionMap();
+
+      unsigned ordinal = opaqueDecl->getAnonymousOpaqueParamOrdinal(opaqueRepr);
+      return OpaqueTypeArchetypeType::get(opaqueDecl, ordinal, subs);
+    }
+
+    // We are not inside an `OpaqueTypeDecl`, so diagnose an error.
     if (!(options & TypeResolutionFlags::SilenceErrors)) {
       diagnose(opaqueRepr->getOpaqueLoc(),
                diag::unsupported_opaque_type);
@@ -2668,6 +2660,20 @@ TypeResolver::resolveAttributedType(TypeAttributes &attrs, TypeRepr *repr,
     }
   }
 
+  if (attrs.has(TAK_unchecked)) {
+    if (!options.is(TypeResolverContext::Inherited) ||
+        getDeclContext()->getSelfProtocolDecl()) {
+      diagnoseInvalid(repr, attrs.getLoc(TAK_unchecked),
+                      diag::unchecked_not_inheritance_clause);
+    } else if (!ty->isExistentialType()) {
+      diagnoseInvalid(repr, attrs.getLoc(TAK_unchecked),
+                      diag::unchecked_not_existential, ty);
+    }
+
+    // Nothing to record in the type. Just clear the attribute.
+    attrs.clearAttribute(TAK_unchecked);
+  }
+
   for (unsigned i = 0; i != TypeAttrKind::TAK_Count; ++i)
     if (attrs.has((TypeAttrKind)i)) {
       diagnoseInvalid(repr, attrs.getLoc((TypeAttrKind)i),
@@ -3048,9 +3054,9 @@ NeverNullType TypeResolver::resolveSILBoxType(SILBoxTypeRepr *repr,
   if (genericSig) {
     TypeSubstitutionMap genericArgMap;
 
-    auto params = genericSig->getGenericParams();
+    auto params = genericSig.getGenericParams();
     if (repr->getGenericArguments().size()
-          != genericSig->getGenericParams().size()) {
+          != genericSig.getGenericParams().size()) {
       diagnose(repr->getLoc(), diag::sil_box_arg_mismatch);
       return ErrorType::get(getASTContext());
     }
@@ -3152,7 +3158,7 @@ NeverNullType TypeResolver::resolveSILFunctionType(
                                   TypeResolver &&parameterResolver) {
     auto sig = env->getGenericSignature().getCanonicalSignature();
     TypeSubstitutionMap subsMap;
-    auto params = sig->getGenericParams();
+    auto params = sig.getGenericParams();
     for (unsigned i : indices(args)) {
       auto resolved = parameterResolver.resolveType(args[i], options);
       subsMap.insert({params[i], resolved->getCanonicalType()});
@@ -3687,6 +3693,7 @@ NeverNullType TypeResolver::resolveImplicitlyUnwrappedOptionalType(
   case TypeResolverContext::EditorPlaceholderExpr:
   case TypeResolverContext::AbstractFunctionDecl:
   case TypeResolverContext::ClosureExpr:
+  case TypeResolverContext::Inherited:
     doDiag = true;
     break;
   }

@@ -229,13 +229,10 @@ getTypeRefByFunction(IRGenModule &IGM,
       accessor->setAttributes(IGM.constructInitialAttributes());
       
       SmallVector<GenericRequirement, 4> requirements;
-      GenericEnvironment *genericEnv = nullptr;
-      if (sig) {
-        enumerateGenericSignatureRequirements(sig,
-                [&](GenericRequirement reqt) { requirements.push_back(reqt); });
-        genericEnv = sig->getGenericEnvironment();
-      }
-      
+      auto *genericEnv = sig.getGenericEnvironment();
+      enumerateGenericSignatureRequirements(sig,
+              [&](GenericRequirement reqt) { requirements.push_back(reqt); });
+
       {
         IRGenFunction IGF(IGM, accessor);
         if (IGM.DebugInfo)
@@ -355,16 +352,12 @@ IRGenModule::emitWitnessTableRefString(CanType type,
     = substOpaqueTypesWithUnderlyingTypes(type, conformance);
   
   auto origType = type;
-  CanGenericSignature genericSig;
-  SmallVector<GenericRequirement, 4> requirements;
-  GenericEnvironment *genericEnv = nullptr;
+  auto genericSig = origGenericSig.getCanonicalSignature();
 
-  if (origGenericSig) {
-    genericSig = origGenericSig.getCanonicalSignature();
-    enumerateGenericSignatureRequirements(genericSig,
-                [&](GenericRequirement reqt) { requirements.push_back(reqt); });
-    genericEnv = genericSig->getGenericEnvironment();
-  }
+  SmallVector<GenericRequirement, 4> requirements;
+  enumerateGenericSignatureRequirements(genericSig,
+              [&](GenericRequirement reqt) { requirements.push_back(reqt); });
+  auto *genericEnv = genericSig.getGenericEnvironment();
 
   IRGenMangler mangler;
   std::string symbolName =
@@ -1117,6 +1110,10 @@ public:
 
       case irgen::MetadataSource::Kind::Metadata:
         Root = SourceBuilder.createMetadataCapture(Source.getParamIndex());
+        break;
+
+      case irgen::MetadataSource::Kind::ErasedTypeMetadata:
+        // Fixed in the function body
         break;
       }
 

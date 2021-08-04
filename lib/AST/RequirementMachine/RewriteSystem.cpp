@@ -10,22 +10,25 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/AST/Decl.h"
+#include "swift/AST/Types.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <vector>
-
+#include "ProtocolGraph.h"
+#include "RewriteContext.h"
 #include "RewriteSystem.h"
 
 using namespace swift;
 using namespace rewriting;
 
-/// Atoms are uniqued and immutable, stored as a single pointer;
+/// Symbols are uniqued and immutable, stored as a single pointer;
 /// the Storage type is the allocated backing storage.
-struct Atom::Storage final
+struct Symbol::Storage final
   : public llvm::FoldingSetNode,
     public llvm::TrailingObjects<Storage, const ProtocolDecl *, Term> {
-  friend class Atom;
+  friend class Symbol;
 
   unsigned Kind : 3;
   unsigned NumProtocols : 15;
@@ -40,28 +43,28 @@ struct Atom::Storage final
   };
 
   explicit Storage(Identifier name) {
-    Kind = unsigned(Atom::Kind::Name);
+    Kind = unsigned(Symbol::Kind::Name);
     NumProtocols = 0;
     NumSubstitutions = 0;
     Name = name;
   }
 
   explicit Storage(LayoutConstraint layout) {
-    Kind = unsigned(Atom::Kind::Layout);
+    Kind = unsigned(Symbol::Kind::Layout);
     NumProtocols = 0;
     NumSubstitutions = 0;
     Layout = layout;
   }
 
   explicit Storage(const ProtocolDecl *proto) {
-    Kind = unsigned(Atom::Kind::Protocol);
+    Kind = unsigned(Symbol::Kind::Protocol);
     NumProtocols = 0;
     NumSubstitutions = 0;
     Proto = proto;
   }
 
   explicit Storage(GenericTypeParamType *param) {
-    Kind = unsigned(Atom::Kind::GenericParam);
+    Kind = unsigned(Symbol::Kind::GenericParam);
     NumProtocols = 0;
     NumSubstitutions = 0;
     GenericParam = param;
@@ -70,7 +73,7 @@ struct Atom::Storage final
   Storage(ArrayRef<const ProtocolDecl *> protos, Identifier name) {
     assert(!protos.empty());
 
-    Kind = unsigned(Atom::Kind::AssociatedType);
+    Kind = unsigned(Symbol::Kind::AssociatedType);
     NumProtocols = protos.size();
     assert(NumProtocols == protos.size() && "Overflow");
     NumSubstitutions = 0;
@@ -80,9 +83,9 @@ struct Atom::Storage final
       getProtocols()[i] = protos[i];
   }
 
-  Storage(Atom::Kind kind, CanType type, ArrayRef<Term> substitutions) {
-    assert(kind == Atom::Kind::Superclass ||
-           kind == Atom::Kind::ConcreteType);
+  Storage(Symbol::Kind kind, CanType type, ArrayRef<Term> substitutions) {
+    assert(kind == Symbol::Kind::Superclass ||
+           kind == Symbol::Kind::ConcreteType);
     assert(type->hasTypeParameter() != substitutions.empty());
 
     Kind = unsigned(kind);
@@ -121,91 +124,96 @@ struct Atom::Storage final
   void Profile(llvm::FoldingSetNodeID &id) const;
 };
 
-Atom::Kind Atom::getKind() const {
+Symbol::Kind Symbol::getKind() const {
   return Kind(Ptr->Kind);
 }
 
-/// Get the identifier associated with an unbound name atom or an
-/// associated type atom.
-Identifier Atom::getName() const {
+/// Get the identifier associated with an unbound name symbol or an
+/// associated type symbol.
+Identifier Symbol::getName() const {
   assert(getKind() == Kind::Name ||
          getKind() == Kind::AssociatedType);
   return Ptr->Name;
 }
 
-/// Get the single protocol declaration associate with a protocol atom.
-const ProtocolDecl *Atom::getProtocol() const {
+/// Get the single protocol declaration associated with a protocol symbol.
+const ProtocolDecl *Symbol::getProtocol() const {
   assert(getKind() == Kind::Protocol);
   return Ptr->Proto;
 }
 
-/// Get the list of protocols associated with an associated type atom.
-ArrayRef<const ProtocolDecl *> Atom::getProtocols() const {
-  assert(getKind() == Kind::AssociatedType);
+/// Get the list of protocols associated with a protocol or associated type
+/// symbol. Note that if this is a protocol symbol, the return value will have
+/// exactly one element.
+ArrayRef<const ProtocolDecl *> Symbol::getProtocols() const {
   auto protos = Ptr->getProtocols();
-  assert(!protos.empty());
+  if (protos.empty()) {
+    assert(getKind() == Kind::Protocol);
+    return {&Ptr->Proto, 1};
+  }
+  assert(getKind() == Kind::AssociatedType);
   return protos;
 }
 
-/// Get the generic parameter associated with a generic parameter atom.
-GenericTypeParamType *Atom::getGenericParam() const {
+/// Get the generic parameter associated with a generic parameter symbol.
+GenericTypeParamType *Symbol::getGenericParam() const {
   assert(getKind() == Kind::GenericParam);
   return Ptr->GenericParam;
 }
 
-/// Get the layout constraint associated with a layout constraint atom.
-LayoutConstraint Atom::getLayoutConstraint() const {
+/// Get the layout constraint associated with a layout constraint symbol.
+LayoutConstraint Symbol::getLayoutConstraint() const {
   assert(getKind() == Kind::Layout);
   return Ptr->Layout;
 }
 
-/// Get the superclass type associated with a superclass atom.
-CanType Atom::getSuperclass() const {
+/// Get the superclass type associated with a superclass symbol.
+CanType Symbol::getSuperclass() const {
   assert(getKind() == Kind::Superclass);
   return Ptr->ConcreteType;
 }
 
-/// Get the concrete type associated with a concrete type atom.
-CanType Atom::getConcreteType() const {
+/// Get the concrete type associated with a concrete type symbol.
+CanType Symbol::getConcreteType() const {
   assert(getKind() == Kind::ConcreteType);
   return Ptr->ConcreteType;
 }
 
-ArrayRef<Term> Atom::getSubstitutions() const {
+ArrayRef<Term> Symbol::getSubstitutions() const {
   assert(getKind() == Kind::Superclass ||
          getKind() == Kind::ConcreteType);
   return Ptr->getSubstitutions();
 }
 
-/// Creates a new name atom.
-Atom Atom::forName(Identifier name,
+/// Creates a new name symbol.
+Symbol Symbol::forName(Identifier name,
                    RewriteContext &ctx) {
   llvm::FoldingSetNodeID id;
   id.AddInteger(unsigned(Kind::Name));
   id.AddPointer(name.get());
 
   void *insertPos = nullptr;
-  if (auto *atom = ctx.Atoms.FindNodeOrInsertPos(id, insertPos))
-    return atom;
+  if (auto *symbol = ctx.Symbols.FindNodeOrInsertPos(id, insertPos))
+    return symbol;
 
   unsigned size = Storage::totalSizeToAlloc<const ProtocolDecl *, Term>(0, 0);
   void *mem = ctx.Allocator.Allocate(size, alignof(Storage));
-  auto *atom = new (mem) Storage(name);
+  auto *symbol = new (mem) Storage(name);
 
 #ifndef NDEBUG
   llvm::FoldingSetNodeID newID;
-  atom->Profile(newID);
+  symbol->Profile(newID);
   assert(id == newID);
 #endif
 
-  ctx.Atoms.InsertNode(atom, insertPos);
+  ctx.Symbols.InsertNode(symbol, insertPos);
 
-  return atom;
+  return symbol;
 }
 
-/// Creates a new protocol atom.
-Atom Atom::forProtocol(const ProtocolDecl *proto,
-                       RewriteContext &ctx) {
+/// Creates a new protocol symbol.
+Symbol Symbol::forProtocol(const ProtocolDecl *proto,
+                           RewriteContext &ctx) {
   assert(proto != nullptr);
 
   llvm::FoldingSetNodeID id;
@@ -213,40 +221,40 @@ Atom Atom::forProtocol(const ProtocolDecl *proto,
   id.AddPointer(proto);
 
   void *insertPos = nullptr;
-  if (auto *atom = ctx.Atoms.FindNodeOrInsertPos(id, insertPos))
-    return atom;
+  if (auto *symbol = ctx.Symbols.FindNodeOrInsertPos(id, insertPos))
+    return symbol;
 
   unsigned size = Storage::totalSizeToAlloc<const ProtocolDecl *, Term>(0, 0);
   void *mem = ctx.Allocator.Allocate(size, alignof(Storage));
-  auto *atom = new (mem) Storage(proto);
+  auto *symbol = new (mem) Storage(proto);
 
 #ifndef NDEBUG
   llvm::FoldingSetNodeID newID;
-  atom->Profile(newID);
+  symbol->Profile(newID);
   assert(id == newID);
 #endif
 
-  ctx.Atoms.InsertNode(atom, insertPos);
+  ctx.Symbols.InsertNode(symbol, insertPos);
 
-  return atom;
+  return symbol;
 }
 
-/// Creates a new associated type atom for a single protocol.
-Atom Atom::forAssociatedType(const ProtocolDecl *proto,
-                             Identifier name,
-                             RewriteContext &ctx) {
+/// Creates a new associated type symbol for a single protocol.
+Symbol Symbol::forAssociatedType(const ProtocolDecl *proto,
+                                 Identifier name,
+                                 RewriteContext &ctx) {
   SmallVector<const ProtocolDecl *, 1> protos;
   protos.push_back(proto);
 
   return forAssociatedType(protos, name, ctx);
 }
 
-/// Creates a merged associated type atom to represent a nested
+/// Creates a merged associated type symbol to represent a nested
 /// type that conforms to multiple protocols, all of which have
 /// an associated type with the same name.
-Atom Atom::forAssociatedType(ArrayRef<const ProtocolDecl *> protos,
-                             Identifier name,
-                             RewriteContext &ctx) {
+Symbol Symbol::forAssociatedType(ArrayRef<const ProtocolDecl *> protos,
+                                 Identifier name,
+                                 RewriteContext &ctx) {
   llvm::FoldingSetNodeID id;
   id.AddInteger(unsigned(Kind::AssociatedType));
   id.AddInteger(protos.size());
@@ -255,30 +263,30 @@ Atom Atom::forAssociatedType(ArrayRef<const ProtocolDecl *> protos,
   id.AddPointer(name.get());
 
   void *insertPos = nullptr;
-  if (auto *atom = ctx.Atoms.FindNodeOrInsertPos(id, insertPos))
-    return atom;
+  if (auto *symbol = ctx.Symbols.FindNodeOrInsertPos(id, insertPos))
+    return symbol;
 
   unsigned size = Storage::totalSizeToAlloc<const ProtocolDecl *, Term>(
       protos.size(), 0);
   void *mem = ctx.Allocator.Allocate(size, alignof(Storage));
-  auto *atom = new (mem) Storage(protos, name);
+  auto *symbol = new (mem) Storage(protos, name);
 
 #ifndef NDEBUG
   llvm::FoldingSetNodeID newID;
-  atom->Profile(newID);
+  symbol->Profile(newID);
   assert(id == newID);
 #endif
 
-  ctx.Atoms.InsertNode(atom, insertPos);
+  ctx.Symbols.InsertNode(symbol, insertPos);
 
-  return atom;
+  return symbol;
 }
 
-/// Creates a generic parameter atom, representing a generic
+/// Creates a generic parameter symbol, representing a generic
 /// parameter in the top-level generic signature from which the
 /// rewrite system is built.
-Atom Atom::forGenericParam(GenericTypeParamType *param,
-                           RewriteContext &ctx) {
+Symbol Symbol::forGenericParam(GenericTypeParamType *param,
+                               RewriteContext &ctx) {
   assert(param->isCanonical());
 
   llvm::FoldingSetNodeID id;
@@ -286,53 +294,53 @@ Atom Atom::forGenericParam(GenericTypeParamType *param,
   id.AddPointer(param);
 
   void *insertPos = nullptr;
-  if (auto *atom = ctx.Atoms.FindNodeOrInsertPos(id, insertPos))
-    return atom;
+  if (auto *symbol = ctx.Symbols.FindNodeOrInsertPos(id, insertPos))
+    return symbol;
 
   unsigned size = Storage::totalSizeToAlloc<const ProtocolDecl *, Term>(0, 0);
   void *mem = ctx.Allocator.Allocate(size, alignof(Storage));
-  auto *atom = new (mem) Storage(param);
+  auto *symbol = new (mem) Storage(param);
 
 #ifndef NDEBUG
   llvm::FoldingSetNodeID newID;
-  atom->Profile(newID);
+  symbol->Profile(newID);
   assert(id == newID);
 #endif
 
-  ctx.Atoms.InsertNode(atom, insertPos);
+  ctx.Symbols.InsertNode(symbol, insertPos);
 
-  return atom;
+  return symbol;
 }
 
-/// Creates a layout atom, representing a layout constraint.
-Atom Atom::forLayout(LayoutConstraint layout,
-                     RewriteContext &ctx) {
+/// Creates a layout symbol, representing a layout constraint.
+Symbol Symbol::forLayout(LayoutConstraint layout,
+                         RewriteContext &ctx) {
   llvm::FoldingSetNodeID id;
   id.AddInteger(unsigned(Kind::Layout));
   id.AddPointer(layout.getPointer());
 
   void *insertPos = nullptr;
-  if (auto *atom = ctx.Atoms.FindNodeOrInsertPos(id, insertPos))
-    return atom;
+  if (auto *symbol = ctx.Symbols.FindNodeOrInsertPos(id, insertPos))
+    return symbol;
 
   unsigned size = Storage::totalSizeToAlloc<const ProtocolDecl *, Term>(0, 0);
   void *mem = ctx.Allocator.Allocate(size, alignof(Storage));
-  auto *atom = new (mem) Storage(layout);
+  auto *symbol = new (mem) Storage(layout);
 
 #ifndef NDEBUG
   llvm::FoldingSetNodeID newID;
-  atom->Profile(newID);
+  symbol->Profile(newID);
   assert(id == newID);
 #endif
 
-  ctx.Atoms.InsertNode(atom, insertPos);
+  ctx.Symbols.InsertNode(symbol, insertPos);
 
-  return atom;
+  return symbol;
 }
 
-/// Creates a superclass atom, representing a superclass constraint.
-Atom Atom::forSuperclass(CanType type, ArrayRef<Term> substitutions,
-                         RewriteContext &ctx) {
+/// Creates a superclass symbol, representing a superclass constraint.
+Symbol Symbol::forSuperclass(CanType type, ArrayRef<Term> substitutions,
+                             RewriteContext &ctx) {
   llvm::FoldingSetNodeID id;
   id.AddInteger(unsigned(Kind::Superclass));
   id.AddPointer(type.getPointer());
@@ -342,28 +350,28 @@ Atom Atom::forSuperclass(CanType type, ArrayRef<Term> substitutions,
     id.AddPointer(substitution.getOpaquePointer());
 
   void *insertPos = nullptr;
-  if (auto *atom = ctx.Atoms.FindNodeOrInsertPos(id, insertPos))
-    return atom;
+  if (auto *symbol = ctx.Symbols.FindNodeOrInsertPos(id, insertPos))
+    return symbol;
 
   unsigned size = Storage::totalSizeToAlloc<const ProtocolDecl *, Term>(
       0, substitutions.size());
   void *mem = ctx.Allocator.Allocate(size, alignof(Storage));
-  auto *atom = new (mem) Storage(Kind::Superclass, type, substitutions);
+  auto *symbol = new (mem) Storage(Kind::Superclass, type, substitutions);
 
 #ifndef NDEBUG
   llvm::FoldingSetNodeID newID;
-  atom->Profile(newID);
+  symbol->Profile(newID);
   assert(id == newID);
 #endif
 
-  ctx.Atoms.InsertNode(atom, insertPos);
+  ctx.Symbols.InsertNode(symbol, insertPos);
 
-  return atom;
+  return symbol;
 }
 
-/// Creates a concrete type atom, representing a superclass constraint.
-Atom Atom::forConcreteType(CanType type, ArrayRef<Term> substitutions,
-                           RewriteContext &ctx) {
+/// Creates a concrete type symbol, representing a superclass constraint.
+Symbol Symbol::forConcreteType(CanType type, ArrayRef<Term> substitutions,
+                               RewriteContext &ctx) {
   llvm::FoldingSetNodeID id;
   id.AddInteger(unsigned(Kind::ConcreteType));
   id.AddPointer(type.getPointer());
@@ -372,55 +380,61 @@ Atom Atom::forConcreteType(CanType type, ArrayRef<Term> substitutions,
     id.AddPointer(substitution.getOpaquePointer());
 
   void *insertPos = nullptr;
-  if (auto *atom = ctx.Atoms.FindNodeOrInsertPos(id, insertPos))
-    return atom;
+  if (auto *symbol = ctx.Symbols.FindNodeOrInsertPos(id, insertPos))
+    return symbol;
 
   unsigned size = Storage::totalSizeToAlloc<const ProtocolDecl *, Term>(
       0, substitutions.size());
   void *mem = ctx.Allocator.Allocate(size, alignof(Storage));
-  auto *atom = new (mem) Storage(Kind::ConcreteType, type, substitutions);
+  auto *symbol = new (mem) Storage(Kind::ConcreteType, type, substitutions);
 
 #ifndef NDEBUG
   llvm::FoldingSetNodeID newID;
-  atom->Profile(newID);
+  symbol->Profile(newID);
   assert(id == newID);
 #endif
 
-  ctx.Atoms.InsertNode(atom, insertPos);
+  ctx.Symbols.InsertNode(symbol, insertPos);
 
-  return atom;
+  return symbol;
 }
 
-/// Linear order on atoms.
+/// Linear order on symbols.
 ///
-/// First, we order different kinds as follows:
+/// First, we order different kinds as follows, from smallest to largest:
 ///
-///   AssociatedType < GenericParam < Name < Protocol < Layout
+/// - Protocol
+/// - AssociatedType
+/// - GenericParam
+/// - Name
+/// - Layout
+/// - Superclass
+/// - ConcreteType
 ///
-/// Then we break ties when both atoms have the same kind as follows:
+/// Then we break ties when both symbols have the same kind as follows:
 ///
-/// * For associated type atoms, we first order the number of protocols,
-///   with atoms containing more protocols coming first. This ensures
+/// * For associated type symbols, we first order the number of protocols,
+///   with symbols containing more protocols coming first. This ensures
 ///   that the following holds:
 ///
 ///     [P1&P2:T] < [P1:T]
 ///     [P1&P2:T] < [P2:T]
 ///
-///   If both atoms have the same number of protocols, we perform a
+///   If both symbols have the same number of protocols, we perform a
 ///   lexicographic comparison on the protocols pair-wise, using the
 ///   protocol order defined by \p graph (see
 ///   ProtocolGraph::compareProtocols()).
 ///
-/// * For generic parameter atoms, we first order by depth, then index.
+/// * For generic parameter symbols, we first order by depth, then index.
 ///
-/// * For unbound name atoms, we compare identifiers lexicographically.
+/// * For unbound name symbols, we compare identifiers lexicographically.
 ///
-/// * For protocol atoms, we compare the protocols using the protocol
+/// * For protocol symbols, we compare the protocols using the protocol
 ///   linear order on \p graph.
 ///
-/// * For layout atoms, we use LayoutConstraint::compare().
-int Atom::compare(Atom other, const ProtocolGraph &graph) const {
-  // Exit early if the atoms are equal.
+/// * For layout symbols, we use LayoutConstraint::compare().
+int Symbol::compare(Symbol other, const ProtocolGraph &graph) const {
+  // Exit early if the symbols are equal.
   if (Ptr == other.Ptr)
     return 0;
 
@@ -445,7 +459,7 @@ int Atom::compare(Atom other, const ProtocolGraph &graph) const {
     auto protos = getProtocols();
     auto otherProtos = other.getProtocols();
 
-    // Atoms with more protocols are 'smaller' than those with fewer.
+    // Symbols with more protocols are 'smaller' than those with fewer.
     if (protos.size() != otherProtos.size())
       return protos.size() > otherProtos.size() ? -1 : 1;
 
@@ -483,23 +497,23 @@ int Atom::compare(Atom other, const ProtocolGraph &graph) const {
   }
   }
 
-  assert(result != 0 && "Two distinct atoms should not compare equal");
+  assert(result != 0 && "Two distinct symbols should not compare equal");
   return result;
 }
 
-/// For a superclass or concrete type atom
+/// For a superclass or concrete type symbol
 ///
 ///   [concrete: Foo<X1, ..., Xn>]
 ///   [superclass: Foo<X1, ..., Xn>]
 ///
-/// Return a new atom where the function fn is applied to each of the
+/// Return a new symbol where the function fn is applied to each of the
 /// substitutions:
 ///
 ///   [concrete: Foo<fn(X1), ..., fn(Xn)>]
 ///   [superclass: Foo<fn(X1), ..., fn(Xn)>]
 ///
-/// Asserts if this is not a superclass or concrete type atom.
-Atom Atom::transformConcreteSubstitutions(
+/// Asserts if this is not a superclass or concrete type symbol.
+Symbol Symbol::transformConcreteSubstitutions(
     llvm::function_ref<Term(Term)> fn,
     RewriteContext &ctx) const {
   assert(isSuperclassOrConcreteType());
@@ -522,9 +536,9 @@ Atom Atom::transformConcreteSubstitutions(
 
   switch (getKind()) {
   case Kind::Superclass:
-    return Atom::forSuperclass(getSuperclass(), substitutions, ctx);
+    return Symbol::forSuperclass(getSuperclass(), substitutions, ctx);
   case Kind::ConcreteType:
-    return Atom::forConcreteType(getConcreteType(), substitutions, ctx);
+    return Symbol::forConcreteType(getConcreteType(), substitutions, ctx);
 
   case Kind::GenericParam:
   case Kind::Name:
@@ -534,11 +548,11 @@ Atom Atom::transformConcreteSubstitutions(
     break;
   }
 
-  llvm_unreachable("Bad atom kind");
+  llvm_unreachable("Bad symbol kind");
 }
 
-/// Print the atom using our mnemonic representation.
-void Atom::dump(llvm::raw_ostream &out) const {
+/// Print the symbol using our mnemonic representation.
+void Symbol::dump(llvm::raw_ostream &out) const {
   auto dumpSubstitutions = [&]() {
     if (getSubstitutions().size() > 0) {
       out << " with <";
@@ -604,30 +618,30 @@ void Atom::dump(llvm::raw_ostream &out) const {
     return;
   }
 
-  llvm_unreachable("Bad atom kind");
+  llvm_unreachable("Bad symbol kind");
 }
 
-void Atom::Storage::Profile(llvm::FoldingSetNodeID &id) const {
+void Symbol::Storage::Profile(llvm::FoldingSetNodeID &id) const {
   id.AddInteger(Kind);
 
-  switch (Atom::Kind(Kind)) {
-  case Atom::Kind::Name:
+  switch (Symbol::Kind(Kind)) {
+  case Symbol::Kind::Name:
     id.AddPointer(Name.get());
     return;
 
-  case Atom::Kind::Layout:
+  case Symbol::Kind::Layout:
     id.AddPointer(Layout.getPointer());
     return;
 
-  case Atom::Kind::Protocol:
+  case Symbol::Kind::Protocol:
     id.AddPointer(Proto);
     return;
 
-  case Atom::Kind::GenericParam:
+  case Symbol::Kind::GenericParam:
     id.AddPointer(GenericParam);
     return;
 
-  case Atom::Kind::AssociatedType: {
+  case Symbol::Kind::AssociatedType: {
     auto protos = getProtocols();
     id.AddInteger(protos.size());
 
@@ -638,8 +652,8 @@ void Atom::Storage::Profile(llvm::FoldingSetNodeID &id) const {
     return;
   }
 
-  case Atom::Kind::Superclass:
-  case Atom::Kind::ConcreteType: {
+  case Symbol::Kind::Superclass:
+  case Symbol::Kind::ConcreteType: {
     id.AddPointer(ConcreteType.getPointer());
 
     id.AddInteger(NumSubstitutions);
@@ -650,30 +664,30 @@ void Atom::Storage::Profile(llvm::FoldingSetNodeID &id) const {
   }
   }
 
-  llvm_unreachable("Bad atom kind");
+  llvm_unreachable("Bad symbol kind");
 }
 
 /// Terms are uniqued and immutable, stored as a single pointer;
 /// the Storage type is the allocated backing storage.
 struct Term::Storage final
   : public llvm::FoldingSetNode,
-    public llvm::TrailingObjects<Storage, Atom> {
-  friend class Atom;
+    public llvm::TrailingObjects<Storage, Symbol> {
+  friend class Symbol;
 
   unsigned Size;
 
   explicit Storage(unsigned size) : Size(size) {}
 
-  size_t numTrailingObjects(OverloadToken<Atom>) const {
+  size_t numTrailingObjects(OverloadToken<Symbol>) const {
     return Size;
   }
 
-  MutableArrayRef<Atom> getElements() {
-    return {getTrailingObjects<Atom>(), Size};
+  MutableArrayRef<Symbol> getElements() {
+    return {getTrailingObjects<Symbol>(), Size};
   }
 
-  ArrayRef<Atom> getElements() const {
-    return {getTrailingObjects<Atom>(), Size};
+  ArrayRef<Symbol> getElements() const {
+    return {getTrailingObjects<Symbol>(), Size};
   }
 
   void Profile(llvm::FoldingSetNodeID &id) const;
@@ -681,19 +695,27 @@ struct Term::Storage final
 
 size_t Term::size() const { return Ptr->Size; }
 
-ArrayRef<Atom>::const_iterator Term::begin() const {
+ArrayRef<Symbol>::iterator Term::begin() const {
   return Ptr->getElements().begin();
 }
 
-ArrayRef<Atom>::const_iterator Term::end() const {
+ArrayRef<Symbol>::iterator Term::end() const {
   return Ptr->getElements().end();
 }
 
-Atom Term::back() const {
+ArrayRef<Symbol>::reverse_iterator Term::rbegin() const {
+  return Ptr->getElements().rbegin();
+}
+
+ArrayRef<Symbol>::reverse_iterator Term::rend() const {
+  return Ptr->getElements().rend();
+}
+
+Symbol Term::back() const {
   return Ptr->getElements().back();
 }
 
-Atom Term::operator[](size_t index) const {
+Symbol Term::operator[](size_t index) const {
   return Ptr->getElements()[index];
 }
 
@@ -703,19 +725,19 @@ void Term::dump(llvm::raw_ostream &out) const {
 
 Term Term::get(const MutableTerm &mutableTerm, RewriteContext &ctx) {
   unsigned size = mutableTerm.size();
-  assert(size > 0 && "Term must have at least one atom");
+  assert(size > 0 && "Term must have at least one symbol");
 
   llvm::FoldingSetNodeID id;
   id.AddInteger(size);
-  for (auto atom : mutableTerm)
-    id.AddPointer(atom.getOpaquePointer());
+  for (auto symbol : mutableTerm)
+    id.AddPointer(symbol.getOpaquePointer());
 
   void *insertPos = nullptr;
   if (auto *term = ctx.Terms.FindNodeOrInsertPos(id, insertPos))
     return term;
 
   void *mem = ctx.Allocator.Allocate(
-      Storage::totalSizeToAlloc<Atom>(size),
+      Storage::totalSizeToAlloc<Symbol>(size),
       alignof(Storage));
   auto *term = new (mem) Storage(size);
   for (unsigned i = 0; i < size; ++i)
@@ -729,14 +751,43 @@ Term Term::get(const MutableTerm &mutableTerm, RewriteContext &ctx) {
 void Term::Storage::Profile(llvm::FoldingSetNodeID &id) const {
   id.AddInteger(Size);
 
-  for (auto atom : getElements())
-    id.AddPointer(atom.getOpaquePointer());
+  for (auto symbol : getElements())
+    id.AddPointer(symbol.getOpaquePointer());
 }
 
-/// Linear order on terms.
+/// Returns the "domain" of this term by looking at the first symbol.
+///
+/// - If the first symbol is a protocol symbol [P], the domain is P.
+/// - If the first symbol is an associated type symbol [P1&...&Pn],
+///   the domain is {P1, ..., Pn}.
+/// - If the first symbol is a generic parameter symbol, the domain is
+///   the empty set {}.
+/// - Anything else will assert.
+ArrayRef<const ProtocolDecl *> MutableTerm::getRootProtocols() const {
+  auto symbol = *begin();
+
+  switch (symbol.getKind()) {
+  case Symbol::Kind::Protocol:
+  case Symbol::Kind::AssociatedType:
+    return symbol.getProtocols();
+
+  case Symbol::Kind::GenericParam:
+    return ArrayRef<const ProtocolDecl *>();
+
+  case Symbol::Kind::Name:
+  case Symbol::Kind::Layout:
+  case Symbol::Kind::Superclass:
+  case Symbol::Kind::ConcreteType:
+    break;
+  }
+
+  llvm_unreachable("Bad root symbol");
+}
+
+/// Shortlex order on terms.
 ///
 /// First we compare length, then perform a lexicographic comparison
-/// on atoms if the two terms have the same length.
+/// on symbols if the two terms have the same length.
 int MutableTerm::compare(const MutableTerm &other,
                          const ProtocolGraph &graph) const {
   if (size() != other.size())
@@ -760,7 +811,7 @@ int MutableTerm::compare(const MutableTerm &other,
 
 /// Find the start of \p other in this term, returning end() if
 /// \p other does not occur as a subterm of this term.
-decltype(MutableTerm::Atoms)::const_iterator
+decltype(MutableTerm::Symbols)::const_iterator
 MutableTerm::findSubTerm(const MutableTerm &other) const {
   if (other.size() > size())
     return end();
@@ -769,7 +820,7 @@ MutableTerm::findSubTerm(const MutableTerm &other) const {
 }
 
 /// Non-const variant of the above.
-decltype(MutableTerm::Atoms)::iterator
+decltype(MutableTerm::Symbols)::iterator
 MutableTerm::findSubTerm(const MutableTerm &other) {
   if (other.size() > size())
     return end();
@@ -816,7 +867,7 @@ bool MutableTerm::rewriteSubTerm(const MutableTerm &lhs,
 
     // Now, we've moved the gap to the end of the term; close
     // it by shortening the term.
-    Atoms.erase(newEnd, end());
+    Symbols.erase(newEnd, end());
   }
 
   assert(size() == oldSize - lhs.size() + rhs.size());
@@ -826,62 +877,18 @@ bool MutableTerm::rewriteSubTerm(const MutableTerm &lhs,
 void MutableTerm::dump(llvm::raw_ostream &out) const {
   bool first = true;
 
-  for (auto atom : Atoms) {
+  for (auto symbol : Symbols) {
     if (!first)
       out << ".";
     else
       first = false;
 
-    atom.dump(out);
+    symbol.dump(out);
   }
-}
-
-Term RewriteContext::getTermForType(CanType paramType,
-                                    const ProtocolDecl *proto) {
-  return Term::get(getMutableTermForType(paramType, proto), *this);
-}
-
-/// Map an interface type to a term.
-///
-/// If \p proto is null, this is a term relative to a generic
-/// parameter in a top-level signature. The term is rooted in a generic
-/// parameter atom.
-///
-/// If \p proto is non-null, this is a term relative to a protocol's
-/// 'Self' type. The term is rooted in a protocol atom.
-///
-/// The bound associated types in the interface type are ignored; the
-/// resulting term consists entirely of a root atom followed by zero
-/// or more name atoms.
-MutableTerm RewriteContext::getMutableTermForType(CanType paramType,
-                                                  const ProtocolDecl *proto) {
-  assert(paramType->isTypeParameter());
-
-  // Collect zero or more nested type names in reverse order.
-  SmallVector<Atom, 3> atoms;
-  while (auto memberType = dyn_cast<DependentMemberType>(paramType)) {
-    atoms.push_back(Atom::forName(memberType->getName(), *this));
-    paramType = memberType.getBase();
-  }
-
-  // Add the root atom at the end.
-  if (proto) {
-    assert(proto->getSelfInterfaceType()->isEqual(paramType));
-    atoms.push_back(Atom::forProtocol(proto, *this));
-  } else {
-    atoms.push_back(Atom::forGenericParam(
-        cast<GenericTypeParamType>(paramType), *this));
-  }
-
-  std::reverse(atoms.begin(), atoms.end());
-
-  return MutableTerm(atoms);
 }
 
 void Rule::dump(llvm::raw_ostream &out) const {
-  LHS.dump(out);
-  out << " => ";
-  RHS.dump(out);
+  out << LHS << " => " << RHS;
   if (deleted)
     out << " [deleted]";
 }
@@ -891,19 +898,13 @@ void RewriteSystem::initialize(
     ProtocolGraph &&graph) {
   Protos = graph;
 
-  // FIXME: Probably this sort is not necessary
-  std::sort(rules.begin(), rules.end(),
-            [&](std::pair<MutableTerm, MutableTerm> lhs,
-                std::pair<MutableTerm, MutableTerm> rhs) -> int {
-              return lhs.first.compare(rhs.first, graph) < 0;
-            });
   for (const auto &rule : rules)
     addRule(rule.first, rule.second);
 }
 
-Atom RewriteSystem::simplifySubstitutionsInSuperclassOrConcreteAtom(
-    Atom atom) const {
-  return atom.transformConcreteSubstitutions(
+Symbol RewriteSystem::simplifySubstitutionsInSuperclassOrConcreteSymbol(
+    Symbol symbol) const {
+  return symbol.transformConcreteSubstitutions(
     [&](Term term) -> Term {
       MutableTerm mutTerm(term);
       if (!simplify(mutTerm))
@@ -935,16 +936,12 @@ bool RewriteSystem::addRule(MutableTerm lhs, MutableTerm rhs) {
     std::swap(lhs, rhs);
 
   if (lhs.back().isSuperclassOrConcreteType())
-    lhs.back() = simplifySubstitutionsInSuperclassOrConcreteAtom(lhs.back());
+    lhs.back() = simplifySubstitutionsInSuperclassOrConcreteSymbol(lhs.back());
 
   assert(lhs.compare(rhs, Protos) > 0);
 
   if (DebugAdd) {
-    llvm::dbgs() << "# Adding rule ";
-    lhs.dump(llvm::dbgs());
-    llvm::dbgs() << " => ";
-    rhs.dump(llvm::dbgs());
-    llvm::dbgs() << "\n";
+    llvm::dbgs() << "# Adding rule " << lhs << " => " << rhs << "\n";
   }
 
   unsigned i = Rules.size();
@@ -958,8 +955,8 @@ bool RewriteSystem::addRule(MutableTerm lhs, MutableTerm rhs) {
   // types in RewriteSystem::processMergedAssociatedTypes().
   if (lhs.size() == rhs.size() &&
       std::equal(lhs.begin(), lhs.end() - 1, rhs.begin()) &&
-      lhs.back().getKind() == Atom::Kind::AssociatedType &&
-      rhs.back().getKind() == Atom::Kind::AssociatedType &&
+      lhs.back().getKind() == Symbol::Kind::AssociatedType &&
+      rhs.back().getKind() == Symbol::Kind::AssociatedType &&
       lhs.back().getName() == rhs.back().getName()) {
     MergedAssociatedTypes.emplace_back(lhs, rhs);
   }
@@ -995,9 +992,7 @@ bool RewriteSystem::simplify(MutableTerm &term) const {
   bool changed = false;
 
   if (DebugSimplify) {
-    llvm::dbgs() << "= Term ";
-    term.dump(llvm::dbgs());
-    llvm::dbgs() << "\n";
+    llvm::dbgs() << "= Term " << term << "\n";
   }
 
   while (true) {
@@ -1007,16 +1002,12 @@ bool RewriteSystem::simplify(MutableTerm &term) const {
         continue;
 
       if (DebugSimplify) {
-        llvm::dbgs() << "== Rule ";
-        rule.dump(llvm::dbgs());
-        llvm::dbgs() << "\n";
+        llvm::dbgs() << "== Rule " << rule << "\n";
       }
 
       if (rule.apply(term)) {
         if (DebugSimplify) {
-          llvm::dbgs() << "=== Result ";
-          term.dump(llvm::dbgs());
-          llvm::dbgs() << "\n";
+          llvm::dbgs() << "=== Result " << term << "\n";
         }
 
         changed = true;
@@ -1045,9 +1036,8 @@ void RewriteSystem::simplifyRightHandSides() {
 
 #define ASSERT_RULE(expr) \
   if (!(expr)) { \
-    llvm::errs() << "&&& Malformed rewrite rule: "; \
-    rule.dump(llvm::errs()); \
-    llvm::errs() << "\n\n"; \
+    llvm::errs() << "&&& Malformed rewrite rule: " << rule << "\n"; \
+    llvm::errs() << "&&& " << #expr << "\n\n"; \
     dump(llvm::errs()); \
     assert(expr); \
   }
@@ -1060,38 +1050,43 @@ void RewriteSystem::simplifyRightHandSides() {
     const auto &rhs = rule.getRHS();
 
     for (unsigned index : indices(lhs)) {
-      auto atom = lhs[index];
+      auto symbol = lhs[index];
 
       if (index != lhs.size() - 1) {
-        ASSERT_RULE(atom.getKind() != Atom::Kind::Layout);
-        ASSERT_RULE(!atom.isSuperclassOrConcreteType());
+        ASSERT_RULE(symbol.getKind() != Symbol::Kind::Layout);
+        ASSERT_RULE(!symbol.isSuperclassOrConcreteType());
       }
 
       if (index != 0) {
-        ASSERT_RULE(atom.getKind() != Atom::Kind::GenericParam);
+        ASSERT_RULE(symbol.getKind() != Symbol::Kind::GenericParam);
       }
 
       if (index != 0 && index != lhs.size() - 1) {
-        ASSERT_RULE(atom.getKind() != Atom::Kind::Protocol);
+        ASSERT_RULE(symbol.getKind() != Symbol::Kind::Protocol);
       }
     }
 
     for (unsigned index : indices(rhs)) {
-      auto atom = rhs[index];
+      auto symbol = rhs[index];
 
       // FIXME: This is only true if the input requirements were valid.
       // On invalid code, we'll need to skip this assertion (and instead
       // assert that we diagnosed an error!)
-      ASSERT_RULE(atom.getKind() != Atom::Kind::Name);
+      ASSERT_RULE(symbol.getKind() != Symbol::Kind::Name);
 
-      ASSERT_RULE(atom.getKind() != Atom::Kind::Layout);
-      ASSERT_RULE(!atom.isSuperclassOrConcreteType());
+      ASSERT_RULE(symbol.getKind() != Symbol::Kind::Layout);
+      ASSERT_RULE(!symbol.isSuperclassOrConcreteType());
 
       if (index != 0) {
-        ASSERT_RULE(atom.getKind() != Atom::Kind::GenericParam);
-        ASSERT_RULE(atom.getKind() != Atom::Kind::Protocol);
+        ASSERT_RULE(symbol.getKind() != Symbol::Kind::GenericParam);
+        ASSERT_RULE(symbol.getKind() != Symbol::Kind::Protocol);
       }
     }
+
+    auto lhsDomain = lhs.getRootProtocols();
+    auto rhsDomain = rhs.getRootProtocols();
+
+    ASSERT_RULE(lhsDomain == rhsDomain);
   }
 
 #undef ASSERT_RULE
@@ -1101,9 +1096,7 @@ void RewriteSystem::simplifyRightHandSides() {
 void RewriteSystem::dump(llvm::raw_ostream &out) const {
   out << "Rewrite system: {\n";
   for (const auto &rule : Rules) {
-    out << "- ";
-    rule.dump(out);
-    out << "\n";
+    out << "- " << rule << "\n";
   }
   out << "}\n";
 }

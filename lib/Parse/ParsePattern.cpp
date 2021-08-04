@@ -168,16 +168,20 @@ bool Parser::startsParameterName(bool isClosure) {
   // If the next token can be an argument label, we might have a name.
   if (nextTok.canBeArgumentLabel()) {
     // If the first name wasn't "isolated", we're done.
-    if (!Tok.isContextualKeyword("isolated"))
+    if (!Tok.isContextualKeyword("isolated") &&
+        !Tok.isContextualKeyword("some"))
       return true;
 
     // "isolated" can be an argument label, but it's also a contextual keyword,
-    // so look ahead one more token see if we have a ':' that would indicate
-    // that this is an argument label.
-    BacktrackingScope backtrackScope(*this);
-    consumeToken();
-    consumeToken();
-    return Tok.is(tok::colon);
+    // so look ahead one more token (two total) see if we have a ':' that would
+    // indicate that this is an argument label.
+    return lookahead<bool>(2, [&](CancellableBacktrackingScope &) {
+      if (Tok.is(tok::colon))
+        return true; // isolated :
+
+      // isolated x :
+      return Tok.canBeArgumentLabel() && nextTok.is(tok::colon);
+    });
   }
 
   if (isOptionalToken(nextTok)
@@ -260,14 +264,30 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
            Tok.isContextualKeyword("__shared") ||
            Tok.isContextualKeyword("__owned") ||
            Tok.isContextualKeyword("isolated")) {
+
       if (Tok.isContextualKeyword("isolated")) {
+        // did we already find an 'isolated' type modifier?
         if (param.IsolatedLoc.isValid()) {
           diagnose(Tok, diag::parameter_specifier_repeated)
-            .fixItRemove(Tok.getLoc());
+              .fixItRemove(Tok.getLoc());
           consumeToken();
-        } else {
-          param.IsolatedLoc = consumeToken();
+          continue;
         }
+
+        // is this 'isolated' token the identifier of an argument label?
+        bool partOfArgumentLabel = lookahead<bool>(1, [&](CancellableBacktrackingScope &) {
+          if (Tok.is(tok::colon))
+            return true;  // isolated :
+
+          // isolated x :
+          return Tok.canBeArgumentLabel() && peekToken().is(tok::colon);
+        });
+
+        if (partOfArgumentLabel)
+          break;
+
+        // consume 'isolated' as type modifier
+        param.IsolatedLoc = consumeToken();
         continue;
       }
 
@@ -304,7 +324,7 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
       diagnose(Tok, diag::parameter_let_var_as_attr, Tok.getText())
         .fixItReplace(Tok.getLoc(), "`" + Tok.getText().str() + "`");
     }
-    
+
     if (startsParameterName(isClosure)) {
       // identifier-or-none for the first name
       param.FirstNameLoc = consumeArgumentLabel(param.FirstName,
@@ -433,7 +453,7 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
         status.setIsParseError();
       }
     }
-                        
+
     // '...'?
     if (Tok.isEllipsis()) {
       Tok.setKind(tok::ellipsis);
@@ -1119,7 +1139,7 @@ ParserResult<Pattern> Parser::parsePattern() {
       // code complete anything here -- we expect an identifier.
       consumeToken(tok::code_complete);
     }
-    return nullptr;
+    return makeParserCodeCompletionStatus();
     
   case tok::kw_var:
   case tok::kw_let: {

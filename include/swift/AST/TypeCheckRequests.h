@@ -2064,7 +2064,7 @@ enum class ImplicitMemberAction : uint8_t {
   ResolveEncodable,
   ResolveDecodable,
   ResolveDistributedActor,
-  ResolveDistributedActorAddress,
+  ResolveDistributedActorIdentity,
 };
 
 class ResolveImplicitMemberRequest
@@ -2986,9 +2986,9 @@ public:
   bool isCached() const { return true; }
 };
 
-class AsyncAlternativeRequest
-    : public SimpleRequest<AsyncAlternativeRequest,
-                           AbstractFunctionDecl *(AbstractFunctionDecl *),
+class RenamedDeclRequest
+    : public SimpleRequest<RenamedDeclRequest,
+                           ValueDecl *(const ValueDecl *, const AvailableAttr *),
                            RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -2996,8 +2996,8 @@ public:
 private:
   friend SimpleRequest;
 
-  AbstractFunctionDecl *evaluate(
-      Evaluator &evaluator, AbstractFunctionDecl *attachedFunctionDecl) const;
+  ValueDecl *evaluate(Evaluator &evaluator, const ValueDecl *attached,
+                      const AvailableAttr *attr) const;
 
 public:
   bool isCached() const { return true; }

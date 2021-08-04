@@ -23,7 +23,6 @@
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/ForeignInfo.h"
 #include "swift/AST/GenericEnvironment.h"
-#include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ModuleLoader.h"
 #include "swift/AST/ProtocolConformance.h"
@@ -1300,7 +1299,7 @@ public:
     
     // Extract structural substitutions.
     if (origContextType->hasTypeParameter()) {
-      origContextType = origSig->getGenericEnvironment()
+      origContextType = origSig.getGenericEnvironment()
         ->mapTypeIntoContext(origContextType)
         ->getCanonicalType();
     }
@@ -1675,25 +1674,9 @@ private:
         || NextOrigParamIndex != Foreign.Async->completionHandlerParamIndex())
       return false;
     
-    auto nativeCHTy = Foreign.Async->completionHandlerType();
-
-    // Use the abstraction pattern we're lowering against in order to lower
-    // the completion handler type, so we can preserve C/ObjC distinctions that
-    // normally get abstracted away by the importer.
-    auto completionHandlerNativeOrigTy = TopLevelOrigType
-      .getObjCMethodAsyncCompletionHandlerType(nativeCHTy);
-    
-    // Bridge the Swift completion handler type back to its
-    // foreign representation.
-    auto foreignCHTy = TC.getLoweredBridgedType(completionHandlerNativeOrigTy,
-                                      nativeCHTy,
-                                      Bridgeability::Full,
-                                      SILFunctionTypeRepresentation::ObjCMethod,
-                                      TypeConverter::ForArgument)
-      ->getCanonicalType();
-    
-    auto completionHandlerOrigTy = TopLevelOrigType
-      .getObjCMethodAsyncCompletionHandlerType(foreignCHTy);
+    CanType foreignCHTy = TopLevelOrigType
+      .getObjCMethodAsyncCompletionHandlerForeignType(Foreign.Async.getValue(), TC);
+    auto completionHandlerOrigTy = TopLevelOrigType.getObjCMethodAsyncCompletionHandlerType(foreignCHTy);
     auto completionHandlerTy = TC.getLoweredType(completionHandlerOrigTy,
                                                  foreignCHTy, expansion)
       .getASTType();
@@ -1767,7 +1750,7 @@ static bool isPseudogeneric(SILDeclRef c) {
   if (!dc) return false;
 
   auto classDecl = dc->getSelfClassDecl();
-  return (classDecl && classDecl->usesObjCGenericsModel());
+  return (classDecl && classDecl->isTypeErasedGenericClass());
 }
 
 /// Update the result type given the foreign error convention that we will be
@@ -2847,18 +2830,31 @@ public:
 class CXXMethodConventions : public CFunctionTypeConventions {
   using super = CFunctionTypeConventions;
   const clang::CXXMethodDecl *TheDecl;
+  bool isMutating;
 
 public:
-  CXXMethodConventions(const clang::CXXMethodDecl *decl)
+  CXXMethodConventions(const clang::CXXMethodDecl *decl, bool isMutating)
       : CFunctionTypeConventions(
             ConventionsKind::CXXMethod,
             decl->getType()->castAs<clang::FunctionType>()),
-        TheDecl(decl) {}
+        TheDecl(decl), isMutating(isMutating) {}
   ParameterConvention
   getIndirectSelfParameter(const AbstractionPattern &type) const override {
-    if (TheDecl->isConst())
+    llvm_unreachable(
+        "cxx functions do not have a Swift self parameter; "
+        "foreign self parameter is handled in getIndirectParameter");
+  }
+
+  ParameterConvention
+  getIndirectParameter(unsigned int index, const AbstractionPattern &type,
+                       const TypeLowering &substTL) const override {
+    // `self` is the last parameter.
+    if (index == TheDecl->getNumParams()) {
+      if (isMutating)
+        return ParameterConvention::Indirect_Inout;
       return ParameterConvention::Indirect_In_Guaranteed;
-    return ParameterConvention::Indirect_Inout;
+    }
+    return super::getIndirectParameter(index, type, substTL);
   }
   ResultConvention getResult(const TypeLowering &resultTL) const override {
     if (isa<clang::CXXConstructorDecl>(TheDecl)) {
@@ -2910,7 +2906,9 @@ static CanSILFunctionType getSILFunctionTypeForClangDecl(
     AbstractionPattern origPattern = method->isOverloadedOperator() ?
         AbstractionPattern::getCXXOperatorMethod(origType, method, foreignInfo.Self):
         AbstractionPattern::getCXXMethod(origType, method, foreignInfo.Self);
-    auto conventions = CXXMethodConventions(method);
+    bool isMutating =
+        TC.Context.getClangModuleLoader()->isCXXMethodMutating(method);
+    auto conventions = CXXMethodConventions(method, isMutating);
     return getSILFunctionType(TC, TypeExpansionContext::minimal(), origPattern,
                               substInterfaceType, extInfoBuilder, conventions,
                               foreignInfo, constant, constant, None,

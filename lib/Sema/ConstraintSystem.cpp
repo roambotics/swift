@@ -509,6 +509,7 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
     case ComponentKind::OptionalWrap:
     case ComponentKind::Identity:
     case ComponentKind::DictionaryKey:
+    case ComponentKind::CodeCompletion:
       // These components don't have any callee associated, so just continue.
       break;
     }
@@ -843,6 +844,44 @@ Type ConstraintSystem::openType(Type type, OpenedTypeMap &replacements) {
     });
 }
 
+Type ConstraintSystem::openOpaqueType(Type type,
+                                      ConstraintLocatorBuilder locator) {
+  auto opaque = type->castTo<OpaqueTypeArchetypeType>();
+  auto opaqueLocator = locator.withPathElement(
+      LocatorPathElt::OpenedOpaqueArchetype(opaque->getDecl()));
+
+  // Open the generic signature of the opaque decl, and bind the "outer" generic
+  // params to our context. The remaining axes of freedom on the type variable
+  // corresponding to the underlying type should be the constraints on the
+  // underlying return type.
+  OpenedTypeMap replacements;
+  openGeneric(DC, opaque->getBoundSignature(), opaqueLocator, replacements);
+
+  auto underlyingTyVar = openType(opaque->getInterfaceType(), replacements);
+  assert(underlyingTyVar);
+
+  for (auto param : DC->getGenericSignatureOfContext().getGenericParams()) {
+    addConstraint(ConstraintKind::Bind, openType(param, replacements),
+                  DC->mapTypeIntoContext(param), opaqueLocator);
+  }
+
+  return underlyingTyVar;
+}
+
+Type ConstraintSystem::openOpaqueTypeRec(Type type,
+                                         ConstraintLocatorBuilder locator) {
+  // Early return if `type` is `NULL` or if there are no opaque archetypes (in
+  // which case there is certainly nothing for us to do).
+  if (!type || !type->hasOpaqueArchetype())
+    return type;
+
+  return type.transform([&](Type type) -> Type {
+    if (type->is<OpaqueTypeArchetypeType>())
+      return openOpaqueType(type, locator);
+    return type;
+  });
+}
+
 FunctionType *ConstraintSystem::openFunctionType(
        AnyFunctionType *funcType,
        ConstraintLocatorBuilder locator,
@@ -997,8 +1036,11 @@ ConstraintSystem::getPropertyWrapperInformation(
         if (!decl->hasAttachedPropertyWrapper())
           return None;
 
-        return std::make_pair(decl,
-                              decl->getPropertyWrapperBackingPropertyType());
+        auto backingTy = decl->getPropertyWrapperBackingPropertyType();
+        if (!backingTy)
+          return None;
+
+        return std::make_pair(decl, backingTy);
       });
 }
 
@@ -1398,12 +1440,8 @@ static void bindArchetypesFromContext(
       continue;
     }
 
-    // If it's not generic, there's nothing to do.
     auto genericSig = parentDC->getGenericSignatureOfContext();
-    if (!genericSig)
-      break;
-
-    for (auto *paramTy : genericSig->getGenericParams()) {
+    for (auto *paramTy : genericSig.getGenericParams()) {
       Type contextTy = cs.DC->mapTypeIntoContext(paramTy);
       bindPrimaryArchetype(paramTy, contextTy);
     }
@@ -1435,7 +1473,7 @@ void ConstraintSystem::openGenericParameters(DeclContext *outerDC,
   assert(sig);
 
   // Create the type variables for the generic parameters.
-  for (auto gp : sig->getGenericParams()) {
+  for (auto gp : sig.getGenericParams()) {
     auto *paramLocator = getConstraintLocator(
         locator.withPathElement(LocatorPathElt::GenericParameter(gp)));
 
@@ -1458,7 +1496,7 @@ void ConstraintSystem::openGenericRequirements(
     DeclContext *outerDC, GenericSignature signature,
     bool skipProtocolSelfConstraint, ConstraintLocatorBuilder locator,
     llvm::function_ref<Type(Type)> substFn) {
-  auto requirements = signature->getRequirements();
+  auto requirements = signature.getRequirements();
   for (unsigned pos = 0, n = requirements.size(); pos != n; ++pos) {
     const auto &req = requirements[pos];
 
@@ -2957,6 +2995,10 @@ Type ConstraintSystem::simplifyTypeImpl(Type type,
       // Simplify the base.
       Type newBase = simplifyTypeImpl(depMemTy->getBase(), getFixedTypeFn);
 
+      if (newBase->isPlaceholder()) {
+        return PlaceholderType::get(getASTContext(), depMemTy);
+      }
+
       // If nothing changed, we're done.
       if (newBase.getPointer() == depMemTy->getBase().getPointer())
         return type;
@@ -3774,16 +3816,7 @@ static bool diagnoseContextualFunctionCallGenericAmbiguity(
                                             TypeVariableType *typeVar) {
     auto argParamMatch = argMatching->second.parameterBindings[argIdx];
     auto param = applyFnType->getParams()[argParamMatch.front()];
-    if (param.isVariadic()) {
-      auto paramType = param.getParameterType();
-      // Variadic parameter is constructed as an ArraySliceType(which is
-      // just sugared type for a bound generic) with the closure type as
-      // element.
-      auto baseType = paramType->getDesugaredType()->castTo<BoundGenericType>();
-      auto paramFnType = baseType->getGenericArgs()[0]->castTo<FunctionType>();
-      return cs.typeVarOccursInType(typeVar, paramFnType->getResult());
-    }
-    auto paramFnType = param.getParameterType()->castTo<FunctionType>();
+    auto paramFnType = param.getPlainType()->castTo<FunctionType>();
     return cs.typeVarOccursInType(typeVar, paramFnType->getResult());
   };
 
@@ -3904,6 +3937,16 @@ bool ConstraintSystem::diagnoseAmbiguityWithFixes(
       solution.dump(log);
       log << "\n";
     }
+  }
+
+  // If there either no fixes at all or all of the are warnings,
+  // let's diagnose this as regular ambiguity.
+  if (llvm::all_of(solutions, [](const Solution &solution) {
+        return llvm::all_of(solution.Fixes, [](const ConstraintFix *fix) {
+          return fix->isWarning();
+        });
+      })) {
+    return diagnoseAmbiguity(solutions);
   }
 
   // Algorithm is as follows:
@@ -5097,6 +5140,7 @@ ConstraintSystem::isConversionEphemeral(ConversionRestrictionKind conversion,
 
 Expr *ConstraintSystem::buildAutoClosureExpr(Expr *expr,
                                              FunctionType *closureType,
+                                             DeclContext *ClosureContext,
                                              bool isDefaultWrappedValue,
                                              bool isAsyncLetWrapper) {
   auto &Context = DC->getASTContext();
@@ -5115,8 +5159,9 @@ Expr *ConstraintSystem::buildAutoClosureExpr(Expr *expr,
     newClosureType = closureType->withExtInfo(info.withNoEscape(false))
                          ->castTo<FunctionType>();
 
-  auto *closure = new (Context) AutoClosureExpr(
-      expr, newClosureType, AutoClosureExpr::InvalidDiscriminator, DC);
+  auto *closure = new (Context)
+      AutoClosureExpr(expr, newClosureType,
+                      AutoClosureExpr::InvalidDiscriminator, ClosureContext);
 
   closure->setParameterList(ParameterList::createEmpty(Context));
 
@@ -5372,23 +5417,11 @@ bool SolutionApplicationTarget::infersOpaqueReturnType() const {
   assert(kind == Kind::expression);
   switch (expression.contextualPurpose) {
   case CTP_Initialization:
-    if (Type convertType = expression.convertType.getType()) {
-      return convertType->is<OpaqueTypeArchetypeType>();
-    }
-    return false;
-
   case CTP_ReturnStmt:
   case CTP_ReturnSingleExpr:
-    if (Type convertType = expression.convertType.getType()) {
-      if (auto opaqueType = convertType->getAs<OpaqueTypeArchetypeType>()) {
-        auto dc = getDeclContext();
-        if (auto func = dyn_cast<AbstractFunctionDecl>(dc)) {
-          return opaqueType->getDecl()->isOpaqueReturnTypeOfFunction(func);
-        }
-      }
-    }
+    if (Type convertType = expression.convertType.getType())
+      return convertType->hasOpaqueArchetype();
     return false;
-
   default:
     return false;
   }
@@ -5568,7 +5601,7 @@ static Optional<Requirement> getRequirement(ConstraintSystem &cs,
   if (auto openedGeneric =
           reqLocator->findLast<LocatorPathElt::OpenedGeneric>()) {
     auto signature = openedGeneric->getSignature();
-    return signature->getRequirements()[reqLoc->getIndex()];
+    return signature.getRequirements()[reqLoc->getIndex()];
   }
 
   return None;

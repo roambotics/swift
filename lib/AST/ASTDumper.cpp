@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -499,11 +499,12 @@ namespace {
         PrintWithColorRAII(OS, DeclModifierColor) << " trailing_semi";
     }
 
-    void printInherited(ArrayRef<TypeLoc> Inherited) {
+    void printInherited(ArrayRef<InheritedEntry> Inherited) {
       if (Inherited.empty())
         return;
       OS << " inherits: ";
-      interleave(Inherited, [&](TypeLoc Super) { Super.getType().print(OS); },
+      interleave(Inherited,
+                 [&](InheritedEntry Super) { Super.getType().print(OS); },
                  [&] { OS << ", "; });
     }
 
@@ -854,6 +855,10 @@ namespace {
         D->getCaptureInfo().print(OS);
       }
 
+      if (D->isDistributed()) {
+        OS << " distributed";
+      }
+
       if (auto fac = D->getForeignAsyncConvention()) {
         OS << " foreign_async=";
         if (auto type = fac->completionHandlerType())
@@ -1140,43 +1145,23 @@ namespace {
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
 
-    void printOperatorIdentifiers(OperatorDecl *OD) {
-      auto identifiers = OD->getIdentifiers();
-      for (auto index : indices(identifiers)) {
-        OS.indent(Indent + 2);
-        OS << "identifier #" << index << " " << identifiers[index].Item;
-        if (index != identifiers.size() - 1)
-          OS << "\n";
-      }
-    }
-
     void visitInfixOperatorDecl(InfixOperatorDecl *IOD) {
       printCommon(IOD, "infix_operator_decl");
       OS << " " << IOD->getName();
-      if (!IOD->getIdentifiers().empty()) {
-        OS << "\n";
-        printOperatorIdentifiers(IOD);
-      }
+      if (!IOD->getPrecedenceGroupName().empty())
+        OS << " precedence_group_name=" << IOD->getPrecedenceGroupName();
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
 
     void visitPrefixOperatorDecl(PrefixOperatorDecl *POD) {
       printCommon(POD, "prefix_operator_decl");
       OS << " " << POD->getName();
-      if (!POD->getIdentifiers().empty()) {
-        OS << "\n";
-        printOperatorIdentifiers(POD);
-      }
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
 
     void visitPostfixOperatorDecl(PostfixOperatorDecl *POD) {
       printCommon(POD, "postfix_operator_decl");
       OS << " " << POD->getName();
-      if (!POD->getIdentifiers().empty()) {
-        OS << "\n";
-        printOperatorIdentifiers(POD);
-      }
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
 
@@ -1315,9 +1300,11 @@ std::string ValueDecl::printRef() const {
 }
 
 void ValueDecl::dumpRef(raw_ostream &os) const {
-  // Print the context.
-  printContext(os, getDeclContext());
-  os << ".";
+  if (!isa<ModuleDecl>(this)) {
+    // Print the context.
+    printContext(os, getDeclContext());
+    os << ".";
+  }
 
   // Print name.
   getName().printPretty(os);
@@ -2775,6 +2762,9 @@ public:
         PrintWithColorRAII(OS, IdentifierColor)
           << "  key='" << component.getUnresolvedDeclName() << "'";
         break;
+      case KeyPathExpr::Component::Kind::CodeCompletion:
+        PrintWithColorRAII(OS, ASTNodeColor) << "completion";
+        break;
       }
       PrintWithColorRAII(OS, TypeColor)
         << " type='" << GetTypeOfKeyPathComponent(E, i) << "'";
@@ -3252,6 +3242,10 @@ static void dumpProtocolConformanceRec(
                                visited);
     break;
   }
+
+  case ProtocolConformanceKind::Builtin: {
+    printCommon("builtin");
+  }
   }
 
   PrintWithColorRAII(out, ParenthesisColor) << ')';
@@ -3276,7 +3270,7 @@ static void dumpSubstitutionMapRec(
   }
 
   genericSig->print(out);
-  auto genericParams = genericSig->getGenericParams();
+  auto genericParams = genericSig.getGenericParams();
   auto replacementTypes =
       static_cast<const SubstitutionMap &>(map).getReplacementTypesBuffer();
   for (unsigned i : indices(genericParams)) {
@@ -3305,7 +3299,7 @@ static void dumpSubstitutionMapRec(
     return;
 
   auto conformances = map.getConformances();
-  for (const auto &req : genericSig->getRequirements()) {
+  for (const auto &req : genericSig.getRequirements()) {
     if (req.getKind() != RequirementKind::Conformance)
       continue;
 
