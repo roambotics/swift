@@ -1015,7 +1015,8 @@ LLVM_ATTRIBUTE_USED void AccessPath::dump() const { print(llvm::dbgs()); }
 void AccessPathWithBase::print(raw_ostream &os) const {
   if (base)
     os << "Base: " << base;
-
+  else
+    os << "Base: unidentified\n";
   accessPath.print(os);
 }
 
@@ -1256,7 +1257,7 @@ int AccessPathDefUseTraversal::getPathOffset(const DFSEntry &dfs) const {
 bool AccessPathDefUseTraversal::checkAndUpdateOffset(DFSEntry &dfs) {
   int pathOffset = getPathOffset(dfs);
   if (dfs.offset == AccessPath::UnknownOffset) {
-    if (pathOffset > 0) {
+    if (pathOffset != 0) {
       // Pop the offset from the expected path; there should only be
       // one. Continue matching subobject indices even after seeing an unknown
       // offset. A subsequent mismatching subobject index is still considered
