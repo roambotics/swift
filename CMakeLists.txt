@@ -127,6 +127,10 @@ option(SWIFT_BUILD_PERF_TESTSUITE
 
 option(SWIFT_INCLUDE_TESTS "Create targets for building/running tests." TRUE)
 
+option(SWIFT_INCLUDE_TEST_BINARIES
+  "Create targets for building/running test binaries even if SWIFT_INCLUDE_TESTS is disabled"
+  TRUE)
+
 option(SWIFT_INCLUDE_DOCS
     "Create targets for building docs."
     TRUE)
@@ -439,6 +443,10 @@ option(SWIFT_ENABLE_DISPATCH
   "Enable use of libdispatch"
   TRUE)
 
+option(SWIFT_ENABLE_GLOBAL_ISEL_ARM64
+  "Enable global isel on arm64"
+  FALSE)
+
 cmake_dependent_option(SWIFT_BUILD_SYNTAXPARSERLIB
   "Build the Swift Syntax Parser library" TRUE
   "SWIFT_ENABLE_DISPATCH" FALSE)
@@ -608,10 +616,15 @@ set(SWIFT_DARWIN_VARIANTS "^(macosx|iphoneos|iphonesimulator|appletvos|appletvsi
 set(SWIFT_DARWIN_EMBEDDED_VARIANTS "^(iphoneos|iphonesimulator|appletvos|appletvsimulator|watchos|watchsimulator)")
 
 # A convenient list to match Darwin SDKs. Example:
-#  if("${SWIFT_HOST_VARIANT_SDK}" IN_LIST SWIFT_APPLE_PLATFORMS)
+#  if("${SWIFT_HOST_VARIANT_SDK}" IN_LIST SWIFT_DARWIN_PLATFORMS)
 #    ...
 #  endif()
-set(SWIFT_APPLE_PLATFORMS "IOS" "IOS_SIMULATOR" "TVOS" "TVOS_SIMULATOR" "WATCHOS" "WATCHOS_SIMULATOR" "OSX")
+set(SWIFT_DARWIN_PLATFORMS "IOS" "IOS_SIMULATOR" "TVOS" "TVOS_SIMULATOR" "WATCHOS" "WATCHOS_SIMULATOR" "OSX")
+
+set(SWIFT_APPLE_PLATFORMS ${SWIFT_DARWIN_PLATFORMS})
+if(SWIFT_FREESTANDING_FLAVOR STREQUAL "apple")
+  list(APPEND SWIFT_APPLE_PLATFORMS "FREESTANDING")
+endif()
 
 # Configuration flags passed to all of our invocations of gyb.  Try to
 # avoid making up new variable names here if you can find a CMake
@@ -738,6 +751,12 @@ if("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "LINUX")
     configure_sdk_unix("Linux" "${SWIFT_HOST_VARIANT_ARCH}")
     set(SWIFT_PRIMARY_VARIANT_SDK_default  "${SWIFT_HOST_VARIANT_SDK}")
     set(SWIFT_PRIMARY_VARIANT_ARCH_default "${SWIFT_HOST_VARIANT_ARCH}")
+  endif()
+
+  is_sdk_requested(FREESTANDING swift_build_freestanding)
+  if(swift_build_freestanding AND (SWIFT_FREESTANDING_FLAVOR STREQUAL "linux"))
+    # TODO
+    # configure_sdk_unix("FREESTANDING" "${SWIFT_HOST_VARIANT_ARCH}")
   endif()
 
 elseif("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "FREEBSD")
@@ -1040,6 +1059,11 @@ if(SWIFT_BUILD_STDLIB)
 else()
   if(SWIFT_BUILD_STDLIB_EXTRA_TOOLCHAIN_CONTENT)
     add_subdirectory(stdlib/toolchain)
+  endif()
+
+  if (BUILD_SWIFT_CONCURRENCY_BACK_DEPLOYMENT_LIBRARIES)
+    # Build the back-deployed concurrency library.
+    add_subdirectory(stdlib/public/BackDeployConcurrency)
   endif()
 
   # Some tools (e.g. swift-reflection-dump) rely on a host swiftReflection, so

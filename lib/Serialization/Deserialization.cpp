@@ -609,7 +609,7 @@ ModuleFile::readConformanceChecked(llvm::BitstreamCursor &Cursor,
       module = getAssociatedModule();
 
     SmallVector<ProtocolConformance *, 2> conformances;
-    nominal->lookupConformance(module, proto, conformances);
+    nominal->lookupConformance(proto, conformances);
     PrettyStackTraceModuleFile traceMsg(
         "If you're seeing a crash here, check that your SDK and dependencies "
         "are at least as new as the versions used to build", *this);
@@ -3561,14 +3561,13 @@ public:
                                        StringRef blobData) {
     IdentifierID nameID;
     DeclContextID contextID;
-    bool isImplicit, isClassBounded, isObjC, existentialTypeSupported;
+    bool isImplicit, isClassBounded, isObjC;
     uint8_t rawAccessLevel;
     unsigned numInheritedTypes;
     ArrayRef<uint64_t> rawInheritedAndDependencyIDs;
 
     decls_block::ProtocolLayout::readRecord(scratch, nameID, contextID,
                                             isImplicit, isClassBounded, isObjC,
-                                            existentialTypeSupported,
                                             rawAccessLevel, numInheritedTypes,
                                             rawInheritedAndDependencyIDs);
 
@@ -3594,8 +3593,6 @@ public:
 
     ctx.evaluator.cacheOutput(ProtocolRequiresClassRequest{proto},
                               std::move(isClassBounded));
-    ctx.evaluator.cacheOutput(ExistentialTypeSupportedRequest{proto},
-                              std::move(existentialTypeSupported));
 
     if (auto accessLevel = getActualAccessLevel(rawAccessLevel))
       proto->setAccess(*accessLevel);
@@ -6495,8 +6492,7 @@ void ModuleFile::finishNormalConformance(NormalProtocolConformance *conformance,
     } else {
       fatal(thirdOrError.takeError());
     }
-    if (third &&
-        isa<TypeAliasDecl>(third) &&
+    if (isa_and_nonnull<TypeAliasDecl>(third) &&
         third->getModuleContext() != getAssociatedModule() &&
         !third->getDeclaredInterfaceType()->isEqual(second)) {
       // Conservatively drop references to typealiases in other modules
@@ -6556,8 +6552,8 @@ void ModuleFile::finishNormalConformance(NormalProtocolConformance *conformance,
     } else {
       fatal(deserializedWitness.takeError());
     }
-    
-    assert(!req || isOpaque || witness ||
+
+    assert(allowCompilerErrors() || !req || isOpaque || witness ||
            req->getAttrs().hasAttribute<OptionalAttr>() ||
            req->getAttrs().isUnavailable(getContext()));
     if (!witness && !isOpaque) {

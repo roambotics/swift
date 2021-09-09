@@ -412,13 +412,15 @@ static bool buildModuleFromInterface(CompilerInstance &Instance) {
   StringRef InputPath = FEOpts.InputsAndOutputs.getFilenameOfFirstInput();
   StringRef PrebuiltCachePath = FEOpts.PrebuiltModuleCachePath;
   ModuleInterfaceLoaderOptions LoaderOpts(FEOpts);
+  StringRef ABIPath = Instance.getPrimarySpecificPathsForAtMostOnePrimary()
+    .SupplementaryOutputs.ABIDescriptorOutputPath;
   return ModuleInterfaceLoader::buildSwiftModuleFromSwiftInterface(
       Instance.getSourceMgr(), Instance.getDiags(),
       Invocation.getSearchPathOptions(), Invocation.getLangOptions(),
       Invocation.getClangImporterOptions(),
       Invocation.getClangModuleCachePath(), PrebuiltCachePath,
       FEOpts.BackupModuleInterfaceDir,
-      Invocation.getModuleName(), InputPath, Invocation.getOutputFilename(),
+      Invocation.getModuleName(), InputPath, Invocation.getOutputFilename(), ABIPath,
       FEOpts.SerializeModuleInterfaceDependencyHashes,
       FEOpts.shouldTrackSystemDependencies(), LoaderOpts,
       RequireOSSAModules_t(Invocation.getSILOptions()));
@@ -693,16 +695,28 @@ static bool performCompileStepsPostSema(CompilerInstance &Instance,
                                         int &ReturnValue,
                                         FrontendObserver *observer) {
   const auto &Invocation = Instance.getInvocation();
-  const SILOptions &SILOpts = Invocation.getSILOptions();
   const FrontendOptions &opts = Invocation.getFrontendOptions();
+
+  auto getSILOptions = [&](const PrimarySpecificPaths &PSPs) -> SILOptions {
+    SILOptions SILOpts = Invocation.getSILOptions();
+    if (SILOpts.OptRecordFile.empty()) {
+      // Check if the record file path was passed via supplemental outputs.
+      SILOpts.OptRecordFile = SILOpts.OptRecordFormat ==
+        llvm::remarks::Format::YAML ?
+          PSPs.SupplementaryOutputs.YAMLOptRecordPath :
+          PSPs.SupplementaryOutputs.BitstreamOptRecordPath;
+    }
+    return SILOpts;
+  };
 
   auto *mod = Instance.getMainModule();
   if (!opts.InputsAndOutputs.hasPrimaryInputs()) {
     // If there are no primary inputs the compiler is in WMO mode and builds one
     // SILModule for the entire module.
-    auto SM = performASTLowering(mod, Instance.getSILTypes(), SILOpts);
     const PrimarySpecificPaths PSPs =
         Instance.getPrimarySpecificPathsForWholeModuleOptimizationMode();
+    SILOptions SILOpts = getSILOptions(PSPs);
+    auto SM = performASTLowering(mod, Instance.getSILTypes(), SILOpts);
     return performCompileStepsPostSILGen(Instance, std::move(SM), mod, PSPs,
                                          ReturnValue, observer);
   }
@@ -712,10 +726,11 @@ static bool performCompileStepsPostSema(CompilerInstance &Instance,
   if (!Instance.getPrimarySourceFiles().empty()) {
     bool result = false;
     for (auto *PrimaryFile : Instance.getPrimarySourceFiles()) {
-      auto SM = performASTLowering(*PrimaryFile, Instance.getSILTypes(),
-                                   SILOpts);
       const PrimarySpecificPaths PSPs =
           Instance.getPrimarySpecificPathsForSourceFile(*PrimaryFile);
+      SILOptions SILOpts = getSILOptions(PSPs);
+      auto SM = performASTLowering(*PrimaryFile, Instance.getSILTypes(),
+                                   SILOpts);
       result |= performCompileStepsPostSILGen(Instance, std::move(SM),
                                               PrimaryFile, PSPs, ReturnValue,
                                               observer);
@@ -730,9 +745,10 @@ static bool performCompileStepsPostSema(CompilerInstance &Instance,
   for (FileUnit *fileUnit : mod->getFiles()) {
     if (auto SASTF = dyn_cast<SerializedASTFile>(fileUnit))
       if (opts.InputsAndOutputs.isInputPrimary(SASTF->getFilename())) {
-        auto SM = performASTLowering(*SASTF, Instance.getSILTypes(), SILOpts);
         const PrimarySpecificPaths &PSPs =
             Instance.getPrimarySpecificPathsForPrimary(SASTF->getFilename());
+        SILOptions SILOpts = getSILOptions(PSPs);
+        auto SM = performASTLowering(*SASTF, Instance.getSILTypes(), SILOpts);
         result |= performCompileStepsPostSILGen(Instance, std::move(SM), mod,
                                                 PSPs, ReturnValue, observer);
       }
@@ -1494,9 +1510,19 @@ static bool performCompileStepsPostSILGen(CompilerInstance &Instance,
     SerializationOptions serializationOpts =
         Invocation.computeSerializationOptions(outs, Instance.getMainModule());
 
+    // Infer if this is an emit-module job part of an incremental build,
+    // vs a partial emit-module job (with primary files) or other kinds.
+    // We may want to rely on a flag instead to differentiate them.
+    const bool isEmitModuleSeparately =
+        Action == FrontendOptions::ActionType::EmitModuleOnly &&
+        MSF.is<ModuleDecl *>() &&
+        Instance.getInvocation()
+            .getTypeCheckerOptions()
+            .SkipFunctionBodies == FunctionBodySkipping::NonInlinableWithoutTypes;
     const bool canEmitIncrementalInfoIntoModule =
         !serializationOpts.DisableCrossModuleIncrementalInfo &&
-        (Action == FrontendOptions::ActionType::MergeModules);
+        (Action == FrontendOptions::ActionType::MergeModules ||
+         isEmitModuleSeparately);
     if (canEmitIncrementalInfoIntoModule) {
       const auto alsoEmitDotFile =
           Instance.getInvocation()
@@ -1829,7 +1855,7 @@ static void printTripleInfo(const llvm::Triple &triple,
   }
 
   out << "    \"librariesRequireRPath\": "
-      << (tripleRequiresRPathForSwiftInOS(triple) ? "true" : "false")
+      << (tripleRequiresRPathForSwiftLibrariesInOS(triple) ? "true" : "false")
       << "\n";
 
   out << "  }";

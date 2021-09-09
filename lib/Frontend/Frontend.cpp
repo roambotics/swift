@@ -764,6 +764,8 @@ static bool shouldImportConcurrencyByDefault(const llvm::Triple &target) {
   if (target.isOSLinux())
     return true;
 #if SWIFT_IMPLICIT_CONCURRENCY_IMPORT
+  if (target.isOSWASI())
+    return true;
   if (target.isOSOpenBSD())
     return true;
 #endif
@@ -773,12 +775,6 @@ static bool shouldImportConcurrencyByDefault(const llvm::Triple &target) {
 bool CompilerInvocation::shouldImportSwiftConcurrency() const {
   return shouldImportConcurrencyByDefault(getLangOptions().Target) &&
       !getLangOptions().DisableImplicitConcurrencyModuleImport &&
-      getFrontendOptions().InputMode !=
-        FrontendOptions::ParseInputMode::SwiftModuleInterface;
-}
-
-bool CompilerInvocation::shouldImportSwiftDistributed() const {
-  return getLangOptions().EnableExperimentalDistributed &&
       getFrontendOptions().InputMode !=
         FrontendOptions::ParseInputMode::SwiftModuleInterface;
 }
@@ -973,6 +969,9 @@ ModuleDecl *CompilerInstance::getMainModule() const {
     }
     if (Invocation.getFrontendOptions().EnableLibraryEvolution)
       MainModule->setResilienceStrategy(ResilienceStrategy::Resilient);
+    if (Invocation.getLangOptions().WarnConcurrency ||
+        Invocation.getLangOptions().isSwiftVersionAtLeast(6))
+      MainModule->setIsConcurrencyChecked(true);
 
     // Register the main module with the AST context.
     Context->addLoadedModule(MainModule);
@@ -1154,10 +1153,10 @@ CompilerInstance::getSourceFileParsingOptions(bool forPrimary) const {
       opts |= SourceFile::ParsingFlags::DisableDelayedBodies;
   }
 
+  auto typeOpts = getASTContext().TypeCheckerOpts;
   if (forPrimary || isWholeModuleCompilation()) {
     // Disable delayed body parsing for primaries and in WMO, unless
     // forcefully skipping function bodies
-    auto typeOpts = getASTContext().TypeCheckerOpts;
     if (typeOpts.SkipFunctionBodies == FunctionBodySkipping::None)
       opts |= SourceFile::ParsingFlags::DisableDelayedBodies;
   } else {
@@ -1166,9 +1165,10 @@ CompilerInstance::getSourceFileParsingOptions(bool forPrimary) const {
     opts |= SourceFile::ParsingFlags::SuppressWarnings;
   }
 
-  // Enable interface hash computation for primaries, but not in WMO, as it's
-  // only currently needed for incremental mode.
-  if (forPrimary) {
+  // Enable interface hash computation for primaries or emit-module-separately,
+  // but not in WMO, as it's only currently needed for incremental mode.
+  if (forPrimary ||
+      typeOpts.SkipFunctionBodies == FunctionBodySkipping::NonInlinableWithoutTypes) {
     opts |= SourceFile::ParsingFlags::EnableInterfaceHash;
   }
   return opts;

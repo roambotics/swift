@@ -357,6 +357,15 @@ bool MemoryLocations::analyzeLocationUsesRecursively(SILValue V, unsigned locIdx
         if (!handleNonTrivialProjections && hasInoutArgument(ApplySite(user)))
           return false;
         break;
+      case SILInstructionKind::LoadBorrowInst:
+        // Reborrows are not handled
+        if (!cast<LoadBorrowInst>(user)->getUsersOfType<BranchInst>().empty())
+          return false;
+        break;
+      case SILInstructionKind::DebugValueInst:
+        if (cast<DebugValueInst>(user)->hasAddrVal())
+          break;
+        return false;
       case SILInstructionKind::InjectEnumAddrInst:
       case SILInstructionKind::SelectEnumAddrInst:
       case SILInstructionKind::ExistentialMetatypeInst:
@@ -367,7 +376,6 @@ bool MemoryLocations::analyzeLocationUsesRecursively(SILValue V, unsigned locIdx
       case SILInstructionKind::StoreInst:
       case SILInstructionKind::StoreBorrowInst:
       case SILInstructionKind::EndAccessInst:
-      case SILInstructionKind::LoadBorrowInst:
       case SILInstructionKind::DestroyAddrInst:
       case SILInstructionKind::CheckedCastAddrBranchInst:
       case SILInstructionKind::UncheckedRefCastAddrInst:
@@ -375,7 +383,6 @@ bool MemoryLocations::analyzeLocationUsesRecursively(SILValue V, unsigned locIdx
       case SILInstructionKind::ApplyInst:
       case SILInstructionKind::TryApplyInst:
       case SILInstructionKind::BeginApplyInst:
-      case SILInstructionKind::DebugValueAddrInst:
       case SILInstructionKind::CopyAddrInst:
       case SILInstructionKind::YieldInst:
       case SILInstructionKind::DeallocStackInst:

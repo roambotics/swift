@@ -737,8 +737,25 @@ void AttributeChecker::visitAccessControlAttr(AccessControlAttr *attr) {
 
   if (auto extension = dyn_cast<ExtensionDecl>(D)) {
     if (attr->getAccess() == AccessLevel::Open) {
-      diagnose(attr->getLocation(), diag::access_control_extension_open)
-        .fixItReplace(attr->getRange(), "public");
+      auto diag =
+          diagnose(attr->getLocation(), diag::access_control_extension_open);
+      diag.fixItRemove(attr->getRange());
+      for (auto Member : extension->getMembers()) {
+        if (auto *VD = dyn_cast<ValueDecl>(Member)) {
+          if (VD->getAttrs().hasAttribute<AccessControlAttr>())
+            continue;
+
+          StringRef accessLevel = VD->isObjC() ? "open " : "public ";
+
+          if (auto *FD = dyn_cast<FuncDecl>(VD))
+            diag.fixItInsert(FD->getFuncLoc(), accessLevel);
+
+          if (auto *VAD = dyn_cast<VarDecl>(VD))
+            diag.fixItInsert(VAD->getParentPatternBinding()->getLoc(),
+                             accessLevel);
+        }
+      }
+
       attr->setInvalid();
       return;
     }
@@ -1903,7 +1920,9 @@ synthesizeMainBody(AbstractFunctionDecl *fn, void *arg) {
                                                       DeclNameLoc(),
                                                       /*implicit=*/true);
     funcExpr->setType(runner->getInterfaceType());
-    auto *callExpr = CallExpr::createImplicit(context, funcExpr, memberRefExpr, {});
+    auto *argList =
+        ArgumentList::forImplicitUnlabeled(context, {memberRefExpr});
+    auto *callExpr = CallExpr::createImplicit(context, funcExpr, argList);
     returnedExpr = callExpr;
   } else if (mainFunction->hasThrows()) {
     auto *tryExpr = new (context) TryExpr(
@@ -2910,7 +2929,7 @@ void AttributeChecker::visitImplementsAttr(ImplementsAttr *attr) {
     // conforms to the specified protocol.
     NominalTypeDecl *NTD = DC->getSelfNominalTypeDecl();
     SmallVector<ProtocolConformance *, 2> conformances;
-    if (!NTD->lookupConformance(DC->getParentModule(), PD, conformances)) {
+    if (!NTD->lookupConformance(PD, conformances)) {
       diagnose(attr->getLocation(),
                diag::implements_attr_protocol_not_conformed_to,
                NTD->getName(), PD->getName())
@@ -2953,7 +2972,30 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
   auto nominal = evaluateOrDefault(
     Ctx.evaluator, CustomAttrNominalRequest{attr, dc}, nullptr);
 
+  // Diagnose errors.
   if (!nominal) {
+    auto typeRepr = attr->getTypeRepr();
+
+    auto type = TypeResolution::forInterface(dc, TypeResolverContext::CustomAttr,
+                                             // Unbound generics and placeholders
+                                             // are not allowed within this
+                                             // attribute.
+                                             /*unboundTyOpener*/ nullptr,
+                                             /*placeholderHandler*/ nullptr)
+        .resolveType(typeRepr);
+
+    if (type->is<ErrorType>()) {
+      // Type resolution has failed, and we should have diagnosed something already.
+      assert(Ctx.hadError());
+    } else {
+      // Otherwise, something odd happened.
+      std::string typeName;
+      llvm::raw_string_ostream out(typeName);
+      typeRepr->print(out);
+
+      Ctx.Diags.diagnose(attr->getLocation(), diag::unknown_attribute, typeName);
+    }
+
     attr->setInvalid();
     return;
   }
@@ -2973,7 +3015,7 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
     if (isa<ParamDecl>(D)) {
       // Check for unsupported declarations.
       auto *context = D->getDeclContext()->getAsDecl();
-      if (context && isa<SubscriptDecl>(context)) {
+      if (isa_and_nonnull<SubscriptDecl>(context)) {
         diagnose(attr->getLocation(),
                  diag::property_wrapper_param_not_supported,
                  context->getDescriptiveKind());
@@ -3044,9 +3086,9 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
     }
 
     // Diagnose and ignore arguments.
-    if (attr->getArg()) {
+    if (attr->hasArgs()) {
       diagnose(attr->getLocation(), diag::result_builder_arguments)
-        .highlight(attr->getArg()->getSourceRange());
+        .highlight(attr->getArgs()->getSourceRange());
     }
 
     // Complain if this isn't the primary result-builder attribute.

@@ -68,12 +68,6 @@ static_assert(DeclAttribute::isOptionSetFor##Id(DeclAttribute::DeclAttrOptions::
               #Name " needs to specify either APIBreakingToRemove or APIStableToRemove");
 #include "swift/AST/Attr.def"
 
-// Only allow allocation of attributes using the allocator in ASTContext.
-void *AttributeBase::operator new(size_t Bytes, ASTContext &C,
-                                  unsigned Alignment) {
-  return C.Allocate(Bytes, Alignment);
-}
-
 StringRef swift::getAccessLevelSpelling(AccessLevel value) {
   switch (value) {
   case AccessLevel::Private: return "private";
@@ -326,6 +320,38 @@ DeclAttributes::getDeprecated(const ASTContext &ctx) const {
   return conditional;
 }
 
+const AvailableAttr *
+DeclAttributes::getSoftDeprecated(const ASTContext &ctx) const {
+  const AvailableAttr *conditional = nullptr;
+  const AvailableAttr *bestActive = findMostSpecificActivePlatform(ctx);
+  for (auto Attr : *this) {
+    if (auto AvAttr = dyn_cast<AvailableAttr>(Attr)) {
+      if (AvAttr->isInvalid())
+        continue;
+
+      if (AvAttr->hasPlatform() &&
+          (!bestActive || AvAttr != bestActive))
+        continue;
+
+      if (!AvAttr->isActivePlatform(ctx) &&
+          !AvAttr->isLanguageVersionSpecific() &&
+          !AvAttr->isPackageDescriptionVersionSpecific())
+        continue;
+
+      Optional<llvm::VersionTuple> DeprecatedVersion = AvAttr->Deprecated;
+      if (!DeprecatedVersion.hasValue())
+        continue;
+
+      llvm::VersionTuple ActiveVersion = AvAttr->getActiveVersion(ctx);
+
+      if (DeprecatedVersion.getValue() > ActiveVersion) {
+        conditional = AvAttr;
+      }
+    }
+  }
+  return conditional;
+}
+
 void DeclAttributes::dump(const Decl *D) const {
   StreamPrinter P(llvm::errs());
   PrintOptions PO = PrintOptions::printEverything();
@@ -425,7 +451,9 @@ static void printShortFormAvailable(ArrayRef<const DeclAttribute *> Attrs,
     for (auto *DA : Attrs) {
       auto *AvailAttr = cast<AvailableAttr>(DA);
       assert(AvailAttr->Introduced.hasValue());
-      if (isShortFormAvailabilityImpliedByOther(AvailAttr, Attrs))
+      // Avoid omitting available attribute when we are printing module interface.
+      if (!Options.IsForSwiftInterface &&
+          isShortFormAvailabilityImpliedByOther(AvailAttr, Attrs))
         continue;
       Printer << platformString(AvailAttr->Platform) << " "
               << AvailAttr->Introduced.getValue().getAsString() << ", ";
@@ -1959,47 +1987,24 @@ TypeRepr *ImplementsAttr::getProtocolTypeRepr() const {
 }
 
 CustomAttr::CustomAttr(SourceLoc atLoc, SourceRange range, TypeExpr *type,
-                       PatternBindingInitializer *initContext, Expr *arg,
-                       ArrayRef<Identifier> argLabels,
-                       ArrayRef<SourceLoc> argLabelLocs, bool implicit)
-    : DeclAttribute(DAK_Custom, atLoc, range, implicit),
-      typeExpr(type),
-      arg(arg),
-      initContext(initContext) {
+                       PatternBindingInitializer *initContext,
+                       ArgumentList *argList, bool implicit)
+    : DeclAttribute(DAK_Custom, atLoc, range, implicit), typeExpr(type),
+      argList(argList), initContext(initContext) {
   assert(type);
-  hasArgLabelLocs = !argLabelLocs.empty();
-  numArgLabels = argLabels.size();
   isArgUnsafeBit = false;
-  initializeCallArguments(argLabels, argLabelLocs);
 }
 
 CustomAttr *CustomAttr::create(ASTContext &ctx, SourceLoc atLoc, TypeExpr *type,
-                               bool hasInitializer,
                                PatternBindingInitializer *initContext,
-                               SourceLoc lParenLoc,
-                               ArrayRef<Expr *> args,
-                               ArrayRef<Identifier> argLabels,
-                               ArrayRef<SourceLoc> argLabelLocs,
-                               SourceLoc rParenLoc,
-                               bool implicit) {
+                               ArgumentList *argList, bool implicit) {
   assert(type);
-  SmallVector<Identifier, 2> argLabelsScratch;
-  SmallVector<SourceLoc, 2> argLabelLocsScratch;
-  Expr *arg = nullptr;
-  if (hasInitializer) {
-    arg = packSingleArgument(ctx, lParenLoc, args, argLabels, argLabelLocs,
-                             rParenLoc, /*trailingClosures=*/{}, implicit,
-                             argLabelsScratch, argLabelLocsScratch);
-  }
-
   SourceRange range(atLoc, type->getSourceRange().End);
-  if (arg)
-    range.End = arg->getEndLoc();
+  if (argList)
+    range.End = argList->getEndLoc();
 
-  size_t size = totalSizeToAlloc(argLabels, argLabelLocs);
-  void *mem = ctx.Allocate(size, alignof(CustomAttr));
-  return new (mem) CustomAttr(atLoc, range, type, initContext, arg, argLabels,
-                              argLabelLocs, implicit);
+  return new (ctx)
+      CustomAttr(atLoc, range, type, initContext, argList, implicit);
 }
 
 TypeRepr *CustomAttr::getTypeRepr() const { return typeExpr->getTypeRepr(); }
@@ -2016,17 +2021,17 @@ bool CustomAttr::isArgUnsafe() const {
   if (isArgUnsafeBit)
     return true;
 
-  auto arg = getArg();
-  if (!arg)
+  auto args = getArgs();
+  if (!args)
     return false;
 
-  if (auto parenExpr = dyn_cast<ParenExpr>(arg)) {
-    if (auto declRef =
-            dyn_cast<UnresolvedDeclRefExpr>(parenExpr->getSubExpr())) {
-      if (declRef->getName().isSimpleName("unsafe")) {
-        isArgUnsafeBit = true;
-      }
-    }
+  auto *unary = args->getUnlabeledUnaryExpr();
+  if (!unary)
+    return false;
+
+  if (auto declRef = dyn_cast<UnresolvedDeclRefExpr>(unary)) {
+    if (declRef->getName().isSimpleName("unsafe"))
+      isArgUnsafeBit = true;
   }
 
   return isArgUnsafeBit;

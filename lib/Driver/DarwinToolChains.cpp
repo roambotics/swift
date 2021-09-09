@@ -409,6 +409,8 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 0);
     } else if (value.equals("5.1")) {
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 1);
+    } else if (value.equals("5.5")) {
+      runtimeCompatibilityVersion = llvm::VersionTuple(5, 5);
     } else if (value.equals("none")) {
       runtimeCompatibilityVersion = None;
     } else {
@@ -469,7 +471,7 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
       Arguments.push_back("-rpath");
       Arguments.push_back(context.Args.MakeArgString(path));
     }
-  } else if (!tripleRequiresRPathForSwiftInOS(getTriple()) ||
+  } else if (!tripleRequiresRPathForSwiftLibrariesInOS(getTriple()) ||
              context.Args.hasArg(options::OPT_no_stdlib_rpath)) {
     // If targeting an OS with Swift in /usr/lib/swift, the LC_ID_DYLIB
     // install_name the stdlib will be an absolute path like
@@ -497,9 +499,11 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
     // package isn't installed.
     Arguments.push_back("-rpath");
     Arguments.push_back(context.Args.MakeArgString("/usr/lib/swift"));
-    // We don't need an rpath for /System/iOSSupport/usr/lib/swift because...
-    assert(!tripleIsMacCatalystEnvironment(getTriple())
-           && "macCatalyst not supported without Swift-in-the-OS");
+    // We don’t need an rpath for /System/iOSSupport/usr/lib/swift because:
+    // 1. The standard library and overlays were part of the OS before
+    //    Catalyst was introduced, so they are always available for Catalyst.
+    // 2. The _Concurrency back-deployment library is zippered, whereas only
+    //    unzippered frameworks need an unzippered twin in /System/iOSSupport.
   }
 }
 
@@ -796,7 +800,9 @@ toolchains::Darwin::constructInvocation(const DynamicLinkJobAction &job,
   Arguments.push_back("-no_objc_category_merging");
 
   // These custom arguments should be right before the object file at the end.
-  context.Args.AddAllArgs(Arguments, options::OPT_linker_option_Group);
+  context.Args.AddAllArgsExcept(Arguments, {options::OPT_linker_option_Group},
+                                {options::OPT_l});
+  ToolChain::addLinkedLibArgs(context.Args, Arguments);
   context.Args.AddAllArgValues(Arguments, options::OPT_Xlinker);
 
   // This should be the last option, for convenience in checking output.

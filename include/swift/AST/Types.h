@@ -18,6 +18,7 @@
 #ifndef SWIFT_TYPES_H
 #define SWIFT_TYPES_H
 
+#include "swift/AST/ASTAllocated.h"
 #include "swift/AST/AutoDiff.h"
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/ExtInfo.h"
@@ -53,6 +54,7 @@ namespace swift {
 
 enum class AllocationArena;
 class ArchetypeType;
+class ArgumentList;
 class AssociatedTypeDecl;
 class ASTContext;
 enum BufferPointerTypeKind : unsigned;
@@ -293,7 +295,8 @@ using TypeMatchOptions = OptionSet<TypeMatchFlags>;
 /// Base class for all types which describe the Swift and SIL ASTs.
 ///
 /// See TypeNodes.def for a succinct description of the full class hierarchy.
-class alignas(1 << TypeAlignInBits) TypeBase {
+class alignas(1 << TypeAlignInBits) TypeBase
+    : public ASTAllocated<std::aligned_storage<8, 8>::type> {
   
   friend class ASTContext;
   TypeBase(const TypeBase&) = delete;
@@ -1232,17 +1235,6 @@ public:
   /// return `None`.
   Optional<TangentSpace>
   getAutoDiffTangentSpace(LookupConformanceFn lookupConformance);
-
-private:
-  // Make vanilla new/delete illegal for Types.
-  void *operator new(size_t Bytes) throw() = delete;
-  void operator delete(void *Data) throw() = delete;
-public:
-  // Only allow allocation of Types using the allocator in ASTContext
-  // or by doing a placement new.
-  void *operator new(size_t bytes, const ASTContext &ctx,
-                     AllocationArena arena, unsigned alignment = 8);
-  void *operator new(size_t Bytes, void *Mem) throw() { return Mem; }
 };
 
 /// AnyGenericType - This abstract class helps types ensure that fields
@@ -1823,12 +1815,6 @@ protected:
   SugarType(TypeKind K, Type type, RecursiveTypeProperties properties)
       : TypeBase(K, nullptr, properties), UnderlyingType(type.getPointer()) {
     Bits.SugarType.HasCachedType = true;
-  }
-
-  void setUnderlyingType(Type type) {
-    assert(!Bits.SugarType.HasCachedType && "Cached type already set");
-    Bits.SugarType.HasCachedType = true;
-    UnderlyingType = type.getPointer();
   }
 
 public:
@@ -3018,10 +3004,6 @@ protected:
   }
 
 public:
-  /// Break a tuple or paren type into an array of \c AnyFunctionType::Params.
-  static void decomposeTuple(Type type,
-                             SmallVectorImpl<Param> &result);
-
   /// Take an array of parameters and turn it into a tuple or paren type.
   static Type composeTuple(ASTContext &ctx, ArrayRef<Param> params,
                            bool canonicalVararg);
@@ -3040,11 +3022,11 @@ public:
   /// account.
   static bool equalParams(CanParamArrayRef a, CanParamArrayRef b);
 
-  /// Given an array of parameters and an array of labels of the
+  /// Given an array of parameters and an argument list of the
   /// same length, update each parameter to have the corresponding label.
   /// The internal parameter labels remain the same.
   static void relabelParams(MutableArrayRef<Param> params,
-                            ArrayRef<Identifier> labels);
+                            ArgumentList *argList);
 
   Type getResult() const { return Output; }
   ArrayRef<Param> getParams() const;

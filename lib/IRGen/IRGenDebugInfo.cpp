@@ -21,6 +21,7 @@
 #include "GenType.h"
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/Expr.h"
+#include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ModuleLoader.h"
@@ -825,9 +826,29 @@ private:
       return MetadataTypeDeclCache.find(DbgTy.getDecl()->getName().str())
           ->getKey();
 
+    // This is a bit of a hack. We need a generic signature to use for mangling.
+    // If we started with an interface type, just use IGM.getCurGenericContext(),
+    // since callers that use interface types typically push a signature that way.
+    //
+    // Otherwise, if we have a contextual type, find an archetype and ask it for
+    // it's generic signature. The context generic signature from the IRGenModule
+    // is unlikely to be useful here.
+    GenericSignature Sig;
     Type Ty = DbgTy.getType();
-    if (Ty->hasArchetype())
+    if (Ty->hasArchetype()) {
+      Ty.findIf([&](Type t) -> bool {
+        if (auto *archetypeTy = t->getAs<PrimaryArchetypeType>()) {
+          Sig = archetypeTy->getGenericEnvironment()->getGenericSignature();
+          return true;
+        }
+
+        return false;
+      });
+
       Ty = Ty->mapTypeOutOfContext();
+    } else {
+      Sig = IGM.getCurGenericContext();
+    }
 
     // Strip off top level of type sugar (except for type aliases).
     // We don't want Optional<T> and T? to get different debug types.
@@ -852,7 +873,6 @@ private:
         IGM.getSILModule());
 
     Mangle::ASTMangler Mangler;
-    GenericSignature Sig = IGM.getCurGenericContext();
     std::string Result = Mangler.mangleTypeForDebugger(Ty, Sig);
 
     if (!Opts.DisableRoundTripDebugTypes) {
@@ -1670,8 +1690,7 @@ private:
   static bool canMangle(TypeBase *Ty) {
     // TODO: C++ types are not yet supported (SR-13223).
     if (Ty->getStructOrBoundGenericStruct() &&
-        Ty->getStructOrBoundGenericStruct()->getClangDecl() &&
-        isa<clang::CXXRecordDecl>(
+        isa_and_nonnull<clang::CXXRecordDecl>(
             Ty->getStructOrBoundGenericStruct()->getClangDecl()))
       return false;
 
@@ -2391,6 +2410,9 @@ bool IRGenDebugInfoImpl::buildDebugInfoExpression(
       if (!handleFragmentDIExpr(ExprOperand, Operands))
         return false;
       break;
+    case SILDIExprOperator::Dereference:
+      Operands.push_back(llvm::dwarf::DW_OP_deref);
+      break;
     default:
       llvm_unreachable("Unrecognized operator");
     }
@@ -2425,7 +2447,7 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
     while (isa<llvm::DILexicalBlock>(Scope))
       Scope = cast<llvm::DILexicalBlock>(Scope)->getScope();
   }
-  assert(Scope && isa<llvm::DIScope>(Scope) && "variable has no scope");
+  assert(isa_and_nonnull<llvm::DIScope>(Scope) && "variable has no scope");
   llvm::DIFile *Unit = getFile(Scope);
   llvm::DIType *DITy = getOrCreateType(DbgTy);
   assert(DITy && "could not determine debug type of variable");
@@ -2543,6 +2565,23 @@ void IRGenDebugInfoImpl::emitDbgIntrinsic(
       !llvm::FindDbgDeclareUses(Storage).empty())
     return;
 
+  // Fragment DIExpression cannot cover the whole variable
+  // or going out-of-bound.
+  if (auto Fragment = Expr->getFragmentInfo())
+    if (auto VarSize = Var->getSizeInBits()) {
+      unsigned FragSize = Fragment->SizeInBits;
+      unsigned FragOffset = Fragment->OffsetInBits;
+      if (FragOffset + FragSize > *VarSize ||
+          FragSize == *VarSize) {
+        // Drop the fragment part
+        assert(Expr->isValid());
+        // Since this expression is valid, DW_OP_LLVM_fragment
+        // and its arguments must be the last 3 elements.
+        auto OrigElements = Expr->getElements();
+        Expr = DBuilder.createExpression(OrigElements.drop_back(3));
+      }
+    }
+
   // A dbg.declare is only meaningful if there is a single alloca for
   // the variable that is live throughout the function.
   if (auto *Alloca = dyn_cast<llvm::AllocaInst>(Storage)) {
@@ -2599,8 +2638,7 @@ void IRGenDebugInfoImpl::emitGlobalVariableDeclaration(
     if (MetatypeType *metaTy = dyn_cast<MetatypeType>(ty))
       ty = metaTy->getInstanceType().getPointer();
     if (ty->getStructOrBoundGenericStruct() &&
-        ty->getStructOrBoundGenericStruct()->getClangDecl() &&
-        isa<clang::CXXRecordDecl>(
+        isa_and_nonnull<clang::CXXRecordDecl>(
             ty->getStructOrBoundGenericStruct()->getClangDecl()))
       return;
   }

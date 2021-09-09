@@ -357,31 +357,30 @@ DebugValueInst *DebugValueInst::create(SILDebugLocation DebugLoc,
   return ::new (buf) DebugValueInst(DebugLoc, Operand, Var, poisonRefs);
 }
 
-DebugValueAddrInst::DebugValueAddrInst(SILDebugLocation DebugLoc,
-                                       SILValue Operand, SILDebugVariable Var)
-    : UnaryInstructionBase(DebugLoc, Operand),
-      SILDebugVariableSupplement(Var.DIExpr.getNumElements(),
-                                 Var.Type.hasValue(), Var.Loc.hasValue(),
-                                 Var.Scope),
-      VarInfo(Var, getTrailingObjects<char>(), getTrailingObjects<SILType>(),
-              getTrailingObjects<SILLocation>(),
-              getTrailingObjects<const SILDebugScope *>(),
-              getTrailingObjects<SILDIExprElement>()) {
-  if (auto *VD = DebugLoc.getLocation().getAsASTNode<VarDecl>())
-    VarInfo.setImplicit(VD->isImplicit() || VarInfo.isImplicit());
+DebugValueInst *DebugValueInst::createAddr(SILDebugLocation DebugLoc,
+                                           SILValue Operand, SILModule &M,
+                                           SILDebugVariable Var) {
+  // For alloc_stack, debug_value is used to annotate the associated
+  // memory location, so we shouldn't attach op_deref.
+  if (!isa<AllocStackInst>(Operand))
+    Var.DIExpr.prependElements(
+      {SILDIExprElement::createOperator(SILDIExprOperator::Dereference)});
+  void *buf = allocateDebugVarCarryingInst<DebugValueInst>(M, Var);
+  return ::new (buf) DebugValueInst(DebugLoc, Operand, Var,
+                                    /*poisonRefs=*/false);
 }
 
-DebugValueAddrInst *DebugValueAddrInst::create(SILDebugLocation DebugLoc,
-                                               SILValue Operand, SILModule &M,
-                                               SILDebugVariable Var) {
-  void *buf = allocateDebugVarCarryingInst<DebugValueAddrInst>(M, Var);
-  return ::new (buf) DebugValueAddrInst(DebugLoc, Operand, Var);
+bool DebugValueInst::exprStartsWithDeref() const {
+  if (!NumDIExprOperands)
+    return false;
+
+  llvm::ArrayRef<SILDIExprElement> DIExprElements(
+      getTrailingObjects<SILDIExprElement>(), NumDIExprOperands);
+  return DIExprElements.front().getAsOperator()
+          == SILDIExprOperator::Dereference;
 }
 
 VarDecl *DebugValueInst::getDecl() const {
-  return getLoc().getAsASTNode<VarDecl>();
-}
-VarDecl *DebugValueAddrInst::getDecl() const {
   return getLoc().getAsASTNode<VarDecl>();
 }
 
@@ -2895,4 +2894,69 @@ ReturnInst::ReturnInst(SILFunction &func, SILDebugLocation debugLoc,
   assert(ownershipKind &&
          "Conflicting ownership kinds when creating term inst from function "
          "result info?!");
+}
+
+// This may be called in an invalid SIL state. SILCombine creates new
+// terminators in non-terminator position and defers deleting the original
+// terminator until after all modification.
+SILPhiArgument *OwnershipForwardingTermInst::createResult(SILBasicBlock *succ,
+                                                          SILType resultTy) {
+  // The forwarding instruction declares a forwarding ownership kind that
+  // determines the ownership of its results.
+  auto resultOwnership = getForwardingOwnershipKind();
+
+  // Trivial results have no ownership. Although it is valid for a trivially
+  // typed value to have ownership, it is never necessary and less efficient.
+  if (resultTy.isTrivial(*getFunction())) {
+    resultOwnership = OwnershipKind::None;
+
+  } else if (resultOwnership == OwnershipKind::None) {
+    // switch_enum strangely allows results to acquire ownership out of thin
+    // air whenever the operand has no ownership and result is nontrivial:
+    //     %e = enum $Optional<AnyObject>, #Optional.none!enumelt
+    //     switch_enum %e : $Optional<AnyObject>,
+    //                 case #Optional.some!enumelt: bb2...
+    //   bb2(%arg : @guaranteed T):
+    //
+    // We can either use None or Guaranteed. None would correctly propagate
+    // ownership and would maintain the invariant that guaranteed values are
+    // always within a borrow scope. However it would result in a nontrivial
+    // type without ownership. The lifetime verifier does not like that.
+    resultOwnership = OwnershipKind::Guaranteed;
+  }
+  return succ->createPhiArgument(resultTy, resultOwnership);
+}
+
+SILPhiArgument *SwitchEnumInst::createDefaultResult() {
+  auto *f = getFunction();
+  if (!f->hasOwnership())
+    return nullptr;
+
+  if (!hasDefault())
+    return nullptr;
+
+  assert(getDefaultBB()->getNumArguments() == 0 && "precondition");
+
+  auto enumTy = getOperand()->getType();
+  NullablePtr<EnumElementDecl> uniqueCase = getUniqueCaseForDefault();
+
+  // Without a unique default case, the OSSA result simply forwards the
+  // switch_enum operand.
+  if (!uniqueCase)
+    return createResult(getDefaultBB(), enumTy);
+
+  // With a unique default case, the result is materialized exactly the same way
+  // as a matched result. It has a value iff the unique case has a payload.
+  if (!uniqueCase.get()->hasAssociatedValues())
+    return nullptr;
+
+  auto resultTy = enumTy.getEnumElementType(uniqueCase.get(), f->getModule(),
+                                            f->getTypeExpansionContext());
+  return createResult(getDefaultBB(), resultTy);
+}
+
+SILPhiArgument *SwitchEnumInst::createOptionalSomeResult() {
+  auto someDecl = getModule().getASTContext().getOptionalSomeDecl();
+  auto someBB = getCaseDestination(someDecl);
+  return createResult(someBB, getOperand()->getType().unwrapOptionalType());
 }

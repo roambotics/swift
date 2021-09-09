@@ -37,7 +37,7 @@ import Swift
 /// with by end-users directly, unless implementing a scheduler.
 @available(SwiftStdlib 5.5, *)
 @frozen
-public struct Task<Success, Failure: Error>: Sendable {
+public struct Task<Success: Sendable, Failure: Error>: Sendable {
   @usableFromInline
   internal let _task: Builtin.NativeObject
 
@@ -756,7 +756,7 @@ func _enqueueJobGlobalWithDelay(_ delay: UInt64, _ task: Builtin.Job)
 public func _asyncMainDrainQueue() -> Never
 
 @available(SwiftStdlib 5.5, *)
-public func _runAsyncMain(_ asyncFun: @escaping () async throws -> ()) {
+public func _runAsyncMain(@_unsafeSendable _ asyncFun: @escaping () async throws -> ()) {
   Task.detached {
     do {
 #if !os(Windows)
@@ -824,7 +824,14 @@ func _getCurrentThreadPriority() -> Int
 @_alwaysEmitIntoClient
 @usableFromInline
 internal func _runTaskForBridgedAsyncMethod(@_inheritActorContext _ body: __owned @Sendable @escaping () async -> Void) {
+#if compiler(>=5.6)
   Task(operation: body)
+#else
+  Task<Int, Error> {
+    await body()
+    return 0
+  }
+#endif
 }
 
 #endif

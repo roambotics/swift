@@ -64,6 +64,10 @@ def emit_fixits_path
   : Separate<["-"], "emit-fixits-path">, MetaVarName<"<path>">,
     HelpText<"Output compiler fixits as source edits to <path>">;
 
+def emit_abi_descriptor_path
+  : Separate<["-"], "emit-abi-descriptor-path">, MetaVarName<"<path>">,
+    HelpText<"Output the ABI descriptor of current module to <path>">;
+
 def serialize_module_interface_dependency_hashes
   : Flag<["-"], "serialize-module-interface-dependency-hashes">,
     Flags<[HelpHidden]>;
@@ -273,8 +277,11 @@ def debug_constraints_on_line_EQ : Joined<["-"], "debug-constraints-on-line=">,
 def disable_named_lazy_member_loading : Flag<["-"], "disable-named-lazy-member-loading">,
   HelpText<"Disable per-name lazy member loading">;
 
-def debug_requirement_machine : Flag<["-"], "debug-requirement-machine">,
-  HelpText<"Enables debugging output from the generics implementation">;
+def dump_requirement_machine : Flag<["-"], "dump-requirement-machine">,
+  HelpText<"Enables dumping rewrite systems from the generics implementation">;
+
+def debug_requirement_machine : Joined<["-"], "debug-requirement-machine=">,
+  HelpText<"Fine-grained debug output from the generics implementation">;
 
 def analyze_requirement_machine : Flag<["-"], "analyze-requirement-machine">,
   Flags<[FrontendOption, HelpHidden, DoesNotAffectIncrementalBuild]>,
@@ -431,9 +438,13 @@ def enable_experimental_static_assert :
   Flag<["-"], "enable-experimental-static-assert">,
   HelpText<"Enable experimental #assert">;
 
-def enable_experimental_opaque_return_types :
-  Flag<["-"], "enable-experimental-opaque-return-types">,
-  HelpText<"Enable experimental extensions to opaque return type support">;
+def enable_experimental_named_opaque_types :
+  Flag<["-"], "enable-experimental-named-opaque-types">,
+  HelpText<"Enable experimental support for named opaque result types">;
+
+def enable_experimental_structural_opaque_types :
+  Flag<["-"], "enable-experimental-structural-opaque-types">,
+  HelpText<"Enable experimental support for structural opaque result types">;
 
 def enable_deserialization_recovery :
   Flag<["-"], "enable-deserialization-recovery">,
@@ -458,6 +469,10 @@ def warn_on_potentially_unavailable_enum_case : Flag<["-"],
   "warn-on-potentially-unavailable-enum-case">,
   HelpText<"Downgrade potential unavailability of enum case to a warning">;
 
+def warn_on_editor_placeholder : Flag<["-"],
+  "warn-on-editor-placeholder">,
+  HelpText<"Downgrade the editor placeholder error to a warning">;
+
 def report_errors_to_debugger : Flag<["-"], "report-errors-to-debugger">,
   HelpText<"Deprecated, will be removed in future versions.">;
 
@@ -469,11 +484,6 @@ def disable_swift3_objc_inference :
   Flag<["-"], "disable-swift3-objc-inference">,
   Flags<[FrontendOption, HelpHidden]>,
   HelpText<"Disable Swift 3's @objc inference rules for NSObject-derived classes and 'dynamic' members (emulates Swift 4 behavior)">;
-
-def library_level : Separate<["-"], "library-level">,
-  MetaVarName<"<level>">,
-  Flags<[FrontendOption, ModuleInterfaceOption]>,
-  HelpText<"Library distribution level 'api', 'spi' or 'other' (the default)">;
 
 def enable_implicit_dynamic : Flag<["-"], "enable-implicit-dynamic">,
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,

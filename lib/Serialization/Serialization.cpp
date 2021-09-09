@@ -812,6 +812,7 @@ void Serializer::writeBlockInfoBlock() {
   BLOCK_RECORD(options_block, RESILIENCE_STRATEGY);
   BLOCK_RECORD(options_block, IS_ALLOW_MODULE_WITH_COMPILER_ERRORS_ENABLED);
   BLOCK_RECORD(options_block, MODULE_ABI_NAME);
+  BLOCK_RECORD(options_block, IS_CONCURRENCY_CHECKED);
 
   BLOCK(INPUT_BLOCK);
   BLOCK_RECORD(input_block, IMPORTED_MODULE);
@@ -869,6 +870,7 @@ void Serializer::writeBlockInfoBlock() {
   BLOCK_RECORD(sil_block, SIL_ONE_OPERAND);
   BLOCK_RECORD(sil_block, SIL_ONE_TYPE_ONE_OPERAND);
   BLOCK_RECORD(sil_block, SIL_ONE_TYPE_VALUES);
+  BLOCK_RECORD(sil_block, SIL_ONE_TYPE_OWNERSHIP_VALUES);
   BLOCK_RECORD(sil_block, SIL_TWO_OPERANDS);
   BLOCK_RECORD(sil_block, SIL_TAIL_ADDR);
   BLOCK_RECORD(sil_block, SIL_INST_APPLY);
@@ -1024,6 +1026,11 @@ void Serializer::writeHeader(const SerializationOptions &options) {
       if (M->getABIName() != M->getName()) {
         options_block::ModuleABINameLayout ABIName(Out);
         ABIName.emit(ScratchRecord, M->getABIName().str());
+      }
+
+      if (M->isConcurrencyChecked()) {
+        options_block::IsConcurrencyCheckedLayout IsConcurrencyChecked(Out);
+        IsConcurrencyChecked.emit(ScratchRecord);
       }
 
       if (options.SerializeOptionsForDebugging) {
@@ -3511,7 +3518,9 @@ public:
     for (auto element : proto->getInherited()) {
       auto elementType = element.getType();
       assert(!elementType || !elementType->hasArchetype());
-      if (elementType && elementType->is<ProtocolType>())
+      if (elementType &&
+          (elementType->is<ProtocolType>() ||
+           elementType->is<ProtocolCompositionType>()))
         dependencyTypes.insert(elementType);
     }
 
@@ -3537,7 +3546,6 @@ public:
                                const_cast<ProtocolDecl *>(proto)
                                  ->requiresClass(),
                                proto->isObjC(),
-                               proto->existentialTypeSupported(),
                                rawAccessLevel, numInherited,
                                inheritedAndDependencyTypes);
 

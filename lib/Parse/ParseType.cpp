@@ -157,6 +157,7 @@ LayoutConstraint Parser::parseLayoutConstraint(Identifier LayoutConstraintID) {
 ///     type-simple '!'
 ///     type-collection
 ///     type-array
+///     '_'
 ParserResult<TypeRepr> Parser::parseTypeSimple(
     Diag<> MessageID, ParseTypeReason reason) {
   ParserResult<TypeRepr> ty;
@@ -189,6 +190,9 @@ ParserResult<TypeRepr> Parser::parseTypeSimple(
     ty = parseTypeCollection();
     break;
   }
+  case tok::kw__:
+    ty = makeParserResult(new (Context) PlaceholderTypeRepr(consumeToken()));
+    break;
   case tok::kw_protocol:
     if (startsWithLess(peekToken())) {
       ty = parseOldStyleProtocolComposition();
@@ -550,7 +554,7 @@ ParserResult<TypeRepr> Parser::parseType(
 
 ParserResult<TypeRepr> Parser::parseTypeWithOpaqueParams(Diag<> MessageID) {
   GenericParamList *genericParams = nullptr;
-  if (Context.LangOpts.EnableExperimentalOpaqueReturnTypes) {
+  if (Context.LangOpts.EnableExperimentalNamedOpaqueTypes) {
     auto result = maybeParseGenericParams();
     genericParams = result.getPtrOrNull();
     if (result.hasCodeCompletion())
@@ -1468,6 +1472,9 @@ bool Parser::canParseType() {
     }
     if (!consumeIf(tok::r_square))
       return false;
+    break;
+  case tok::kw__:
+    consumeToken();
     break;
 
 

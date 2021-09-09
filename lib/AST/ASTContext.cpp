@@ -684,6 +684,11 @@ llvm::BumpPtrAllocator &ASTContext::getAllocator(AllocationArena arena) const {
   llvm_unreachable("bad AllocationArena");
 }
 
+void *detail::allocateInASTContext(size_t bytes, const ASTContext &ctx,
+                                   AllocationArena arena, unsigned alignment) {
+  return ctx.Allocate(bytes, alignment, arena);
+}
+
 ImportPath::Raw
 swift::detail::ImportPathBuilder_copyToImpl(ASTContext &ctx,
                                             ImportPath::Raw raw) {
@@ -1040,6 +1045,8 @@ ProtocolDecl *ASTContext::getProtocol(KnownProtocolKind kind) const {
     M = getLoadedModule(Id_Concurrency);
     break;
   case KnownProtocolKind::DistributedActor:
+  case KnownProtocolKind::ActorTransport:
+  case KnownProtocolKind::ActorIdentity:
     M = getLoadedModule(Id_Distributed);
     break;
   default:
@@ -2936,6 +2943,29 @@ AnyFunctionType::Param swift::computeSelfParam(AbstractFunctionDecl *AFD,
       // inout self.
       if (!containerTy->hasReferenceSemantics())
         selfAccess = SelfAccessKind::Mutating;
+
+      // FIXME(distributed): pending swift-evolution, allow `self =` in class
+      //  inits in general.
+      //  See also: https://github.com/apple/swift/pull/19151 general impl
+      if (Ctx.LangOpts.EnableExperimentalDistributed) {
+        auto ext = dyn_cast<ExtensionDecl>(AFD->getDeclContext());
+        auto distProto =
+            Ctx.getProtocol(KnownProtocolKind::DistributedActor);
+        if (distProto && ext && ext->getExtendedNominal() &&
+            ext->getExtendedNominal()->getInterfaceType()
+                ->isEqual(distProto->getInterfaceType())) {
+          auto name = CD->getName();
+          auto params = name.getArgumentNames();
+          if (params.size() == 1 && params[0] == Ctx.Id_from) {
+            // FIXME(distributed): this is a workaround to allow init(from:) to
+            //  be implemented in AST by allowing the self to be mutable in the
+            //  decoding initializer. This should become a general Swift
+            //  feature, allowing this in all classes:
+            //  https://forums.swift.org/t/allow-self-x-in-class-convenience-initializers/15924
+            selfAccess = SelfAccessKind::Mutating;
+          }
+        }
+      }
     } else {
       // allocating constructors have metatype 'self'.
       isStatic = true;
@@ -3410,39 +3440,6 @@ AnyFunctionType *AnyFunctionType::withExtInfo(ExtInfo info) const {
                                   getParams(), getResult(), info);
 }
 
-void AnyFunctionType::decomposeTuple(
-    Type type, SmallVectorImpl<AnyFunctionType::Param> &result) {
-  switch (type->getKind()) {
-  case TypeKind::Tuple: {
-    auto tupleTy = cast<TupleType>(type.getPointer());
-    for (auto &elt : tupleTy->getElements()) {
-      result.emplace_back((elt.isVararg()
-                           ? elt.getVarargBaseTy()
-                           : elt.getRawType()),
-                          elt.getName(),
-                          elt.getParameterFlags());
-    }
-    return;
-  }
-      
-  case TypeKind::Paren: {
-    auto pty = cast<ParenType>(type.getPointer());
-    result.emplace_back(pty->getUnderlyingType()->getInOutObjectType(),
-                        Identifier(),
-                        pty->getParameterFlags());
-    return;
-  }
-      
-  default:
-    result.emplace_back(
-        type->getInOutObjectType(), Identifier(),
-        ParameterTypeFlags::fromParameterType(type, false, false, false,
-                                              ValueOwnership::Default, false,
-                                              false));
-    return;
-  }
-}
-
 Type AnyFunctionType::Param::getParameterType(bool forCanonical,
                                               ASTContext *ctx) const {
   Type type = getPlainType();
@@ -3496,11 +3493,11 @@ bool AnyFunctionType::equalParams(CanParamArrayRef a, CanParamArrayRef b) {
 }
 
 void AnyFunctionType::relabelParams(MutableArrayRef<Param> params,
-                                    ArrayRef<Identifier> labels) {
-  assert(params.size() == labels.size());
+                                    ArgumentList *argList) {
+  assert(params.size() == argList->size());
   for (auto i : indices(params)) {
     auto &param = params[i];
-    param = AnyFunctionType::Param(param.getPlainType(), labels[i],
+    param = AnyFunctionType::Param(param.getPlainType(), argList->getLabel(i),
                                    param.getParameterFlags(),
                                    param.getInternalLabel());
   }
@@ -5143,11 +5140,22 @@ ASTContext::getOverrideGenericSignature(const ValueDecl *base,
 bool ASTContext::overrideGenericSignatureReqsSatisfied(
     const ValueDecl *base, const ValueDecl *derived,
     const OverrideGenericSignatureReqCheck direction) {
+  auto *baseCtx = base->getAsGenericContext();
+  auto *derivedCtx = derived->getAsGenericContext();
+
+  if (baseCtx->isGeneric() != derivedCtx->isGeneric())
+    return false;
+
+  if (baseCtx->isGeneric() &&
+      (baseCtx->getGenericParams()->size() !=
+       derivedCtx->getGenericParams()->size()))
+    return false;
+
   auto sig = getOverrideGenericSignature(base, derived);
   if (!sig)
     return true;
 
-  auto derivedSig = derived->getAsGenericContext()->getGenericSignature();
+  auto derivedSig = derivedCtx->getGenericSignature();
 
   switch (direction) {
   case OverrideGenericSignatureReqCheck::BaseReqSatisfiedByDerived:

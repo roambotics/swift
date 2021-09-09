@@ -276,8 +276,11 @@ void SourceLookupCache::populateMemberCache(const ModuleDecl &Mod) {
                              "populate-module-class-member-cache");
 
   for (const FileUnit *file : Mod.getFiles()) {
-    auto &SF = *cast<SourceFile>(file);
-    addToMemberCache(SF.getTopLevelDecls());
+    assert(isa<SourceFile>(file) ||
+           isa<SynthesizedFileUnit>(file));
+    SmallVector<Decl *, 8> decls;
+    file->getTopLevelDecls(decls);
+    addToMemberCache(decls);
   }
 
   MemberCachePopulated = true;
@@ -486,6 +489,7 @@ ModuleDecl::ModuleDecl(Identifier name, ASTContext &ctx,
   Bits.ModuleDecl.IsNonSwiftModule = 0;
   Bits.ModuleDecl.IsMainModule = 0;
   Bits.ModuleDecl.HasIncrementalInfo = 0;
+  Bits.ModuleDecl.IsConcurrencyChecked = 0;
 }
 
 ImplicitImportList ModuleDecl::getImplicitImports() const {
@@ -975,6 +979,21 @@ static bool shouldCreateMissingConformances(ProtocolDecl *proto) {
   return proto->isSpecificProtocol(KnownProtocolKind::Sendable);
 }
 
+ProtocolConformanceRef ProtocolConformanceRef::forMissingOrInvalid(
+    Type type, ProtocolDecl *proto) {
+  // Introduce "missing" conformances when appropriate, so that type checking
+  // (and even code generation) can continue.
+  ASTContext &ctx = proto->getASTContext();
+  if (shouldCreateMissingConformances(proto)) {
+    return ProtocolConformanceRef(
+        ctx.getBuiltinConformance(
+          type, proto, GenericSignature(), { },
+          BuiltinConformanceKind::Missing));
+  }
+
+  return ProtocolConformanceRef::forInvalid();
+}
+
 ProtocolConformanceRef ModuleDecl::lookupConformance(Type type,
                                                      ProtocolDecl *protocol,
                                                      bool allowMissing) {
@@ -1002,23 +1021,6 @@ ProtocolConformanceRef ModuleDecl::lookupConformance(Type type,
     return ProtocolConformanceRef::forInvalid();
 
   return result;
-}
-
-/// Retrieve an invalid or missing conformance, as appropriate, when a
-/// legitimate conformance doesn't exist.
-static ProtocolConformanceRef getInvalidOrMissingConformance(
-    Type type, ProtocolDecl *proto) {
-  // Introduce "missing" conformances when appropriate, so that type checking
-  // (and even code generation) can continue.
-  ASTContext &ctx = proto->getASTContext();
-  if (shouldCreateMissingConformances(proto)) {
-    return ProtocolConformanceRef(
-        ctx.getBuiltinConformance(
-          type, proto, GenericSignature(), { },
-          BuiltinConformanceKind::Missing));
-  }
-
-  return ProtocolConformanceRef::forInvalid();
 }
 
 /// Synthesize a builtin tuple type conformance to the given protocol, if
@@ -1080,7 +1082,7 @@ static ProtocolConformanceRef getBuiltinTupleTypeConformance(
         ctx.getSpecializedConformance(type, genericConformance, subMap));
   }
 
-  return getInvalidOrMissingConformance(type, protocol);
+  return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
 }
 
 /// Whether the given function type conforms to Sendable.
@@ -1113,7 +1115,7 @@ static ProtocolConformanceRef getBuiltinFunctionTypeConformance(
                                   BuiltinConformanceKind::Synthesized));
   }
 
-  return getInvalidOrMissingConformance(type, protocol);
+  return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
 }
 
 /// Synthesize a builtin metatype type conformance to the given protocol, if
@@ -1128,7 +1130,7 @@ static ProtocolConformanceRef getBuiltinMetaTypeTypeConformance(
                                   BuiltinConformanceKind::Synthesized));
   }
 
-  return getInvalidOrMissingConformance(type, protocol);
+  return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
 }
 
 /// Synthesize a builtin type conformance to the given protocol, if
@@ -1143,7 +1145,7 @@ static ProtocolConformanceRef getBuiltinBuiltinTypeConformance(
                                   BuiltinConformanceKind::Synthesized));
   }
 
-  return getInvalidOrMissingConformance(type, protocol);
+  return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
 }
 
 ProtocolConformanceRef
@@ -1181,7 +1183,7 @@ LookupConformanceInModuleRequest::evaluate(
         return ProtocolConformanceRef(protocol);
     }
 
-    return getInvalidOrMissingConformance(type, protocol);
+    return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
   }
 
   // An existential conforms to a protocol if the protocol is listed in the
@@ -1190,7 +1192,7 @@ LookupConformanceInModuleRequest::evaluate(
   if (type->isExistentialType()) {
     auto result = mod->lookupExistentialConformance(type, protocol);
     if (result.isInvalid())
-      return getInvalidOrMissingConformance(type, protocol);
+      return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
     return result;
   }
 
@@ -1228,13 +1230,13 @@ LookupConformanceInModuleRequest::evaluate(
 
   // If we don't have a nominal type, there are no conformances.
   if (!nominal || isa<ProtocolDecl>(nominal))
-    return getInvalidOrMissingConformance(type, protocol);
+    return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
 
   // Find the (unspecialized) conformance.
   SmallVector<ProtocolConformance *, 2> conformances;
-  if (!nominal->lookupConformance(mod, protocol, conformances)) {
+  if (!nominal->lookupConformance(protocol, conformances)) {
     if (!protocol->isSpecificProtocol(KnownProtocolKind::Sendable))
-      return getInvalidOrMissingConformance(type, protocol);
+      return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
 
     // Try to infer Sendable conformance.
     GetImplicitSendableRequest cvRequest{nominal};
@@ -1243,7 +1245,7 @@ LookupConformanceInModuleRequest::evaluate(
       conformances.clear();
       conformances.push_back(conformance);
     } else {
-      return getInvalidOrMissingConformance(type, protocol);
+      return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
     }
   }
 
@@ -1851,7 +1853,7 @@ bool ModuleDecl::isExternallyConsumed() const {
 
 namespace swift {
 /// Represents a file containing information about cross-module overlays.
-class OverlayFile {
+class OverlayFile : public ASTAllocated<OverlayFile> {
   friend class ModuleDecl;
   /// The file that data should be loaded from.
   StringRef filePath;
@@ -1874,13 +1876,6 @@ class OverlayFile {
                               StringRef bystandingModule,
                               SourceLoc diagLoc);
 public:
-  // Only allocate in ASTContexts.
-  void *operator new(size_t bytes) = delete;
-  void *operator new(size_t bytes, const ASTContext &ctx,
-                     unsigned alignment = alignof(OverlayFile)) {
-    return ctx.Allocate(bytes, alignment);
-  }
-
   OverlayFile(StringRef filePath)
       : filePath(filePath) {
     assert(!filePath.empty());
@@ -2351,14 +2346,15 @@ bool ModuleDecl::isImportedImplementationOnly(const ModuleDecl *module) const {
 }
 
 bool ModuleDecl::
-canBeUsedForCrossModuleOptimization(NominalTypeDecl *nominal) const {
-  ModuleDecl *moduleOfNominal = nominal->getParentModule();
+canBeUsedForCrossModuleOptimization(DeclContext *ctxt) const {
+  ModuleDecl *moduleOfCtxt = ctxt->getParentModule();
 
-  // If the nominal is defined in the same module, it's fine.
-  if (moduleOfNominal == this)
+  // If the context defined in the same module - or is the same module, it's
+  // fine.
+  if (moduleOfCtxt == this)
     return true;
 
-  // See if nominal is imported in a "regular" way, i.e. not with
+  // See if context is imported in a "regular" way, i.e. not with
   // @_implementationOnly or @_spi.
   ModuleDecl::ImportFilter filter = {
     ModuleDecl::ImportFilterKind::Exported,
@@ -2368,7 +2364,7 @@ canBeUsedForCrossModuleOptimization(NominalTypeDecl *nominal) const {
 
   auto &imports = getASTContext().getImportCache();
   for (auto &desc : results) {
-    if (imports.isImportedBy(moduleOfNominal, desc.importedModule))
+    if (imports.isImportedBy(moduleOfCtxt, desc.importedModule))
       return true;
   }
   return false;
@@ -3012,10 +3008,6 @@ void SynthesizedFileUnit::getTopLevelDecls(
 //===----------------------------------------------------------------------===//
 
 void FileUnit::anchor() {}
-void *FileUnit::operator new(size_t Bytes, ASTContext &C, unsigned Alignment) {
-  return C.Allocate(Bytes, Alignment);
-}
-
 void FileUnit::getTopLevelDeclsWhereAttributesMatch(
             SmallVectorImpl<Decl*> &Results,
             llvm::function_ref<bool(DeclAttributes)> matchAttributes) const {

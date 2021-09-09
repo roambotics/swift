@@ -583,7 +583,7 @@ struct SelectedOverload {
 /// Provides information about the application of a function argument to a
 /// parameter.
 class FunctionArgApplyInfo {
-  Expr *ArgListExpr;
+  ArgumentList *ArgList;
   Expr *ArgExpr;
   unsigned ArgIdx;
   Type ArgType;
@@ -595,15 +595,15 @@ class FunctionArgApplyInfo {
   const ValueDecl *Callee;
 
 public:
-  FunctionArgApplyInfo(Expr *argListExpr, Expr *argExpr, unsigned argIdx,
+  FunctionArgApplyInfo(ArgumentList *argList, Expr *argExpr, unsigned argIdx,
                        Type argType, unsigned paramIdx, Type fnInterfaceType,
                        FunctionType *fnType, const ValueDecl *callee)
-      : ArgListExpr(argListExpr), ArgExpr(argExpr), ArgIdx(argIdx),
-        ArgType(argType), ParamIdx(paramIdx), FnInterfaceType(fnInterfaceType),
-        FnType(fnType), Callee(callee) {}
+      : ArgList(argList), ArgExpr(argExpr), ArgIdx(argIdx), ArgType(argType),
+        ParamIdx(paramIdx), FnInterfaceType(fnInterfaceType), FnType(fnType),
+        Callee(callee) {}
 
   /// \returns The list of the arguments used for this application.
-  Expr *getArgListExpr() const { return ArgListExpr; }
+  ArgumentList *getArgList() const { return ArgList; }
 
   /// \returns The argument being applied.
   Expr *getArgExpr() const { return ArgExpr; }
@@ -625,11 +625,7 @@ public:
 
   /// \returns The label for the argument being applied.
   Identifier getArgLabel() const {
-    if (auto *te = dyn_cast<TupleExpr>(ArgListExpr))
-      return te->getElementName(ArgIdx);
-
-    assert(isa<ParenExpr>(ArgListExpr));
-    return Identifier();
+    return ArgList->getLabel(ArgIdx);
   }
 
   Identifier getParamLabel() const {
@@ -649,10 +645,8 @@ public:
       if (argLabel.empty())
         return false;
 
-      if (auto *te = dyn_cast<TupleExpr>(ArgListExpr))
-        return llvm::count(te->getElementNames(), argLabel) == 1;
-
-      return false;
+      SmallVector<Identifier, 4> scratch;
+      return llvm::count(ArgList->getArgumentLabels(scratch), argLabel) == 1;
     };
 
     if (useArgLabel()) {
@@ -668,11 +662,7 @@ public:
 
   /// Whether the argument is a trailing closure.
   bool isTrailingClosure() const {
-    if (auto trailingClosureArg =
-            ArgListExpr->getUnlabeledTrailingClosureIndexOfPackedArgument())
-      return ArgIdx >= *trailingClosureArg;
-
-    return false;
+    return ArgList->isTrailingClosureIndex(ArgIdx);
   }
 
   /// \returns The interface type for the function being applied. Note that this
@@ -996,7 +986,7 @@ public:
 
   SolutionApplicationTargetsKey(
       const PatternBindingDecl *patternBinding, unsigned index) {
-    kind = Kind::stmt;
+    kind = Kind::patternBindingEntry;
     storage.patternBindingEntry.patternBinding = patternBinding;
     storage.patternBindingEntry.index = index;
   }
@@ -1208,6 +1198,11 @@ public:
   /// A map from argument expressions to their applied property wrapper expressions.
   llvm::MapVector<ASTNode, SmallVector<AppliedPropertyWrapper, 2>> appliedPropertyWrappers;
 
+  /// A mapping from the constraint locators for references to various
+  /// names (e.g., member references, normal name references, possible
+  /// constructions) to the argument lists for the call to that locator.
+  llvm::MapVector<ConstraintLocator *, ArgumentList *> argumentLists;
+
   /// Record a new argument matching choice for given locator that maps a
   /// single argument to a single parameter.
   void recordSingleArgMatchingChoice(ConstraintLocator *locator);
@@ -1341,6 +1336,10 @@ public:
   /// expression that reads the type from the Solution
   /// expression type map.
   bool isStaticallyDerivedMetatype(Expr *E) const;
+
+  /// Retrieve the argument list that is associated with a call at the given
+  /// locator.
+  ArgumentList *getArgumentList(ConstraintLocator *locator) const;
 
   SWIFT_DEBUG_DUMP;
 
@@ -1559,7 +1558,7 @@ public:
     stmtCondition,
     caseLabelItem,
     patternBinding,
-    uninitializedWrappedVar,
+    uninitializedVar,
   } kind;
 
 private:
@@ -1631,9 +1630,16 @@ private:
       DeclContext *dc;
     } caseLabelItem;
 
-    PatternBindingDecl *patternBinding;
+    struct {
+      PatternBindingDecl *binding;
+      /// Index into pattern binding declaration (if any).
+      unsigned index;
+      PointerUnion<VarDecl *, Pattern *> declaration;
+      /// Type associated with the declaration.
+      Type type;
+    } uninitializedVar;
 
-    VarDecl *uninitializedWrappedVar;
+    PatternBindingDecl *patternBinding;
   };
 
   // If the pattern contains a single variable that has an attached
@@ -1679,9 +1685,28 @@ public:
     this->patternBinding = patternBinding;
   }
 
-  SolutionApplicationTarget(VarDecl *wrappedVar) {
-    kind = Kind::uninitializedWrappedVar;
-    this->uninitializedWrappedVar= wrappedVar;
+  SolutionApplicationTarget(VarDecl *uninitializedWrappedVar)
+      : kind(Kind::uninitializedVar) {
+    if (auto *PDB = uninitializedWrappedVar->getParentPatternBinding()) {
+      uninitializedVar.binding = PDB;
+      uninitializedVar.index =
+          PDB->getPatternEntryIndexForVarDecl(uninitializedWrappedVar);
+    } else {
+      uninitializedVar.binding = nullptr;
+      uninitializedVar.index = 0;
+    }
+
+    uninitializedVar.declaration = uninitializedWrappedVar;
+    uninitializedVar.type = Type();
+  }
+
+  SolutionApplicationTarget(PatternBindingDecl *binding, unsigned index,
+                            Pattern *var, Type patternTy)
+      : kind(Kind::uninitializedVar) {
+    uninitializedVar.binding = binding;
+    uninitializedVar.index = index;
+    uninitializedVar.declaration = var;
+    uninitializedVar.type = patternTy;
   }
 
   /// Form a target for the initialization of a pattern from an expression.
@@ -1703,8 +1728,16 @@ public:
 
   /// Form a target for a property with an attached property wrapper that is
   /// initialized out-of-line.
-  static SolutionApplicationTarget forUninitializedWrappedVar(
-      VarDecl *wrappedVar);
+  static SolutionApplicationTarget
+  forUninitializedWrappedVar(VarDecl *wrappedVar) {
+    return {wrappedVar};
+  }
+
+  static SolutionApplicationTarget
+  forUninitializedVar(PatternBindingDecl *binding, unsigned index,
+                      Type patternTy) {
+    return {binding, index, binding->getPattern(index), patternTy};
+  }
 
   /// Form a target for a synthesized property wrapper initializer.
   static SolutionApplicationTarget forPropertyWrapperInitializer(
@@ -1719,7 +1752,7 @@ public:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
-    case Kind::uninitializedWrappedVar:
+    case Kind::uninitializedVar:
       return nullptr;
     }
     llvm_unreachable("invalid expression type");
@@ -1742,8 +1775,13 @@ public:
     case Kind::patternBinding:
       return patternBinding->getDeclContext();
 
-    case Kind::uninitializedWrappedVar:
-      return uninitializedWrappedVar->getDeclContext();
+    case Kind::uninitializedVar: {
+      if (auto *wrappedVar =
+              uninitializedVar.declaration.dyn_cast<VarDecl *>())
+        return wrappedVar->getDeclContext();
+
+      return uninitializedVar.binding->getInitContext(uninitializedVar.index);
+    }
     }
     llvm_unreachable("invalid decl context type");
   }
@@ -1799,6 +1837,9 @@ public:
 
   /// For a pattern initialization target, retrieve the pattern.
   Pattern *getInitializationPattern() const {
+    if (kind == Kind::uninitializedVar)
+      return uninitializedVar.declaration.get<Pattern *>();
+
     assert(kind == Kind::expression);
     assert(expression.contextualPurpose == CTP_Initialization);
     return expression.pattern;
@@ -1903,6 +1944,12 @@ public:
   }
 
   void setPattern(Pattern *pattern) {
+    if (kind == Kind::uninitializedVar) {
+      assert(uninitializedVar.declaration.is<Pattern *>());
+      uninitializedVar.declaration = pattern;
+      return;
+    }
+
     assert(kind == Kind::expression);
     assert(expression.contextualPurpose == CTP_Initialization ||
            expression.contextualPurpose == CTP_ForEachStmt);
@@ -1915,7 +1962,7 @@ public:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
-    case Kind::uninitializedWrappedVar:
+    case Kind::uninitializedVar:
       return None;
 
     case Kind::function:
@@ -1930,7 +1977,7 @@ public:
     case Kind::function:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
-    case Kind::uninitializedWrappedVar:
+    case Kind::uninitializedVar:
       return None;
 
     case Kind::stmtCondition:
@@ -1945,7 +1992,7 @@ public:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::patternBinding:
-    case Kind::uninitializedWrappedVar:
+    case Kind::uninitializedVar:
       return None;
 
     case Kind::caseLabelItem:
@@ -1960,7 +2007,7 @@ public:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
-    case Kind::uninitializedWrappedVar:
+    case Kind::uninitializedVar:
       return nullptr;
 
     case Kind::patternBinding:
@@ -1978,8 +2025,68 @@ public:
     case Kind::patternBinding:
       return nullptr;
 
-    case Kind::uninitializedWrappedVar:
-      return uninitializedWrappedVar;
+    case Kind::uninitializedVar:
+      return uninitializedVar.declaration.dyn_cast<VarDecl *>();
+    }
+    llvm_unreachable("invalid case label type");
+  }
+
+  Pattern *getAsUninitializedVar() const {
+    switch (kind) {
+    case Kind::expression:
+    case Kind::function:
+    case Kind::stmtCondition:
+    case Kind::caseLabelItem:
+    case Kind::patternBinding:
+      return nullptr;
+
+    case Kind::uninitializedVar:
+      return uninitializedVar.declaration.dyn_cast<Pattern *>();
+    }
+    llvm_unreachable("invalid case label type");
+  }
+
+  Type getTypeOfUninitializedVar() const {
+    switch (kind) {
+    case Kind::expression:
+    case Kind::function:
+    case Kind::stmtCondition:
+    case Kind::caseLabelItem:
+    case Kind::patternBinding:
+      return nullptr;
+
+    case Kind::uninitializedVar:
+      return uninitializedVar.type;
+    }
+    llvm_unreachable("invalid case label type");
+  }
+
+  PatternBindingDecl *getPatternBindingOfUninitializedVar() const {
+    switch (kind) {
+    case Kind::expression:
+    case Kind::function:
+    case Kind::stmtCondition:
+    case Kind::caseLabelItem:
+    case Kind::patternBinding:
+      return nullptr;
+
+    case Kind::uninitializedVar:
+      return uninitializedVar.binding;
+    }
+    llvm_unreachable("invalid case label type");
+  }
+
+  unsigned getIndexOfUninitializedVar() const {
+    switch (kind) {
+    case Kind::expression:
+    case Kind::function:
+    case Kind::stmtCondition:
+    case Kind::caseLabelItem:
+    case Kind::patternBinding:
+      return 0;
+
+    case Kind::uninitializedVar:
+      return uninitializedVar.index;
     }
     llvm_unreachable("invalid case label type");
   }
@@ -2013,8 +2120,13 @@ public:
     case Kind::patternBinding:
       return patternBinding->getSourceRange();
 
-    case Kind::uninitializedWrappedVar:
-      return uninitializedWrappedVar->getSourceRange();
+    case Kind::uninitializedVar: {
+      if (auto *wrappedVar =
+              uninitializedVar.declaration.dyn_cast<VarDecl *>()) {
+        return wrappedVar->getSourceRange();
+      }
+      return uninitializedVar.declaration.get<Pattern *>()->getSourceRange();
+    }
     }
     llvm_unreachable("invalid target type");
   }
@@ -2037,8 +2149,13 @@ public:
     case Kind::patternBinding:
       return patternBinding->getLoc();
 
-    case Kind::uninitializedWrappedVar:
-      return uninitializedWrappedVar->getLoc();
+    case Kind::uninitializedVar: {
+      if (auto *wrappedVar =
+          uninitializedVar.declaration.dyn_cast<VarDecl *>()) {
+        return wrappedVar->getLoc();
+      }
+      return uninitializedVar.declaration.get<Pattern *>()->getLoc();
+    }
     }
     llvm_unreachable("invalid target type");
   }
@@ -2297,6 +2414,11 @@ private:
 
   /// Cache of the effects any closures visited.
   llvm::SmallDenseMap<ClosureExpr *, FunctionType::ExtInfo, 4> closureEffectsCache;
+
+  /// A mapping from the constraint locators for references to various
+  /// names (e.g., member references, normal name references, possible
+  /// constructions) to the argument lists for the call to that locator.
+  llvm::MapVector<ConstraintLocator *, ArgumentList *> ArgumentLists;
 
 public:
   /// A map from argument expressions to their applied property wrapper expressions.
@@ -2676,25 +2798,17 @@ public:
   /// we're exploring.
   SolverState *solverState = nullptr;
 
-  struct ArgumentInfo {
-    ArrayRef<Identifier> Labels;
-    Optional<unsigned> UnlabeledTrailingClosureIndex;
-  };
-
-  /// A mapping from the constraint locators for references to various
-  /// names (e.g., member references, normal name references, possible
-  /// constructions) to the argument labels provided in the call to
-  /// that locator.
-  llvm::DenseMap<ConstraintLocator *, ArgumentInfo> ArgumentInfos;
-
   /// Form a locator that can be used to retrieve argument information cached in
   /// the constraint system for the callee described by the anchor of the
   /// passed locator.
   ConstraintLocator *getArgumentInfoLocator(ConstraintLocator *locator);
 
-  /// Retrieve the argument info that is associated with a member
-  /// reference at the given locator.
-  Optional<ArgumentInfo> getArgumentInfo(ConstraintLocator *locator);
+  /// Retrieve the argument list that is associated with a call at the given
+  /// locator.
+  ArgumentList *getArgumentList(ConstraintLocator *locator);
+
+  /// Associate an argument list with a call at a given locator.
+  void associateArgumentList(ConstraintLocator *locator, ArgumentList *args);
 
   Optional<SelectedOverload>
   findSelectedOverloadFor(ConstraintLocator *locator) const {
@@ -2793,6 +2907,9 @@ public:
 
     /// The length of \c ImplicitValueConversions.
     unsigned numImplicitValueConversions;
+
+    /// The length of \c ArgumentLists.
+    unsigned numArgumentLists;
 
     /// The previous score.
     Score PreviousScore;
@@ -4211,6 +4328,19 @@ public:
       llvm::function_ref<ConstraintFix *(unsigned, const OverloadChoice &)>
           getFix = [](unsigned, const OverloadChoice &) { return nullptr; });
 
+  /// Generate constraints for the given property that has an
+  /// attached property wrapper.
+  ///
+  /// \param wrappedVar The property that has a property wrapper.
+  /// \param initializerType The type of the initializer for the
+  ///        backing storage variable.
+  /// \param propertyType The type of the wrapped property.
+  ///
+  /// \returns true if there is an error.
+  bool generateWrappedPropertyTypeConstraints(VarDecl *wrappedVar,
+                                              Type initializerType,
+                                              Type propertyType);
+
   /// Propagate constraints in an effort to enforce local
   /// consistency to reduce the time to solve the system.
   ///
@@ -4406,8 +4536,25 @@ public:
     Type underlyingType;
     if (auto *fnTy = type->getAs<AnyFunctionType>())
       underlyingType = replaceFinalResultTypeWithUnderlying(fnTy);
-    else
+    else if (auto *typeVar =
+                 type->getWithoutSpecifierType()->getAs<TypeVariableType>()) {
+      auto *locator = typeVar->getImpl().getLocator();
+
+      // If `type` hasn't been resolved yet, we need to allocate a type
+      // variable to represent an object type of a future optional, and
+      // add a constraint beetween `type` and `underlyingType` to model it.
+      underlyingType = createTypeVariable(
+          getConstraintLocator(locator, LocatorPathElt::GenericArgument(0)),
+          TVO_PrefersSubtypeBinding | TVO_CanBindToLValue |
+              TVO_CanBindToNoEscape);
+
+      // Using a `typeVar` here because l-value is going to be applied
+      // to the underlying type below.
+      addConstraint(ConstraintKind::OptionalObject, typeVar, underlyingType,
+                    locator);
+    } else {
       underlyingType = type->getWithoutSpecifierType()->getOptionalObjectType();
+    }
 
     assert(underlyingType);
 
@@ -5062,10 +5209,10 @@ public:
 
   /// Check whether given AST node represents an argument of an application
   /// of some sort (call, operator invocation, subscript etc.)
-  /// and return AST node representing and argument index. E.g. for regular
-  /// calls `test(42)` passing `42` should return node representing
-  /// entire call and index `0`.
-  Optional<std::pair<Expr *, unsigned>> isArgumentExpr(Expr *expr);
+  /// and returns a locator for the argument application. E.g. for regular
+  /// calls `test(42)` passing `42` should return a locator with the entire call
+  /// as the anchor, and a path to the argument at index `0`.
+  ConstraintLocator *getArgumentLocator(Expr *expr);
 
   SWIFT_DEBUG_DUMP;
   SWIFT_DEBUG_DUMPER(dump(Expr *));

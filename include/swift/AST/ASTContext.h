@@ -17,6 +17,7 @@
 #ifndef SWIFT_AST_ASTCONTEXT_H
 #define SWIFT_AST_ASTCONTEXT_H
 
+#include "swift/AST/ASTAllocated.h"
 #include "swift/AST/Evaluator.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Identifier.h"
@@ -144,22 +145,6 @@ namespace rewriting {
 namespace syntax {
   class SyntaxArena;
 }
-
-/// The arena in which a particular ASTContext allocation will go.
-enum class AllocationArena {
-  /// The permanent arena, which is tied to the lifetime of
-  /// the ASTContext.
-  ///
-  /// All global declarations and types need to be allocated into this arena.
-  /// At present, everything that is not a type involving a type variable is
-  /// allocated in this arena.
-  Permanent,
-  /// The constraint solver's temporary arena, which is tied to the
-  /// lifetime of a particular instance of the constraint solver.
-  ///
-  /// Any type involving a type variable is allocated in this arena.
-  ConstraintSolver
-};
 
 /// Lists the set of "known" Foundation entities that are used in the
 /// compiler.
@@ -753,6 +738,9 @@ public:
   /// Get the runtime availability of support for concurrency.
   AvailabilityContext getConcurrencyAvailability();
 
+  /// Get the back-deployed availability for concurrency.
+  AvailabilityContext getBackDeployedConcurrencyAvailability();
+
   /// Get the runtime availability of support for differentiation.
   AvailabilityContext getDifferentiationAvailability();
 
@@ -783,6 +771,11 @@ public:
   /// Get the runtime availability of features introduced in the Swift 5.6
   /// compiler for the target platform.
   AvailabilityContext getSwift56Availability();
+
+  // Note: Update this function if you add a new getSwiftXYAvailability above.
+  /// Get the runtime availability for a particular version of Swift (5.0+).
+  AvailabilityContext
+  getSwift5PlusAvailability(llvm::VersionTuple swiftVersion);
 
   /// Get the runtime availability of features that have been introduced in the
   /// Swift compiler for future versions of the target platform.

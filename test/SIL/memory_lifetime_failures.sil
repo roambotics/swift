@@ -191,7 +191,7 @@ bb0(%0 : $*Optional<T>):
   %1 = load_borrow %0 : $*Optional<T>
   switch_enum %1 : $Optional<T>, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
 
-bb1(%3 : $T):
+bb1(%3 : @guaranteed $T):
   end_borrow %1 : $Optional<T>
   %2 = unchecked_take_enum_data_addr %0 : $*Optional<T>, #Optional.some!enumelt
   br bb3
@@ -537,4 +537,33 @@ bb0(%0 : $Bool):
   %9 = apply %8(%1) : $@convention(thin) (@inout_aliasable Bool) -> ()
   %10 = tuple ()
   return %10 : $()
+}
+
+// MemoryLifetimeVerifier does not detect an error here due to reborrows
+sil [ossa] @test_load_borrow1 : $@convention(thin) (@in Optional<T>) -> () {
+bb0(%0 : $*Optional<T>):
+  destroy_addr %0 : $*Optional<T>
+  %1 = load_borrow %0 : $*Optional<T>
+  br bb1(%1 : $Optional<T>)
+
+bb1(%3 : @guaranteed $Optional<T>):
+  end_borrow %3 : $Optional<T>
+  br bb2
+
+bb2:
+  %r = tuple ()
+  return %r : $()
+}
+
+// CHECK: SIL memory lifetime failure in @test_load_borrow2: memory is not initialized, but should
+sil [ossa] @test_load_borrow2 : $@convention(thin) (@in Optional<T>) -> () {
+bb0(%0 : $*Optional<T>):
+  destroy_addr %0 : $*Optional<T>
+  %1 = load_borrow %0 : $*Optional<T>
+  end_borrow %1 : $Optional<T>
+  br bb1
+
+bb1:
+  %r = tuple ()
+  return %r : $()
 }

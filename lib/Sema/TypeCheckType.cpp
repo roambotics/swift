@@ -401,7 +401,7 @@ Type TypeResolution::resolveTypeInContext(TypeDecl *typeDecl,
     // type within the context.
     if (auto *nominalType = dyn_cast<NominalTypeDecl>(typeDecl)) {
       for (auto *parentDC = fromDC; !parentDC->isModuleScopeContext();
-           parentDC = parentDC->getParent()) {
+           parentDC = parentDC->getParentForLookup()) {
         auto *parentNominal = parentDC->getSelfNominalTypeDecl();
         if (parentNominal == nominalType)
           return mapTypeIntoContext(parentDC->getDeclaredInterfaceType());
@@ -421,7 +421,7 @@ Type TypeResolution::resolveTypeInContext(TypeDecl *typeDecl,
     // referenced without generic arguments as well.
     if (auto *aliasDecl = dyn_cast<TypeAliasDecl>(typeDecl)) {
       for (auto *parentDC = fromDC; !parentDC->isModuleScopeContext();
-           parentDC = parentDC->getParent()) {
+           parentDC = parentDC->getParentForLookup()) {
         if (auto *ext = dyn_cast<ExtensionDecl>(parentDC)) {
           auto extendedType = ext->getExtendedType();
           if (auto *unboundGeneric =
@@ -590,8 +590,6 @@ bool TypeChecker::checkContextualRequirements(GenericTypeDecl *decl,
     return true;
   }
 
-  auto &ctx = dc->getASTContext();
-
   SourceLoc noteLoc;
   {
     // We are interested in either a contextual where clause or
@@ -610,14 +608,6 @@ bool TypeChecker::checkContextualRequirements(GenericTypeDecl *decl,
 
   const auto subMap = parentTy->getContextSubstitutions(decl->getDeclContext());
   const auto genericSig = decl->getGenericSignature();
-  if (!genericSig) {
-    if (loc.isValid()) {
-      ctx.Diags.diagnose(loc, diag::recursive_decl_reference,
-                         decl->getDescriptiveKind(), decl->getName());
-      decl->diagnose(diag::kind_declared_here, DescriptiveDeclKind::Type);
-    }
-    return false;
-  }
 
   const auto result =
     TypeChecker::checkGenericArguments(
@@ -763,14 +753,6 @@ static Type applyGenericArguments(Type type, TypeResolution resolution,
         return BoundGenericType::get(nominal, /*parent*/ Type(), objectType);
       }
     }  
-  }
-
-  // FIXME: More principled handling of circularity.
-  if (!decl->getGenericSignature()) {
-    diags.diagnose(loc, diag::recursive_decl_reference,
-                   decl->getDescriptiveKind(), decl->getName());
-    decl->diagnose(diag::kind_declared_here, DescriptiveDeclKind::Type);
-    return ErrorType::get(ctx);
   }
 
   // Resolve the types of the generic arguments.
@@ -1098,6 +1080,14 @@ static Type diagnoseUnknownType(TypeResolution resolution,
 
   // Unqualified lookup case.
   if (parentType.isNull()) {
+    // Tailored diagnostic for custom attributes.
+    if (resolution.getOptions().is(TypeResolverContext::CustomAttr)) {
+      diags.diagnose(comp->getNameLoc(), diag::unknown_attribute,
+                     comp->getNameRef().getBaseIdentifier().str());
+
+      return ErrorType::get(ctx);
+    }
+
     if (comp->getNameRef().isSimpleName(ctx.Id_Self) &&
         !isa<GenericIdentTypeRepr>(comp)) {
       DeclContext *nominalDC = nullptr;
@@ -1660,6 +1650,15 @@ resolveIdentTypeComponent(TypeResolution resolution,
       !options.is(TypeResolverContext::TypeAliasDecl)) {
 
     if (!options.contains(TypeResolutionFlags::SilenceErrors)) {
+      // Tailored diagnostic for custom attributes.
+      if (options.is(TypeResolverContext::CustomAttr)) {
+        auto &ctx = resolution.getASTContext();
+        ctx.Diags.diagnose(lastComp->getNameLoc(), diag::unknown_attribute,
+                           lastComp->getNameRef().getBaseIdentifier().str());
+
+        return ErrorType::get(ctx);
+      }
+
       diagnoseUnboundGenericType(result,
                                  lastComp->getNameLoc().getBaseNameLoc());
     }
@@ -1896,11 +1895,6 @@ namespace {
     NeverNullType resolveOpaqueReturnType(TypeRepr *repr, StringRef mangledName,
                                           unsigned ordinal,
                                           TypeResolutionOptions options);
-
-    /// Returns true if the given type conforms to `Differentiable` in the
-    /// module of `DC`. If `tangentVectorEqualsSelf` is true, returns true iff
-    /// the given type additionally satisfies `Self == Self.TangentVector`.
-    bool isDifferentiable(Type type, bool tangentVectorEqualsSelf = false);
   };
 } // end anonymous namespace
 
@@ -1942,6 +1936,31 @@ Type ResolveTypeRequest::evaluate(Evaluator &evaluator,
 
   if (validateAutoClosureAttributeUse(ctx.Diags, TyR, result, options))
     return ErrorType::get(ctx);
+
+  // Diagnose an attempt to use a placeholder at the top level.
+  if (result->getCanonicalType()->is<PlaceholderType>() &&
+      resolution->getOptions().contains(TypeResolutionFlags::Direct)) {
+    if (!resolution->getOptions().contains(TypeResolutionFlags::SilenceErrors))
+      ctx.Diags.diagnose(loc, diag::top_level_placeholder_type);
+
+    TyR->setInvalid();
+    return ErrorType::get(ctx);
+  }
+
+  // Now that top-level placeholders have been diagnosed, replace them according
+  // to the user-specified handler (if it exists).
+  if (const auto handlerFn = resolution->getPlaceholderHandler()) {
+    result = result.get().transform([&](Type ty) {
+      if (auto *oldTy = ty->getAs<PlaceholderType>()) {
+        auto originator = oldTy->getOriginator();
+        if (auto *repr = originator.dyn_cast<PlaceholderTypeRepr *>())
+          if (auto newTy = handlerFn(ctx, repr))
+            return newTy;
+      }
+
+      return ty;
+    });
+  }
 
   return result;
 }
@@ -2071,18 +2090,21 @@ NeverNullType TypeResolver::resolveType(TypeRepr *repr,
                        options);
 
   case TypeReprKind::Placeholder: {
-    auto &ctx = getASTContext();
-    // Fill in the placeholder if there's an appropriate handler.
-    if (const auto handlerFn = resolution.getPlaceholderHandler())
-      if (const auto ty = handlerFn(ctx, cast<PlaceholderTypeRepr>(repr)))
-        return ty;
+    if (resolution.getPlaceholderHandler())
+      // For now, just form a `PlaceholderType` so that we can properly diagnose
+      // invalid top-level placeholders. `ResolveTypeRequest::evaluate` will
+      // take care of substituting the placeholder based on the caller-specified
+      // handler.
+      return PlaceholderType::get(getASTContext(),
+                                  cast<PlaceholderTypeRepr>(repr));
 
-    // Complain if we're allowed to and bail out with an error.
+    // If there's no handler, complain if we're allowed to and bail out with an
+    // error.
     if (!options.contains(TypeResolutionFlags::SilenceErrors))
-      ctx.Diags.diagnose(repr->getLoc(),
+      getASTContext().Diags.diagnose(repr->getLoc(),
                          diag::placeholder_type_not_allowed);
 
-    return ErrorType::get(resolution.getASTContext());
+    return ErrorType::get(getASTContext());
   }
 
   case TypeReprKind::Fixed:
@@ -2774,50 +2796,6 @@ TypeResolver::resolveASTFunctionTypeParams(TupleTypeRepr *inputRepr,
                           inputRepr->getElementName(i));
   }
 
-  // All non-`@noDerivative` parameters of `@differentiable` function types must
-  // be differentiable.
-  if (diffKind != DifferentiabilityKind::NonDifferentiable &&
-      resolution.getStage() != TypeResolutionStage::Structural) {
-    bool isLinear = diffKind == DifferentiabilityKind::Linear;
-    // Emit `@noDerivative` fixit only if there is at least one valid
-    // differentiability parameter. Otherwise, adding `@noDerivative` produces
-    // an ill-formed function type.
-    auto hasValidDifferentiabilityParam =
-        llvm::find_if(elements, [&](AnyFunctionType::Param param) {
-          if (param.isNoDerivative())
-            return false;
-          return isDifferentiable(param.getPlainType(),
-                                  /*tangentVectorEqualsSelf*/ isLinear);
-        }) != elements.end();
-    bool alreadyDiagnosedOneParam = false;
-    for (unsigned i = 0, end = inputRepr->getNumElements(); i != end; ++i) {
-      auto *eltTypeRepr = inputRepr->getElementType(i);
-      auto param = elements[i];
-      if (param.isNoDerivative())
-        continue;
-      auto paramType = param.getPlainType();
-      if (isDifferentiable(paramType, isLinear))
-        continue;
-      auto paramTypeString = paramType->getString();
-      auto diagnostic =
-          diagnose(eltTypeRepr->getLoc(),
-                   diag::differentiable_function_type_invalid_parameter,
-                   paramTypeString, isLinear, hasValidDifferentiabilityParam);
-      alreadyDiagnosedOneParam = true;
-      if (hasValidDifferentiabilityParam)
-        diagnostic.fixItInsert(eltTypeRepr->getLoc(), "@noDerivative ");
-    }
-    // Reject the case where all parameters have '@noDerivative'.
-    if (!alreadyDiagnosedOneParam && !hasValidDifferentiabilityParam) {
-      diagnose(
-          inputRepr->getLoc(),
-          diag::
-              differentiable_function_type_no_differentiability_parameters,
-          isLinear)
-          .highlight(inputRepr->getSourceRange());
-    }
-  }
-
   return elements;
 }
 
@@ -2946,57 +2924,12 @@ NeverNullType TypeResolver::resolveASTFunctionType(
   if (fnTy->hasError())
     return fnTy;
 
-  // If the type is a block or C function pointer, it must be representable in
-  // ObjC.
-  switch (representation) {
-  case AnyFunctionType::Representation::Block:
-  case AnyFunctionType::Representation::CFunctionPointer:
-    if (!fnTy->isRepresentableIn(ForeignLanguage::ObjectiveC,
-                                 getDeclContext())) {
-      StringRef strName =
-        (representation == AnyFunctionType::Representation::Block)
-        ? "block"
-        : "c";
-      auto extInfo2 =
-        extInfo.withRepresentation(AnyFunctionType::Representation::Swift);
-      auto simpleFnTy = FunctionType::get(params, outputTy, extInfo2);
-      diagnose(repr->getStartLoc(), diag::objc_convention_invalid,
-               simpleFnTy, strName);
-    }
-    break;
-
-  case AnyFunctionType::Representation::Thin:
-  case AnyFunctionType::Representation::Swift:
-    break;
-  }
-
-  // `@differentiable` function types must return a differentiable type.
-  if (extInfo.isDifferentiable() &&
-      resolution.getStage() != TypeResolutionStage::Structural) {
-    bool isLinear = diffKind == DifferentiabilityKind::Linear;
-    if (!isDifferentiable(outputTy, /*tangentVectorEqualsSelf*/ isLinear)) {
-      diagnose(repr->getResultTypeRepr()->getLoc(),
-               diag::differentiable_function_type_invalid_result,
-               outputTy->getString(), isLinear)
-          .highlight(repr->getResultTypeRepr()->getSourceRange());
-    }
-  }
+  if (TypeChecker::diagnoseInvalidFunctionType(fnTy, repr->getLoc(), repr,
+                                               getDeclContext(),
+                                               resolution.getStage()))
+    return ErrorType::get(fnTy);
 
   return fnTy;
-}
-
-bool TypeResolver::isDifferentiable(Type type, bool tangentVectorEqualsSelf) {
-  if (resolution.getStage() != TypeResolutionStage::Contextual)
-    type = getDeclContext()->mapTypeIntoContext(type);
-  auto tanSpace = type->getAutoDiffTangentSpace(
-      LookUpConformanceInModule(getDeclContext()->getParentModule()));
-  if (!tanSpace)
-    return false;
-  // If no `Self == Self.TangentVector` requirement, return true.
-  if (!tangentVectorEqualsSelf)
-    return true;
-  // Otherwise, return true if `Self == Self.TangentVector`.
-  return type->getCanonicalType() == tanSpace->getCanonicalType();
 }
 
 NeverNullType TypeResolver::resolveSILBoxType(SILBoxTypeRepr *repr,
@@ -3689,6 +3622,7 @@ NeverNullType TypeResolver::resolveImplicitlyUnwrappedOptionalType(
   case TypeResolverContext::AbstractFunctionDecl:
   case TypeResolverContext::ClosureExpr:
   case TypeResolverContext::Inherited:
+  case TypeResolverContext::CustomAttr:
     doDiag = true;
     break;
   }
@@ -3828,7 +3762,7 @@ TypeResolver::resolveCompositionType(CompositionTypeRepr *repr,
     if (ty->hasError()) return ty;
 
     auto nominalDecl = ty->getAnyNominal();
-    if (nominalDecl && isa<ClassDecl>(nominalDecl)) {
+    if (isa_and_nonnull<ClassDecl>(nominalDecl)) {
       if (checkSuperclass(tyR->getStartLoc(), ty))
         continue;
 
@@ -4013,159 +3947,6 @@ Type TypeChecker::substMemberTypeWithBase(ModuleDecl *module,
   }
 
   return resultType;
-}
-
-namespace {
-
-class UnsupportedProtocolVisitor
-  : public TypeReprVisitor<UnsupportedProtocolVisitor>, public ASTWalker
-{
-  ASTContext &Ctx;
-  bool checkStatements;
-  bool hitTopStmt;
-    
-public:
-  UnsupportedProtocolVisitor(ASTContext &ctx, bool checkStatements)
-    : Ctx(ctx), checkStatements(checkStatements), hitTopStmt(false) { }
-
-  bool walkToTypeReprPre(TypeRepr *T) override {
-    if (T->isInvalid())
-      return false;
-    if (auto compound = dyn_cast<CompoundIdentTypeRepr>(T)) {
-      // Only visit the last component to check, because nested typealiases in
-      // existentials are okay.
-      visit(compound->getComponentRange().back());
-      return false;
-    }
-    // Arbitrary protocol constraints are OK on opaque types.
-    if (isa<OpaqueReturnTypeRepr>(T))
-      return false;
-    
-    visit(T);
-    return true;
-  }
-
-  std::pair<bool, Stmt*> walkToStmtPre(Stmt *S) override {
-    if (checkStatements && !hitTopStmt) {
-      hitTopStmt = true;
-      return { true, S };
-    }
-
-    return { false, S };
-  }
-
-  bool walkToDeclPre(Decl *D) override {
-    return !checkStatements;
-  }
-
-  void visitTypeRepr(TypeRepr *T) {
-    // Do nothing for all TypeReprs except the ones listed below.
-  }
-
-  void visitIdentTypeRepr(IdentTypeRepr *T) {
-    if (T->isInvalid())
-      return;
-    
-    auto comp = T->getComponentRange().back();
-    if (auto *proto = dyn_cast_or_null<ProtocolDecl>(comp->getBoundDecl())) {
-      if (!proto->existentialTypeSupported()) {
-        Ctx.Diags.diagnose(comp->getNameLoc(),
-                           diag::unsupported_existential_type,
-                           proto->getName());
-        T->setInvalid();
-      }
-    } else if (auto *alias = dyn_cast_or_null<TypeAliasDecl>(comp->getBoundDecl())) {
-      auto type = Type(alias->getDeclaredInterfaceType()->getDesugaredType());
-      type.findIf([&](Type type) -> bool {
-        if (T->isInvalid())
-          return false;
-        if (type->isExistentialType()) {
-          auto layout = type->getExistentialLayout();
-          for (auto *proto : layout.getProtocols()) {
-            auto *protoDecl = proto->getDecl();
-            if (protoDecl->existentialTypeSupported())
-              continue;
-            
-            Ctx.Diags.diagnose(comp->getNameLoc(),
-                               diag::unsupported_existential_type,
-                               protoDecl->getName());
-            T->setInvalid();
-          }
-        }
-        return false;
-      });
-    }
-  }
-
-  void visitRequirements(ArrayRef<RequirementRepr> reqts) {
-    for (auto reqt : reqts) {
-      if (reqt.getKind() == RequirementReprKind::SameType) {
-        if (auto *repr = reqt.getFirstTypeRepr())
-          repr->walk(*this);
-        if (auto *repr = reqt.getSecondTypeRepr())
-          repr->walk(*this);
-      }
-    }
-  }
-};
-
-} // end anonymous namespace
-
-void TypeChecker::checkUnsupportedProtocolType(Decl *decl) {
-  if (!decl || decl->isInvalid())
-    return;
-
-  auto &ctx = decl->getASTContext();
-  if (auto *protocolDecl = dyn_cast<ProtocolDecl>(decl)) {
-    checkUnsupportedProtocolType(ctx, protocolDecl->getTrailingWhereClause());
-  } else if (auto *genericDecl = dyn_cast<GenericTypeDecl>(decl)) {
-    checkUnsupportedProtocolType(ctx, genericDecl->getGenericParams());
-    checkUnsupportedProtocolType(ctx, genericDecl->getTrailingWhereClause());
-  } else if (auto *assocType = dyn_cast<AssociatedTypeDecl>(decl)) {
-    checkUnsupportedProtocolType(ctx, assocType->getTrailingWhereClause());
-  } else if (auto *extDecl = dyn_cast<ExtensionDecl>(decl)) {
-    checkUnsupportedProtocolType(ctx, extDecl->getTrailingWhereClause());
-  } else if (auto *subscriptDecl = dyn_cast<SubscriptDecl>(decl)) {
-    checkUnsupportedProtocolType(ctx, subscriptDecl->getGenericParams());
-    checkUnsupportedProtocolType(ctx, subscriptDecl->getTrailingWhereClause());
-  } else if (auto *funcDecl = dyn_cast<AbstractFunctionDecl>(decl)) {
-    if (!isa<AccessorDecl>(funcDecl)) {
-      checkUnsupportedProtocolType(ctx, funcDecl->getGenericParams());
-      checkUnsupportedProtocolType(ctx, funcDecl->getTrailingWhereClause());
-    }
-  }
-
-  if (isa<TypeDecl>(decl) || isa<ExtensionDecl>(decl))
-    return;
-
-  UnsupportedProtocolVisitor visitor(ctx, /*checkStatements=*/false);
-  decl->walk(visitor);
-}
-
-void TypeChecker::checkUnsupportedProtocolType(ASTContext &ctx, Stmt *stmt) {
-  if (!stmt)
-    return;
-
-  UnsupportedProtocolVisitor visitor(ctx, /*checkStatements=*/true);
-  stmt->walk(visitor);
-}
-
-void TypeChecker::checkUnsupportedProtocolType(
-    ASTContext &ctx, TrailingWhereClause *whereClause) {
-  if (whereClause == nullptr)
-    return;
-
-  UnsupportedProtocolVisitor visitor(ctx, /*checkStatements=*/false);
-  visitor.visitRequirements(whereClause->getRequirements());
-}
-
-void TypeChecker::checkUnsupportedProtocolType(
-    ASTContext &ctx, GenericParamList *genericParams) {
-  if (genericParams  == nullptr)
-    return;
-
-  UnsupportedProtocolVisitor visitor(ctx, /*checkStatements=*/false);
-  visitor.visitRequirements(genericParams->getRequirements());
 }
 
 Type CustomAttrTypeRequest::evaluate(Evaluator &eval, CustomAttr *attr,

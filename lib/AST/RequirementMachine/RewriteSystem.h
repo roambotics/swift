@@ -13,8 +13,9 @@
 #ifndef SWIFT_REWRITESYSTEM_H
 #define SWIFT_REWRITESYSTEM_H
 
-#include <algorithm>
+#include "llvm/ADT/DenseSet.h"
 
+#include "Debug.h"
 #include "ProtocolGraph.h"
 #include "Symbol.h"
 #include "Term.h"
@@ -47,12 +48,6 @@ public:
 
   const Term &getLHS() const { return LHS; }
   const Term &getRHS() const { return RHS; }
-
-  OverlapKind checkForOverlap(const Rule &other,
-                              MutableTerm &t,
-                              MutableTerm &v) const {
-    return LHS.checkForOverlap(other.LHS, t, v);
-  }
 
   /// Returns if the rule was deleted.
   bool isDeleted() const {
@@ -102,27 +97,29 @@ class RewriteSystem final {
   /// rewrite rules, used for the linear order on symbols.
   ProtocolGraph Protos;
 
+  /// Constructed from a rule of the form X.[P2:T] => X.[P1:T] by
+  /// checkMergedAssociatedType().
+  struct MergedAssociatedType {
+    /// The *right* hand side of the original rule, X.[P1:T].
+    Term rhs;
+
+    /// The associated type symbol appearing at the end of the *left*
+    /// hand side of the original rule, [P2:T].
+    Symbol lhsSymbol;
+
+    /// The merged associated type symbol, [P1&P2:T].
+    Symbol mergedSymbol;
+  };
+
   /// A list of pending terms for the associated type merging completion
-  /// heuristic.
-  ///
-  /// The pair (lhs, rhs) satisfies the following conditions:
-  /// - lhs > rhs
-  /// - all symbols but the last are pair-wise equal in lhs and rhs
-  /// - the last symbol in both lhs and rhs is an associated type symbol
-  /// - the last symbol in both lhs and rhs has the same name
-  ///
-  /// See RewriteSystem::processMergedAssociatedTypes() for details.
-  std::vector<std::pair<MutableTerm, MutableTerm>> MergedAssociatedTypes;
+  /// heuristic. Entries are added by checkMergedAssociatedType(), and
+  /// consumed in processMergedAssociatedTypes().
+  std::vector<MergedAssociatedType> MergedAssociatedTypes;
 
-  /// A list of pending pairs for checking overlap in the completion
-  /// procedure.
-  std::deque<std::pair<unsigned, unsigned>> Worklist;
+  /// Pairs of rules which have already been checked for overlap.
+  llvm::DenseSet<std::pair<unsigned, unsigned>> CheckedOverlaps;
 
-  /// Set these to true to enable debugging output.
-  unsigned DebugSimplify : 1;
-  unsigned DebugAdd : 1;
-  unsigned DebugMerge : 1;
-  unsigned DebugCompletion : 1;
+  DebugOptions Debug;
 
 public:
   explicit RewriteSystem(RewriteContext &ctx);
@@ -176,11 +173,15 @@ public:
   void dump(llvm::raw_ostream &out) const;
 
 private:
-  Optional<std::pair<MutableTerm, MutableTerm>>
-  computeCriticalPair(const Rule &lhs, const Rule &rhs) const;
+  bool
+  computeCriticalPair(ArrayRef<Symbol>::const_iterator from,
+                      const Rule &lhs, const Rule &rhs,
+                      std::vector<std::pair<MutableTerm,
+                                            MutableTerm>> &result) const;
 
-  Symbol mergeAssociatedTypes(Symbol lhs, Symbol rhs) const;
   void processMergedAssociatedTypes();
+
+  void checkMergedAssociatedType(Term lhs, Term rhs);
 };
 
 } // end namespace rewriting

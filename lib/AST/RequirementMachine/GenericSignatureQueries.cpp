@@ -517,7 +517,14 @@ RequirementMachine::getConformanceAccessPath(Type type,
       return found->second;
     }
 
-    assert(CurrentConformanceAccessPaths.size() > 0);
+    if (CurrentConformanceAccessPaths.empty()) {
+      llvm::errs() << "Failed to find conformance access path for ";
+      llvm::errs() << type << " " << protocol->getName() << "\n:";
+      type.dump(llvm::errs());
+      llvm::errs() << "\n";
+      dump(llvm::errs());
+      abort();
+    }
 
     // The buffer consists of all conformance access paths of length N.
     // Swap it out with an empty buffer, and fill it with all paths of
@@ -573,35 +580,6 @@ RequirementMachine::getConformanceAccessPath(Type type,
       }
     }
   }
-}
-
-/// Compare two associated types.
-static int compareAssociatedTypes(AssociatedTypeDecl *assocType1,
-                                  AssociatedTypeDecl *assocType2) {
-  // - by name.
-  if (int result = assocType1->getName().str().compare(
-                                              assocType2->getName().str()))
-    return result;
-
-  // Prefer an associated type with no overrides (i.e., an anchor) to one
-  // that has overrides.
-  bool hasOverridden1 = !assocType1->getOverriddenDecls().empty();
-  bool hasOverridden2 = !assocType2->getOverriddenDecls().empty();
-  if (hasOverridden1 != hasOverridden2)
-    return hasOverridden1 ? +1 : -1;
-
-  // - by protocol, so t_n_m.`P.T` < t_n_m.`Q.T` (given P < Q)
-  auto proto1 = assocType1->getProtocol();
-  auto proto2 = assocType2->getProtocol();
-  if (int compareProtocols = TypeDecl::compare(proto1, proto2))
-    return compareProtocols;
-
-  // Error case: if we have two associated types with the same name in the
-  // same protocol, just tie-break based on address.
-  if (assocType1 != assocType2)
-    return assocType1 < assocType2 ? -1 : +1;
-
-  return 0;
 }
 
 static void lookupConcreteNestedType(NominalTypeDecl *decl,

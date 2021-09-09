@@ -1083,7 +1083,8 @@ void SILCloner<ImplClass>::visitBeginBorrowInst(BeginBorrowInst *Inst) {
 
   recordClonedInstruction(
       Inst, getBuilder().createBeginBorrow(getOpLocation(Inst->getLoc()),
-                                           getOpValue(Inst->getOperand())));
+                                           getOpValue(Inst->getOperand()), 
+                                           Inst->isDefined()));
 }
 
 template <typename ImplClass>
@@ -1250,24 +1251,6 @@ SILCloner<ImplClass>::visitDebugValueInst(DebugValueInst *Inst) {
   auto *NewInst = getBuilder().createDebugValue(Inst->getLoc(),
                                                 getOpValue(Inst->getOperand()),
                                                 VarInfo, Inst->poisonRefs());
-  remapDebugVarInfo(DebugVarCarryingInst(NewInst));
-  recordClonedInstruction(Inst, NewInst);
-}
-template<typename ImplClass>
-void
-SILCloner<ImplClass>::visitDebugValueAddrInst(DebugValueAddrInst *Inst) {
-  // We cannot inline/clone debug intrinsics without a scope. If they
-  // describe function arguments there is no way to determine which
-  // function they belong to.
-  if (!Inst->getDebugScope())
-    return;
-
-  // Do not remap the location for a debug Instruction.
-  SILDebugVariable VarInfo = *Inst->getVarInfo();
-  SILValue OpValue = getOpValue(Inst->getOperand());
-  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  auto *NewInst = getBuilder().createDebugValueAddr(Inst->getLoc(), OpValue,
-                                                    *Inst->getVarInfo());
   remapDebugVarInfo(DebugVarCarryingInst(NewInst));
   recordClonedInstruction(Inst, NewInst);
 }

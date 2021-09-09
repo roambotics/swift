@@ -292,7 +292,7 @@ enum class ArtificialMainKind : uint8_t {
 };
 
 /// Decl - Base class for all declarations in Swift.
-class alignas(1 << DeclAlignInBits) Decl {
+class alignas(1 << DeclAlignInBits) Decl : public ASTAllocated<Decl> {
 protected:
   union { uint64_t OpaqueBits;
 
@@ -403,9 +403,12 @@ protected:
   SWIFT_INLINE_BITFIELD(SubscriptDecl, VarDecl, 2,
     StaticSpelling : 2
   );
-  SWIFT_INLINE_BITFIELD(AbstractFunctionDecl, ValueDecl, 3+8+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(AbstractFunctionDecl, ValueDecl, 3+2+8+1+1+1+1+1+1,
     /// \see AbstractFunctionDecl::BodyKind
     BodyKind : 3,
+
+    /// \see AbstractFunctionDecl::SILSynthesizeKind
+    SILSynthesizeKind : 2,
 
     /// Import as member status.
     IAMStatus : 8,
@@ -511,7 +514,7 @@ protected:
     IsComputingSemanticMembers : 1
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(ProtocolDecl, NominalTypeDecl, 1+1+1+1+1+1+1+1+1+1+1+8+16,
+  SWIFT_INLINE_BITFIELD_FULL(ProtocolDecl, NominalTypeDecl, 1+1+1+1+1+1+1+1+1+8+16,
     /// Whether the \c RequiresClass bit is valid.
     RequiresClassValid : 1,
 
@@ -523,12 +526,6 @@ protected:
 
     /// Whether the existential of this protocol conforms to itself.
     ExistentialConformsToSelf : 1,
-
-    /// Whether the \c ExistentialTypeSupported bit is valid.
-    ExistentialTypeSupportedValid : 1,
-
-    /// Whether the existential of this protocol can be represented.
-    ExistentialTypeSupported : 1,
 
     /// True if the protocol has requirements that cannot be satisfied (e.g.
     /// because they could not be imported from Objective-C).
@@ -595,7 +592,7 @@ protected:
     HasAnyUnavailableValues : 1
   );
 
-  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1,
     /// If the module is compiled as static library.
     StaticLibrary : 1,
 
@@ -630,7 +627,11 @@ protected:
     IsMainModule : 1,
 
     /// Whether this module has incremental dependency information available.
-    HasIncrementalInfo : 1
+    HasIncrementalInfo : 1,
+
+    /// Whether this module has been compiled with comprehensive checking for
+    /// concurrency, e.g., Sendable checking.
+    IsConcurrencyChecked : 1
   );
 
   SWIFT_INLINE_BITFIELD(PrecedenceGroupDecl, Decl, 1+2,
@@ -1015,19 +1016,6 @@ public:
   /// Retrieve the diagnostic engine for diagnostics emission.
   LLVM_READONLY
   DiagnosticEngine &getDiags() const;
-
-  // Make vanilla new/delete illegal for Decls.
-  void *operator new(size_t Bytes) = delete;
-  void operator delete(void *Data) = delete;
-
-  // Only allow allocation of Decls using the allocator in ASTContext
-  // or by doing a placement new.
-  void *operator new(size_t Bytes, const ASTContext &C,
-                     unsigned Alignment = alignof(Decl));
-  void *operator new(size_t Bytes, void *Mem) { 
-    assert(Mem); 
-    return Mem; 
-  }
 };
 
 /// Allocates memory for a Decl with the given \p baseSize. If necessary,
@@ -1410,6 +1398,7 @@ public:
   }
 
   using DeclContext::operator new;
+  using DeclContext::operator delete;
 };
 
 /// Iterator that walks the extensions of a particular type.
@@ -1964,6 +1953,7 @@ public:
   }
   
   using DeclContext::operator new;
+  using DeclContext::operator delete;
 };
 
 /// SerializedTopLevelCodeDeclContext - This represents what was originally a
@@ -2614,6 +2604,7 @@ public:
   // Resolve ambiguity due to multiple base classes.
   using TypeDecl::getASTContext;
   using DeclContext::operator new;
+  using DeclContext::operator delete;
   using TypeDecl::getDeclaredInterfaceType;
 
   static bool classof(const DeclContext *C) {
@@ -3239,16 +3230,13 @@ public:
   /// Look for conformances of this nominal type to the given
   /// protocol.
   ///
-  /// \param module The module from which we initiate the search.
-  /// FIXME: This is currently unused.
-  ///
   /// \param protocol The protocol whose conformance is requested.
   /// \param conformances Will be populated with the set of protocol
   /// conformances found for this protocol.
   ///
   /// \returns true if any conformances were found. 
   bool lookupConformance(
-         ModuleDecl *module, ProtocolDecl *protocol,
+         ProtocolDecl *protocol,
          SmallVectorImpl<ProtocolConformance *> &conformances) const;
 
   /// Retrieve all of the protocols that this nominal type conforms to.
@@ -3369,8 +3357,6 @@ public:
   /// \returns the static 'shared' property for a global actor, or \c nullptr
   /// for types that are not global actors.
   VarDecl *getGlobalActorInstance() const;
-
-  bool hasDistributedActorLocalInitializer() const;
 
   /// Whether this type is a global actor, which can be used as an
   /// attribute to decorate declarations for inclusion in the actor-isolated
@@ -4159,21 +4145,6 @@ class ProtocolDecl final : public NominalTypeDecl {
     Bits.ProtocolDecl.ExistentialConformsToSelf = result;
   }
 
-  /// Returns the cached result of \c existentialTypeSupported or \c None if it
-  /// hasn't yet been computed.
-  Optional<bool> getCachedExistentialTypeSupported() {
-    if (Bits.ProtocolDecl.ExistentialTypeSupportedValid)
-      return Bits.ProtocolDecl.ExistentialTypeSupported;
-
-    return None;
-  }
-
-  /// Caches the result of \c existentialTypeSupported
-  void setCachedExistentialTypeSupported(bool supported) {
-    Bits.ProtocolDecl.ExistentialTypeSupportedValid = true;
-    Bits.ProtocolDecl.ExistentialTypeSupported = supported;
-  }
-
   bool hasLazyRequirementSignature() const {
     return Bits.ProtocolDecl.HasLazyRequirementSignature;
   }
@@ -4183,7 +4154,6 @@ class ProtocolDecl final : public NominalTypeDecl {
   friend class RequirementSignatureRequest;
   friend class ProtocolRequiresClassRequest;
   friend class ExistentialConformsToSelfRequest;
-  friend class ExistentialTypeSupportedRequest;
   friend class InheritedProtocolsRequest;
   
 public:
@@ -4271,12 +4241,6 @@ public:
   /// the member does not contain any associated types, and does not
   /// contain 'Self' in 'parameter' or 'other' position.
   bool isAvailableInExistential(const ValueDecl *decl) const;
-
-  /// Determine whether we are allowed to refer to an existential type
-  /// conforming to this protocol. This is only permitted if the types of
-  /// all the members do not contain any associated types, and do not
-  /// contain 'Self' in 'parameter' or 'other' position.
-  bool existentialTypeSupported() const;
 
   /// Returns a list of protocol requirements that must be assessed to
   /// determine a concrete's conformance effect polymorphism kind.
@@ -5732,6 +5696,7 @@ public:
   }
 
   using DeclContext::operator new;
+  using DeclContext::operator delete;
   using Decl::getASTContext;
 };
 
@@ -5772,6 +5737,15 @@ class AbstractFunctionDecl : public GenericContext, public ValueDecl {
   friend class NeedsNewVTableEntryRequest;
 
 public:
+  /// records the kind of SILGen-synthesized body this decl represents
+  enum class SILSynthesizeKind {
+    None,
+    MemberwiseInitializer,
+    DistributedActorFactory
+
+    // This enum currently needs to fit in a 2-bit bitfield.
+  };
+
   enum class BodyKind {
     /// The function did not have a body in the source code file.
     None,
@@ -5791,8 +5765,8 @@ public:
     /// Function body is present and type-checked.
     TypeChecked,
 
-    /// This is a memberwise initializer that will be synthesized by SILGen.
-    MemberwiseInitializer,
+    // Function body will be synthesized by SILGen.
+    SILSynthesize,
 
     /// Function body text was deserialized from a .swiftmodule.
     Deserialized
@@ -5892,6 +5866,14 @@ protected:
     Bits.AbstractFunctionDecl.BodyKind = unsigned(K);
   }
 
+  void setSILSynthesizeKind(SILSynthesizeKind K) {
+    Bits.AbstractFunctionDecl.SILSynthesizeKind = unsigned(K);
+  }
+
+  SILSynthesizeKind getSILSynthesizeKind() const {
+    return SILSynthesizeKind(Bits.AbstractFunctionDecl.SILSynthesizeKind);
+  }
+
 public:
   void setHasSingleExpressionBody(bool Has = true) { 
     Bits.AbstractFunctionDecl.HasSingleExpressionBody = Has;
@@ -5975,6 +5957,10 @@ public:
 
   /// Returns 'true' if the function is distributed.
   bool isDistributed() const;
+
+  /// Get (or synthesize)  the associated remote function for this one.
+  /// For example, for `distributed func hi()` get `func _remote_hi()`.
+  AbstractFunctionDecl *getDistributedActorRemoteFuncDecl() const;
 
   PolymorphicEffectKind getPolymorphicEffectKind(EffectKind kind) const;
 
@@ -6068,7 +6054,17 @@ public:
   void setIsMemberwiseInitializer() {
     assert(getBodyKind() == BodyKind::None);
     assert(isa<ConstructorDecl>(this));
-    setBodyKind(BodyKind::MemberwiseInitializer);
+    setBodyKind(BodyKind::SILSynthesize);
+    setSILSynthesizeKind(SILSynthesizeKind::MemberwiseInitializer);
+  }
+
+  /// Mark that the body should be filled in to be a factory method for creating
+  /// a distributed actor.
+  void setDistributedActorFactory() {
+    assert(getBodyKind() == BodyKind::None);
+    assert(isa<FuncDecl>(this));
+    setBodyKind(BodyKind::SILSynthesize);
+    setSILSynthesizeKind(SILSynthesizeKind::DistributedActorFactory);
   }
 
   /// Gets the body of this function, stripping the unused portions of #if
@@ -6092,7 +6088,16 @@ public:
   }
 
   bool isMemberwiseInitializer() const {
-    return getBodyKind() == BodyKind::MemberwiseInitializer;
+    return getBodyKind() == BodyKind::SILSynthesize
+        && getSILSynthesizeKind() == SILSynthesizeKind::MemberwiseInitializer;
+  }
+
+  /// Determines whether this function represents a distributed actor
+  /// initialization factory. Such functions do not have a body that is
+  /// representable in the AST, so it must be synthesized during SILGen.
+  bool isDistributedActorFactory() const {
+    return getBodyKind() == BodyKind::SILSynthesize
+    && getSILSynthesizeKind() == SILSynthesizeKind::DistributedActorFactory;
   }
 
   /// For a method of a class, checks whether it will require a new entry in the
@@ -6244,6 +6249,7 @@ public:
   bool hasKnownUnsafeSendableFunctionParams() const;
 
   using DeclContext::operator new;
+  using DeclContext::operator delete;
   using Decl::getASTContext;
 };
 
@@ -6775,6 +6781,7 @@ public:
   }
 
   using DeclContext::operator new;
+  using DeclContext::operator delete;
   using Decl::getASTContext;
 };
   
@@ -7001,18 +7008,6 @@ public:
   /// @objc init(forMemory: ())
   /// \endcode
   bool isObjCZeroParameterWithLongSelector() const;
-
-  /// Checks if the initializer is a distributed actor's 'local' initializer:
-  /// ```
-  /// init(transport: ActorTransport)
-  /// ```
-  bool isDistributedActorLocalInit() const;
-
-  /// Checks if the initializer is a distributed actor's 'resolve' initializer:
-  /// ```
-  /// init(resolve address: ActorAddress, using transport: ActorTransport)
-  /// ```
-  bool isDistributedActorResolveInit() const;
 
   static bool classof(const Decl *D) {
     return D->getKind() == DeclKind::Constructor;

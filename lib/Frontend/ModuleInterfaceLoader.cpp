@@ -1007,7 +1007,7 @@ class ModuleInterfaceLoaderImpl {
       ModuleInterfaceBuilder builder(
         ctx.SourceMgr, diagsToUse,
         astDelegate, interfacePath, moduleName, cacheDir,
-        prebuiltCacheDir, backupInterfaceDir,
+        prebuiltCacheDir, backupInterfaceDir, StringRef(),
         Opts.disableInterfaceLock, diagnosticLoc,
         dependencyTracker);
       // If we found an out-of-date .swiftmodule, we still want to add it as
@@ -1039,7 +1039,7 @@ class ModuleInterfaceLoaderImpl {
       // the genericSubInvocation we'll need to use to compute the cache paths.
       ModuleInterfaceBuilder fallbackBuilder(
         ctx.SourceMgr, &ctx.Diags, astDelegate, backupPath, moduleName, cacheDir,
-        prebuiltCacheDir, backupInterfaceDir,
+        prebuiltCacheDir, backupInterfaceDir, StringRef(),
         Opts.disableInterfaceLock, diagnosticLoc,
         dependencyTracker);
       if (rebuildInfo.sawOutOfDateModule(modulePath))
@@ -1083,7 +1083,7 @@ std::error_code ModuleInterfaceLoader::findModuleFilesInDirectory(
   std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
   std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
   std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-  bool IsFramework) {
+  bool skipBuildingInterface, bool IsFramework) {
 
   // If running in OnlySerialized mode, ModuleInterfaceLoader
   // should not have been constructed at all.
@@ -1109,6 +1109,16 @@ std::error_code ModuleInterfaceLoader::findModuleFilesInDirectory(
   // If present, use the private interface instead of the public one.
   if (fs.exists(PrivateInPath)) {
     InPath = PrivateInPath;
+  }
+
+  // If we've been told to skip building interfaces, we are done here and do
+  // not need to have the module actually built. For example, if we are
+  // currently answering a `canImport` query, it is enough to have found
+  // the interface.
+  if (skipBuildingInterface) {
+    if (ModuleInterfacePath)
+      *ModuleInterfacePath = InPath;
+    return std::error_code();
   }
 
   // Create an instance of the Impl to do the heavy lifting.
@@ -1208,7 +1218,8 @@ bool ModuleInterfaceLoader::buildSwiftModuleFromSwiftInterface(
     const ClangImporterOptions &ClangOpts, StringRef CacheDir,
     StringRef PrebuiltCacheDir, StringRef BackupInterfaceDir,
     StringRef ModuleName, StringRef InPath,
-    StringRef OutPath, bool SerializeDependencyHashes,
+    StringRef OutPath, StringRef ABIOutputPath,
+    bool SerializeDependencyHashes,
     bool TrackSystemDependencies, ModuleInterfaceLoaderOptions LoaderOpts,
     RequireOSSAModules_t RequireOSSAModules) {
   InterfaceSubContextDelegateImpl astDelegate(
@@ -1218,7 +1229,7 @@ bool ModuleInterfaceLoader::buildSwiftModuleFromSwiftInterface(
       SerializeDependencyHashes, TrackSystemDependencies, RequireOSSAModules);
   ModuleInterfaceBuilder builder(SourceMgr, &Diags, astDelegate, InPath,
                                  ModuleName, CacheDir, PrebuiltCacheDir,
-                                 BackupInterfaceDir,
+                                 BackupInterfaceDir, ABIOutputPath,
                                  LoaderOpts.disableInterfaceLock);
   // FIXME: We really only want to serialize 'important' dependencies here, if
   //        we want to ship the built swiftmodules to another machine.
@@ -1236,7 +1247,7 @@ bool ModuleInterfaceLoader::buildSwiftModuleFromSwiftInterface(
   assert(!backInPath.empty());
   ModuleInterfaceBuilder backupBuilder(SourceMgr, &Diags, astDelegate, backInPath,
                                        ModuleName, CacheDir, PrebuiltCacheDir,
-                                       BackupInterfaceDir,
+                                       BackupInterfaceDir, ABIOutputPath,
                                        LoaderOpts.disableInterfaceLock);
   // Ensure we can rebuild module after user changed the original interface file.
   backupBuilder.addExtraDependency(InPath);
@@ -1710,7 +1721,7 @@ bool ExplicitSwiftModuleLoader::findModule(ImportPath::Element ModuleID,
            std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
            std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
            std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-           bool &IsFramework, bool &IsSystemModule) {
+           bool skipBuildingInterface, bool &IsFramework, bool &IsSystemModule) {
   StringRef moduleName = ModuleID.Item.str();
   auto it = Impl.ExplicitModuleMap.find(moduleName);
   // If no explicit module path is given matches the name, return with an
@@ -1782,7 +1793,7 @@ std::error_code ExplicitSwiftModuleLoader::findModuleFilesInDirectory(
   std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
   std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
   std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-  bool IsFramework) {
+  bool skipBuildingInterface, bool IsFramework) {
   llvm_unreachable("Not supported in the Explicit Swift Module Loader.");
   return std::make_error_code(std::errc::not_supported);
 }

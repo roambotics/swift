@@ -200,6 +200,9 @@ public:
   /// (archetypes) that correspond to the interface types in this generic
   /// signature.
   GenericEnvironment *getGenericEnvironment() const;
+
+  /// Check invariants.
+  void verify() const;
 };
 
 /// A reference to a canonical generic signature.
@@ -471,6 +474,11 @@ inline bool CanGenericSignature::isActuallyCanonicalOrNull() const {
              llvm::DenseMapInfo<GenericSignatureImpl *>::getTombstoneKey() ||
          getPointer()->isCanonical();
 }
+
+int compareAssociatedTypes(AssociatedTypeDecl *assocType1,
+                           AssociatedTypeDecl *assocType2);
+
+int compareDependentTypes(Type type1, Type type2);
 
 } // end namespace swift
 
