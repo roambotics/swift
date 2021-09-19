@@ -13,6 +13,7 @@
 # This is always build standalone
 include("${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/modules/StandaloneOverlay.cmake")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/modules")
+set(SWIFT_STDLIB_STABLE_ABI TRUE)
 include(AddSwiftStdlib)
 
 # Don't build the libraries for 32-bit iOS targets; there is no back-deployment
@@ -42,6 +43,9 @@ set(swift_concurrency_install_component back-deployment)
 set(swift_concurrency_options
   BACK_DEPLOYMENT_LIBRARY 5.5
   DARWIN_INSTALL_NAME_DIR "@rpath")
-set(swift_concurrency_extra_sources "../BackDeployConcurrency/Exclusivity.cpp")
+set(swift_concurrency_extra_sources
+  "../BackDeployConcurrency/Exclusivity.cpp"
+  "../BackDeployConcurrency/Metadata.cpp")
+set(swift_concurrency_async_fp_mode "never")
 
 add_subdirectory(../Concurrency stdlib/public/BackDeployConcurrency)
