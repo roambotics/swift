@@ -53,6 +53,42 @@ DistributedModuleIsAvailableRequest::evaluate(Evaluator &evaluator,
 
 // ==== ------------------------------------------------------------------------
 
+/// Add Fix-It text for the given protocol type to inherit DistributedActor.
+void swift::diagnoseDistributedFunctionInNonDistributedActorProtocol(
+    const ProtocolDecl *proto, InFlightDiagnostic &diag) {
+  if (proto->getInherited().empty()) {
+    SourceLoc fixItLoc = proto->getBraces().Start;
+    diag.fixItInsert(fixItLoc, ": DistributedActor");
+  } else {
+    // Similar to how Sendable FitIts do this, we insert at the end of
+    // the inherited types.
+    ASTContext &ctx = proto->getASTContext();
+    SourceLoc fixItLoc = proto->getInherited().back().getSourceRange().End;
+    fixItLoc = Lexer::getLocForEndOfToken(ctx.SourceMgr, fixItLoc);
+    diag.fixItInsert(fixItLoc, ", DistributedActor");
+  }
+}
+
+
+/// Add Fix-It text for the given nominal type to adopt Codable.
+///
+/// Useful when 'Codable' is the 'SerializationRequirement' and a non-Codable
+/// function parameter or return value type is detected.
+void swift::addCodableFixIt(
+    const NominalTypeDecl *nominal, InFlightDiagnostic &diag) {
+  if (nominal->getInherited().empty()) {
+    SourceLoc fixItLoc = nominal->getBraces().Start;
+    diag.fixItInsert(fixItLoc, ": Codable");
+  } else {
+    ASTContext &ctx = nominal->getASTContext();
+    SourceLoc fixItLoc = nominal->getInherited().back().getSourceRange().End;
+    fixItLoc = Lexer::getLocForEndOfToken(ctx.SourceMgr, fixItLoc);
+    diag.fixItInsert(fixItLoc, ", Codable");
+  }
+}
+
+// ==== ------------------------------------------------------------------------
+
 bool IsDistributedActorRequest::evaluate(
     Evaluator &evaluator, NominalTypeDecl *nominal) const {
   // Protocols are actors if they inherit from `DistributedActor`.
@@ -63,42 +99,13 @@ bool IsDistributedActorRequest::evaluate(
             protocol->inheritsFrom(distributedActorProtocol));
   }
 
-  // Class declarations are 'distributed actors' if they are declared with 'distributed actor'
+  // Class declarations are 'distributed actors' if they are declared with
+  // 'distributed actor'
   auto classDecl = dyn_cast<ClassDecl>(nominal);
   if(!classDecl)
     return false;
 
   return classDecl->isExplicitDistributedActor();
-}
-
-AbstractFunctionDecl *GetDistributedRemoteFuncRequest::evaluate(
-    Evaluator &evaluator, AbstractFunctionDecl *func) const {
-
-  if (!func->isDistributed())
-    return nullptr;
-
-  auto &C = func->getASTContext();
-  DeclContext *DC = func->getDeclContext();
-
-  // not via `ensureDistributedModuleLoaded` to avoid generating a warning,
-  // we won't be emitting the offending decl after all.
-  if (!C.getLoadedModule(C.Id_Distributed))
-    return nullptr;
-
-  // Locate the actor decl that the member must be synthesized to.
-  // TODO(distributed): should this just be added to the extension instead when we're in one?
-  ClassDecl *decl = dyn_cast<ClassDecl>(DC);
-  if (!decl) {
-    if (auto ED = dyn_cast<ExtensionDecl>(DC)) {
-      decl = dyn_cast<ClassDecl>(ED->getExtendedNominal());
-    }
-  }
-
-  /// A distributed func cannot be added to a non-distributed actor;
-  /// If the 'decl' was not a distributed actor we must have declared and
-  /// requested it from a illegal context, let's just ignore the synthesis.
-  assert(decl && "Can't find actor detect to add implicit _remote function to");
-  return TypeChecker::addImplicitDistributedActorRemoteFunction(decl, func);
 }
 
 // ==== ------------------------------------------------------------------------
@@ -123,14 +130,35 @@ bool swift::checkDistributedFunction(FuncDecl *func, bool diagnose) {
     auto paramTy = func->mapTypeIntoContext(param->getInterfaceType());
     if (TypeChecker::conformsToProtocol(paramTy, encodableType, module).isInvalid() ||
         TypeChecker::conformsToProtocol(paramTy, decodableType, module).isInvalid()) {
-      if (diagnose)
-        func->diagnose(
+      if (diagnose) {
+        auto diag = func->diagnose(
             diag::distributed_actor_func_param_not_codable,
-            param->getArgumentName().str(),
-            param->getInterfaceType()
-        );
-      // TODO: suggest a fixit to add Codable to the type?
+            param->getArgumentName().str(), param->getInterfaceType(),
+            func->getDescriptiveKind(), "Codable");
+        if (auto paramNominalTy = paramTy->getAnyNominal()) {
+          addCodableFixIt(paramNominalTy, diag);
+        } // else, no nominal type to suggest the fixit for, e.g. a closure
+      }
       return true;
+    }
+
+    if (param->isInOut()) {
+      param->diagnose(
+          diag::distributed_actor_func_inout,
+          param->getName(),
+          func->getDescriptiveKind(), func->getName()
+      ).fixItRemove(SourceRange(param->getTypeSourceRangeForDiagnostics().Start,
+                                param->getTypeSourceRangeForDiagnostics().Start.getAdvancedLoc(1)));
+      // FIXME(distributed): the fixIt should be on param->getSpecifierLoc(), but that Loc is invalid for some reason?
+      return true;
+    }
+
+    if (param->isVariadic()) {
+      param->diagnose(
+          diag::distributed_actor_func_variadic,
+          param->getName(),
+          func->getDescriptiveKind(), func->getName()
+      );
     }
   }
 
@@ -139,21 +167,25 @@ bool swift::checkDistributedFunction(FuncDecl *func, bool diagnose) {
   if (!resultType->isVoid()) {
     if (TypeChecker::conformsToProtocol(resultType, decodableType, module).isInvalid() ||
         TypeChecker::conformsToProtocol(resultType, encodableType, module).isInvalid()) {
-      if (diagnose)
-        func->diagnose(
+      if (diagnose) {
+        auto diag = func->diagnose(
             diag::distributed_actor_func_result_not_codable,
-            func->getResultInterfaceType()
+            func->getResultInterfaceType(), func->getDescriptiveKind(),
+            "Codable" // Codable is a typealias, easier to diagnose like that
         );
-      // TODO: suggest a fixit to add Codable to the type?
+        if (auto resultNominalType = resultType->getAnyNominal()) {
+          addCodableFixIt(resultNominalType, diag);
+        }
+      }
       return true;
     }
   }
 
   // === Check _remote functions
-  ClassDecl *actorDecl = dyn_cast<ClassDecl>(func->getParent());
+  auto actorDecl = func->getParent()->getSelfNominalTypeDecl();
   assert(actorDecl && actorDecl->isDistributedActor());
 
-  // _remote function for a distributed function must not be implemented by end-users,
+  // _remote function for a distributed instance method must not be implemented by end-users,
   // it must be the specific implementation synthesized by the compiler.
   auto remoteFuncDecl = actorDecl->lookupDirectRemoteFunc(func);
   if (remoteFuncDecl && !remoteFuncDecl->isSynthesized()) {
@@ -195,20 +227,15 @@ void swift::checkDistributedActorConstructor(const ClassDecl *decl, ConstructorD
   if (!ctor->isDesignatedInit())
     return;
 
-  // === Designated initializers must accept exactly one ActorTransport
-  auto &C = ctor->getASTContext();
-  auto module = ctor->getParentModule();
-
+  // === Designated initializers must accept exactly one actor transport that
+  // matches the actor transport type of the actor.
   SmallVector<ParamDecl*, 2> transportParams;
   int transportParamsCount = 0;
-  auto protocolDecl = C.getProtocol(KnownProtocolKind::ActorTransport);
-  auto protocolTy = protocolDecl->getDeclaredInterfaceType();
-
+  Type transportTy = ctor->mapTypeIntoContext(
+      getDistributedActorTransportType(const_cast<ClassDecl *>(decl)));
   for (auto param : *ctor->getParameters()) {
     auto paramTy = ctor->mapTypeIntoContext(param->getInterfaceType());
-    auto conformance = TypeChecker::conformsToProtocol(paramTy, protocolDecl, module);
-
-    if (paramTy->isEqual(protocolTy) || !conformance.isInvalid()) {
+    if (paramTy->isEqual(transportTy)) {
       transportParamsCount += 1;
       transportParams.push_back(param);
     }
@@ -252,10 +279,6 @@ void TypeChecker::checkDistributedActor(ClassDecl *decl) {
     // --- Check all constructors
     if (auto ctor = dyn_cast<ConstructorDecl>(member))
       checkDistributedActorConstructor(decl, ctor);
-
-    // --- synthesize _remote functions for distributed functions
-    if (auto func = dyn_cast<FuncDecl>(member))
-      (void)addImplicitDistributedActorRemoteFunction(decl, func);
   }
 
   // ==== Properties
@@ -263,3 +286,50 @@ void TypeChecker::checkDistributedActor(ClassDecl *decl) {
   checkDistributedActorProperties(decl);
 }
 
+Type swift::getDistributedActorTransportType(NominalTypeDecl *actor) {
+  assert(actor->isDistributedActor());
+  auto &ctx = actor->getASTContext();
+
+  auto protocol = ctx.getProtocol(KnownProtocolKind::DistributedActor);
+  if (!protocol)
+    return ErrorType::get(ctx);
+
+  // Dig out the actor transport type.
+  auto module = actor->getParentModule();
+  Type selfType = actor->getSelfInterfaceType();
+  auto conformance = module->lookupConformance(selfType, protocol);
+  return conformance.getTypeWitnessByName(selfType, ctx.Id_Transport);
+}
+
+Type swift::getDistributedActorIdentityType(NominalTypeDecl *actor) {
+  assert(actor->isDistributedActor());
+  auto &ctx = actor->getASTContext();
+
+  auto actorProtocol = ctx.getProtocol(KnownProtocolKind::DistributedActor);
+  if (!actorProtocol)
+    return ErrorType::get(ctx);
+
+  AssociatedTypeDecl *transportDecl =
+      actorProtocol->getAssociatedType(ctx.Id_Transport);
+  if (!transportDecl)
+    return ErrorType::get(ctx);
+
+  auto transportProtocol = ctx.getProtocol(KnownProtocolKind::ActorTransport);
+  if (!transportProtocol)
+    return ErrorType::get(ctx);
+
+  AssociatedTypeDecl *identityDecl =
+      transportProtocol->getAssociatedType(ctx.getIdentifier("Identity"));
+  if (!identityDecl)
+    return ErrorType::get(ctx);
+
+  auto module = actor->getParentModule();
+  Type selfType = actor->getSelfInterfaceType();
+  auto conformance = module->lookupConformance(selfType, actorProtocol);
+  Type dependentType = actorProtocol->getSelfInterfaceType();
+  dependentType = DependentMemberType::get(dependentType, transportDecl);
+  dependentType = DependentMemberType::get(dependentType, identityDecl);
+  return dependentType.subst(
+      SubstitutionMap::getProtocolSubstitutions(
+        actorProtocol, selfType, conformance));
+}

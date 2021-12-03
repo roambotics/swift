@@ -1,5 +1,8 @@
-// RUN: %target-typecheck-verify-swift  -disable-availability-checking
+// RUN: %empty-directory(%t)
+// RUN: %target-swift-frontend -emit-module -emit-module-path %t/dynamically_replaceable.swiftmodule -module-name dynamically_replaceable -warn-concurrency %S/Inputs/dynamically_replaceable.swift
+// RUN: %target-typecheck-verify-swift -I %t -disable-availability-checking
 // REQUIRES: concurrency
+import dynamically_replaceable
 
 actor SomeActor { }
 
@@ -502,15 +505,24 @@ func acceptClosure<T>(_: () -> T) { }
 }
 
 // ----------------------------------------------------------------------
-// Unsafe main actor parameter annotation
+// Main actor that predates concurrency
 // ----------------------------------------------------------------------
-func takesUnsafeMainActor(@_unsafeMainActor fn: () -> Void) { }
+@_predatesConcurrency func takesUnsafeMainActor(fn: @MainActor () -> Void) { }
 
 @MainActor func onlyOnMainActor() { }
 
 func useUnsafeMainActor() {
   takesUnsafeMainActor {
     onlyOnMainActor() // okay due to parameter attribute
+  }
+}
+
+// ----------------------------------------------------------------------
+// @IBAction implies @MainActor(unsafe)
+// ----------------------------------------------------------------------
+class SomeWidgetThing {
+  @IBAction func onTouch(_ object: AnyObject) {
+    onlyOnMainActor() // okay
   }
 }
 
@@ -551,4 +563,12 @@ func useFooInADefer() -> String {
   }
 
   return "hello"
+}
+
+// ----------------------------------------------------------------------
+// Dynamic replacement
+// ----------------------------------------------------------------------
+@_dynamicReplacement(for: dynamicOnMainActor)
+func replacesDynamicOnMainActor() {
+  onlyOnMainActor()
 }

@@ -39,6 +39,12 @@ enum class Status {
   /// compiler.
   FormatTooNew,
 
+  /// The precise revision version doesn't match.
+  RevisionIncompatible,
+
+  /// The module is required to be in OSSA, but is not.
+  NotInOSSA,
+
   /// The module file depends on another module that can't be loaded.
   MissingDependency,
 
@@ -98,12 +104,13 @@ struct ValidationInfo {
 /// \sa validateSerializedAST()
 class ExtendedValidationInfo {
   SmallVector<StringRef, 4> ExtraClangImporterOpts;
-  StringRef SDKPath;
+  std::string SDKPath;
   StringRef ModuleABIName;
   struct {
     unsigned ArePrivateImportsEnabled : 1;
     unsigned IsSIB : 1;
-    unsigned IsStaticLibrary: 1;
+    unsigned IsStaticLibrary : 1;
+    unsigned HasHermeticSealAtLink : 1;
     unsigned IsTestable : 1;
     unsigned ResilienceStrategy : 2;
     unsigned IsImplicitDynamicEnabled : 1;
@@ -114,7 +121,7 @@ public:
   ExtendedValidationInfo() : Bits() {}
 
   StringRef getSDKPath() const { return SDKPath; }
-  void setSDKPath(StringRef path) {
+  void setSDKPath(std::string path) {
     assert(SDKPath.empty());
     SDKPath = path;
   }
@@ -141,6 +148,10 @@ public:
   bool isStaticLibrary() const { return Bits.IsStaticLibrary; }
   void setIsStaticLibrary(bool val) {
     Bits.IsStaticLibrary = val;
+  }
+  bool hasHermeticSealAtLink() const { return Bits.HasHermeticSealAtLink; }
+  void setHasHermeticSealAtLink(bool val) {
+    Bits.HasHermeticSealAtLink = val;
   }
   bool isTestable() const { return Bits.IsTestable; }
   void setIsTestable(bool val) {
@@ -183,13 +194,16 @@ public:
 ///
 /// \param data A buffer containing the serialized AST. Result information
 /// refers directly into this buffer.
+/// \param requiresOSSAModules If true, necessitates the module to be
+/// compiled with -enable-ossa-modules.
 /// \param[out] extendedInfo If present, will be populated with additional
 /// compilation options serialized into the AST at build time that may be
 /// necessary to load it properly.
 /// \param[out] dependencies If present, will be populated with list of
 /// input files the module depends on, if present in INPUT_BLOCK.
 ValidationInfo validateSerializedAST(
-    StringRef data, ExtendedValidationInfo *extendedInfo = nullptr,
+    StringRef data, bool requiresOSSAModules,
+    ExtendedValidationInfo *extendedInfo = nullptr,
     SmallVectorImpl<SerializationOptions::FileDependency> *dependencies =
         nullptr);
 

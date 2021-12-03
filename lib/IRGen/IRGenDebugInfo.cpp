@@ -47,6 +47,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Serialization/ASTReader.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Config/config.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfo.h"
@@ -107,7 +108,10 @@ class IRGenDebugInfoImpl : public IRGenDebugInfo {
   const PathRemapper &DebugPrefixMap;
 
   /// Various caches.
-  /// @{
+  /// \{
+  llvm::StringSet<> VarNames;
+  using VarID = std::tuple<llvm::MDNode *, llvm::StringRef, unsigned, uint16_t>;
+  llvm::DenseMap<VarID, llvm::TrackingMDNodeRef> LocalVarCache;
   llvm::DenseMap<const SILDebugScope *, llvm::TrackingMDNodeRef> ScopeCache;
   llvm::DenseMap<const SILDebugScope *, llvm::TrackingMDNodeRef> InlinedAtCache;
   llvm::DenseMap<const void *, SILLocation::FilenameAndLocation>
@@ -117,7 +121,7 @@ class IRGenDebugInfoImpl : public IRGenDebugInfo {
   llvm::StringMap<llvm::TrackingMDNodeRef> DIFileCache;
   TrackingDIRefMap DIRefMap;
   TrackingDIRefMap InnerTypeCache;
-  /// @}
+  /// \}
 
   /// A list of replaceable fwddecls that need to be RAUWed at the end.
   std::vector<std::pair<TypeBase *, llvm::TrackingMDRef>> ReplaceMap;
@@ -443,19 +447,17 @@ private:
   createFile(StringRef FileName,
              Optional<llvm::DIFile::ChecksumInfo<StringRef>> CSInfo,
              Optional<StringRef> Source) {
-    StringRef Dir;
-    StringRef File;
-    SmallString<128> DirBuf;
-    SmallString<128> FileBuf;
-    std::string RemappedFileString = DebugPrefixMap.remapPath(FileName);
-    SmallString<128> RemappedFile = StringRef(RemappedFileString);
-    llvm::sys::path::remove_dots(RemappedFile);
-    std::string CurDir = DebugPrefixMap.remapPath(Opts.DebugCompilationDir);
-    if (llvm::sys::path::is_absolute(RemappedFile)) {
+    StringRef File, Dir;
+    StringRef CurDir = Opts.DebugCompilationDir;
+    SmallString<128> NormalizedFile(FileName);
+    SmallString<128> FileBuf, DirBuf;
+    llvm::sys::path::remove_dots(NormalizedFile);
+    if (llvm::sys::path::is_absolute(NormalizedFile) &&
+        llvm::sys::path::is_absolute(CurDir)) {
       // Strip the common prefix (if it is more than just "/") from current
       // directory and FileName for a more space-efficient encoding.
-      auto FileIt = llvm::sys::path::begin(RemappedFile);
-      auto FileE = llvm::sys::path::end(RemappedFile);
+      auto FileIt = llvm::sys::path::begin(NormalizedFile);
+      auto FileE = llvm::sys::path::end(NormalizedFile);
       auto CurDirIt = llvm::sys::path::begin(CurDir);
       auto CurDirE = llvm::sys::path::end(CurDir);
       for (; CurDirIt != CurDirE && *CurDirIt == *FileIt; ++CurDirIt, ++FileIt)
@@ -464,7 +466,7 @@ private:
         // Don't strip the common prefix if it is only the root "/"
         // since that would make LLVM diagnostic locations confusing.
         Dir = {};
-        File = RemappedFile;
+        File = NormalizedFile;
       } else {
         for (; FileIt != FileE; ++FileIt)
           llvm::sys::path::append(FileBuf, *FileIt);
@@ -472,12 +474,14 @@ private:
         File = FileBuf;
       }
     } else {
-      File = RemappedFile;
+      File = NormalizedFile;
       // Leave <compiler-generated> & friends as is, without directory.
       if (!(File.startswith("<") && File.endswith(">")))
         Dir = CurDir;
     }
-    llvm::DIFile *F = DBuilder.createFile(File, Dir, CSInfo, Source);
+    llvm::DIFile *F =
+        DBuilder.createFile(DebugPrefixMap.remapPath(File),
+                            DebugPrefixMap.remapPath(Dir), CSInfo, Source);
     DIFileCache[FileName].reset(F);
     return F;
   }
@@ -613,8 +617,8 @@ private:
   void createParameterType(llvm::SmallVectorImpl<llvm::Metadata *> &Parameters,
                            SILType type) {
     auto RealType = type.getASTType();
-    auto DbgTy =
-        DebugTypeInfo::getFromTypeInfo(RealType, IGM.getTypeInfo(type));
+    auto DbgTy = DebugTypeInfo::getFromTypeInfo(RealType, IGM.getTypeInfo(type),
+                                                /*isFragment*/ false);
     Parameters.push_back(getOrCreateType(DbgTy));
   }
 
@@ -777,7 +781,12 @@ private:
     if (Optional<ASTSourceDescriptor> ModuleDesc = getClangModule(*M))
       return getOrCreateModule(*ModuleDesc, ModuleDesc->getModuleOrNull());
     StringRef Path = getFilenameFromDC(M);
-    StringRef Name = M->getName().str();
+    // Use the module 'real' name, which can be different from the name if module
+    // aliasing was used (swift modules only). For example, if a source file has
+    // 'import Foo', and '-module-alias Foo=Bar' was passed in, the real name of
+    // the module on disk is Bar (.swiftmodule or .swiftinterface), and is used
+    // for loading and mangling.
+    StringRef Name = M->getRealName().str();
     return getOrCreateModule(M, TheCU, Name, Path);
   }
 
@@ -842,6 +851,11 @@ private:
           return true;
         }
 
+        if (auto *archetypeTy = t->getAs<SequenceArchetypeType>()) {
+          Sig = archetypeTy->getGenericEnvironment()->getGenericSignature();
+          return true;
+        }
+
         return false;
       });
 
@@ -875,7 +889,9 @@ private:
     Mangle::ASTMangler Mangler;
     std::string Result = Mangler.mangleTypeForDebugger(Ty, Sig);
 
-    if (!Opts.DisableRoundTripDebugTypes) {
+    // TODO(SR-15377): We currently cannot round trip some C++ types.
+    if (!Opts.DisableRoundTripDebugTypes &&
+        !Ty->getASTContext().LangOpts.EnableCXXInterop) {
       // Make sure we can reconstruct mangled types for the debugger.
 #ifndef NDEBUG
       auto &Ctx = Ty->getASTContext();
@@ -978,7 +994,7 @@ private:
                                         llvm::DINode::DIFlags Flags) {
     StringRef Name = Decl->getName().str();
     unsigned SizeOfByte = CI.getTargetInfo().getCharWidth();
-    unsigned SizeInBits = DbgTy.getSize()->getValue() * SizeOfByte;
+    unsigned SizeInBits = DbgTy.getSizeValue() * SizeOfByte;
     // Default, since Swift doesn't allow specifying a custom alignment.
     unsigned AlignInBits = 0;
 
@@ -1009,8 +1025,9 @@ private:
         // all enum values. Use the raw type for the debug type, but
         // the storage size from the enum.
         ElemDbgTy = CompletedDebugTypeInfo::get(
-            DebugTypeInfo(Decl->getRawType(), DbgTy.getStorageType(),
-                          DbgTy.getSize(), DbgTy.getAlignment(), true, false));
+            DebugTypeInfo(Decl->getRawType(), DbgTy.getFragmentStorageType(),
+                          DbgTy.getRawSize(), DbgTy.getAlignment(), true, false,
+                          DbgTy.isSizeFragmentSize()));
       else if (auto ArgTy = ElemDecl->getArgumentInterfaceType()) {
         // A discriminated union. This should really be described as a
         // DW_TAG_variant_type. For now only describing the data.
@@ -1021,8 +1038,9 @@ private:
         // Discriminated union case without argument. Fallback to Int
         // as the element type; there is no storage here.
         Type IntTy = IGM.Context.getIntType();
-        ElemDbgTy = CompletedDebugTypeInfo::get(DebugTypeInfo(
-            IntTy, DbgTy.getStorageType(), Size(0), Alignment(1), true, false));
+        ElemDbgTy = CompletedDebugTypeInfo::get(
+            DebugTypeInfo(IntTy, DbgTy.getFragmentStorageType(), Size(0),
+                          Alignment(1), true, false, false));
       }
       if (!ElemDbgTy) {
         // Without complete type info we can only create a forward decl.
@@ -1046,19 +1064,18 @@ private:
   }
 
   llvm::DIType *getOrCreateDesugaredType(Type Ty, DebugTypeInfo DbgTy) {
-    DebugTypeInfo BlandDbgTy(Ty, DbgTy.getStorageType(), DbgTy.getSize(),
-                             DbgTy.getAlignment(), DbgTy.hasDefaultAlignment(),
-                             DbgTy.isMetadataType());
+    DebugTypeInfo BlandDbgTy(
+        Ty, DbgTy.getFragmentStorageType(), DbgTy.getRawSize(),
+        DbgTy.getAlignment(), DbgTy.hasDefaultAlignment(),
+        DbgTy.isMetadataType(), DbgTy.isSizeFragmentSize());
     return getOrCreateType(BlandDbgTy);
   }
 
   uint64_t getSizeOfBasicType(CompletedDebugTypeInfo DbgTy) {
     uint64_t SizeOfByte = CI.getTargetInfo().getCharWidth();
-    uint64_t BitWidth = 0;
-    if (DbgTy.getSize())
-      BitWidth = DbgTy.getSizeValue() * SizeOfByte;
-    llvm::Type *StorageType = DbgTy.getStorageType()
-                                  ? DbgTy.getStorageType()
+    uint64_t BitWidth = DbgTy.getSizeValue() * SizeOfByte;
+    llvm::Type *StorageType = DbgTy.getFragmentStorageType()
+                                  ? DbgTy.getFragmentStorageType()
                                   : IGM.DataLayout.getSmallestLegalIntType(
                                         IGM.getLLVMContext(), BitWidth);
 
@@ -1291,8 +1308,8 @@ private:
     uint64_t SizeOfByte = CI.getTargetInfo().getCharWidth();
     // FIXME: SizeInBits is redundant with DbgTy, remove it.
     uint64_t SizeInBits = 0;
-    if (DbgTy.getSize())
-      SizeInBits = DbgTy.getSize()->getValue() * SizeOfByte;
+    if (DbgTy.getTypeSize())
+      SizeInBits = DbgTy.getTypeSize()->getValue() * SizeOfByte;
     unsigned AlignInBits = DbgTy.hasDefaultAlignment()
                                ? 0
                                : DbgTy.getAlignment().getValue() * SizeOfByte;
@@ -1407,7 +1424,7 @@ private:
                                 SizeInBits, AlignInBits, Flags, nullptr,
                                 llvm::dwarf::DW_LANG_Swift, MangledName);
       StringRef Name = Decl->getName().str();
-      if (DbgTy.getSize())
+      if (DbgTy.getTypeSize())
         return createOpaqueStruct(Scope, Name, File, FwdDeclLine, SizeInBits,
                                   AlignInBits, Flags, MangledName);
       return DBuilder.createForwardDecl(
@@ -1506,7 +1523,8 @@ private:
     case TypeKind::OpaqueTypeArchetype:
     case TypeKind::PrimaryArchetype:
     case TypeKind::OpenedArchetype:
-    case TypeKind::NestedArchetype: {
+    case TypeKind::NestedArchetype:
+    case TypeKind::SequenceArchetype: {
       auto *Archetype = BaseTy->castTo<ArchetypeType>();
       AssociatedTypeDecl *assocType = nullptr;
       if (auto nested = dyn_cast<NestedArchetypeType>(Archetype))
@@ -1529,7 +1547,8 @@ private:
         auto PTy =
             IGM.getLoweredType(ProtocolDecl->getInterfaceType()).getASTType();
         auto PDbgTy = DebugTypeInfo::getFromTypeInfo(
-            ProtocolDecl->getInterfaceType(), IGM.getTypeInfoForLowered(PTy));
+            ProtocolDecl->getInterfaceType(), IGM.getTypeInfoForLowered(PTy),
+            false);
         auto PDITy = getOrCreateType(PDbgTy);
         Protocols.push_back(
             DBuilder.createInheritance(FwdDecl.get(), PDITy, 0, 0, Flags));
@@ -1600,7 +1619,7 @@ private:
       auto *BuiltinVectorTy = BaseTy->castTo<BuiltinVectorType>();
       auto ElemTy = BuiltinVectorTy->getElementType();
       auto ElemDbgTy = DebugTypeInfo::getFromTypeInfo(
-          ElemTy, IGM.getTypeInfoForUnlowered(ElemTy));
+          ElemTy, IGM.getTypeInfoForUnlowered(ElemTy), false);
       unsigned Count = BuiltinVectorTy->getNumElements();
       auto Subscript = DBuilder.getOrCreateSubrange(0, Count ? Count : -1);
       return DBuilder.createVectorType(SizeInBits, AlignInBits,
@@ -1634,9 +1653,10 @@ private:
 
       // For TypeAlias types, the DeclContext for the aliased type is
       // in the decl of the alias type.
-      DebugTypeInfo AliasedDbgTy(AliasedTy, DbgTy.getStorageType(),
-                                 DbgTy.getSize(), DbgTy.getAlignment(),
-                                 DbgTy.hasDefaultAlignment(), false);
+      DebugTypeInfo AliasedDbgTy(AliasedTy, DbgTy.getFragmentStorageType(),
+                                 DbgTy.getRawSize(), DbgTy.getAlignment(),
+                                 DbgTy.hasDefaultAlignment(), false,
+                                 DbgTy.isSizeFragmentSize());
       return DBuilder.createTypedef(getOrCreateType(AliasedDbgTy), MangledName,
                                     File, 0, Scope);
     }
@@ -1866,9 +1886,13 @@ IRGenDebugInfoImpl::IRGenDebugInfoImpl(const IRGenOptions &Opts,
   StringRef SplitName = StringRef();
   // Note that File + Dir need not result in a valid path.
   // The directory part of the main file is the current working directory.
-  MainFile =
-      DBuilder.createFile(DebugPrefixMap.remapPath(SourcePath),
-                          DebugPrefixMap.remapPath(Opts.DebugCompilationDir));
+  std::string RemappedFile = DebugPrefixMap.remapPath(SourcePath);
+  std::string RemappedDir = DebugPrefixMap.remapPath(Opts.DebugCompilationDir);
+  bool RelFile = llvm::sys::path::is_relative(RemappedFile);
+  bool RelDir = llvm::sys::path::is_relative(RemappedDir);
+  MainFile = (RelFile && RelDir)
+                 ? createFile(SourcePath, {}, {})
+                 : DBuilder.createFile(RemappedFile, RemappedDir);
 
   StringRef Sysroot = IGM.Context.SearchPathOpts.SDKPath;
   StringRef SDK;
@@ -2312,7 +2336,8 @@ IRGenDebugInfoImpl::emitFunction(const SILDebugScope *DS, llvm::Function *Fn,
           ErrorInfo->getReturnValueType(IGM.getSILModule(), FnTy,
                                         IGM.getMaximalTypeExpansionContext()),
           IGM.getTypeInfo(IGM.silConv.getSILType(
-              *ErrorInfo, FnTy, IGM.getMaximalTypeExpansionContext())));
+              *ErrorInfo, FnTy, IGM.getMaximalTypeExpansionContext())),
+          false);
       Error = DBuilder.getOrCreateArray({getOrCreateType(DTI)}).get();
     }
 
@@ -2413,8 +2438,22 @@ bool IRGenDebugInfoImpl::buildDebugInfoExpression(
     case SILDIExprOperator::Dereference:
       Operands.push_back(llvm::dwarf::DW_OP_deref);
       break;
-    default:
-      llvm_unreachable("Unrecognized operator");
+    case SILDIExprOperator::Plus:
+      Operands.push_back(llvm::dwarf::DW_OP_plus);
+      break;
+    case SILDIExprOperator::Minus:
+      Operands.push_back(llvm::dwarf::DW_OP_minus);
+      break;
+    case SILDIExprOperator::ConstUInt:
+      Operands.push_back(llvm::dwarf::DW_OP_constu);
+      Operands.push_back(*ExprOperand[1].getAsConstInt());
+      break;
+    case SILDIExprOperator::ConstSInt:
+      Operands.push_back(llvm::dwarf::DW_OP_consts);
+      Operands.push_back(*ExprOperand[1].getAsConstInt());
+      break;
+    case SILDIExprOperator::INVALID:
+      return false;
     }
   }
   return true;
@@ -2434,7 +2473,7 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
   if (DbgTy.getType()->hasOpenedExistential())
     return;
 
-  if (!DbgTy.getSize())
+  if (!DbgTy.getTypeSize())
     DbgTy.setSize(getStorageSize(IGM.DataLayout, Storage));
 
   auto *Scope = dyn_cast_or_null<llvm::DILocalScope>(getOrCreateScope(DS));
@@ -2443,7 +2482,8 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
 
   // FIXME: this should be the scope of the type's declaration.
   // If this is an argument, attach it to the current function scope.
-  if (VarInfo.ArgNo > 0) {
+  uint16_t ArgNo = VarInfo.ArgNo;
+  if (ArgNo > 0) {
     while (isa<llvm::DILexicalBlock>(Scope))
       Scope = cast<llvm::DILexicalBlock>(Scope)->getScope();
   }
@@ -2457,35 +2497,50 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
   unsigned DInstLine = DInstLoc.line;
 
   // Self is always an artificial argument, so are variables without location.
-  if (!DInstLine ||
-      (VarInfo.ArgNo > 0 && VarInfo.Name == IGM.Context.Id_self.str()))
+  if (!DInstLine || (ArgNo > 0 && VarInfo.Name == IGM.Context.Id_self.str()))
     Artificial = ArtificialValue;
 
   llvm::DINode::DIFlags Flags = llvm::DINode::FlagZero;
   if (Artificial || DITy->isArtificial() || DITy == InternalType)
     Flags |= llvm::DINode::FlagArtificial;
 
-  // This could be Opts.Optimize if we would also unique DIVariables here.
-  bool Optimized = false;
   // Create the descriptor for the variable.
   unsigned DVarLine = DInstLine;
+  uint16_t DVarCol = 0;
   if (VarInfo.Loc) {
     auto DVarLoc = getStartLocation(VarInfo.Loc);
     DVarLine = DVarLoc.line;
+    DVarCol = DVarLoc.column;
   }
   llvm::DIScope *VarScope = Scope;
-  if (VarInfo.Scope) {
+  if (ArgNo == 0 && VarInfo.Scope) {
     if (auto *VS = dyn_cast_or_null<llvm::DILocalScope>(
-            getOrCreateScope(VarInfo.Scope)))
+            getOrCreateScope(VarInfo.Scope))) {
       VarScope = VS;
+    }
   }
-  llvm::DILocalVariable *Var =
-      (VarInfo.ArgNo > 0)
-          ? DBuilder.createParameterVariable(VarScope, VarInfo.Name,
-                                             VarInfo.ArgNo, Unit, DVarLine,
-                                             DITy, Optimized, Flags)
-          : DBuilder.createAutoVariable(VarScope, VarInfo.Name, Unit, DVarLine,
-                                        DITy, Optimized, Flags);
+
+  // Get or create the DILocalVariable.
+  llvm::DILocalVariable *Var;
+  // VarInfo.Name points into tail-allocated storage in debug_value insns.
+  llvm::StringRef UniqueName = VarNames.insert(VarInfo.Name).first->getKey();
+  VarID Key(VarScope, UniqueName, DVarLine, DVarCol);
+  auto CachedVar = LocalVarCache.find(Key);
+  if (CachedVar != LocalVarCache.end()) {
+    Var = cast<llvm::DILocalVariable>(CachedVar->second);
+  } else {
+    // The llvm.dbg.value(undef) emitted for zero-sized variables get filtered
+    // out by DwarfDebug::collectEntityInfo(), so all variables need to be
+    // preserved even at -Onone.
+    bool Preserve = true;
+    if (ArgNo > 0)
+      Var = DBuilder.createParameterVariable(
+          VarScope, VarInfo.Name, ArgNo, Unit, DVarLine, DITy, Preserve, Flags);
+    else
+      Var = DBuilder.createAutoVariable(VarScope, VarInfo.Name, Unit, DVarLine,
+                                        DITy, Preserve, Flags);
+    LocalVarCache.insert({Key, llvm::TrackingMDNodeRef(Var)});
+  }
 
   auto appendDIExpression =
       [&VarInfo, this](llvm::DIExpression *DIExpr) -> llvm::DIExpression * {
@@ -2520,9 +2575,14 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
         AlignInBits = SizeOfByte;
 
       // Sanity checks.
+#ifndef NDEBUG
       assert(SizeInBits && "zero-sized piece");
-      assert(SizeInBits < getSizeInBits(Var) && "piece covers entire var");
-      assert(OffsetInBits + SizeInBits <= getSizeInBits(Var) && "pars > totum");
+      if (getSizeInBits(Var)) {
+        assert(SizeInBits < getSizeInBits(Var) && "piece covers entire var");
+        assert(OffsetInBits + SizeInBits <= getSizeInBits(Var) &&
+               "pars > totum");
+      }
+#endif
 
       // Add the piece DWARF expression.
       Operands.push_back(llvm::dwarf::DW_OP_LLVM_fragment);

@@ -203,36 +203,6 @@ public:
         EPE->setSemanticExpr(nullptr);
       }
 
-      // If this expression represents keypath based dynamic member
-      // lookup, let's convert it back to the original form of
-      // member or subscript reference.
-      if (auto *SE = dyn_cast<SubscriptExpr>(expr)) {
-        auto *args = SE->getArgs();
-        auto isImplicitKeyPathExpr = [](Expr *argExpr) -> bool {
-          if (auto *KP = dyn_cast<KeyPathExpr>(argExpr))
-            return KP->isImplicit();
-          return false;
-        };
-
-        if (SE->isImplicit() && args->isUnary() &&
-            args->front().getLabel() == C.Id_dynamicMember &&
-            isImplicitKeyPathExpr(args->front().getExpr())) {
-          auto *keyPathExpr = cast<KeyPathExpr>(args->front().getExpr());
-          auto *componentExpr = keyPathExpr->getParsedPath();
-
-          if (auto *UDE = dyn_cast<UnresolvedDotExpr>(componentExpr)) {
-            UDE->setBase(SE->getBase());
-            return {true, UDE};
-          }
-
-          if (auto *subscript = dyn_cast<SubscriptExpr>(componentExpr)) {
-            subscript->setBase(SE->getBase());
-            return {true, subscript};
-          }
-          llvm_unreachable("unknown keypath component type");
-        }
-      }
-
       // If this is a closure, only walk into its children if they
       // are type-checked in the context of the enclosing expression.
       if (auto closure = dyn_cast<ClosureExpr>(expr)) {
@@ -1057,6 +1027,11 @@ fallbackTypeCheck(DeclContext *DC) {
 }
 
 static Type getTypeForCompletion(const constraints::Solution &S, Expr *E) {
+  if (!S.hasType(E)) {
+    assert(false && "Expression wasn't type checked?");
+    return nullptr;
+  }
+
   auto &CS = S.getConstraintSystem();
 
   // To aid code completion, we need to attempt to convert type placeholders
@@ -1103,7 +1078,7 @@ static Type getTypeForCompletion(const constraints::Solution &S, Expr *E) {
   }
 
   return S.getResolvedType(E);
-};
+}
 
 /// Whether the given completion expression is the only expression in its
 /// containing closure or function body and its value is implicitly returned.
@@ -1148,7 +1123,7 @@ sawSolution(const constraints::Solution &S) {
   Type ExpectedTy = getTypeForCompletion(S, CompletionExpr);
   Expr *ParentExpr = CS.getParentExpr(CompletionExpr);
   if (!ParentExpr)
-    ExpectedTy = CS.getContextualType(CompletionExpr);
+    ExpectedTy = CS.getContextualType(CompletionExpr, /*forConstraint=*/false);
 
   auto *CalleeLocator = S.getCalleeLocator(Locator);
   ValueDecl *ReferencedDecl = nullptr;
@@ -1303,16 +1278,21 @@ void KeyPathTypeCheckCompletionCallback::sawSolution(
       // to look up type variables by their locators.
       auto RootLocator =
           S.getConstraintLocator(KeyPath, {ConstraintLocator::KeyPathRoot});
-      auto BaseVariableType =
+      auto BaseVariableTypeBinding =
           llvm::find_if(S.typeBindings, [&RootLocator](const auto &Entry) {
             return Entry.first->getImpl().getLocator() == RootLocator;
-          })->getSecond();
-      BaseType = S.simplifyType(BaseVariableType);
+          });
+      if (BaseVariableTypeBinding != S.typeBindings.end()) {
+        BaseType = S.simplifyType(BaseVariableTypeBinding->getSecond());
+      }
     }
   } else {
     // We are completing after a component. Get the previous component's result
     // type.
     BaseType = S.simplifyType(S.getType(KeyPath, ComponentIndex - 1));
+  }
+  if (BaseType.isNull()) {
+    return;
   }
 
   // If ExpectedTy is a duplicate of any other result, ignore this solution.
@@ -1321,7 +1301,5 @@ void KeyPathTypeCheckCompletionCallback::sawSolution(
   })) {
     return;
   }
-  if (BaseType) {
-    Results.push_back({BaseType, /*OnRoot=*/(ComponentIndex == 0)});
-  }
+  Results.push_back({BaseType, /*OnRoot=*/(ComponentIndex == 0)});
 }

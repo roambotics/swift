@@ -14,6 +14,7 @@
 #define SWIFT_AST_SEARCHPATHOPTIONS_H
 
 #include "swift/Basic/ArrayRefView.h"
+#include "swift/Basic/PathRemapper.h"
 #include "llvm/ADT/Hashing.h"
 
 #include <string>
@@ -97,6 +98,15 @@ public:
 
   /// A file containing modules we should perform batch scanning.
   std::string BatchScanInputFilePath;
+
+  /// Debug path mappings to apply to serialized search paths. These are
+  /// specified in LLDB from the target.source-map entries.
+  PathRemapper SearchPathRemapper;
+
+  /// Recover the search paths deserialized from .swiftmodule files to their
+  /// original form.
+  PathObfuscator DeserializedPathRecoverer;
+
 private:
   static StringRef
   pathStringFromFrameworkSearchPath(const FrameworkSearchPath &next) {

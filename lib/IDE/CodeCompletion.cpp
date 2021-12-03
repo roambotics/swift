@@ -34,7 +34,6 @@
 #include "swift/Frontend/FrontendOptions.h"
 #include "swift/IDE/CodeCompletionCache.h"
 #include "swift/IDE/CodeCompletionResultPrinter.h"
-#include "swift/IDE/ModuleSourceFileInfo.h"
 #include "swift/IDE/Utils.h"
 #include "swift/Parse/CodeCompletionCallbacks.h"
 #include "swift/Sema/IDETypeChecking.h"
@@ -632,13 +631,13 @@ void CodeCompletionResult::dump() const {
 CodeCompletionResult *
 CodeCompletionResult::withFlair(CodeCompletionFlair newFlair,
                                 CodeCompletionResultSink &Sink) {
-  if (Kind == ResultKind::Declaration) {
+  if (getKind() == ResultKind::Declaration) {
     return new (*Sink.Allocator) CodeCompletionResult(
         getSemanticContext(), newFlair, getNumBytesToErase(),
         getCompletionString(), getAssociatedDeclKind(), isSystem(),
-        getModuleName(), getSourceFilePath(), getNotRecommendedReason(),
-        getDiagnosticSeverity(), getDiagnosticMessage(),
-        getBriefDocComment(), getAssociatedUSRs(), getExpectedTypeRelation(),
+        getModuleName(), getNotRecommendedReason(), getDiagnosticSeverity(),
+        getDiagnosticMessage(), getBriefDocComment(), getAssociatedUSRs(),
+        getExpectedTypeRelation(),
         isOperator() ? getOperatorKind() : CodeCompletionOperatorKind::None);
   } else {
     return new (*Sink.Allocator) CodeCompletionResult(
@@ -1303,8 +1302,6 @@ CodeCompletionResult *CodeCompletionResultBuilder::takeResult() {
         ModuleName, NotRecReason, copyString(*Sink.Allocator, BriefDocComment),
         copyAssociatedUSRs(*Sink.Allocator, AssociatedDecl),
         ExpectedTypeRelation);
-    if (!result->isSystem())
-      result->setSourceFilePath(getSourceFilePathForDecl(AssociatedDecl));
     if (NotRecReason != NotRecommendedReason::None) {
       // FIXME: We should generate the message lazily.
       if (const auto *VD = dyn_cast<ValueDecl>(AssociatedDecl)) {
@@ -1465,13 +1462,13 @@ void CodeCompletionContext::sortCompletionResults(
   // Sort nameCache, and then transform Results to return the pointers in order.
   std::sort(nameCache.begin(), nameCache.end(),
             [](const ResultAndName &LHS, const ResultAndName &RHS) {
-    int Result = StringRef(LHS.name).compare_lower(RHS.name);
-    // If the case insensitive comparison is equal, then secondary sort order
-    // should be case sensitive.
-    if (Result == 0)
-      Result = LHS.name.compare(RHS.name);
-    return Result < 0;
-  });
+              int Result = StringRef(LHS.name).compare_insensitive(RHS.name);
+              // If the case insensitive comparison is equal, then secondary
+              // sort order should be case sensitive.
+              if (Result == 0)
+                Result = LHS.name.compare(RHS.name);
+              return Result < 0;
+            });
 
   llvm::transform(nameCache, Results.begin(),
                   [](const ResultAndName &entry) { return entry.result; });
@@ -1583,10 +1580,12 @@ class CodeCompletionCallbacksImpl : public CodeCompletionCallbacks {
         /*GenericParams=*/nullptr,
         CurDeclContext,
         /*ProduceDiagnostics=*/false);
-    ParsedTypeLoc.setType(ty);
-    if (!ParsedTypeLoc.isError()) {
+    if (!ty->hasError()) {
+      ParsedTypeLoc.setType(CurDeclContext->mapTypeIntoContext(ty));
       return true;
     }
+
+    ParsedTypeLoc.setType(ty);
 
     // It doesn't type check as a type, so see if it's a qualifying module name.
     if (auto *ITR = dyn_cast<IdentTypeRepr>(ParsedTypeLoc.getTypeRepr())) {
@@ -2742,10 +2741,17 @@ public:
     for (auto param : *func->getParameters()) {
       switch (param->getDefaultArgumentKind()) {
       case DefaultArgumentKind::Normal:
+      case DefaultArgumentKind::NilLiteral:
+      case DefaultArgumentKind::EmptyArray:
+      case DefaultArgumentKind::EmptyDictionary:
       case DefaultArgumentKind::StoredProperty:
       case DefaultArgumentKind::Inherited: // FIXME: include this?
         return true;
-      default:
+
+      case DefaultArgumentKind::None:
+#define MAGIC_IDENTIFIER(NAME, STRING, SYNTAX_KIND)                            \
+      case DefaultArgumentKind::NAME:
+#include "swift/AST/MagicIdentifierKinds.def"
         break;
       }
     }
@@ -3261,7 +3267,8 @@ public:
       if (!IsImplicitlyCurriedInstanceMethod &&
           expectedTypeContext.requiresNonVoid() &&
           ResultType->isVoid()) {
-        Builder.setExpectedTypeRelation(CodeCompletionResult::Invalid);
+        Builder.setExpectedTypeRelation(
+            CodeCompletionResult::ExpectedTypeRelation::Invalid);
       }
     };
 
@@ -3369,7 +3376,7 @@ public:
   void addConstructorCallsForType(Type type, Identifier name,
                                   DeclVisibilityKind Reason,
                                   DynamicLookupInfo dynamicLookupInfo) {
-    if (!Ctx.LangOpts.CodeCompleteInitsInPostfixExpr)
+    if (!Sink.addInitsToTopLevel)
       return;
 
     assert(CurrDeclContext);
@@ -4317,13 +4324,14 @@ public:
       if (!T)
         continue;
 
-      auto typeRelation = CodeCompletionResult::Identical;
+      auto typeRelation = CodeCompletionResult::ExpectedTypeRelation::Identical;
       // Convert through optional types unless we're looking for a protocol
       // that Optional itself conforms to.
       if (kind != CodeCompletionLiteralKind::NilLiteral) {
         if (auto optionalObjT = T->getOptionalObjectType()) {
           T = optionalObjT;
-          typeRelation = CodeCompletionResult::Convertible;
+          typeRelation =
+              CodeCompletionResult::ExpectedTypeRelation::Convertible;
         }
       }
 
@@ -4411,19 +4419,19 @@ public:
     if (isCodeCompletionAtTopLevelOfLibraryFile(CurrDeclContext))
       flair |= CodeCompletionFlairBit::ExpressionAtNonScriptOrMainFileScope;
 
-    auto addFromProto = [&](
-        CodeCompletionLiteralKind kind,
-        llvm::function_ref<void(CodeCompletionResultBuilder &)> consumer,
-        bool isKeyword = false) {
+    auto addFromProto =
+        [&](CodeCompletionLiteralKind kind,
+            llvm::function_ref<void(CodeCompletionResultBuilder &)> consumer,
+            bool isKeyword = false) {
+          CodeCompletionResultBuilder builder(
+              Sink, CodeCompletionResult::ResultKind::Literal,
+              SemanticContextKind::None, {});
+          builder.setLiteralKind(kind);
+          builder.addFlair(flair);
 
-      CodeCompletionResultBuilder builder(Sink, CodeCompletionResult::Literal,
-                                          SemanticContextKind::None, {});
-      builder.setLiteralKind(kind);
-      builder.addFlair(flair);
-
-      consumer(builder);
-      addTypeRelationFromProtocol(builder, kind);
-    };
+          consumer(builder);
+          addTypeRelationFromProtocol(builder, kind);
+        };
 
     // FIXME: the pedantically correct way is to resolve Swift.*LiteralType.
 
@@ -4462,7 +4470,7 @@ public:
     });
 
     // Optionally add object literals.
-    if (CompletionContext->includeObjectLiterals()) {
+    if (Sink.includeObjectLiterals) {
       auto floatType = context.getFloatType();
       addFromProto(LK::ColorLiteral, [&](Builder &builder) {
         builder.addBaseName("#colorLiteral");
@@ -4489,8 +4497,9 @@ public:
 
     // Add tuple completion (item, item).
     {
-      CodeCompletionResultBuilder builder(Sink, CodeCompletionResult::Literal,
-                                          SemanticContextKind::None, {});
+      CodeCompletionResultBuilder builder(
+          Sink, CodeCompletionResult::ResultKind::Literal,
+          SemanticContextKind::None, {});
       builder.setLiteralKind(LK::Tuple);
       builder.addFlair(flair);
 
@@ -4500,7 +4509,8 @@ public:
       for (auto T : expectedTypeContext.possibleTypes) {
         if (T && T->is<TupleType>() && !T->isVoid()) {
           addTypeAnnotation(builder, T);
-          builder.setExpectedTypeRelation(CodeCompletionResult::Identical);
+          builder.setExpectedTypeRelation(
+              CodeCompletionResult::ExpectedTypeRelation::Identical);
           break;
         }
       }
@@ -5769,7 +5779,7 @@ void CodeCompletionCallbacksImpl::completePostfixExprParen(Expr *E,
   CodeCompleteTokenExpr = static_cast<CodeCompletionExpr*>(CodeCompletionE);
 
   ShouldCompleteCallPatternAfterParen = true;
-  if (Context.LangOpts.CodeCompleteCallPatternHeuristics) {
+  if (CompletionContext.getCallPatternHeuristics()) {
     // Lookahead one token to decide what kind of call completions to provide.
     // When it appears that there is already code for the call present, just
     // complete values and/or argument labels.  Otherwise give the entire call
@@ -5911,7 +5921,7 @@ void CodeCompletionCallbacksImpl::completeCallArg(CodeCompletionExpr *E,
   ShouldCompleteCallPatternAfterParen = false;
   if (isFirst) {
     ShouldCompleteCallPatternAfterParen = true;
-    if (Context.LangOpts.CodeCompleteCallPatternHeuristics) {
+    if (CompletionContext.getCallPatternHeuristics()) {
       // Lookahead one token to decide what kind of call completions to provide.
       // When it appears that there is already code for the call present, just
       // complete values and/or argument labels.  Otherwise give the entire call
@@ -6412,8 +6422,9 @@ static void addPoundDirectives(CodeCompletionResultSink &Sink) {
       [&](StringRef name, CodeCompletionKeywordKind K,
           llvm::function_ref<void(CodeCompletionResultBuilder &)> consumer =
               nullptr) {
-        CodeCompletionResultBuilder Builder(Sink, CodeCompletionResult::Keyword,
-                                            SemanticContextKind::None, {});
+        CodeCompletionResultBuilder Builder(
+            Sink, CodeCompletionResult::ResultKind::Keyword,
+            SemanticContextKind::None, {});
         Builder.addBaseName(name);
         Builder.setKeywordKind(K);
         if (consumer)
@@ -6575,37 +6586,6 @@ static void postProcessResults(MutableArrayRef<CodeCompletionResult *> results,
   }
 }
 
-static void copyAllKnownSourceFileInfo(
-    ASTContext &Ctx, CodeCompletionResultSink &Sink) {
-  assert(Sink.SourceFiles.empty());
-
-  SmallVector<ModuleDecl *, 8> loadedModules;
-  loadedModules.reserve(Ctx.getNumLoadedModules());
-  for (auto &entry : Ctx.getLoadedModules())
-    loadedModules.push_back(entry.second);
-
-  auto &result = Sink.SourceFiles;
-  for (auto *M : loadedModules) {
-    // We don't need to check system modules.
-    if (M->isSystemModule())
-      continue;
-
-    M->collectBasicSourceFileInfo([&](const BasicSourceFileInfo &info) {
-      if (info.getFilePath().empty())
-        return;
-      
-      bool isUpToDate = false;
-      if (info.isFromSourceFile()) {
-        // 'SourceFile' is always "up-to-date" because we've just loaded.
-        isUpToDate = true;
-      } else {
-        isUpToDate = isSourceFileUpToDate(info, Ctx);
-      }
-      result.emplace_back(copyString(*Sink.Allocator, info.getFilePath()), isUpToDate);
-    });
-  }
-}
-
 static void deliverCompletionResults(CodeCompletionContext &CompletionContext,
                                      CompletionLookup &Lookup,
                                      DeclContext *DC,
@@ -6657,7 +6637,6 @@ static void deliverCompletionResults(CodeCompletionContext &CompletionContext,
       // ModuleFilename can be empty if something strange happened during
       // module loading, for example, the module file is corrupted.
       if (!ModuleFilename.empty()) {
-        auto &Ctx = TheModule->getASTContext();
         CodeCompletionCache::Key K{
             ModuleFilename.str(),
             std::string(TheModule->getName()),
@@ -6669,7 +6648,7 @@ static void deliverCompletionResults(CodeCompletionContext &CompletionContext,
             SF.hasTestableOrPrivateImport(
                 AccessLevel::Internal, TheModule,
                 SourceFile::ImportQueryKind::PrivateOnly),
-            Ctx.LangOpts.CodeCompleteInitsInPostfixExpr,
+            CompletionContext.getAddInitsToTopLevel(),
             CompletionContext.getAnnotateResult(),
         };
 
@@ -6724,10 +6703,6 @@ static void deliverCompletionResults(CodeCompletionContext &CompletionContext,
   postProcessResults(CompletionContext.getResultSink().Results,
                      CompletionContext.CodeCompletionKind, DC,
                      /*Sink=*/nullptr);
-
-  if (CompletionContext.requiresSourceFileInfo())
-    copyAllKnownSourceFileInfo(SF.getASTContext(),
-                               CompletionContext.getResultSink());
 
   Consumer.handleResultsAndModules(CompletionContext, RequestedModules, DC);
 }
@@ -7445,98 +7420,6 @@ void CodeCompletionCallbacksImpl::doneParsing() {
   deliverCompletionResults(CompletionContext, Lookup, CurDeclContext, Consumer);
 }
 
-void PrintingCodeCompletionConsumer::handleResults(
-    CodeCompletionContext &context) {
-  if (context.requiresSourceFileInfo() &&
-      !context.getResultSink().SourceFiles.empty()) {
-    OS << "Known module source files\n";
-    for (auto &entry : context.getResultSink().SourceFiles) {
-      OS << (entry.IsUpToDate ? " + "  : " - ");
-      OS << entry.FilePath;
-      OS << "\n";
-    }
-    this->RequiresSourceFileInfo = true;
-  }
-  auto results = context.takeResults();
-  handleResults(results);
-}
-
-void PrintingCodeCompletionConsumer::handleResults(
-    MutableArrayRef<CodeCompletionResult *> Results) {
-  unsigned NumResults = 0;
-  for (auto Result : Results) {
-    if (!IncludeKeywords && Result->getKind() == CodeCompletionResult::Keyword)
-      continue;
-    ++NumResults;
-  }
-  if (NumResults == 0)
-    return;
-
-  OS << "Begin completions, " << NumResults << " items\n";
-  for (auto Result : Results) {
-    if (!IncludeKeywords && Result->getKind() == CodeCompletionResult::Keyword)
-      continue;
-    Result->printPrefix(OS);
-    if (PrintAnnotatedDescription) {
-      printCodeCompletionResultDescriptionAnnotated(*Result, OS, /*leadingPunctuation=*/false);
-      OS << "; typename=";
-      printCodeCompletionResultTypeNameAnnotated(*Result, OS);
-    } else {
-      Result->getCompletionString()->print(OS);
-    }
-
-    OS << "; name=";
-    printCodeCompletionResultFilterName(*Result, OS);
-
-    if (IncludeSourceText) {
-      OS << "; sourcetext=";
-      SmallString<64> buf;
-      {
-        llvm::raw_svector_ostream bufOS(buf);
-        printCodeCompletionResultSourceText(*Result, bufOS);
-      }
-      OS.write_escaped(buf);
-    }
-
-    StringRef comment = Result->getBriefDocComment();
-    if (IncludeComments && !comment.empty()) {
-      OS << "; comment=" << comment;
-    }
-
-    if (RequiresSourceFileInfo) {
-      StringRef sourceFilePath = Result->getSourceFilePath();
-      if (!sourceFilePath.empty()) {
-        OS << "; source=" << sourceFilePath;
-      }
-    }
-
-    if (Result->getDiagnosticSeverity() !=
-        CodeCompletionDiagnosticSeverity::None) {
-      OS << "; diagnostics=" << comment;
-      switch (Result->getDiagnosticSeverity()) {
-      case CodeCompletionDiagnosticSeverity::Error:
-        OS << "error";
-        break;
-      case CodeCompletionDiagnosticSeverity::Warning:
-        OS << "warning";
-        break;
-      case CodeCompletionDiagnosticSeverity::Remark:
-        OS << "remark";
-        break;
-      case CodeCompletionDiagnosticSeverity::Note:
-        OS << "note";
-        break;
-      case CodeCompletionDiagnosticSeverity::None:
-        llvm_unreachable("none");
-      }
-      OS << ":" << Result->getDiagnosticMessage();
-    }
-
-    OS << "\n";
-  }
-  OS << "End completions\n";
-}
-
 namespace {
 class CodeCompletionCallbacksFactoryImpl
     : public CodeCompletionCallbacksFactory {
@@ -7584,41 +7467,42 @@ swift::ide::copyCodeCompletionResults(CodeCompletionResultSink &targetSink,
   auto startSize = targetSink.Results.size();
 
   if (onlyTypes) {
-    std::copy_if(sourceSink.Results.begin(), sourceSink.Results.end(),
-                 std::back_inserter(targetSink.Results),
-                 [](CodeCompletionResult *R) -> bool {
-      if (R->getKind() != CodeCompletionResult::Declaration)
-        return false;
-      switch(R->getAssociatedDeclKind()) {
-      case CodeCompletionDeclKind::Module:
-      case CodeCompletionDeclKind::Class:
-      case CodeCompletionDeclKind::Struct:
-      case CodeCompletionDeclKind::Enum:
-      case CodeCompletionDeclKind::Protocol:
-      case CodeCompletionDeclKind::TypeAlias:
-      case CodeCompletionDeclKind::AssociatedType:
-      case CodeCompletionDeclKind::GenericTypeParam:
-        return true;
-      case CodeCompletionDeclKind::PrecedenceGroup:
-      case CodeCompletionDeclKind::EnumElement:
-      case CodeCompletionDeclKind::Constructor:
-      case CodeCompletionDeclKind::Destructor:
-      case CodeCompletionDeclKind::Subscript:
-      case CodeCompletionDeclKind::StaticMethod:
-      case CodeCompletionDeclKind::InstanceMethod:
-      case CodeCompletionDeclKind::PrefixOperatorFunction:
-      case CodeCompletionDeclKind::PostfixOperatorFunction:
-      case CodeCompletionDeclKind::InfixOperatorFunction:
-      case CodeCompletionDeclKind::FreeFunction:
-      case CodeCompletionDeclKind::StaticVar:
-      case CodeCompletionDeclKind::InstanceVar:
-      case CodeCompletionDeclKind::LocalVar:
-      case CodeCompletionDeclKind::GlobalVar:
-        return false;
-      }
+    std::copy_if(
+        sourceSink.Results.begin(), sourceSink.Results.end(),
+        std::back_inserter(targetSink.Results),
+        [](CodeCompletionResult *R) -> bool {
+          if (R->getKind() != CodeCompletionResult::ResultKind::Declaration)
+            return false;
+          switch (R->getAssociatedDeclKind()) {
+          case CodeCompletionDeclKind::Module:
+          case CodeCompletionDeclKind::Class:
+          case CodeCompletionDeclKind::Struct:
+          case CodeCompletionDeclKind::Enum:
+          case CodeCompletionDeclKind::Protocol:
+          case CodeCompletionDeclKind::TypeAlias:
+          case CodeCompletionDeclKind::AssociatedType:
+          case CodeCompletionDeclKind::GenericTypeParam:
+            return true;
+          case CodeCompletionDeclKind::PrecedenceGroup:
+          case CodeCompletionDeclKind::EnumElement:
+          case CodeCompletionDeclKind::Constructor:
+          case CodeCompletionDeclKind::Destructor:
+          case CodeCompletionDeclKind::Subscript:
+          case CodeCompletionDeclKind::StaticMethod:
+          case CodeCompletionDeclKind::InstanceMethod:
+          case CodeCompletionDeclKind::PrefixOperatorFunction:
+          case CodeCompletionDeclKind::PostfixOperatorFunction:
+          case CodeCompletionDeclKind::InfixOperatorFunction:
+          case CodeCompletionDeclKind::FreeFunction:
+          case CodeCompletionDeclKind::StaticVar:
+          case CodeCompletionDeclKind::InstanceVar:
+          case CodeCompletionDeclKind::LocalVar:
+          case CodeCompletionDeclKind::GlobalVar:
+            return false;
+          }
 
-      llvm_unreachable("Unhandled CodeCompletionDeclKind in switch.");
-    });
+          llvm_unreachable("Unhandled CodeCompletionDeclKind in switch.");
+        });
   } else if (onlyPrecedenceGroups) {
     std::copy_if(sourceSink.Results.begin(), sourceSink.Results.end(),
                  std::back_inserter(targetSink.Results),
@@ -7655,7 +7539,11 @@ void SimpleCachingCodeCompletionConsumer::handleResultsAndModules(
     if (!V.hasValue()) {
       // No cached results found. Fill the cache.
       V = context.Cache.createValue();
-      (*V)->Sink.annotateResult = context.getAnnotateResult();
+      CodeCompletionResultSink &Sink = (*V)->Sink;
+      Sink.annotateResult = context.getAnnotateResult();
+      Sink.addInitsToTopLevel = context.getAddInitsToTopLevel();
+      Sink.enableCallPatternHeuristics = context.getCallPatternHeuristics();
+      Sink.includeObjectLiterals = context.includeObjectLiterals();
       lookupCodeCompletionResultsFromModule(
           (*V)->Sink, R.TheModule, R.Key.AccessPath,
           R.Key.ResultsHaveLeadingDot, SF);

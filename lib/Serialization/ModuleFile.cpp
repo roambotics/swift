@@ -131,8 +131,15 @@ Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
   Status status = Status::Valid;
 
   ModuleDecl *M = file->getParentModule();
-  if (M->getName().str() != Core->Name)
+  // The real (on-disk) name of the module should be checked here as that's the
+  // actually loaded module. In case module aliasing is used when building the main
+  // module, e.g. -module-name MyModule -module-alias Foo=Bar, the loaded module
+  // that maps to 'Foo' is actually Bar.swiftmodule|.swiftinterface (applies to swift
+  // modules only), which is retrieved via M->getRealName(). If no module aliasing is
+  // used, M->getRealName() will return the same value as M->getName(), which is 'Foo'.
+  if (M->getRealName().str() != Core->Name) {
     return error(Status::NameMismatch);
+  }
 
   ASTContext &ctx = getContext();
 
@@ -149,8 +156,8 @@ Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
       return error(status);
   }
 
-  auto clientSDK = ctx.LangOpts.SDKName;
   StringRef moduleSDK = Core->SDKName;
+  StringRef clientSDK = ctx.LangOpts.SDKName;
   if (ctx.SearchPathOpts.EnableSameSDKCheck &&
       !moduleSDK.empty() && !clientSDK.empty() &&
       moduleSDK != clientSDK) {
@@ -158,9 +165,11 @@ Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
     return error(status);
   }
 
-  for (const auto &searchPath : Core->SearchPaths)
-    ctx.addSearchPath(searchPath.Path, searchPath.IsFramework,
-                      searchPath.IsSystem);
+  for (const auto &searchPath : Core->SearchPaths) {
+    ctx.addSearchPath(
+        ctx.SearchPathOpts.SearchPathRemapper.remapPath(searchPath.Path),
+        searchPath.IsFramework, searchPath.IsSystem);
+  }
 
   auto clangImporter = static_cast<ClangImporter *>(ctx.getClangModuleLoader());
 
@@ -349,12 +358,11 @@ ModuleFile::getModuleName(ASTContext &Ctx, StringRef modulePath,
     /*RequiresNullTerminator=*/false);
   std::shared_ptr<const ModuleFileSharedCore> loadedModuleFile;
   bool isFramework = false;
-  serialization::ValidationInfo loadInfo =
-     ModuleFileSharedCore::load(modulePath.str(),
-                      std::move(newBuf),
-                      nullptr,
-                      nullptr,
-                      /*isFramework*/isFramework, loadedModuleFile);
+  serialization::ValidationInfo loadInfo = ModuleFileSharedCore::load(
+      modulePath.str(), std::move(newBuf), nullptr, nullptr,
+      /*isFramework*/ isFramework, Ctx.SILOpts.EnableOSSAModules,
+      Ctx.SearchPathOpts.DeserializedPathRecoverer,
+      loadedModuleFile);
   Name = loadedModuleFile->Name.str();
   return std::move(moduleBuf.get());
 }
@@ -990,6 +998,13 @@ Optional<CommentInfo> ModuleFile::getCommentForDecl(const Decl *D) const {
     return None;
 
   return getCommentForDeclByUSR(USRBuffer.str());
+}
+
+void ModuleFile::collectSerializedSearchPath(
+    llvm::function_ref<void(StringRef)> callback) const {
+  for (auto path: Core->SearchPaths) {
+    callback(path.Path);
+  }
 }
 
 void ModuleFile::collectBasicSourceFileInfo(

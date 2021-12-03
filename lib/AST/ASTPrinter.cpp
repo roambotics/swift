@@ -30,6 +30,7 @@
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PrintOptions.h"
 #include "swift/AST/ProtocolConformance.h"
@@ -44,6 +45,7 @@
 #include "swift/Basic/QuotedString.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/StringExtras.h"
+#include "swift/ClangImporter/ClangImporterRequests.h"
 #include "swift/Config.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Strings.h"
@@ -263,7 +265,8 @@ PrintOptions PrintOptions::printSwiftInterfaceFile(ModuleDecl *ModuleToPrint,
     DAK_SetterAccess,
     DAK_Lazy,
     DAK_StaticInitializeObjCMetadata,
-    DAK_RestatedObjCConformance
+    DAK_RestatedObjCConformance,
+    DAK_NonSendable,
   };
 
   return result;
@@ -531,6 +534,7 @@ static bool willUseTypeReprPrinting(TypeLoc tyLoc,
           (tyLoc.getType().isNull() && tyLoc.getTypeRepr()));
 }
 
+static std::vector<Feature> getUniqueFeaturesUsed(Decl *decl);
 namespace {
 /// AST pretty-printer.
 class PrintAST : public ASTVisitor<PrintAST> {
@@ -991,7 +995,7 @@ public:
       }
     }
 
-    
+
     Printer.callPrintDeclPre(D, Options.BracketOptions);
 
     bool haveFeatureChecks = Options.PrintCompatibilityFeatureChecks &&
@@ -1000,7 +1004,22 @@ public:
     ASTVisitor::visit(D);
 
     if (haveFeatureChecks) {
-      printCompatibilityFeatureChecksPost(Printer);
+
+      printCompatibilityFeatureChecksPost(Printer, [&]() -> void {
+        auto features = getUniqueFeaturesUsed(D);
+        assert(!features.empty());
+        if (std::find_if(features.begin(), features.end(),
+                         [](Feature feature) -> bool {
+                           return getFeatureName(feature).equals(
+                               "SpecializeAttributeWithAvailability");
+                         }) != features.end()) {
+          Printer << "#else\n";
+          Options.PrintSpecializeAttributeWithAvailability = false;
+          ASTVisitor::visit(D);
+          Options.PrintSpecializeAttributeWithAvailability = true;
+          Printer.printNewline();
+        }
+      });
     }
 
     if (Synthesize) {
@@ -1750,6 +1769,24 @@ bool ShouldPrintChecker::shouldPrint(const Pattern *P,
   return ShouldPrint;
 }
 
+bool isNonSendableExtension(const Decl *D) {
+  ASTContext &ctx = D->getASTContext();
+
+  const ExtensionDecl *ED = dyn_cast<ExtensionDecl>(D);
+  if (!ED || !ED->getAttrs().isUnavailable(ctx))
+    return false;
+
+  auto nonSendable =
+      ED->getExtendedNominal()->getAttrs().getEffectiveSendableAttr();
+  if (!isa_and_nonnull<NonSendableAttr>(nonSendable))
+    return false;
+
+  // GetImplicitSendableRequest::evaluate() creates its extension with the
+  // attribute's AtLoc, so this is a good way to quickly check if the extension
+  // was synthesized for an '@_nonSendable' attribute.
+  return ED->getLocFromSource() == nonSendable->AtLoc;
+}
+
 bool ShouldPrintChecker::shouldPrint(const Decl *D,
                                      const PrintOptions &Options) {
   #if SWIFT_BUILD_ONLY_SYNTAXPARSERLIB
@@ -1772,15 +1809,18 @@ bool ShouldPrintChecker::shouldPrint(const Decl *D,
     return false;
   }
 
-  if (Options.SkipImplicit && D->isImplicit()) {
-    const auto &IgnoreList = Options.TreatAsExplicitDeclList;
-    if (std::find(IgnoreList.begin(), IgnoreList.end(), D) == IgnoreList.end())
+  // Optionally skip these checks for extensions synthesized for '@_nonSendable'
+  if (!Options.AlwaysPrintNonSendableExtensions || !isNonSendableExtension(D)) {
+    if (Options.SkipImplicit && D->isImplicit()) {
+      const auto &IgnoreList = Options.TreatAsExplicitDeclList;
+      if (!llvm::is_contained(IgnoreList, D))
         return false;
-  }
+    }
 
-  if (Options.SkipUnavailable &&
-      D->getAttrs().isUnavailable(D->getASTContext()))
-    return false;
+    if (Options.SkipUnavailable &&
+        D->getAttrs().isUnavailable(D->getASTContext()))
+      return false;
+  }
 
   if (Options.ExplodeEnumCaseDecls) {
     if (isa<EnumElementDecl>(D))
@@ -2157,10 +2197,58 @@ void PrintAST::printAccessors(const AbstractStorageDecl *ASD) {
   indent();
 }
 
+// This provides logic for looking up all members of a namespace. This is
+// intentionally implemented only in the printer and should *only* be used for
+// debugging, testing, generating module dumps, etc. (In other words, if you're
+// trying to get all the members of a namespace in another part of the compiler,
+// you're probably doing somethign wrong. This is a very expensive operation,
+// so we want to do it only when absolutely nessisary.)
+static void addNamespaceMembers(Decl *decl,
+                                llvm::SmallVector<Decl *, 16> &members) {
+  auto &ctx = decl->getASTContext();
+  auto namespaceDecl = cast<clang::NamespaceDecl>(decl->getClangDecl());
+
+  // This is only to keep track of the members we've already seen.
+  llvm::SmallPtrSet<Decl *, 16> addedMembers;
+  for (auto redecl : namespaceDecl->redecls()) {
+    for (auto member : redecl->decls()) {
+      if (auto classTemplate = dyn_cast<clang::ClassTemplateDecl>(member)) {
+        // Add all specializtaions to a worklist so we don't accidently mutate
+        // the list of decls we're iterating over.
+        llvm::SmallPtrSet<const clang::ClassTemplateSpecializationDecl *, 16> specWorklist;
+        for (auto spec : classTemplate->specializations())
+          specWorklist.insert(spec);
+        for (auto spec : specWorklist) {
+          if (auto import =
+                  ctx.getClangModuleLoader()->importDeclDirectly(spec))
+            if (addedMembers.insert(import).second)
+              members.push_back(import);
+        }
+      }
+
+      auto namedDecl = dyn_cast<clang::NamedDecl>(member);
+      if (!namedDecl)
+        continue;
+
+      auto name = ctx.getClangModuleLoader()->importName(namedDecl);
+      if (!name)
+        continue;
+
+      // If we're building libSyntaxParser, #if out the clang importer request
+      // because libSyntaxParser doesn't know about the clang importer.
+      CXXNamespaceMemberLookup lookupRequest({cast<EnumDecl>(decl), name});
+      for (auto found : evaluateOrDefault(ctx.evaluator, lookupRequest, {})) {
+        if (addedMembers.insert(found).second)
+          members.push_back(found);
+      }
+    }
+  }
+}
+
 void PrintAST::printMembersOfDecl(Decl *D, bool needComma,
                                   bool openBracket,
                                   bool closeBracket) {
-  llvm::SmallVector<Decl *, 3> Members;
+  llvm::SmallVector<Decl *, 16> Members;
   auto AddMembers = [&](IterableDeclContext *idc) {
     if (Options.PrintCurrentMembersOnly) {
       for (auto RD : idc->getMembers())
@@ -2187,6 +2275,8 @@ void PrintAST::printMembersOfDecl(Decl *D, bool needComma,
         }
       }
     }
+    if (isa_and_nonnull<clang::NamespaceDecl>(D->getClangDecl()))
+      addNamespaceMembers(D, Members);
   }
   printMembers(Members, needComma, openBracket, closeBracket);
 }
@@ -2337,13 +2427,16 @@ void PrintAST::visitImportDecl(ImportDecl *decl) {
   llvm::interleave(decl->getImportPath(),
                    [&](const ImportPath::Element &Elem) {
                      if (!Mods.empty()) {
-                       Identifier Name = Elem.Item;
+                       // Should print the module real name in case module
+                       // aliasing is used (see -module-alias), since that's
+                       // the actual binary name.
+                       Identifier Name = decl->getASTContext().getRealModuleName(Elem.Item);
                        if (Options.MapCrossImportOverlaysToDeclaringModule) {
                          if (auto *MD = Mods.front().getAsSwiftModule()) {
                            ModuleDecl *Declaring = const_cast<ModuleDecl*>(MD)
                              ->getDeclaringModuleIfCrossImportOverlay();
                            if (Declaring)
-                             Name = Declaring->getName();
+                             Name = Declaring->getRealName();
                          }
                        }
                        Printer.printModuleRef(Mods.front(), Name);
@@ -2756,6 +2849,22 @@ static bool usesFeatureBuiltinCreateAsyncTaskInGroup(Decl *decl) {
   return false;
 }
 
+static bool usesFeatureBuiltinMove(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureBuiltinCopy(Decl *decl) { return false; }
+
+static bool usesFeatureSpecializeAttributeWithAvailability(Decl *decl) {
+  if (auto func = dyn_cast<AbstractFunctionDecl>(decl)) {
+    for (auto specialize : func->getAttrs().getAttributes<SpecializeAttr>()) {
+      if (!specialize->getAvailableAttrs().empty())
+        return true;
+    }
+  }
+  return false;
+}
+
 static bool usesFeatureInheritActorContext(Decl *decl) {
   if (auto func = dyn_cast<AbstractFunctionDecl>(decl)) {
     for (auto param : *func->getParameters()) {
@@ -2778,20 +2887,24 @@ static bool usesFeatureImplicitSelfCapture(Decl *decl) {
   return false;
 }
 
+static bool usesFeatureBuiltinStackAlloc(Decl *decl) {
+  return false;
+}
+
 /// Determine the set of "new" features used on a given declaration.
 ///
 /// Note: right now, all features we check for are "new". At some point, we'll
 /// want a baseline version.
 static std::vector<Feature> getFeaturesUsed(Decl *decl) {
   std::vector<Feature> features;
-  
+
   // Go through each of the features, checking whether the declaration uses that
   // feature. This also ensures that the resulting set is in sorted order.
 #define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)  \
   if (usesFeature##FeatureName(decl))                                 \
     features.push_back(Feature::FeatureName);
 #include "swift/Basic/Features.def"
-  
+
   return features;
 }
 
@@ -2852,7 +2965,7 @@ bool swift::printCompatibilityFeatureChecksPre(
   if (features.empty())
     return false;
 
-  printer.printNewline();  
+  printer.printNewline();
   printer << "#if compiler(>=5.3) && ";
   llvm::interleave(features.begin(), features.end(),
     [&](Feature feature) {
@@ -2864,11 +2977,12 @@ bool swift::printCompatibilityFeatureChecksPre(
   return true;
 }
 
-void swift::printCompatibilityFeatureChecksPost(ASTPrinter &printer) {
+void swift::printCompatibilityFeatureChecksPost(
+    ASTPrinter &printer, llvm::function_ref<void()> printElse) {
   printer.printNewline();
+  printElse();
   printer << "#endif\n";
 }
-
 
 void PrintAST::visitExtensionDecl(ExtensionDecl *decl) {
   if (Options.TransformContext &&
@@ -2977,7 +3091,7 @@ void PrintAST::visitPoundDiagnosticDecl(PoundDiagnosticDecl *PDD) {
   if (PDD->isError()) {
     Printer << tok::pound_error;
   } else {
-    Printer << tok::pound_warning; 
+    Printer << tok::pound_warning;
   }
 
   Printer << "(\"" << PDD->getMessage()->getValue() << "\")";
@@ -3216,6 +3330,9 @@ static void printParameterFlags(ASTPrinter &printer,
 
   if (!options.excludeAttrKind(TAK_escaping) && escaping)
     printer.printKeyword("@escaping", options, " ");
+
+  if (flags.isCompileTimeConst())
+    printer.printKeyword("_const", options, " ");
 }
 
 void PrintAST::visitVarDecl(VarDecl *decl) {
@@ -3324,9 +3441,6 @@ void PrintAST::printOneParameter(const ParamDecl *param,
   };
 
   printAttributes(param);
-
-  if (param->isIsolated())
-    Printer << "isolated ";
 
   printArgName();
 
@@ -3609,7 +3723,7 @@ void PrintAST::visitFuncDecl(FuncDecl *decl) {
   }
 
   printBodyIfNecessary(decl);
-  
+
   // If the function has an opaque result type, print the opaque type decl.
   if (auto opaqueResult = decl->getOpaqueResultTypeDecl()) {
     Printer.printNewline();
@@ -4321,7 +4435,9 @@ class TypePrinter : public TypeVisitor<TypePrinter> {
         Mod = Declaring;
     }
 
-    Identifier Name = Mod->getName();
+    // Should use the module real (binary) name here and everywhere else the
+    // module is printed in case module aliasing is used (see -module-alias)
+    Identifier Name = Mod->getRealName();
     if (Options.UseExportedModuleNames && !ExportedModuleName.empty()) {
       Name = Mod->getASTContext().getIdentifier(ExportedModuleName);
     }
@@ -4342,7 +4458,7 @@ class TypePrinter : public TypeVisitor<TypePrinter> {
   bool isLLDBExpressionModule(ModuleDecl *M) {
     if (!M)
       return false;
-    return M->getName().str().startswith(LLDB_EXPRESSIONS_MODULE_NAME_PREFIX);
+    return M->getRealName().str().startswith(LLDB_EXPRESSIONS_MODULE_NAME_PREFIX);
   }
 
   bool shouldPrintFullyQualified(TypeBase *T) {
@@ -4373,7 +4489,7 @@ class TypePrinter : public TypeVisitor<TypePrinter> {
 
     // Don't print qualifiers for types from the standard library.
     if (M->isStdlibModule() ||
-        M->getName() == M->getASTContext().Id_ObjectiveC ||
+        M->getRealName() == M->getASTContext().Id_ObjectiveC ||
         M->isSystemModule() ||
         isLLDBExpressionModule(M))
       return false;
@@ -4636,7 +4752,9 @@ public:
 
   void visitModuleType(ModuleType *T) {
     Printer << "module<";
-    Printer.printModuleRef(T->getModule(), T->getModule()->getName());
+    // Should print the module real name in case module aliasing is
+    // used (see -module-alias), since that's the actual binary name.
+    Printer.printModuleRef(T->getModule(), T->getModule()->getRealName());
     Printer << ">";
   }
 
@@ -4939,7 +5057,7 @@ public:
                });
     Printer << ">";
   }
-  
+
   void visitGenericFunctionType(GenericFunctionType *T) {
     Printer.callPrintStructurePre(PrintStructureKind::FunctionType);
     SWIFT_DEFER {
@@ -5021,7 +5139,7 @@ public:
                             PrintAST::PrintRequirements);
       Printer << " ";
     }
-  
+
     // If this is a substituted function type, then its generic signature is
     // independent of the enclosing context, and defines the parameters active
     // in the interface params and results. Unsubstituted types use the existing
@@ -5044,7 +5162,7 @@ public:
                                  PrintAST::PrintRequirements);
       sub->Printer << " ";
     }
-  
+
     // Capture list used here to ensure we don't print anything using `this`
     // printer, but only the sub-Printer.
     [T, sub, &subOptions] {
@@ -5226,7 +5344,7 @@ public:
       Printer << "@opened(\"" << T->getOpenedExistentialID() << "\") ";
     visit(T->getOpenedExistentialType());
   }
-  
+
   void printArchetypeCommon(ArchetypeType *T,
                             const AbstractTypeParamDecl *Decl) {
     if (Options.AlternativeTypeNames) {
@@ -5251,11 +5369,11 @@ public:
     visitParentType(T->getParent());
     printArchetypeCommon(T, T->getAssocType());
   }
-  
+
   void visitPrimaryArchetypeType(PrimaryArchetypeType *T) {
     printArchetypeCommon(T, T->getInterfaceType()->getDecl());
   }
-  
+
   void visitOpaqueTypeArchetypeType(OpaqueTypeArchetypeType *T) {
     switch (Options.OpaqueReturnTypePrinting) {
     case PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword:
@@ -5272,14 +5390,14 @@ public:
       // type.
       Printer << "@_opaqueReturnTypeOf(";
       OpaqueTypeDecl *decl = T->getDecl();
-      
+
       Printer.printEscapedStringLiteral(
                                    decl->getOpaqueReturnTypeIdentifier().str());
-      
+
       Printer << ", " << T->getInterfaceType()
                           ->castTo<GenericTypeParamType>()
                           ->getIndex();
-      
+
       // The identifier after the closing parenthesis is irrelevant and can be
       // anything. It just needs to be there for the @_opaqueReturnTypeOf
       // attribute to apply to, but the attribute alone references the opaque
@@ -5305,6 +5423,10 @@ public:
       return;
     }
     }
+  }
+
+  void visitSequenceArchetypeType(SequenceArchetypeType *T) {
+    printArchetypeCommon(T, T->getInterfaceType()->getDecl());
   }
 
   void visitGenericTypeParamType(GenericTypeParamType *T) {
@@ -5433,7 +5555,7 @@ void LayoutConstraintInfo::print(ASTPrinter &Printer,
     break;
   }
 }
-  
+
 void LayoutConstraint::dump() const {
   if (!*this) {
     llvm::errs() << "(null)\n";
@@ -5696,13 +5818,13 @@ void ProtocolConformance::printName(llvm::raw_ostream &os,
   case ProtocolConformanceKind::Normal: {
     auto normal = cast<NormalProtocolConformance>(this);
     os << normal->getProtocol()->getName()
-       << " module " << normal->getDeclContext()->getParentModule()->getName();
+       << " module " << normal->getDeclContext()->getParentModule()->getRealName();
     break;
   }
   case ProtocolConformanceKind::Self: {
     auto self = cast<SelfProtocolConformance>(this);
     os << self->getProtocol()->getName()
-       << " module " << self->getDeclContext()->getParentModule()->getName();
+       << " module " << self->getDeclContext()->getParentModule()->getRealName();
     break;
   }
   case ProtocolConformanceKind::Specialized: {
@@ -5808,6 +5930,7 @@ swift::getInheritedForPrinting(
   // Collect synthesized conformances.
   auto &ctx = decl->getASTContext();
   llvm::SetVector<ProtocolDecl *> protocols;
+  llvm::TinyPtrVector<ProtocolDecl *> uncheckedProtocols;
   for (auto attr : decl->getAttrs().getAttributes<SynthesizedProtocolAttr>()) {
     if (auto *proto = ctx.getProtocol(attr->getProtocolKind())) {
       // The SerialExecutor conformance is only synthesized on the root
@@ -5820,11 +5943,14 @@ swift::getInheritedForPrinting(
           cast<EnumDecl>(decl)->hasRawType())
         continue;
       protocols.insert(proto);
+      if (attr->isUnchecked())
+        uncheckedProtocols.push_back(proto);
     }
   }
 
   for (size_t i = 0; i < protocols.size(); i++) {
     auto proto = protocols[i];
+    bool isUnchecked = llvm::is_contained(uncheckedProtocols, proto);
 
     if (!options.shouldPrint(proto)) {
       // If private stdlib protocols are skipped and this is a private stdlib
@@ -5835,12 +5961,14 @@ swift::getInheritedForPrinting(
           proto->isPrivateStdlibDecl(!options.SkipUnderscoredStdlibProtocols)) {
         auto inheritedProtocols = proto->getInheritedProtocols();
         protocols.insert(inheritedProtocols.begin(), inheritedProtocols.end());
+        if (isUnchecked)
+          copy(inheritedProtocols, std::back_inserter(uncheckedProtocols));
       }
       continue;
     }
 
     Results.push_back({TypeLoc::withoutLoc(proto->getDeclaredInterfaceType()),
-                       /*isUnchecked=*/false});
+                       isUnchecked});
   }
 }
 

@@ -334,26 +334,56 @@ void IRGenModule::emitNonoverriddenMethodDescriptor(const SILVTable *VTable,
   getAddrOfLLVMVariable(entity, init, DebugTypeInfo());
 }
 
+void IRGenModule::setVCallVisibility(llvm::GlobalVariable *var,
+                          llvm::GlobalObject::VCallVisibility vis,
+                          std::pair<uint64_t, uint64_t> range) {
+  // Insert attachment of !vcall_visibility !{ vis, range.first, range.second }
+  var->addMetadata(
+      llvm::LLVMContext::MD_vcall_visibility,
+      *llvm::MDNode::get(getLLVMContext(),
+                         {
+                             llvm::ConstantAsMetadata::get(
+                                 llvm::ConstantInt::get(Int64Ty, vis)),
+                             llvm::ConstantAsMetadata::get(
+                                 llvm::ConstantInt::get(Int64Ty, range.first)),
+                             llvm::ConstantAsMetadata::get(
+                                 llvm::ConstantInt::get(Int64Ty, range.second)),
+                         }));
+  // Insert attachment of !typed_global_not_for_cfi !{}
+  var->addMetadata("typed_global_not_for_cfi",
+                   *llvm::MDNode::get(getLLVMContext(), {}));
+}
+
 void IRGenModule::addVTableTypeMetadata(
     ClassDecl *decl, llvm::GlobalVariable *var,
     SmallVector<std::pair<Size, SILDeclRef>, 8> vtableEntries) {
+  if (vtableEntries.empty())
+    return;
+
+  uint64_t minOffset = UINT64_MAX;
+  uint64_t maxOffset = 0;
   for (auto ventry : vtableEntries) {
     auto method = ventry.second;
     auto offset = ventry.first.getValue();
     var->addTypeMetadata(offset, typeIdForMethod(*this, method));
+    minOffset = std::min(minOffset, offset);
+    maxOffset = std::max(maxOffset, offset);
   }
 
+  using VCallVisibility = llvm::GlobalObject::VCallVisibility;
+  VCallVisibility vis = VCallVisibility::VCallVisibilityPublic;
   auto AS = decl->getFormalAccessScope();
   if (AS.isFileScope()) {
-    var->setVCallVisibilityMetadata(
-      llvm::GlobalObject::VCallVisibility::VCallVisibilityTranslationUnit);
+    vis = VCallVisibility::VCallVisibilityTranslationUnit;
   } else if (AS.isPrivate() || AS.isInternal()) {
-    var->setVCallVisibilityMetadata(
-      llvm::GlobalObject::VCallVisibility::VCallVisibilityLinkageUnit);
-  } else {
-    var->setVCallVisibilityMetadata(
-      llvm::GlobalObject::VCallVisibility::VCallVisibilityPublic);
+    vis = VCallVisibility::VCallVisibilityLinkageUnit;
+  } else if (getOptions().InternalizeAtLink) {
+    vis = VCallVisibility::VCallVisibilityLinkageUnit;
   }
+
+  auto relptrSize = DataLayout.getTypeAllocSize(Int32Ty).getValue();
+  setVCallVisibility(var, vis,
+                     std::make_pair(minOffset, maxOffset + relptrSize));
 }
 
 namespace {
@@ -821,7 +851,7 @@ namespace {
       SILDeclRef func(entry.getFunction());
 
       // Emit the dispatch thunk.
-      if (Resilient)
+      if (Resilient || IGM.getOptions().WitnessMethodElimination)
         IGM.emitDispatchThunk(func);
 
       // Classify the function.
@@ -869,8 +899,9 @@ namespace {
           B.getAddrOfCurrentPosition(IGM.ProtocolRequirementStructTy);
         int offset = WitnessTableFirstRequirementOffset;
         auto firstReqAdjustment = llvm::ConstantInt::get(IGM.Int32Ty, -offset);
-        address = llvm::ConstantExpr::getGetElementPtr(nullptr, address,
-                                                       firstReqAdjustment);
+        address = llvm::ConstantExpr::getGetElementPtr(
+          address->getType()->getPointerElementType(), address,
+          firstReqAdjustment);
 
         IGM.defineProtocolRequirementsBaseDescriptor(Proto, address);
       }
@@ -1756,8 +1787,9 @@ namespace {
 
       // Emit method dispatch thunk if the class is resilient.
       auto *func = cast<AbstractFunctionDecl>(fn.getDecl());
-      if (Resilient &&
-          func->getEffectiveAccess() >= AccessLevel::Public) {
+
+      if ((Resilient && func->getEffectiveAccess() >= AccessLevel::Public) ||
+          IGM.getOptions().VirtualFunctionElimination) {
         IGM.emitDispatchThunk(fn);
       }
     }
@@ -1782,9 +1814,10 @@ namespace {
       // method for external clients.
       
       // Emit method dispatch thunk.
-      if (hasPublicVisibility(fn.getLinkage(NotForDefinition))) {
-        IGM.emitDispatchThunk(fn);
-      }
+     if (hasPublicVisibility(fn.getLinkage(NotForDefinition)) ||
+         IGM.getOptions().VirtualFunctionElimination) {
+       IGM.emitDispatchThunk(fn);
+     }
 
       if (IGM.getOptions().VirtualFunctionElimination) {
         auto offset = B.getNextOffsetFromGlobal() +
@@ -2018,7 +2051,6 @@ namespace {
       case SILLinkage::Hidden:
       case SILLinkage::HiddenExternal:
       case SILLinkage::Private:
-      case SILLinkage::PrivateExternal:
         return true;
         
       case SILLinkage::Shared:
@@ -5219,6 +5251,7 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   case KnownProtocolKind::Hashable:
   case KnownProtocolKind::CaseIterable:
   case KnownProtocolKind::Comparable:
+  case KnownProtocolKind::SIMD:
   case KnownProtocolKind::SIMDScalar:
   case KnownProtocolKind::BinaryInteger:
   case KnownProtocolKind::ObjectiveCBridgeable:

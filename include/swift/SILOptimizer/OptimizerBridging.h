@@ -13,7 +13,9 @@
 #ifndef SWIFT_SILOPTIMIZER_OPTIMIZERBRIDGING_H
 #define SWIFT_SILOPTIMIZER_OPTIMIZERBRIDGING_H
 
-#include "../SIL/SILBridging.h"
+#include "swift/SIL/SILBridging.h"
+
+SWIFT_BEGIN_NULLABILITY_ANNOTATIONS
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,5 +73,7 @@ BridgedFunction BridgedFunctionArray_get(BridgedCalleeList callees,
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+SWIFT_END_NULLABILITY_ANNOTATIONS
 
 #endif

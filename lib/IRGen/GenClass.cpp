@@ -478,7 +478,8 @@ llvm::Value *IRGenFunction::emitByteOffsetGEP(llvm::Value *base,
                                               const llvm::Twine &name) {
   assert(offset->getType() == IGM.SizeTy || offset->getType() == IGM.Int32Ty);
   auto addr = Builder.CreateBitCast(base, IGM.Int8PtrTy);
-  addr = Builder.CreateInBoundsGEP(addr, offset);
+  addr = Builder.CreateInBoundsGEP(
+      addr->getType()->getScalarType()->getPointerElementType(), addr, offset);
   return Builder.CreateBitCast(addr, objectType->getPointerTo(), name);
 }
 
@@ -960,6 +961,7 @@ void IRGenModule::emitClassDecl(ClassDecl *D) {
   emitFieldDescriptor(D);
 
   IRGen.addClassForEagerInitialization(D);
+  IRGen.addBackDeployedObjCActorInitialization(D);
 
   emitNestedTypeDecls(D->getMembers());
 }
@@ -1764,8 +1766,12 @@ namespace {
         return null();
       }
 
-      return buildGlobalVariable(array, "_PROTOCOL_METHOD_TYPES_",
-                                 /*const*/ true);
+      auto *gv_as_const =  buildGlobalVariable(array, "_PROTOCOL_METHOD_TYPES_",
+                               /*const*/ true,
+                               /*likage*/ llvm::GlobalVariable::WeakAnyLinkage);
+      llvm::GlobalValue *gv = (llvm::GlobalValue *)gv_as_const;
+      gv->setVisibility(llvm::GlobalValue::HiddenVisibility);
+      return gv;
     }
 
     void buildExtMethodTypes(ConstantArrayBuilder &array,
@@ -2165,8 +2171,9 @@ namespace {
     /// Build a private global variable as a structure containing the
     /// given fields.
     template <class B>
-    llvm::Constant *buildGlobalVariable(B &fields, StringRef nameBase,
-                                        bool isConst) {
+    llvm::Constant *buildGlobalVariable(B &fields, StringRef nameBase, bool isConst,
+                      llvm::GlobalValue::LinkageTypes linkage =
+                          llvm::GlobalVariable::InternalLinkage) {
       llvm::SmallString<64> nameBuffer;
       auto var =
         fields.finishAndCreateGlobal(Twine(nameBase) 
@@ -2176,7 +2183,7 @@ namespace {
                                            : Twine()),
                                      IGM.getPointerAlignment(),
                                      /*constant*/ true,
-                                     llvm::GlobalVariable::InternalLinkage);
+                                     linkage);
 
       switch (IGM.TargetInfo.OutputObjectFormat) {
       case llvm::Triple::MachO:
@@ -2527,15 +2534,24 @@ ClassDecl *irgen::getRootClassForMetaclass(IRGenModule &IGM, ClassDecl *C) {
 
 ClassDecl *
 irgen::getSuperclassDeclForMetadata(IRGenModule &IGM, ClassDecl *C) {
-  if (C->isNativeNSObjectSubclass())
+  if (C->isNativeNSObjectSubclass()) {
+    // When concurrency isn't available in the OS, use NSObject instead.
+    if (!IGM.isConcurrencyAvailable()) {
+      return IGM.getObjCRuntimeBaseClass(
+          IGM.Context.getSwiftId(KnownFoundationEntity::NSObject),
+          IGM.Context.getIdentifier("NSObject"));
+    }
+
     return IGM.getSwiftNativeNSObjectDecl();
+  }
   return C->getSuperclassDecl();
 }
 
 CanType irgen::getSuperclassForMetadata(IRGenModule &IGM, ClassDecl *C) {
-  if (C->isNativeNSObjectSubclass())
-    return IGM.getSwiftNativeNSObjectDecl()->getDeclaredInterfaceType()
-                                           ->getCanonicalType();
+  if (C->isNativeNSObjectSubclass()) {
+    return getSuperclassDeclForMetadata(IGM, C)->getDeclaredInterfaceType()
+                                               ->getCanonicalType();
+  }
   if (auto superclass = C->getSuperclass())
     return superclass->getCanonicalType();
   return CanType();
@@ -2544,9 +2560,10 @@ CanType irgen::getSuperclassForMetadata(IRGenModule &IGM, ClassDecl *C) {
 CanType irgen::getSuperclassForMetadata(IRGenModule &IGM, CanType type,
                                         bool useArchetypes) {
   auto cls = type->getClassOrBoundGenericClass();
-  if (cls->isNativeNSObjectSubclass())
-    return IGM.getSwiftNativeNSObjectDecl()->getDeclaredInterfaceType()
-                                           ->getCanonicalType();
+  if (cls->isNativeNSObjectSubclass()) {
+    return getSuperclassDeclForMetadata(IGM, cls)->getDeclaredInterfaceType()
+                                                 ->getCanonicalType();
+  }
   if (auto superclass = type->getSuperclass(useArchetypes))
     return superclass->getCanonicalType();
   return CanType();
@@ -2699,6 +2716,8 @@ static llvm::Value *emitVTableSlotLoad(IRGenFunction &IGF, Address slot,
     args.push_back(llvm::ConstantInt::get(IGF.IGM.Int32Ty, 0));
     args.push_back(llvm::MetadataAsValue::get(*IGF.IGM.LLVMContext, typeId));
 
+    // TODO/FIXME: Using @llvm.type.checked.load loses the "invariant" marker
+    // which could mean redundant loads don't get removed.
     llvm::Value *checkedLoad =
         IGF.Builder.CreateCall(checkedLoadIntrinsic, args);
     auto fnPtr = IGF.Builder.CreateExtractValue(checkedLoad, 0);

@@ -579,6 +579,10 @@ public:
   StmtCondition getCond() const { return Cond; }
   void setCond(StmtCondition e);
 
+  /// FIXME: Find a better way to implement this. Allows conditions to be
+  ///        stored in \c ASTNode.
+  StmtCondition *getCondPointer() { return &Cond; }
+
   static bool classof(const Stmt *S) {
     return S->getKind() >= StmtKind::First_LabeledConditionalStmt &&
            S->getKind() <= StmtKind::Last_LabeledConditionalStmt;
@@ -1392,7 +1396,7 @@ inline void simple_display(llvm::raw_ostream &out, Stmt *S) {
     out << Stmt::getKindName(S->getKind());
   else
     out << "(null)";
-};
+}
 
 } // end namespace swift
 

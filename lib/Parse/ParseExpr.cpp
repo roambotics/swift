@@ -656,17 +656,17 @@ ParserResult<Expr> Parser::parseExprKeyPath() {
     // Add the code completion expression to the path result.
     CodeCompletionExpr *CC = new (Context)
         CodeCompletionExpr(pathResult.getPtrOrNull(), Tok.getLoc());
-    auto keypath = new (Context)
-        KeyPathExpr(backslashLoc, rootResult.getPtrOrNull(), CC, hasLeadingDot);
+    auto *keypath = KeyPathExpr::createParsed(
+        Context, backslashLoc, rootResult.getPtrOrNull(), CC, hasLeadingDot);
     if (CodeCompletion)
       CodeCompletion->completeExprKeyPath(keypath, DotLoc);
     consumeToken(tok::code_complete);
     return makeParserCodeCompletionResult(keypath);
   }
 
-  auto keypath =
-      new (Context) KeyPathExpr(backslashLoc, rootResult.getPtrOrNull(),
-                                pathResult.getPtrOrNull(), hasLeadingDot);
+  auto *keypath = KeyPathExpr::createParsed(
+      Context, backslashLoc, rootResult.getPtrOrNull(),
+      pathResult.getPtrOrNull(), hasLeadingDot);
   return makeParserResult(parseStatus, keypath);
 }
 
@@ -690,8 +690,8 @@ ParserResult<Expr> Parser::parseExprKeyPathObjC() {
   auto handleCodeCompletion = [&](SourceLoc DotLoc) -> ParserResult<Expr> {
     KeyPathExpr *expr = nullptr;
     if (!components.empty()) {
-      expr = new (Context)
-          KeyPathExpr(Context, keywordLoc, lParenLoc, components, Tok.getLoc());
+      expr = KeyPathExpr::createParsedPoundKeyPath(
+          Context, keywordLoc, lParenLoc, components, Tok.getLoc());
     }
 
     if (CodeCompletion)
@@ -764,7 +764,7 @@ ParserResult<Expr> Parser::parseExprKeyPathObjC() {
   }
 
   // We're done: create the key-path expression.
-  return makeParserResult<Expr>(new (Context) KeyPathExpr(
+  return makeParserResult<Expr>(KeyPathExpr::createParsedPoundKeyPath(
       Context, keywordLoc, lParenLoc, components, rParenLoc));
 }
 
@@ -1142,18 +1142,6 @@ Parser::parseExprPostfixSuffix(ParserResult<Expr> Result, bool isExprBasic,
             new (Context) DotSelfExpr(Result.get(), TokLoc, consumeToken()));
         SyntaxContext->createNodeInPlace(SyntaxKind::MemberAccessExpr);
         continue;
-      }
-
-      // Handle the deprecated 'x.dynamicType' and migrate it to `type(of: x)`
-      if (Tok.getText() == "dynamicType") {
-        auto range = Result.get()->getSourceRange();
-        auto dynamicTypeExprRange = SourceRange(TokLoc, Tok.getLoc());
-        diagnose(TokLoc, diag::expr_dynamictype_deprecated)
-            .highlight(dynamicTypeExprRange)
-            .fixItReplace(dynamicTypeExprRange, ")")
-            .fixItInsert(range.Start, "type(of: ");
-
-        // fallthrough to an UnresolvedDotExpr.
       }
 
       // Handle "x.<tab>" for code completion.
@@ -3133,10 +3121,6 @@ ParserStatus Parser::parseExprList(tok leftTok, tok rightTok,
                                    SourceLoc &rightLoc, SyntaxKind Kind) {
   StructureMarkerRAII ParsingExprList(*this, Tok);
   
-  if (ParsingExprList.isFailed()) {
-    return makeParserError();
-  }
-
   leftLoc = consumeToken(leftTok);
   return parseList(rightTok, leftLoc, rightLoc, /*AllowSepAfterLast=*/false,
                    rightTok == tok::r_paren ? diag::expected_rparen_expr_list
@@ -3144,8 +3128,7 @@ ParserStatus Parser::parseExprList(tok leftTok, tok rightTok,
                    Kind, [&] () -> ParserStatus {
     Identifier FieldName;
     SourceLoc FieldNameLoc;
-    if (Kind != SyntaxKind::YieldStmt)
-      parseOptionalArgumentLabel(FieldName, FieldNameLoc);
+    parseOptionalArgumentLabel(FieldName, FieldNameLoc);
 
     // See if we have an operator decl ref '(<op>)'. The operator token in
     // this case lexes as a binary operator because it neither leads nor

@@ -7,35 +7,29 @@
 // UNSUPPORTED: use_os_stdlib
 // UNSUPPORTED: back_deployment_runtime
 
-// temporary non-support. tracked in rdar://82593574
+// FIXME(distributed): Distributed actors currently have some issues on windows, isRemote always returns false. rdar://82593574
 // UNSUPPORTED: windows
 
 import _Distributed
 
-@available(SwiftStdlib 5.5, *)
-    actor A {}
+@available(SwiftStdlib 5.6, *)
+actor A {}
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 distributed actor DA {
-  init(transport: ActorTransport) {
-    defer { transport.actorReady(self) }
-  }
+  init(transport: FakeTransport) {}
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 distributed actor DA_userDefined {
-  init(transport: ActorTransport) {
-    defer { transport.actorReady(self) }
-  }
+  init(transport: FakeTransport) {}
 
   deinit {}
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 distributed actor DA_userDefined2 {
-  init(transport: ActorTransport) {
-    defer { transport.actorReady(self) }
-  }
+  init(transport: FakeTransport) {}
 
   deinit {
     print("Deinitializing \(self.id)")
@@ -43,14 +37,12 @@ distributed actor DA_userDefined2 {
   }
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 distributed actor DA_state {
   var name = "Hello"
   var age = 42
 
-  init(transport: ActorTransport) {
-    defer { transport.actorReady(self) }
-  }
+  init(transport: FakeTransport) {}
 
   deinit {
     print("Deinitializing \(self.id)")
@@ -60,7 +52,7 @@ distributed actor DA_state {
 
 // ==== Fake Transport ---------------------------------------------------------
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 struct ActorAddress: ActorIdentity {
   let address: String
   init(parse address : String) {
@@ -68,7 +60,7 @@ struct ActorAddress: ActorIdentity {
   }
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 final class FakeTransport: @unchecked Sendable, ActorTransport {
 
   var n = 0
@@ -101,9 +93,12 @@ final class FakeTransport: @unchecked Sendable, ActorTransport {
   }
 }
 
+@available(SwiftStdlib 5.6, *)
+typealias DefaultActorTransport = FakeTransport
+
 // ==== Execute ----------------------------------------------------------------
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 func test() {
   let transport = FakeTransport()
 
@@ -155,7 +150,7 @@ func test() {
   // CHECK-NEXT: Deinitializing
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 @main struct Main {
   static func main() async {
     test()

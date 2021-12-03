@@ -102,7 +102,10 @@ template <typename... ArgTypes>
 InFlightDiagnostic
 FailureDiagnostic::emitDiagnosticAt(ArgTypes &&... Args) const {
   auto &DE = getASTContext().Diags;
-  return DE.diagnose(std::forward<ArgTypes>(Args)...);
+  auto behavior = isWarning ? DiagnosticBehavior::Warning
+                            : DiagnosticBehavior::Unspecified;
+  return std::move(DE.diagnose(std::forward<ArgTypes>(Args)...)
+                     .limitBehavior(behavior));
 }
 
 Expr *FailureDiagnostic::findParentExpr(const Expr *subExpr) const {
@@ -660,8 +663,10 @@ Optional<Diag<Type, Type>> GenericArgumentsMismatchFailure::getDiagnosticFor(
   case CTP_WrappedProperty:
     return diag::wrapped_value_mismatch;
 
+  case CTP_CaseStmt:
   case CTP_ThrowStmt:
   case CTP_ForEachStmt:
+  case CTP_ForEachSequence:
   case CTP_ComposedPropertyWrapper:
   case CTP_Unused:
   case CTP_CannotFail:
@@ -1614,13 +1619,13 @@ bool RValueTreatedAsLValueFailure::diagnoseAsError() {
       }
     }
 
-    if (auto resolvedOverload = getOverloadChoiceIfAvailable(getLocator())) {
+    if (auto resolvedOverload =
+            getCalleeOverloadChoiceIfAvailable(getLocator())) {
       if (resolvedOverload->choice.getKind() ==
           OverloadChoiceKind::DynamicMemberLookup)
         subElementDiagID = diag::assignment_dynamic_property_has_immutable_base;
 
-      if (resolvedOverload->choice.getKind() ==
-          OverloadChoiceKind::KeyPathDynamicMemberLookup) {
+      if (resolvedOverload->choice.isKeyPathDynamicMemberLookup()) {
         if (!getType(member->getBase(), /*wantRValue=*/false)->hasLValueType())
           subElementDiagID =
               diag::assignment_dynamic_property_has_immutable_base;
@@ -2320,7 +2325,7 @@ bool ContextualFailure::diagnoseAsError() {
       }
     }
 
-    if (CTP == CTP_ForEachStmt) {
+    if (CTP == CTP_ForEachStmt || CTP == CTP_ForEachSequence) {
       if (fromType->isAnyExistentialType()) {
         emitDiagnostic(diag::type_cannot_conform,
                        /*isExistentialType=*/true, fromType, 
@@ -2416,6 +2421,22 @@ bool ContextualFailure::diagnoseAsError() {
     break;
   }
 
+  case ConstraintLocator::OptionalPayload: {
+    // If this is an attempt at a Double <-> CGFloat conversion
+    // through optional chaining, let's produce a tailored diagnostic.
+    if (isExpr<OptionalEvaluationExpr>(getAnchor())) {
+      if ((fromType->isDouble() || fromType->isCGFloat()) &&
+          (toType->isDouble() || toType->isCGFloat())) {
+        fromType = OptionalType::get(fromType);
+        toType = OptionalType::get(toType);
+        diagnostic = diag::cannot_implicitly_convert_in_optional_context;
+        break;
+      }
+    }
+
+    return false;
+  }
+
   default:
     return false;
   }
@@ -2469,8 +2490,10 @@ getContextualNilDiagnostic(ContextualTypePurpose CTP) {
   case CTP_ReturnStmt:
     return diag::cannot_convert_to_return_type_nil;
 
+  case CTP_CaseStmt:
   case CTP_ThrowStmt:
   case CTP_ForEachStmt:
+  case CTP_ForEachSequence:
   case CTP_YieldByReference:
   case CTP_WrappedProperty:
   case CTP_ComposedPropertyWrapper:
@@ -2953,6 +2976,20 @@ bool ContextualFailure::tryTypeCoercionFixIt(
   if (!toType->hasTypeRepr())
     return false;
 
+  // If object of the optional type is a subtype of the specified contextual
+  // type, let's suggest a force unwrap "!". Otherwise fallback to potential
+  // coercion or force cast.
+  if (!bothOptional && fromType->getOptionalObjectType()) {
+    if (TypeChecker::isSubtypeOf(fromType->lookThroughAllOptionalTypes(),
+                                 toType, getDC())) {
+      diagnostic.fixItInsert(
+          Lexer::getLocForEndOfToken(getASTContext().SourceMgr,
+                                     getSourceRange().End),
+          "!");
+      return true;
+    }
+  }
+
   CheckedCastKind Kind =
       TypeChecker::typeCheckCheckedCast(fromType, toType,
                                         CheckedCastContextKind::None, getDC(),
@@ -3211,8 +3248,10 @@ ContextualFailure::getDiagnosticFor(ContextualTypePurpose context,
   case CTP_WrappedProperty:
     return diag::wrapped_value_mismatch;
 
+  case CTP_CaseStmt:
   case CTP_ThrowStmt:
   case CTP_ForEachStmt:
+  case CTP_ForEachSequence:
   case CTP_ComposedPropertyWrapper:
   case CTP_Unused:
   case CTP_CannotFail:
@@ -3514,7 +3553,7 @@ DeclName MissingMemberFailure::findCorrectEnumCaseName(
   auto candidate =
       corrections.getUniqueCandidateMatching([&](ValueDecl *candidate) {
         return (isa<EnumElementDecl>(candidate) &&
-                candidate->getBaseIdentifier().str().equals_lower(
+                candidate->getBaseIdentifier().str().equals_insensitive(
                     memberName.getBaseIdentifier().str()));
       });
   return (candidate ? candidate->getName() : DeclName());
@@ -4189,6 +4228,9 @@ bool PartialApplicationFailure::diagnoseAsError() {
     kind = RefKind::SuperMethod;
   }
 
+  /* TODO(diagnostics): SR-15250, 
+  Add a "did you mean to call it?" note with a fix-it for inserting '()'
+  if function type has no params or all have a default value. */
   auto diagnostic = CompatibilityWarning
                         ? diag::partial_application_of_function_invalid_swift4
                         : diag::partial_application_of_function_invalid;
@@ -5395,12 +5437,24 @@ bool ExtraneousReturnFailure::diagnoseAsError() {
   return true;
 }
 
+bool NotCompileTimeConstFailure::diagnoseAsError() {
+  emitDiagnostic(diag::expect_compile_time_const);
+  return true;
+}
+
 bool CollectionElementContextualFailure::diagnoseAsError() {
   auto anchor = getRawAnchor();
   auto *locator = getLocator();
 
   auto eltType = getFromType();
   auto contextualType = getToType();
+
+  auto diagnoseAllOccurances = [&](Diag<Type, Type> diagnostic) {
+    assert(AffectedElements.size() > 1);
+    for (auto *element : AffectedElements) {
+      emitDiagnosticAt(element->getLoc(), diagnostic, eltType, contextualType);
+    }
+  };
 
   auto isFixedToDictionary = [&](ArrayExpr *anchor) {
     return llvm::any_of(getSolution().Fixes, [&](ConstraintFix *fix) {
@@ -5414,8 +5468,10 @@ bool CollectionElementContextualFailure::diagnoseAsError() {
   Optional<InFlightDiagnostic> diagnostic;
   if (auto *AE = getAsExpr<ArrayExpr>(anchor)) {
     if (!(treatAsDictionary = isFixedToDictionary(AE))) {
-      if (diagnoseMergedLiteralElements())
+      if (AffectedElements.size() > 1) {
+        diagnoseAllOccurances(diag::cannot_convert_array_element);
         return true;
+      }
 
       diagnostic.emplace(emitDiagnostic(diag::cannot_convert_array_element,
                                         eltType, contextualType));
@@ -5425,15 +5481,27 @@ bool CollectionElementContextualFailure::diagnoseAsError() {
   if (treatAsDictionary || isExpr<DictionaryExpr>(anchor)) {
     auto eltLoc = locator->castLastElementTo<LocatorPathElt::TupleElement>();
     switch (eltLoc.getIndex()) {
-    case 0: // key
+    case 0: { // key
+      if (AffectedElements.size() > 1) {
+        diagnoseAllOccurances(diag::cannot_convert_dict_key);
+        return true;
+      }
+
       diagnostic.emplace(emitDiagnostic(diag::cannot_convert_dict_key, eltType,
                                         contextualType));
       break;
+    }
 
-    case 1: // value
+    case 1: { // value
+      if (AffectedElements.size() > 1) {
+        diagnoseAllOccurances(diag::cannot_convert_dict_value);
+        return true;
+      }
+
       diagnostic.emplace(emitDiagnostic(diag::cannot_convert_dict_value,
                                         eltType, contextualType));
       break;
+    }
 
     default:
       break;
@@ -5441,11 +5509,12 @@ bool CollectionElementContextualFailure::diagnoseAsError() {
   }
 
   if (locator->isForSequenceElementType()) {
+    auto purpose = FailureDiagnostic::getContextualTypePurpose(getAnchor());
     // If this is a conversion failure related to binding of `for-each`
     // statement it has to be diagnosed as pattern match if there are
     // holes present in the contextual type.
-    if (FailureDiagnostic::getContextualTypePurpose(getAnchor()) ==
-            ContextualTypePurpose::CTP_ForEachStmt &&
+    if ((purpose == ContextualTypePurpose::CTP_ForEachStmt ||
+         purpose == ContextualTypePurpose::CTP_ForEachSequence) &&
         contextualType->hasUnresolvedType()) {
       diagnostic.emplace(emitDiagnostic(
           (contextualType->is<TupleType>() && !eltType->is<TupleType>())
@@ -5465,30 +5534,6 @@ bool CollectionElementContextualFailure::diagnoseAsError() {
     return false;
 
   (void)trySequenceSubsequenceFixIts(*diagnostic);
-  return true;
-}
-
-bool CollectionElementContextualFailure::diagnoseMergedLiteralElements() {
-  auto elementAnchor = simplifyLocatorToAnchor(getLocator());
-  if (!elementAnchor)
-    return false;
-
-  auto *typeVar = getRawType(elementAnchor)->getAs<TypeVariableType>();
-  if (!typeVar || !typeVar->getImpl().getAtomicLiteralKind())
-    return false;
-
-  // This element is a literal whose type variable could have been merged with others,
-  // but the conversion constraint to the array element type was only placed on one
-  // of them. So, we want to emit the error for each element whose type variable is in
-  // this equivalence class.
-  auto &cs = getConstraintSystem();
-  auto node = cs.getRepresentative(typeVar)->getImpl().getGraphNode();
-  for (const auto *typeVar : node->getEquivalenceClass()) {
-    auto anchor = typeVar->getImpl().getLocator()->getAnchor();
-    emitDiagnosticAt(constraints::getLoc(anchor), diag::cannot_convert_array_element,
-                     getFromType(), getToType());
-  }
-
   return true;
 }
 
@@ -6691,6 +6736,7 @@ void NonEphemeralConversionFailure::emitSuggestionNotes() const {
   case ConversionRestrictionKind::ExistentialMetatypeToAnyObject:
   case ConversionRestrictionKind::ProtocolMetatypeToProtocolClass:
   case ConversionRestrictionKind::PointerToPointer:
+  case ConversionRestrictionKind::PointerToCPointer:
   case ConversionRestrictionKind::ArrayUpcast:
   case ConversionRestrictionKind::DictionaryUpcast:
   case ConversionRestrictionKind::SetUpcast:
@@ -6736,12 +6782,9 @@ bool NonEphemeralConversionFailure::diagnosePointerInit() const {
     return false;
   }
 
-  auto diagID = DowngradeToWarning
-                    ? diag::cannot_construct_dangling_pointer_warning
-                    : diag::cannot_construct_dangling_pointer;
-
   auto anchor = getRawAnchor();
-  emitDiagnosticAt(::getLoc(anchor), diagID, constructedTy, constructorKind)
+  emitDiagnosticAt(::getLoc(anchor), diag::cannot_construct_dangling_pointer,
+                   constructedTy, constructorKind)
       .highlight(::getSourceRange(anchor));
 
   emitSuggestionNotes();
@@ -6771,20 +6814,12 @@ bool NonEphemeralConversionFailure::diagnoseAsError() {
 
   auto *argExpr = getArgExpr();
   if (isa<InOutExpr>(argExpr)) {
-    auto diagID = DowngradeToWarning
-                      ? diag::cannot_use_inout_non_ephemeral_warning
-                      : diag::cannot_use_inout_non_ephemeral;
-
-    emitDiagnosticAt(argExpr->getLoc(), diagID, argDesc, getCallee(),
-                     getCalleeFullName())
+    emitDiagnosticAt(argExpr->getLoc(), diag::cannot_use_inout_non_ephemeral,
+                     argDesc, getCallee(), getCalleeFullName())
         .highlight(argExpr->getSourceRange());
   } else {
-    auto diagID = DowngradeToWarning
-                      ? diag::cannot_pass_type_to_non_ephemeral_warning
-                      : diag::cannot_pass_type_to_non_ephemeral;
-
-    emitDiagnosticAt(argExpr->getLoc(), diagID, getArgType(), argDesc,
-                     getCallee(), getCalleeFullName())
+    emitDiagnosticAt(argExpr->getLoc(), diag::cannot_pass_type_to_non_ephemeral,
+                     getArgType(), argDesc, getCallee(), getCalleeFullName())
         .highlight(argExpr->getSourceRange());
   }
   emitSuggestionNotes();
@@ -7652,8 +7687,11 @@ bool CoercibleOptionalCheckedCastFailure::diagnoseForcedCastExpr() const {
 
   bool isBridged = CastKind == CheckedCastKind::BridgingCoercion;
   if (isCastTypeIUO()) {
-    toType = toType->getOptionalObjectType();
-    extraFromOptionals++;
+    // IUO type could either be optional or unwrapped.
+    if (auto objType = toType->getOptionalObjectType()) {
+      extraFromOptionals++;
+      toType = objType;
+    }
   }
 
   std::string extraFromOptionalsStr(extraFromOptionals, '!');
@@ -7722,7 +7760,7 @@ bool CoercibleOptionalCheckedCastFailure::diagnoseConditionalCastExpr() const {
   return true;
 }
 
-bool AlwaysSucceedCheckedCastFailure::diagnoseIfExpr() const {
+bool NoopCheckedCast::diagnoseIfExpr() const {
   auto *expr = getAsExpr<IsExpr>(CastExpr);
   if (!expr)
     return false;
@@ -7731,7 +7769,7 @@ bool AlwaysSucceedCheckedCastFailure::diagnoseIfExpr() const {
   return true;
 }
 
-bool AlwaysSucceedCheckedCastFailure::diagnoseConditionalCastExpr() const {
+bool NoopCheckedCast::diagnoseConditionalCastExpr() const {
   auto *expr = getAsExpr<ConditionalCheckedCastExpr>(CastExpr);
   if (!expr)
     return false;
@@ -7741,7 +7779,7 @@ bool AlwaysSucceedCheckedCastFailure::diagnoseConditionalCastExpr() const {
   return true;
 }
 
-bool AlwaysSucceedCheckedCastFailure::diagnoseForcedCastExpr() const {
+bool NoopCheckedCast::diagnoseForcedCastExpr() const {
   auto *expr = getAsExpr<ForcedCheckedCastExpr>(CastExpr);
   if (!expr)
     return false;
@@ -7751,7 +7789,8 @@ bool AlwaysSucceedCheckedCastFailure::diagnoseForcedCastExpr() const {
   auto diagLoc = expr->getLoc();
 
   if (isCastTypeIUO()) {
-    toType = toType->getOptionalObjectType();
+    if (auto objType = toType->getOptionalObjectType())
+      toType = objType;
   }
 
   if (fromType->isEqual(toType)) {
@@ -7766,7 +7805,7 @@ bool AlwaysSucceedCheckedCastFailure::diagnoseForcedCastExpr() const {
   return true;
 }
 
-bool AlwaysSucceedCheckedCastFailure::diagnoseAsError() {
+bool NoopCheckedCast::diagnoseAsError() {
   if (diagnoseIfExpr())
     return true;
 
@@ -7822,5 +7861,25 @@ bool InvalidWeakAttributeUse::diagnoseAsError() {
         .fixItInsertAfter(typeRange.End, ")?");
   }
 
+  return true;
+}
+
+bool TupleLabelMismatchWarning::diagnoseAsError() {
+  emitDiagnostic(diag::tuple_label_mismatch_warning, getFromType(), getToType())
+      .highlight(getSourceRange());
+  return true;
+}
+
+bool SwiftToCPointerConversionInInvalidContext::diagnoseAsError() {
+  auto argInfo = getFunctionArgApplyInfo(getLocator());
+  if (!argInfo)
+    return false;
+
+  auto *callee = argInfo->getCallee();
+  auto argType = resolveType(argInfo->getArgType());
+  auto paramType = resolveType(argInfo->getParamType());
+
+  emitDiagnostic(diag::cannot_convert_argument_value_for_swift_func, argType,
+                 paramType, callee->getDescriptiveKind(), callee->getName());
   return true;
 }

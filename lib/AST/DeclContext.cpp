@@ -867,6 +867,10 @@ void IterableDeclContext::addMemberSilently(Decl *member, Decl *hint,
       if (d->isImplicit())
         return true;
 
+      // Imported decls won't have complete location info.
+      if (d->hasClangNode())
+        return true;
+
       return false;
     };
 
@@ -962,6 +966,10 @@ bool IterableDeclContext::hasUnparsedMembers() const {
   return true;
 }
 
+void IterableDeclContext::setHasLazyMembers(bool hasLazyMembers) const {
+  FirstDeclAndLazyMembers.setInt(hasLazyMembers);
+}
+
 void IterableDeclContext::loadAllMembers() const {
   ASTContext &ctx = getASTContext();
 
@@ -986,7 +994,7 @@ void IterableDeclContext::loadAllMembers() const {
     return;
 
   // Don't try to load all members re-entrant-ly.
-  FirstDeclAndLazyMembers.setInt(false);
+  setHasLazyMembers(false);
 
   const Decl *container = getDecl();
   auto contextInfo = ctx.getOrCreateLazyIterableContextData(this,

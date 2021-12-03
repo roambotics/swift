@@ -438,7 +438,7 @@ static bool checkObjCActorIsolation(const ValueDecl *VD,
   case ActorIsolationRestriction::CrossActorSelf:
     // FIXME: Substitution map?
     diagnoseNonSendableTypesInReference(
-        const_cast<ValueDecl *>(VD), VD->getDeclContext()->getParentModule(),
+        const_cast<ValueDecl *>(VD), VD->getDeclContext(),
         VD->getLoc(), ConcurrentReferenceKind::CrossActor);
     return false;
   case ActorIsolationRestriction::ActorSelf:
@@ -455,9 +455,6 @@ static bool checkObjCActorIsolation(const ValueDecl *VD,
   case ActorIsolationRestriction::GlobalActor:
     // FIXME: Consider whether to limit @objc on global-actor-qualified
     // declarations.
-  case ActorIsolationRestriction::DistributedActorSelf:
-    // we do not allow distributed + objc actors.
-    return false;
   case ActorIsolationRestriction::Unrestricted:
   case ActorIsolationRestriction::Unsafe:
     return false;

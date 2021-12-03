@@ -1143,7 +1143,7 @@ public:
   bool visitDeclReference(ValueDecl *D, CharSourceRange Range,
                           TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef, Type Ty,
                           ReferenceMetaData Data) override {
-    if (Data.isImplicit)
+    if (Data.isImplicit || !Range.isValid())
       return true;
     unsigned StartOffset = getOffset(Range.getStart());
     References.emplace_back(D, StartOffset, Range.getByteLength(), Ty);
@@ -1282,7 +1282,7 @@ RequestRefactoringEditConsumer(CategorizedEditsReceiver Receiver) :
   Impl(*new Implementation(Receiver)) {}
 
 RequestRefactoringEditConsumer::
-~RequestRefactoringEditConsumer() { delete &Impl; };
+~RequestRefactoringEditConsumer() { delete &Impl; }
 
 void RequestRefactoringEditConsumer::
 accept(SourceManager &SM, RegionType RegionType,
@@ -1407,7 +1407,8 @@ void SwiftLangSupport::findRenameRanges(
 
 void SwiftLangSupport::findLocalRenameRanges(
     StringRef Filename, unsigned Line, unsigned Column, unsigned Length,
-    ArrayRef<const char *> Args, CategorizedRenameRangesReceiver Receiver) {
+    ArrayRef<const char *> Args, SourceKitCancellationToken CancellationToken,
+    CategorizedRenameRangesReceiver Receiver) {
   std::string Error;
   SwiftInvocationRef Invok = ASTMgr->getInvocation(Args, Filename, Error);
   if (!Invok) {
@@ -1447,6 +1448,7 @@ void SwiftLangSupport::findLocalRenameRanges(
   /// don't use 'OncePerASTToken'.
   static const char OncePerASTToken = 0;
   getASTManager()->processASTAsync(Invok, ASTConsumer, &OncePerASTToken,
+                                   CancellationToken,
                                    llvm::vfs::getRealFileSystem());
 }
 

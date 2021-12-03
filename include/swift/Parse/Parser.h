@@ -221,12 +221,6 @@ public:
   /// The location of the previous token.
   SourceLoc PreviousLoc;
 
-  /// Stop parsing immediately.
-  void cutOffParsing() {
-    // Cut off parsing by acting as if we reached the end-of-file.
-    Tok.setKind(tok::eof);
-  }
-
   /// Use this to assert that the parser has advanced the lexing location, e.g.
   /// before a specific parser function has returned.
   class AssertParserMadeProgressBeforeLeavingScopeRAII {
@@ -329,35 +323,21 @@ public:
 
   /// An RAII object that notes when we have seen a structure marker.
   class StructureMarkerRAII {
-    Parser *const P;
+    Parser &P;
 
     /// Max nesting level
     // TODO: customizable.
     enum { MaxDepth = 256 };
 
-    StructureMarkerRAII(Parser *parser) : P(parser) {}
-
-    /// Have the parser start the new Structure or fail if already too deep.
-    bool pushStructureMarker(Parser &parser, SourceLoc loc,
-                             StructureMarkerKind kind);
+    StructureMarkerRAII(Parser &parser) : P(parser) {}
 
   public:
-    StructureMarkerRAII(Parser &parser, SourceLoc loc, StructureMarkerKind kind)
-        : StructureMarkerRAII(
-              pushStructureMarker(parser, loc, kind) ? &parser : nullptr) {}
+    StructureMarkerRAII(Parser &parser, SourceLoc loc,
+                        StructureMarkerKind kind);
 
     StructureMarkerRAII(Parser &parser, const Token &tok);
 
-    /// Did we fail to push the new structure?
-    bool isFailed() {
-      return P == nullptr;
-    }
-
-    ~StructureMarkerRAII() {
-      if (P != nullptr) {
-        P->StructureMarkers.pop_back();
-      }
-    }
+    ~StructureMarkerRAII() { P.StructureMarkers.pop_back(); }
   };
   friend class StructureMarkerRAII;
 
@@ -1049,7 +1029,7 @@ public:
   /// \p Attr is where to store the parsed attribute
   bool parseSpecializeAttribute(
       swift::tok ClosingBrace, SourceLoc AtLoc, SourceLoc Loc,
-      SpecializeAttr *&Attr,
+      SpecializeAttr *&Attr, AvailabilityContext *SILAvailability,
       llvm::function_ref<bool(Parser &)> parseSILTargetName =
           [](Parser &) { return false; },
       llvm::function_ref<bool(Parser &)> parseSILSIPModule =
@@ -1060,7 +1040,9 @@ public:
       swift::tok ClosingBrace, bool &DiscardAttribute, Optional<bool> &Exported,
       Optional<SpecializeAttr::SpecializationKind> &Kind,
       TrailingWhereClause *&TrailingWhereClause, DeclNameRef &targetFunction,
+      AvailabilityContext *SILAvailability,
       SmallVectorImpl<Identifier> &spiGroups,
+      SmallVectorImpl<AvailableAttr *> &availableAttrs,
       llvm::function_ref<bool(Parser &)> parseSILTargetName,
       llvm::function_ref<bool(Parser &)> parseSILSIPModule);
 
@@ -1127,20 +1109,23 @@ public:
   ParserStatus parseTypeAttributeList(ParamDecl::Specifier &Specifier,
                                       SourceLoc &SpecifierLoc,
                                       SourceLoc &IsolatedLoc,
+                                      SourceLoc &ConstLoc,
                                       TypeAttributes &Attributes) {
     if (Tok.isAny(tok::at_sign, tok::kw_inout) ||
         (Tok.is(tok::identifier) &&
          (Tok.getRawText().equals("__shared") ||
           Tok.getRawText().equals("__owned") ||
-          Tok.isContextualKeyword("isolated"))))
+          Tok.isContextualKeyword("isolated") ||
+          Tok.isContextualKeyword("_const"))))
       return parseTypeAttributeListPresent(
-          Specifier, SpecifierLoc, IsolatedLoc, Attributes);
+          Specifier, SpecifierLoc, IsolatedLoc, ConstLoc, Attributes);
     return makeParserSuccess();
   }
 
   ParserStatus parseTypeAttributeListPresent(ParamDecl::Specifier &Specifier,
                                              SourceLoc &SpecifierLoc,
                                              SourceLoc &IsolatedLoc,
+                                             SourceLoc &ConstLoc,
                                              TypeAttributes &Attributes);
 
   bool parseConventionAttributeInternal(bool justChecking,
@@ -1318,7 +1303,8 @@ public:
   TypeRepr *applyAttributeToType(TypeRepr *Ty, const TypeAttributes &Attr,
                                  ParamDecl::Specifier Specifier,
                                  SourceLoc SpecifierLoc,
-                                 SourceLoc IsolatedLoc);
+                                 SourceLoc IsolatedLoc,
+                                 SourceLoc ConstLoc);
 
   //===--------------------------------------------------------------------===//
   // Pattern Parsing
@@ -1379,6 +1365,9 @@ public:
 
     /// The location of the 'isolated' keyword, if present.
     SourceLoc IsolatedLoc;
+
+    /// The location of the '_const' keyword, if present.
+    SourceLoc CompileConstLoc;
 
     /// The type following the ':'.
     TypeRepr *Type = nullptr;
@@ -1850,7 +1839,11 @@ public:
   parsePlatformVersionConstraintSpec();
   ParserResult<PlatformAgnosticVersionConstraintAvailabilitySpec>
   parsePlatformAgnosticVersionConstraintSpec();
-
+  bool
+  parseAvailability(bool parseAsPartOfSpecializeAttr, StringRef AttrName,
+                    bool &DiscardAttribute, SourceRange &attrRange,
+                    SourceLoc AtLoc, SourceLoc Loc,
+                    llvm::function_ref<void(AvailableAttr *)> addAttribute);
   //===--------------------------------------------------------------------===//
   // Code completion second pass.
 

@@ -223,7 +223,8 @@ public:
 
   /// Create a SILArgument for an input parameter. Asserts if used to create a
   /// function argument for an out parameter.
-  ManagedValue createInputFunctionArgument(SILType type, ValueDecl *decl);
+  ManagedValue createInputFunctionArgument(SILType type, ValueDecl *decl,
+                                           bool isNoImplicitCopy = false);
 
   /// Create a SILArgument for an input parameter. Uses \p loc to create any
   /// copies necessary. Asserts if used to create a function argument for an out
@@ -389,6 +390,9 @@ public:
   void emitDestructureValueOperation(
       SILLocation loc, ManagedValue value,
       function_ref<void(unsigned, ManagedValue)> func);
+  void emitDestructureValueOperation(
+      SILLocation loc, ManagedValue value,
+      SmallVectorImpl<ManagedValue> &destructuredValues);
 
   using SILBuilder::createProjectBox;
   ManagedValue createProjectBox(SILLocation loc, ManagedValue mv,

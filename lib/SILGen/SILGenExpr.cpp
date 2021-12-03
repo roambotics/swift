@@ -30,6 +30,7 @@
 #include "swift/AST/CanTypeVisitor.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsCommon.h"
+#include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -158,34 +159,30 @@ SILGenFunction::emitManagedBeginBorrow(SILLocation loc, SILValue v,
   return emitManagedBorrowedRValueWithCleanup(v, bbi, lowering);
 }
 
-namespace {
-
-struct EndBorrowCleanup : Cleanup {
-  SILValue borrowedValue;
-
-  EndBorrowCleanup(SILValue borrowedValue) : borrowedValue(borrowedValue) {
-    if (auto *arg = dyn_cast<SILPhiArgument>(borrowedValue)) {
-      if (auto *ti = arg->getSingleTerminator()) {
-        assert(!ti->isTransformationTerminator() &&
-               "Transforming terminators do not have end_borrow");
-      }
+EndBorrowCleanup::EndBorrowCleanup(SILValue borrowedValue)
+    : borrowedValue(borrowedValue) {
+  if (auto *arg = dyn_cast<SILPhiArgument>(borrowedValue)) {
+    if (auto *ti = arg->getSingleTerminator()) {
+      assert(!ti->isTransformationTerminator() &&
+             "Transforming terminators do not have end_borrow");
     }
   }
+}
 
-  void emit(SILGenFunction &SGF, CleanupLocation l,
-            ForUnwind_t forUnwind) override {
-    SGF.B.createEndBorrow(l, borrowedValue);
-  }
+void EndBorrowCleanup::emit(SILGenFunction &SGF, CleanupLocation l,
+                            ForUnwind_t forUnwind) {
+  SGF.B.createEndBorrow(l, borrowedValue);
+}
 
-  void dump(SILGenFunction &) const override {
+void EndBorrowCleanup::dump(SILGenFunction &) const {
 #ifndef NDEBUG
-    llvm::errs() << "EndBorrowCleanup "
-                 << "State:" << getState() << "\n"
-                 << "borrowed:" << borrowedValue
-                 << "\n";
+  llvm::errs() << "EndBorrowCleanup "
+               << "State:" << getState() << "\n"
+               << "borrowed:" << borrowedValue << "\n";
 #endif
-  }
-};
+}
+
+namespace {
 
 struct FormalEvaluationEndBorrowCleanup : Cleanup {
   FormalEvaluationContext::stable_iterator Depth;
@@ -456,8 +453,6 @@ namespace {
     RValue visitCovariantReturnConversionExpr(
              CovariantReturnConversionExpr *E,
              SGFContext C);
-    RValue visitImplicitlyUnwrappedFunctionConversionExpr(
-        ImplicitlyUnwrappedFunctionConversionExpr *E, SGFContext C);
     RValue visitErasureExpr(ErasureExpr *E, SGFContext C);
     RValue visitAnyHashableErasureExpr(AnyHashableErasureExpr *E, SGFContext C);
     RValue visitForcedCheckedCastExpr(ForcedCheckedCastExpr *E,
@@ -1037,6 +1032,16 @@ SILValue SILGenFunction::emitTemporaryAllocation(SILLocation loc, SILType ty,
   Optional<SILDebugVariable> DbgVar;
   if (auto *VD = loc.getAsASTNode<VarDecl>())
     DbgVar = SILDebugVariable(VD->isLet(), 0);
+  // Recognize "catch let errorvar" bindings.
+  if (auto *DRE = loc.getAsASTNode<DeclRefExpr>())
+    if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+      if (!isa<ParamDecl>(VD) && VD->isImplicit() &&
+          (VD->getType()->is<ProtocolType>() ||
+           VD->getType()->is<ProtocolCompositionType>()) &&
+          VD->getType()->getExistentialLayout().isErrorExistential()) {
+        DbgVar = SILDebugVariable(VD->isLet(), 0);
+        loc = SILLocation(VD);
+      }
   auto alloc = B.createAllocStack(loc, ty, DbgVar, hasDynamicLifetime);
   enterDeallocStackCleanup(alloc);
   return alloc;
@@ -1416,8 +1421,10 @@ RValueEmitter::visitConditionalBridgeFromObjCExpr(
   auto conversion = cast<FuncDecl>(conversionRef.getDecl());
   auto subs = conversionRef.getSubstitutions();
 
-  auto nativeType =
-    Type(GenericTypeParamType::get(0, 0, SGF.getASTContext())).subst(subs);
+  auto nativeType = Type(GenericTypeParamType::get(/*type sequence*/ false,
+                                                   /*depth*/ 0, /*index*/ 0,
+                                                   SGF.getASTContext()))
+                        .subst(subs);
 
   auto metatypeType = SGF.getLoweredType(MetatypeType::get(nativeType));
   auto metatype =
@@ -1825,13 +1832,6 @@ RValue RValueEmitter::visitCovariantReturnConversionExpr(
   ManagedValue result = SGF.B.createUncheckedRefCast(e, original, resultType);
 
   return RValue(SGF, e, result);
-}
-
-RValue RValueEmitter::visitImplicitlyUnwrappedFunctionConversionExpr(
-    ImplicitlyUnwrappedFunctionConversionExpr *e, SGFContext C) {
-  // These are generated for short term use in the type checker.
-  llvm_unreachable(
-      "We should not see ImplicitlyUnwrappedFunctionConversionExpr here");
 }
 
 RValue RValueEmitter::visitErasureExpr(ErasureExpr *E, SGFContext C) {
@@ -3146,10 +3146,12 @@ getOrCreateKeyPathEqualsAndHash(SILGenModule &SGM,
       auto formalCanTy = formalTy->getCanonicalType(genericSig);
       
       // Get the Equatable conformance from the Hashable conformance.
-      auto equatable = hashable.getAssociatedConformance(formalTy,
-        GenericTypeParamType::get(0, 0, C),
-        equatableProtocol);
-      
+      auto equatable = hashable.getAssociatedConformance(
+          formalTy,
+          GenericTypeParamType::get(/*type sequence*/ false,
+                                    /*depth*/ 0, /*index*/ 0, C),
+          equatableProtocol);
+
       assert(equatable.isAbstract() == hashable.isAbstract());
       if (equatable.isConcrete())
         assert(equatable.getConcrete()->getType()->isEqual(
@@ -3418,7 +3420,7 @@ lowerKeyPathSubscriptIndexTypes(
                                     ->getCanonicalType(),
                              indexLoweredTy});
   }
-};
+}
 
 static void
 lowerKeyPathSubscriptIndexPatterns(
@@ -3436,7 +3438,7 @@ lowerKeyPathSubscriptIndexPatterns(
 
     indexPatterns.push_back({baseOperand++, formalTy, loweredTy, hashable});
   }
-};
+}
 
 KeyPathPatternComponent
 SILGenModule::emitKeyPathComponentForDecl(SILLocation loc,
@@ -5334,7 +5336,7 @@ public:
     return RValue(SGF, ManagedValue::forUnmanaged(unowned), refType);
   }
 
-  Optional<AccessedStorage> getAccessedStorage() const override {
+  Optional<AccessStorage> getAccessStorage() const override {
     return None;
   }
 

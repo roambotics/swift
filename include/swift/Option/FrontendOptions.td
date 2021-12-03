@@ -68,6 +68,10 @@ def emit_abi_descriptor_path
   : Separate<["-"], "emit-abi-descriptor-path">, MetaVarName<"<path>">,
     HelpText<"Output the ABI descriptor of current module to <path>">;
 
+def emit_module_semantic_info_path
+  : Separate<["-"], "emit-module-semantic-info-path">, MetaVarName<"<path>">,
+    HelpText<"Output semantic info of current module to <path>">;
+
 def serialize_module_interface_dependency_hashes
   : Flag<["-"], "serialize-module-interface-dependency-hashes">,
     Flags<[HelpHidden]>;
@@ -138,6 +142,10 @@ def disable_testable_attr_requires_testable_module :
   Flag<["-"], "disable-testable-attr-requires-testable-module">,
   HelpText<"Disable checking of @testable">;
 
+def enable_clang_spi :
+  Flag<["-"], "enable-clang-spi">,
+  HelpText<"Import Clang SPIs as Swift SPIs">;
+
 def enable_target_os_checking :
   Flag<["-"], "enable-target-os-checking">,
   HelpText<"Enable checking the target OS of serialized modules">;
@@ -157,6 +165,10 @@ def print_clang_stats : Flag<["-"], "print-clang-stats">,
 
 def serialize_debugging_options : Flag<["-"], "serialize-debugging-options">,
   HelpText<"Always serialize options for debugging (default: only for apps)">;
+
+def serialized_path_obfuscate : Separate<["-"], "serialized-path-obfuscate">,
+    HelpText<"Remap source paths in debug info">, MetaVarName<"<prefix=replacement>">;
+
 def no_serialize_debugging_options :
   Flag<["-"], "no-serialize-debugging-options">,
   HelpText<"Never serialize options for debugging (default: only for apps)">;
@@ -173,9 +185,9 @@ def disable_typo_correction : Flag<["-"], "disable-typo-correction">,
 def disable_implicit_swift_modules: Flag<["-"], "disable-implicit-swift-modules">,
   HelpText<"Disable building Swift modules implicitly by the compiler">;
 
-def explict_swift_module_map
+def explicit_swift_module_map
   : Separate<["-"], "explicit-swift-module-map-file">, MetaVarName<"<path>">,
-    HelpText<"Specify a JSON file containing information of explict Swift modules">;
+    HelpText<"Specify a JSON file containing information of explicit Swift modules">;
 
 def placeholder_dependency_module_map
   : Separate<["-"], "placeholder-dependency-module-map-file">, MetaVarName<"<path>">,
@@ -186,7 +198,7 @@ def batch_scan_input_file
     HelpText<"Specify a JSON file containing modules to perform batch dependencies scanning">;
 
 def import_prescan : Flag<["-"], "import-prescan">,
-   HelpText<"When performing a dependency scan, only dentify all imports of the main Swift module sources">;
+   HelpText<"When performing a dependency scan, only identify all imports of the main Swift module sources">;
 
 def serialize_dependency_scan_cache : Flag<["-"], "serialize-dependency-scan-cache">,
    HelpText<"After performing a dependency scan, serialize the scanner's internal state.">;
@@ -247,9 +259,19 @@ def enable_experimental_concurrency :
   Flag<["-"], "enable-experimental-concurrency">,
   HelpText<"Enable experimental concurrency model">;
 
+def disable_lexical_lifetimes :
+  Flag<["-"], "disable-lexical-lifetimes">,
+  HelpText<"Disables early lexical lifetimes. Mutually exclusive with "
+           "-enable-experimental-lexical-lifetimes">;
+
 def enable_experimental_lexical_lifetimes :
   Flag<["-"], "enable-experimental-lexical-lifetimes">,
-  HelpText<"Enable experimental lexical lifetimes">;
+  HelpText<"Enable experimental lexical lifetimes. Mutually exclusive with "
+           "-disable-early-lexical-lifetimes">;
+
+def enable_experimental_move_only :
+  Flag<["-"], "enable-experimental-move-only">,
+  HelpText<"Enable experimental move only">;
 
 def enable_experimental_distributed :
   Flag<["-"], "enable-experimental-distributed">,
@@ -457,6 +479,10 @@ def disable_deserialization_recovery :
   Flag<["-"], "disable-deserialization-recovery">,
   HelpText<"Don't attempt to recover from missing xrefs (etc) in swiftmodules">;
 
+def enable_experimental_string_processing :
+  Flag<["-"], "enable-experimental-string-processing">,
+  HelpText<"Enable experimental string processing">;
+
 def disable_availability_checking : Flag<["-"],
   "disable-availability-checking">,
   HelpText<"Disable checking for potentially unavailable APIs">;
@@ -495,7 +521,21 @@ def enable_implicit_dynamic : Flag<["-"], "enable-implicit-dynamic">,
 
 def enable_llvm_vfe : Flag<["-"], "enable-llvm-vfe">,
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
-  HelpText<"Use LLVM Virtual Function Elimination on Swift class virtual tables">;
+  HelpText<"Use LLVM IR Virtual Function Elimination on Swift class virtual tables">;
+
+def enable_llvm_wme : Flag<["-"], "enable-llvm-wme">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Use LLVM IR Witness Method Elimination on Swift protocol witness tables">;
+
+def internalize_at_link : Flag<["-"], "internalize-at-link">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Allow internalizing public symbols and vtables at link time (assume"
+  " all client code of public types is part of the same link unit, or that"
+  " external symbols are explicitly requested via -exported_symbols_list)">;
+
+def conditional_runtime_records : Flag<["-"], "conditional-runtime-records">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Allow removal of runtime metadata records (public types, protocol conformances) based on whether they're used or unused">;
 
 def disable_previous_implementation_calls_in_dynamic_replacements :
   Flag<["-"], "disable-previous-implementation-calls-in-dynamic-replacements">,
@@ -535,6 +575,9 @@ def warn_long_expression_type_checking_EQ : Joined<["-"], "warn-long-expression-
 
 def Rmodule_interface_rebuild : Flag<["-"], "Rmodule-interface-rebuild">,
   HelpText<"Emits a remark if an imported module needs to be re-compiled from its module interface">;
+
+def downgrade_typecheck_interface_error : Flag<["-"], "downgrade-typecheck-interface-error">,
+  HelpText<"Downgrade error to warning when typechecking emitted module interfaces">;
 
 def enable_volatile_modules : Flag<["-"], "enable-volatile-modules">,
   HelpText<"Load Swift modules in memory">;
@@ -600,6 +643,10 @@ def disable_debugger_shadow_copies : Flag<["-"], "disable-debugger-shadow-copies
 
 def disable_concrete_type_metadata_mangled_name_accessors : Flag<["-"], "disable-concrete-type-metadata-mangled-name-accessors">,
   HelpText<"Disable concrete type metadata access by mangled name">,
+  Flags<[FrontendOption, HelpHidden]>;
+
+def disable_standard_substitutions_in_reflection_mangling : Flag<["-"], "disable-standard-substitutions-in-reflection-mangling">,
+  HelpText<"Disable referencing stdlib symbols via mangled names in reflection mangling">,
   Flags<[FrontendOption, HelpHidden]>;
   
 def playground : Flag<["-"], "playground">,
@@ -749,6 +796,10 @@ def experimental_one_way_closure_params :
   Flag<["-"], "experimental-one-way-closure-params">,
   HelpText<"Enable experimental support for one-way closure parameters">;
 
+def experimental_multi_statement_closures :
+  Flag<["-"], "experimental-multi-statement-closures">,
+  HelpText<"Enable experimental support for type inference in multi-statement closures">;
+
 def prebuilt_module_cache_path :
   Separate<["-"], "prebuilt-module-cache-path">,
   HelpText<"Directory of prebuilt modules for loading module interfaces">;
@@ -786,7 +837,7 @@ def enable_verify_exclusivity : Flag<["-"], "enable-verify-exclusivity">,
   HelpText<"Enable verification of access markers used to enforce exclusivity.">;
 
 def disable_verify_exclusivity : Flag<["-"], "disable-verify-exclusivity">,
-  HelpText<"Diable verification of access markers used to enforce exclusivity.">;
+  HelpText<"Disable verification of access markers used to enforce exclusivity.">;
 
 def disable_legacy_type_info : Flag<["-"], "disable-legacy-type-info">,
   HelpText<"Completely disable legacy type layout">;
@@ -819,6 +870,9 @@ def enable_type_layouts : Flag<["-"], "enable-type-layout">,
 
 def disable_type_layouts : Flag<["-"], "disable-type-layout">,
   HelpText<"Disable type layout based lowering">;
+
+def force_struct_type_layouts : Flag<["-"], "force-struct-type-layouts">,
+  HelpText<"Force type layout based lowering for structs">;
 
 def disable_interface_lockfile : Flag<["-"], "disable-interface-lock">,
   HelpText<"Don't lock interface file when building module">;

@@ -42,13 +42,6 @@
 // Avoid defining macro max(), min() which conflict with std::max(), std::min()
 #define NOMINMAX
 #include <windows.h>
-#else
-#include <sys/mman.h>
-#include <unistd.h>
-// WASI doesn't support dynamic linking yet.
-#if !defined(__wasi__)
-#include <dlfcn.h>
-#endif // !defined(__wasi__)
 #endif
 #if SWIFT_PTRAUTH
 #include <ptrauth.h>
@@ -64,10 +57,6 @@ extern "C" void _objc_setClassCopyFixupHandler(void (* _Nonnull newFixupHandler)
 #include "ExistentialMetadataImpl.h"
 #include "swift/Runtime/Debug.h"
 #include "Private.h"
-
-#if defined(__APPLE__)
-#include <mach/vm_page_size.h>
-#endif
 
 #if SWIFT_OBJC_INTEROP
 #include "ObjCRuntimeGetImageNameFromClass.h"
@@ -2548,7 +2537,11 @@ static char *copyGenericClassObjCName(ClassMetadata *theClass) {
   auto globalNode = Dem.createNode(Demangle::Node::Kind::Global);
   globalNode->addChild(typeNode, Dem);
 
-  llvm::StringRef string = Demangle::mangleNodeOld(globalNode, Dem);
+  auto mangling = Demangle::mangleNodeOld(globalNode, Dem);
+  if (!mangling.isSuccess()) {
+    return nullptr;
+  }
+  llvm::StringRef string = mangling.result();
 
   // If the class is in the Swift module, add a $ to the end of the ObjC
   // name. The old and new Swift libraries must be able to coexist in
@@ -5747,7 +5740,7 @@ diagnoseMetadataDependencyCycle(const Metadata *start,
                             &details);
   }
 
-  fatalError(0, diagnostic.c_str());
+  fatalError(0, "%s", diagnostic.c_str());
 }
 
 /// Check whether the given metadata dependency is satisfied, and if not,
@@ -5817,6 +5810,8 @@ void swift::checkMetadataDependencyCycle(const Metadata *startMetadata,
 /***************************************************************************/
 /*** Allocator implementation **********************************************/
 /***************************************************************************/
+
+#if !SWIFT_STDLIB_PASSTHROUGH_METADATA_ALLOCATOR
 
 namespace {
   struct alignas(sizeof(uintptr_t) * 2) PoolRange {
@@ -5947,9 +5942,9 @@ void *MetadataAllocator::Allocate(size_t size, size_t alignment) {
   static OnceToken_t getenvToken;
   SWIFT_ONCE_F(getenvToken, checkAllocatorDebugEnvironmentVariables, nullptr);
 
-  // If the size is larger than the maximum, just use malloc.
+  // If the size is larger than the maximum, just do a normal heap allocation.
   if (size > PoolRange::MaxPoolAllocationSize) {
-    void *allocation = malloc(size);
+    void *allocation = swift_slowAlloc(size, alignment - 1);
     memsetScribble(allocation, size);
     return allocation;
   }
@@ -5987,6 +5982,21 @@ void *MetadataAllocator::Allocate(size_t size, size_t alignment) {
       newState = PoolRange{allocation + sizeWithHeader,
                            poolSize - sizeWithHeader};
       __asan_poison_memory_region(allocation, newState.Remaining);
+    }
+
+    // NULL should be impossible, but check anyway in case of bugs or corruption
+    if (SWIFT_UNLIKELY(!allocation)) {
+      PoolRange curStateReRead = AllocationPool.load(std::memory_order_relaxed);
+      swift::fatalError(
+          0,
+          "Metadata allocator corruption: allocation is NULL. "
+          "curState: {%p, %zu} - curStateReRead: {%p, %zu} - "
+          "newState: {%p, %zu} - allocatedNewPage: %s - requested size: %zu - "
+          "sizeWithHeader: %zu - alignment: %zu - Tag: %d\n",
+          curState.Begin, curState.Remaining, curStateReRead.Begin,
+          curStateReRead.Remaining, newState.Begin, newState.Remaining,
+          allocatedNewPage ? "true" : "false", size, sizeWithHeader, alignment,
+          Tag);
     }
 
     // Swap in the new state.
@@ -6029,7 +6039,7 @@ void MetadataAllocator::Deallocate(const void *allocation, size_t size,
   __asan_poison_memory_region(allocation, size);
 
   if (size > PoolRange::MaxPoolAllocationSize) {
-    free(const_cast<void*>(allocation));
+    swift_slowDealloc(const_cast<void *>(allocation), size, Alignment - 1);
     return;
   }
 
@@ -6054,6 +6064,8 @@ void MetadataAllocator::Deallocate(const void *allocation, size_t size,
                                                  std::memory_order_relaxed,
                                                  std::memory_order_relaxed);
 }
+
+#endif
 
 void *swift::allocateMetadata(size_t size, size_t alignment) {
   return MetadataAllocator(MetadataTag).Allocate(size, alignment);
@@ -6085,26 +6097,33 @@ void swift::verifyMangledNameRoundtrip(const Metadata *metadata) {
   // us stress test the mangler/demangler and type lookup machinery.
   if (!swift::runtime::environment::SWIFT_ENABLE_MANGLED_NAME_VERIFICATION())
     return;
-  
+
   Demangle::StackAllocatedDemangler<1024> Dem;
   auto node = _swift_buildDemanglingForMetadata(metadata, Dem);
   // If the mangled node involves types in an AnonymousContext, then by design,
   // it cannot be looked up by name.
   if (referencesAnonymousContext(node))
     return;
-  
-  auto mangledName = Demangle::mangleNode(node);
-  auto result =
-    swift_getTypeByMangledName(MetadataState::Abstract,
-                          mangledName,
-                          nullptr,
-                          [](unsigned, unsigned){ return nullptr; },
-                          [](const Metadata *, unsigned) { return nullptr; })
-      .getType().getMetadata();
-  if (metadata != result)
+
+  auto mangling = Demangle::mangleNode(node);
+  if (!mangling.isSuccess()) {
     swift::warning(RuntimeErrorFlagNone,
-                   "Metadata mangled name failed to roundtrip: %p -> %s -> %p\n",
-                   metadata, mangledName.c_str(), (const Metadata *)result);
+                   "Metadata mangled name failed to roundtrip: %p couldn't be mangled\n",
+                   metadata);
+  } else {
+    std::string mangledName = mangling.result();
+    auto result =
+      swift_getTypeByMangledName(MetadataState::Abstract,
+                                 mangledName,
+                                 nullptr,
+                                 [](unsigned, unsigned){ return nullptr; },
+                                 [](const Metadata *, unsigned) { return nullptr; })
+      .getType().getMetadata();
+    if (metadata != result)
+      swift::warning(RuntimeErrorFlagNone,
+                     "Metadata mangled name failed to roundtrip: %p -> %s -> %p\n",
+                     metadata, mangledName.c_str(), (const Metadata *)result);
+  }
 }
 #endif
 

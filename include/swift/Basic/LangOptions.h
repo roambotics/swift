@@ -31,6 +31,7 @@
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/VersionTuple.h"
 #include "llvm/Support/raw_ostream.h"
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -143,8 +144,14 @@ namespace swift {
     /// PackageDescription version to compile for.
     version::Version PackageDescriptionVersion;
 
+    /// Enable experimental string processing
+    bool EnableExperimentalStringProcessing = false;
+
     /// Disable API availability checking.
     bool DisableAvailabilityChecking = false;
+
+    /// Only check the availability of the API, ignore function bodies.
+    bool CheckAPIAvailabilityOnly = false;
 
     /// Should conformance availability violations be diagnosed as errors?
     bool EnableConformanceAvailabilityErrors = false;
@@ -174,6 +181,9 @@ namespace swift {
 
     // Availability macros definitions to be expanded at parsing.
     SmallVector<std::string, 4> AvailabilityMacros;
+
+    /// Require public declarations to declare that they are Sendable (or not).
+    bool RequireExplicitSendable = false;
 
     /// If false, '#file' evaluates to the full path rather than a
     /// human-readable string.
@@ -229,14 +239,6 @@ namespace swift {
 
     /// Keep comments during lexing and attach them to declarations.
     bool AttachCommentsToDecls = false;
-
-    /// Whether to include initializers when code-completing a postfix
-    /// expression.
-    bool CodeCompleteInitsInPostfixExpr = false;
-
-    /// Whether to use heuristics to decide whether to show call-pattern
-    /// completions.
-    bool CodeCompleteCallPatternHeuristics = false;
 
     ///
     /// Flags for use by tests
@@ -304,16 +306,9 @@ namespace swift {
     /// Enable experimental concurrency model.
     bool EnableExperimentalConcurrency = false;
 
-    /// Enable experimental support for emitting defined borrow scopes.
-    bool EnableExperimentalLexicalLifetimes = false;
-
     /// Enable experimental support for named opaque result types, e.g.
     /// `func f() -> <T> T`.
     bool EnableExperimentalNamedOpaqueTypes = false;
-
-    /// Enable experimental support for structural opaque result types, e.g.
-    /// `func f() -> (some P)?`.
-    bool EnableExperimentalStructuralOpaqueTypes = false;
 
     /// Enable experimental flow-sensitive concurrent captures.
     bool EnableExperimentalFlowSensitiveConcurrentCaptures = false;
@@ -323,6 +318,9 @@ namespace swift {
 
     /// Enable experimental 'distributed' actors and functions.
     bool EnableExperimentalDistributed = false;
+
+    /// Enable experimental 'move only' features.
+    bool EnableExperimentalMoveOnly = false;
 
     /// Disable the implicit import of the _Concurrency module.
     bool DisableImplicitConcurrencyModuleImport =
@@ -437,6 +435,11 @@ namespace swift {
     /// Load swiftmodule files in memory as volatile and avoid mmap.
     bool EnableVolatileModules = false;
 
+    /// Enable experimental 'hermetic seal at link' feature. Turns on
+    /// dead-stripping optimizations assuming that all users of library code
+    /// are present at LTO time.
+    bool HermeticSealAtLink = false;
+
     /// Allow deserializing implementation only dependencies. This should only
     /// be set true by lldb and other tooling, so that deserilization
     /// recovery issues won't bring down the debugger.
@@ -463,7 +466,7 @@ namespace swift {
 
     /// Whether the new experimental generics implementation is enabled.
     RequirementMachineMode EnableRequirementMachine =
-        RequirementMachineMode::Disabled;
+        RequirementMachineMode::Enabled;
 
     /// Enables dumping rewrite systems from the requirement machine.
     bool DumpRequirementMachine = false;
@@ -474,13 +477,28 @@ namespace swift {
     /// Enables fine-grained debug output from the requirement machine.
     std::string DebugRequirementMachine;
 
-    /// Maximum iteration count for requirement machine confluent completion
+    /// Maximum iteration count for requirement machine Knuth-Bendix completion
     /// algorithm.
-    unsigned RequirementMachineStepLimit = 2000;
+    unsigned RequirementMachineStepLimit = 4000;
 
-    /// Maximum term length for requirement machine confluent completion
+    /// Maximum term length for requirement machine Knuth-Bendix completion
     /// algorithm.
     unsigned RequirementMachineDepthLimit = 10;
+
+    /// Enable the new experimental protocol requirement signature minimization
+    /// algorithm.
+    RequirementMachineMode RequirementMachineProtocolSignatures =
+        RequirementMachineMode::Disabled;
+
+    /// Enable the new experimental generic signature minimization algorithm
+    /// for abstract generic signatures.
+    RequirementMachineMode RequirementMachineAbstractSignatures =
+        RequirementMachineMode::Disabled;
+
+    /// Enable the new experimental generic signature minimization algorithm
+    /// for user-written generic signatures.
+    RequirementMachineMode RequirementMachineInferredSignatures =
+        RequirementMachineMode::Disabled;
 
     /// Sets the target we are building for and updates platform conditions
     /// to match.
@@ -595,6 +613,12 @@ namespace swift {
     /// than this many seconds.
     unsigned ExpressionTimeoutThreshold = 600;
 
+    /// If the shared pointer is not a \c nullptr and the pointee is \c true,
+    /// typechecking should be aborted at the next possible opportunity.
+    /// This is used by SourceKit to cancel requests for which the result is no
+    /// longer of interest.
+    std::shared_ptr<std::atomic<bool>> CancellationFlag = nullptr;
+
     /// If non-zero, abort the switch statement exhaustiveness checker if
     /// the Space::minus function is called more than this many times.
     ///
@@ -663,6 +687,10 @@ namespace swift {
     /// parameters of closures.
     bool EnableOneWayClosureParameters = false;
 
+    /// Enable experimental support for type inference through multi-statement
+    /// closures.
+    bool EnableMultiStatementClosureInference = false;
+
     /// See \ref FrontendOptions.PrintFullConvention
     bool PrintFullConvention = false;
   };
@@ -670,6 +698,10 @@ namespace swift {
   /// Options for controlling the behavior of the Clang importer.
   class ClangImporterOptions final {
   public:
+    /// The path to the Clang compiler executable.
+    /// Used to detect the default include paths.
+    std::string clangPath = "clang";
+
     /// The module cache path which the Clang importer should use.
     std::string ModuleCachePath;
 
@@ -736,6 +768,9 @@ namespace swift {
     /// When set, don't look for or load overlays.
     bool DisableOverlayModules = false;
 
+    /// When set, import SPI_AVAILABLE symbols with Swift SPI attribtues.
+    bool EnableClangSPI = false;
+
     /// When set, don't enforce warnings with -Werror.
     bool DebuggerSupport = false;
 
@@ -763,8 +798,12 @@ namespace swift {
                           DetailedPreprocessingRecord,
                           ImportForwardDeclarations,
                           DisableSwiftBridgeAttr,
-                          DisableOverlayModules);
+                          DisableOverlayModules,
+                          EnableClangSPI);
     }
+
+    std::vector<std::string> getRemappedExtraArgs(
+        std::function<std::string(StringRef)> pathRemapCallback) const;
   };
 
 } // end namespace swift

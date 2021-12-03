@@ -42,7 +42,8 @@ using namespace swift;
 
 Witness::Witness(ValueDecl *decl, SubstitutionMap substitutions,
                  GenericEnvironment *syntheticEnv,
-                 SubstitutionMap reqToSynthesizedEnvSubs) {
+                 SubstitutionMap reqToSynthesizedEnvSubs,
+                 GenericSignature derivativeGenSig) {
   if (!syntheticEnv && substitutions.empty() &&
       reqToSynthesizedEnvSubs.empty()) {
     storage = decl;
@@ -53,7 +54,8 @@ Witness::Witness(ValueDecl *decl, SubstitutionMap substitutions,
   auto declRef = ConcreteDeclRef(decl, substitutions);
   auto storedMem = ctx.Allocate(sizeof(StoredWitness), alignof(StoredWitness));
   auto stored = new (storedMem) StoredWitness{declRef, syntheticEnv,
-                                              reqToSynthesizedEnvSubs};
+                                              reqToSynthesizedEnvSubs,
+                                              derivativeGenSig};
 
   storage = stored;
 }
@@ -543,7 +545,7 @@ ConditionalRequirementsRequest::evaluate(Evaluator &evaluator,
 
   // Find the requirements in the extension that aren't proved by the original
   // type, these are the ones that make the conformance conditional.
-  const auto unsatReqs = extensionSig->requirementsNotSatisfiedBy(typeSig);
+  const auto unsatReqs = extensionSig.requirementsNotSatisfiedBy(typeSig);
   if (unsatReqs.empty())
     return {};
 
@@ -892,7 +894,8 @@ NormalProtocolConformance::getWitnessUncached(ValueDecl *requirement) const {
 }
 
 Witness SelfProtocolConformance::getWitness(ValueDecl *requirement) const {
-  return Witness(requirement, SubstitutionMap(), nullptr, SubstitutionMap());
+  return Witness(requirement, SubstitutionMap(), nullptr, SubstitutionMap(),
+                 GenericSignature());
 }
 
 ConcreteDeclRef

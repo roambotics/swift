@@ -1779,6 +1779,22 @@ void TypeChecker::diagnosePotentialAccessorUnavailability(
   fixAvailability(ReferenceRange, ReferenceDC, RequiredRange, Context);
 }
 
+static DiagnosticBehavior
+behaviorLimitForExplicitUnavailability(
+    const RootProtocolConformance *rootConf,
+    const DeclContext *fromDC) {
+  auto protoDecl = rootConf->getProtocol();
+
+  // Soften errors about unavailable `Sendable` conformances depending on the
+  // concurrency checking mode
+  if (protoDecl->isSpecificProtocol(KnownProtocolKind::Sendable) ||
+      protoDecl->isSpecificProtocol(KnownProtocolKind::UnsafeSendable)) {
+    return SendableCheckContext(fromDC).defaultDiagnosticBehavior();
+  }
+
+  return DiagnosticBehavior::Unspecified;
+}
+
 void TypeChecker::diagnosePotentialUnavailability(
     const RootProtocolConformance *rootConf,
     const ExtensionDecl *ext,
@@ -1795,11 +1811,13 @@ void TypeChecker::diagnosePotentialUnavailability(
     auto diagID = (ctx.LangOpts.EnableConformanceAvailabilityErrors
                    ? diag::conformance_availability_only_version_newer
                    : diag::conformance_availability_only_version_newer_warn);
+    auto behavior = behaviorLimitForExplicitUnavailability(rootConf, dc);
     auto err =
       ctx.Diags.diagnose(
                loc, diagID,
                type, proto, prettyPlatformString(targetPlatform(ctx.LangOpts)),
                reason.getRequiredOSVersionRange().getLowerEndpoint());
+    err.limitBehavior(behavior);
 
     // Direct a fixit to the error if an existing guard is nearly-correct
     if (fixAvailabilityByNarrowingNearbyVersionCheck(loc, dc,
@@ -2446,6 +2464,7 @@ bool swift::diagnoseExplicitUnavailability(SourceLoc loc,
   auto proto = rootConf->getProtocol()->getDeclaredInterfaceType();
 
   StringRef platform;
+  auto behavior = DiagnosticBehavior::Unspecified;
   switch (attr->getPlatformAgnosticAvailability()) {
   case PlatformAgnosticAvailabilityKind::Deprecated:
     llvm_unreachable("shouldn't see deprecations in explicit unavailability");
@@ -2457,6 +2476,11 @@ bool swift::diagnoseExplicitUnavailability(SourceLoc loc,
       platform = attr->prettyPlatformString();
       break;
     }
+
+    // Downgrade unavailable Sendable conformance diagnostics where
+    // appropriate.
+    behavior = behaviorLimitForExplicitUnavailability(
+        rootConf, where.getDeclContext());
     LLVM_FALLTHROUGH;
 
   case PlatformAgnosticAvailabilityKind::SwiftVersionSpecific:
@@ -2474,7 +2498,8 @@ bool swift::diagnoseExplicitUnavailability(SourceLoc loc,
   EncodedDiagnosticMessage EncodedMessage(attr->Message);
   diags.diagnose(loc, diag::conformance_availability_unavailable,
                  type, proto,
-                 platform.empty(), platform, EncodedMessage.Message);
+                 platform.empty(), platform, EncodedMessage.Message)
+      .limitBehavior(behavior);
 
   switch (attr->getVersionAvailability(ctx)) {
   case AvailableVersionComparison::Available:
@@ -3495,9 +3520,9 @@ void swift::diagnoseTypeAvailability(const TypeRepr *TR, Type T, SourceLoc loc,
 }
 
 static void diagnoseMissingConformance(
-    SourceLoc loc, Type type, ProtocolDecl *proto, ModuleDecl *module) {
+    SourceLoc loc, Type type, ProtocolDecl *proto, const DeclContext *fromDC) {
   assert(proto->isSpecificProtocol(KnownProtocolKind::Sendable));
-  diagnoseMissingSendableConformance(loc, type, module);
+  diagnoseMissingSendableConformance(loc, type, fromDC);
 }
 
 bool
@@ -3515,15 +3540,13 @@ swift::diagnoseConformanceAvailability(SourceLoc loc,
 
   // Diagnose "missing" conformances where we needed a conformance but
   // didn't have one.
+  auto *DC = where.getDeclContext();
   if (auto builtinConformance = dyn_cast<BuiltinProtocolConformance>(rootConf)){
     if (builtinConformance->isMissing()) {
       diagnoseMissingConformance(loc, builtinConformance->getType(),
-                                 builtinConformance->getProtocol(),
-                                 where.getDeclContext()->getParentModule());
+                                 builtinConformance->getProtocol(), DC);
     }
   }
-
-  auto *DC = where.getDeclContext();
 
   auto maybeEmitAssociatedTypeNote = [&]() {
     if (!depTy && !replacementTy)

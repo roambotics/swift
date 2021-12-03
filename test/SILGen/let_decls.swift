@@ -68,10 +68,10 @@ func test3() {
   // CHECK-NEXT: [[STR:%[0-9]+]] = apply [[GETFN]]()
   let o = getAString()
 
+  // CHECK-NEXT: [[STR_BORROW:%.*]] = begin_borrow [lexical] [[STR]]
   // CHECK-NEXT: debug_value
   // CHECK-NOT: destroy_value
 
-  // CHECK-NEXT: [[STR_BORROW:%.*]] = begin_borrow [[STR]]
   // CHECK: [[USEFN:%[0-9]+]] = function_ref{{.*}}useAString
   // CHECK-NEXT: [[USE:%[0-9]+]] = apply [[USEFN]]([[STR_BORROW]])
   useAString(o)
@@ -398,7 +398,6 @@ struct StructMemberTest {
   // CHECK:  debug_value [[ARG]] : $StructMemberTest, let, name "self"
   // CHECK:  [[TRIVIAL_VALUE:%.*]] = struct_extract [[ARG]] : $StructMemberTest, #StructMemberTest.i
   // CHECK-NOT:  destroy_value [[ARG]] : $StructMemberTest
-  // CHECK-NOT:  destroy_value [[BORROWED_ARG]] : $StructMemberTest
   // CHECK:  return [[TRIVIAL_VALUE]] : $Int
 
   // Accessing the int member in s should not copy_value the whole struct.
@@ -454,7 +453,6 @@ struct GenericStruct<T> {
   // CHECK-NEXT: debug_value [[SELF_ADDR]] : $*GenericStruct<T>, let, name "self", {{.*}} expr op_deref
   // CHECK-NEXT: [[PROJ_ADDR:%.*]] = struct_element_addr [[SELF_ADDR]] : $*GenericStruct<T>, #GenericStruct.b
   // CHECK-NEXT: [[PROJ_VAL:%.*]] = load [trivial] [[PROJ_ADDR]] : $*Int
-  // CHECK-NOT: destroy_addr [[SELF]] : $*GenericStruct<T>
   // CHECK-NEXT: return [[PROJ_VAL]] : $Int
 }
 

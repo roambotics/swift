@@ -307,7 +307,6 @@ class BuildScriptInvocation(object):
                 "--android-arch", args.android_arch,
                 "--android-ndk", args.android_ndk,
                 "--android-api-level", args.android_api_level,
-                "--android-ndk-gcc-version", args.android_ndk_gcc_version,
                 "--android-icu-uc", args.android_icu_uc,
                 "--android-icu-uc-include", args.android_icu_uc_include,
                 "--android-icu-i18n", args.android_icu_i18n,
@@ -395,6 +394,11 @@ class BuildScriptInvocation(object):
                     min(args.swift_tools_max_parallel_lto_link_jobs,
                         args.build_jobs)
                 ]
+
+        if args.libswift_mode is not None:
+            impl_args += [
+                "--libswift=%s" % args.libswift_mode,
+            ]
 
         impl_args += args.build_script_impl_args
 
@@ -600,6 +604,10 @@ class BuildScriptInvocation(object):
                             is_enabled=self.args.build_swift_inspect)
         builder.add_product(products.TSanLibDispatch,
                             is_enabled=self.args.tsan_libdispatch_test)
+        builder.add_product(products.SwiftDocC,
+                            is_enabled=self.args.build_swiftdocc)
+        builder.add_product(products.SwiftDocCRender,
+                            is_enabled=self.args.install_swiftdocc)                  
 
         # Keep SwiftDriver at last.
         # swift-driver's integration with the build scripts is not fully
