@@ -1893,6 +1893,7 @@ static bool isScratchBuffer(SILValue value) {
 
 bool swift::memInstMustInitialize(Operand *memOper) {
   SILValue address = memOper->get();
+
   SILInstruction *memInst = memOper->getUser();
 
   switch (memInst->getKind()) {
@@ -1903,11 +1904,20 @@ bool swift::memInstMustInitialize(Operand *memOper) {
     auto *CAI = cast<CopyAddrInst>(memInst);
     return CAI->getDest() == address && CAI->isInitializationOfDest();
   }
+  case SILInstructionKind::MarkUnresolvedMoveAddrInst: {
+    return cast<MarkUnresolvedMoveAddrInst>(memInst)->getDest() == address;
+  }
   case SILInstructionKind::InitExistentialAddrInst:
   case SILInstructionKind::InitEnumDataAddrInst:
   case SILInstructionKind::InjectEnumAddrInst:
     return true;
 
+  case SILInstructionKind::BeginApplyInst:
+  case SILInstructionKind::TryApplyInst:
+  case SILInstructionKind::ApplyInst: {
+    FullApplySite applySite(memInst);
+    return applySite.isIndirectResultOperand(*memOper);
+  }
   case SILInstructionKind::StoreInst:
     return cast<StoreInst>(memInst)->getOwnershipQualifier()
            == StoreOwnershipQualifier::Init;
@@ -2337,6 +2347,11 @@ void swift::visitAccessedAddress(SILInstruction *I,
   case SILInstructionKind::CopyAddrInst:
     visitor(&I->getAllOperands()[CopyAddrInst::Src]);
     visitor(&I->getAllOperands()[CopyAddrInst::Dest]);
+    return;
+
+  case SILInstructionKind::MarkUnresolvedMoveAddrInst:
+    visitor(&I->getAllOperands()[MarkUnresolvedMoveAddrInst::Src]);
+    visitor(&I->getAllOperands()[MarkUnresolvedMoveAddrInst::Dest]);
     return;
 
 #define NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \

@@ -1,7 +1,7 @@
 // RUN: %target-typecheck-verify-swift  -disable-availability-checking -warn-concurrency
 // REQUIRES: concurrency
 
-class NotConcurrent { } // expected-note 21{{class 'NotConcurrent' does not conform to the 'Sendable' protocol}}
+class NotConcurrent { } // expected-note 26{{class 'NotConcurrent' does not conform to the 'Sendable' protocol}}
 
 // ----------------------------------------------------------------------
 // Sendable restriction on actor operations
@@ -131,8 +131,9 @@ func testConcurrency() {
     print(y) // okay
   }
   acceptConcurrent {
-    print(x) // expected-warning{{cannot use let 'x' with a non-sendable type 'NotConcurrent' from concurrently-executed code}}
-    print(y) // expected-error{{reference to captured var 'y' in concurrently-executing code}}
+    print(x) // expected-warning{{capture of 'x' with non-sendable type 'NotConcurrent' in a `@Sendable` closure}}
+    print(y) // expected-warning{{capture of 'y' with non-sendable type 'NotConcurrent' in a `@Sendable` closure}}
+    // expected-error@-1{{reference to captured var 'y' in concurrently-executing code}}
   }
 }
 
@@ -157,7 +158,7 @@ func testUnsafeSendableInAsync() async {
 // ----------------------------------------------------------------------
 // Sendable restriction on key paths.
 // ----------------------------------------------------------------------
-class NC: Hashable { // expected-note 3{{class 'NC' does not conform to the 'Sendable' protocol}}
+class NC: Hashable { // expected-note 2{{class 'NC' does not conform to the 'Sendable' protocol}}
   func hash(into: inout Hasher) { }
   static func==(_: NC, _: NC) -> Bool { true }
 }
@@ -174,9 +175,12 @@ func testKeyPaths(dict: [NC: Int], nc: NC) {
 // Sendable restriction on nonisolated declarations.
 // ----------------------------------------------------------------------
 actor ANI {
-  // FIXME: improve diagnostics to talk about nonisolated
-  nonisolated let nc = NC() // expected-warning{{cannot use property 'nc' with a non-sendable type 'NC' across actors}}
-  nonisolated func f() -> NC? { nil } // expected-warning{{cannot call function returning non-sendable type 'NC?' across actors}}
+  nonisolated let nc = NC()
+  nonisolated func f() -> NC? { nil }
+}
+
+func testANI(ani: ANI) async {
+  _ = ani.nc // expected-warning{{cannot use property 'nc' with a non-sendable type 'NC' across actors}}
 }
 
 // ----------------------------------------------------------------------
@@ -223,7 +227,7 @@ func acceptConcurrentUnary<T>(_: @Sendable (T) -> T) { }
 func concurrentClosures<T>(_: T) {
   acceptConcurrentUnary { (x: T) in
     _ = x // ok
-    acceptConcurrentUnary { _ in x } // expected-warning{{cannot use parameter 'x' with a non-sendable type 'T' from concurrently-executed code}}
+    acceptConcurrentUnary { _ in x } // expected-warning{{capture of 'x' with non-sendable type 'T' in a `@Sendable` closure}}
   }
 }
 
@@ -283,6 +287,28 @@ final class C7<T>: Sendable { }
 
 class C9: Sendable { } // expected-warning{{non-final class 'C9' cannot conform to 'Sendable'; use '@unchecked Sendable'}}
 
+extension NotConcurrent {
+  func f() { }
+
+  func test() {
+    Task {
+      f() // expected-warning{{capture of 'self' with non-sendable type 'NotConcurrent' in a `@Sendable` closure}}
+    }
+
+    Task {
+      self.f()  // expected-warning{{capture of 'self' with non-sendable type 'NotConcurrent' in a `@Sendable` closure}}
+    }
+
+    Task { [self] in
+      f()  // expected-warning{{capture of 'self' with non-sendable type 'NotConcurrent' in a `@Sendable` closure}}
+    }
+
+    Task { [self] in
+      self.f()  // expected-warning{{capture of 'self' with non-sendable type 'NotConcurrent' in a `@Sendable` closure}}
+    }
+  }
+}
+
 // ----------------------------------------------------------------------
 // @unchecked Sendable disabling checking
 // ----------------------------------------------------------------------
@@ -324,7 +350,7 @@ enum E12<T>: UnsafeSendable { // expected-warning{{'UnsafeSendable' is deprecate
 func testSendableOptionalInference(nc: NotConcurrent) {
   var fn: (@Sendable () -> Void)? = nil
   fn = {
-    print(nc) // expected-warning{{cannot use parameter 'nc' with a non-sendable type 'NotConcurrent' from concurrently-executed code}}
+    print(nc) // expected-warning{{capture of 'nc' with non-sendable type 'NotConcurrent' in a `@Sendable` closure}}
   }
   _ = fn
 }

@@ -428,9 +428,19 @@ ActorIsolationRestriction ActorIsolationRestriction::forDeclaration(
       // nonisolated, they need cross-actor restrictions (e.g., for Sendable).
       if (auto *ctor = dyn_cast<ConstructorDecl>(decl))
         if (!ctor->isConvenienceInit())
-          if (auto *parent = dyn_cast<ClassDecl>(ctor->getParent()))
-              if (parent->isAnyActor())
-                return forActorSelf(parent, /*isCrossActor=*/true);
+          if (auto *parent = ctor->getParent()->getSelfClassDecl())
+            if (parent->isAnyActor())
+              return forActorSelf(parent, /*isCrossActor=*/true);
+
+      // `nonisolated let` members are cross-actor as well.
+      if (auto var = dyn_cast<VarDecl>(decl)) {
+        if (var->isInstanceMember() && var->isLet()) {
+          if (auto parent = var->getDeclContext()->getSelfClassDecl()) {
+            if (parent->isActor() && !parent->isDistributedActor())
+              return forActorSelf(parent, /*isCrossActor=*/true);
+          }
+        }
+      }
 
       return forUnrestricted();
 
@@ -605,7 +615,7 @@ static bool shouldDiagnoseExistingDataRaces(const DeclContext *dc) {
   if (dc->getParentModule()->isConcurrencyChecked())
     return true;
 
-  return contextUsesConcurrencyFeatures(dc);
+  return contextRequiresStrictConcurrencyChecking(dc);
 }
 
 /// Determine the default diagnostic behavior for this language mode.
@@ -642,6 +652,26 @@ DiagnosticBehavior SendableCheckContext::defaultDiagnosticBehavior() const {
   return defaultSendableDiagnosticBehavior(fromDC->getASTContext().LangOpts);
 }
 
+/// Determine whether the given nominal type that is within the current module
+/// has an explicit Sendable.
+static bool hasExplicitSendableConformance(NominalTypeDecl *nominal) {
+  ASTContext &ctx = nominal->getASTContext();
+
+  // Look for any conformance to `Sendable`.
+  auto proto = ctx.getProtocol(KnownProtocolKind::Sendable);
+  if (!proto)
+    return false;
+
+  // Look for a conformance. If it's present and not (directly) missing,
+  // we're done.
+  auto conformance = nominal->getParentModule()->lookupConformance(
+      nominal->getDeclaredInterfaceType(), proto, /*allowMissing=*/true);
+  return conformance &&
+      !(isa<BuiltinProtocolConformance>(conformance.getConcrete()) &&
+        cast<BuiltinProtocolConformance>(
+          conformance.getConcrete())->isMissing());
+}
+
 /// Determine the diagnostic behavior for a Sendable reference to the given
 /// nominal type.
 DiagnosticBehavior SendableCheckContext::diagnosticBehavior(
@@ -649,7 +679,8 @@ DiagnosticBehavior SendableCheckContext::diagnosticBehavior(
   // Determine whether the type was explicitly non-Sendable.
   auto nominalModule = nominal->getParentModule();
   bool isExplicitlyNonSendable = nominalModule->isConcurrencyChecked() ||
-      isExplicitSendableConformance();
+      isExplicitSendableConformance() ||
+      hasExplicitSendableConformance(nominal);
 
   // Determine whether this nominal type is visible via a @_predatesConcurrency
   // import.
@@ -914,13 +945,8 @@ void swift::diagnoseMissingExplicitSendable(NominalTypeDecl *nominal) {
         /*treatUsableFromInlineAsPublic=*/true).isPublic())
     return;
 
-  // Look for any conformance to `Sendable`.
-  auto proto = ctx.getProtocol(KnownProtocolKind::Sendable);
-  if (!proto)
-    return;
-
-  SmallVector<ProtocolConformance *, 2> conformances;
-  if (nominal->lookupConformance(proto, conformances))
+  // If the conformance is explicitly stated, do nothing.
+  if (hasExplicitSendableConformance(nominal))
     return;
 
   // Diagnose it.
@@ -1233,6 +1259,29 @@ namespace {
       return false;
     }
 
+    /// Check closure captures for Sendable violations.
+    void checkClosureCaptures(AbstractClosureExpr *closure) {
+      if (!isSendableClosure(closure, /*forActorIsolation=*/false))
+        return;
+
+      SmallVector<CapturedValue, 2> captures;
+      closure->getCaptureInfo().getLocalCaptures(captures);
+      for (const auto &capture : captures) {
+        if (capture.isDynamicSelfMetadata())
+          continue;
+        if (capture.isOpaqueValue())
+          continue;
+
+        auto decl = capture.getDecl();
+        Type type = getDeclContext()
+            ->mapTypeIntoContext(decl->getInterfaceType())
+            ->getReferenceStorageReferent();
+        diagnoseNonSendableTypes(
+            type, getDeclContext(), capture.getLoc(),
+            diag::non_sendable_capture, decl->getName());
+      }
+    }
+
   public:
     ActorIsolationChecker(const DeclContext *dc) : ctx(dc->getASTContext()) {
       contextStack.push_back(dc);
@@ -1305,6 +1354,7 @@ namespace {
 
       if (auto *closure = dyn_cast<AbstractClosureExpr>(expr)) {
         closure->setActorIsolation(determineClosureIsolation(closure));
+        checkClosureCaptures(closure);
         contextStack.push_back(closure);
         return { true, expr };
       }
@@ -2223,9 +2273,7 @@ namespace {
         if (!var->supportsMutation() ||
             (ctx.LangOpts.EnableExperimentalFlowSensitiveConcurrentCaptures &&
              parent.dyn_cast<LoadExpr *>())) {
-          return diagnoseNonSendableTypesInReference(
-              valueRef, getDeclContext(), loc,
-              ConcurrentReferenceKind::LocalCapture);
+          return false;
         }
 
         // Otherwise, we have concurrent access. Complain.
@@ -3214,18 +3262,6 @@ ActorIsolation ActorIsolationRequest::evaluate(
   // If this declaration has one of the actor isolation attributes, report
   // that.
   if (isolationFromAttr) {
-    // Nonisolated declarations must involve Sendable types.
-    if (*isolationFromAttr == ActorIsolation::Independent) {
-      SubstitutionMap subs;
-      if (auto genericEnv = value->getInnermostDeclContext()
-              ->getGenericEnvironmentOfContext()) {
-        subs = genericEnv->getForwardingSubstitutionMap();
-      }
-      diagnoseNonSendableTypesInReference(
-          ConcreteDeclRef(value, subs), value->getDeclContext(),
-          value->getLoc(), ConcurrentReferenceKind::Nonisolated);
-    }
-
     // Classes with global actors have additional rules regarding inheritance.
     if (isolationFromAttr->isGlobalActor()) {
       if (auto classDecl = dyn_cast<ClassDecl>(value))
@@ -3518,7 +3554,13 @@ void swift::checkOverrideActorIsolation(ValueDecl *value) {
   if (isolation == overriddenIsolation)
     return;
 
-  // If both are actor-instance isolated, we're done.
+  // If the overriding declaration is non-isolated, it's okay.
+  if (isolation.isIndependent() || isolation.isUnspecified())
+    return;
+
+  // If both are actor-instance isolated, we're done. This wasn't caught by
+  // the equality case above because the nominal type describing the actor
+  // will differ when we're overriding.
   if (isolation.getKind() == overriddenIsolation.getKind() &&
       (isolation.getKind() == ActorIsolation::ActorInstance ||
        isolation.getKind() == ActorIsolation::DistributedActorInstance))
@@ -3529,56 +3571,6 @@ void swift::checkOverrideActorIsolation(ValueDecl *value) {
   if (overridden->hasClangNode() && !overriddenIsolation)
     return;
 
-  // If the overridden declaration uses an unsafe global actor, we can do
-  // anything except be actor-isolated or have a different global actor.
-  if (overriddenIsolation == ActorIsolation::GlobalActorUnsafe) {
-    switch (isolation) {
-    case ActorIsolation::Independent:
-    case ActorIsolation::Unspecified:
-      return;
-
-    case ActorIsolation::ActorInstance:
-    case ActorIsolation::DistributedActorInstance:
-      // Diagnose below.
-      break;
-
-    case ActorIsolation::GlobalActor:
-    case ActorIsolation::GlobalActorUnsafe:
-      // The global actors don't match; diagnose it.
-      if (overriddenIsolation.getGlobalActor()->isEqual(
-              isolation.getGlobalActor()))
-        return;
-
-      // Diagnose below.
-      break;
-    }
-  }
-
-  // If the overriding declaration uses an unsafe global actor, we can do
-  // anything that doesn't actively conflict with the overridden isolation.
-  if (isolation == ActorIsolation::GlobalActorUnsafe) {
-    switch (overriddenIsolation) {
-    case ActorIsolation::Unspecified:
-      return;
-
-    case ActorIsolation::ActorInstance:
-    case ActorIsolation::DistributedActorInstance:
-    case ActorIsolation::Independent:
-      // Diagnose below.
-      break;
-
-    case ActorIsolation::GlobalActor:
-    case ActorIsolation::GlobalActorUnsafe:
-      // The global actors don't match; diagnose it.
-      if (overriddenIsolation.getGlobalActor()->isEqual(
-              isolation.getGlobalActor()))
-        return;
-
-      // Diagnose below.
-      break;
-    }
-  }
-
   // Isolation mismatch. Diagnose it.
   value->diagnose(
       diag::actor_isolation_override_mismatch, isolation,
@@ -3586,7 +3578,11 @@ void swift::checkOverrideActorIsolation(ValueDecl *value) {
   overridden->diagnose(diag::overridden_here);
 }
 
-bool swift::contextUsesConcurrencyFeatures(const DeclContext *dc) {
+bool swift::contextRequiresStrictConcurrencyChecking(const DeclContext *dc) {
+  // If Swift >= 6, everything uses strict concurrency checking.
+  if (dc->getASTContext().LangOpts.isSwiftVersionAtLeast(6))
+    return true;
+
   while (!dc->isModuleScopeContext()) {
     if (auto closure = dyn_cast<AbstractClosureExpr>(dc)) {
       // A closure with an explicit global actor or nonindependent
@@ -4071,7 +4067,7 @@ Type swift::adjustVarTypeForConcurrency(
   if (!var->predatesConcurrency())
     return type;
 
-  if (contextUsesConcurrencyFeatures(dc))
+  if (contextRequiresStrictConcurrencyChecking(dc))
     return type;
 
   bool isLValue = false;
@@ -4193,7 +4189,7 @@ AnyFunctionType *swift::adjustFunctionTypeForConcurrency(
     unsigned numApplies, bool isMainDispatchQueue) {
   // Apply unsafe concurrency features to the given function type.
   fnType = applyUnsafeConcurrencyToFunctionType(
-      fnType, decl, contextUsesConcurrencyFeatures(dc), numApplies,
+      fnType, decl, contextRequiresStrictConcurrencyChecking(dc), numApplies,
       isMainDispatchQueue);
 
   Type globalActorType;
@@ -4208,7 +4204,7 @@ AnyFunctionType *swift::adjustFunctionTypeForConcurrency(
     case ActorIsolation::GlobalActorUnsafe:
       // Only treat as global-actor-qualified within code that has adopted
       // Swift Concurrency features.
-      if (!contextUsesConcurrencyFeatures(dc))
+      if (!contextRequiresStrictConcurrencyChecking(dc))
         return fnType;
 
       LLVM_FALLTHROUGH;
@@ -4250,7 +4246,7 @@ AnyFunctionType *swift::adjustFunctionTypeForConcurrency(
 }
 
 bool swift::completionContextUsesConcurrencyFeatures(const DeclContext *dc) {
-  return contextUsesConcurrencyFeatures(dc);
+  return contextRequiresStrictConcurrencyChecking(dc);
 }
 
 AbstractFunctionDecl const *swift::isActorInitOrDeInitContext(

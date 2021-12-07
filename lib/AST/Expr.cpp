@@ -282,6 +282,7 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
   NO_REFERENCE(BooleanLiteral);
   NO_REFERENCE(StringLiteral);
   NO_REFERENCE(InterpolatedStringLiteral);
+  NO_REFERENCE(RegexLiteral);
   NO_REFERENCE(ObjectLiteral);
   NO_REFERENCE(MagicIdentifierLiteral);
   NO_REFERENCE(DiscardAssignment);
@@ -590,6 +591,7 @@ bool Expr::canAppendPostfixExpression(bool appendingPostfixOperator) const {
   case ExprKind::BooleanLiteral:
   case ExprKind::StringLiteral:
   case ExprKind::InterpolatedStringLiteral:
+  case ExprKind::RegexLiteral:
   case ExprKind::MagicIdentifierLiteral:
   case ExprKind::ObjCSelector:
   case ExprKind::KeyPath:
@@ -815,6 +817,7 @@ bool Expr::isValidParentOfTypeExpr(Expr *typeExpr) const {
   case ExprKind::StringLiteral:
   case ExprKind::MagicIdentifierLiteral:
   case ExprKind::InterpolatedStringLiteral:
+  case ExprKind::RegexLiteral:
   case ExprKind::ObjectLiteral:
   case ExprKind::DiscardAssignment:
   case ExprKind::DeclRef:
@@ -1674,6 +1677,26 @@ void AbstractClosureExpr::setParameterList(ParameterList *P) {
     P->setDeclContextOfParamDecls(this);
 }
 
+bool AbstractClosureExpr::hasBody() const {
+  switch (getKind()) {
+    case ExprKind::Closure:
+    case ExprKind::AutoClosure:
+      return true;
+    default:
+      return false;
+  }
+}
+
+BraceStmt * AbstractClosureExpr::getBody() const {
+  if (!hasBody())
+    return nullptr;
+  if (const AutoClosureExpr *autocls = dyn_cast<AutoClosureExpr>(this))
+    return autocls->getBody();
+  if (const ClosureExpr *cls = dyn_cast<ClosureExpr>(this))
+    return cls->getBody();
+  llvm_unreachable("Unknown closure expression");
+}
+
 Type AbstractClosureExpr::getResultType(
     llvm::function_ref<Type(Expr *)> getType) const {
   auto *E = const_cast<AbstractClosureExpr *>(this);
@@ -2185,6 +2208,13 @@ SourceLoc TapExpr::getEndLoc() const {
   if (auto *const se = getSubExpr())
     return se->getEndLoc();
   return SourceLoc();
+}
+
+RegexLiteralExpr *
+RegexLiteralExpr::createParsed(ASTContext &ctx, SourceLoc loc,
+                               StringRef regexText, Expr *semanticExpr) {
+  return new (ctx) RegexLiteralExpr(loc, regexText, semanticExpr,
+                                    /*implicit*/ false);
 }
 
 void swift::simple_display(llvm::raw_ostream &out, const ClosureExpr *CE) {

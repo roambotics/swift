@@ -961,7 +961,38 @@ public:
     return E->getKind() == ExprKind::InterpolatedStringLiteral;
   }
 };
-  
+
+/// A regular expression literal e.g '(a|c)*'.
+class RegexLiteralExpr : public LiteralExpr {
+  SourceLoc Loc;
+  StringRef RegexText;
+  Expr *SemanticExpr;
+
+  RegexLiteralExpr(SourceLoc loc, StringRef regexText, Expr *semanticExpr,
+                   bool isImplicit)
+      : LiteralExpr(ExprKind::RegexLiteral, isImplicit), Loc(loc),
+        RegexText(regexText), SemanticExpr(semanticExpr) {}
+
+public:
+  static RegexLiteralExpr *createParsed(ASTContext &ctx, SourceLoc loc,
+                                        StringRef regexText,
+                                        Expr *semanticExpr);
+
+  /// Retrieve the raw regex text.
+  StringRef getRegexText() const { return RegexText; }
+
+  /// Retrieve the semantic expression that the regex will be type-checked and
+  /// emitted as.
+  Expr *getSemanticExpr() const { return SemanticExpr; }
+  void setSemanticExpr(Expr *expr) { SemanticExpr = expr; }
+
+  SourceRange getSourceRange() const { return Loc; }
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::RegexLiteral;
+  }
+};
+
 /// MagicIdentifierLiteralExpr - A magic identifier like #file which expands
 /// out to a literal at SILGen time.
 class MagicIdentifierLiteralExpr : public BuiltinLiteralExpr {
@@ -3600,6 +3631,13 @@ public:
   ///
   /// Only valid when \c hasSingleExpressionBody() is true.
   Expr *getSingleExpressionBody() const;
+
+  /// Whether this closure has a body
+  bool hasBody() const;
+
+  /// Returns the body of closures that have a body
+  /// returns nullptr if the closure doesn't have a body
+  BraceStmt *getBody() const;
 
   ClosureActorIsolation getActorIsolation() const { return actorIsolation; }
 

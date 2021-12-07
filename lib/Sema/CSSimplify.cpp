@@ -2040,7 +2040,7 @@ static bool fixMissingArguments(ConstraintSystem &cs, ASTNode anchor,
 
       // Something like `foo { x in }` or `foo { $0 }`
       if (auto *closure = getAsExpr<ClosureExpr>(anchor)) {
-        forEachExprInConstraintSystem(closure, [&](Expr *expr) -> Expr * {
+        cs.forEachExpr(closure, [&](Expr *expr) -> Expr * {
           if (auto *UDE = dyn_cast<UnresolvedDotExpr>(expr)) {
             if (!isParam(UDE->getBase()))
               return expr;
@@ -2171,8 +2171,7 @@ ConstraintSystem::matchFunctionTypes(FunctionType *func1, FunctionType *func2,
 
   /// Whether to downgrade to a concurrency warning.
   auto isConcurrencyWarning = [&] {
-    if (contextUsesConcurrencyFeatures(DC) ||
-        Context.LangOpts.isSwiftVersionAtLeast(6))
+    if (contextRequiresStrictConcurrencyChecking(DC))
       return false;
 
     switch (kind) {
@@ -11663,7 +11662,7 @@ bool ConstraintSystem::recordFix(ConstraintFix *fix, unsigned impact) {
 
   bool found = false;
   if (auto *expr = getAsExpr(anchor)) {
-    forEachExprInConstraintSystem(expr, [&](Expr *subExpr) -> Expr * {
+    forEachExpr(expr, [&](Expr *subExpr) -> Expr * {
       found |= anchors.count(subExpr);
       return subExpr;
     });
@@ -12710,6 +12709,7 @@ ConstraintSystem::simplifyConstraint(const Constraint &constraint) {
   case ConstraintKind::ClosureBodyElement:
     return simplifyClosureBodyElementConstraint(
         constraint.getClosureElement(), constraint.getElementContext(),
+        constraint.isDiscardedElement(),
         /*flags=*/None, constraint.getLocator());
 
   case ConstraintKind::BindTupleOfFunctionParams:

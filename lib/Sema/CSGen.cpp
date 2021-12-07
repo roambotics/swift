@@ -1163,6 +1163,35 @@ namespace {
       return tv;
     }
 
+    Type visitRegexLiteralExpr(RegexLiteralExpr *expr) {
+      auto &ctx = CS.getASTContext();
+      auto exprLoc = expr->getLoc();
+
+      // TODO: This should eventually be a known stdlib decl.
+      auto regexLookup = TypeChecker::lookupUnqualified(
+          CurDC, DeclNameRef(ctx.Id_Regex), exprLoc);
+      if (regexLookup.size() != 1) {
+        ctx.Diags.diagnose(exprLoc, diag::regex_decl_broken);
+        return Type();
+      }
+      auto result = regexLookup.allResults()[0];
+      auto *regexDecl = dyn_cast<NominalTypeDecl>(result.getValueDecl());
+      if (!regexDecl || isa<ProtocolDecl>(regexDecl)) {
+        ctx.Diags.diagnose(exprLoc, diag::regex_decl_broken);
+        return Type();
+      }
+
+      auto *loc = CS.getConstraintLocator(expr);
+      auto regexTy = CS.replaceInferableTypesWithTypeVars(
+          regexDecl->getDeclaredType(), loc);
+
+      // The semantic expr should be of regex type.
+      auto semanticExprTy = CS.getType(expr->getSemanticExpr());
+      CS.addConstraint(ConstraintKind::Bind, regexTy, semanticExprTy, loc);
+
+      return regexTy;
+    }
+
     Type visitMagicIdentifierLiteralExpr(MagicIdentifierLiteralExpr *expr) {
       switch (expr->getKind()) {
       // Magic pointer identifiers are of type UnsafeMutableRawPointer.
@@ -2105,7 +2134,7 @@ namespace {
         // If this is a multi-statement closure, let's mark result
         // as potential hole right away.
         return Type(CS.createTypeVariable(
-            resultLocator, shouldTypeCheckInEnclosingExpression(closure)
+            resultLocator, CS.participatesInInference(closure)
                                ? 0
                                : TVO_CanBindToHole));
       }();
@@ -2627,7 +2656,7 @@ namespace {
       // genreation only if closure is going to participate
       // in the type-check. This allows us to delay validation of
       // multi-statement closures until body is opened.
-      if (shouldTypeCheckInEnclosingExpression(closure) &&
+      if (CS.participatesInInference(closure) &&
           collectVarRefs.hasErrorExprs) {
         return Type();
       }

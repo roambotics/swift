@@ -427,9 +427,6 @@ namespace {
     RValue visitFloatLiteralExpr(FloatLiteralExpr *E, SGFContext C);
     RValue visitBooleanLiteralExpr(BooleanLiteralExpr *E, SGFContext C);
 
-    RValue emitStringLiteral(Expr *E, StringRef Str, SGFContext C,
-                             StringLiteralExpr::Encoding encoding);
-        
     RValue visitStringLiteralExpr(StringLiteralExpr *E, SGFContext C);
     RValue visitLoadExpr(LoadExpr *E, SGFContext C);
     RValue visitDerivedToBaseExpr(DerivedToBaseExpr *E, SGFContext C);
@@ -478,6 +475,7 @@ namespace {
     RValue visitAbstractClosureExpr(AbstractClosureExpr *E, SGFContext C);
     RValue visitInterpolatedStringLiteralExpr(InterpolatedStringLiteralExpr *E,
                                               SGFContext C);
+    RValue visitRegexLiteralExpr(RegexLiteralExpr *E, SGFContext C);
     RValue visitObjectLiteralExpr(ObjectLiteralExpr *E, SGFContext C);
     RValue visitEditorPlaceholderExpr(EditorPlaceholderExpr *E, SGFContext C);
     RValue visitObjCSelectorExpr(ObjCSelectorExpr *E, SGFContext C);
@@ -1027,7 +1025,8 @@ RValue RValueEmitter::visitLoadExpr(LoadExpr *E, SGFContext C) {
 }
 
 SILValue SILGenFunction::emitTemporaryAllocation(SILLocation loc, SILType ty,
-                                                 bool hasDynamicLifetime) {
+                                                 bool hasDynamicLifetime,
+                                                 bool isLexical) {
   ty = ty.getObjectType();
   Optional<SILDebugVariable> DbgVar;
   if (auto *VD = loc.getAsASTNode<VarDecl>())
@@ -1042,7 +1041,8 @@ SILValue SILGenFunction::emitTemporaryAllocation(SILLocation loc, SILType ty,
         DbgVar = SILDebugVariable(VD->isLet(), 0);
         loc = SILLocation(VD);
       }
-  auto alloc = B.createAllocStack(loc, ty, DbgVar, hasDynamicLifetime);
+  auto *alloc =
+      B.createAllocStack(loc, ty, DbgVar, hasDynamicLifetime, isLexical);
   enterDeallocStackCleanup(alloc);
   return alloc;
 }
@@ -2525,6 +2525,10 @@ visitInterpolatedStringLiteralExpr(InterpolatedStringLiteralExpr *E,
 
   return SGF.emitApplyAllocatingInitializer(
       E, E->getInitializer(), std::move(resultInitArgs), Type(), C);
+}
+
+RValue RValueEmitter::visitRegexLiteralExpr(RegexLiteralExpr *E, SGFContext C) {
+  return SGF.emitRValue(E->getSemanticExpr());
 }
 
 RValue RValueEmitter::

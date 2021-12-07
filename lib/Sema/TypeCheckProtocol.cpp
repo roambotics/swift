@@ -2864,10 +2864,23 @@ static void emitDeclaredHereIfNeeded(DiagnosticEngine &diags,
 
 bool ConformanceChecker::checkActorIsolation(
     ValueDecl *requirement, ValueDecl *witness) {
+  /// Retrieve a concrete witness for Sendable checking.
+  auto getConcreteWitness = [&] {
+    if (auto genericEnv = witness->getInnermostDeclContext()
+            ->getGenericEnvironmentOfContext()) {
+      return ConcreteDeclRef(
+          witness, genericEnv->getForwardingSubstitutionMap());
+    }
+
+    return ConcreteDeclRef(witness);
+  };
+
   // Ensure that the witness is not actor-isolated in a manner that makes it
   // unsuitable as a witness.
   bool isCrossActor = false;
   bool witnessIsUnsafe = false;
+  DiagnosticBehavior behavior = SendableCheckContext(
+      witness->getInnermostDeclContext()).defaultDiagnosticBehavior();
   Type witnessGlobalActor;
   switch (auto witnessRestriction =
               ActorIsolationRestriction::forDeclaration(
@@ -3012,8 +3025,8 @@ bool ConformanceChecker::checkActorIsolation(
 
   case ActorIsolationRestriction::CrossActorSelf: {
     if (diagnoseNonSendableTypesInReference(
-        witness, DC, witness->getLoc(),
-        ConcurrentReferenceKind::CrossActor)) {
+            getConcreteWitness(), DC, witness->getLoc(),
+            ConcurrentReferenceKind::CrossActor)) {
       return true;
     }
 
@@ -3091,8 +3104,6 @@ bool ConformanceChecker::checkActorIsolation(
   }
 
   case ActorIsolationRestriction::Unsafe:
-    break;
-
   case ActorIsolationRestriction::Unrestricted:
     // The witness is completely unrestricted, so ignore any annotations on
     // the requirement.
@@ -3145,8 +3156,8 @@ bool ConformanceChecker::checkActorIsolation(
       return false;
 
     return diagnoseNonSendableTypesInReference(
-      witness, DC, witness->getLoc(),
-      ConcurrentReferenceKind::CrossActor);
+        getConcreteWitness(), DC, witness->getLoc(),
+        ConcurrentReferenceKind::CrossActor);
   }
 
   // If the witness has a global actor but the requirement does not, we have
@@ -3155,43 +3166,23 @@ bool ConformanceChecker::checkActorIsolation(
   // However, we allow this case when the requirement was imported, because
   // it might not have been annotated.
   if (witnessGlobalActor && !requirementGlobalActor) {
-    // If the requirement was imported from Objective-C, it may not have been
-    // annotated appropriately. Allow the mismatch.
+    // If the requirement was imported from Objective-C, downgrade to a warning
+    // because it may not have been annotated appropriately.
     if (requirement->hasClangNode())
-      return false;
-
-    // If the witness is "unsafe", allow the mismatch.
-    if (witnessIsUnsafe)
-      return false;
+      behavior = std::max(behavior, DiagnosticBehavior::Warning);
 
     witness->diagnose(
         diag::global_actor_isolated_witness, witness->getDescriptiveKind(),
-        witness->getName(), witnessGlobalActor, Proto->getName());
+        witness->getName(), witnessGlobalActor, Proto->getName())
+      .limitBehavior(behavior);
     requirement->diagnose(diag::decl_declared_here, requirement->getName());
-    return true;
+    return behavior == DiagnosticBehavior::Unspecified;
   }
 
-  // If the requirement has a global actor but the witness does not, we have
-  // an isolation error.
+  // If the requirement has a global actor but the witness does not, it's
+  // fine.
   if (requirementGlobalActor && !witnessGlobalActor) {
-    // If the requirement's global actor was "unsafe", we allow this.
-    if (requirementIsUnsafe)
-      return false;
-
-    if (isCrossActor) {
-      return diagnoseNonSendableTypesInReference(
-        witness, DC, witness->getLoc(),
-        ConcurrentReferenceKind::CrossActor);
-    }
-
-    witness->diagnose(
-        diag::global_actor_isolated_requirement, witness->getDescriptiveKind(),
-        witness->getName(), requirementGlobalActor, Proto->getName())
-      .fixItInsert(
-        witness->getAttributeInsertionLoc(/*forModifier=*/false),
-      "@" + requirementGlobalActor.getString());
-    requirement->diagnose(diag::decl_declared_here, requirement->getName());
-    return true;
+    return false;
   }
 
   // Both have global actors but they differ, so this is an isolation error.
@@ -3199,9 +3190,10 @@ bool ConformanceChecker::checkActorIsolation(
   witness->diagnose(
       diag::global_actor_isolated_requirement_witness_conflict,
       witness->getDescriptiveKind(), witness->getName(), witnessGlobalActor,
-      Proto->getName(), requirementGlobalActor);
+      Proto->getName(), requirementGlobalActor)
+    .limitBehavior(behavior);
   requirement->diagnose(diag::decl_declared_here, requirement->getName());
-  return true;
+  return behavior == DiagnosticBehavior::Unspecified;
 }
 
 bool ConformanceChecker::checkObjCTypeErasedGenerics(
@@ -4123,6 +4115,11 @@ void ConformanceChecker::checkNonFinalClassWitness(ValueDecl *requirement,
   }
 }
 
+static bool isSwiftRawRepresentableEnum(Type adoptee) {
+  auto *enumDecl = dyn_cast<EnumDecl>(adoptee->getAnyNominal());
+  return (enumDecl && enumDecl->hasRawType() && !enumDecl->isObjC());
+}
+
 // If the given witness matches a generic RawRepresentable function conforming
 // with a given protocol e.g. `func == <T : RawRepresentable>(lhs: T, rhs: T) ->
 // Bool where T.RawValue : Equatable`
@@ -4201,13 +4198,8 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
       !requirement->getAttrs().isUnavailable(getASTContext());
 
   auto &ctx = getASTContext();
-  bool isEquatableConformance = Conformance->getProtocol() ==
-                                ctx.getProtocol(KnownProtocolKind::Equatable);
-
-  auto decl = Conformance->getDeclContext()->getSelfNominalTypeDecl();
-  auto *enumDecl = dyn_cast_or_null<EnumDecl>(decl);
-  bool isSwiftRawRepresentableEnum =
-      enumDecl && enumDecl->hasRawType() && !enumDecl->isObjC();
+  bool isEquatableConformance = (Conformance->getProtocol() ==
+                                 ctx.getProtocol(KnownProtocolKind::Equatable));
 
   if (findBestWitness(requirement,
                       considerRenames ? &ignoringNames : nullptr,
@@ -4217,12 +4209,23 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
     const auto &best = matches[bestIdx];
     auto witness = best.Witness;
 
-    if (canDerive && isSwiftRawRepresentableEnum && isEquatableConformance) {
-      // For swift enum types that can derive equatable conformance,
-      // if the best witness is default generic conditional conforming
-      // `func == <T : RawRepresentable>(lhs: T, rhs: T) -> Bool where
-      // T.RawValue : Equatable` let's return as missing and derive
-      // the conformance since it is possible.
+    if (canDerive &&
+        isEquatableConformance &&
+        isSwiftRawRepresentableEnum(Adoptee) &&
+        !Conformance->getDeclContext()->getParentModule()->isResilient()) {
+      // For swift enum types that can derive an Equatable conformance,
+      // if the best witness is the default implementation
+      //
+      //   func == <T : RawRepresentable>(lhs: T, rhs: T) -> Bool
+      //     where T.RawValue : Equatable
+      //
+      // let's return as missing and derive the conformance, since it will be
+      // more efficient than comparing rawValues.
+      //
+      // However, we only do this if the module is non-resilient. If it is
+      // resilient, this change can break ABI by publishing a synthesized ==
+      // declaration that may not exist in versions of the framework built
+      // with an older compiler.
       if (isRawRepresentableGenericFunction(ctx, witness, Conformance)) {
         return ResolveWitnessResult::Missing;
       }

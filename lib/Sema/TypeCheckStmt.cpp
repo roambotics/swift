@@ -1233,6 +1233,7 @@ static void diagnoseIgnoredLiteral(ASTContext &Ctx, LiteralExpr *LE) {
     case ExprKind::BooleanLiteral: return "boolean";
     case ExprKind::StringLiteral: return "string";
     case ExprKind::InterpolatedStringLiteral: return "string";
+    case ExprKind::RegexLiteral: return "regular expression";
     case ExprKind::MagicIdentifierLiteral:
       return MagicIdentifierLiteralExpr::getKindString(
           cast<MagicIdentifierLiteralExpr>(LE)->getKind());
@@ -1514,7 +1515,7 @@ void StmtChecker::typeCheckASTNode(ASTNode &node) {
 
   // Type check the declaration.
   if (auto *D = node.dyn_cast<Decl *>()) {
-    TypeChecker::typeCheckDecl(D);
+    TypeChecker::typeCheckDecl(D, LeaveBraceStmtBodyUnchecked);
     return;
   }
 
