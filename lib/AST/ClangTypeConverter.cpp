@@ -212,6 +212,7 @@ const clang::Type *ClangTypeConverter::getFunctionType(
     return nullptr;
 
   switch (repr) {
+  case SILFunctionType::Representation::CXXMethod:
   case SILFunctionType::Representation::CFunctionPointer:
     return ClangASTContext.getPointerType(fn).getTypePtr();
   case SILFunctionType::Representation::Block:
@@ -545,7 +546,8 @@ ClangTypeConverter::visitBoundGenericType(BoundGenericType *type) {
     auto args = type->getGenericArgs();
     assert((args.size() == 1) && "Optional should have 1 generic argument.");
     clang::QualType innerTy = convert(args[0]);
-    if (swift::canImportAsOptional(innerTy.getTypePtrOrNull()))
+    if (swift::canImportAsOptional(innerTy.getTypePtrOrNull()) ||
+        args[0]->isForeignReferenceType())
       return innerTy;
     return clang::QualType();
   }

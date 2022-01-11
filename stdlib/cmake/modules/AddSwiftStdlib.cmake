@@ -310,8 +310,8 @@ function(_add_target_variant_c_compile_flags)
     list(APPEND result "-DSWIFT_LIBRARY_EVOLUTION=0")
   endif()
 
-  if(NOT SWIFT_ENABLE_COMPATIBILITY_OVERRIDES)
-    list(APPEND result "-DSWIFT_RUNTIME_NO_COMPATIBILITY_OVERRIDES")
+  if(SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT)
+    list(APPEND result "-DSWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT")
   endif()
 
   if(SWIFT_ENABLE_REFLECTION)
@@ -344,6 +344,10 @@ function(_add_target_variant_c_compile_flags)
     list(APPEND result "-DSWIFT_STDLIB_HAS_ENVIRON")
   endif()
 
+  if(SWIFT_STDLIB_HAS_LOCALE)
+    list(APPEND result "-DSWIFT_STDLIB_HAS_LOCALE")
+  endif()
+
   if(SWIFT_STDLIB_SINGLE_THREADED_RUNTIME)
     list(APPEND result "-DSWIFT_STDLIB_SINGLE_THREADED_RUNTIME")
   endif()
@@ -360,8 +364,16 @@ function(_add_target_variant_c_compile_flags)
     list(APPEND result "-DSWIFT_STDLIB_SHORT_MANGLING_LOOKUPS")
   endif()
 
+  if(SWIFT_STDLIB_HAS_TYPE_PRINTING)
+    list(APPEND result "-DSWIFT_STDLIB_HAS_TYPE_PRINTING")
+  endif()
+
   if(SWIFT_STDLIB_SUPPORTS_BACKTRACE_REPORTING)
     list(APPEND result "-DSWIFT_STDLIB_SUPPORTS_BACKTRACE_REPORTING")
+  endif()
+  
+  if(SWIFT_STDLIB_ENABLE_UNICODE_DATA)
+    list(APPEND result "-D" "SWIFT_STDLIB_ENABLE_UNICODE_DATA")
   endif()
 
   list(APPEND result ${SWIFT_STDLIB_EXTRA_C_COMPILE_FLAGS})
@@ -742,7 +754,9 @@ function(add_swift_target_library_single target name)
   # Include LLVM Bitcode slices for iOS, Watch OS, and Apple TV OS device libraries.
   set(embed_bitcode_arg)
   if(SWIFT_EMBED_BITCODE_SECTION AND NOT SWIFTLIB_SINGLE_DONT_EMBED_BITCODE)
-    if("${SWIFTLIB_SINGLE_SDK}" STREQUAL "IOS" OR "${SWIFTLIB_SINGLE_SDK}" STREQUAL "TVOS" OR "${SWIFTLIB_SINGLE_SDK}" STREQUAL "WATCHOS")
+    if("${SWIFTLIB_SINGLE_SDK}" STREQUAL "IOS" OR
+       "${SWIFTLIB_SINGLE_SDK}" STREQUAL "TVOS" OR
+       "${SWIFTLIB_SINGLE_SDK}" STREQUAL "WATCHOS")
       list(APPEND SWIFTLIB_SINGLE_C_COMPILE_FLAGS "-fembed-bitcode")
       set(embed_bitcode_arg EMBED_BITCODE)
     endif()
@@ -1144,17 +1158,9 @@ function(add_swift_target_library_single target name)
     target_link_libraries("${target}" INTERFACE ${SWIFTLIB_SINGLE_LINK_LIBRARIES})
   endif()
 
-  # Don't add the icucore target.
-  set(SWIFTLIB_SINGLE_LINK_LIBRARIES_WITHOUT_ICU)
-  foreach(item ${SWIFTLIB_SINGLE_LINK_LIBRARIES})
-    if(NOT "${item}" STREQUAL "icucore")
-      list(APPEND SWIFTLIB_SINGLE_LINK_LIBRARIES_WITHOUT_ICU "${item}")
-    endif()
-  endforeach()
-
   if(target_static)
     _list_add_string_suffix(
-        "${SWIFTLIB_SINGLE_LINK_LIBRARIES_WITHOUT_ICU}"
+        "${SWIFTLIB_SINGLE_LINK_LIBRARIES}"
         "-static"
         target_static_depends)
     # FIXME: should this be target_link_libraries?
@@ -1310,9 +1316,9 @@ function(add_swift_target_library_single target name)
     endif()
     # Include LLVM Bitcode slices for iOS, Watch OS, and Apple TV OS device libraries.
     if(SWIFT_EMBED_BITCODE_SECTION AND NOT SWIFTLIB_SINGLE_DONT_EMBED_BITCODE)
-      if(${SWIFTLIB_SINGLE_SDK} STREQUAL "IOS" OR
-         ${SWIFTLIB_SINGLE_SDK} STREQUAL "TVOS" OR
-         ${SWIFTLIB_SINGLE_SDK} STREQUAL "WATCHOS")
+      if("${SWIFTLIB_SINGLE_SDK}" STREQUAL "IOS" OR
+         "${SWIFTLIB_SINGLE_SDK}" STREQUAL "TVOS" OR
+         "${SWIFTLIB_SINGLE_SDK}" STREQUAL "WATCHOS")
         # Please note that using a generator expression to fit
         # this in a single target_link_options does not work
         # (at least in CMake 3.15 and 3.16),

@@ -490,7 +490,8 @@ void SILSerializer::writeSILFunction(const SILFunction &F, bool DeclOnly) {
       (unsigned)numSpecAttrs, (unsigned)F.hasOwnership(),
       F.isAlwaysWeakImported(), LIST_VER_TUPLE_PIECES(available),
       (unsigned)F.isDynamicallyReplaceable(), (unsigned)F.isExactSelfClass(),
-      FnID, replacedFunctionID, genericSigID, clangNodeOwnerID, SemanticsIDs);
+      (unsigned)F.isDistributed(), FnID, replacedFunctionID, genericSigID,
+      clangNodeOwnerID, SemanticsIDs);
 
   if (NoBody)
     return;
@@ -1412,6 +1413,7 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   case SILInstructionKind::UnmanagedAutoreleaseValueInst:
   case SILInstructionKind::SetDeallocatingInst:
   case SILInstructionKind::DeallocStackInst:
+  case SILInstructionKind::DeallocStackRefInst:
   case SILInstructionKind::DeallocRefInst:
   case SILInstructionKind::DeinitExistentialAddrInst:
   case SILInstructionKind::DeinitExistentialValueInst:
@@ -1444,8 +1446,6 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
     else if (auto *LI = dyn_cast<Load##Name##Inst>(&SI)) \
       Attr = LI->isTake();
 #include "swift/AST/ReferenceStorage.def"
-    else if (auto *DRI = dyn_cast<DeallocRefInst>(&SI))
-      Attr = (unsigned)DRI->canAllocOnStack();
     else if (auto *RCI = dyn_cast<RefCountingInst>(&SI))
       Attr = RCI->isNonAtomic();
     else if (auto *UOCI = dyn_cast<UncheckedOwnershipConversionInst>(&SI)) {

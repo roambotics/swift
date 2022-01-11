@@ -283,6 +283,9 @@ namespace swift {
     /// Whether to dump debug info for request evaluator cycles.
     bool DebugDumpCycles = false;
 
+    /// Disable SIL substituted function types.
+    bool DisableSubstSILFunctionTypes = false;
+
     /// Whether to diagnose an ephemeral to non-ephemeral conversion as an
     /// error.
     bool DiagnoseInvalidEphemeralnessAsError = false;
@@ -310,8 +313,18 @@ namespace swift {
     /// `func f() -> <T> T`.
     bool EnableExperimentalNamedOpaqueTypes = false;
 
+    /// Enable support for explicit existential types via the \c any
+    /// keyword.
+    bool EnableExplicitExistentialTypes = false;
+
     /// Enable experimental flow-sensitive concurrent captures.
     bool EnableExperimentalFlowSensitiveConcurrentCaptures = false;
+
+    /// Enable experimental ClangImporter diagnostics.
+    bool EnableExperimentalClangImporterDiagnostics = false;
+
+    /// Enable experimental eager Clang module diagnostics.
+    bool EnableExperimentalEagerClangModuleDiagnostics = false;
 
     /// Enable inference of Sendable conformances for public types.
     bool EnableInferPublicSendable = false;
@@ -467,6 +480,9 @@ namespace swift {
     /// Whether the new experimental generics implementation is enabled.
     RequirementMachineMode EnableRequirementMachine =
         RequirementMachineMode::Enabled;
+
+    /// Enables merged associated type support, which might go away.
+    bool RequirementMachineMergedAssociatedTypes = true;
 
     /// Enables dumping rewrite systems from the requirement machine.
     bool DumpRequirementMachine = false;

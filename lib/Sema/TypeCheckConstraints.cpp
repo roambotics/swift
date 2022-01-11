@@ -124,6 +124,12 @@ bool TypeVariableType::Implementation::isSubscriptResultType() const {
          locator->isLastElement<LocatorPathElt::FunctionResult>();
 }
 
+bool TypeVariableType::Implementation::isTypeSequence() const {
+  return locator
+      && locator->isForGenericParameter()
+      && locator->getGenericParameter()->isTypeSequence();
+}
+
 void *operator new(size_t bytes, ConstraintSystem& cs,
                    size_t alignment) {
   return cs.getAllocator().Allocate(bytes, alignment);
@@ -531,31 +537,6 @@ bool TypeChecker::typeCheckPatternBinding(PatternBindingDecl *PBD,
 
   PBD->setPattern(patternNumber, pattern, initContext);
   PBD->setInit(patternNumber, init);
-
-  // Bind a property with an opaque return type to the underlying type
-  // given by the initializer.
-  if (auto var = pattern->getSingleVar()) {
-    if (auto opaque = var->getOpaqueResultTypeDecl()) {
-      init->forEachChildExpr([&](Expr *expr) -> Expr * {
-        if (auto coercionExpr = dyn_cast<UnderlyingToOpaqueExpr>(expr)) {
-          auto underlyingType =
-              coercionExpr->getSubExpr()->getType()->mapTypeOutOfContext();
-          auto underlyingSubs = SubstitutionMap::get(
-              opaque->getOpaqueInterfaceGenericSignature(),
-              [&](SubstitutableType *t) -> Type {
-                if (t->isEqual(opaque->getUnderlyingInterfaceType())) {
-                  return underlyingType;
-                }
-                return Type(t);
-              },
-              LookUpConformanceInModule(opaque->getModuleContext()));
-
-          opaque->setUnderlyingTypeSubstitutions(underlyingSubs);
-        }
-        return expr;
-      });
-    }
-  }
 
   if (hadError)
     PBD->setInvalid();

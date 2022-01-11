@@ -2891,6 +2891,10 @@ static bool usesFeatureBuiltinStackAlloc(Decl *decl) {
   return false;
 }
 
+static bool usesFeatureBuiltinAssumeAlignment(Decl *decl) {
+  return false;
+}
+
 /// Determine the set of "new" features used on a given declaration.
 ///
 /// Note: right now, all features we check for are "new". At some point, we'll
@@ -4334,9 +4338,10 @@ class TypePrinter : public TypeVisitor<TypePrinter> {
       case PrintOptions::OpaqueReturnTypePrintingMode::Description:
         return true;
       case PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword:
-        return false;
+        return opaque->getDecl()->hasExplicitGenericParams();
       case PrintOptions::OpaqueReturnTypePrintingMode::WithoutOpaqueKeyword:
-        return isSimpleUnderPrintOptions(opaque->getExistentialType());
+        return opaque->getDecl()->hasExplicitGenericParams() ||
+            isSimpleUnderPrintOptions(opaque->getExistentialType());
       }
       llvm_unreachable("bad opaque-return-type printing mode");
     }
@@ -4626,6 +4631,25 @@ public:
     Printer << ")";
   }
 
+  void visitPackType(PackType *T) {
+    Printer << "(";
+
+    auto Fields = T->getElementTypes();
+    for (unsigned i = 0, e = Fields.size(); i != e; ++i) {
+      if (i)
+        Printer << ", ";
+      Type EltType = Fields[i];
+      visit(EltType);
+    }
+    Printer << ")";
+  }
+
+  void visitPackExpansionType(PackExpansionType *T) {
+    Printer << "(";
+    visit(T->getPatternType());
+    Printer << "..." << ")";
+  }
+
   void visitTupleType(TupleType *T) {
     Printer.callPrintStructurePre(PrintStructureKind::TupleType);
     SWIFT_DEFER { Printer.printStructurePost(PrintStructureKind::TupleType); };
@@ -4739,11 +4763,18 @@ public:
       case MetatypeRepresentation::ObjC:  Printer << "@objc_metatype "; break;
       }
     }
+
+    auto &ctx = T->getASTContext();
+    if (T->is<ExistentialMetatypeType>() &&
+        ctx.LangOpts.EnableExplicitExistentialTypes)
+      Printer << "any ";
+
     printWithParensIfNotSimple(T->getInstanceType());
 
     // We spell normal metatypes of existential types as .Protocol.
     if (isa<MetatypeType>(T) &&
-        T->getInstanceType()->isAnyExistentialType()) {
+        T->getInstanceType()->isAnyExistentialType() &&
+        !ctx.LangOpts.EnableExplicitExistentialTypes) {
       Printer << ".Protocol";
     } else {
       Printer << ".Type";
@@ -4855,6 +4886,9 @@ public:
       case SILFunctionType::Representation::Method:
         Printer << "method";
         break;
+      case SILFunctionType::Representation::CXXMethod:
+        Printer << "cxx_method";
+        break;
       case SILFunctionType::Representation::ObjCMethod:
         Printer << "objc_method";
         break;
@@ -4932,6 +4966,9 @@ public:
         break;
       case SILFunctionType::Representation::Method:
         Printer << "method";
+        break;
+      case SILFunctionType::Representation::CXXMethod:
+        Printer << "cxx_method";
         break;
       case SILFunctionType::Representation::ObjCMethod:
         Printer << "objc_method";
@@ -5329,6 +5366,11 @@ public:
     }
   }
 
+  void visitExistentialType(ExistentialType *T) {
+    Printer << "any ";
+    visit(T->getConstraintType());
+  }
+
   void visitLValueType(LValueType *T) {
     Printer << "@lvalue ";
     visit(T->getObjectType());
@@ -5375,11 +5417,28 @@ public:
   }
 
   void visitOpaqueTypeArchetypeType(OpaqueTypeArchetypeType *T) {
+    // Try to print a named opaque type.
+    auto printNamedOpaque = [&] {
+      if (auto genericParam =
+              T->getDecl()->getExplicitGenericParam(T->getOrdinal())) {
+        visit(genericParam->getDeclaredInterfaceType());
+        return true;
+      }
+
+      return false;
+    };
+
     switch (Options.OpaqueReturnTypePrinting) {
     case PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword:
+      if (printNamedOpaque())
+        return;
+
       Printer.printKeyword("some", Options, /*Suffix=*/" ");
       LLVM_FALLTHROUGH;
     case PrintOptions::OpaqueReturnTypePrintingMode::WithoutOpaqueKeyword: {
+      if (printNamedOpaque())
+        return;
+
       visit(T->getExistentialType());
       return;
     }

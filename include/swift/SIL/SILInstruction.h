@@ -368,7 +368,7 @@ class SILInstruction : public llvm::ilist_node<SILInstruction> {
   SILInstructionResultArray getResultsImpl() const;
 
 protected:
-  friend class LibswiftPassInvocation;
+  friend class SwiftPassInvocation;
 
   SILInstruction() {
     NumCreatedInstructions++;
@@ -458,6 +458,14 @@ public:
       loc.kindAndFlags.packedKindAndFlags;
     locationStorage = loc.storage;
   }
+
+  /// Return the next instruction or nullptr if this is the last instruction in
+  /// its block.
+  SILInstruction *getPreviousInstruction();
+
+  /// Return the previous instruction or nullptr if this is the first
+  /// instruction in its block.
+  SILInstruction *getNextInstruction();
 
   /// This method unlinks 'self' from the containing basic block and deletes it.
   void eraseFromParent();
@@ -1013,6 +1021,14 @@ public:
   /// If this is an instruction which "defines" an opened archetype, it is
   /// returned.
   CanArchetypeType getOpenedArchetype() const;
+
+  SILInstruction *getPreviousInstruction() {
+    return SILInstruction::getPreviousInstruction();
+  }
+
+  SILInstruction *getNextInstruction() {
+    return SILInstruction::getNextInstruction();
+  }
 };
 
 struct SILNodeOffsetChecker {
@@ -4027,6 +4043,9 @@ private:
 public:
   SILValue getSrc() const { return Operands[Src].get(); }
   SILValue getDest() const { return Operands[Dest].get(); }
+
+  void setSrc(SILValue V) { Operands[Src].set(V); }
+  void setDest(SILValue V) { Operands[Dest].set(V); }
 
   ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
   MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
@@ -7600,6 +7619,18 @@ class DeallocStackInst :
       : UnaryInstructionBase(DebugLoc, operand) {}
 };
 
+/// Like DeallocStackInst, but for `alloc_ref [stack]`.
+class DeallocStackRefInst
+    : public UnaryInstructionBase<SILInstructionKind::DeallocStackRefInst,
+                                  DeallocationInst> {
+  friend SILBuilder;
+
+  DeallocStackRefInst(SILDebugLocation DebugLoc, SILValue Operand)
+      : UnaryInstructionBase(DebugLoc, Operand) {}
+public:
+  AllocRefInst *getAllocRef() { return cast<AllocRefInst>(getOperand()); }
+};
+
 /// Deallocate memory for a reference type instance from a destructor or
 /// failure path of a constructor.
 ///
@@ -7613,21 +7644,8 @@ class DeallocRefInst :
                               DeallocationInst> {
   friend SILBuilder;
 
-private:
-  DeallocRefInst(SILDebugLocation DebugLoc, SILValue Operand,
-                 bool canBeOnStack = false)
-      : UnaryInstructionBase(DebugLoc, Operand) {
-    SILNode::Bits.DeallocRefInst.OnStack = canBeOnStack;
-  }
-
-public:
-  bool canAllocOnStack() const {
-    return SILNode::Bits.DeallocRefInst.OnStack;
-  }
-
-  void setStackAllocatable(bool OnStack) {
-    SILNode::Bits.DeallocRefInst.OnStack = OnStack;
-  }
+  DeallocRefInst(SILDebugLocation DebugLoc, SILValue Operand)
+      : UnaryInstructionBase(DebugLoc, Operand) { }
 };
 
 /// Deallocate memory for a reference type instance from a failure path of a

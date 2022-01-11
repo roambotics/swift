@@ -1169,10 +1169,9 @@ public:
   struct ParsedAccessors;
   ParserStatus parseGetSet(ParseDeclOptions Flags,
                            GenericParamList *GenericParams,
-                           ParameterList *Indices,
+                           ParameterList *Indices, TypeRepr *ResultType,
                            ParsedAccessors &accessors,
-                           AbstractStorageDecl *storage,
-                           SourceLoc StaticLoc);
+                           AbstractStorageDecl *storage, SourceLoc StaticLoc);
   ParserResult<VarDecl> parseDeclVarGetSet(PatternBindingEntry &entry,
                                            ParseDeclOptions Flags,
                                            SourceLoc StaticLoc,
@@ -1195,9 +1194,11 @@ public:
                                        ParseDeclOptions Flags,
                                        DeclAttributes &Attributes,
                                        bool HasFuncKeyword = true);
-  BraceStmt *parseAbstractFunctionBodyImpl(AbstractFunctionDecl *AFD);
+  BodyAndFingerprint
+  parseAbstractFunctionBodyImpl(AbstractFunctionDecl *AFD);
   void parseAbstractFunctionBody(AbstractFunctionDecl *AFD);
-  BraceStmt *parseAbstractFunctionBodyDelayed(AbstractFunctionDecl *AFD);
+  BodyAndFingerprint
+  parseAbstractFunctionBodyDelayed(AbstractFunctionDecl *AFD);
   ParserResult<ProtocolDecl> parseDeclProtocol(ParseDeclOptions Flags,
                                                DeclAttributes &Attributes);
 

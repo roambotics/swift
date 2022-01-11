@@ -357,8 +357,8 @@ private:
     DelayedPatternContexts;
 
   /// Cache of module names that fail the 'canImport' test in this context.
-  mutable llvm::SmallPtrSet<Identifier, 8> FailedModuleImportNames;
-  
+  mutable llvm::StringSet<> FailedModuleImportNames;
+
   /// Set if a `-module-alias` was passed. Used to store mapping between module aliases and
   /// their corresponding real names, and vice versa for a reverse lookup, which is needed to check
   /// if the module names appearing in source files are aliases or real names.
@@ -367,6 +367,12 @@ private:
   /// The boolean in the value indicates whether or not the entry is keyed by an alias vs real name,
   /// i.e. true if the entry is [key: alias_name, value: (real_name, true)].
   mutable llvm::DenseMap<Identifier, std::pair<Identifier, bool>> ModuleAliasMap;
+
+  /// The maximum arity of `_StringProcessing.Tuple{n}`.
+  static constexpr unsigned StringProcessingTupleDeclMaxArity = 8;
+  /// Cached `_StringProcessing.Tuple{n}` declarations.
+  mutable SmallVector<StructDecl *, StringProcessingTupleDeclMaxArity - 2>
+      StringProcessingTupleDecls;
 
   /// Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &
@@ -620,7 +626,18 @@ public:
   ConcreteDeclRef getBuiltinInitDecl(NominalTypeDecl *decl,
                                      KnownProtocolKind builtinProtocol,
                 llvm::function_ref<DeclName (ASTContext &ctx)> initName) const;
-  
+
+  /// Retrieve _StringProcessing.Regex.init(_regexString: String, version: Int).
+  ConcreteDeclRef getRegexInitDecl(Type regexType) const;
+
+  /// Retrieve the max arity that `_StringProcessing.Tuple{arity}` was
+  /// instantiated for.
+  unsigned getStringProcessingTupleDeclMaxArity() const;
+
+  /// Retrieve the `_StringProcessing.Tuple{arity}` declaration for the given
+  /// arity.
+  StructDecl *getStringProcessingTupleDecl(unsigned arity) const;
+
   /// Retrieve the declaration of Swift.<(Int, Int) -> Bool.
   FuncDecl *getLessThanIntDecl() const;
 
@@ -845,6 +862,7 @@ public:
   const CanType TheErrorType;             /// This is the ErrorType singleton.
   const CanType TheUnresolvedType;        /// This is the UnresolvedType singleton.
   const CanType TheEmptyTupleType;        /// This is '()', aka Void
+  const CanType TheEmptyPackType;
   const CanType TheAnyType;               /// This is 'Any', the empty protocol composition
 #define SINGLETON_TYPE(SHORT_ID, ID) \
   const CanType The##SHORT_ID##Type;
@@ -976,10 +994,10 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  bool canImportModuleImpl(ImportPath::Element ModulePath,
-                           llvm::VersionTuple version,
-                           bool underlyingVersion,
+  bool canImportModuleImpl(ImportPath::Module ModulePath,
+                           llvm::VersionTuple version, bool underlyingVersion,
                            bool updateFailingList) const;
+
 public:
   namelookup::ImportCache &getImportCache() const;
 
@@ -1008,10 +1026,10 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  bool canImportModule(ImportPath::Element ModulePath,
+  bool canImportModule(ImportPath::Module ModulePath,
                        llvm::VersionTuple version = llvm::VersionTuple(),
                        bool underlyingVersion = false);
-  bool canImportModule(ImportPath::Element ModulePath,
+  bool canImportModule(ImportPath::Module ModulePath,
                        llvm::VersionTuple version = llvm::VersionTuple(),
                        bool underlyingVersion = false) const;
 
@@ -1156,6 +1174,9 @@ public:
   InheritedProtocolConformance *
   getInheritedConformance(Type type, ProtocolConformance *inherited);
 
+  /// Check if \p decl is included in LazyContexts.
+  bool isLazyContext(const DeclContext *decl);
+
   /// Get the lazy data for the given declaration.
   ///
   /// \param lazyLoader If non-null, the lazy loader to use when creating the
@@ -1230,6 +1251,11 @@ public:
   /// method.
   bool isRecursivelyConstructingRequirementMachine(
       CanGenericSignature sig);
+
+  /// This is a hack to break cycles. Don't introduce new callers of this
+  /// method.
+  bool isRecursivelyConstructingRequirementMachine(
+      const ProtocolDecl *proto);
 
   /// Retrieve a generic signature with a single unconstrained type parameter,
   /// like `<T>`.

@@ -103,6 +103,16 @@ SILModule &SILInstruction::getModule() const {
   return getFunction()->getModule();
 }
 
+SILInstruction *SILInstruction::getPreviousInstruction() {
+  auto pos = getIterator();
+  return pos == getParent()->begin() ? nullptr : &*std::prev(pos);
+}
+
+SILInstruction *SILInstruction::getNextInstruction() {
+  auto nextPos = std::next(getIterator());
+  return nextPos == getParent()->end() ? nullptr : &*nextPos;
+}
+
 void SILInstruction::removeFromParent() {
 #ifndef NDEBUG
   for (auto result : getResults()) {
@@ -358,6 +368,10 @@ namespace {
     }
 
     bool visitDeallocStackInst(const DeallocStackInst *RHS) {
+      return true;
+    }
+
+    bool visitDeallocStackRefInst(const DeallocStackRefInst *RHS) {
       return true;
     }
 
@@ -1275,13 +1289,8 @@ bool SILInstruction::isAllocatingStack() const {
 }
 
 bool SILInstruction::isDeallocatingStack() const {
-  if (isa<DeallocStackInst>(this))
+  if (isa<DeallocStackInst>(this) || isa<DeallocStackRefInst>(this))
     return true;
-
-  if (auto *DRI = dyn_cast<DeallocRefInst>(this)) {
-    if (DRI->canAllocOnStack())
-      return true;
-  }
 
   if (auto *BI = dyn_cast<BuiltinInst>(this)) {
     if (BI->getBuiltinKind() == BuiltinValueKind::StackDealloc) {

@@ -1239,6 +1239,85 @@ public:
   }
 };
 
+namespace {
+class OpenTypeSequenceElements {
+  ConstraintSystem &CS;
+  int64_t argIdx;
+  Type patternTy;
+  // A map that relates a type variable opened for a reference to a type
+  // sequence to an array of parallel type variables, one for each argument.
+  llvm::MapVector<TypeVariableType *, SmallVector<TypeVariableType *, 2>> SequenceElementCache;
+
+public:
+  OpenTypeSequenceElements(ConstraintSystem &CS, PackExpansionType *PET)
+      : CS(CS), argIdx(-1), patternTy(PET->getPatternType()) {}
+
+public:
+  Type expandParameter() {
+    argIdx += 1;
+    return patternTy.transform(*this);
+  }
+
+  void intoPackTypes(llvm::function_ref<void(TypeVariableType *, Type)> fn) && {
+    if (argIdx == -1) {
+      (void)patternTy.transform(*this);
+      for (auto &entry : SequenceElementCache) {
+        entry.second.clear();
+      }
+    }
+
+    for (const auto &entry : SequenceElementCache) {
+      SmallVector<Type, 8> elements;
+      llvm::transform(entry.second, std::back_inserter(elements), [](Type t) {
+        return t;
+      });
+      auto packType = PackType::get(CS.getASTContext(), elements);
+      fn(entry.first, packType);
+    }
+  }
+
+  Type operator()(Type Ty) {
+    if (!Ty || !Ty->isTypeVariableOrMember())
+      return Ty;
+
+    auto *TV = Ty->getAs<TypeVariableType>();
+    if (!TV)
+      return Ty;
+
+    // Leave plain opened type variables alone.
+    if (!TV->getImpl().getGenericParameter()->isTypeSequence())
+      return TV;
+
+    // Create a clone of the type sequence type variable.
+    auto *clonedTV = CS.createTypeVariable(TV->getImpl().getLocator(),
+                                           TV->getImpl().getRawOptions());
+
+    // Is there an entry for this type sequence?
+    const auto &entries = SequenceElementCache.find(TV);
+    if (entries == SequenceElementCache.end()) {
+      // We're just seeing this type sequence fresh, so enter a new type
+      // variable in its place and cache down the fact we just saw it.
+      SequenceElementCache[TV] = {clonedTV};
+    } else if ((int64_t)entries->second.size() <= argIdx) {
+      // We've seen this type sequence before, but we have a brand new element.
+      // Expand the cache entry.
+      SequenceElementCache[TV].push_back(clonedTV);
+    } else {
+      // Not only have we seen this type sequence before, we've seen this
+      // argument index before. Extract the old cache entry, emplace the new
+      // one, and bind them together.
+      auto *oldEntry = SequenceElementCache[TV][argIdx];
+      SequenceElementCache[TV][argIdx] = clonedTV;
+
+      CS.addConstraint(ConstraintKind::Bind, oldEntry, clonedTV,
+                       TV->getImpl().getLocator());
+    }
+
+    return clonedTV;
+  }
+};
+}
+
 // Match the argument of a call to the parameter.
 ConstraintSystem::TypeMatchResult constraints::matchCallArguments(
     ConstraintSystem &cs, FunctionType *contextualType,
@@ -1376,14 +1455,47 @@ ConstraintSystem::TypeMatchResult constraints::matchCallArguments(
 
   for (unsigned paramIdx = 0, numParams = parameterBindings.size();
        paramIdx != numParams; ++paramIdx){
-    // Skip unfulfilled parameters. There's nothing to do for them.
-    if (parameterBindings[paramIdx].empty())
-      continue;
-
     // Determine the parameter type.
     const auto &param = params[paramIdx];
     auto paramTy = param.getOldType();
 
+    // Type sequences ingest the entire set of argument bindings as
+    // a pack type bound to the sequence archetype for the parameter.
+    //
+    // We pull these out special because variadic parameters ban lots of
+    // the more interesting typing constructs called out below like
+    // inout and @autoclosure.
+    if (paramInfo.isVariadicGenericParameter(paramIdx)) {
+      auto *PET = paramTy->castTo<PackExpansionType>();
+      OpenTypeSequenceElements openTypeSequence{cs, PET};
+      for (auto argIdx : parameterBindings[paramIdx]) {
+        const auto &argument = argsWithLabels[argIdx];
+        auto argTy = argument.getPlainType();
+
+        // First, re-open the parameter type so we bind the elements of the type
+        // sequence into their proper positions.
+        auto substParamTy = openTypeSequence.expandParameter();
+
+        cs.addConstraint(
+            subKind, argTy, substParamTy, loc, /*isFavored=*/false);
+      }
+
+      // Now that we have the pack mappings, bind the raw type sequence to the
+      // whole parameter pack. This ensures references to the type sequence in
+      // return position refer to the whole pack of elements we just gathered.
+      std::move(openTypeSequence)
+          .intoPackTypes([&](TypeVariableType *tsParam, Type pack) {
+            cs.addConstraint(ConstraintKind::Bind, pack, tsParam, loc,
+                             /*isFavored=*/false);
+          });
+
+      continue;
+    }
+
+    // Skip unfulfilled parameters. There's nothing to do for them.
+    if (parameterBindings[paramIdx].empty())
+      continue;
+    
     // Compare each of the bound arguments for this parameter.
     for (auto argIdx : parameterBindings[paramIdx]) {
       auto loc = locator.withPathElement(LocatorPathElt::ApplyArgToParam(
@@ -1505,6 +1617,7 @@ ConstraintSystem::TypeMatchResult constraints::matchCallArguments(
           }
         }
       }
+
       if (!argument.isCompileTimeConst() && param.isCompileTimeConst()) {
         auto *locator = cs.getConstraintLocator(loc);
         SourceRange range;
@@ -1530,6 +1643,7 @@ ConstraintSystem::TypeMatchResult constraints::matchCallArguments(
 
   return cs.getTypeMatchSuccess();
 }
+
 
 ConstraintSystem::TypeMatchResult
 ConstraintSystem::matchFunctionResultTypes(Type expectedResult, Type fnResult,
@@ -1746,6 +1860,29 @@ ConstraintSystem::matchTupleTypes(TupleType *tuple1, TupleType *tuple2,
     auto result = matchTypes(elt1.getType(), elt2.getType(), subKind, subflags,
                        locator.withPathElement(
                                         LocatorPathElt::TupleElement(idx1)));
+    if (result.isFailure())
+      return result;
+  }
+
+  return getTypeMatchSuccess();
+}
+
+ConstraintSystem::TypeMatchResult
+ConstraintSystem::matchPackTypes(PackType *pack1, PackType *pack2,
+                                 ConstraintKind kind, TypeMatchOptions flags,
+                                 ConstraintLocatorBuilder locator) {
+  TypeMatchOptions subflags = getDefaultDecompositionOptions(flags);
+  if (pack1->getNumElements() != pack2->getNumElements())
+    return getTypeMatchFailure(locator);
+
+  for (unsigned i = 0, n = pack1->getNumElements(); i != n; ++i) {
+    Type ty1 = pack1->getElementType(i);
+    Type ty2 = pack2->getElementType(i);
+
+    // Compare the element types.
+    auto result =
+        matchTypes(ty1, ty2, kind, subflags,
+                   locator.withPathElement(LocatorPathElt::PackElement(i)));
     if (result.isFailure())
       return result;
   }
@@ -2171,7 +2308,7 @@ ConstraintSystem::matchFunctionTypes(FunctionType *func1, FunctionType *func2,
 
   /// Whether to downgrade to a concurrency warning.
   auto isConcurrencyWarning = [&] {
-    if (contextRequiresStrictConcurrencyChecking(DC))
+    if (contextRequiresStrictConcurrencyChecking(DC, GetClosureType{*this}))
       return false;
 
     switch (kind) {
@@ -2714,12 +2851,10 @@ ConstraintSystem::matchDeepEqualityTypes(Type type1, Type type2,
     auto arch2 = type2->castTo<ArchetypeType>();
     auto opaque1 = cast<OpaqueTypeArchetypeType>(arch1->getRoot());
     auto opaque2 = cast<OpaqueTypeArchetypeType>(arch2->getRoot());
-    assert(arch1->getInterfaceType()->getCanonicalType(
-                      opaque1->getGenericEnvironment()->getGenericSignature())
-        == arch2->getInterfaceType()->getCanonicalType(
-                      opaque2->getGenericEnvironment()->getGenericSignature()));
     assert(opaque1->getDecl() == opaque2->getDecl());
-    
+    assert(opaque1->getCanonicalInterfaceType(arch1->getInterfaceType())->isEqual(
+               opaque2->getCanonicalInterfaceType(arch2->getInterfaceType())));
+
     auto args1 = opaque1->getSubstitutions().getReplacementTypes();
     auto args2 = opaque2->getSubstitutions().getReplacementTypes();
 
@@ -2920,7 +3055,13 @@ ConstraintSystem::matchExistentialTypes(Type type1, Type type2,
 
   // Handle existential metatypes.
   if (auto meta1 = type1->getAs<MetatypeType>()) {
-    if (auto meta2 = type2->getAs<ExistentialMetatypeType>()) {
+    ExistentialMetatypeType *meta2;
+    if (auto existential = type2->getAs<ExistentialType>()) {
+      meta2 = existential->getConstraintType()->getAs<ExistentialMetatypeType>();
+    } else {
+      meta2 = type2->getAs<ExistentialMetatypeType>();
+    }
+    if (meta2) {
       return matchExistentialTypes(meta1->getInstanceType(),
                                    meta2->getInstanceType(), kind, subflags,
                                    locator.withPathElement(
@@ -5674,6 +5815,7 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
     case TypeKind::GenericFunction:
       llvm_unreachable("Polymorphic function type should have been opened");
 
+    case TypeKind::Existential:
     case TypeKind::ProtocolComposition:
       switch (kind) {
       case ConstraintKind::Equal:
@@ -5752,13 +5894,11 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
       auto rootOpaque1 = dyn_cast<OpaqueTypeArchetypeType>(nested1->getRoot());
       auto rootOpaque2 = dyn_cast<OpaqueTypeArchetypeType>(nested2->getRoot());
       if (rootOpaque1 && rootOpaque2) {
-        auto interfaceTy1 = nested1->getInterfaceType()
-          ->getCanonicalType(rootOpaque1->getGenericEnvironment()
-                                        ->getGenericSignature());
-        auto interfaceTy2 = nested2->getInterfaceType()
-          ->getCanonicalType(rootOpaque2->getGenericEnvironment()
-                                        ->getGenericSignature());
-        if (interfaceTy1 == interfaceTy2
+        auto interfaceTy1 = rootOpaque1->getCanonicalInterfaceType(
+            nested1->getInterfaceType());
+        auto interfaceTy2 = rootOpaque2->getCanonicalInterfaceType(
+            nested2->getInterfaceType());
+        if (interfaceTy1->isEqual(interfaceTy2)
             && rootOpaque1->getDecl() == rootOpaque2->getDecl()) {
           conversionsOrFixes.push_back(ConversionRestrictionKind::DeepEquality);
           break;
@@ -5772,6 +5912,18 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
       // If the archetypes aren't rooted in an opaque type, or are rooted in
       // completely different decls, then there's nothing else we can do.
       return getTypeMatchFailure(locator);
+    }
+    case TypeKind::Pack: {
+      auto tmpPackLoc = locator.withPathElement(LocatorPathElt::PackType(type1));
+      auto packLoc = tmpPackLoc.withPathElement(LocatorPathElt::PackType(type2));
+      return matchPackTypes(cast<PackType>(desugar1),
+                            cast<PackType>(desugar2),
+                            kind, subflags, packLoc);
+    }
+    case TypeKind::PackExpansion: {
+      return matchTypes(cast<PackExpansionType>(desugar1)->getPatternType(),
+                        cast<PackExpansionType>(desugar2)->getPatternType(),
+                        kind, subflags, locator);
     }
     }
   }
@@ -5859,6 +6011,10 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
                                   type1, type2, locator);
           return getTypeMatchSuccess();
         };
+
+      // Foreign reference types do *not* conform to AnyObject.
+      if (type1->isForeignReferenceType() && type2->isAnyObject())
+        return getTypeMatchFailure(locator);
       
       if (auto meta1 = type1->getAs<MetatypeType>()) {
         if (meta1->getInstanceType()->mayHaveSuperclass()
@@ -6083,6 +6239,15 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
           }
           break;
         }
+      }
+    }
+
+    // A Pack of (Ts...) is convertible to a tuple (X, Y, Z) as long as there
+    // is an element-wise match.
+    if (auto *expansionTy = type1->getAs<PackType>()) {
+      if (!type2->isTypeVariableOrMember()) {
+        conversionsOrFixes.push_back(
+            ConversionRestrictionKind::ReifyPackToType);
       }
     }
   }
@@ -6314,6 +6479,7 @@ ConstraintSystem::simplifyConstructionConstraint(
   case TypeKind::DynamicSelf:
   case TypeKind::ProtocolComposition:
   case TypeKind::Protocol:
+  case TypeKind::Existential:
     // Break out to handle the actual construction below.
     break;
 
@@ -6328,7 +6494,9 @@ ConstraintSystem::simplifyConstructionConstraint(
   case TypeKind::Function:
   case TypeKind::LValue:
   case TypeKind::InOut:
-  case TypeKind::Module: {
+  case TypeKind::Module:
+  case TypeKind::Pack:
+  case TypeKind::PackExpansion: {
     // If solver is in the diagnostic mode and this is an invalid base,
     // let's give solver a chance to repair it to produce a good diagnostic.
     if (shouldAttemptFixes())
@@ -8640,8 +8808,8 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyMemberConstraint(
             baseTy->getMetatypeInstanceType()->getAs<ArchetypeType>()) {
       if (auto genericTy =
               archetype->mapTypeOutOfContext()->getAs<GenericTypeParamType>()) {
-        for (auto param :
-             archetype->getGenericEnvironment()->getGenericParams()) {
+        for (auto param : DC->getGenericSignatureOfContext()
+                              .getGenericParams()) {
           // Find a param at the same depth and one index past the type we're
           // dealing with
           if (param->getDepth() != genericTy->getDepth() ||
@@ -10690,6 +10858,11 @@ getDynamicCallableMethods(Type type, ConstraintSystem &CS,
     if (auto protocolComp = dyn_cast<ProtocolCompositionType>(canType))
       return calculateForComponentTypes(protocolComp->getMembers());
 
+    if (auto existential = dyn_cast<ExistentialType>(canType)) {
+      auto constraint = existential->getConstraintType();
+      return getDynamicCallableMethods(constraint, CS, locator);
+    }
+
     // Otherwise, this must be a nominal type.
     // Dynamic calling doesn't work for tuples, etc.
     auto nominal = canType->getAnyNominal();
@@ -11453,6 +11626,22 @@ ConstraintSystem::simplifyRestrictedConstraintImpl(
         {getConstraintLocator(locator), restriction});
     return SolutionKind::Solved;
   }
+  case ConversionRestrictionKind::ReifyPackToType: {
+    type1 = simplifyType(type1);
+    auto *PET = type1->castTo<PackType>();
+    if (auto *TT = type2->getAs<TupleType>()) {
+      llvm::SmallVector<TupleTypeElt, 8> elts;
+      for (Type elt : PET->getElementTypes()) {
+        elts.push_back(elt);
+      }
+      Type tupleType1 = TupleType::get(elts, getASTContext());
+      return matchTypes(tupleType1, TT, ConstraintKind::Bind, subflags,
+                        locator);
+    } else {
+      return matchTypes(PET->getElementType(0), type2, ConstraintKind::Bind,
+                        subflags, locator);
+    }
+  }
   }
   
   llvm_unreachable("bad conversion restriction");
@@ -11657,9 +11846,16 @@ bool ConstraintSystem::recordFix(ConstraintFix *fix, unsigned impact) {
   // current anchor or, in case of anchor being an expression, any of
   // its sub-expressions.
   llvm::SmallDenseSet<ASTNode> anchors;
-  for (const auto *fix : Fixes)
-    anchors.insert(fix->getAnchor());
+  for (const auto *fix : Fixes) {
+    // Warning fixes shouldn't be considered because even if
+    // such fix is recorded at that anchor this should not
+    // have any affect in the recording of any other fix.
+    if (fix->isWarning())
+      continue;
 
+    anchors.insert(fix->getAnchor());
+  }
+  
   bool found = false;
   if (auto *expr = getAsExpr(anchor)) {
     forEachExpr(expr, [&](Expr *subExpr) -> Expr * {

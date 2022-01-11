@@ -276,6 +276,7 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::CheckedCastAddrBranchInst:
   case SILInstructionKind::CheckedCastValueBranchInst:
   case SILInstructionKind::DeallocStackInst:
+  case SILInstructionKind::DeallocStackRefInst:
   case SILInstructionKind::DeallocRefInst:
   case SILInstructionKind::DeallocPartialRefInst:
   case SILInstructionKind::DeallocBoxInst:
@@ -405,8 +406,6 @@ void updateOpaqueArchetypes(SILFunction &F) {
 /// pipeline.
 class SerializeSILPass : public SILModuleTransform {
     
-  bool onlyForCrossModuleOptimization;
-    
   /// Removes [serialized] from all functions. This allows for more
   /// optimizations and for a better dead function elimination.
   void removeSerializedFlagFromAllFunctions(SILModule &M) {
@@ -438,9 +437,7 @@ class SerializeSILPass : public SILModuleTransform {
   }
 
 public:
-  SerializeSILPass(bool onlyForCrossModuleOptimization)
-    : onlyForCrossModuleOptimization(onlyForCrossModuleOptimization)
-  { }
+  SerializeSILPass() {}
   
   void run() override {
     auto &M = *getModule();
@@ -448,10 +445,6 @@ public:
     if (M.isSerialized())
       return;
     
-    if (onlyForCrossModuleOptimization &&
-        !M.getOptions().CrossModuleOptimization)
-      return;
-
     LLVM_DEBUG(llvm::dbgs() << "Serializing SILModule in SerializeSILPass\n");
     M.serialize();
 
@@ -460,9 +453,5 @@ public:
 };
 
 SILTransform *swift::createSerializeSILPass() {
-  return new SerializeSILPass(/* onlyForCrossModuleOptimization */ false);
-}
-
-SILTransform *swift::createCMOSerializeSILPass() {
-  return new SerializeSILPass(/* onlyForCrossModuleOptimization */ true);
+  return new SerializeSILPass();
 }

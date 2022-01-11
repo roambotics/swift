@@ -123,7 +123,7 @@ public:
     setInsertionPoint(I);
   }
 
-  // Used by libswift bridging.
+  // Used by swift bridging.
   explicit SILBuilder(SILInstruction *I, const SILDebugScope *debugScope)
       : TempContext(I->getFunction()->getModule()),
         C(TempContext), F(I->getFunction()), CurDebugScope(debugScope) {
@@ -2005,10 +2005,14 @@ public:
     return insert(new (getModule())
                       DeallocStackInst(getSILDebugLocation(Loc), operand));
   }
-  DeallocRefInst *createDeallocRef(SILLocation Loc, SILValue operand,
-                                   bool canBeOnStack) {
+  DeallocStackRefInst *createDeallocStackRef(SILLocation Loc,
+                                                     SILValue operand) {
+    return insert(new (getModule())
+                    DeallocStackRefInst(getSILDebugLocation(Loc), operand));
+  }
+  DeallocRefInst *createDeallocRef(SILLocation Loc, SILValue operand) {
     return insert(new (getModule()) DeallocRefInst(
-        getSILDebugLocation(Loc), operand, canBeOnStack));
+        getSILDebugLocation(Loc), operand));
   }
   DeallocPartialRefInst *createDeallocPartialRef(SILLocation Loc,
                                                  SILValue operand,

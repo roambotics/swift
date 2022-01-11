@@ -2211,9 +2211,10 @@ public:
   void visitDeallocStackInst(DeallocStackInst *DI) {
     *this << getIDAndType(DI->getOperand());
   }
+  void visitDeallocStackRefInst(DeallocStackRefInst *ESRL) {
+    *this << getIDAndType(ESRL->getOperand());
+  }
   void visitDeallocRefInst(DeallocRefInst *DI) {
-    if (DI->canAllocOnStack())
-      *this << "[stack] ";
     *this << getIDAndType(DI->getOperand());
   }
   void visitDeallocPartialRefInst(DeallocPartialRefInst *DPI) {
@@ -2883,6 +2884,9 @@ void SILFunction::print(SILPrintContext &PrintCtx) const {
   }
   if (isDynamicallyReplaceable()) {
     OS << "[dynamically_replacable] ";
+  }
+  if (isDistributed()) {
+    OS << "[distributed] ";
   }
   if (isExactSelfClass()) {
     OS << "[exact_self_class] ";

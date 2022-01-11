@@ -1898,6 +1898,48 @@ buildBuiltinLiteralArgs(SILGenFunction &SGF, SGFContext C,
 
 static inline PreparedArguments
 buildBuiltinLiteralArgs(SILGenFunction &SGF, SGFContext C,
+                        RegexLiteralExpr *expr) {
+  auto &ctx = SGF.getASTContext();
+  // %0 = string_literal <regex text>
+  auto strLiteralArgs = emitStringLiteral(SGF, expr, expr->getRegexText(), C,
+                                          StringLiteralExpr::Encoding::UTF8);
+  // %1 = function_ref String.init(
+  //   _builtinStringLiteral:utf8CodeUnitCount:isASCII:)
+  // %2 = apply %1(%0, ..., ...) -> $String
+  auto strInitDecl = ctx.getStringBuiltinInitDecl(ctx.getStringDecl());
+  RValue string = SGF.emitApplyAllocatingInitializer(
+      expr, strInitDecl, std::move(strLiteralArgs),
+      /*overriddenSelfType*/ Type(), SGFContext());
+
+  // The version of the regex string.
+  // %3 = integer_literal $Builtin.IntLiteral <version>
+  auto versionIntLiteral =
+      ManagedValue::forUnmanaged(SGF.B.createIntegerLiteral(
+          expr, SILType::getBuiltinIntegerLiteralType(SGF.getASTContext()),
+          expr->getVersion()));
+
+  using Param = AnyFunctionType::Param;
+  auto builtinIntTy = versionIntLiteral.getType().getASTType();
+  PreparedArguments versionIntBuiltinArgs(ArrayRef<Param>{Param(builtinIntTy)});
+  versionIntBuiltinArgs.add(
+      expr, RValue(SGF, {versionIntLiteral}, builtinIntTy));
+
+  // %4 = function_ref Int.init(_builtinIntegerLiteral: Builtin.IntLiteral)
+  // %5 = apply %5(%3, ...) -> $Int
+  auto intLiteralInit = ctx.getIntBuiltinInitDecl(ctx.getIntDecl());
+  RValue versionInt = SGF.emitApplyAllocatingInitializer(
+      expr, intLiteralInit, std::move(versionIntBuiltinArgs),
+      /*overriddenSelfType*/ Type(), SGFContext());
+
+  PreparedArguments args(ArrayRef<Param>{Param(ctx.getStringType()),
+                                         Param(ctx.getIntType())});
+  args.add(expr, std::move(string));
+  args.add(expr, std::move(versionInt));
+  return args;
+}
+
+static inline PreparedArguments
+buildBuiltinLiteralArgs(SILGenFunction &SGF, SGFContext C,
                         MagicIdentifierLiteralExpr *magicLiteral) {
   ASTContext &ctx = SGF.getASTContext();
   SourceLoc loc = magicLiteral->getStartLoc();
@@ -1961,6 +2003,8 @@ static inline PreparedArguments buildBuiltinLiteralArgs(SILGenFunction &SGF,
     return buildBuiltinLiteralArgs(SGF, C, integerLiteral);
   } else if (auto floatLiteral = dyn_cast<FloatLiteralExpr>(literal)) {
     return buildBuiltinLiteralArgs(SGF, C, floatLiteral);
+  } else if (auto regexLiteral = dyn_cast<RegexLiteralExpr>(literal)) {
+    return buildBuiltinLiteralArgs(SGF, C, regexLiteral);
   } else {
     return buildBuiltinLiteralArgs(
         SGF, C, cast<MagicIdentifierLiteralExpr>(literal));

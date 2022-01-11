@@ -265,11 +265,6 @@ Type ASTBuilder::resolveOpaqueType(NodePointer opaqueDescriptor,
     auto opaqueDecl = parentModule->lookupOpaqueResultType(mangledName);
     if (!opaqueDecl)
       return Type();
-    // TODO [OPAQUE SUPPORT]: multiple opaque types
-    assert(ordinal == 0 && "not implemented");
-    if (ordinal != 0)
-      return Type();
-    
     SmallVector<Type, 8> allArgs;
     for (auto argSet : args) {
       allArgs.append(argSet.begin(), argSet.end());
@@ -589,7 +584,12 @@ Type ASTBuilder::createProtocolCompositionType(
     members.push_back(protocol->getDeclaredInterfaceType());
   if (superclass && superclass->getClassOrBoundGenericClass())
     members.push_back(superclass);
-  return ProtocolCompositionType::get(Ctx, members, isClassBound);
+  Type composition = ProtocolCompositionType::get(Ctx, members, isClassBound);
+  if (Ctx.LangOpts.EnableExplicitExistentialTypes &&
+      !(composition->isAny() || composition->isAnyObject())) {
+    composition = ExistentialType::get(composition);
+  }
+  return composition;
 }
 
 static MetatypeRepresentation
@@ -607,6 +607,8 @@ getMetatypeRepresentation(ImplMetatypeRepresentation repr) {
 
 Type ASTBuilder::createExistentialMetatypeType(Type instance,
                           Optional<Demangle::ImplMetatypeRepresentation> repr) {
+  if (auto existential = instance->getAs<ExistentialType>())
+    instance = existential->getConstraintType();
   if (!instance->isAnyExistentialType())
     return Type();
   if (!repr)

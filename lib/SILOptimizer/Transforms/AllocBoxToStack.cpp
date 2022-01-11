@@ -718,7 +718,8 @@ SILFunction *PromotedParamCloner::initCloned(SILOptFunctionBuilder &FuncBuilder,
       swift::getSpecializedLinkage(Orig, Orig->getLinkage()), ClonedName,
       ClonedTy, Orig->getGenericEnvironment(), Orig->getLocation(),
       Orig->isBare(), Orig->isTransparent(), Serialized, IsNotDynamic,
-      Orig->getEntryCount(), Orig->isThunk(), Orig->getClassSubclassScope(),
+      IsNotDistributed, Orig->getEntryCount(), Orig->isThunk(),
+      Orig->getClassSubclassScope(),
       Orig->getInlineStrategy(), Orig->getEffectsKind(), Orig,
       Orig->getDebugScope());
   for (auto &Attr : Orig->getSemanticsAttrs()) {
@@ -932,6 +933,7 @@ specializeApplySite(SILOptFunctionBuilder &FuncBuilder, ApplySite Apply,
     SILValue Box = O.get();
     assert((isa<SingleValueInstruction>(Box) && isa<AllocBoxInst>(Box) ||
             isa<CopyValueInst>(Box) ||
+            isa<MarkUninitializedInst>(Box) ||
             isa<SILFunctionArgument>(Box)) &&
            "Expected either an alloc box or a copy of an alloc box or a "
            "function argument");
