@@ -296,6 +296,18 @@ static llvm::cl::opt<OptimizationMode> OptModeFlag(
                                 "ignore debug info, reduce runtime")),
     llvm::cl::init(OptimizationMode::NotSet));
 
+static llvm::cl::opt<IRGenDebugInfoLevel> IRGenDebugInfoLevelArg(
+    "irgen-debuginfo-level", llvm::cl::desc("IRGen debug info level"),
+    llvm::cl::values(clEnumValN(IRGenDebugInfoLevel::None, "none",
+                                "No debug info"),
+                     clEnumValN(IRGenDebugInfoLevel::LineTables, "line-tables",
+                                "Line tables only"),
+                     clEnumValN(IRGenDebugInfoLevel::ASTTypes, "ast-types",
+                                "Line tables + AST type references"),
+                     clEnumValN(IRGenDebugInfoLevel::DwarfTypes, "dwarf-types",
+                                "Line tables + AST type refs + Dwarf types")),
+    llvm::cl::init(IRGenDebugInfoLevel::ASTTypes));
+
 static llvm::cl::opt<OptGroup> OptimizationGroup(
     llvm::cl::desc("Predefined optimization groups:"),
     llvm::cl::values(
@@ -458,11 +470,6 @@ static llvm::cl::opt<bool>
                        llvm::cl::desc("Ignore [always_inline] attribute."),
                        llvm::cl::init(false));
 
-static llvm::cl::opt<std::string> EnableRequirementMachine(
-    "requirement-machine",
-    llvm::cl::desc("Control usage of experimental generics implementation: "
-                   "'on', 'off', or 'verify'."));
-
 static void runCommandLineSelectedPasses(SILModule *Module,
                                          irgen::IRGenModule *IRGenMod) {
   const SILOptions &opts = Module->getOptions();
@@ -582,23 +589,6 @@ int main(int argc, char **argv) {
   Invocation.getDiagnosticOptions().VerifyMode =
       VerifyMode ? DiagnosticOptions::Verify : DiagnosticOptions::NoVerify;
 
-  if (EnableRequirementMachine.size()) {
-    auto value = llvm::StringSwitch<Optional<RequirementMachineMode>>(
-        EnableRequirementMachine)
-      .Case("off", RequirementMachineMode::Disabled)
-      .Case("on", RequirementMachineMode::Enabled)
-      .Case("verify", RequirementMachineMode::Verify)
-      .Default(None);
-
-    if (value)
-      Invocation.getLangOptions().EnableRequirementMachine = *value;
-    else {
-      fprintf(stderr, "Invalid value for -requirement-machine flag: %s\n",
-              EnableRequirementMachine.c_str());
-      exit(-1);
-    }
-  }
-
   // Setup the SIL Options.
   SILOptions &SILOpts = Invocation.getSILOptions();
   SILOpts.InlineThreshold = SILInlineThreshold;
@@ -610,6 +600,7 @@ int main(int argc, char **argv) {
   SILOpts.OptRecordFile = RemarksFilename;
   SILOpts.OptRecordPasses = RemarksPasses;
   SILOpts.checkSILModuleLeaks = true;
+  SILOpts.EnablePerformanceAnnotations = true;
 
   SILOpts.VerifyExclusivity = VerifyExclusivity;
   if (EnforceExclusivity.getNumOccurrences() != 0) {
@@ -696,8 +687,19 @@ int main(int argc, char **argv) {
     SILOpts.OptMode = OptModeFlag;
   }
 
-  // Note: SILOpts must be set before the CompilerInstance is initializer below
-  // based on Invocation.
+  auto &IRGenOpts = Invocation.getIRGenOptions();
+  if (OptModeFlag == OptimizationMode::NotSet) {
+    if (OptimizationGroup == OptGroup::Diagnostics)
+      IRGenOpts.OptMode = OptimizationMode::NoOptimization;
+    else
+      IRGenOpts.OptMode = OptimizationMode::ForSpeed;
+  } else {
+    IRGenOpts.OptMode = OptModeFlag;
+  }
+  IRGenOpts.DebugInfoLevel = IRGenDebugInfoLevelArg;
+
+  // Note: SILOpts, LangOpts, and IRGenOpts must be set before the
+  // CompilerInstance is initializer below based on Invocation.
 
   serialization::ExtendedValidationInfo extendedInfo;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
@@ -795,7 +797,8 @@ int main(int argc, char **argv) {
   case OptGroup::Unknown: {
     auto T = irgen::createIRGenModule(
         SILMod.get(), Invocation.getOutputFilenameForAtMostOnePrimary(),
-        Invocation.getMainInputFilenameForDebugInfoForAtMostOnePrimary(), "");
+        Invocation.getMainInputFilenameForDebugInfoForAtMostOnePrimary(), "",
+        IRGenOpts);
     runCommandLineSelectedPasses(SILMod.get(), T.second);
     irgen::deleteIRGenModule(T);
     break;

@@ -78,28 +78,6 @@ TypeChecker::gatherGenericParamBindingsText(
   return result.str().str();
 }
 
-// An alias to avoid repeating the `SmallVector`'s size parameter.
-using CollectedOpaqueReprs = SmallVector<OpaqueReturnTypeRepr *, 2>;
-
-/// Walk `repr` recursively, collecting any `OpaqueReturnTypeRepr`s.
-static CollectedOpaqueReprs collectOpaqueReturnTypeReprs(TypeRepr *repr) {
-  class Walker : public ASTWalker {
-    CollectedOpaqueReprs &Reprs;
-
-  public:
-    explicit Walker(CollectedOpaqueReprs &reprs) : Reprs(reprs) {}
-
-    bool walkToTypeReprPre(TypeRepr *repr) override {
-      if (auto opaqueRepr = dyn_cast<OpaqueReturnTypeRepr>(repr))
-        Reprs.push_back(opaqueRepr);
-      return true;
-    }
-  };
-
-  CollectedOpaqueReprs reprs;
-  repr->walk(Walker(reprs));
-  return reprs;
-}
 
 //
 // Generic functions
@@ -206,7 +184,7 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
       return nullptr;
     }
   } else {
-    opaqueReprs = collectOpaqueReturnTypeReprs(repr);
+    opaqueReprs = repr->collectOpaqueReturnTypeReprs();
     SmallVector<GenericTypeParamType *, 2> genericParamTypes;
     SmallVector<Requirement, 2> requirements;
     for (unsigned i = 0; i < opaqueReprs.size(); ++i) {
@@ -248,27 +226,20 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
       if (constraintType->hasError())
         return nullptr;
 
-      // Error out if the constraint type isn't a class or existential type.
-      if (!constraintType->getClassOrBoundGenericClass() &&
-          !constraintType->isExistentialType()) {
+      RequirementKind kind;
+      if (constraintType->isConstraintType())
+        kind = RequirementKind::Conformance;
+      else if (constraintType->getClassOrBoundGenericClass())
+        kind = RequirementKind::Superclass;
+      else {
+        // Error out if the constraint type isn't a class or existential type.
         ctx.Diags.diagnose(currentRepr->getLoc(),
                            diag::opaque_type_invalid_constraint);
         return nullptr;
       }
 
-      if (constraintType->hasArchetype())
-        constraintType = constraintType->mapTypeOutOfContext();
-
-      if (constraintType->getClassOrBoundGenericClass()) {
-        requirements.push_back(
-            Requirement(RequirementKind::Superclass, paramType,
-                        constraintType));
-      } else {
-        // In this case, the constraint type is an existential
-        requirements.push_back(
-            Requirement(RequirementKind::Conformance, paramType,
-                        constraintType));
-      }
+      assert(!constraintType->hasArchetype());
+      requirements.emplace_back(kind, paramType, constraintType);
     }
 
     interfaceSignature = buildGenericSignature(ctx, outerGenericSignature,
@@ -306,7 +277,7 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
 
         ctx.Diags.diagnose(repr->getLoc(),
                            diag::opaque_type_in_parameter,
-                           interfaceType);
+                           false, interfaceType);
         return true;
       }
     }
@@ -536,7 +507,6 @@ void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
       // Produce an error that this generic parameter cannot be bound.
       paramDecl->diagnose(diag::unreferenced_generic_parameter,
                           paramDecl->getNameStr());
-      decl->setInvalid();
     }
   }
 }
@@ -559,6 +529,18 @@ static Type formExtensionInterfaceType(
   if (type->is<ProtocolCompositionType>())
     type = type->getCanonicalType();
 
+  // A parameterized protocol type is not a nominal. Unwrap it to get
+  // the underlying nominal, and record a same-type requirement for
+  // the primary associated type.
+  if (auto *paramProtoTy = type->getAs<ParameterizedProtocolType>()) {
+    auto *protoTy = paramProtoTy->getBaseType();
+    type = protoTy;
+
+    paramProtoTy->getRequirements(
+        protoTy->getDecl()->getSelfInterfaceType(),
+        sameTypeReqs);
+  }
+
   Type parentType = type->getNominalParent();
   GenericTypeDecl *genericDecl = type->getAnyGeneric();
 
@@ -577,8 +559,8 @@ static Type formExtensionInterfaceType(
   auto nominal = dyn_cast<NominalTypeDecl>(genericDecl);
   auto typealias = dyn_cast<TypeAliasDecl>(genericDecl);
   if (!nominal) {
-    Type underlyingType = typealias->getUnderlyingType();
-    nominal = underlyingType->getNominalOrBoundGenericNominal();
+    type = typealias->getUnderlyingType();
+    nominal = type->getNominalOrBoundGenericNominal();
   }
 
   // Form the result.
@@ -656,10 +638,12 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
       llvm::errs() << "\n";
       PD->printContext(llvm::errs());
       llvm::errs() << "Generic signature: ";
-      sig->print(llvm::errs());
+      PrintOptions Opts;
+      Opts.ProtocolQualifiedDependentMemberTypes = true;
+      sig->print(llvm::errs(), Opts);
       llvm::errs() << "\n";
       llvm::errs() << "Canonical generic signature: ";
-      sig.getCanonicalSignature()->print(llvm::errs());
+      sig.getCanonicalSignature()->print(llvm::errs(), Opts);
       llvm::errs() << "\n";
     }
     return sig;
@@ -817,10 +801,12 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
       GC->printContext(llvm::errs());
     }
     llvm::errs() << "Generic signature: ";
-    sig->print(llvm::errs());
+    PrintOptions Opts;
+    Opts.ProtocolQualifiedDependentMemberTypes = true;
+    sig->print(llvm::errs(), Opts);
     llvm::errs() << "\n";
     llvm::errs() << "Canonical generic signature: ";
-    sig.getCanonicalSignature()->print(llvm::errs());
+    sig.getCanonicalSignature()->print(llvm::errs(), Opts);
     llvm::errs() << "\n";
   }
 

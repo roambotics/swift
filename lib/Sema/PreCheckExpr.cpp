@@ -590,6 +590,10 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
           .diagnose(Loc, diag::cannot_find_in_scope, Name,
                     Name.isOperator())
           .highlight(UDRE->getSourceRange());
+      if (!Context.LangOpts.DisableExperimentalClangImporterDiagnostics) {
+        Context.getClangModuleLoader()->diagnoseTopLevelValue(
+            Name.getFullName());
+      }
     };
 
     if (!isConfused) {
@@ -2104,6 +2108,40 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
                                           call->getSourceRange(),
                                           typeExpr->getTypeRepr())
              : nullptr;
+}
+
+bool ConstraintSystem::preCheckTarget(SolutionApplicationTarget &target,
+                                      bool replaceInvalidRefsWithErrors,
+                                      bool leaveClosureBodiesUnchecked) {
+  auto *DC = target.getDeclContext();
+
+  bool hadErrors = false;
+
+  if (auto *expr = target.getAsExpr()) {
+    hadErrors |= preCheckExpression(expr, DC, replaceInvalidRefsWithErrors,
+                                    leaveClosureBodiesUnchecked);
+    // Even if the pre-check fails, expression still has to be re-set.
+    target.setExpr(expr);
+  }
+
+  if (target.isForEachStmt()) {
+    auto &info = target.getForEachStmtInfo();
+
+    if (info.whereExpr)
+      hadErrors |= preCheckExpression(info.whereExpr, DC,
+                                      /*replaceInvalidRefsWithErrors=*/true,
+                                      /*leaveClosureBodiesUnchecked=*/false);
+
+    // Update sequence and where expressions to pre-checked versions.
+    if (!hadErrors) {
+      info.stmt->setSequence(target.getAsExpr());
+
+      if (info.whereExpr)
+        info.stmt->setWhere(info.whereExpr);
+    }
+  }
+
+  return hadErrors;
 }
 
 /// Pre-check the expression, validating any types that occur in the

@@ -25,8 +25,9 @@ RequirementMachine::RequirementMachine(RewriteContext &ctx)
     : Context(ctx), System(ctx), Map(System) {
   auto &langOpts = ctx.getASTContext().LangOpts;
   Dump = langOpts.DumpRequirementMachine;
-  RequirementMachineStepLimit = langOpts.RequirementMachineStepLimit;
-  RequirementMachineDepthLimit = langOpts.RequirementMachineDepthLimit;
+  MaxRuleCount = langOpts.RequirementMachineMaxRuleCount;
+  MaxRuleLength = langOpts.RequirementMachineMaxRuleLength;
+  MaxConcreteNesting = langOpts.RequirementMachineMaxConcreteNesting;
   Stats = ctx.getASTContext().Stats;
 
   if (Stats)
@@ -35,33 +36,46 @@ RequirementMachine::RequirementMachine(RewriteContext &ctx)
 
 RequirementMachine::~RequirementMachine() {}
 
-static void checkCompletionResult(const RequirementMachine &machine,
-                                  CompletionResult result) {
+/// Checks the result of a completion in a context where we can't diagnose
+/// failure, either when building a rewrite system from an existing
+/// minimal signature (which should have been checked when it was
+/// minimized) or from AbstractGenericSignatureRequest (where failure
+/// is fatal).
+void RequirementMachine::checkCompletionResult(CompletionResult result) const {
   switch (result) {
   case CompletionResult::Success:
     break;
 
-  case CompletionResult::MaxIterations:
-    llvm::errs() << "Rewrite system exceeds maximum completion step count\n";
-    machine.dump(llvm::errs());
+  case CompletionResult::MaxRuleCount:
+    llvm::errs() << "Rewrite system exceeded maximum rule count\n";
+    dump(llvm::errs());
     abort();
 
-  case CompletionResult::MaxDepth:
-    llvm::errs() << "Rewrite system exceeds maximum completion depth\n";
-    machine.dump(llvm::errs());
+  case CompletionResult::MaxRuleLength:
+    llvm::errs() << "Rewrite system exceeded rule length limit\n";
+    dump(llvm::errs());
+    abort();
+
+  case CompletionResult::MaxConcreteNesting:
+    llvm::errs() << "Rewrite system exceeded concrete type nesting depth limit\n";
+    dump(llvm::errs());
     abort();
   }
 }
 
 /// Build a requirement machine for the requirements of a generic signature.
 ///
+/// In this mode, minimization is not going to be performed, so rewrite loops
+/// are not recorded.
+///
 /// This must only be called exactly once, before any other operations are
 /// performed on this requirement machine.
 ///
 /// Used by ASTContext::getOrCreateRequirementMachine().
 ///
-/// Asserts if completion fails within the configured number of steps.
-void RequirementMachine::initWithGenericSignature(CanGenericSignature sig) {
+/// Returns failure if completion fails within the configured number of steps.
+std::pair<CompletionResult, unsigned>
+RequirementMachine::initWithGenericSignature(CanGenericSignature sig) {
   Sig = sig;
   Params.append(sig.getGenericParams().begin(),
                 sig.getGenericParams().end());
@@ -76,7 +90,7 @@ void RequirementMachine::initWithGenericSignature(CanGenericSignature sig) {
 
   // Collect the top-level requirements, and all transtively-referenced
   // protocol requirement signatures.
-  RuleBuilder builder(Context, Dump);
+  RuleBuilder builder(Context, System.getProtocolMap());
   builder.addRequirements(sig.getRequirements());
 
   // Add the initial set of rewrite rules to the rewrite system.
@@ -86,16 +100,20 @@ void RequirementMachine::initWithGenericSignature(CanGenericSignature sig) {
                     std::move(builder.RequirementRules));
 
   auto result = computeCompletion(RewriteSystem::DisallowInvalidRequirements);
-  checkCompletionResult(*this, result);
 
   if (Dump) {
     llvm::dbgs() << "}\n";
   }
+
+  return result;
 }
 
 /// Build a requirement machine for the structural requirements of a set
 /// of protocols, which are understood to form a strongly-connected component
 /// (SCC) of the protocol dependency graph.
+///
+/// In this mode, minimization will be performed, so rewrite loops are recorded
+/// during completion.
 ///
 /// This must only be called exactly once, before any other operations are
 /// performed on this requirement machine.
@@ -103,7 +121,7 @@ void RequirementMachine::initWithGenericSignature(CanGenericSignature sig) {
 /// Used by RequirementSignatureRequest.
 ///
 /// Returns failure if completion fails within the configured number of steps.
-CompletionResult
+std::pair<CompletionResult, unsigned>
 RequirementMachine::initWithProtocols(ArrayRef<const ProtocolDecl *> protos) {
   FrontendStatsTracer tracer(Stats, "build-rewrite-system");
 
@@ -115,7 +133,7 @@ RequirementMachine::initWithProtocols(ArrayRef<const ProtocolDecl *> protos) {
     llvm::dbgs() << " {\n";
   }
 
-  RuleBuilder builder(Context, Dump);
+  RuleBuilder builder(Context, System.getProtocolMap());
   builder.addProtocols(protos);
 
   // Add the initial set of rewrite rules to the rewrite system.
@@ -133,57 +151,18 @@ RequirementMachine::initWithProtocols(ArrayRef<const ProtocolDecl *> protos) {
 }
 
 /// Build a requirement machine from a set of generic parameters and
-/// (possibly non-canonical or non-minimal) abstract requirements.
-///
-/// This must only be called exactly once, before any other operations are
-/// performed on this requirement machine.
-///
-/// Used by AbstractGenericSignatureRequest.
-///
-/// Asserts if completion fails within the configured number of steps.
-void RequirementMachine::initWithAbstractRequirements(
-    ArrayRef<GenericTypeParamType *> genericParams,
-    ArrayRef<Requirement> requirements) {
-  Params.append(genericParams.begin(), genericParams.end());
-
-  FrontendStatsTracer tracer(Stats, "build-rewrite-system");
-
-  if (Dump) {
-    llvm::dbgs() << "Adding generic parameters:";
-    for (auto *paramTy : genericParams)
-      llvm::dbgs() << " " << Type(paramTy);
-    llvm::dbgs() << "\n";
-  }
-
-  // Collect the top-level requirements, and all transtively-referenced
-  // protocol requirement signatures.
-  RuleBuilder builder(Context, Dump);
-  builder.addRequirements(requirements);
-
-  // Add the initial set of rewrite rules to the rewrite system.
-  System.initialize(/*recordLoops=*/true,
-                    /*protos=*/ArrayRef<const ProtocolDecl *>(),
-                    std::move(builder.PermanentRules),
-                    std::move(builder.RequirementRules));
-
-  auto result = computeCompletion(RewriteSystem::AllowInvalidRequirements);
-  checkCompletionResult(*this, result);
-
-  if (Dump) {
-    llvm::dbgs() << "}\n";
-  }
-}
-
-/// Build a requirement machine from a set of generic parameters and
 /// structural requirements.
 ///
+/// In this mode, minimization will be performed, so rewrite loops are recorded
+/// during completion.
+///
 /// This must only be called exactly once, before any other operations are
 /// performed on this requirement machine.
 ///
-/// Used by InferredGenericSignatureRequest.
+/// Used by AbstractGenericSignatureRequest and InferredGenericSignatureRequest.
 ///
 /// Returns failure if completion fails within the configured number of steps.
-CompletionResult
+std::pair<CompletionResult, unsigned>
 RequirementMachine::initWithWrittenRequirements(
     ArrayRef<GenericTypeParamType *> genericParams,
     ArrayRef<StructuralRequirement> requirements) {
@@ -200,7 +179,7 @@ RequirementMachine::initWithWrittenRequirements(
 
   // Collect the top-level requirements, and all transtively-referenced
   // protocol requirement signatures.
-  RuleBuilder builder(Context, Dump);
+  RuleBuilder builder(Context, System.getProtocolMap());
   builder.addRequirements(requirements);
 
   // Add the initial set of rewrite rules to the rewrite system.
@@ -221,46 +200,71 @@ RequirementMachine::initWithWrittenRequirements(
 /// Attempt to obtain a confluent rewrite system by iterating the Knuth-Bendix
 /// completion procedure together with property map construction until fixed
 /// point.
-CompletionResult
+///
+/// Returns a pair where the first element is the status. If the status is not
+/// CompletionResult::Success, the second element of the pair is the rule ID
+/// which triggered failure.
+std::pair<CompletionResult, unsigned>
 RequirementMachine::computeCompletion(RewriteSystem::ValidityPolicy policy) {
   while (true) {
-    // First, run the Knuth-Bendix algorithm to resolve overlapping rules.
-    auto result = System.computeConfluentCompletion(
-        RequirementMachineStepLimit,
-        RequirementMachineDepthLimit);
+    {
+      unsigned ruleCount = System.getRules().size();
 
-    if (Stats) {
-      Stats->getFrontendCounters()
-          .NumRequirementMachineCompletionSteps += result.second;
+      // First, run the Knuth-Bendix algorithm to resolve overlapping rules.
+      auto result = System.computeConfluentCompletion(MaxRuleCount, MaxRuleLength);
+
+      unsigned rulesAdded = (System.getRules().size() - ruleCount);
+
+      if (Stats) {
+        Stats->getFrontendCounters()
+            .NumRequirementMachineCompletionSteps += rulesAdded;
+      }
+
+      // Check for failure.
+      if (result.first != CompletionResult::Success)
+        return result;
+
+      // Check invariants.
+      System.verifyRewriteRules(policy);
     }
 
-    // Check for failure.
-    if (result.first != CompletionResult::Success)
-      return result.first;
+    {
+      unsigned ruleCount = System.getRules().size();
 
-    // Check invariants.
-    System.verifyRewriteRules(policy);
+      // Build the property map, which also performs concrete term
+      // unification; if this added any new rules, run the completion
+      // procedure again.
+      Map.buildPropertyMap();
 
-    // Build the property map, which also performs concrete term
-    // unification; if this added any new rules, run the completion
-    // procedure again.
-    result = Map.buildPropertyMap(
-        RequirementMachineStepLimit,
-        RequirementMachineDepthLimit);
+      unsigned rulesAdded = (System.getRules().size() - ruleCount);
 
-    if (Stats) {
-      Stats->getFrontendCounters()
-        .NumRequirementMachineUnifiedConcreteTerms += result.second;
+      if (Stats) {
+        Stats->getFrontendCounters()
+          .NumRequirementMachineUnifiedConcreteTerms += rulesAdded;
+      }
+
+      // Check new rules added by the property map against configured limits.
+      for (unsigned i = 0; i < rulesAdded; ++i) {
+        const auto &newRule = System.getRule(ruleCount + i);
+        if (newRule.getDepth() > MaxRuleLength) {
+          return std::make_pair(CompletionResult::MaxRuleLength,
+                                ruleCount + i);
+        }
+        if (newRule.getNesting() > MaxConcreteNesting) {
+          return std::make_pair(CompletionResult::MaxConcreteNesting,
+                                ruleCount + i);
+        }
+      }
+
+      if (System.getRules().size() > MaxRuleCount) {
+        return std::make_pair(CompletionResult::MaxRuleCount,
+                              System.getRules().size() - 1);
+      }
+
+      // If buildPropertyMap() didn't add any new rules, we are done.
+      if (rulesAdded == 0)
+        break;
     }
-
-    // Check for failure.
-    if (result.first != CompletionResult::Success)
-      return result.first;
-
-    // If buildPropertyMap() added new rules, we run another round of
-    // Knuth-Bendix, and build the property map again.
-    if (result.second == 0)
-      break;
   }
 
   if (Dump) {
@@ -270,7 +274,17 @@ RequirementMachine::computeCompletion(RewriteSystem::ValidityPolicy policy) {
   assert(!Complete);
   Complete = true;
 
-  return CompletionResult::Success;
+  return std::make_pair(CompletionResult::Success, 0);
+}
+
+std::string RequirementMachine::getRuleAsStringForDiagnostics(
+    unsigned ruleID) const {
+  const auto &rule = System.getRule(ruleID);
+
+  std::string result;
+  llvm::raw_string_ostream out(result);
+  out << rule;
+  return out.str();
 }
 
 bool RequirementMachine::isComplete() const {
@@ -288,9 +302,10 @@ void RequirementMachine::dump(llvm::raw_ostream &out) const {
   if (Sig)
     out << Sig;
   else if (!Params.empty()) {
-    out << "fresh signature ";
+    out << "fresh signature <";
     for (auto paramTy : Params)
       out << " " << Type(paramTy);
+    out << " >";
   } else {
     auto protos = System.getProtocols();
     assert(!protos.empty());

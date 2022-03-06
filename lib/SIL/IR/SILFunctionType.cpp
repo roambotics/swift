@@ -394,11 +394,45 @@ static CanGenericSignature buildDifferentiableGenericSignature(CanGenericSignatu
   if (origTypeOfAbstraction) {
     (void) origTypeOfAbstraction.findIf([&](Type t) -> bool {
       if (auto *at = t->getAs<ArchetypeType>()) {
-        types.insert(at->getInterfaceType()->getCanonicalType());
-        for (auto *proto : at->getConformsTo()) {
-          reqs.push_back(Requirement(RequirementKind::Conformance,
-                                     at->getInterfaceType(),
-                                     proto->getDeclaredInterfaceType()));
+        auto interfaceTy = at->getInterfaceType();
+        auto genericParams = sig.getGenericParams();
+
+        // The GSB used to drop requirements which reference non-existent
+        // generic parameters, whereas the RequirementMachine asserts now.
+        // Filter thes requirements out explicitly to preserve the old
+        // behavior.
+        if (std::find_if(genericParams.begin(), genericParams.end(),
+                         [interfaceTy](CanGenericTypeParamType t) -> bool {
+                           return t->isEqual(interfaceTy->getRootGenericParam());
+                         }) != genericParams.end()) {
+          types.insert(interfaceTy->getCanonicalType());
+
+          for (auto *proto : at->getConformsTo()) {
+            reqs.push_back(Requirement(RequirementKind::Conformance,
+                                       interfaceTy,
+                                       proto->getDeclaredInterfaceType()));
+          }
+
+          // The GSB would add conformance requirements if a nested type
+          // requirement involving a resolved DependentMemberType was added;
+          // eg, if you start with <T> and add T.[P]A == Int, it would also
+          // add the conformance requirement T : P.
+          //
+          // This was not an intended behavior on the part of the GSB, and the
+          // logic here is a complete mess, so just simulate the old behavior
+          // here.
+          auto parentTy = interfaceTy;
+          while (parentTy) {
+            if (auto memberTy = parentTy->getAs<DependentMemberType>()) {
+              parentTy = memberTy->getBase();
+              if (auto *assocTy = memberTy->getAssocType()) {
+                reqs.push_back(Requirement(RequirementKind::Conformance,
+                                           parentTy,
+                                           assocTy->getProtocol()->getDeclaredInterfaceType()));
+              }
+            } else
+              parentTy = Type();
+          }
         }
       }
       return false;
@@ -702,7 +736,7 @@ static CanSILFunctionType getAutoDiffPullbackType(
   for (auto &param : diffParams) {
     // Skip `inout` parameters, which semantically behave as original results
     // and always appear as pullback parameters.
-    if (param.isIndirectInOut())
+    if (param.isIndirectMutating())
       continue;
     auto paramTanType = getAutoDiffTangentTypeForLinearMap(
         param.getInterfaceType(), lookupConformance,
@@ -1289,6 +1323,14 @@ static bool isClangTypeMoreIndirectThanSubstType(TypeConverter &TC,
 
     return true;
   }
+
+  // Pass C++ const reference types indirectly. Right now there's no way to
+  // express immutable borrowed params, so we have to have this hack.
+  // Eventually, we should just express these correctly: rdar://89647503
+  if (clangTy->isReferenceType() &&
+      clangTy->getPointeeType().isConstQualified())
+    return true;
+
   return false;
 }
 
@@ -2686,9 +2728,9 @@ public:
         TheDecl(decl), isMutating(isMutating) {}
   ParameterConvention
   getIndirectSelfParameter(const AbstractionPattern &type) const override {
-    llvm_unreachable(
-        "cxx functions do not have a Swift self parameter; "
-        "foreign self parameter is handled in getIndirectParameter");
+    if (isMutating)
+      return ParameterConvention::Indirect_Inout;
+    return ParameterConvention::Indirect_In_Guaranteed;
   }
 
   ParameterConvention
@@ -2696,9 +2738,7 @@ public:
                        const TypeLowering &substTL) const override {
     // `self` is the last parameter.
     if (index == TheDecl->getNumParams()) {
-      if (isMutating)
-        return ParameterConvention::Indirect_Inout;
-      return ParameterConvention::Indirect_In_Guaranteed;
+      return getIndirectSelfParameter(type);
     }
     return super::getIndirectParameter(index, type, substTL);
   }
@@ -4390,8 +4430,9 @@ SILFunctionType::isABICompatibleWith(CanSILFunctionType other,
   if (getRepresentation() != other->getRepresentation())
     return ABICompatibilityCheckResult::DifferentFunctionRepresentations;
 
-  // `() async -> ()` is not compatible with `() async -> @error Error`.
-  if (!hasErrorResult() && other->hasErrorResult() && isAsync()) {
+  // `() async -> ()` is not compatible with `() async -> @error Error` and
+  // vice versa.
+  if (hasErrorResult() != other->hasErrorResult() && isAsync()) {
     return ABICompatibilityCheckResult::DifferentErrorResultConventions;
   }
 

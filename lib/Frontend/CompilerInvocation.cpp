@@ -360,6 +360,9 @@ static void ParseModuleInterfaceArgs(ModuleInterfaceOptions &Opts,
       Opts.PrintSPIs = true;
     }
   }
+  for (auto val: Args.getAllArgValues(OPT_skip_import_in_public_interface)) {
+    Opts.ModulesToSkipInPublicInterface.push_back(val);
+  }
 }
 
 /// Save a copy of any flags marked as ModuleInterfaceOption, if running
@@ -445,14 +448,27 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableExperimentalNamedOpaqueTypes |=
       Args.hasArg(OPT_enable_experimental_named_opaque_types);
 
-  Opts.EnableExplicitExistentialTypes |=
-      Args.hasArg(OPT_enable_explicit_existential_types);
+  Opts.EnableParameterizedProtocolTypes |=
+      Args.hasArg(OPT_enable_parameterized_protocol_types);
+
+  Opts.EnableOpenedExistentialTypes =
+    Args.hasFlag(OPT_enable_experimental_opened_existential_types,
+                 OPT_disable_experimental_opened_existential_types,
+                 false);
+
+  // SwiftOnoneSupport produces different symbols when opening existentials,
+  // so disable it.
+  if (FrontendOpts.ModuleName == SWIFT_ONONE_SUPPORT)
+    Opts.EnableOpenedExistentialTypes = false;
 
   Opts.EnableExperimentalDistributed |=
     Args.hasArg(OPT_enable_experimental_distributed);
 
   Opts.EnableExperimentalMoveOnly |=
     Args.hasArg(OPT_enable_experimental_move_only);
+
+  Opts.EnableExperimentalPairwiseBuildBlock |=
+    Args.hasArg(OPT_enable_experimental_pairwise_build_block);
 
   Opts.EnableInferPublicSendable |=
     Args.hasFlag(OPT_enable_infer_public_concurrent_value,
@@ -461,20 +477,26 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableExperimentalFlowSensitiveConcurrentCaptures |=
     Args.hasArg(OPT_enable_experimental_flow_sensitive_concurrent_captures);
 
-  Opts.EnableExperimentalClangImporterDiagnostics |=
-      Args.hasArg(OPT_enable_experimental_clang_importer_diagnostics);
+  Opts.DisableExperimentalClangImporterDiagnostics |=
+      Args.hasArg(OPT_disable_experimental_clang_importer_diagnostics);
 
   Opts.EnableExperimentalEagerClangModuleDiagnostics |=
+      !Args.hasArg(OPT_disable_experimental_clang_importer_diagnostics) &&
       Args.hasArg(OPT_enable_experimental_eager_clang_module_diagnostics);
 
   Opts.DisableImplicitConcurrencyModuleImport |=
     Args.hasArg(OPT_disable_implicit_concurrency_module_import);
+
+  Opts.EnableExperimentalAsyncTopLevel |=
+    Args.hasArg(OPT_enable_experimental_async_top_level);
 
   /// experimental distributed also implicitly enables experimental concurrency
   Opts.EnableExperimentalDistributed |=
     Args.hasArg(OPT_enable_experimental_distributed);
   Opts.EnableExperimentalConcurrency |=
     Args.hasArg(OPT_enable_experimental_distributed);
+  Opts.EnableExperimentalConcurrency |=
+    Args.hasArg(OPT_enable_experimental_async_top_level);
 
   Opts.DiagnoseInvalidEphemeralnessAsError |=
       Args.hasArg(OPT_enable_invalid_ephemeralness_as_error);
@@ -488,6 +510,9 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   // Experimental string processing
   Opts.EnableExperimentalStringProcessing |=
       Args.hasArg(OPT_enable_experimental_string_processing);
+
+  Opts.EnableExperimentalBoundGenericExtensions |=
+    Args.hasArg(OPT_enable_experimental_bound_generic_extensions);
 
   Opts.DisableAvailabilityChecking |=
       Args.hasArg(OPT_disable_availability_checking);
@@ -854,25 +879,14 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.DisableSubstSILFunctionTypes =
       Args.hasArg(OPT_disable_subst_sil_function_types);
 
-  if (auto A = Args.getLastArg(OPT_requirement_machine_EQ)) {
-    auto value = llvm::StringSwitch<Optional<RequirementMachineMode>>(A->getValue())
-        .Case("off", RequirementMachineMode::Disabled)
-        .Case("on", RequirementMachineMode::Enabled)
-        .Case("verify", RequirementMachineMode::Verify)
-        .Default(None);
-
-    if (value)
-      Opts.EnableRequirementMachine = *value;
-    else
-      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
-                     A->getAsString(Args), A->getValue());
-  }
+  Opts.RequirementMachineProtocolSignatures = RequirementMachineMode::Verify;
 
   if (auto A = Args.getLastArg(OPT_requirement_machine_protocol_signatures_EQ)) {
     auto value = llvm::StringSwitch<Optional<RequirementMachineMode>>(A->getValue())
         .Case("off", RequirementMachineMode::Disabled)
         .Case("on", RequirementMachineMode::Enabled)
         .Case("verify", RequirementMachineMode::Verify)
+        .Case("check", RequirementMachineMode::Check)
         .Default(None);
 
     if (value)
@@ -887,6 +901,7 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
         .Case("off", RequirementMachineMode::Disabled)
         .Case("on", RequirementMachineMode::Enabled)
         .Case("verify", RequirementMachineMode::Verify)
+        .Case("check", RequirementMachineMode::Check)
         .Default(None);
 
     if (value)
@@ -901,6 +916,7 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
         .Case("off", RequirementMachineMode::Disabled)
         .Case("on", RequirementMachineMode::Enabled)
         .Case("verify", RequirementMachineMode::Verify)
+        .Case("check", RequirementMachineMode::Check)
         .Default(None);
 
     if (value)
@@ -908,12 +924,6 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     else
       Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
                      A->getAsString(Args), A->getValue());
-  }
-
-  if (auto A = Args.getLastArg(OPT_enable_requirement_machine_merged_associated_types,
-                               OPT_disable_requirement_machine_merged_associated_types)) {
-    Opts.RequirementMachineMergedAssociatedTypes
-      = A->getOption().matches(OPT_enable_requirement_machine_merged_associated_types);
   }
 
   Opts.DumpRequirementMachine = Args.hasArg(
@@ -924,27 +934,43 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   if (const Arg *A = Args.getLastArg(OPT_debug_requirement_machine))
     Opts.DebugRequirementMachine = A->getValue();
 
-  if (const Arg *A = Args.getLastArg(OPT_requirement_machine_step_limit)) {
+  if (const Arg *A = Args.getLastArg(OPT_requirement_machine_max_rule_count)) {
     unsigned limit;
     if (StringRef(A->getValue()).getAsInteger(10, limit)) {
       Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
                      A->getAsString(Args), A->getValue());
       HadError = true;
     } else {
-      Opts.RequirementMachineStepLimit = limit;
+      Opts.RequirementMachineMaxRuleCount = limit;
     }
   }
 
-  if (const Arg *A = Args.getLastArg(OPT_requirement_machine_depth_limit)) {
+  if (const Arg *A = Args.getLastArg(OPT_requirement_machine_max_rule_length)) {
     unsigned limit;
     if (StringRef(A->getValue()).getAsInteger(10, limit)) {
       Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
                      A->getAsString(Args), A->getValue());
       HadError = true;
     } else {
-      Opts.RequirementMachineDepthLimit = limit;
+      Opts.RequirementMachineMaxRuleLength = limit;
     }
   }
+
+  if (const Arg *A = Args.getLastArg(OPT_requirement_machine_max_concrete_nesting)) {
+    unsigned limit;
+    if (StringRef(A->getValue()).getAsInteger(10, limit)) {
+      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
+                     A->getAsString(Args), A->getValue());
+      HadError = true;
+    } else {
+      Opts.RequirementMachineMaxConcreteNesting = limit;
+    }
+  }
+
+  if (Args.hasArg(OPT_disable_requirement_machine_concrete_contraction))
+    Opts.EnableRequirementMachineConcreteContraction = false;
+
+  Opts.DumpTypeWitnessSystems = Args.hasArg(OPT_dump_type_witness_systems);
 
   return HadError || UnsupportedOS || UnsupportedArch;
 }
@@ -1035,6 +1061,9 @@ static bool ParseTypeCheckerArgs(TypeCheckerOptions &Opts, ArgList &Args,
 
   Opts.EnableMultiStatementClosureInference |=
       Args.hasArg(OPT_experimental_multi_statement_closures);
+
+  Opts.EnableTypeInferenceFromDefaultArguments |=
+      Args.hasArg(OPT_experimental_type_inference_from_defaults);
 
   Opts.PrintFullConvention |=
       Args.hasArg(OPT_experimental_print_full_convention);
@@ -1641,6 +1670,8 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
       OPT_disable_previous_implementation_calls_in_dynamic_replacements);
   Opts.ParseStdlib = FEOpts.ParseStdlib;
 
+  Opts.emitTBD = FEOpts.InputsAndOutputs.hasTBDPath();
+
   if (const Arg *A = Args.getLastArg(OPT_save_optimization_record_EQ)) {
     llvm::Expected<llvm::remarks::Format> formatOrErr =
         llvm::remarks::parseFormat(A->getValue());
@@ -1822,10 +1853,14 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
                                           RenderedArgs, SDKPath,
                                           ResourceDir);
     }
-    // TODO: Should we support -fdebug-compilation-dir?
-    llvm::SmallString<256> cwd;
-    llvm::sys::fs::current_path(cwd);
-    Opts.DebugCompilationDir = std::string(cwd.str());
+
+    if (const Arg *A = Args.getLastArg(OPT_file_compilation_dir))
+      Opts.DebugCompilationDir = A->getValue();
+    else {
+      llvm::SmallString<256> cwd;
+      llvm::sys::fs::current_path(cwd);
+      Opts.DebugCompilationDir = std::string(cwd.str());
+    }
   }
 
   if (const Arg *A = Args.getLastArg(options::OPT_debug_info_format)) {
@@ -1909,6 +1944,9 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
     }
     Opts.StackPromotionSizeLimit = limit;
   }
+
+  if (Args.hasArg(OPT_trap_function))
+    Opts.TrapFuncName = Args.getLastArgValue(OPT_trap_function).str();
 
   Opts.FunctionSections = Args.hasArg(OPT_function_sections);
 
@@ -2039,8 +2077,13 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
   }
 
   if (Args.hasArg(OPT_disable_reflection_metadata)) {
-    Opts.EnableReflectionMetadata = false;
+    Opts.ReflectionMetadata = ReflectionMetadataMode::None;
     Opts.EnableReflectionNames = false;
+  }
+
+  if (Args.hasArg(OPT_reflection_metadata_for_debugger_only)) {
+    Opts.ReflectionMetadata = ReflectionMetadataMode::DebuggerOnly;
+    Opts.EnableReflectionNames = true;
   }
 
   if (Args.hasArg(OPT_enable_anonymous_context_mangled_names))
@@ -2176,6 +2219,12 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
 
   if (Args.hasArg(OPT_internalize_at_link)) {
     Opts.InternalizeAtLink = true;
+  }
+
+  Opts.InternalizeSymbols = FrontendOpts.Static;
+
+  if (Args.hasArg(OPT_disable_preallocated_instantiation_caches)) {
+    Opts.NoPreallocatedInstantiationCaches = true;
   }
 
   // Default to disabling swift async extended frame info on anything but

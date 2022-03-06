@@ -118,6 +118,7 @@ public:
     EmitSyntax,        ///< Parse and dump Syntax tree as JSON
     DumpAST,           ///< Parse, type-check, and dump AST
     PrintAST,          ///< Parse, type-check, and pretty-print AST
+    PrintASTDecl,      ///< Parse, type-check, and pretty-print AST declarations
 
     /// Parse and dump scope map.
     DumpScopeMaps,
@@ -446,10 +447,15 @@ public:
   /// to encode the actual paths into the .swiftmodule file.
   PathObfuscator serializedPathObfuscator;
 
+  /// Avoid printing actual module content into the ABI descriptor file.
+  /// This should only be used as a workaround when emitting ABI descriptor files
+  /// crashes the compiler.
+  bool emptyABIDescriptor = false;
+
 private:
   static bool canActionEmitDependencies(ActionType);
   static bool canActionEmitReferenceDependencies(ActionType);
-  static bool canActionEmitObjCHeader(ActionType);
+  static bool canActionEmitClangHeader(ActionType);
   static bool canActionEmitLoadedModuleTrace(ActionType);
   static bool canActionEmitModule(ActionType);
   static bool canActionEmitModuleDoc(ActionType);

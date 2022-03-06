@@ -95,7 +95,6 @@ namespace swift {
   class TypeVariableType;
   class TupleType;
   class FunctionType;
-  class GenericSignatureBuilder;
   class ArchetypeType;
   class Identifier;
   class InheritedNameSet;
@@ -368,12 +367,6 @@ private:
   /// i.e. true if the entry is [key: alias_name, value: (real_name, true)].
   mutable llvm::DenseMap<Identifier, std::pair<Identifier, bool>> ModuleAliasMap;
 
-  /// The maximum arity of `_StringProcessing.Tuple{n}`.
-  static constexpr unsigned StringProcessingTupleDeclMaxArity = 8;
-  /// Cached `_StringProcessing.Tuple{n}` declarations.
-  mutable SmallVector<StructDecl *, StringProcessingTupleDeclMaxArity - 2>
-      StringProcessingTupleDecls;
-
   /// Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &
   getAllocator(AllocationArena arena = AllocationArena::Permanent) const;
@@ -532,7 +525,7 @@ public:
 
   /// Retrieve the declaration of Swift.Error.
   ProtocolDecl *getErrorDecl() const;
-  CanType getExceptionType() const;
+  CanType getErrorExistentialType() const;
   
 #define KNOWN_STDLIB_TYPE_DECL(NAME, DECL_CLASS, NUM_GENERIC_PARAMS) \
   /** Retrieve the declaration of Swift.NAME. */ \
@@ -630,14 +623,6 @@ public:
   /// Retrieve _StringProcessing.Regex.init(_regexString: String, version: Int).
   ConcreteDeclRef getRegexInitDecl(Type regexType) const;
 
-  /// Retrieve the max arity that `_StringProcessing.Tuple{arity}` was
-  /// instantiated for.
-  unsigned getStringProcessingTupleDeclMaxArity() const;
-
-  /// Retrieve the `_StringProcessing.Tuple{arity}` declaration for the given
-  /// arity.
-  StructDecl *getStringProcessingTupleDecl(unsigned arity) const;
-
   /// Retrieve the declaration of Swift.<(Int, Int) -> Bool.
   FuncDecl *getLessThanIntDecl() const;
 
@@ -659,6 +644,69 @@ public:
 
   // Retrieve the declaration of Swift._stdlib_isOSVersionAtLeast.
   FuncDecl *getIsOSVersionAtLeastDecl() const;
+
+  /// Retrieve the declaration of DistributedActorSystem.remoteCall(Void)(...).
+  ///
+  /// \param actorOrSystem distributed actor or actor system to get the
+  /// remoteCall function for. Since the method we're looking for is an ad-hoc
+  /// requirement, a specific type MUST be passed here as it is not possible
+  /// to obtain the decl from just the `DistributedActorSystem` protocol type.
+  /// \param isVoidReturn true if the call will be returning `Void`.
+  AbstractFunctionDecl *getRemoteCallOnDistributedActorSystem(
+      NominalTypeDecl *actorOrSystem,
+      bool isVoidReturn) const;
+
+  /// Retrieve the declaration of DistributedActorSystem.make().
+  ///
+  /// \param actorOrSystem distributed actor or actor system to get the
+  /// remoteCall function for. Since the method we're looking for is an ad-hoc
+  /// requirement, a specific type MUST be passed here as it is not possible
+  /// to obtain the decl from just the `DistributedActorSystem` protocol type.
+  FuncDecl *getMakeInvocationEncoderOnDistributedActorSystem(
+      NominalTypeDecl *actorOrSystem) const;
+
+  // Retrieve the declaration of
+  // DistributedInvocationEncoder.recordGenericSubstitution(_:).
+  //
+  // \param nominal optionally provide a 'NominalTypeDecl' from which the
+  // function decl shall be extracted. This is useful to avoid witness calls
+  // through the protocol which is looked up when nominal is null.
+  FuncDecl *getRecordGenericSubstitutionOnDistributedInvocationEncoder(
+      NominalTypeDecl *nominal) const;
+
+  // Retrieve the declaration of DistributedTargetInvocationEncoder.recordArgument(_:).
+  //
+  // \param nominal optionally provide a 'NominalTypeDecl' from which the
+  // function decl shall be extracted. This is useful to avoid witness calls
+  // through the protocol which is looked up when nominal is null.
+  AbstractFunctionDecl *getRecordArgumentOnDistributedInvocationEncoder(
+      NominalTypeDecl *nominal) const;
+
+  // Retrieve the declaration of DistributedTargetInvocationEncoder.recordReturnType(_:).
+  AbstractFunctionDecl *getRecordReturnTypeOnDistributedInvocationEncoder(
+      NominalTypeDecl *nominal) const;
+
+  // Retrieve the declaration of DistributedTargetInvocationEncoder.recordErrorType(_:).
+  AbstractFunctionDecl *getRecordErrorTypeOnDistributedInvocationEncoder(
+      NominalTypeDecl *nominal) const;
+
+  // Retrieve the declaration of
+  // DistributedTargetInvocationDecoder.getDecodeNextArgumentOnDistributedInvocationDecoder(_:).
+  AbstractFunctionDecl *getDecodeNextArgumentOnDistributedInvocationDecoder(
+      NominalTypeDecl *nominal) const;
+
+  // Retrieve the declaration of
+  // getOnReturnOnDistributedTargetInvocationResultHandler.onReturn(_:).
+  AbstractFunctionDecl *getOnReturnOnDistributedTargetInvocationResultHandler(
+      NominalTypeDecl *nominal) const;
+
+  // Retrieve the declaration of DistributedInvocationEncoder.doneRecording().
+  //
+  // \param nominal optionally provide a 'NominalTypeDecl' from which the
+  // function decl shall be extracted. This is useful to avoid witness calls
+  // through the protocol which is looked up when nominal is null.
+  FuncDecl *getDoneRecordingOnDistributedInvocationEncoder(
+      NominalTypeDecl *nominal) const;
 
   /// Look for the declaration with the given name within the
   /// passed in module.
@@ -837,6 +885,10 @@ public:
   /// Get the runtime availability of features introduced in the Swift 5.6
   /// compiler for the target platform.
   AvailabilityContext getSwift56Availability();
+
+  /// Get the runtime availability of features introduced in the Swift 5.7
+  /// compiler for the target platform.
+  AvailabilityContext getSwift57Availability();
 
   // Note: Update this function if you add a new getSwiftXYAvailability above.
   /// Get the runtime availability for a particular version of Swift (5.0+).
@@ -1115,7 +1167,7 @@ public:
   /// conformance itself, along with a bit indicating whether this diagnostic
   /// produces an error.
   struct DelayedConformanceDiag {
-    ValueDecl *Requirement;
+    const ValueDecl *Requirement;
     std::function<void()> Callback;
     bool IsError;
   };
@@ -1174,9 +1226,6 @@ public:
   InheritedProtocolConformance *
   getInheritedConformance(Type type, ProtocolConformance *inherited);
 
-  /// Check if \p decl is included in LazyContexts.
-  bool isLazyContext(const DeclContext *decl);
-
   /// Get the lazy data for the given declaration.
   ///
   /// \param lazyLoader If non-null, the lazy loader to use when creating the
@@ -1225,14 +1274,6 @@ public:
   /// Increments \c NumTypoCorrections then checks this against the limit in
   /// the language options.
   bool shouldPerformTypoCorrection();
-  
-private:
-  /// Register the given generic signature builder to be used as the canonical
-  /// generic signature builder for the given signature, if we don't already
-  /// have one.
-  void registerGenericSignatureBuilder(GenericSignature sig,
-                                       GenericSignatureBuilder &&builder);
-  friend class GenericSignatureBuilder;
 
 private:
   friend class IntrinsicInfo;
@@ -1240,11 +1281,6 @@ private:
   llvm::LLVMContext &getIntrinsicScratchContext() const;
 
 public:
-  /// Retrieve or create the stored generic signature builder for the given
-  /// canonical generic signature and module.
-  GenericSignatureBuilder *getOrCreateGenericSignatureBuilder(
-                                                     CanGenericSignature sig);
-
   rewriting::RewriteContext &getRewriteContext();
 
   /// This is a hack to break cycles. Don't introduce new callers of this
@@ -1314,6 +1350,17 @@ public:
   /// Retrieve the name of to be used for the entry point, either main or an
   /// alternative specified via the -entry-point-function-name frontend flag.
   std::string getEntryPointFunctionName() const;
+
+  Type getAssociatedTypeOfDistributedSystemOfActor(NominalTypeDecl *actor,
+                                            Identifier member);
+
+  /// Find the concrete invocation decoder associated with the given actor.
+  NominalTypeDecl *
+  getDistributedActorInvocationDecoder(NominalTypeDecl *);
+
+  /// Find `decodeNextArgument<T>(type: T.Type) -> T` method associated with
+  /// invocation decoder of the given distributed actor.
+  FuncDecl *getDistributedActorArgumentDecodingMethod(NominalTypeDecl *);
 
 private:
   friend Decl;

@@ -240,8 +240,12 @@ static bool needsForeignMetadataCompletionFunction(IRGenModule &IGM,
 
 template <class Flags>
 static Flags getMethodDescriptorFlags(ValueDecl *fn) {
-  if (isa<ConstructorDecl>(fn))
-    return Flags(Flags::Kind::Init); // 'init' is considered static
+  if (isa<ConstructorDecl>(fn)) {
+    auto flags = Flags(Flags::Kind::Init); // 'init' is considered static
+    if (auto *afd = dyn_cast<AbstractFunctionDecl>(fn))
+      flags = flags.withIsAsync(afd->hasAsync());
+    return flags;
+  }
 
   auto kind = [&] {
     auto accessor = dyn_cast<AccessorDecl>(fn);
@@ -792,9 +796,10 @@ namespace {
     }
 
     void addRequirementSignature() {
+      auto requirements = Proto->getRequirementSignature().getRequirements();
       auto metadata =
         irgen::addGenericRequirements(IGM, B, Proto->getGenericSignature(),
-                                      Proto->getRequirementSignature());
+                                      requirements);
 
       B.fillPlaceholderWithInt(*NumRequirementsInSignature, IGM.Int32Ty,
                                metadata.NumRequirements);
@@ -1165,7 +1170,14 @@ namespace {
         // declaration's name as the ABI name.
       } else if (auto clangDecl =
                             Mangle::ASTMangler::getClangDeclForMangling(Type)) {
-        abiName = clangDecl->getName();
+        // Class template specializations need to use their mangled name so
+        // that each specialization gets its own metadata. A class template
+        // specialization's Swift name will always be the mangled name, so just
+        // use that.
+        if (auto spec = dyn_cast<clang::ClassTemplateSpecializationDecl>(clangDecl))
+          abiName = Type->getName().str();
+        else
+          abiName = clangDecl->getName();
 
         // Typedefs and compatibility aliases that have been promoted to
         // their own nominal types need to be marked specially.
@@ -1267,7 +1279,7 @@ namespace {
     }
 
     void addMetadataInstantiationCache() {
-      if (!HasMetadata) {
+      if (!HasMetadata || IGM.getOptions().NoPreallocatedInstantiationCaches) {
         B.addInt32(0);
         return;
       }
@@ -1488,11 +1500,12 @@ namespace {
     void maybeAddResilientSuperclass() { }
 
     void addReflectionFieldDescriptor() {
-      if (!IGM.IRGen.Opts.EnableReflectionMetadata) {
+      if (IGM.IRGen.Opts.ReflectionMetadata !=
+          ReflectionMetadataMode::Runtime) {
         B.addInt32(0);
         return;
       }
-    
+
       IGM.IRGen.noteUseOfFieldDescriptor(getType());
 
       B.addRelativeAddress(IGM.getAddrOfReflectionFieldDescriptor(
@@ -1566,7 +1579,8 @@ namespace {
     void maybeAddResilientSuperclass() { }
 
     void addReflectionFieldDescriptor() {
-      if (!IGM.IRGen.Opts.EnableReflectionMetadata) {
+      if (IGM.IRGen.Opts.ReflectionMetadata !=
+          ReflectionMetadataMode::Runtime) {
         B.addInt32(0);
         return;
       }
@@ -1723,7 +1737,8 @@ namespace {
     void addReflectionFieldDescriptor() {
       // Classes are always reflectable, unless reflection is disabled or this
       // is a foreign class.
-      if (!IGM.IRGen.Opts.EnableReflectionMetadata ||
+      if ((IGM.IRGen.Opts.ReflectionMetadata !=
+           ReflectionMetadataMode::Runtime) ||
           getType()->isForeign()) {
         B.addInt32(0);
         return;
@@ -2007,29 +2022,7 @@ namespace {
     ///
     /// When it does, returns the protocol.
     ProtocolDecl *requiresWitnessTable(const Requirement &req) const {
-      // We only care about conformance requirements.
-      if (req.getKind() != RequirementKind::Conformance)
-        return nullptr;
-
-      // The protocol must require a witness table.
-      auto proto = req.getProtocolDecl();
-      if (!Lowering::TypeConverter::protocolRequiresWitnessTable(proto))
-        return nullptr;
-
-      // The type itself must be anchored on one of the generic parameters of
-      // the opaque type (not an outer context).
-      Type subject = req.getFirstType();
-      while (auto depMember = subject->getAs<DependentMemberType>()) {
-        subject = depMember->getBase();
-      }
-
-      if (auto genericParam = subject->getAs<GenericTypeParamType>()) {
-        unsigned opaqueDepth = O->getOpaqueGenericParams().front()->getDepth();
-        if (genericParam->getDepth() == opaqueDepth)
-          return proto;
-      }
-
-      return nullptr;
+      return opaqueTypeRequiresWitnessTable(O, req);
     }
 
   public:
@@ -2154,6 +2147,33 @@ namespace {
     }
   };
 } // end anonymous namespace
+
+ProtocolDecl *irgen::opaqueTypeRequiresWitnessTable(
+    OpaqueTypeDecl *opaque, const Requirement &req) {
+  // We only care about conformance requirements.
+  if (req.getKind() != RequirementKind::Conformance)
+    return nullptr;
+
+  // The protocol must require a witness table.
+  auto proto = req.getProtocolDecl();
+  if (!Lowering::TypeConverter::protocolRequiresWitnessTable(proto))
+    return nullptr;
+
+  // The type itself must be anchored on one of the generic parameters of
+  // the opaque type (not an outer context).
+  Type subject = req.getFirstType();
+  while (auto depMember = subject->getAs<DependentMemberType>()) {
+    subject = depMember->getBase();
+  }
+
+  if (auto genericParam = subject->getAs<GenericTypeParamType>()) {
+    unsigned opaqueDepth = opaque->getOpaqueGenericParams().front()->getDepth();
+    if (genericParam->getDepth() == opaqueDepth)
+      return proto;
+  }
+
+  return nullptr;
+}
 
 static void eraseExistingTypeContextDescriptor(IRGenModule &IGM,
                                                NominalTypeDecl *type) {
@@ -2564,6 +2584,8 @@ namespace {
 
     /// Emit the instantiation cache variable for the template.
     void emitInstantiationCache() {
+      if (IGM.IRGen.Opts.NoPreallocatedInstantiationCaches) return;
+      
       auto cache = cast<llvm::GlobalVariable>(
         IGM.getAddrOfTypeMetadataInstantiationCache(Target, ForDefinition));
       auto init =
@@ -5023,10 +5045,8 @@ namespace {
         auto candidate = IGF.IGM.getAddrOfTypeMetadata(type);
         auto call = IGF.Builder.CreateCall(IGF.IGM.getGetForeignTypeMetadataFn(),
                                            {request.get(IGF), candidate});
-        call->addAttribute(llvm::AttributeList::FunctionIndex,
-                           llvm::Attribute::NoUnwind);
-        call->addAttribute(llvm::AttributeList::FunctionIndex,
-                           llvm::Attribute::ReadNone);
+        call->addFnAttr(llvm::Attribute::NoUnwind);
+        call->addFnAttr(llvm::Attribute::ReadNone);
 
         return MetadataResponse::handle(IGF, request, call);
       });
@@ -5340,9 +5360,11 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   case KnownProtocolKind::Differentiable:
   case KnownProtocolKind::FloatingPoint:
   case KnownProtocolKind::Actor:
-  case KnownProtocolKind::DistributedActorSystem:
   case KnownProtocolKind::DistributedActor:
-  case KnownProtocolKind::ActorIdentity:
+  case KnownProtocolKind::DistributedActorSystem:
+  case KnownProtocolKind::DistributedTargetInvocationEncoder:
+  case KnownProtocolKind::DistributedTargetInvocationDecoder:
+  case KnownProtocolKind::DistributedTargetInvocationResultHandler:
   case KnownProtocolKind::SerialExecutor:
   case KnownProtocolKind::Sendable:
   case KnownProtocolKind::UnsafeSendable:

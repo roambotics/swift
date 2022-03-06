@@ -965,6 +965,7 @@ ManglingError Remangler::mangleDependentAssociatedTypeRef(Node *node,
 ManglingError
 Remangler::mangleDependentGenericConformanceRequirement(Node *node,
                                                         unsigned depth) {
+  DEMANGLER_ASSERT(node->getNumChildren() == 2, node);
   Node *ProtoOrClass = node->getChild(1);
   if (ProtoOrClass->getFirstChild()->getKind() == Node::Kind::Protocol) {
     RETURN_IF_ERROR(manglePureProtocol(ProtoOrClass, depth + 1));
@@ -1321,6 +1322,7 @@ ManglingError Remangler::mangleFunctionSignatureSpecialization(Node *node,
           break;
         }
         case FunctionSigSpecializationParamKind::ClosureProp:
+        case FunctionSigSpecializationParamKind::ConstantPropKeyPath:
           RETURN_IF_ERROR(mangleIdentifier(Param->getChild(1), depth + 1));
           for (unsigned i = 2, e = Param->getNumChildren(); i != e; ++i) {
             RETURN_IF_ERROR(mangleType(Param->getChild(i), depth + 1));
@@ -1398,6 +1400,9 @@ Remangler::mangleFunctionSignatureSpecializationParam(Node *node,
       }
       break;
     }
+    case FunctionSigSpecializationParamKind::ConstantPropKeyPath:
+      Buffer << "pk";
+      break;
     case FunctionSigSpecializationParamKind::ClosureProp:
       Buffer << 'c';
       break;
@@ -1622,6 +1627,8 @@ ManglingError Remangler::mangleGlobal(Node *node, unsigned depth) {
       case Node::Kind::AsyncAwaitResumePartialFunction:
       case Node::Kind::AsyncSuspendResumePartialFunction:
       case Node::Kind::AccessibleFunctionRecord:
+      case Node::Kind::BackDeploymentThunk:
+      case Node::Kind::BackDeploymentFallback:
         mangleInReverseOrder = true;
         break;
       default:
@@ -1965,6 +1972,12 @@ ManglingError Remangler::mangleInOut(Node *node, unsigned depth) {
 ManglingError Remangler::mangleIsolated(Node *node, unsigned depth) {
   RETURN_IF_ERROR(mangleSingleChildNode(node, depth + 1));
   Buffer << "Yi";
+  return ManglingError::Success;
+}
+
+ManglingError Remangler::mangleCompileTimeConst(Node *node, unsigned depth) {
+  RETURN_IF_ERROR(mangleSingleChildNode(node, depth + 1));
+  Buffer << "Yt";
   return ManglingError::Success;
 }
 
@@ -3393,6 +3406,18 @@ ManglingError Remangler::mangleGlobalVariableOnceDeclList(Node *node,
 ManglingError Remangler::mangleAccessibleFunctionRecord(Node *node,
                                                         unsigned depth) {
   Buffer << "HF";
+  return ManglingError::Success;
+}
+
+ManglingError Remangler::mangleBackDeploymentThunk(Node *node,
+                                                   unsigned depth) {
+  Buffer << "Twb";
+  return ManglingError::Success;
+}
+
+ManglingError Remangler::mangleBackDeploymentFallback(Node *node,
+                                                      unsigned depth) {
+  Buffer << "TwB";
   return ManglingError::Success;
 }
 

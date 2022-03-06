@@ -234,8 +234,8 @@ inline bool accessKindMayConflict(SILAccessKind a, SILAccessKind b) {
 
 /// Return true if \p instruction is a deinitialization barrier.
 ///
-/// Deinitialization barriers constrain variable lifetimes. Lexical end_borrow
-/// and destroy_addr cannot be hoisted above them.
+/// Deinitialization barriers constrain variable lifetimes. Lexical end_borrow,
+/// destroy_value, and destroy_addr cannot be hoisted above them.
 bool isDeinitBarrier(SILInstruction *instruction);
 
 } // end namespace swift
@@ -948,7 +948,7 @@ namespace swift {
 /// The index of ref_element_addr is part of the storage identity and does
 /// not contribute to the access path indices.
 ///
-/// A well-formed path has at most one offset component at the begining of the
+/// A well-formed path has at most one offset component at the beginning of the
 /// path (chained index_addrs are merged into one offset). In other words,
 /// taking an offset from a subobject projection is not well-formed access
 /// path. However, it is possible (however undesirable) for programmers to
@@ -1098,7 +1098,6 @@ public:
   // ignores its subclass bits.
   AccessPath(AccessStorage storage, PathNode pathNode, int offset)
       : storage(storage), pathNode(pathNode), offset(offset) {
-    assert(storage.getKind() != AccessStorage::Nested);
     assert(pathNode.isValid() || !storage && "Access path requires a pathNode");
   }
 
@@ -1337,6 +1336,7 @@ namespace swift {
 /// to the storage within this function is derived from these roots.
 ///
 /// Gather the kinds of uses that are typically relevant to algorithms:
+/// - accesses    (specifically, begin_access insts)
 /// - loads       (including copies out of, not including inout args)
 /// - stores      (including copies into and inout args)
 /// - destroys    (of the entire aggregate)
@@ -1353,6 +1353,7 @@ struct UniqueStorageUseVisitor {
 
   virtual ~UniqueStorageUseVisitor() = default;
 
+  virtual bool visitBeginAccess(Operand *use) = 0;
   virtual bool visitLoad(Operand *use) = 0;
   virtual bool visitStore(Operand *use) = 0;
   virtual bool visitDestroy(Operand *use) = 0;
@@ -1689,7 +1690,7 @@ Result AccessUseDefChainVisitor<Impl, Result>::visit(SILValue sourceAddr) {
 
   case ValueKind::SILPhiArgument: {
     auto *phiArg = cast<SILPhiArgument>(sourceAddr);
-    if (phiArg->isPhiArgument()) {
+    if (phiArg->isPhi()) {
       return asImpl().visitPhi(phiArg);
     }
 

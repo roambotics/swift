@@ -88,7 +88,10 @@ namespace swift {
     Enabled = 1,
 
     /// Use both and assert if the results do not match.
-    Verify = 2
+    Verify = 2,
+
+    /// Use both, print a message only but do not assert on mismatch.
+    Check = 3,
   };
 
   /// A collection of options that affect the language dialect and
@@ -313,15 +316,19 @@ namespace swift {
     /// `func f() -> <T> T`.
     bool EnableExperimentalNamedOpaqueTypes = false;
 
-    /// Enable support for explicit existential types via the \c any
-    /// keyword.
-    bool EnableExplicitExistentialTypes = false;
+    /// Enable support for implicitly opening existential argument types
+    /// in calls to generic functions.
+    bool EnableOpenedExistentialTypes = false;
+
+    /// Enable support for protocol types parameterized by primary
+    /// associated type.
+    bool EnableParameterizedProtocolTypes = false;
 
     /// Enable experimental flow-sensitive concurrent captures.
     bool EnableExperimentalFlowSensitiveConcurrentCaptures = false;
 
-    /// Enable experimental ClangImporter diagnostics.
-    bool EnableExperimentalClangImporterDiagnostics = false;
+    /// Disable experimental ClangImporter diagnostics.
+    bool DisableExperimentalClangImporterDiagnostics = false;
 
     /// Enable experimental eager Clang module diagnostics.
     bool EnableExperimentalEagerClangModuleDiagnostics = false;
@@ -334,6 +341,9 @@ namespace swift {
 
     /// Enable experimental 'move only' features.
     bool EnableExperimentalMoveOnly = false;
+
+    /// Enable experimental pairwise `buildBlock` for result builders.
+    bool EnableExperimentalPairwiseBuildBlock = false;
 
     /// Disable the implicit import of the _Concurrency module.
     bool DisableImplicitConcurrencyModuleImport =
@@ -389,6 +399,9 @@ namespace swift {
     /// Diagnose switches over non-frozen enums that do not have catch-all
     /// cases.
     bool EnableNonFrozenEnumExhaustivityDiagnostics = false;
+
+    /// Enable making top-level code support concurrency
+    bool EnableExperimentalAsyncTopLevel = false;
 
     /// Regex for the passes that should report passed and missed optimizations.
     ///
@@ -463,6 +476,13 @@ namespace swift {
     // FrontendOptions.
     bool AllowModuleWithCompilerErrors = false;
 
+    /// Enable extensions of (sugared) bound generic types
+    ///
+    /// \code
+    /// extension [Int] { /**/ }
+    /// \endcode
+    bool EnableExperimentalBoundGenericExtensions = false;
+
     /// A helper enum to represent whether or not we customized the default
     /// ASTVerifier behavior via a frontend flag. By default, we do not
     /// customize.
@@ -477,13 +497,6 @@ namespace swift {
     ASTVerifierOverrideKind ASTVerifierOverride =
         ASTVerifierOverrideKind::NoOverride;
 
-    /// Whether the new experimental generics implementation is enabled.
-    RequirementMachineMode EnableRequirementMachine =
-        RequirementMachineMode::Enabled;
-
-    /// Enables merged associated type support, which might go away.
-    bool RequirementMachineMergedAssociatedTypes = true;
-
     /// Enables dumping rewrite systems from the requirement machine.
     bool DumpRequirementMachine = false;
 
@@ -493,13 +506,17 @@ namespace swift {
     /// Enables fine-grained debug output from the requirement machine.
     std::string DebugRequirementMachine;
 
-    /// Maximum iteration count for requirement machine Knuth-Bendix completion
+    /// Maximum rule count for requirement machine Knuth-Bendix completion
     /// algorithm.
-    unsigned RequirementMachineStepLimit = 4000;
+    unsigned RequirementMachineMaxRuleCount = 4000;
 
     /// Maximum term length for requirement machine Knuth-Bendix completion
     /// algorithm.
-    unsigned RequirementMachineDepthLimit = 10;
+    unsigned RequirementMachineMaxRuleLength = 12;
+
+    /// Maximum concrete type nesting depth for requirement machine property map
+    /// algorithm.
+    unsigned RequirementMachineMaxConcreteNesting = 30;
 
     /// Enable the new experimental protocol requirement signature minimization
     /// algorithm.
@@ -515,6 +532,14 @@ namespace swift {
     /// for user-written generic signatures.
     RequirementMachineMode RequirementMachineInferredSignatures =
         RequirementMachineMode::Disabled;
+
+    /// Disable preprocessing pass to eliminate conformance requirements
+    /// on generic parameters which are made concrete. Usually you want this
+    /// enabled. It can be disabled for debugging and testing.
+    bool EnableRequirementMachineConcreteContraction = true;
+
+    /// Enables dumping type witness systems from associated type inference.
+    bool DumpTypeWitnessSystems = false;
 
     /// Sets the target we are building for and updates platform conditions
     /// to match.
@@ -700,6 +725,10 @@ namespace swift {
     /// Enable experimental support for type inference through multi-statement
     /// closures.
     bool EnableMultiStatementClosureInference = false;
+
+    /// Enable experimental support for generic parameter inference in
+    /// parameter positions from associated default expressions.
+    bool EnableTypeInferenceFromDefaultArguments = false;
 
     /// See \ref FrontendOptions.PrintFullConvention
     bool PrintFullConvention = false;

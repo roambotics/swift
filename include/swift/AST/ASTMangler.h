@@ -70,7 +70,7 @@ protected:
   /// Whether the mangling predates concurrency, and therefore shouldn't
   /// include concurrency features such as global actors or @Sendable
   /// function types.
-  bool PredatesConcurrency = false;
+  bool Preconcurrency = false;
 
 public:
   using SymbolicReferent = llvm::PointerUnion<const NominalTypeDecl *,
@@ -105,7 +105,9 @@ public:
     ObjCAsSwiftThunk,
     DistributedThunk,
     DistributedAccessor,
-    AccessibleFunctionRecord
+    AccessibleFunctionRecord,
+    BackDeploymentThunk,
+    BackDeploymentFallback,
   };
 
   ASTMangler(bool DWARFMangling = false)
@@ -365,6 +367,11 @@ protected:
                                      ModuleDecl *fromModule);
   void appendImplFunctionType(SILFunctionType *fn, GenericSignature sig,
                               const ValueDecl *forDecl = nullptr);
+  void appendOpaqueTypeArchetype(ArchetypeType *archetype,
+                                 OpaqueTypeDecl *opaqueDecl,
+                                 SubstitutionMap subs,
+                                 GenericSignature sig,
+                                 const ValueDecl *forDecl);
 
   void appendContextOf(const ValueDecl *decl);
 

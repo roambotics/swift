@@ -66,6 +66,10 @@ llvm::cl::opt<bool> SILDisableLateOMEByDefault(
     llvm::cl::desc(
         "Disable late OME for non-transparent functions by default"));
 
+llvm::cl::opt<bool>
+    EnableDestroyHoisting("enable-destroy-hoisting", llvm::cl::init(true),
+                          llvm::cl::desc("Enable the DestroyHoisting pass."));
+
 //===----------------------------------------------------------------------===//
 //                          Diagnostic Pass Pipeline
 //===----------------------------------------------------------------------===//
@@ -122,6 +126,8 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   P.addNoReturnFolding();
   addDefiniteInitialization(P);
 
+  P.addFlowIsolation();
+
   // Automatic differentiation: canonicalize all differentiability witnesses
   // and `differentiable_function` instructions.
   P.addDifferentiation();
@@ -143,7 +149,7 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
     P.addSILSkippingChecker();
 #endif
 
-  if (Options.shouldOptimize()) {
+  if (Options.shouldOptimize() && EnableDestroyHoisting) {
     P.addDestroyHoisting();
   }
   P.addMandatoryInlining();
@@ -156,6 +162,12 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   // Promote loads as necessary to ensure we have enough SSA formation to emit
   // SSA based diagnostics.
   P.addPredictableMemoryAccessOptimizations();
+
+  // Now that we have promoted simple loads for SSA based diagnostics, perform
+  // SSA based move function checking and no implicit copy checking.
+  P.addMoveKillsCopyableValuesChecker(); // No uses after _move of copyable
+                                         //   value.
+  P.addMoveOnlyChecker();                // Check noImplicitCopy isn't copied.
 
   // This phase performs optimizations necessary for correct interoperation of
   // Swift os log APIs with C os_log ABIs.
@@ -172,11 +184,6 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   // Now that we have emitted constant propagation diagnostics, try to eliminate
   // dead allocations.
   P.addPredictableDeadAllocationElimination();
-
-  // Now perform move semantic checking.
-  P.addMoveKillsCopyableValuesChecker(); // No uses after _move of copyable
-                                         //   value.
-  P.addMoveOnlyChecker();                // Check noImplicitCopy isn't copied.
 
   // Now that we have finished performing diagnostics that rely on lexical
   // scopes, if lexical lifetimes are not enabled, eliminate lexical lfietimes.
@@ -342,6 +349,8 @@ void addFunctionPasses(SILPassPipelinePlan &P,
                        OptimizationLevelKind OpLevel) {
   // Promote box allocations to stack allocations.
   P.addAllocBoxToStack();
+
+  P.addSSADestroyHoisting();
 
   // Propagate copies through stack locations.  Should run after
   // box-to-stack promotion since it is limited to propagating through
@@ -907,10 +916,7 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
   P.startPipeline("non-Diagnostic Enabling Mandatory Optimizations");
   P.addForEachLoopUnroll();
   P.addMandatoryCombine();
-  if (P.getOptions().CopyPropagation == CopyPropagationOption::On) {
-    // MandatoryCopyPropagation should only be run at -Onone, not -O.
-    P.addMandatoryCopyPropagation();
-  }
+
   // TODO: MandatoryARCOpts should be subsumed by CopyPropagation. There should
   // be no need to run another analysis of copies at -Onone.
   P.addMandatoryARCOpts();

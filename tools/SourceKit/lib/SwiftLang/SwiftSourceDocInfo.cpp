@@ -21,20 +21,21 @@
 #include "swift/AST/ASTDemangler.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/GenericSignature.h"
 #include "swift/AST/LookupKinds.h"
 #include "swift/AST/ModuleNameLookup.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/SwiftNameTranslation.h"
-#include "swift/AST/GenericSignature.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
+#include "swift/IDE/CodeCompletion.h"
 #include "swift/IDE/CommentConversion.h"
+#include "swift/IDE/IDERequests.h"
 #include "swift/IDE/ModuleInterfacePrinting.h"
+#include "swift/IDE/Refactoring.h"
 #include "swift/IDE/SourceEntityWalker.h"
 #include "swift/IDE/Utils.h"
-#include "swift/IDE/Refactoring.h"
-#include "swift/IDE/IDERequests.h"
 #include "swift/Markup/XMLUtils.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "swift/SymbolGraphGen/SymbolGraphGen.h"
@@ -760,7 +761,7 @@ static StringRef getModuleName(const ValueDecl *VD,
       static_cast<ClangImporter *>(Ctx.getClangModuleLoader());
   if (auto ClangNode = VD->getClangNode()) {
     if (const auto *ClangMod = Importer->getClangOwningModule(ClangNode))
-      return copyString(Allocator, ClangMod->getFullModuleName());
+      return StringRef(ClangMod->getFullModuleName()).copy(Allocator);
     return "";
   }
 
@@ -785,6 +786,7 @@ struct DeclInfo {
   const ValueDecl *OriginalProperty = nullptr;
   bool Unavailable = true;
   Type BaseType;
+  /// Whether the \c VD is in a synthesized extension of \c BaseType
   bool InSynthesizedExtension = false;
 
   DeclInfo(const ValueDecl *VD, Type ContainerType, bool IsRef, bool IsDynamic,
@@ -810,9 +812,8 @@ struct DeclInfo {
     }
 
     BaseType = findBaseTypeForReplacingArchetype(VD, ContainerType);
-    InSynthesizedExtension = false;
     if (BaseType) {
-      if (auto Target = BaseType->getAnyNominal()) {
+      if (auto *Target = BaseType->getAnyNominal()) {
         SynthesizedExtensionAnalyzer Analyzer(
             Target, PrintOptions::printModuleInterface(
                         Invoc.getFrontendOptions().PrintFullConvention));
@@ -824,7 +825,7 @@ struct DeclInfo {
 
 static StringRef copyAndClearString(llvm::BumpPtrAllocator &Allocator,
                                     SmallVectorImpl<char> &Str) {
-  auto Ref = copyString(Allocator, StringRef(Str.data(), Str.size()));
+  auto Ref = StringRef(Str.data(), Str.size()).copy(Allocator);
   Str.clear();
   return Ref;
 }
@@ -998,7 +999,7 @@ fillSymbolInfo(CursorSymbolInfo &Symbol, const DeclInfo &DInfo,
     SmallVector<ParentInfo, 4> Parents;
     for (auto &Component : PathComponents) {
       SwiftLangSupport::printUSR(Component.VD, OS);
-      Parents.emplace_back(copyString(Allocator, Component.Title),
+      Parents.emplace_back(Component.Title.str().copy(Allocator),
                            Component.Kind,
                            copyAndClearString(Allocator, Buffer));
     };
@@ -1009,7 +1010,7 @@ fillSymbolInfo(CursorSymbolInfo &Symbol, const DeclInfo &DInfo,
       SmallVector<ParentInfo, 4> FIParents;
       for (auto &Component: FI.ParentContexts) {
         SwiftLangSupport::printUSR(Component.VD, OS);
-        FIParents.emplace_back(copyString(Allocator, Component.Title),
+        FIParents.emplace_back(Component.Title.str().copy(Allocator),
                                Component.Kind,
                                copyAndClearString(Allocator, Buffer));
       }

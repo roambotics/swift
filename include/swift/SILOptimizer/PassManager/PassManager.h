@@ -12,6 +12,7 @@
 
 #include "swift/SIL/Notifications.h"
 #include "swift/SIL/InstructionUtils.h"
+#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
 #include "swift/SILOptimizer/PassManager/PassPipeline.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
@@ -58,6 +59,12 @@ class SwiftPassInvocation {
   /// All slabs, allocated by the pass.
   SILModule::SlabList allocatedSlabs;
 
+  static constexpr int BlockSetCapacity = 8;
+  char blockSetStorage[sizeof(BasicBlockSet) * BlockSetCapacity];
+  bool aliveBlockSets[BlockSetCapacity];
+
+  int numBlockSetsAllocated = 0;
+
   void endPassRunChecks();
 
 public:
@@ -75,6 +82,10 @@ public:
   FixedSizeSlab *allocSlab(FixedSizeSlab *afterSlab);
 
   FixedSizeSlab *freeSlab(FixedSizeSlab *slab);
+
+  BasicBlockSet *allocBlockSet();
+
+  void freeBlockSet(BasicBlockSet *set);
 
   /// The top-level API to erase an instruction, called from the Swift pass.
   void eraseInstruction(SILInstruction *inst);
@@ -132,6 +143,10 @@ class SILPassManager {
 
   /// The number of passes run so far.
   unsigned NumPassesRun = 0;
+  unsigned numSubpassesRun = 0;
+
+  unsigned maxNumPassesToRun = UINT_MAX;
+  unsigned maxNumSubpassesToRun = UINT_MAX;
 
   /// For invoking Swift passes.
   SwiftPassInvocation swiftPassInvocation;
@@ -341,7 +356,17 @@ public:
 
   void executePassPipelinePlan(const SILPassPipelinePlan &Plan);
 
+  bool continueWithNextSubpassRun(SILInstruction *forInst, SILFunction *function,
+                                  SILTransform *trans);
+
+  static bool isPassDisabled(StringRef passName);
+  static bool disablePassesForFunction(SILFunction *function);
+
 private:
+  bool doPrintBefore(SILTransform *T, SILFunction *F);
+
+  bool doPrintAfter(SILTransform *T, SILFunction *F, bool PassChangedSIL);
+
   void execute();
 
   /// Add a pass of a specific kind.
@@ -373,7 +398,8 @@ private:
   bool analysesUnlocked();
 
   /// Dumps information about the pass with index \p TransIdx to llvm::dbgs().
-  void dumpPassInfo(const char *Title, SILTransform *Tr, SILFunction *F);
+  void dumpPassInfo(const char *Title, SILTransform *Tr, SILFunction *F,
+                    int passIdx = -1);
 
   /// Dumps information about the pass with index \p TransIdx to llvm::dbgs().
   void dumpPassInfo(const char *Title, unsigned TransIdx,

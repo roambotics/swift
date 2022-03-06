@@ -6,7 +6,6 @@
 # See http://swift.org/LICENSE.txt for license information
 # See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 
-
 # Following function are needed as a workaround until it's possible to compile
 # swift code with cmake's builtin swift support.
 
@@ -19,15 +18,9 @@ function(add_swift_compiler_module module)
   cmake_parse_arguments(ALSM
                         ""
                         ""
-                        "DEPENDS"
+                        "DEPENDS;SOURCES"
                         ${ARGN})
-  set(raw_sources ${ALSM_UNPARSED_ARGUMENTS})
-  set(sources)
-  foreach(raw_source ${raw_sources})
-    get_filename_component(
-      raw_source "${raw_source}" REALPATH BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
-    list(APPEND sources "${raw_source}")
-  endforeach()
+  set(raw_sources ${ALSM_SOURCES} ${ALSM_UNPARSED_ARGUMENTS})
 
   set(target_name "SwiftModule${module}")
 
@@ -36,8 +29,9 @@ function(add_swift_compiler_module module)
   # This target is mainly used to add properties, like the list of source files.
   add_custom_target(
       ${target_name}
-      SOURCES ${sources}
       COMMENT "swift compiler module ${module}")
+
+  swift_compiler_sources(${module} ${raw_sources})
 
   set_property(TARGET ${target_name} PROPERTY module_name ${module})
   set_property(TARGET ${target_name} PROPERTY module_depends ${ALSM_DEPENDS})
@@ -54,8 +48,13 @@ function(swift_compiler_sources module)
                         ""
                         ""
                         ${ARGN})
-  set(sources ${LSS_UNPARSED_ARGUMENTS})
-  list(TRANSFORM sources PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
+  set(raw_sources ${LSS_UNPARSED_ARGUMENTS})
+  set(sources)
+  foreach(raw_source ${raw_sources})
+    get_filename_component(
+      raw_source "${raw_source}" REALPATH BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    list(APPEND sources "${raw_source}")
+  endforeach()
 
   set(target_name "SwiftModule${module}")
   set_property(TARGET "SwiftModule${module}" APPEND PROPERTY SOURCES ${sources})
@@ -89,8 +88,7 @@ function(add_swift_compiler_modules_library name)
   set(sdk_option "")
 
   if(SWIFT_HOST_VARIANT_SDK IN_LIST SWIFT_DARWIN_PLATFORMS)
-    set(deployment_version "10.15") # TODO: once #38675 lands, replace this with
-#   set(deployment_version "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_DEPLOYMENT_VERSION}")
+    set(deployment_version "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_DEPLOYMENT_VERSION}")
     set(sdk_option "-sdk" "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${SWIFT_HOST_VARIANT_ARCH}_PATH}")
     if(${BOOTSTRAPPING_MODE} STREQUAL "CROSSCOMPILE-WITH-HOSTLIBS")
       # Let the cross-compiled compile don't pick up the compiled stdlib by providing
@@ -120,7 +118,10 @@ function(add_swift_compiler_modules_library name)
     if (dependencies)
       foreach(dep_module ${dependencies})
         if (DEFINED "${dep_module}_dep_target")
-          list(APPEND deps "${${dep_module}_dep_target}")
+          # We have to add the module target for the ordering dependency
+          # and the output file for the file dependency (otherwise the dependent
+          # module wouldn't be rebuilt if the current module changes)
+          list(APPEND deps "${${dep_module}_dep_target}" "${build_dir}/${dep_module}.o")
         else()
           message(FATAL_ERROR "module dependency ${module} -> ${dep_module} not found. Make sure to add modules in dependency order")
         endif()
@@ -144,8 +145,11 @@ function(add_swift_compiler_modules_library name)
               "-emit-module-path" "${build_dir}/${module}.swiftmodule"
               "-parse-as-library" ${sources}
               "-wmo" ${swift_compile_options}
-              "-I" "${SWIFT_SOURCE_DIR}/include/swift"
-              "-I" "${SWIFT_SOURCE_DIR}/include"
+              # Bridging modules and headers.
+              "-Xcc" "-I" "-Xcc" "${SWIFT_SOURCE_DIR}/include"
+              # Generated C headers.
+              "-Xcc" "-I" "-Xcc" "${CMAKE_BINARY_DIR}/include"
+              # Generated swift modules.
               "-I" "${build_dir}"
       COMMENT "Building swift module ${module}")
 
@@ -158,6 +162,15 @@ function(add_swift_compiler_modules_library name)
   add_dependencies(${name} ${all_module_targets})
   set_target_properties(${name} PROPERTIES LINKER_LANGUAGE CXX)
   set_property(GLOBAL APPEND PROPERTY SWIFT_BUILDTREE_EXPORTS ${name})
+
+  # Xcode does not compile libraries that contain only object files.
+  # Therefore, it fails to create the static library. As a workaround,
+  # we add a dummy script phase to the target.
+  if (XCODE)
+    add_custom_command(TARGET ${name} POST_BUILD 
+      COMMAND ""
+      COMMENT "Dummy script phase to force building this target")
+  endif()
 endfunction()
 
 

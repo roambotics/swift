@@ -21,7 +21,7 @@
 #include "swift/AST/Availability.h"
 #include "swift/AST/ResilienceExpansion.h"
 #include "swift/Basic/ProfileCounter.h"
-#include "swift/SIL/SwiftObjectHeader.h"
+#include "swift/Basic/SwiftObjectHeader.h"
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILDeclRef.h"
@@ -150,8 +150,9 @@ class SILFunction
   : public llvm::ilist_node<SILFunction>, public SILAllocated<SILFunction>,
     public SwiftObjectHeader {
     
-  static SwiftMetatype registeredMetatype;
-    
+private:
+  void *libswiftSpecificData[1];
+
 public:
   using BlockListType = llvm::iplist<SILBasicBlock>;
 
@@ -418,10 +419,6 @@ private:
   void setHasOwnership(bool newValue) { HasOwnership = newValue; }
 
 public:
-  static void registerBridgedMetatype(SwiftMetatype metatype) {
-    registeredMetatype = metatype;
-  }
-
   ~SILFunction();
 
   SILModule &getModule() const { return Module; }
@@ -462,6 +459,15 @@ public:
       return;
     ReplacedFunction = f;
     ReplacedFunction->incrementRefCount();
+  }
+
+  SILFunction *getDistributedRecordArgumentFunction() const {
+    return ReplacedFunction;
+  }
+  void setDistributedRecordArgumentFunction(SILFunction *f) {
+    if (f == nullptr)
+      return;
+    f->incrementRefCount();
   }
 
   /// This function should only be called when SILFunctions are bulk deleted.
@@ -943,6 +949,19 @@ public:
     EffectsKindAttr = unsigned(E);
   }
   
+  enum class ArgEffectKind {
+    Unknown,
+    Escape
+  };
+  
+  std::pair<const char *, int>  parseEffects(StringRef attrs, bool fromSIL,
+                                             bool isDerived,
+                                             ArrayRef<StringRef> paramNames);
+  void writeEffect(llvm::raw_ostream &OS, int effectIdx) const;
+  void copyEffects(SILFunction *from);
+  bool hasArgumentEffects() const;
+  void visitArgEffects(std::function<void(int, bool, ArgEffectKind)> c) const;
+
   Purpose getSpecialPurpose() const { return specialPurpose; }
 
   /// Get this function's global_init attribute.

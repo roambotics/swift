@@ -175,7 +175,7 @@ set(SWIFT_ANALYZE_CODE_COVERAGE FALSE CACHE STRING
 # SWIFT_VERSION is deliberately /not/ cached so that an existing build directory
 # can be reused when a new version of Swift comes out (assuming the user hasn't
 # manually set it as part of their own CMake configuration).
-set(SWIFT_VERSION "5.6")
+set(SWIFT_VERSION "5.7")
 
 set(SWIFT_VENDOR "" CACHE STRING
     "The vendor name of the Swift compiler")
@@ -192,8 +192,14 @@ set(SWIFT_TOOLS_ENABLE_LTO OFF CACHE STRING "Build Swift tools with LTO. One
     option only affects the tools that run on the host (the compiler), and has
     no effect on the target libraries (the standard library and the runtime).")
 
-# NOTE: We do not currently support building the swift compiler modules with the Xcode generator.
-cmake_dependent_option(BOOTSTRAPPING_MODE [=[
+option(SWIFT_TOOLS_LD64_LTO_CODEGEN_ONLY_FOR_SUPPORTING_TARGETS
+    "When building ThinLTO using ld64 on Darwin, controls whether to opt out of
+    LLVM IR optimizations when linking targets that will get
+    little benefit from it (e.g. tools for bootstrapping or
+    debugging Swift)"
+    FALSE)
+
+option(BOOTSTRAPPING_MODE [=[
 How to build the swift compiler modules. Possible values are
     OFF:           build without swift modules
     HOSTTOOLS:     build with a pre-installed toolchain
@@ -204,7 +210,7 @@ How to build the swift compiler modules. Possible values are
                    `SWIFT_NATIVE_SWIFT_TOOLS_PATH` (non-Darwin only)
     CROSSCOMPILE-WITH-HOSTLIBS:    build with a bootstrapping-with-hostlibs compiled
                                    compiler, provided in `SWIFT_NATIVE_SWIFT_TOOLS_PATH`
-]=]  OFF "NOT CMAKE_GENERATOR STREQUAL \"Xcode\"" OFF)
+]=] OFF)
 
 # The following only works with the Ninja generator in CMake >= 3.0.
 set(SWIFT_PARALLEL_LINK_JOBS "" CACHE STRING
@@ -357,6 +363,10 @@ option(SWIFT_SIL_VERIFY_ALL
     "Run SIL verification after each transform when building Swift files in the build process"
     FALSE)
 
+option(SWIFT_SIL_VERIFY_ALL_MACOS_ONLY
+    "Run SIL verification after each transform when building the macOS stdlib"
+    FALSE)
+
 option(SWIFT_EMIT_SORTED_SIL_OUTPUT
     "Sort SIL output by name to enable diffing of output"
     FALSE)
@@ -422,6 +432,10 @@ option(SWIFT_ENABLE_RUNTIME_FUNCTION_COUNTERS
 
 option(SWIFT_ENABLE_STDLIBCORE_EXCLUSIVITY_CHECKING
   "Build stdlibCore with exclusivity checking enabled"
+  FALSE)
+
+option(SWIFT_STDLIB_ENABLE_DEBUG_PRECONDITIONS_IN_RELEASE
+  "Enable _debugPrecondition checks in the stdlib in Release configurations"
   FALSE)
 
 option(SWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING
@@ -530,7 +544,12 @@ include(CMakePushCheckState)
 
 # Print out path and version of any installed commands
 message(STATUS "CMake (${CMAKE_COMMAND}) Version: ${CMAKE_VERSION}")
-execute_process(COMMAND ${CMAKE_MAKE_PROGRAM} --version
+if(XCODE)
+  set(version_flag -version)
+else()
+  set(version_flag --version)
+endif()
+execute_process(COMMAND ${CMAKE_MAKE_PROGRAM} ${version_flag}
   OUTPUT_VARIABLE _CMAKE_MAKE_PROGRAM_VERSION
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 message(STATUS "CMake Make Program (${CMAKE_MAKE_PROGRAM}) Version: ${_CMAKE_MAKE_PROGRAM_VERSION}")
@@ -1110,8 +1129,6 @@ if(SWIFT_INCLUDE_TOOLS)
   # SwiftCompilerSources must come before "tools".
   # It adds swift module names to the global property "swift_compiler_modules"
   # which is used in add_swift_host_tool for the lldb workaround.
-  #
-  # NOTE: We do not currently support SwiftCompilerSources with the Xcode generator.
   add_subdirectory(SwiftCompilerSources)
 
   # Always include this after including stdlib/!

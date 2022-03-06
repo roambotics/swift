@@ -80,6 +80,8 @@ Optional<constraints::SolutionApplicationTarget>
 typeCheckExpression(constraints::SolutionApplicationTarget &target,
                     OptionSet<TypeCheckExprFlags> options);
 
+Type typeCheckParameterDefault(Expr *&, DeclContext *, Type, bool);
+
 } // end namespace TypeChecker
 
 } // end namespace swift
@@ -167,17 +169,30 @@ public:
 
 
 class ExpressionTimer {
-  Expr* E;
+public:
+  using AnchorType = llvm::PointerUnion<Expr *, ConstraintLocator *>;
+
+private:
+  AnchorType Anchor;
   ASTContext &Context;
   llvm::TimeRecord StartTime;
+
+  /// The number of milliseconds from creation until
+  /// this timer is considered expired.
+  unsigned ThresholdInMillis;
 
   bool PrintDebugTiming;
   bool PrintWarning;
 
 public:
-  ExpressionTimer(Expr *E, ConstraintSystem &CS);
+  /// This constructor sets a default threshold defined for all expressions
+  /// via compiler flag `solver-expression-time-threshold`.
+  ExpressionTimer(AnchorType Anchor, ConstraintSystem &CS);
+  ExpressionTimer(AnchorType Anchor, ConstraintSystem &CS, unsigned thresholdInMillis);
 
   ~ExpressionTimer();
+
+  AnchorType getAnchor() const { return Anchor; }
 
   unsigned getWarnLimit() const {
     return Context.TypeCheckerOpts.WarnLongExpressionTypeChecking;
@@ -192,13 +207,19 @@ public:
     return endTime.getProcessTime() - StartTime.getProcessTime();
   }
 
+  /// Return the remaining process time in milliseconds until the
+  /// threshold specified during construction is reached.
+  unsigned getRemainingProcessTimeInMillis() const {
+    auto elapsed = unsigned(getElapsedProcessTimeInFractionalSeconds());
+    return elapsed >= ThresholdInMillis ? 0 : ThresholdInMillis - elapsed;
+  }
+
   // Disable emission of warnings about expressions that take longer
   // than the warning threshold.
   void disableWarning() { PrintWarning = false; }
 
-  bool isExpired(unsigned thresholdInMillis) const {
-    auto elapsed = getElapsedProcessTimeInFractionalSeconds();
-    return unsigned(elapsed) > thresholdInMillis;
+  bool isExpired() const {
+    return getRemainingProcessTimeInMillis() == 0;
   }
 };
 
@@ -947,6 +968,7 @@ public:
     stmtCondElement,
     expr,
     stmt,
+    pattern,
     patternBindingEntry,
     varDecl,
   };
@@ -960,6 +982,8 @@ private:
     const Expr *expr;
 
     const Stmt *stmt;
+
+    const Pattern *pattern;
 
     struct PatternBindingEntry {
       const PatternBindingDecl *patternBinding;
@@ -988,6 +1012,11 @@ public:
   SolutionApplicationTargetsKey(const Stmt *stmt) {
     kind = Kind::stmt;
     storage.stmt = stmt;
+  }
+
+  SolutionApplicationTargetsKey(const Pattern *pattern) {
+    kind = Kind::pattern;
+    storage.pattern = pattern;
   }
 
   SolutionApplicationTargetsKey(
@@ -1020,6 +1049,9 @@ public:
 
     case Kind::stmt:
       return lhs.storage.stmt == rhs.storage.stmt;
+
+    case Kind::pattern:
+      return lhs.storage.pattern == rhs.storage.pattern;
 
     case Kind::patternBindingEntry:
       return (lhs.storage.patternBindingEntry.patternBinding
@@ -1061,6 +1093,11 @@ public:
       return hash_combine(
           DenseMapInfo<unsigned>::getHashValue(static_cast<unsigned>(kind)),
           DenseMapInfo<void *>::getHashValue(storage.stmt));
+
+    case Kind::pattern:
+      return hash_combine(
+          DenseMapInfo<unsigned>::getHashValue(static_cast<unsigned>(kind)),
+          DenseMapInfo<void *>::getHashValue(storage.pattern));
 
     case Kind::patternBindingEntry:
       return hash_combine(
@@ -1219,6 +1256,10 @@ public:
   /// names (e.g., member references, normal name references, possible
   /// constructions) to the argument lists for the call to that locator.
   llvm::MapVector<ConstraintLocator *, ArgumentList *> argumentLists;
+
+  /// The set of implicitly generated `.callAsFunction` root expressions.
+  llvm::DenseMap<ConstraintLocator *, UnresolvedDotExpr *>
+      ImplicitCallAsFunctionRoots;
 
   /// Record a new argument matching choice for given locator that maps a
   /// single argument to a single parameter.
@@ -1676,6 +1717,13 @@ public:
                             ContextualTypePurpose contextualPurpose,
                             TypeLoc convertType, bool isDiscarded);
 
+  SolutionApplicationTarget(Expr *expr, DeclContext *dc, ExprPattern *pattern,
+                            Type patternType)
+      : SolutionApplicationTarget(expr, dc, CTP_ExprPattern, patternType,
+                                  /*isDiscarded=*/false) {
+    setPattern(pattern);
+  }
+
   SolutionApplicationTarget(AnyFunctionRef fn)
       : SolutionApplicationTarget(fn, fn.getBody()) { }
 
@@ -1760,6 +1808,12 @@ public:
   /// Form a target for a synthesized property wrapper initializer.
   static SolutionApplicationTarget forPropertyWrapperInitializer(
       VarDecl *wrappedVar, DeclContext *dc, Expr *initializer);
+
+  static SolutionApplicationTarget forExprPattern(Expr *expr, DeclContext *dc,
+                                                  ExprPattern *pattern,
+                                                  Type patternTy) {
+    return {expr, dc, pattern, patternTy};
+  }
 
   Expr *getAsExpr() const {
     switch (kind) {
@@ -1861,6 +1915,12 @@ public:
     assert(kind == Kind::expression);
     assert(expression.contextualPurpose == CTP_Initialization);
     return expression.pattern;
+  }
+
+  ExprPattern *getExprPattern() const {
+    assert(kind == Kind::expression);
+    assert(expression.contextualPurpose == CTP_ExprPattern);
+    return cast<ExprPattern>(expression.pattern);
   }
 
   /// For a pattern initialization target, retrieve the contextual pattern.
@@ -1983,7 +2043,8 @@ public:
     assert(kind == Kind::expression);
     assert(expression.contextualPurpose == CTP_Initialization ||
            expression.contextualPurpose == CTP_ForEachStmt ||
-           expression.contextualPurpose == CTP_ForEachSequence);
+           expression.contextualPurpose == CTP_ForEachSequence ||
+           expression.contextualPurpose == CTP_ExprPattern);
     expression.pattern = pattern;
   }
 
@@ -2468,6 +2529,12 @@ public:
   /// types.
   llvm::DenseMap<CanType, DynamicCallableMethods> DynamicCallableCache;
 
+  /// A cache of implicitly generated dot-member expressions used as roots
+  /// for some `.callAsFunction` calls. The key here is "base" locator for
+  /// the `.callAsFunction` member reference.
+  llvm::SmallMapVector<ConstraintLocator *, UnresolvedDotExpr *, 2>
+      ImplicitCallAsFunctionRoots;
+
 private:
   /// Describe the candidate expression for partial solving.
   /// This class used by shrink & solve methods which apply
@@ -2951,6 +3018,9 @@ public:
     /// The length of \c ArgumentLists.
     unsigned numArgumentLists;
 
+    /// The length of \c ImplicitCallAsFunctionRoots.
+    unsigned numImplicitCallAsFunctionRoots;
+
     /// The previous score.
     Score PreviousScore;
 
@@ -3012,6 +3082,10 @@ private:
   friend Optional<SolutionApplicationTarget>
   swift::TypeChecker::typeCheckExpression(
       SolutionApplicationTarget &target, OptionSet<TypeCheckExprFlags> options);
+
+  friend Type swift::TypeChecker::typeCheckParameterDefault(Expr *&,
+                                                            DeclContext *, Type,
+                                                            bool);
 
   /// Emit the fixes computed as part of the solution, returning true if we were
   /// able to emit an error message, or false if none of the fixits worked out.
@@ -3321,6 +3395,11 @@ public:
   ConstraintLocator *getOpenOpaqueLocator(
       ConstraintLocatorBuilder locator, OpaqueTypeDecl *opaqueDecl);
 
+  /// Open the given existential type, recording the opened type in the
+  /// constraint system and returning both it and the root opened archetype.
+  std::pair<Type, OpenedArchetypeType *> openExistentialType(
+      Type type, ConstraintLocator *locator);
+
   /// Retrive the constraint locator for the given anchor and
   /// path, uniqued and automatically infer the summary flags
   ConstraintLocator *
@@ -3474,6 +3553,11 @@ public:
 
   void recordMatchCallArgumentResult(ConstraintLocator *locator,
                                      MatchCallArgumentResult result);
+
+  /// Record implicitly generated `callAsFunction` with root at the
+  /// given expression, located at \c locator.
+  void recordCallAsFunction(UnresolvedDotExpr *root, ArgumentList *arguments,
+                            ConstraintLocator *locator);
 
   /// Walk a closure AST to determine its effects.
   ///
@@ -4125,6 +4209,13 @@ public:
                              OpenedTypeMap &replacements,
                              ConstraintLocatorBuilder locator);
 
+  /// Open a generic parameter into a type variable and record
+  /// it in \c replacements.
+  TypeVariableType *openGenericParameter(DeclContext *outerDC,
+                                         GenericTypeParamType *parameter,
+                                         OpenedTypeMap &replacements,
+                                         ConstraintLocatorBuilder locator);
+
   /// Given generic signature open its generic requirements,
   /// using substitution function, and record them in the
   /// constraint system for further processing.
@@ -4133,6 +4224,14 @@ public:
                                bool skipProtocolSelfConstraint,
                                ConstraintLocatorBuilder locator,
                                llvm::function_ref<Type(Type)> subst);
+
+  // Record the given requirement in the constraint system.
+  void openGenericRequirement(DeclContext *outerDC,
+                              unsigned index,
+                              const Requirement &requirement,
+                              bool skipProtocolSelfConstraint,
+                              ConstraintLocatorBuilder locator,
+                              llvm::function_ref<Type(Type)> subst);
 
   /// Record the set of opened types for the given locator.
   void recordOpenedTypes(
@@ -5044,6 +5143,15 @@ private:
                              = FreeTypeVariableBinding::Disallow);
 
 public:
+  /// Pre-check the target, validating any types that occur in it
+  /// and folding sequence expressions.
+  ///
+  /// \param replaceInvalidRefsWithErrors Indicates whether it's allowed
+  /// to replace any discovered invalid member references with `ErrorExpr`.
+  static bool preCheckTarget(SolutionApplicationTarget &target,
+                             bool replaceInvalidRefsWithErrors,
+                             bool leaveClosureBodiesUnchecked);
+
   /// Pre-check the expression, validating any types that occur in the
   /// expression and folding sequence expressions.
   ///
@@ -5226,9 +5334,7 @@ public:
       return isExpressionAlreadyTooComplex= true;
     }
 
-    const auto timeoutThresholdInMillis =
-        getASTContext().TypeCheckerOpts.ExpressionTimeoutThreshold;
-    if (Timer && Timer->isExpired(timeoutThresholdInMillis)) {
+    if (Timer && Timer->isExpired()) {
       // Disable warnings about expressions that go over the warning
       // threshold since we're arbitrarily ending evaluation and
       // emitting an error.
@@ -5295,6 +5401,13 @@ public:
   /// Determine whether one of the parent closures the given one is nested
   /// in (if any) has a result builder applied to its body.
   bool isInResultBuilderContext(ClosureExpr *closure) const;
+
+  /// Determine whether referencing the given member on the
+  /// given existential base type is supported. This is the case only if the
+  /// type of the member, spelled in the context of \p baseTy, does not contain
+  /// 'Self' or 'Self'-rooted dependent member types in non-covariant position.
+  bool isMemberAvailableOnExistential(Type baseTy,
+                                      const ValueDecl *member) const;
 
   SWIFT_DEBUG_DUMP;
   SWIFT_DEBUG_DUMPER(dump(Expr *));
@@ -5464,18 +5577,15 @@ matchCallArguments(
     MatchCallArgumentListener &listener,
     Optional<TrailingClosureMatching> trailingClosureMatching);
 
-ConstraintSystem::TypeMatchResult
-matchCallArguments(ConstraintSystem &cs,
-                   FunctionType *contextualType,
-                   ArrayRef<AnyFunctionType::Param> args,
-                   ArrayRef<AnyFunctionType::Param> params,
-                   ConstraintKind subKind,
-                   ConstraintLocatorBuilder locator,
-                   Optional<TrailingClosureMatching> trailingClosureMatching);
-
 /// Given an expression that is the target of argument labels (for a call,
 /// subscript, etc.), find the underlying target expression.
 Expr *getArgumentLabelTargetExpr(Expr *fn);
+
+/// Given a type that includes an existential type that has been opened to
+/// the given type variable, type-erase occurences of that opened type
+/// variable and anything that depends on it to their non-dependent bounds.
+Type typeEraseOpenedExistentialReference(Type type, Type existentialBaseType,
+                                         TypeVariableType *openedTypeVar);
 
 /// Returns true if a reference to a member on a given base type will apply
 /// its curried self parameter, assuming it has one.
@@ -5660,6 +5770,8 @@ public:
   ConjunctionElement(Constraint *element) : Element(element) {}
 
   bool attempt(ConstraintSystem &cs) const;
+
+  ConstraintLocator *getLocator() const { return Element->getLocator(); }
 
   void print(llvm::raw_ostream &Out, SourceManager *SM) const {
     Out << "conjunction element ";

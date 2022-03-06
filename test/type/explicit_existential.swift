@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -enable-explicit-existential-types
+// RUN: %target-typecheck-verify-swift
 
 protocol HasSelfRequirements {
   func foo(_ x: Self)
@@ -149,16 +149,132 @@ func testInvalidAny() {
   let _: any ((S) -> Void) = generic // expected-error{{'any' has no effect on concrete type '(S) -> Void'}}
 }
 
-func testRedundantAnyWarning() {
-  let _: any Any // expected-warning {{'any' is redundant on type 'Any'}}
-  let _: any AnyObject // expected-warning {{'any' is redundant on type 'AnyObject'}}
+func anyAny() {
+  let _: any Any
+  let _: any AnyObject
 }
 
 protocol P1 {}
 protocol P2 {}
+do {
+  // Test that we don't accidentally misparse an 'any' type as a 'some' type
+  // and vice versa.
+  let _: P1 & any P2 // expected-error {{'any' should appear at the beginning of a composition}}
+  let _: any P1 & any P2 // expected-error {{'any' should appear at the beginning of a composition}}
+  let _: any P1 & some P2 // expected-error {{'some' should appear at the beginning of a composition}}
+  let _: some P1 & any P2
+  // expected-error@-1 {{'some' type can only be declared on a single property declaration}}
+  // expected-error@-2 {{'any' should appear at the beginning of a composition}}
+}
+
 struct ConcreteComposition: P1, P2 {}
 
 func testMetatypes() {
   let _: any P1.Type = ConcreteComposition.self
   let _: any (P1 & P2).Type = ConcreteComposition.self
+}
+
+func generic<T: any P1>(_ t: T) {} // expected-error {{type 'T' constrained to non-protocol, non-class type 'any P1'}}
+
+protocol RawRepresentable {
+  associatedtype RawValue
+  var rawValue: RawValue { get }
+}
+
+enum E1: RawRepresentable {
+  typealias RawValue = P1
+
+  var rawValue: P1 {
+    return ConcreteComposition()
+  }
+}
+
+enum E2: RawRepresentable {
+  typealias RawValue = any P1
+
+  var rawValue: any P1 {
+    return ConcreteComposition()
+  }
+}
+
+public protocol MyError {}
+
+extension MyError {
+  static func ~=(lhs: any Error, rhs: Self) -> Bool {
+    return true
+  }
+}
+
+struct Wrapper {
+  typealias E = Error
+}
+
+func typealiasMemberReferences(metatype: Wrapper.Type) {
+  let _: Wrapper.E.Protocol = metatype.E.self
+  let _: (any Wrapper.E).Type = metatype.E.self
+}
+
+func testAnyTypeExpr() {
+  let _: (any P).Type = (any P).self
+
+  func test(_: (any P).Type) {}
+  test((any P).self)
+
+  // expected-error@+2 {{expected member name or constructor call after type name}}
+  // expected-note@+1 {{use '.self' to reference the type object}}
+  let invalid = any P
+  test(invalid)
+
+  // Make sure 'any' followed by an identifier
+  // on the next line isn't parsed as a type.
+  func doSomething() {}
+
+  let any = 10
+  let _ = any
+  doSomething()
+}
+
+func hasInvalidExistential(_: any DoesNotExistIHope) {}
+// expected-error@-1 {{cannot find type 'DoesNotExistIHope' in scope}}
+
+protocol Input {
+  associatedtype A
+}
+protocol Output {
+  associatedtype A
+}
+
+// expected-warning@+2{{protocol 'Input' as a type must be explicitly marked as 'any'}}
+// expected-warning@+1{{protocol 'Output' as a type must be explicitly marked as 'any'}}
+typealias InvalidFunction = (Input) -> Output
+func testInvalidFunctionAlias(fn: InvalidFunction) {}
+
+typealias ExistentialFunction = (any Input) -> any Output
+func testFunctionAlias(fn: ExistentialFunction) {}
+
+typealias Constraint = Input
+func testConstraintAlias(x: Constraint) {} // expected-warning{{'Constraint' (aka 'Input') as a type must be explicitly marked as 'any'}}
+
+typealias Existential = any Input
+func testExistentialAlias(x: Existential, y: any Constraint) {}
+
+// Reject explicit existential types in inheritance clauses
+protocol Empty {}
+
+struct S : any Empty {} // expected-error {{inheritance from non-protocol type 'any Empty'}}
+class C : any Empty {} // expected-error {{inheritance from non-protocol, non-class type 'any Empty'}}
+
+// FIXME: Diagnostics are not great in the enum case because we confuse this with a raw type
+
+enum E : any Empty { // expected-error {{raw type 'Empty' is not expressible by a string, integer, or floating-point literal}}
+// expected-error@-1 {{'E' declares raw type 'Empty', but does not conform to RawRepresentable and conformance could not be synthesized}}
+// expected-error@-2 {{RawRepresentable conformance cannot be synthesized because raw type 'Empty' is not Equatable}}
+  case hack
+}
+
+enum EE : Equatable, any Empty { // expected-error {{raw type 'Empty' is not expressible by a string, integer, or floating-point literal}}
+// expected-error@-1 {{'EE' declares raw type 'Empty', but does not conform to RawRepresentable and conformance could not be synthesized}}
+// expected-error@-2 {{RawRepresentable conformance cannot be synthesized because raw type 'Empty' is not Equatable}}
+// expected-error@-3 {{raw type 'Empty' must appear first in the enum inheritance clause}}
+  case hack
 }

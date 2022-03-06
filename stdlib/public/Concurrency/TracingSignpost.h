@@ -173,12 +173,13 @@ inline void task_create(AsyncTask *task, AsyncTask *parent, TaskGroup *group,
                         AsyncLet *asyncLet) {
   ENSURE_LOGS();
   auto id = os_signpost_id_make_with_pointer(TaskLog, task);
+  auto parentID = parent ? parent->getTaskId() : 0;
   os_signpost_interval_begin(
       TaskLog, id, SWIFT_LOG_TASK_LIFETIME_NAME,
       "task=%" PRIx64 " resumefn=%p flags=0x%" PRIx32
-      " parent=%p group=%p asyncLet=%p",
+      " parent=%" PRIx64 " group=%p asyncLet=%p",
       task->getTaskId(), task->getResumeFunctionForLogging(),
-      task->Flags.getOpaqueValue(), parent, group, asyncLet);
+      task->Flags.getOpaqueValue(), parentID, group, asyncLet);
 }
 
 inline void task_destroy(AsyncTask *task) {
@@ -208,9 +209,10 @@ inline void task_flags_changed(AsyncTask *task, uint32_t flags) {
 inline void task_wait(AsyncTask *task, AsyncTask *waitingOn, uintptr_t status) {
   ENSURE_LOGS();
   auto id = os_signpost_id_make_with_pointer(TaskLog, task);
+  auto waitingID = waitingOn ? waitingOn->getTaskId() : 0;
   os_signpost_event_emit(TaskLog, id, SWIFT_LOG_TASK_WAIT_NAME,
-                         "task=%" PRIx64 " waitingOnTask=%p status=0x%" PRIxPTR,
-                         task->getTaskId(), waitingOn, status);
+                         "task=%" PRIx64 " waitingOnTask=%" PRIx64 " status=0x%" PRIxPTR,
+                         task->getTaskId(), waitingID, status);
 }
 
 inline void job_enqueue_global(Job *job) {
@@ -242,29 +244,33 @@ inline void job_enqueue_main_executor(Job *job) {
   }
 }
 
-inline uint64_t job_run_begin(Job *job, ExecutorRef *executor) {
+inline job_run_info job_run_begin(Job *job, ExecutorRef *executor) {
+  auto invalidInfo = []{
+    return job_run_info{ 0, OS_SIGNPOST_ID_INVALID };
+  };
+
   if (AsyncTask *task = dyn_cast<AsyncTask>(job)) {
-    ENSURE_LOGS(0);
-    auto id = os_signpost_id_generate(TaskLog);
+    ENSURE_LOGS(invalidInfo());
+    auto handle = os_signpost_id_generate(TaskLog);
+    auto taskId = task->getTaskId();
     os_signpost_interval_begin(
-        TaskLog, id, SWIFT_LOG_JOB_RUN_NAME,
+        TaskLog, handle, SWIFT_LOG_JOB_RUN_NAME,
         "task=%" PRIx64
         " executorIdentity=%p executorImplementation=0x%" PRIxPTR,
-        task->getTaskId(), executor->getIdentity(),
-        executor->getRawImplementation());
-    return id;
+        taskId, executor->getIdentity(), executor->getRawImplementation());
+    return { taskId, handle };
   }
-  return 0;
+  return invalidInfo();
 }
 
-inline void job_run_end(Job *job, ExecutorRef *executor, uint64_t beginHandle) {
-  if (AsyncTask *task = dyn_cast<AsyncTask>(job)) {
+inline void job_run_end(ExecutorRef *executor, job_run_info info) {
+  if (info.handle != OS_SIGNPOST_ID_INVALID) {
     ENSURE_LOGS();
     os_signpost_interval_end(
-        TaskLog, beginHandle, SWIFT_LOG_JOB_RUN_NAME,
+        TaskLog, info.handle, SWIFT_LOG_JOB_RUN_NAME,
         "task=%" PRIx64
         " executorIdentity=%p executorImplementation=0x%" PRIxPTR,
-        task->getTaskId(), executor->getIdentity(),
+        info.taskId, executor->getIdentity(),
         executor->getRawImplementation());
   }
 }

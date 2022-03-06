@@ -831,6 +831,10 @@ std::string ASTMangler::mangleOpaqueTypeDecl(const OpaqueTypeDecl *decl) {
 }
 
 std::string ASTMangler::mangleOpaqueTypeDecl(const ValueDecl *decl) {
+#if SWIFT_BUILD_ONLY_SYNTAXPARSERLIB
+  return std::string(); // not needed for the parser library.
+#endif
+
   OptimizeProtocolNames = false;
 
   beginMangling();
@@ -853,6 +857,8 @@ void ASTMangler::appendSymbolKind(SymbolKind SKind) {
     case SymbolKind::DistributedThunk: return appendOperator("TE");
     case SymbolKind::DistributedAccessor: return appendOperator("TF");
     case SymbolKind::AccessibleFunctionRecord: return appendOperator("HF");
+    case SymbolKind::BackDeploymentThunk: return appendOperator("Twb");
+    case SymbolKind::BackDeploymentFallback: return appendOperator("TwB");
   }
 }
 
@@ -1262,6 +1268,11 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
       return appendExistentialLayout(layout, sig, forDecl);
     }
 
+    case TypeKind::ParameterizedProtocol: {
+      llvm::errs() << "Not implemented\n";
+      abort();
+    }
+
     case TypeKind::Existential: {
       auto constraint = cast<ExistentialType>(tybase)->getConstraintType();
       return appendType(constraint, sig, forDecl);
@@ -1314,61 +1325,10 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
       llvm_unreachable("Cannot mangle free-standing archetypes");
 
     case TypeKind::OpaqueTypeArchetype: {
-      // If this is the opaque return type of the declaration currently being
-      // mangled, use a short mangling to represent it.
       auto opaqueType = cast<OpaqueTypeArchetypeType>(tybase);
       auto opaqueDecl = opaqueType->getDecl();
-      if (opaqueDecl->getNamingDecl() == forDecl) {
-        assert(opaqueType->getSubstitutions().isIdentity());
-        if (opaqueType->getOrdinal() == 0)
-          return appendOperator("Qr");
-
-        return appendOperator("QR", Index(opaqueType->getOrdinal() - 1));
-      }
-      
-      // Otherwise, try to substitute it.
-      if (tryMangleTypeSubstitution(type, sig))
-        return;
-      
-      // Use the fully elaborated explicit mangling.
-      appendOpaqueDeclName(opaqueDecl);
-      bool isFirstArgList = true;
-      appendBoundGenericArgs(opaqueDecl, sig,
-                             opaqueType->getSubstitutions(),
-                             isFirstArgList, forDecl);
-      appendRetroactiveConformances(opaqueType->getSubstitutions(), sig,
-                                    opaqueDecl->getParentModule());
-      
-      appendOperator("Qo", Index(opaqueType->getOrdinal()));
-
-      addTypeSubstitution(type, sig);
-      return;
-    }
-      
-    case TypeKind::NestedArchetype: {
-      auto nestedType = cast<NestedArchetypeType>(tybase);
-      
-      // Mangle associated types of opaque archetypes like dependent member
-      // types, so that they can be accurately demangled at runtime.
-      if (auto opaque =
-            dyn_cast<OpaqueTypeArchetypeType>(nestedType->getRoot())) {
-        if (tryMangleTypeSubstitution(nestedType, sig))
-          return;
-        
-        appendType(opaque, sig, forDecl);
-        bool isAssocTypeAtDepth = false;
-        appendAssocType(nestedType->getInterfaceType(),
-                        sig, isAssocTypeAtDepth);
-        appendOperator(isAssocTypeAtDepth ? "QX" : "Qx");
-        addTypeSubstitution(nestedType, sig);
-        return;
-      }
-
-      // FIXME: Never actually used.
-      appendType(nestedType->getParent(), sig, forDecl);
-      appendIdentifier(nestedType->getName().str());
-      appendOperator("Qa");
-      return;
+      return appendOpaqueTypeArchetype(
+          opaqueType, opaqueDecl, opaqueType->getSubstitutions(), sig, forDecl);
     }
       
     case TypeKind::DynamicSelf: {
@@ -1952,6 +1912,51 @@ void ASTMangler::appendImplFunctionType(SILFunctionType *fn,
   OpArgs.push_back('_');
 
   appendOperator("I", StringRef(OpArgs.data(), OpArgs.size()));
+}
+
+void ASTMangler::appendOpaqueTypeArchetype(ArchetypeType *archetype,
+                                           OpaqueTypeDecl *opaqueDecl,
+                                           SubstitutionMap subs,
+                                           GenericSignature sig,
+                                           const ValueDecl *forDecl) {
+  Type interfaceType = archetype->getInterfaceType();
+  auto genericParam = interfaceType->getAs<GenericTypeParamType>();
+
+  // If this is the opaque return type of the declaration currently being
+  // mangled, use a short mangling to represent it.
+  if (genericParam && opaqueDecl->getNamingDecl() == forDecl) {
+    assert(subs.isIdentity());
+    if (genericParam->getIndex() == 0)
+      return appendOperator("Qr");
+
+    return appendOperator("QR", Index(genericParam->getIndex() - 1));
+  }
+
+  // Otherwise, try to substitute it.
+  if (tryMangleTypeSubstitution(Type(archetype), sig))
+    return;
+
+  // Mangling at the root, described by a generic parameter.
+  if (genericParam) {
+    // Use the fully elaborated explicit mangling.
+    appendOpaqueDeclName(opaqueDecl);
+    bool isFirstArgList = true;
+    appendBoundGenericArgs(opaqueDecl, sig, subs, isFirstArgList, forDecl);
+    appendRetroactiveConformances(subs, sig, opaqueDecl->getParentModule());
+
+    appendOperator("Qo", Index(genericParam->getIndex()));
+  } else {
+    // Mangle associated types of opaque archetypes like dependent member
+    // types, so that they can be accurately demangled at runtime.
+    appendType(Type(archetype->getRoot()), sig, forDecl);
+    bool isAssocTypeAtDepth = false;
+    appendAssocType(
+        archetype->getInterfaceType()->castTo<DependentMemberType>(),
+        sig, isAssocTypeAtDepth);
+    appendOperator(isAssocTypeAtDepth ? "QX" : "Qx");
+  }
+
+  addTypeSubstitution(Type(archetype), sig);
 }
 
 Optional<ASTMangler::SpecialContext>
@@ -2685,6 +2690,9 @@ void ASTMangler::appendTypeListElement(Identifier name, Type elementType,
   if (flags.isIsolated())
     appendOperator("Yi");
 
+  if (flags.isCompileTimeConst())
+    appendOperator("Yt");
+
   if (!name.empty())
     appendIdentifier(name.str());
   if (flags.isVariadic())
@@ -3010,7 +3018,7 @@ CanType ASTMangler::getDeclTypeForMangling(
   // If this declaration predates concurrency, adjust its type to not
   // contain type features that were not available pre-concurrency. This
   // cannot alter the ABI in any way.
-  if (decl->predatesConcurrency()) {
+  if (decl->preconcurrency()) {
     ty = ty->stripConcurrency(/*recurse=*/true, /*dropGlobalActor=*/true);
   }
 
@@ -3278,9 +3286,8 @@ void ASTMangler::appendDependentProtocolConformance(
 
     // Conformances are relative to the current protocol's requirement
     // signature.
-    auto index =
-      conformanceRequirementIndex(entry,
-                                  currentProtocol->getRequirementSignature());
+    auto reqs = currentProtocol->getRequirementSignature().getRequirements();
+    auto index = conformanceRequirementIndex(entry, reqs);
 
     // Inherited conformance.
     bool isInheritedConformance =

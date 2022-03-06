@@ -791,6 +791,12 @@ public:
     // the block header.
     printBlockArgumentUses(BB);
 
+    // If the basic block has a name available, print it as well
+    auto debugName = BB->getDebugName();
+    if (debugName.hasValue()) {
+      *this << "// " << debugName.getValue() << '\n';
+    }
+
     // Then print the name of our block, the arguments, and the block colon.
     *this << Ctx.getID(BB);
     printBlockArguments(BB);
@@ -1315,6 +1321,8 @@ public:
       *this << "[dynamic_lifetime] ";
     if (AVI->isLexical())
       *this << "[lexical] ";
+    if (AVI->getWasMoved())
+      *this << "[moved] ";
     *this << AVI->getElementType();
     printDebugVar(AVI->getVarInfo(),
                   &AVI->getModule().getASTContext().SourceMgr);
@@ -1675,6 +1683,8 @@ public:
   void visitDebugValueInst(DebugValueInst *DVI) {
     if (DVI->poisonRefs())
       *this << "[poison] ";
+    if (DVI->getWasMoved())
+      *this << "[moved] ";
     *this << getIDAndType(DVI->getOperand());
     printDebugVar(DVI->getVarInfo(),
                   &DVI->getModule().getASTContext().SourceMgr);
@@ -1896,6 +1906,20 @@ public:
   void visitMoveValueInst(MoveValueInst *I) {
     if (I->getAllowDiagnostics())
       *this << "[allows_diagnostics] ";
+    if (I->isLexical())
+      *this << "[lexical] ";
+    *this << getIDAndType(I->getOperand());
+  }
+
+  void visitMarkMustCheckInst(MarkMustCheckInst *I) {
+    using CheckKind = MarkMustCheckInst::CheckKind;
+    switch (I->getCheckKind()) {
+    case CheckKind::Invalid:
+      llvm_unreachable("Invalid?!");
+    case CheckKind::NoImplicitCopy:
+      *this << "[no_implicit_copy] ";
+      break;
+    }
     *this << getIDAndType(I->getOperand());
   }
 
@@ -2944,6 +2968,36 @@ void SILFunction::print(SILPrintContext &PrintCtx) const {
   else if (getEffectsKind() == EffectsKind::ReleaseNone)
     OS << "[releasenone] ";
 
+  llvm::SmallVector<int, 8> definedEscapesIndices;
+  llvm::SmallVector<int, 8> escapesIndices;
+  visitArgEffects([&](int effectIdx, bool isDerived, ArgEffectKind kind) {
+    if (kind == ArgEffectKind::Escape) {
+      if (isDerived) {
+        escapesIndices.push_back(effectIdx);
+      } else {
+        definedEscapesIndices.push_back(effectIdx);
+      }
+    }
+  });
+  if (!definedEscapesIndices.empty()) {
+    OS << "[defined_escapes ";
+    for (int effectIdx : definedEscapesIndices) {
+      if (effectIdx > 0)
+        OS << ", ";
+      writeEffect(OS, effectIdx);
+    }
+    OS << "] ";
+  }
+  if (!escapesIndices.empty()) {
+    OS << "[escapes ";
+    for (int effectIdx : escapesIndices) {
+      if (effectIdx > 0)
+        OS << ", ";
+      writeEffect(OS, effectIdx);
+    }
+    OS << "] ";
+  }
+
   if (auto *replacedFun = getDynamicallyReplacedFunction()) {
     OS << "[dynamic_replacement_for \"";
     OS << replacedFun->getName();
@@ -3809,6 +3863,11 @@ void SILSpecializeAttr::print(llvm::raw_ostream &OS) const {
                },
                [&] { OS << ", "; });
   }
+}
+
+void KeyPathPatternComponent::print(SILPrintContext &ctxt) const {
+  SILPrinter printer(ctxt);
+  printer.printKeyPathPatternComponent(*this);
 }
 
 //===----------------------------------------------------------------------===//

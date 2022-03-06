@@ -457,6 +457,20 @@ function(_compile_swift_files
     list(APPEND swift_flags "-Xfrontend" "-sil-verify-all")
   endif()
 
+  if(SWIFT_SIL_VERIFY_ALL_MACOS_ONLY)
+    # Only add if we have a macOS build triple
+    if ("${SWIFTFILE_SDK}" STREQUAL "OSX" AND
+        "${SWIFTFILE_ARCHITECTURE}" STREQUAL "x86_64")
+      list(APPEND swift_flags "-Xfrontend" "-sil-verify-all")
+    endif()
+  endif()
+
+  # The standard library and overlays are built with the Requirement Machine enabled.
+  if(SWIFTFILE_IS_STDLIB)
+    list(APPEND swift_flags "-Xfrontend" "-requirement-machine-protocol-signatures=verify")
+    list(APPEND swift_flags "-Xfrontend" "-requirement-machine-abstract-signatures=verify")
+  endif()
+
   # The standard library and overlays are built resiliently when SWIFT_STDLIB_STABLE_ABI=On.
   if(SWIFTFILE_IS_STDLIB AND SWIFT_STDLIB_STABLE_ABI)
     list(APPEND swift_flags "-enable-library-evolution")
@@ -475,7 +489,7 @@ function(_compile_swift_files
   endif()
 
   if(NOT SWIFT_ENABLE_REFLECTION)
-    list(APPEND swift_flags "-Xfrontend" "-disable-reflection-metadata")
+    list(APPEND swift_flags "-Xfrontend" "-reflection-metadata-for-debugger-only")
   else()
     list(APPEND swift_flags "-D" "SWIFT_ENABLE_REFLECTION")
   endif()
@@ -524,6 +538,10 @@ function(_compile_swift_files
 
   if(SWIFT_STDLIB_EXPERIMENTAL_HERMETIC_SEAL_AT_LINK)
     list(APPEND swift_flags "-experimental-hermetic-seal-at-link")
+  endif()
+
+  if(SWIFT_STDLIB_DISABLE_INSTANTIATION_CACHES)
+    list(APPEND swift_flags "-Xfrontend" "-disable-preallocated-instantiation-caches")
   endif()
 
   list(APPEND swift_flags ${SWIFT_STDLIB_EXTRA_SWIFT_COMPILE_FLAGS})
@@ -939,6 +957,13 @@ function(_compile_swift_files
         OUTPUT ${module_outputs_static}
         DEPENDS
           "${module_dependency_target}"
+          "${line_directive_tool}"
+          "${file_path}"
+          ${swift_compiler_tool_dep}
+          ${source_files} ${SWIFTFILE_DEPENDS}
+          ${swift_ide_test_dependency}
+          ${create_dirs_dependency_target}
+          ${copy_legacy_layouts_dep}
         COMMENT "Generating ${module_file}")
       set("${dependency_module_target_out_var_name}" "${module_dependency_target_static}" PARENT_SCOPE)
     else()

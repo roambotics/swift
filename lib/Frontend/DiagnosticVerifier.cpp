@@ -29,11 +29,39 @@ using namespace swift;
 namespace swift {
 struct ExpectedFixIt {
   const char *StartLoc, *EndLoc; // The loc of the {{ and }}'s.
-  unsigned StartCol;
-  unsigned EndCol;
+  LineColumnRange Range;
+
   std::string Text;
 };
 } // end namespace swift
+
+constexpr unsigned LineColumnRange::NoValue;
+
+const LineColumnRange &
+CapturedFixItInfo::getLineColumnRange(const SourceManager &SM,
+                                      unsigned BufferID,
+                                      bool ComputeStartLocLine,
+                                      bool ComputeEndLocLine) const {
+  if (LineColRange.StartLine == LineColumnRange::NoValue &&
+      ComputeStartLocLine) {
+    std::tie(LineColRange.StartLine, LineColRange.StartCol) =
+        SM.getPresumedLineAndColumnForLoc(getSourceRange().getStart(),
+                                          BufferID);
+  } else if (LineColRange.StartCol == LineColumnRange::NoValue) {
+    LineColRange.StartCol =
+        SM.getColumnInBuffer(getSourceRange().getStart(), BufferID);
+  }
+
+  if (LineColRange.EndLine == LineColumnRange::NoValue && ComputeEndLocLine) {
+    std::tie(LineColRange.EndLine, LineColRange.EndCol) =
+        SM.getPresumedLineAndColumnForLoc(FixIt.getRange().getEnd(), BufferID);
+  } else if (LineColRange.EndCol == LineColumnRange::NoValue) {
+    LineColRange.EndCol =
+        SM.getColumnInBuffer(getSourceRange().getEnd(), BufferID);
+  }
+
+  return LineColRange;
+}
 
 namespace {
 
@@ -43,6 +71,9 @@ static constexpr StringLiteral educationalNotesSpecifier("educational-notes=");
 struct ExpectedDiagnosticInfo {
   // This specifies the full range of the "expected-foo {{}}" specifier.
   const char *ExpectedStart, *ExpectedEnd = nullptr;
+
+  // This specifies the full range of the classification string.
+  const char *ClassificationStart, *ClassificationEnd = nullptr;
 
   DiagnosticKind Classification;
 
@@ -80,8 +111,11 @@ struct ExpectedDiagnosticInfo {
   Optional<ExpectedEducationalNotes> EducationalNotes;
 
   ExpectedDiagnosticInfo(const char *ExpectedStart,
+                         const char *ClassificationStart,
+                         const char *ClassificationEnd,
                          DiagnosticKind Classification)
-      : ExpectedStart(ExpectedStart), Classification(Classification) {}
+      : ExpectedStart(ExpectedStart), ClassificationStart(ClassificationStart),
+        ClassificationEnd(ClassificationEnd), Classification(Classification) {}
 };
 
 static std::string getDiagKindString(DiagnosticKind Kind) {
@@ -111,11 +145,15 @@ renderEducationalNotes(llvm::SmallVectorImpl<std::string> &EducationalNotes) {
   return OS.str();
 }
 
-/// If we find the specified diagnostic in the list, return it.
-/// Otherwise return CapturedDiagnostics.end().
-static std::vector<CapturedDiagnosticInfo>::iterator
+/// If we find the specified diagnostic in the list, return it with \c true .
+/// If we find a near-match that varies only in classification, return it with
+/// \c false.
+/// Otherwise return \c CapturedDiagnostics.end() with \c false.
+static std::tuple<std::vector<CapturedDiagnosticInfo>::iterator, bool>
 findDiagnostic(std::vector<CapturedDiagnosticInfo> &CapturedDiagnostics,
                const ExpectedDiagnosticInfo &Expected, StringRef BufferName) {
+  auto fallbackI = CapturedDiagnostics.end();
+
   for (auto I = CapturedDiagnostics.begin(), E = CapturedDiagnostics.end();
        I != E; ++I) {
     // Verify the file and line of the diagnostic.
@@ -127,15 +165,22 @@ findDiagnostic(std::vector<CapturedDiagnosticInfo> &CapturedDiagnostics,
       continue;
 
     // Verify the classification and string.
-    if (I->Classification != Expected.Classification ||
-        I->Message.find(Expected.MessageStr) == StringRef::npos)
+    if (I->Message.find(Expected.MessageStr) == StringRef::npos)
       continue;
 
+    // Verify the classification and, if incorrect, remember as a second choice.
+    if (I->Classification != Expected.Classification) {
+      if (fallbackI == E && !Expected.MessageStr.empty())
+        fallbackI = I;
+      continue;
+    }
+
     // Okay, we found a match, hurray!
-    return I;
+    return { I, true };
   }
 
-  return CapturedDiagnostics.end();
+  // No perfect match; we'll return the fallback or `end()` instead.
+  return { fallbackI, false };
 }
 
 /// If there are any -verify errors (e.g. differences between expectations
@@ -237,36 +282,35 @@ verifyUnknown(SourceManager &SM,
 }
 } // end anonymous namespace
 
-static unsigned getColumnNumber(StringRef buffer, llvm::SMLoc loc) {
-  assert(loc.getPointer() >= buffer.data());
-  assert((size_t)(loc.getPointer() - buffer.data()) <= buffer.size());
-
-  StringRef UpToLoc = buffer.slice(0, loc.getPointer() - buffer.data());
-
-  size_t ColumnNo = UpToLoc.size();
-  size_t NewlinePos = UpToLoc.find_last_of("\r\n");
-  if (NewlinePos != StringRef::npos)
-    ColumnNo -= NewlinePos;
-
-  return static_cast<unsigned>(ColumnNo);
-}
-
 /// Return true if the given \p ExpectedFixIt is in the fix-its emitted by
 /// diagnostic \p D.
 bool DiagnosticVerifier::checkForFixIt(const ExpectedFixIt &Expected,
                                        const CapturedDiagnosticInfo &D,
-                                       StringRef buffer) {
+                                       unsigned BufferID) const {
   for (auto &ActualFixIt : D.FixIts) {
     if (ActualFixIt.getText() != Expected.Text)
       continue;
 
-    CharSourceRange Range = ActualFixIt.getRange();
-    if (getColumnNumber(buffer, getRawLoc(Range.getStart())) !=
-        Expected.StartCol)
-      continue;
-    if (getColumnNumber(buffer, getRawLoc(Range.getEnd())) != Expected.EndCol)
-      continue;
+    LineColumnRange ActualRange = ActualFixIt.getLineColumnRange(
+        SM, BufferID,
+        // Don't compute line numbers unless we have to.
+        /*ComputeStartLocLine=*/Expected.Range.StartLine !=
+            LineColumnRange::NoValue,
+        /*ComputeEndLocLine=*/Expected.Range.EndLine !=
+            LineColumnRange::NoValue);
 
+    if (Expected.Range.StartCol != ActualRange.StartCol ||
+        Expected.Range.EndCol != ActualRange.EndCol) {
+      continue;
+    }
+    if (Expected.Range.StartLine != LineColumnRange::NoValue &&
+        Expected.Range.StartLine != ActualRange.StartLine) {
+      continue;
+    }
+    if (Expected.Range.EndLine != LineColumnRange::NoValue &&
+        Expected.Range.EndLine != ActualRange.EndLine) {
+      continue;
+    }
     return true;
   }
 
@@ -274,32 +318,151 @@ bool DiagnosticVerifier::checkForFixIt(const ExpectedFixIt &Expected,
 }
 
 std::string
-DiagnosticVerifier::renderFixits(ArrayRef<DiagnosticInfo::FixIt> fixits,
-                                 StringRef InputFile) {
+DiagnosticVerifier::renderFixits(ArrayRef<CapturedFixItInfo> ActualFixIts,
+                                 unsigned BufferID,
+                                 unsigned DiagnosticLineNo) const {
   std::string Result;
   llvm::raw_string_ostream OS(Result);
-  interleave(fixits,
-             [&](const DiagnosticInfo::FixIt &ActualFixIt) {
-               CharSourceRange Range = ActualFixIt.getRange();
+  interleave(
+      ActualFixIts,
+      [&](const CapturedFixItInfo &ActualFixIt) {
+        LineColumnRange ActualRange =
+            ActualFixIt.getLineColumnRange(SM, BufferID,
+                                           /*ComputeStartLocLine=*/true,
+                                           /*ComputeEndLocLine=*/true);
+        OS << "{{";
 
-               OS << "{{"
-                  << getColumnNumber(InputFile, getRawLoc(Range.getStart()))
-                  << '-'
-                  << getColumnNumber(InputFile, getRawLoc(Range.getEnd()))
-                  << '=';
+        if (ActualRange.StartLine != DiagnosticLineNo)
+          OS << ActualRange.StartLine << ':';
+        OS << ActualRange.StartCol;
 
-               for (auto C : ActualFixIt.getText()) {
-                 if (C == '\n')
-                   OS << "\\n";
-                 else if (C == '}' || C == '\\')
-                   OS << '\\' << C;
-                 else
-                   OS << C;
-               }
-               OS << "}}";
-             },
-             [&] { OS << ' '; });
+        OS << '-';
+
+        if (ActualRange.EndLine != ActualRange.StartLine)
+          OS << ActualRange.EndLine << ':';
+        OS << ActualRange.EndCol;
+
+        OS << '=';
+
+        for (auto C : ActualFixIt.getText()) {
+          if (C == '\n')
+            OS << "\\n";
+          else if (C == '}' || C == '\\')
+            OS << '\\' << C;
+          else
+            OS << C;
+        }
+        OS << "}}";
+      },
+      [&] { OS << ' '; });
   return OS.str();
+}
+
+/// Parse the introductory line-column range of an expected fix-it by consuming
+/// the given input string. The range format is \c ([+-]?N:)?N-([+-]?N:)?N
+/// where \c 'N' is \c [0-9]+.
+///
+/// \param DiagnosticLineNo The line number of the associated expected
+/// diagnostic; used to turn line offsets into line numbers.
+static Optional<LineColumnRange> parseExpectedFixItRange(
+    StringRef &Str, unsigned DiagnosticLineNo,
+    llvm::function_ref<void(const char *, const Twine &)> diagnoseError) {
+  assert(!Str.empty());
+
+  const auto parseLineAndColumn =
+      [&]() -> Optional<std::pair<unsigned, unsigned>> {
+    enum class LineOffsetKind : uint8_t { None, Plus, Minus };
+
+    LineOffsetKind lineOffsetKind = LineOffsetKind::None;
+    if (!Str.empty()) {
+      switch (Str.front()) {
+      case '+':
+        lineOffsetKind = LineOffsetKind::Plus;
+        Str = Str.drop_front();
+        break;
+      case '-':
+        lineOffsetKind = LineOffsetKind::Minus;
+        Str = Str.drop_front();
+        break;
+      default:
+        break;
+      }
+    }
+
+    unsigned firstNumber = LineColumnRange::NoValue;
+    if (Str.consumeInteger(10, firstNumber)) {
+      if (lineOffsetKind > LineOffsetKind::None) {
+        diagnoseError(Str.data(),
+                      "expected line offset after leading '+' or '-' in fix-it "
+                      "verification");
+      } else {
+        diagnoseError(Str.data(),
+                      "expected line or column number in fix-it verification");
+      }
+      return None;
+    }
+
+    unsigned secondNumber = LineColumnRange::NoValue;
+    if (!Str.empty() && Str.front() == ':') {
+      Str = Str.drop_front();
+
+      if (Str.consumeInteger(10, secondNumber)) {
+        diagnoseError(
+            Str.data(),
+            "expected column number after ':' in fix-it verification");
+        return None;
+      }
+    } else if (lineOffsetKind > LineOffsetKind::None) {
+      diagnoseError(Str.data(),
+                    "expected colon-separated column number after line offset "
+                    "in fix-it verification");
+      return None;
+    }
+
+    if (secondNumber == LineColumnRange::NoValue) {
+      // If only one value is specified, it's a column number;
+      return std::make_pair(LineColumnRange::NoValue, firstNumber);
+    }
+
+    unsigned lineNo = DiagnosticLineNo;
+    switch (lineOffsetKind) {
+    case LineOffsetKind::None:
+      lineNo = firstNumber;
+      break;
+    case LineOffsetKind::Plus:
+      lineNo += firstNumber;
+      break;
+    case LineOffsetKind::Minus:
+      lineNo -= firstNumber;
+      break;
+    }
+
+    return std::make_pair(lineNo, secondNumber);
+  };
+
+  LineColumnRange Range;
+
+  if (const auto lineAndCol = parseLineAndColumn()) {
+    std::tie(Range.StartLine, Range.StartCol) = lineAndCol.getValue();
+  } else {
+    return None;
+  }
+
+  if (!Str.empty() && Str.front() == '-') {
+    Str = Str.drop_front();
+  } else {
+    diagnoseError(Str.data(),
+                  "expected '-' range separator in fix-it verification");
+    return None;
+  }
+
+  if (const auto lineAndCol = parseLineAndColumn()) {
+    std::tie(Range.EndLine, Range.EndCol) = lineAndCol.getValue();
+  } else {
+    return None;
+  }
+
+  return Range;
 }
 
 /// After the file has been processed, check to see if we got all of
@@ -309,8 +472,7 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
   using llvm::SMLoc;
   
   const SourceLoc BufferStartLoc = SM.getLocForBufferStart(BufferID);
-  CharSourceRange EntireRange = SM.getRangeForBuffer(BufferID);
-  StringRef InputFile = SM.extractText(EntireRange);
+  StringRef InputFile = SM.getEntireTextForBuffer(BufferID);
   StringRef BufferName = SM.getIdentifierForBuffer(BufferID);
 
   // Queue up all of the diagnostics, allowing us to sort them and emit them in
@@ -336,20 +498,22 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
     // the next match.
     StringRef MatchStart = InputFile.substr(Match);
     const char *DiagnosticLoc = MatchStart.data();
+    MatchStart = MatchStart.substr(strlen("expected-"));
+    const char *ClassificationStartLoc = MatchStart.data();
 
     DiagnosticKind ExpectedClassification;
-    if (MatchStart.startswith("expected-note")) {
+    if (MatchStart.startswith("note")) {
       ExpectedClassification = DiagnosticKind::Note;
-      MatchStart = MatchStart.substr(strlen("expected-note"));
-    } else if (MatchStart.startswith("expected-warning")) {
+      MatchStart = MatchStart.substr(strlen("note"));
+    } else if (MatchStart.startswith("warning")) {
       ExpectedClassification = DiagnosticKind::Warning;
-      MatchStart = MatchStart.substr(strlen("expected-warning"));
-    } else if (MatchStart.startswith("expected-error")) {
+      MatchStart = MatchStart.substr(strlen("warning"));
+    } else if (MatchStart.startswith("error")) {
       ExpectedClassification = DiagnosticKind::Error;
-      MatchStart = MatchStart.substr(strlen("expected-error"));
-    } else if (MatchStart.startswith("expected-remark")) {
+      MatchStart = MatchStart.substr(strlen("error"));
+    } else if (MatchStart.startswith("remark")) {
       ExpectedClassification = DiagnosticKind::Remark;
-      MatchStart = MatchStart.substr(strlen("expected-remark"));
+      MatchStart = MatchStart.substr(strlen("remark"));
     } else
       continue;
 
@@ -363,7 +527,9 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
       continue;
     }
 
-    ExpectedDiagnosticInfo Expected(DiagnosticLoc, ExpectedClassification);
+    ExpectedDiagnosticInfo Expected(DiagnosticLoc, ClassificationStartLoc,
+                                    /*ClassificationEndLoc=*/MatchStart.data(),
+                                    ExpectedClassification);
     int LineOffset = 0;
 
     if (TextStartIdx > 0 && MatchStart[0] == '@') {
@@ -538,41 +704,35 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
         break;
       }
 
-      // Parse the pieces of the fix-it.
-      size_t MinusLoc = CheckStr.find('-');
-      if (MinusLoc == StringRef::npos) {
-        addError(CheckStr.data(), "expected '-' in fix-it verification");
+      if (CheckStr.empty()) {
+        addError(CheckStr.data(), Twine("expected fix-it verification within "
+                                        "braces; example: '1-2=text' or '") +
+                                      fixitExpectationNoneString + Twine("'"));
         continue;
       }
-      StringRef StartColStr = CheckStr.slice(0, MinusLoc);
-      StringRef AfterMinus = CheckStr.substr(MinusLoc + 1);
 
-      size_t EqualLoc = AfterMinus.find('=');
-      if (EqualLoc == StringRef::npos) {
-        addError(AfterMinus.data(),
-                 "expected '=' after '-' in fix-it verification");
-        continue;
-      }
-      StringRef EndColStr = AfterMinus.slice(0, EqualLoc);
-      StringRef AfterEqual = AfterMinus.substr(EqualLoc+1);
-      
+      // Parse the pieces of the fix-it.
       ExpectedFixIt FixIt;
       FixIt.StartLoc = OpenLoc;
       FixIt.EndLoc = CloseLoc;
-      if (StartColStr.getAsInteger(10, FixIt.StartCol)) {
-        addError(StartColStr.data(),
-                 "invalid column number in fix-it verification");
+
+      if (const auto range =
+              parseExpectedFixItRange(CheckStr, Expected.LineNo, addError)) {
+        FixIt.Range = range.getValue();
+      } else {
         continue;
       }
-      if (EndColStr.getAsInteger(10, FixIt.EndCol)) {
-        addError(EndColStr.data(),
-                 "invalid column number in fix-it verification");
+
+      if (!CheckStr.empty() && CheckStr.front() == '=') {
+        CheckStr = CheckStr.drop_front();
+      } else {
+        addError(CheckStr.data(),
+                 "expected '=' after range in fix-it verification");
         continue;
       }
-      
+
       // Translate literal "\\n" into '\n', inefficiently.
-      StringRef fixItText = AfterEqual.slice(0, EndIndex);
-      for (const char *current = fixItText.begin(), *end = fixItText.end();
+      for (const char *current = CheckStr.begin(), *end = CheckStr.end();
            current != end; /* in loop */) {
         if (*current == '\\' && current + 1 < end) {
           if (current[1] == 'n') {
@@ -611,8 +771,9 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
     auto &expected = ExpectedDiagnostics[i];
 
     // Check to see if we had this expected diagnostic.
-    auto FoundDiagnosticIter =
+    auto FoundDiagnosticInfo =
         findDiagnostic(CapturedDiagnostics, expected, BufferName);
+    auto FoundDiagnosticIter = std::get<0>(FoundDiagnosticInfo);
     if (FoundDiagnosticIter == CapturedDiagnostics.end()) {
       // Diagnostic didn't exist.  If this is a 'mayAppear' diagnostic, then
       // we're ok.  Otherwise, leave it in the list.
@@ -620,14 +781,35 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
         ExpectedDiagnostics.erase(ExpectedDiagnostics.begin()+i);
       continue;
     }
-    
+
+    auto emitFixItsError = [&](const char *location, const Twine &message,
+                               const char *replStartLoc, const char *replEndLoc,
+                               const std::string &replStr) {
+      llvm::SMFixIt fix(llvm::SMRange(SMLoc::getFromPointer(replStartLoc),
+                                      SMLoc::getFromPointer(replEndLoc)),
+                        replStr);
+      addError(location, message, fix);
+    };
+
     auto &FoundDiagnostic = *FoundDiagnosticIter;
+
+    if (!std::get<1>(FoundDiagnosticInfo)) {
+      // Found a diagnostic with the right location and text but the wrong
+      // classification. We'll emit an error about the mismatch and
+      // thereafter pretend that the diagnostic fully matched.
+      auto expectedKind = getDiagKindString(expected.Classification);
+      auto actualKind = getDiagKindString(FoundDiagnostic.Classification);
+      emitFixItsError(expected.ClassificationStart,
+          llvm::Twine("expected ") + expectedKind + ", not " + actualKind,
+          expected.ClassificationStart, expected.ClassificationEnd,
+          actualKind);
+    }
 
     const char *missedFixitLoc = nullptr;
     // Verify that any expected fix-its are present in the diagnostic.
     for (auto fixit : expected.Fixits) {
       // If we found it, we're ok.
-      if (!checkForFixIt(fixit, FoundDiagnostic, InputFile)) {
+      if (!checkForFixIt(fixit, FoundDiagnostic, BufferID)) {
         missedFixitLoc = fixit.StartLoc;
         break;
       }
@@ -642,23 +824,14 @@ DiagnosticVerifier::Result DiagnosticVerifier::verifyFile(unsigned BufferID) {
     };
 
     auto makeActualFixitsPhrase =
-        [&](ArrayRef<DiagnosticInfo::FixIt> actualFixits)
-        -> ActualFixitsPhrase {
-      std::string actualFixitsStr = renderFixits(actualFixits, InputFile);
+        [&](ArrayRef<CapturedFixItInfo> actualFixits) -> ActualFixitsPhrase {
+      std::string actualFixitsStr =
+          renderFixits(actualFixits, BufferID, expected.LineNo);
 
       return ActualFixitsPhrase{(Twine("actual fix-it") +
                                  (actualFixits.size() >= 2 ? "s" : "") +
                                  " seen: " + actualFixitsStr).str(),
                                 actualFixitsStr};
-    };
-
-    auto emitFixItsError = [&](const char *location, const Twine &message,
-                               const char *replStartLoc, const char *replEndLoc,
-                               const std::string &replStr) {
-      llvm::SMFixIt fix(llvm::SMRange(SMLoc::getFromPointer(replStartLoc),
-                                      SMLoc::getFromPointer(replEndLoc)),
-                        replStr);
-      addError(location, message, fix);
     };
 
     // If we have any expected fixits that didn't get matched, then they are
@@ -947,8 +1120,10 @@ void DiagnosticVerifier::printRemainingDiagnostics() const {
 /// file.
 void DiagnosticVerifier::handleDiagnostic(SourceManager &SM,
                                           const DiagnosticInfo &Info) {
-  SmallVector<DiagnosticInfo::FixIt, 2> fixIts;
-  std::copy(Info.FixIts.begin(), Info.FixIts.end(), std::back_inserter(fixIts));
+  SmallVector<CapturedFixItInfo, 2> fixIts;
+  for (const auto &fixIt : Info.FixIts) {
+    fixIts.emplace_back(fixIt);
+  }
 
   llvm::SmallVector<std::string, 1> eduNotes;
   for (auto &notePath : Info.EducationalNotePaths) {
@@ -982,10 +1157,11 @@ void DiagnosticVerifier::handleDiagnostic(SourceManager &SM,
 
     capturedDiag.Loc = correctSM.getLocForForeignLoc(capturedDiag.Loc, SM);
     for (auto &fixIt : capturedDiag.FixIts) {
-      auto newStart = correctSM.getLocForForeignLoc(fixIt.getRange().getStart(),
-                                                    SM);
-      fixIt.getRange() = CharSourceRange(newStart,
-                                         fixIt.getRange().getByteLength());
+      auto newStart =
+          correctSM.getLocForForeignLoc(fixIt.getSourceRange().getStart(), SM);
+      auto &mutableRange = fixIt.getSourceRange();
+      mutableRange =
+          CharSourceRange(newStart, fixIt.getSourceRange().getByteLength());
     }
   }
 }

@@ -96,6 +96,11 @@ CompilerInvocation::getObjCHeaderOutputPathForAtMostOnePrimary() const {
   return getPrimarySpecificPathsForAtMostOnePrimary()
       .SupplementaryOutputs.ObjCHeaderOutputPath;
 }
+std::string
+CompilerInvocation::getCxxHeaderOutputPathForAtMostOnePrimary() const {
+  return getPrimarySpecificPathsForAtMostOnePrimary()
+      .SupplementaryOutputs.CxxHeaderOutputPath;
+}
 std::string CompilerInvocation::getModuleOutputPathForAtMostOnePrimary() const {
   return getPrimarySpecificPathsForAtMostOnePrimary()
       .SupplementaryOutputs.ModuleOutputPath;
@@ -153,7 +158,8 @@ SerializationOptions CompilerInvocation::computeSerializationOptions(
       getIRGenOptions().PublicLinkLibraries;
   serializationOpts.SDKName = getLangOptions().SDKName;
   serializationOpts.ABIDescriptorPath = outs.ABIDescriptorOutputPath.c_str();
-  
+  serializationOpts.emptyABIDescriptor = opts.emptyABIDescriptor;
+
   if (!getIRGenOptions().ForceLoadSymbolName.empty())
     serializationOpts.AutolinkForceLoad = true;
 
@@ -1363,6 +1369,10 @@ bool CompilerInstance::performSILProcessing(SILModule *silModule) {
   return false;
 }
 
+bool CompilerInstance::isCancellationRequested() const {
+  auto flag = getASTContext().CancellationFlag;
+  return flag && flag->load(std::memory_order_relaxed);
+}
 
 const PrimarySpecificPaths &
 CompilerInstance::getPrimarySpecificPathsForWholeModuleOptimizationMode()

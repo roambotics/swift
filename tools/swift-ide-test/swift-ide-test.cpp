@@ -35,7 +35,6 @@
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/IDE/CompletionInstance.h"
-#include "swift/IDE/CodeCompletion.h"
 #include "swift/IDE/CodeCompletionResultPrinter.h"
 #include "swift/IDE/CommentConversion.h"
 #include "swift/IDE/ConformingMethodList.h"
@@ -527,6 +526,12 @@ FunctionDefinitions("function-definitions",
                     llvm::cl::init(true));
 
 static llvm::cl::opt<bool>
+Expressions("expressions",
+            llvm::cl::desc("Print expressions"),
+            llvm::cl::cat(Category),
+            llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
 AbstractAccessors("abstract-accessors",
                   llvm::cl::desc("Hide the concrete accessors used to "
                                  "implement a property or subscript"),
@@ -808,7 +813,7 @@ AllowCompilerErrors("allow-compiler-errors",
                     llvm::cl::desc("Whether to attempt to continue despite compiler errors"),
                     llvm::cl::init(false));
 
-static llvm::cl::opt<std::string>
+static llvm::cl::list<std::string>
   DefineAvailability("define-availability",
                      llvm::cl::desc("Define a macro for @available"),
                      llvm::cl::cat(Category));
@@ -1056,14 +1061,14 @@ doConformingMethodList(const CompilerInvocation &InitInvok,
 }
 
 static void
-printCodeCompletionResultsImpl(MutableArrayRef<CodeCompletionResult *> Results,
+printCodeCompletionResultsImpl(ArrayRef<CodeCompletionResult *> Results,
                                llvm::raw_ostream &OS, bool IncludeKeywords,
                                bool IncludeComments, bool IncludeSourceText,
                                bool PrintAnnotatedDescription) {
   unsigned NumResults = 0;
   for (auto Result : Results) {
     if (!IncludeKeywords &&
-        Result->getKind() == CodeCompletionResult::ResultKind::Keyword)
+        Result->getKind() == CodeCompletionResultKind::Keyword)
       continue;
     ++NumResults;
   }
@@ -1073,7 +1078,7 @@ printCodeCompletionResultsImpl(MutableArrayRef<CodeCompletionResult *> Results,
   OS << "Begin completions, " << NumResults << " items\n";
   for (auto Result : Results) {
     if (!IncludeKeywords &&
-        Result->getKind() == CodeCompletionResult::ResultKind::Keyword)
+        Result->getKind() == CodeCompletionResultKind::Keyword)
       continue;
     Result->printPrefix(OS);
     if (PrintAnnotatedDescription) {
@@ -1085,8 +1090,7 @@ printCodeCompletionResultsImpl(MutableArrayRef<CodeCompletionResult *> Results,
       Result->getCompletionString()->print(OS);
     }
 
-    OS << "; name=";
-    printCodeCompletionResultFilterName(*Result, OS);
+    OS << "; name=" << Result->getFilterName();
 
     if (IncludeSourceText) {
       OS << "; sourcetext=";
@@ -1137,8 +1141,8 @@ static int printCodeCompletionResults(
   return printResult<CodeCompleteResult>(
       CancellableResult, [&](CodeCompleteResult &Result) {
         printCodeCompletionResultsImpl(
-            Result.Results, llvm::outs(), IncludeKeywords, IncludeComments,
-            IncludeSourceText, PrintAnnotatedDescription);
+            Result.ResultSink.Results, llvm::outs(), IncludeKeywords,
+            IncludeComments, IncludeSourceText, PrintAnnotatedDescription);
         return 0;
       });
 }
@@ -1514,8 +1518,9 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
           case CancellableResultKind::Success: {
             wasASTContextReused =
                 Result->Info.completionContext->ReusingASTContext;
-            printCodeCompletionResultsImpl(Result->Results, OS, IncludeKeywords,
-                                           IncludeComments, IncludeSourceText,
+            printCodeCompletionResultsImpl(Result->ResultSink.Results, OS,
+                                           IncludeKeywords, IncludeComments,
+                                           IncludeSourceText,
                                            CodeCompletionAnnotateResults);
             break;
           }
@@ -2595,7 +2600,7 @@ static int doPrintLocalTypes(const CompilerInvocation &InitInvok,
 
   int ExitCode = 0;
 
-  PrintOptions Options = PrintOptions::printEverything();
+  PrintOptions Options = PrintOptions::printDeclarations();
 
   for (StringRef ModuleName : ModulesToPrint) {
     auto *M = getModuleByFullName(Context, ModuleName);
@@ -2687,7 +2692,7 @@ static int doPrintLocalTypes(const CompilerInvocation &InitInvok,
 
       llvm::outs() << remangled << "\n";
 
-      auto Options = PrintOptions::printEverything();
+      auto Options = PrintOptions::printDeclarations();
       Options.PrintAccess = false;
       LTD->print(llvm::outs(), Options);
       llvm::outs() << "\n";
@@ -2955,11 +2960,10 @@ static int doPrintModules(const CompilerInvocation &InitInvok,
   registerIDERequestFunctions(CI.getASTContext().evaluator);
   auto &Context = CI.getASTContext();
 
-  // Load standard library so that Clang importer can use it.
-  auto *Stdlib = getModuleByFullName(Context, Context.StdlibModuleName);
-  if (!Stdlib) {
-    llvm::errs() << "Failed loading stdlib\n";
-    return 1;
+  // Load implict imports so that Clang importer can use it.
+  for (auto unloadedImport :
+       CI.getMainModule()->getImplicitImportInfo().AdditionalUnloadedImports) {
+    (void)Context.getModule(unloadedImport.module.getModulePath());
   }
 
   // If needed, load _Concurrency library so that the Clang importer can use it.
@@ -3023,11 +3027,10 @@ static int doPrintHeaders(const CompilerInvocation &InitInvok,
   registerIDERequestFunctions(CI.getASTContext().evaluator);
   auto &Context = CI.getASTContext();
 
-  // Load standard library so that Clang importer can use it.
-  auto *Stdlib = getModuleByFullName(Context, Context.StdlibModuleName);
-  if (!Stdlib) {
-    llvm::errs() << "Failed loading stdlib\n";
-    return 1;
+  // Load implict imports so that Clang importer can use it.
+  for (auto unloadedImport :
+       CI.getMainModule()->getImplicitImportInfo().AdditionalUnloadedImports) {
+    (void)Context.getModule(unloadedImport.module.getModulePath());
   }
 
   auto &FEOpts = Invocation.getFrontendOptions();
@@ -3234,7 +3237,7 @@ static int doPrintTypes(const CompilerInvocation &InitInvok,
   registerIDERequestFunctions(CI.getASTContext().evaluator);
   CI.performSema();
 
-  PrintOptions Options = PrintOptions::printEverything();
+  PrintOptions Options = PrintOptions::printDeclarations();
   Options.FullyQualifiedTypes = FullyQualifiedTypes;
   ASTTypePrinter Printer(CI.getSourceMgr(), Options);
 
@@ -4172,10 +4175,24 @@ int main(int argc, char *argv[]) {
         // FIXME: error?
         continue;
       }
+      // Make contextual CodeCompletionResults from the
+      // ContextFreeCodeCompletionResults so we can print them.
+      std::vector<CodeCompletionResult *> contextualResults;
+      contextualResults.reserve(resultsOpt->get()->Results.size());
+      for (auto contextFreeResult : resultsOpt->get()->Results) {
+        // We are leaking these results but it doesn't matter since the process
+        // just terminates afterwards anyway.
+        auto contextualResult = new CodeCompletionResult(
+            *contextFreeResult, SemanticContextKind::OtherModule,
+            CodeCompletionFlair(),
+            /*numBytesToErase=*/0, /*TypeContext=*/nullptr, /*DC=*/nullptr,
+            /*USRTypeContext=*/nullptr, ContextualNotRecommendedReason::None,
+            CodeCompletionDiagnosticSeverity::None, /*DiagnosticMessage=*/"");
+        contextualResults.push_back(contextualResult);
+      }
       printCodeCompletionResultsImpl(
-          resultsOpt->get()->Sink.Results, llvm::outs(),
-          options::CodeCompletionKeywords, options::CodeCompletionComments,
-          options::CodeCompletionSourceText,
+          contextualResults, llvm::outs(), options::CodeCompletionKeywords,
+          options::CodeCompletionComments, options::CodeCompletionSourceText,
           options::CodeCompletionAnnotateResults);
     }
 
@@ -4216,8 +4233,8 @@ int main(int argc, char *argv[]) {
 
   InitInvok.setSDKPath(options::SDK);
 
-  if (!options::DefineAvailability.empty()) {
-    InitInvok.getLangOptions().AvailabilityMacros.push_back(options::DefineAvailability);
+  for (auto macro : options::DefineAvailability) {
+    InitInvok.getLangOptions().AvailabilityMacros.push_back(macro);
   }
   for (auto map: options::SerializedPathObfuscate) {
     auto SplitMap = StringRef(map).split('=');
@@ -4379,6 +4396,7 @@ int main(int argc, char *argv[]) {
     PrintOpts.SynthesizeSugarOnTypes = options::SynthesizeSugarOnTypes;
     PrintOpts.AbstractAccessors = options::AbstractAccessors;
     PrintOpts.FunctionDefinitions = options::FunctionDefinitions;
+    PrintOpts.PrintExprs = options::Expressions;
     PrintOpts.PreferTypeRepr = options::PreferTypeRepr;
     PrintOpts.ExplodePatternBindingDecls = options::ExplodePatternBindingDecls;
     PrintOpts.PrintImplicitAttrs = options::PrintImplicitAttrs;

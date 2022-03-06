@@ -328,9 +328,12 @@ NODE(AsyncSuspendResumePartialFunction)
 
 // Added in Swift 5.6
 NODE(AccessibleFunctionRecord)
+NODE(CompileTimeConst)
 
 // Added in Swift 5.7
 NODE(OpaqueReturnTypeIndexed)
+NODE(BackDeploymentThunk)
+NODE(BackDeploymentFallback)
 
 #undef CONTEXT_NODE
 #undef NODE

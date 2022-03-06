@@ -109,7 +109,7 @@ devirtualizeReleaseOfObject(SILInstruction *ReleaseInst,
   LLVM_DEBUG(llvm::dbgs() << "  try to devirtualize " << *ReleaseInst);
 
   // Does the last release really release the allocated object?
-  AllocRefInst *ARI = deallocStackInst->getAllocRef();
+  auto *ARI = deallocStackInst->getAllocRef();
   SILValue rcRoot = RCIA->getRCIdentityRoot(ReleaseInst->getOperand(0));
   if (rcRoot != ARI)
     return false;
@@ -133,14 +133,9 @@ bool ReleaseDevirtualizer::createDeallocCall(SILType AllocType,
   SILFunction *Dealloc = M.lookUpFunction(DeallocRef);
   if (!Dealloc)
     return false;
-  TypeExpansionContext context(*ReleaseInst->getFunction());
-  CanSILFunctionType DeallocType =
-      Dealloc->getLoweredFunctionTypeInContext(context);
   auto *NTD = AllocType.getASTType()->getAnyNominal();
   auto AllocSubMap = AllocType.getASTType()
     ->getContextSubstitutionMap(M.getSwiftModule(), NTD);
-
-  DeallocType = DeallocType->substGenericArgs(M, AllocSubMap, context);
 
   SILBuilder B(ReleaseInst);
   if (object->getType() != AllocType)
@@ -164,6 +159,6 @@ bool ReleaseDevirtualizer::createDeallocCall(SILType AllocType,
 
 } // end anonymous namespace
 
-SILTransform *swift::createReleaseDevirtualizer() {
+SILTransform *swift::createLegacyReleaseDevirtualizer() {
   return new ReleaseDevirtualizer();
 }

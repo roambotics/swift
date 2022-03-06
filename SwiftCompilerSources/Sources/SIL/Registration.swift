@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Basic
 import SILBridging
 
 private func register<T: AnyObject>(_ cl: T.Type) {
@@ -20,7 +21,7 @@ private func register<T: AnyObject>(_ cl: T.Type) {
 }
 
 public func registerSILClasses() {
-  register(Function.self)
+  Function.register()
   register(BasicBlock.self)
   register(GlobalVariable.self)
 
@@ -76,6 +77,7 @@ public func registerSILClasses() {
   register(OpenExistentialMetatypeInst.self)
   register(ValueMetatypeInst.self)
   register(ExistentialMetatypeInst.self)
+  register(FunctionRefInst.self)
   register(GlobalAddrInst.self)
   register(GlobalValueInst.self)
   register(IntegerLiteralInst.self)
@@ -96,6 +98,7 @@ public func registerSILClasses() {
   register(ObjCExistentialMetatypeToObjectInst.self)
   register(ObjCMetatypeToObjectInst.self)
   register(ValueToBridgeObjectInst.self)
+  register(MarkDependenceInst.self)
   register(BridgeObjectToRefInst.self)
   register(BeginAccessInst.self)
   register(BeginBorrowInst.self)
@@ -109,6 +112,8 @@ public func registerSILClasses() {
   register(ObjCMethodInst.self)
   register(ObjCSuperMethodInst.self)
   register(WitnessMethodInst.self)
+  register(IsUniqueInst.self)
+  register(IsEscapingClosureInst.self)
   register(AllocStackInst.self)
   register(AllocRefInst.self)
   register(AllocRefDynamicInst.self)

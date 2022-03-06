@@ -297,6 +297,7 @@ bool ArgsToFrontendOptionsConverter::convert(
     auto SplitMap = StringRef(A).split('=');
     Opts.serializedPathObfuscator.addMapping(SplitMap.first, SplitMap.second);
   }
+  Opts.emptyABIDescriptor = Args.hasArg(OPT_empty_abi_descriptor);
   return false;
 }
 
@@ -478,6 +479,8 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
     return FrontendOptions::ActionType::DumpTypeInfo;
   if (Opt.matches(OPT_print_ast))
     return FrontendOptions::ActionType::PrintAST;
+  if (Opt.matches(OPT_print_ast_decl))
+    return FrontendOptions::ActionType::PrintASTDecl;
   if (Opt.matches(OPT_emit_pcm))
     return FrontendOptions::ActionType::EmitPCM;
   if (Opt.matches(OPT_dump_pcm))
@@ -621,9 +624,14 @@ bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
                    diag::error_mode_cannot_emit_reference_dependencies);
     return true;
   }
-  if (!FrontendOptions::canActionEmitObjCHeader(Opts.RequestedAction) &&
+  if (!FrontendOptions::canActionEmitClangHeader(Opts.RequestedAction) &&
       Opts.InputsAndOutputs.hasObjCHeaderOutputPath()) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_header);
+    return true;
+  }
+  if (!FrontendOptions::canActionEmitClangHeader(Opts.RequestedAction) &&
+      Opts.InputsAndOutputs.hasCxxHeaderOutputPath()) {
+    Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_cxx_header);
     return true;
   }
   if (!FrontendOptions::canActionEmitLoadedModuleTrace(Opts.RequestedAction) &&

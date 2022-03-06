@@ -43,9 +43,9 @@ void Parser_registerRegexLiteralLexingFn(RegexLiteralLexingFn fn) {
 using namespace swift;
 using namespace swift::syntax;
 
-// clang::isIdentifierHead and clang::isIdentifierBody are deliberately not in
-// this list as a reminder that they are using C rules for identifiers.
-// (Admittedly these are the same as Swift's right now.)
+// clang::isAsciiIdentifierStart and clang::isAsciiIdentifierContinue are
+// deliberately not in this list as a reminder that they are using C rules for
+// identifiers. (Admittedly these are the same as Swift's right now.)
 using clang::isAlphanumeric;
 using clang::isDigit;
 using clang::isHexDigit;
@@ -522,7 +522,7 @@ void Lexer::skipSlashStarComment() {
 
 static bool isValidIdentifierContinuationCodePoint(uint32_t c) {
   if (c < 0x80)
-    return clang::isIdentifierBody(c, /*dollar*/true);
+    return clang::isAsciiIdentifierContinue(c, /*dollar*/true);
   
   // N1518: Recommendations for extended identifier characters for C and C++
   // Proposed Annex X.1: Ranges of characters allowed
@@ -680,10 +680,10 @@ void Lexer::lexHash() {
 
   // Scan for [a-zA-Z]+ to see what we match.
   const char *tmpPtr = CurPtr;
-  if (clang::isIdentifierHead(*tmpPtr)) {
+  if (clang::isAsciiIdentifierStart(*tmpPtr)) {
     do {
       ++tmpPtr;
-    } while (clang::isIdentifierBody(*tmpPtr));
+    } while (clang::isAsciiIdentifierContinue(*tmpPtr));
   }
 
   // Map the character sequence onto
@@ -1959,8 +1959,6 @@ const char *Lexer::findEndOfCurlyQuoteStringLiteral(const char *Body,
 }
 
 bool Lexer::tryLexRegexLiteral(const char *TokStart) {
-  assert(*TokStart == '\'');
-
   // We need to have experimental string processing enabled, and have the
   // parsing logic for regex literals available.
   if (!LangOpts.EnableExperimentalStringProcessing || !regexLiteralLexingFn)
@@ -1995,7 +1993,6 @@ bool Lexer::tryLexRegexLiteral(const char *TokStart) {
 
   // Otherwise, we either had a successful lex, or something that was
   // recoverable.
-  assert(ErrStr || CurPtr[-1] == '\'');
   formToken(tok::regex_literal, TokStart);
   return true;
 }
@@ -2471,8 +2468,16 @@ void Lexer::lexImpl() {
   case '\\': return formToken(tok::backslash, TokStart);
 
   case '#':
+    // Try lex a raw string literal.
     if (unsigned CustomDelimiterLen = advanceIfCustomDelimiter(CurPtr, Diags))
       return lexStringLiteral(CustomDelimiterLen);
+
+    // If we have experimental string processing enabled, try lex a regex
+    // literal.
+    if (tryLexRegexLiteral(TokStart))
+      return;
+
+    // Otherwise try lex a magic pound literal.
     return lexHash();
 
       // Operator characters.
@@ -2492,10 +2497,10 @@ void Lexer::lexImpl() {
     return lexOperatorIdentifier();
   case '%':
     // Lex %[0-9a-zA-Z_]+ as a local SIL value
-    if (InSILBody && clang::isIdentifierBody(CurPtr[0])) {
+    if (InSILBody && clang::isAsciiIdentifierContinue(CurPtr[0])) {
       do {
         ++CurPtr;
-      } while (clang::isIdentifierBody(CurPtr[0]));
+      } while (clang::isAsciiIdentifierContinue(CurPtr[0]));
       
       return formToken(tok::sil_local_name, TokStart);
     }
@@ -2525,13 +2530,20 @@ void Lexer::lexImpl() {
   case '&': case '|':  case '^': case '~': case '.':
     return lexOperatorIdentifier();
 
+  case 'r':
+    // If we have experimental string processing enabled, try lex a regex
+    // literal.
+    if (tryLexRegexLiteral(TokStart))
+      return;
+    LLVM_FALLTHROUGH;
+
   case 'A': case 'B': case 'C': case 'D': case 'E': case 'F': case 'G':
   case 'H': case 'I': case 'J': case 'K': case 'L': case 'M': case 'N':
   case 'O': case 'P': case 'Q': case 'R': case 'S': case 'T': case 'U':
   case 'V': case 'W': case 'X': case 'Y': case 'Z':
   case 'a': case 'b': case 'c': case 'd': case 'e': case 'f': case 'g':
   case 'h': case 'i': case 'j': case 'k': case 'l': case 'm': case 'n':
-  case 'o': case 'p': case 'q': case 'r': case 's': case 't': case 'u':
+  case 'o': case 'p': case 'q': /*r above*/ case 's': case 't': case 'u':
   case 'v': case 'w': case 'x': case 'y': case 'z':
   case '_':
     return lexIdentifier();
@@ -2544,14 +2556,6 @@ void Lexer::lexImpl() {
     return lexNumber();
 
   case '\'':
-    // If we have experimental string processing enabled, and have the parsing
-    // logic for regex literals, try to lex a single quoted string as a regex
-    // literal.
-    if (tryLexRegexLiteral(TokStart))
-      return;
-
-    // Otherwise lex as a string literal and emit a diagnostic.
-    LLVM_FALLTHROUGH;
   case '"':
     return lexStringLiteral();
       

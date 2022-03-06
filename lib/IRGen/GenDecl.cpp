@@ -468,7 +468,15 @@ void IRGenModule::emitSourceFile(SourceFile &SF) {
 
   if (ObjCInterop)
     this->addLinkLibrary(LinkLibrary("objc", LibraryKind::Library));
-  
+
+  // If C++ interop is enabled, add -lc++ on Darwin and -lstdc++ on linux.
+  if (Context.LangOpts.EnableCXXInterop) {
+    if (Context.LangOpts.Target.isOSDarwin())
+      this->addLinkLibrary(LinkLibrary("c++", LibraryKind::Library));
+    else if (Context.LangOpts.Target.isOSLinux())
+      this->addLinkLibrary(LinkLibrary("stdc++", LibraryKind::Library));
+  }
+
   // FIXME: It'd be better to have the driver invocation or build system that
   // executes the linker introduce these compatibility libraries, since at
   // that point we know whether we're building an executable, which is the only
@@ -2016,7 +2024,11 @@ void IRGenModule::emitVTableStubs() {
     if (F.getEffectiveSymbolLinkage() == SILLinkage::Hidden)
       alias->setVisibility(llvm::GlobalValue::HiddenVisibility);
     else
-      ApplyIRLinkage(IRLinkage::ExternalExport).to(alias);
+      ApplyIRLinkage(IRGen.Opts.InternalizeSymbols
+                        ? IRLinkage{llvm::GlobalValue::ExternalLinkage,
+                                    llvm::GlobalValue::HiddenVisibility,
+                                    llvm::GlobalValue::DefaultStorageClass}
+                        : IRLinkage::ExternalExport).to(alias);
   }
 }
 
@@ -2086,7 +2098,8 @@ getIRLinkage(const UniversalLinkageInfo &info, SILLinkage linkage,
   switch (linkage) {
   case SILLinkage::Public:
     return {llvm::GlobalValue::ExternalLinkage, PublicDefinitionVisibility,
-            ExportedStorage};
+            info.Internalize ? llvm::GlobalValue::DefaultStorageClass
+                             : ExportedStorage};
 
   case SILLinkage::PublicNonABI:
     return isDefinition ? RESULT(WeakODR, Hidden, Default)
@@ -2201,11 +2214,9 @@ LinkInfo LinkInfo::get(const UniversalLinkageInfo &linkInfo, StringRef name,
                        SILLinkage linkage, ForDefinition_t isDefinition,
                        bool isWeakImported) {
   LinkInfo result;
-
-  // TODO(compnerd) handle this properly
-
   result.Name += name;
-  result.IRL = getIRLinkage(linkInfo, linkage, isDefinition, isWeakImported);
+  result.IRL = getIRLinkage(linkInfo, linkage, isDefinition, isWeakImported,
+                            linkInfo.Internalize);
   result.ForDefinition = isDefinition;
   return result;
 }
@@ -2253,10 +2264,8 @@ llvm::Function *irgen::createFunction(IRGenModule &IGM,
   llvm::AttrBuilder initialAttrs;
   IGM.constructInitialFnAttributes(initialAttrs, FuncOptMode);
   // Merge initialAttrs with attrs.
-  auto updatedAttrs =
-    signature.getAttributes().addAttributes(IGM.getLLVMContext(),
-                                      llvm::AttributeList::FunctionIndex,
-                                            initialAttrs);
+  auto updatedAttrs = signature.getAttributes().addFnAttributes(
+      IGM.getLLVMContext(), initialAttrs);
   if (!updatedAttrs.isEmpty())
     fn->setAttributes(updatedAttrs);
 
@@ -2624,9 +2633,8 @@ static void addLLVMFunctionAttributes(SILFunction *f, Signature &signature) {
   auto &attrs = signature.getMutableAttributes();
   switch (f->getInlineStrategy()) {
   case NoInline:
-    attrs = attrs.addAttribute(signature.getType()->getContext(),
-                               llvm::AttributeList::FunctionIndex,
-                               llvm::Attribute::NoInline);
+    attrs = attrs.addFnAttribute(signature.getType()->getContext(),
+                                 llvm::Attribute::NoInline);
     break;
   case AlwaysInline:
     // FIXME: We do not currently transfer AlwaysInline since doing so results
@@ -2636,9 +2644,8 @@ static void addLLVMFunctionAttributes(SILFunction *f, Signature &signature) {
   }
 
   if (isReadOnlyFunction(f)) {
-    attrs = attrs.addAttribute(signature.getType()->getContext(),
-                               llvm::AttributeList::FunctionIndex,
-                               llvm::Attribute::ReadOnly);
+    attrs = attrs.addFnAttribute(signature.getType()->getContext(),
+                                 llvm::Attribute::ReadOnly);
   }
 }
 
@@ -2756,27 +2763,27 @@ void IRGenModule::createReplaceableProlog(IRGenFunction &IGF, SILFunction *f) {
     auto *realReplFn = Builder.CreateBitCast(ReplFn, fnType);
     auto asyncFnPtr =
         FunctionPointer(silFunctionType, realReplFn, authInfo, signature);
+    // We never emit a function that uses special conventions, so we
+    // can just use the default async kind.
+    FunctionPointerKind fpKind =
+        FunctionPointerKind::AsyncFunctionPointer;
     PointerAuthInfo codeAuthInfo =
         asyncFnPtr.getAuthInfo().getCorrespondingCodeAuthInfo();
     auto newFnPtr = FunctionPointer(
         FunctionPointer::Kind::Function, asyncFnPtr.getPointer(IGF),
         codeAuthInfo,
-        Signature::forAsyncAwait(IGM, silFunctionType,
-                                 /*useSpecialConvention*/ false));
+        Signature::forAsyncAwait(IGM, silFunctionType, fpKind));
     SmallVector<llvm::Value *, 16> forwardedArgs;
     for (auto &arg : IGF.CurFn->args())
       forwardedArgs.push_back(&arg);
     auto layout = getAsyncContextLayout(
         IGM, silFunctionType, silFunctionType,
-        f->getForwardingSubstitutionMap(), false,
-        FunctionPointer::Kind(
-            FunctionPointer::BasicKind::AsyncFunctionPointer));
+        f->getForwardingSubstitutionMap());
     llvm::Value *dynamicContextSize32;
     llvm::Value *calleeFunction;
-    auto initialContextSize = Size(0);
     std::tie(calleeFunction, dynamicContextSize32) = getAsyncFunctionAndSize(
         IGF, silFunctionType->getRepresentation(), asyncFnPtr, nullptr,
-        std::make_pair(false, true), initialContextSize);
+        std::make_pair(false, true));
     auto *dynamicContextSize =
         Builder.CreateZExt(dynamicContextSize32, IGM.SizeTy);
     auto calleeContextBuffer = emitAllocAsyncContext(IGF, dynamicContextSize);
@@ -2848,7 +2855,7 @@ void IRGenModule::createReplaceableProlog(IRGenFunction &IGF, SILFunction *f) {
     unsigned argIdx = 0;
     for (auto arg : forwardedArgs) {
       // Replace the context argument.
-      if (argIdx == asyncContextIndex)
+      if (argIdx == asyncFnPtr.getSignature().getAsyncContextIndex())
         arguments.push_back(Builder.CreateBitOrPointerCast(
             calleeContextBuffer.getAddress(), IGM.SwiftContextPtrTy));
       else
@@ -3102,8 +3109,8 @@ llvm::Constant *swift::irgen::emitCXXConstructorThunkIfNeeded(
   llvm::AttrBuilder attrBuilder;
   IGM.constructInitialFnAttributes(attrBuilder);
   attrBuilder.addAttribute(llvm::Attribute::AlwaysInline);
-  llvm::AttributeList attr = signature.getAttributes().addAttributes(
-      IGM.getLLVMContext(), llvm::AttributeList::FunctionIndex, attrBuilder);
+  llvm::AttributeList attr = signature.getAttributes().addFnAttributes(
+      IGM.getLLVMContext(), attrBuilder);
   thunk->setAttributes(attr);
 
   IRGenFunction subIGF(IGM, thunk);
@@ -3225,7 +3232,7 @@ llvm::Function *IRGenModule::getAddrOfSILFunction(
   }
   auto fpKind = irgen::classifyFunctionPointerKind(f);
   Signature signature =
-      getSignature(f->getLoweredFunctionType(), fpKind.useSpecialConvention());
+      getSignature(f->getLoweredFunctionType(), fpKind);
   addLLVMFunctionAttributes(f, signature);
 
   LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
@@ -4152,21 +4159,31 @@ void IRGenModule::emitAccessibleFunctions() {
         llvm::GlobalValue::PrivateLinkage, /*initializer*/ nullptr,
         mangledRecordName);
 
+    ConstantInitBuilder builder(*this);
+    ConstantStructBuilder fields =
+        builder.beginStruct(AccessibleFunctionRecordTy);
+
     std::string mangledFunctionName =
         LinkEntity::forSILFunction(func).mangleAsString();
     llvm::Constant *name = getAddrOfGlobalString(
         mangledFunctionName, /*willBeRelativelyAddressed*/ true);
-    llvm::Constant *relativeName = emitDirectRelativeReference(name, var, {});
+    fields.addRelativeAddress(name);
+
+    llvm::Constant *genericEnvironment = nullptr;
 
     GenericSignature signature;
     if (auto *env = func->getGenericEnvironment()) {
       signature = env->getGenericSignature();
+      genericEnvironment =
+          getAddrOfGenericEnvironment(signature.getCanonicalSignature());
     }
+
+    fields.addRelativeAddressOrNull(genericEnvironment);
 
     llvm::Constant *type = getTypeRef(func->getLoweredFunctionType(), signature,
                                       MangledTypeRefRole::Metadata)
                                .first;
-    llvm::Constant *relativeType = emitDirectRelativeReference(type, var, {1});
+    fields.addRelativeAddress(type);
 
     llvm::Constant *funcAddr = nullptr;
     if (func->isDistributed()) {
@@ -4178,20 +4195,13 @@ void IRGenModule::emitAccessibleFunctions() {
       funcAddr = getAddrOfSILFunction(func, NotForDefinition);
     }
 
-    llvm::Constant *relativeFuncAddr =
-        emitDirectRelativeReference(funcAddr, var, {2});
+    fields.addRelativeAddress(funcAddr);
 
-    AccessibleFunctionFlags flagsVal;
-    flagsVal.setDistributed(func->isDistributed());
+    AccessibleFunctionFlags flags;
+    flags.setDistributed(func->isDistributed());
+    fields.addInt32(flags.getOpaqueValue());
 
-    llvm::Constant *flags =
-        llvm::ConstantInt::get(Int32Ty, flagsVal.getOpaqueValue());
-
-    llvm::Constant *recordFields[] = {relativeName, relativeType,
-                                      relativeFuncAddr, flags};
-    auto record =
-        llvm::ConstantStruct::get(AccessibleFunctionRecordTy, recordFields);
-    var->setInitializer(record);
+    fields.finishAndSetAsInitializer(var);
     var->setSection(sectionName);
     var->setAlignment(llvm::MaybeAlign(4));
     disableAddressSanitizer(*this, var);

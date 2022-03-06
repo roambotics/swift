@@ -212,7 +212,15 @@ static void checkInheritanceClause(
       inheritedAnyObject = { i, inherited.getSourceRange() };
     }
 
-    if (inheritedTy->isExistentialType()) {
+    if (inheritedTy->is<ParameterizedProtocolType>()) {
+      if (!isa<ProtocolDecl>(decl)) {
+        decl->diagnose(diag::inheritance_from_parameterized_protocol,
+                       inheritedTy);
+      }
+      continue;
+    }
+
+    if (inheritedTy->isConstraintType()) {
       auto layout = inheritedTy->getExistentialLayout();
 
       // Subclass existentials are not allowed except on classes and
@@ -227,10 +235,7 @@ static void checkInheritanceClause(
       // AnyObject is not allowed except on protocols.
       if (layout.hasExplicitAnyObject &&
           !isa<ProtocolDecl>(decl)) {
-        decl->diagnose(canHaveSuperclass
-                       ? diag::inheritance_from_non_protocol_or_class
-                       : diag::inheritance_from_non_protocol,
-                       inheritedTy);
+        decl->diagnose(diag::inheritance_from_anyobject);
         continue;
       }
 
@@ -330,11 +335,19 @@ static void checkInheritanceClause(
       }
     }
 
+    // FIXME: The inherited type is printed directly here because
+    // the current default is to not print `any` for existential
+    // types, but this error message is super confusing without `any`
+    // if the user wrote it explicitly.
+    PrintOptions options;
+    options.PrintExplicitAny = true;
+    auto inheritedTyString = inheritedTy.getString(options);
+
     // We can't inherit from a non-class, non-protocol type.
     decl->diagnose(canHaveSuperclass
                    ? diag::inheritance_from_non_protocol_or_class
                    : diag::inheritance_from_non_protocol,
-                   inheritedTy);
+                   inheritedTyString);
     // FIXME: Note pointing to the declaration 'inheritedTy' references?
   }
 }
@@ -1055,6 +1068,13 @@ Expr *DefaultArgumentExprRequest::evaluate(Evaluator &evaluator,
   return initExpr;
 }
 
+Type DefaultArgumentTypeRequest::evaluate(Evaluator &evaluator,
+                                          ParamDecl *param) const {
+  if (auto expr = param->getTypeCheckedDefaultExpr())
+    return expr->getType();
+  return Type();
+}
+
 Initializer *
 DefaultArgumentInitContextRequest::evaluate(Evaluator &eval,
                                             ParamDecl *param) const {
@@ -1477,7 +1497,7 @@ static StringRef prettyPrintAttrs(const ValueDecl *VD,
   llvm::raw_svector_ostream os(out);
   StreamPrinter printer(os);
 
-  PrintOptions opts = PrintOptions::printEverything();
+  PrintOptions opts = PrintOptions::printDeclarations();
   VD->getAttrs().print(printer, opts, attrs, VD);
   return StringRef(out.begin(), out.size()).drop_back();
 }
@@ -1654,6 +1674,30 @@ ApplyAccessNoteRequest::evaluate(Evaluator &evaluator, ValueDecl *VD) const {
   if (auto note = notes.lookup(VD))
     applyAccessNote(VD, *note.get(), notes);
   return {};
+}
+
+static void diagnoseWrittenPlaceholderTypes(ASTContext &Ctx,
+                                            const Pattern *P,
+                                            Expr *init) {
+  // Make sure we have a user-written type annotation.
+  auto *TP = dyn_cast<TypedPattern>(P);
+  if (!TP || !TP->getTypeRepr()) {
+    return;
+  }
+
+  auto *repr = TP->getTypeRepr()->getWithoutParens();
+  if (auto *PTR = dyn_cast<PlaceholderTypeRepr>(repr)) {
+    Ctx.Diags.diagnose(P->getLoc(),
+                       diag::placeholder_type_not_allowed_in_pattern)
+        .highlight(P->getSourceRange());
+    if (init && !init->getType()->hasError()) {
+      auto initTy = init->getType()->mapTypeOutOfContext();
+      Ctx.Diags
+          .diagnose(PTR->getLoc(),
+                    diag::replace_placeholder_with_inferred_type, initTy)
+          .fixItReplace(PTR->getSourceRange(), initTy.getString());
+    }
+  }
 }
 
 namespace {
@@ -2069,6 +2113,11 @@ public:
         diagnoseUnownedImmediateDeallocation(Ctx, PBD->getPattern(i),
                                              PBD->getEqualLoc(i),
                                              init);
+
+        // Written placeholder types are banned in the signatures of pattern
+        // bindings. If there's a valid initializer, try to offer its type
+        // as a replacement.
+        diagnoseWrittenPlaceholderTypes(Ctx, PBD->getPattern(i), init);
 
         // If we entered an initializer context, contextualize any
         // auto-closures we might have created.
@@ -2494,7 +2543,7 @@ public:
 
         for (auto *member : superclass->getMembers()) {
           if (auto *vd = dyn_cast<ValueDecl>(member)) {
-            if (vd->isPotentiallyOverridable()) {
+            if (vd->isSyntacticallyOverridable()) {
               (void) vd->isObjC();
             }
           }
@@ -2553,6 +2602,10 @@ public:
         if (!isInvalidSuperclass) {
           CD->diagnose(diag::inheritance_from_class_with_missing_vtable_entries,
                        Super->getName());
+          for (const auto &member : Super->getMembers())
+            if (const auto *MMD = dyn_cast<MissingMemberDecl>(member))
+              CD->diagnose(diag::inheritance_from_class_with_missing_vtable_entry,
+                           MMD->getName());
           isInvalidSuperclass = true;
         }
       }
@@ -2604,6 +2657,12 @@ public:
 
     TypeChecker::checkDeclAttributes(PD);
 
+    // Explicity compute the requirement signature to detect errors.
+    // Do this before visiting members, to avoid a request cycle if
+    // a member referenecs another declaration whose generic signature
+    // has a conformance requirement to this protocol.
+    auto reqSig = PD->getRequirementSignature().getRequirements();
+
     // Check the members.
     for (auto Member : PD->getMembers())
       visit(Member);
@@ -2617,9 +2676,6 @@ public:
       if (!SF || SF->Kind != SourceFileKind::Interface)
         TypeChecker::inferDefaultWitnesses(PD);
 
-    // Explicity compute the requirement signature to detect errors.
-    auto reqSig = PD->getRequirementSignature();
-
     if (PD->getASTContext().TypeCheckerOpts.DebugGenericSignatures) {
       auto requirementsSig =
         GenericSignature::get({PD->getProtocolSelfType()}, reqSig);
@@ -2629,14 +2685,16 @@ public:
       PD->dumpRef(llvm::errs());
       llvm::errs() << "\n";
       llvm::errs() << "Requirement signature: ";
-      requirementsSig->print(llvm::errs());
+      PrintOptions Opts;
+      Opts.ProtocolQualifiedDependentMemberTypes = true;
+      requirementsSig->print(llvm::errs(), Opts);
       llvm::errs() << "\n";
 
       llvm::errs() << "Canonical requirement signature: ";
       auto canRequirementSig =
         CanGenericSignature::getCanonical(requirementsSig.getGenericParams(),
                                           requirementsSig.getRequirements());
-      canRequirementSig->print(llvm::errs());
+      canRequirementSig->print(llvm::errs(), Opts);
       llvm::errs() << "\n";
     }
 
@@ -3206,6 +3264,44 @@ void TypeChecker::checkParameterList(ParameterList *params,
             addAsyncNotes(func);
         }
       }
+    }
+
+    // Opaque types cannot occur in parameter position.
+    Type interfaceType = param->getInterfaceType();
+    if (interfaceType->hasTypeParameter()) {
+      interfaceType.findIf([&](Type type) {
+        if (auto fnType = type->getAs<FunctionType>()) {
+          for (auto innerParam : fnType->getParams()) {
+            auto paramType = innerParam.getPlainType();
+            if (!paramType->hasTypeParameter())
+              continue;
+
+            bool hadError = paramType.findIf([&](Type innerType) {
+              auto genericParam = innerType->getAs<GenericTypeParamType>();
+              if (!genericParam)
+                return false;
+
+              auto genericParamDecl = genericParam->getDecl();
+              if (!genericParamDecl)
+                return false;
+
+              if (!genericParamDecl->isOpaqueType())
+                return false;
+
+              param->diagnose(
+                 diag::opaque_type_in_parameter, true, interfaceType);
+              return true;
+            });
+
+            if (hadError)
+              return true;
+          }
+
+          return false;
+        }
+
+        return false;
+      });
     }
 
     if (param->hasAttachedPropertyWrapper())

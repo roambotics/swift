@@ -67,11 +67,11 @@ public struct OperandArray : RandomAccessCollection, CustomReflectable {
   
   public subscript(_ index: Int) -> Operand {
     precondition(index >= 0 && index < endIndex)
-    return Operand(BridgedOperand(op: opArray.data + index &* BridgedOperandSize))
+    return Operand(BridgedOperand(op: opArray.data! + index &* BridgedOperandSize))
   }
   
   public func getIndex(of operand: Operand) -> Int {
-    let idx = (operand.bridged.op - UnsafeRawPointer(opArray.data)) /
+    let idx = (operand.bridged.op - UnsafeRawPointer(opArray.data!)) /
                 BridgedOperandSize
     precondition(self[idx].bridged.op == operand.bridged.op)
     return idx
@@ -86,12 +86,12 @@ public struct OperandArray : RandomAccessCollection, CustomReflectable {
     precondition(bounds.lowerBound >= 0)
     precondition(bounds.upperBound <= endIndex)
     return OperandArray(opArray: BridgedArrayRef(
-      data: opArray.data + bounds.lowerBound &* BridgedOperandSize,
+      data: opArray.data! + bounds.lowerBound &* BridgedOperandSize,
       numElements: bounds.upperBound - bounds.lowerBound))
   }
 }
 
-public struct UseList : Sequence, CustomReflectable {
+public struct UseList : CollectionLikeSequence {
   public struct Iterator : IteratorProtocol {
     var currentOpPtr: UnsafeRawPointer?
     
@@ -120,10 +120,5 @@ public struct UseList : Sequence, CustomReflectable {
 
   public func makeIterator() -> Iterator {
     return Iterator(currentOpPtr: firstOpPtr)
-  }
-
-  public var customMirror: Mirror {
-    let c: [Mirror.Child] = map { (label: "use", value: $0) }
-    return Mirror(self, children: c)
   }
 }
