@@ -24,6 +24,7 @@
 #include <vector>
 #include "PropertyMap.h"
 #include "RequirementLowering.h"
+#include "RuleBuilder.h"
 
 using namespace swift;
 using namespace rewriting;
@@ -152,17 +153,8 @@ void PropertyMap::concretizeNestedTypesFromConcreteParent(
       // There is no relation between P and C here.
       //
       // With concrete types, a missing conformance is a conflict.
-      if (requirementKind == RequirementKind::SameType) {
-        // FIXME: Diagnose conflict
-        auto &concreteRule = System.getRule(concreteRuleID);
-        if (concreteRule.getRHS().size() == key.size())
-          concreteRule.markConflicting();
-
-        auto &conformanceRule = System.getRule(conformanceRuleID);
-        if (!conformanceRule.isIdentityConformanceRule() &&
-            conformanceRule.getRHS().size() == key.size())
-          conformanceRule.markConflicting();
-      }
+      if (requirementKind == RequirementKind::SameType)
+        System.recordConflict(conformanceRuleID, concreteRuleID);
 
       if (Debug.contains(DebugFlags::ConcretizeNestedTypes)) {
         llvm::dbgs() << "^^ " << concreteType << " does not conform to "
@@ -209,7 +201,9 @@ void PropertyMap::concretizeTypeWitnessInConformance(
     AssociatedTypeDecl *assocType) const {
   auto concreteType = concreteConformanceSymbol.getConcreteType();
   auto substitutions = concreteConformanceSymbol.getSubstitutions();
-  auto *proto = concreteConformanceSymbol.getProtocol();
+
+  auto *proto = assocType->getProtocol();
+  assert(proto == concreteConformanceSymbol.getProtocol());
 
   if (Debug.contains(DebugFlags::ConcretizeNestedTypes)) {
     llvm::dbgs() << "^^ " << "Looking up type witness for "
@@ -483,12 +477,27 @@ void PropertyMap::recordConcreteConformanceRule(
 
   auto protocolSymbol = *conformanceRule.isPropertyRule();
 
-  // Now, transform T''.[concrete: C].[P] into T''.[concrete: C : P].
+  // Now, transform T''.[concrete: C].[P] into T''.[concrete: C].[concrete: C : P].
   unsigned relationID = System.recordConcreteConformanceRelation(
       concreteSymbol, protocolSymbol, concreteConformanceSymbol);
 
   path.add(RewriteStep::forRelation(
       /*startOffset=*/rhs.size(), relationID,
+      /*inverse=*/false));
+
+  // If T' is a suffix of T, prepend the prefix to the concrete type's
+  // substitutions.
+  if (prefixLength > 0 &&
+      !concreteConformanceSymbol.getSubstitutions().empty()) {
+    path.add(RewriteStep::forPrefixSubstitutions(prefixLength, /*endOffset=*/1,
+                                                 /*inverse=*/true));
+  }
+
+  // Finally, apply the concrete type rule to obtain T''.[concrete: C : P].
+  path.add(RewriteStep::forRewriteRule(
+      /*startOffset=*/rhs.size() - concreteRule.getRHS().size(),
+      /*endOffset=*/1,
+      /*ruleID=*/concreteRuleID,
       /*inverse=*/false));
 
   MutableTerm lhs(rhs);
@@ -523,8 +532,8 @@ void PropertyMap::inferConditionalRequirements(
     return;
 
   SmallVector<Requirement, 2> desugaredRequirements;
-  // FIXME: Store errors in the rewrite system to be diagnosed
-  // from the top-level generic signature requests.
+
+  // FIXME: Do we need to diagnose these errors?
   SmallVector<RequirementError, 2> errors;
 
   // First, desugar all conditional requirements.
@@ -539,44 +548,17 @@ void PropertyMap::inferConditionalRequirements(
   }
 
   // Now, convert desugared conditional requirements to rules.
-  for (auto req : desugaredRequirements) {
-    if (Debug.contains(DebugFlags::ConditionalRequirements)) {
-      llvm::dbgs() << "@@@ Desugared requirement: ";
-      req.dump(llvm::dbgs());
-      llvm::dbgs() << "\n";
-    }
 
-    if (req.getKind() == RequirementKind::Conformance) {
-      auto *proto = req.getProtocolDecl();
+  // This will update System.getReferencedProtocols() with any new
+  // protocols that were imported.
+  RuleBuilder builder(Context, System.getReferencedProtocols());
+  builder.initWithConditionalRequirements(desugaredRequirements,
+                                          substitutions);
 
-      // If we haven't seen this protocol before, add rules for its
-      // requirements.
-      if (!System.isKnownProtocol(proto)) {
-        if (Debug.contains(DebugFlags::ConditionalRequirements)) {
-          llvm::dbgs() << "@@@ Unknown protocol: "<< proto->getName() << "\n";
-        }
+  assert(builder.PermanentRules.empty());
+  assert(builder.WrittenRequirements.empty());
 
-        RuleBuilder builder(Context, System.getProtocolMap());
-        builder.addProtocol(proto, /*initialComponent=*/false);
-        builder.collectRulesFromReferencedProtocols();
-
-        for (const auto &rule : builder.PermanentRules)
-          System.addPermanentRule(rule.first, rule.second);
-
-        for (const auto &rule : builder.RequirementRules)
-          System.addExplicitRule(rule.first, rule.second);
-      }
-    }
-
-    auto pair = getRuleForRequirement(req.getCanonical(), /*proto=*/nullptr,
-                                      substitutions, Context);
-
-    if (Debug.contains(DebugFlags::ConditionalRequirements)) {
-      llvm::dbgs() << "@@@ Induced rule from conditional requirement: "
-                   << pair.first << " => " << pair.second << "\n";
-    }
-
-    // FIXME: Do we need a rewrite path here?
-    (void) System.addRule(pair.first, pair.second);
-  }
+  System.addRules(std::move(builder.ImportedRules),
+                  std::move(builder.PermanentRules),
+                  std::move(builder.RequirementRules));
 }

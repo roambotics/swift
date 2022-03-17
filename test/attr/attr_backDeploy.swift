@@ -1,4 +1,5 @@
-// RUN: %target-typecheck-verify-swift -parse-as-library
+// RUN: %target-typecheck-verify-swift -parse-as-library \
+// RUN:   -define-availability "_myProject 2.0:macOS 12.0"
 
 // MARK: - Valid declarations
 
@@ -13,7 +14,7 @@ public func backDeployedTopLevelFunc() {}
 @usableFromInline
 internal func backDeployedUsableFromInlineTopLevelFunc() {}
 
-// OK: function decls in a struct
+// OK: function/property/subscript decls in a struct
 public struct TopLevelStruct {
   @available(macOS 11.0, *)
   @_backDeploy(macOS 12.0)
@@ -22,6 +23,10 @@ public struct TopLevelStruct {
   @available(macOS 11.0, *)
   @_backDeploy(macOS 12.0)
   public var backDeployedComputedProperty: Int { 98 }
+
+  @available(macOS 11.0, *)
+  @_backDeploy(macOS 12.0)
+  public subscript(_ index: Int) -> Int { index }
 }
 
 // OK: final function decls in a non-final class
@@ -127,6 +132,55 @@ protocol CannotBackDeployProtocol {}
 @_backDeploy(macOS 12.0) // expected-error {{'@_backDeploy' attribute cannot be applied to this declaration}}
 public actor CannotBackDeployActor {}
 
+// FIXME(backDeploy): support coroutines rdar://90111169
+public struct CannotBackDeployCoroutines {
+  @available(macOS 11.0, *)
+  @_backDeploy(macOS 12.0) // expected-error {{'@_backDeploy' is not supported on coroutine _modify accessor}}
+  public var readWriteProperty: Int {
+    get { 42 }
+    set(newValue) {}
+  }
+
+  @available(macOS 11.0, *)
+  @_backDeploy(macOS 12.0) // expected-error {{'@_backDeploy' is not supported on coroutine _modify accessor}}
+  public subscript(at index: Int) -> Int {
+    get { 42 }
+    set(newValue) {}
+  }
+
+  public var explicitReadAndModify: Int {
+    @available(macOS 11.0, *)
+    @_backDeploy(macOS 12.0) // expected-error {{'@_backDeploy' is not supported on coroutine _read accessor}}
+    _read { yield 42 }
+
+    @available(macOS 11.0, *)
+    @_backDeploy(macOS 12.0) // expected-error {{'@_backDeploy' is not supported on coroutine _modify accessor}}
+    _modify {}
+  }
+}
+
+// MARK: - Function body diagnostics
+
+public struct FunctionBodyDiagnostics {
+  public func publicFunc() {}
+  @usableFromInline func usableFromInlineFunc() {}
+  func internalFunc() {} // expected-note {{instance method 'internalFunc()' is not '@usableFromInline' or public}}
+  fileprivate func fileprivateFunc() {} // expected-note {{instance method 'fileprivateFunc()' is not '@usableFromInline' or public}}
+  private func privateFunc() {} // expected-note {{instance method 'privateFunc()' is not '@usableFromInline' or public}}
+
+  @available(macOS 11.0, *)
+  @_backDeploy(macOS 12.0)
+  public func backDeployedMethod() {
+    struct Nested {} // expected-error {{type 'Nested' cannot be nested inside a '@_backDeploy' function}}
+
+    publicFunc()
+    usableFromInlineFunc()
+    internalFunc() // expected-error {{instance method 'internalFunc()' is internal and cannot be referenced from a '@_backDeploy' function}}
+    fileprivateFunc() // expected-error {{instance method 'fileprivateFunc()' is fileprivate and cannot be referenced from a '@_backDeploy' function}}
+    privateFunc() // expected-error {{instance method 'privateFunc()' is private and cannot be referenced from a '@_backDeploy' function}}
+  }
+}
+
 // MARK: - Incompatible declarations
 
 @_backDeploy(macOS 12.0) // expected-error {{'@_backDeploy' may not be used on fileprivate declarations}}
@@ -192,6 +246,7 @@ public func transparentFunc() {}
 
 // MARK: - Attribute parsing
 
+@available(macOS 11.0, *)
 @_backDeploy(macOS 12.0, unknownOS 1.0) // expected-warning {{unknown platform 'unknownOS' for attribute '@_backDeploy'}}
 public func unknownOSFunc() {}
 
@@ -230,8 +285,27 @@ public func trailingWildcardFunc() {}
 @_backDeploy(macOS 12.0, *, iOS 15.0) // expected-warning {{* as platform name has no effect in '@_backDeploy' attribute}}
 public func embeddedWildcardFunc() {}
 
+@_backDeploy(_myProject 3.0) // expected-error {{reference to undefined version '3.0' for availability macro '_myProject'}}
+public func macroVersionned() {}
+
+@_backDeploy(_myProject) // expected-error {{reference to undefined version '0' for availability macro '_myProject'}}
+public func missingMacroVersion() {}
+
+// Fall back to the default diagnostic when the macro is unknown.
+@_backDeploy(_unknownMacro) // expected-warning {{unknown platform '_unknownMacro' for attribute '@_backDeploy'}}
+// expected-error@-1 {{expected version number in '@_backDeploy' attribute}}
+public func unknownMacroMissingVersion() {}
+
+@_backDeploy(_unknownMacro 1.0) // expected-warning {{unknown platform '_unknownMacro' for attribute '@_backDeploy'}}
+// expected-error@-1 {{expected at least one platform version in '@_backDeploy' attribute}}
+public func unknownMacroVersionned() {}
+
+@available(macOS 11.0, *)
+@_backDeploy(_unknownMacro 1.0, _myProject 2.0) // expected-warning {{unknown platform '_unknownMacro' for attribute '@_backDeploy'}}
+public func knownAndUnknownMacroVersionned() {}
+
 @_backDeploy() // expected-error {{expected at least one platform version in '@_backDeploy' attribute}}
-public func zeroPlatformVersionsFunc() {}
+public func emptyPlatformVersionsFunc() {}
 
 @_backDeploy // expected-error {{expected '(' in '_backDeploy' attribute}}
 public func expectedLeftParenFunc() {}

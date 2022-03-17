@@ -14,13 +14,13 @@
 // Use those methods instead of calling into the RequirementMachine directly.
 //
 //===----------------------------------------------------------------------===//
+
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Module.h"
-#include "llvm/ADT/TinyPtrVector.h"
 #include <vector>
-
+#include "NameLookup.h"
 #include "RequirementMachine.h"
 
 using namespace swift;
@@ -239,7 +239,8 @@ RequirementMachine::getLongestValidPrefix(const MutableTerm &term) const {
     case Symbol::Kind::Superclass:
     case Symbol::Kind::ConcreteType:
     case Symbol::Kind::ConcreteConformance:
-      llvm_unreachable("Property symbol cannot appear in a type term");
+      llvm::errs() <<"Invalid symbol in a type term: " << term << "\n";
+      abort();
     }
 
     // This symbol is valid, add it to the longest prefix.
@@ -265,6 +266,9 @@ bool RequirementMachine::isCanonicalTypeInContext(Type type) const {
     explicit Walker(const RequirementMachine &self) : Self(self) {}
 
     Action walkToTypePre(Type component) override {
+      if (!component->hasTypeParameter())
+        return Action::SkipChildren;
+
       if (!component->isTypeParameter())
         return Action::Continue;
 
@@ -305,6 +309,9 @@ Type RequirementMachine::getCanonicalTypeInContext(
     TypeArrayView<GenericTypeParamType> genericParams) const {
 
   return type.transformRec([&](Type t) -> Optional<Type> {
+    if (!t->hasTypeParameter())
+      return t;
+
     if (!t->isTypeParameter())
       return None;
 
@@ -600,26 +607,6 @@ RequirementMachine::getConformanceAccessPath(Type type,
       }
     }
   }
-}
-
-static void lookupConcreteNestedType(NominalTypeDecl *decl,
-                                     Identifier name,
-                                     SmallVectorImpl<TypeDecl *> &concreteDecls) {
-  SmallVector<ValueDecl *, 2> foundMembers;
-  decl->getParentModule()->lookupQualified(
-      decl, DeclNameRef(name),
-      NL_QualifiedDefault | NL_OnlyTypes | NL_ProtocolMembers,
-      foundMembers);
-  for (auto member : foundMembers)
-    concreteDecls.push_back(cast<TypeDecl>(member));
-}
-
-static TypeDecl *
-findBestConcreteNestedType(SmallVectorImpl<TypeDecl *> &concreteDecls) {
-  return *std::min_element(concreteDecls.begin(), concreteDecls.end(),
-                           [](TypeDecl *type1, TypeDecl *type2) {
-                             return TypeDecl::compare(type1, type2) < 0;
-                           });
 }
 
 TypeDecl *

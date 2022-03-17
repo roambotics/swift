@@ -1936,7 +1936,8 @@ static void applyAvailableAttribute(Decl *decl, AvailabilityContext &info,
                                       /*Obsoleted=*/noVersion,
                                       /*ObsoletedRange*/SourceRange(),
                                       PlatformAgnosticAvailabilityKind::None,
-                                      /*Implicit=*/false);
+                                      /*Implicit=*/false,
+                                      /*SPI*/false);
 
   decl->getAttrs().add(AvAttr);
 }
@@ -2681,7 +2682,8 @@ namespace {
               /*Deprecated*/llvm::VersionTuple(), SourceRange(),
               /*Obsoleted*/llvm::VersionTuple(), SourceRange(),
               PlatformAgnosticAvailabilityKind::SwiftVersionSpecific,
-              /*Implicit*/false);
+              /*Implicit*/false,
+              /*SPI*/false);
         }
       }
 
@@ -4454,8 +4456,6 @@ namespace {
       auto setterDecl = cast<AccessorDecl>(afd);
       auto setterImpl = static_cast<FuncDecl *>(context);
 
-      ASTContext &ctx = setterDecl->getASTContext();
-
       Expr *selfExpr = createSelfExpr(setterDecl);
       DeclRefExpr *valueParamRefExpr = createParamRefExpr(setterDecl, 0);
 
@@ -4841,8 +4841,9 @@ namespace {
 
       // While importing the DeclContext, we might have imported the decl
       // itself.
-      if (auto Known = Impl.importDeclCached(decl, getVersion()))
-        return Known;
+      auto Known = Impl.importDeclCached(decl, getVersion());
+      if (Known.hasValue())
+        return Known.getValue();
 
       ImportedName importedName;
       std::tie(importedName, std::ignore) = importFullName(decl);
@@ -4926,8 +4927,11 @@ namespace {
     }
 
   private:
-    static bool isAcceptableResult(Decl *fn,
-                                   Optional<AccessorInfo> accessorInfo) {
+    static bool isAcceptableResultOrNull(Decl *fn,
+                                         Optional<AccessorInfo> accessorInfo) {
+      if (nullptr == fn)
+        return true;
+
       // We can't safely re-use the same declaration if it disagrees
       // in accessor-ness.
       auto accessor = dyn_cast<AccessorDecl>(fn);
@@ -5038,7 +5042,7 @@ namespace {
                                               getVersion()});
         if (known != Impl.ImportedDecls.end()) {
           auto decl = known->second;
-          if (isAcceptableResult(decl, accessorInfo))
+          if (isAcceptableResultOrNull(decl, accessorInfo))
             return decl;
         }
       }
@@ -5056,7 +5060,7 @@ namespace {
       if (isActiveSwiftVersion()) {
         if (isMethodAlreadyImported(selector, importedName, isInstance, dc,
                                     [&](AbstractFunctionDecl *fn) {
-              return isAcceptableResult(fn, accessorInfo);
+              return isAcceptableResultOrNull(fn, accessorInfo);
             })) {
           return nullptr;
         }
@@ -5190,7 +5194,7 @@ namespace {
                                               getVersion()});
         if (known != Impl.ImportedDecls.end()) {
           auto decl = known->second;
-          if (isAcceptableResult(decl, accessorInfo))
+          if (isAcceptableResultOrNull(decl, accessorInfo))
             return decl;
         }
       }
@@ -5885,8 +5889,9 @@ namespace {
 
       // While importing the DeclContext, we might have imported the decl
       // itself.
-      if (auto Known = Impl.importDeclCached(decl, getVersion()))
-        return Known;
+      auto Known = Impl.importDeclCached(decl, getVersion());
+      if (Known.hasValue())
+        return Known.getValue();
 
       return importObjCPropertyDecl(decl, dc);
     }
@@ -8589,16 +8594,16 @@ void SwiftDeclConverter::importInheritedConstructors(
   }
 }
 
-Decl *ClangImporter::Implementation::importDeclCached(
+Optional<Decl *> ClangImporter::Implementation::importDeclCached(
     const clang::NamedDecl *ClangDecl,
     ImportNameVersion version,
     bool UseCanonical) {
   auto Known = ImportedDecls.find(
     { UseCanonical? ClangDecl->getCanonicalDecl(): ClangDecl, version });
-  if (Known != ImportedDecls.end())
-    return Known->second;
+  if (Known == ImportedDecls.end())
+    return None;
 
-  return nullptr;
+  return Known->second;
 }
 
 /// Checks if we don't need to import the typedef itself.  If the typedef
@@ -9013,18 +9018,10 @@ void ClangImporter::Implementation::importAttributes(
         AnyUnavailable = true;
       }
 
-      if (EnableClangSPI) {
-        if (isUsingMacroName(getClangASTContext().getSourceManager(),
+      auto IsSPI = isUsingMacroName(getClangASTContext().getSourceManager(),
                               avail->getLoc(), "SPI_AVAILABLE") ||
-             isUsingMacroName(getClangASTContext().getSourceManager(),
-                              avail->getLoc(), "__SPI_AVAILABLE")) {
-          // The decl has been marked as SPI in the header by using the SPI macro,
-          // thus we add the SPI attribute to it with a default group name.
-          MappedDecl->getAttrs().add(SPIAccessControlAttr::create(SwiftContext,
-            SourceLoc(), SourceRange(),
-            SwiftContext.getIdentifier(CLANG_MODULE_DEFUALT_SPI_GROUP_NAME)));
-        }
-      }
+                   isUsingMacroName(getClangASTContext().getSourceManager(),
+                              avail->getLoc(), "__SPI_AVAILABLE");
 
       StringRef message = avail->getMessage();
 
@@ -9065,7 +9062,8 @@ void ClangImporter::Implementation::importAttributes(
                                           /*DeprecatedRange=*/SourceRange(),
                                           obsoleted,
                                           /*ObsoletedRange=*/SourceRange(),
-                                          PlatformAgnostic, /*Implicit=*/false);
+                                          PlatformAgnostic, /*Implicit=*/false,
+                                          IsSPI);
 
       MappedDecl->getAttrs().add(AvAttr);
     }
@@ -9458,11 +9456,12 @@ Decl *ClangImporter::Implementation::importDeclAndCacheImpl(
 
   auto Canon = cast<clang::NamedDecl>(UseCanonicalDecl? ClangDecl->getCanonicalDecl(): ClangDecl);
 
-  if (auto Known = importDeclCached(Canon, version, UseCanonicalDecl)) {
+  auto Known = importDeclCached(Canon, version, UseCanonicalDecl);
+  if (Known.hasValue()) {
     if (!SuperfluousTypedefsAreTransparent &&
         SuperfluousTypedefs.count(Canon))
       return nullptr;
-    return Known;
+    return Known.getValue();
   }
 
   bool TypedefIsSuperfluous = false;
@@ -9471,8 +9470,10 @@ Decl *ClangImporter::Implementation::importDeclAndCacheImpl(
   startedImportingEntity();
   Decl *Result = importDeclImpl(ClangDecl, version, TypedefIsSuperfluous,
                                 HadForwardDeclaration);
-  if (!Result)
+  if (!Result) {
+    ImportedDecls[{Canon, version}] = nullptr;
     return nullptr;
+  }
 
   if (TypedefIsSuperfluous) {
     SuperfluousTypedefs.insert(Canon);
@@ -9640,8 +9641,9 @@ ClangImporter::Implementation::importDeclForDeclContext(
 
   // There's a cycle. Is the declaration imported enough to break the cycle
   // gracefully? If so, we'll have it in the decl cache.
-  if (auto cached = importDeclCached(contextDecl, version, useCanonicalDecl))
-    return cached;
+  auto cached = importDeclCached(contextDecl, version, useCanonicalDecl);
+  if (cached.hasValue())
+    return cached.getValue();
 
   // Can't break it? Warn and return nullptr, which is at least better than
   // stack overflow by recursion.

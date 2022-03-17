@@ -359,6 +359,9 @@ def disable_requirement_machine_concrete_contraction : Flag<["-"], "disable-requ
   HelpText<"Disable preprocessing pass to eliminate conformance requirements "
            "on generic parameters which are made concrete">;
 
+def enable_requirement_machine_loop_normalization : Flag<["-"], "enable-requirement-machine-loop-normalization">,
+  HelpText<"Enable stronger minimization algorithm, for debugging only">;
+
 def dump_type_witness_systems : Flag<["-"], "dump-type-witness-systems">,
   HelpText<"Enables dumping type witness systems from associated type inference">;
 
@@ -405,7 +408,7 @@ def disable_implicit_concurrency_module_import : Flag<["-"],
 
 def disable_implicit_distributed_module_import : Flag<["-"],
   "disable-implicit-distributed-module-import">,
-  HelpText<"Disable the implicit import of the _Distributed module.">;
+  HelpText<"Disable the implicit import of the Distributed module.">;
 
 def disable_arc_opts : Flag<["-"], "disable-arc-opts">,
   HelpText<"Don't run SIL ARC optimization passes.">;
@@ -542,6 +545,10 @@ def disable_deserialization_recovery :
 def enable_experimental_string_processing :
   Flag<["-"], "enable-experimental-string-processing">,
   HelpText<"Enable experimental string processing">;
+
+def enable_experimental_variadic_generics :
+  Flag<["-"], "enable-experimental-variadic-generics">,
+  HelpText<"Enable experimental support for variadic generic types">;
 
 def disable_availability_checking : Flag<["-"],
   "disable-availability-checking">,

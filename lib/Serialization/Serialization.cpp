@@ -2581,6 +2581,7 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
           theAttr->isUnconditionallyUnavailable(),
           theAttr->isUnconditionallyDeprecated(),
           theAttr->isPackageDescriptionVersionSpecific(),
+          theAttr->IsSPI,
           LIST_VER_TUPLE_PIECES(Introduced),
           LIST_VER_TUPLE_PIECES(Deprecated),
           LIST_VER_TUPLE_PIECES(Obsoleted),
@@ -4522,11 +4523,14 @@ public:
 
   void visitOpenedArchetypeType(const OpenedArchetypeType *archetypeTy) {
     using namespace decls_block;
+    auto sig = archetypeTy->getGenericEnvironment()->getGenericSignature();
     auto existentialTypeID = S.addTypeRef(archetypeTy->getExistentialType());
     auto interfaceTypeID = S.addTypeRef(archetypeTy->getInterfaceType());
+    auto sigID = S.addGenericSignatureRef(sig);
     unsigned abbrCode = S.DeclTypeAbbrCodes[OpenedArchetypeTypeLayout::Code];
     OpenedArchetypeTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
-                                          existentialTypeID, interfaceTypeID);
+                                          existentialTypeID, interfaceTypeID,
+                                          sigID);
   }
 
   void
@@ -4959,6 +4963,7 @@ void Serializer::writeAllDeclsAndTypes() {
   registerDeclTypeAbbr<OpaqueArchetypeTypeLayout>();
   registerDeclTypeAbbr<SequenceArchetypeTypeLayout>();
   registerDeclTypeAbbr<ProtocolCompositionTypeLayout>();
+  registerDeclTypeAbbr<ParameterizedProtocolTypeLayout>();
   registerDeclTypeAbbr<ExistentialTypeLayout>();
   registerDeclTypeAbbr<BoundGenericTypeLayout>();
   registerDeclTypeAbbr<GenericFunctionTypeLayout>();

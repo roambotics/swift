@@ -1030,6 +1030,8 @@ public:
   // an @_spi context.
   bool isSPI() const;
 
+  bool isAvailableAsSPI() const;
+
   // List the SPI groups declared with @_spi or inherited by this decl.
   //
   // SPI groups are inherited from the parent contexts only if the local decl
@@ -4387,6 +4389,7 @@ class ProtocolDecl final : public NominalTypeDecl {
   friend class ProtocolDependenciesRequest;
   friend class RequirementSignatureRequest;
   friend class RequirementSignatureRequestRQM;
+  friend class RequirementSignatureRequestGSB;
   friend class ProtocolRequiresClassRequest;
   friend class ExistentialConformsToSelfRequest;
   friend class ExistentialRequiresAnyRequest;
@@ -4487,10 +4490,6 @@ public:
   /// Determine whether this is a "marker" protocol, meaning that is indicates
   /// semantics but has no corresponding witness table.
   bool isMarkerProtocol() const;
-
-  /// Is a protocol that can only be conformed by distributed actors.
-  /// Such protocols are allowed to contain distributed functions.
-  bool inheritsFromDistributedActor() const;
 
 private:
   void computeKnownProtocolKind() const;
@@ -5061,6 +5060,13 @@ protected:
           SourceLoc nameLoc, Identifier name, DeclContext *dc,
           StorageIsMutable_t supportsMutation);
 
+protected:
+  // Only \c ParamDecl::setSpecifier is allowed to flip this - and it's also
+  // on the way out of that business.
+  void setIntroducer(Introducer value) {
+    Bits.VarDecl.Introducer = uint8_t(value);
+  }
+
 public:
   VarDecl(bool isStatic, Introducer introducer,
           SourceLoc nameLoc, Identifier name, DeclContext *dc)
@@ -5242,9 +5248,8 @@ public:
   
   /// Is this an immutable 'let' property?
   ///
-  /// If this is a ParamDecl, isLet() is true iff
-  /// getSpecifier() == Specifier::Default.
-  bool isLet() const { return getIntroducer() == Introducer::Let; }
+  /// For \c ParamDecl instances, using \c isImmutable is preferred.
+  bool isLet() const;
 
   /// Is this an "async let" property?
   bool isAsyncLet() const;
@@ -5252,16 +5257,16 @@ public:
   /// Does this have a 'distributed' modifier?
   bool isDistributed() const;
 
+  /// Is this var known to be a "local" distributed actor,
+  /// if so the implicit throwing ans some isolation checks can be skipped.
+  bool isKnownToBeLocal() const;
+
   /// Is this a stored property that will _not_ trigger any user-defined code
   /// upon any kind of access?
   bool isOrdinaryStoredProperty() const;
 
   Introducer getIntroducer() const {
     return Introducer(Bits.VarDecl.Introducer);
-  }
-
-  void setIntroducer(Introducer value) {
-    Bits.VarDecl.Introducer = uint8_t(value);
   }
 
   CaptureListExpr *getParentCaptureList() const {
@@ -6306,7 +6311,15 @@ public:
   /// Returns 'true' if the function is distributed.
   bool isDistributed() const;
 
-  /// Returns 'true' if the function has the @c @_backDeploy attribute.
+  /// For a 'distributed' target (func or computed property),
+  /// get the 'thunk' responsible for performing the 'remoteCall'.
+  ///
+  /// \return the synthesized thunk, or null if the base of the call has
+  ///         diagnosed errors during type checking.
+  FuncDecl *getDistributedThunk() const;
+  
+  /// Returns 'true' if the function has (or inherits) the @c @_backDeploy
+  /// attribute.
   bool isBackDeployed() const;
 
   PolymorphicEffectKind getPolymorphicEffectKind(EffectKind kind) const;
@@ -6452,6 +6465,16 @@ public:
   /// which is used as ad-hoc protocol requirement by the
   /// 'DistributedActorSystem' protocol.
   bool isDistributedActorSystemRemoteCall(bool isVoidReturn) const;
+
+  /// Determines whether this function is a 'makeInvocationEncoder' function,
+  /// which is used as ad-hoc protocol requirement by the
+  /// 'DistributedActorSystem' protocol.
+  bool isDistributedActorSystemMakeInvocationEncoder() const;
+
+  /// Determines if this function is a 'recordGenericSubstitution' function,
+  /// which is used as ad-hoc protocol requirement by the
+  /// 'DistributedTargetInvocationEncoder' protocol.
+  bool isDistributedTargetInvocationEncoderRecordGenericSubstitution() const;
 
   /// Determines if this function is a 'recordArgument' function,
   /// which is used as ad-hoc protocol requirement by the

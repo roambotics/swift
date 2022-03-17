@@ -1,6 +1,6 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-swift-frontend-emit-module -emit-module-path %t/FakeCodableForDistributedTests.swiftmodule -module-name FakeCodableForDistributedTests -disable-availability-checking %S/../Inputs/FakeCodableForDistributedTests.swift
-// RUN: %target-build-swift -module-name main -Xfrontend -enable-experimental-distributed -Xfrontend -disable-availability-checking -j2 -parse-as-library -I %t %s %S/../Inputs/FakeCodableForDistributedTests.swift -o %t/a.out
+// RUN: %target-build-swift -module-name main -Xfrontend -disable-availability-checking -j2 -parse-as-library -I %t %s %S/../Inputs/FakeCodableForDistributedTests.swift -o %t/a.out
 // RUN: %target-run %t/a.out | %FileCheck %s --color
 
 // REQUIRES: executable_test
@@ -14,7 +14,7 @@
 // FIXME(distributed): Distributed actors currently have some issues on windows, isRemote always returns false. rdar://82593574
 // UNSUPPORTED: windows
 
-import _Distributed
+import Distributed
 
 final class Obj: @unchecked Sendable, Codable  {}
 
@@ -106,7 +106,6 @@ distributed actor Greeter {
   distributed func expectsDecodeError(v: Int???) {
   }
 }
-
 
 // ==== Fake Transport ---------------------------------------------------------
 struct ActorAddress: Sendable, Hashable, Codable {
@@ -281,19 +280,19 @@ struct FakeResultHandler: DistributedTargetInvocationResultHandler {
 typealias DefaultDistributedActorSystem = FakeActorSystem
 
 // actual mangled name:
-let emptyName = "$s4main7GreeterC5emptyyyFTE"
-let helloName = "$s4main7GreeterC5helloSSyFTE"
-let answerName = "$s4main7GreeterC6answerSiyFTE"
-let largeResultName = "$s4main7GreeterC11largeResultAA11LargeStructVyFTE"
-let enumResultName = "$s4main7GreeterC10enumResultAA1EOyFTE"
-let echoName = "$s4main7GreeterC4echo4name3ageS2S_SitFTE"
-let generic1Name = "$s4main7GreeterC8generic11ayx_tSeRzSERzlFTE"
-let generic2Name = "$s4main7GreeterC8generic21a1byx_q_tSeRzSERzSeR_SER_r0_lFTE"
-let generic3Name = "$s4main7GreeterC8generic31a1b1cyx_Sayq_Gq0_tSeRzSERzSeR_SER_SeR0_SER0_r1_lFTE"
-let generic4Name = "$s4main7GreeterC8generic41a1b1cyx_AA1SVyq_GSayq0_GtSeRzSERzSeR_SER_SeR0_SER0_r1_lFTE"
-let generic5Name = "$s4main7GreeterC8generic51a1b1c1dyx_AA1SVyq_Gq0_q1_tSeRzSERzSeR_SER_SeR0_SER0_SeR1_SER1_r2_lFTE"
-let genericOptionalName = "$s4main7GreeterC15genericOptional1tyxSg_tSeRzSERzlFTE"
-let expectsDecodeErrorName = "$s4main7GreeterC18expectsDecodeError1vySiSgSgSg_tFTE"
+let emptyName = "$s4main7GreeterC5emptyyyYaKFTE"
+let helloName = "$s4main7GreeterC5helloSSyYaKFTE"
+let answerName = "$s4main7GreeterC6answerSiyYaKFTE"
+let largeResultName = "$s4main7GreeterC11largeResultAA11LargeStructVyYaKFTE"
+let enumResultName = "$s4main7GreeterC10enumResultAA1EOyYaKFTE"
+let echoName = "$s4main7GreeterC4echo4name3ageS2S_SitYaKFTE"
+let generic1Name = "$s4main7GreeterC8generic11ayx_tYaKSeRzSERzlFTE"
+let generic2Name = "$s4main7GreeterC8generic21a1byx_q_tYaKSeRzSERzSeR_SER_r0_lFTE"
+let generic3Name = "$s4main7GreeterC8generic31a1b1cyx_Sayq_Gq0_tYaKSeRzSERzSeR_SER_SeR0_SER0_r1_lFTE"
+let generic4Name = "$s4main7GreeterC8generic41a1b1cyx_AA1SVyq_GSayq0_GtYaKSeRzSERzSeR_SER_SeR0_SER0_r1_lFTE"
+let generic5Name = "$s4main7GreeterC8generic51a1b1c1dyx_AA1SVyq_Gq0_q1_tYaKSeRzSERzSeR_SER_SeR0_SER0_SeR1_SER1_r2_lFTE"
+let genericOptionalName = "$s4main7GreeterC15genericOptional1tyxSg_tYaKSeRzSERzlFTE"
+let expectsDecodeErrorName = "$s4main7GreeterC18expectsDecodeError1vySiSgSgSg_tYaKFTE"
 
 func test() async throws {
   let system = DefaultDistributedActorSystem()
@@ -305,7 +304,7 @@ func test() async throws {
 
   try await system.executeDistributedTarget(
       on: local,
-      mangledTargetName: emptyName,
+      target: RemoteCallTarget(emptyName),
       invocationDecoder: &emptyInvocation,
       handler: FakeResultHandler()
   )
@@ -313,7 +312,7 @@ func test() async throws {
 
   try await system.executeDistributedTarget(
       on: local,
-      mangledTargetName: helloName,
+      target: RemoteCallTarget(helloName),
       invocationDecoder: &emptyInvocation,
       handler: FakeResultHandler()
   )
@@ -321,7 +320,7 @@ func test() async throws {
 
   try await system.executeDistributedTarget(
       on: local,
-      mangledTargetName: answerName,
+      target: RemoteCallTarget(answerName),
       invocationDecoder: &emptyInvocation,
       handler: FakeResultHandler()
   )
@@ -329,7 +328,7 @@ func test() async throws {
 
   try await system.executeDistributedTarget(
       on: local,
-      mangledTargetName: largeResultName,
+      target: RemoteCallTarget(largeResultName),
       invocationDecoder: &emptyInvocation,
       handler: FakeResultHandler()
   )
@@ -337,7 +336,7 @@ func test() async throws {
 
   try await system.executeDistributedTarget(
       on: local,
-      mangledTargetName: enumResultName,
+      target: RemoteCallTarget(enumResultName),
       invocationDecoder: &emptyInvocation,
       handler: FakeResultHandler()
   )
@@ -351,7 +350,7 @@ func test() async throws {
   var echoDecoder = echoInvocation.makeDecoder()
   try await system.executeDistributedTarget(
       on: local,
-      mangledTargetName: echoName,
+      target: RemoteCallTarget(echoName),
       invocationDecoder: &echoDecoder,
       handler: FakeResultHandler()
   )
@@ -366,7 +365,7 @@ func test() async throws {
   var generic1Decoder = generic1Invocation.makeDecoder()
   try await system.executeDistributedTarget(
     on: local,
-    mangledTargetName: generic1Name,
+    target: RemoteCallTarget(generic1Name),
     invocationDecoder: &generic1Decoder,
     handler: FakeResultHandler()
   )
@@ -384,7 +383,7 @@ func test() async throws {
   var generic2Decoder = generic2Invocation.makeDecoder()
   try await system.executeDistributedTarget(
     on: local,
-    mangledTargetName: generic2Name,
+    target: RemoteCallTarget(generic2Name),
     invocationDecoder: &generic2Decoder,
     handler: FakeResultHandler()
   )
@@ -405,7 +404,7 @@ func test() async throws {
   var generic3Decoder = generic3Invocation.makeDecoder()
   try await system.executeDistributedTarget(
     on: local,
-    mangledTargetName: generic3Name,
+    target: RemoteCallTarget(generic3Name),
     invocationDecoder: &generic3Decoder,
     handler: FakeResultHandler()
   )
@@ -427,7 +426,7 @@ func test() async throws {
   var generic4Decoder = generic4Invocation.makeDecoder()
   try await system.executeDistributedTarget(
     on: local,
-    mangledTargetName: generic4Name,
+    target: RemoteCallTarget(generic4Name),
     invocationDecoder: &generic4Decoder,
     handler: FakeResultHandler()
   )
@@ -451,7 +450,7 @@ func test() async throws {
   var generic5Decoder = generic5Invocation.makeDecoder()
   try await system.executeDistributedTarget(
     on: local,
-    mangledTargetName: generic5Name,
+    target: RemoteCallTarget(generic5Name),
     invocationDecoder: &generic5Decoder,
     handler: FakeResultHandler()
   )
@@ -474,7 +473,7 @@ func test() async throws {
   var genericOptDecoder = genericOptInvocation.makeDecoder()
   try await system.executeDistributedTarget(
     on: local,
-    mangledTargetName: genericOptionalName,
+    target: RemoteCallTarget(genericOptionalName),
     invocationDecoder: &genericOptDecoder,
     handler: FakeResultHandler()
   )
@@ -489,7 +488,7 @@ func test() async throws {
   var decodeErrDecoder = decodeErrInvocation.makeDecoder()
   try await system.executeDistributedTarget(
     on: local,
-    mangledTargetName: expectsDecodeErrorName,
+    target: RemoteCallTarget(expectsDecodeErrorName),
     invocationDecoder: &decodeErrDecoder,
     handler: FakeResultHandler()
   )

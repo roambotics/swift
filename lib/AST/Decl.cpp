@@ -386,6 +386,12 @@ Decl::getBackDeployBeforeOSVersion(PlatformKind Kind) const {
       }
     }
   }
+
+  // Accessors may inherit `@_backDeploy`.
+  if (getKind() == DeclKind::Accessor) {
+    return cast<AccessorDecl>(this)->getStorage()->getBackDeployBeforeOSVersion(Kind);
+  }
+
   return None;
 }
 
@@ -2926,7 +2932,7 @@ CanType ValueDecl::getOverloadSignatureType() const {
                                     /*topLevelFunction=*/true, isMethod,
                                     /*isInitializer=*/isa<ConstructorDecl>(afd),
                                     getNumCurryLevels())
-        ->getCanonicalType();
+        ->getMinimalCanonicalType(afd);
   }
 
   if (isa<AbstractStorageDecl>(this)) {
@@ -2942,7 +2948,7 @@ CanType ValueDecl::getOverloadSignatureType() const {
                                    /*topLevelFunction=*/true,
                                    /*isMethod=*/false,
                                    /*isInitializer=*/false, getNumCurryLevels())
-              ->getCanonicalType();
+              ->getMinimalCanonicalType(cast<SubscriptDecl>(this));
     }
 
     // We want to curry the default signature type with the 'self' type of the
@@ -2957,7 +2963,7 @@ CanType ValueDecl::getOverloadSignatureType() const {
     auto mappedType = mapSignatureFunctionType(
         getASTContext(), getInterfaceType(), /*topLevelFunction=*/false,
         /*isMethod=*/false, /*isInitializer=*/false, getNumCurryLevels());
-    return mappedType->getCanonicalType();
+    return mappedType->getMinimalCanonicalType(getDeclContext());
   }
 
   // Note: If you add more cases to this function, you should update the
@@ -4087,6 +4093,7 @@ GenericParameterReferenceInfo swift::findGenericParameterReferences(
 GenericParameterReferenceInfo ValueDecl::findExistentialSelfReferences(
     Type baseTy, bool treatNonResultCovariantSelfAsInvariant) const {
   assert(baseTy->isExistentialType());
+  assert(!baseTy->hasTypeParameter());
 
   // Types never refer to 'Self'.
   if (isa<TypeDecl>(this))
@@ -4098,7 +4105,12 @@ GenericParameterReferenceInfo ValueDecl::findExistentialSelfReferences(
   if (type->hasError())
     return GenericParameterReferenceInfo();
 
-  const auto sig = getASTContext().getOpenedArchetypeSignature(baseTy);
+  // Note: a non-null GenericSignature would violate the invariant that
+  // the protocol 'Self' type referenced from the requirement's interface
+  // type is the same as the existential 'Self' type.
+  auto sig = getASTContext().getOpenedArchetypeSignature(baseTy,
+      GenericSignature());
+
   auto genericParam = sig.getGenericParams().front();
   return findGenericParameterReferences(
       this, sig, genericParam, treatNonResultCovariantSelfAsInvariant, None);
@@ -5307,11 +5319,6 @@ bool ProtocolDecl::isMarkerProtocol() const {
   return getAttrs().hasAttribute<MarkerAttr>();
 }
 
-bool ProtocolDecl::inheritsFromDistributedActor() const {
-  auto &C = getASTContext();
-  return inheritsFrom(C.getDistributedActorDecl());
-}
-
 ArrayRef<ProtocolDecl *> ProtocolDecl::getInheritedProtocols() const {
   auto *mutThis = const_cast<ProtocolDecl *>(this);
   return evaluateOrDefault(getASTContext().evaluator,
@@ -5562,7 +5569,7 @@ void ProtocolDecl::computeKnownProtocolKind() const {
       !module->getName().is("Foundation") &&
       !module->getName().is("_Differentiation") &&
       !module->getName().is("_Concurrency") &&
-      !module->getName().is("_Distributed")) {
+      !module->getName().is("Distributed")) {
     const_cast<ProtocolDecl *>(this)->Bits.ProtocolDecl.KnownProtocol = 1;
     return;
   }
@@ -6366,12 +6373,29 @@ bool VarDecl::isMemberwiseInitialized(bool preferDeclaredProperties) const {
   return true;
 }
 
+bool VarDecl::isLet() const {
+  // An awful hack that stabilizes the value of 'isLet' for ParamDecl instances.
+  //
+  // All of the callers in SIL are actually looking for the semantic
+  // "is immutable" predicate (present on ParamDecl) and should be migrated to
+  // a high-level request. Once this is done, all callers of the introducer and
+  // specifier setters can be removed.
+  if (auto *PD = dyn_cast<ParamDecl>(this)) {
+    return PD->isImmutable();
+  }
+  return getIntroducer() == Introducer::Let;
+}
+
 bool VarDecl::isAsyncLet() const {
   return getAttrs().hasAttribute<AsyncAttr>();
 }
 
 bool VarDecl::isDistributed() const {
   return getAttrs().hasAttribute<DistributedActorAttr>();
+}
+
+bool VarDecl::isKnownToBeLocal() const {
+  return getAttrs().hasAttribute<KnownToBeLocalAttr>();
 }
 
 bool VarDecl::isOrdinaryStoredProperty() const {
@@ -7644,7 +7668,16 @@ bool AbstractFunctionDecl::isSendable() const {
 }
 
 bool AbstractFunctionDecl::isBackDeployed() const {
-  return getAttrs().hasAttribute<BackDeployAttr>();
+  if (getAttrs().hasAttribute<BackDeployAttr>())
+    return true;
+
+  // Property and subscript accessors inherit the attribute.
+  if (auto *AD = dyn_cast<AccessorDecl>(this)) {
+    if (AD->getStorage()->getAttrs().hasAttribute<BackDeployAttr>())
+      return true;
+  }
+
+  return false;
 }
 
 BraceStmt *AbstractFunctionDecl::getBody(bool canSynthesize) const {
@@ -7993,7 +8026,6 @@ ParamDecl *AbstractFunctionDecl::getImplicitSelfDecl(bool createIfNeeded) {
   *selfDecl = new (ctx) ParamDecl(SourceLoc(), SourceLoc(), Identifier(),
                                   getLoc(), ctx.Id_self, this);
   (*selfDecl)->setImplicit();
-
   return *selfDecl;
 }
 
@@ -9056,9 +9088,11 @@ ActorIsolation swift::getActorIsolationOfContext(DeclContext *dc) {
   }
 
   if (auto *tld = dyn_cast<TopLevelCodeDecl>(dc)) {
-    if (dc->isAsyncContext()) {
+    if (dc->isAsyncContext() || dc->getASTContext().LangOpts.WarnConcurrency) {
       if (Type mainActor = dc->getASTContext().getMainActorType())
-        return ActorIsolation::forGlobalActor(mainActor, /*unsafe=*/false);
+        return ActorIsolation::forGlobalActor(
+            mainActor,
+            /*unsafe=*/!dc->getASTContext().isSwiftVersionAtLeast(6));
     }
   }
 

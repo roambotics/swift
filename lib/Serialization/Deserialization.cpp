@@ -4362,6 +4362,7 @@ DeclDeserializer::readAvailable_DECL_ATTR(SmallVectorImpl<uint64_t> &scratch,
   bool isUnavailable;
   bool isDeprecated;
   bool isPackageDescriptionVersionSpecific;
+  bool isSPI;
   DEF_VER_TUPLE_PIECES(Introduced);
   DEF_VER_TUPLE_PIECES(Deprecated);
   DEF_VER_TUPLE_PIECES(Obsoleted);
@@ -4371,7 +4372,7 @@ DeclDeserializer::readAvailable_DECL_ATTR(SmallVectorImpl<uint64_t> &scratch,
   // Decode the record, pulling the version tuple information.
   serialization::decls_block::AvailableDeclAttrLayout::readRecord(
       scratch, isImplicit, isUnavailable, isDeprecated,
-      isPackageDescriptionVersionSpecific, LIST_VER_TUPLE_PIECES(Introduced),
+      isPackageDescriptionVersionSpecific, isSPI, LIST_VER_TUPLE_PIECES(Introduced),
       LIST_VER_TUPLE_PIECES(Deprecated), LIST_VER_TUPLE_PIECES(Obsoleted),
       platform, renameDeclID, messageSize, renameSize);
 
@@ -4406,7 +4407,7 @@ DeclDeserializer::readAvailable_DECL_ATTR(SmallVectorImpl<uint64_t> &scratch,
   auto attr = new (ctx) AvailableAttr(
       SourceLoc(), SourceRange(), (PlatformKind)platform, message, rename,
       renameDecl, Introduced, SourceRange(), Deprecated, SourceRange(),
-      Obsoleted, SourceRange(), platformAgnostic, isImplicit);
+      Obsoleted, SourceRange(), platformAgnostic, isImplicit, isSPI);
   return attr;
 }
 
@@ -5624,13 +5625,27 @@ public:
                                                 StringRef blobData) {
     TypeID existentialID;
     TypeID interfaceID;
+    GenericSignatureID sigID;
 
-    decls_block::OpenedArchetypeTypeLayout::readRecord(scratch,
-                                                       existentialID,
-                                                       interfaceID);
+    decls_block::OpenedArchetypeTypeLayout::readRecord(scratch, existentialID,
+                                                       interfaceID, sigID);
 
-    return OpenedArchetypeType::get(MF.getType(existentialID)->getCanonicalType(),
-                                    MF.getType(interfaceID));
+    auto sigOrError = MF.getGenericSignatureChecked(sigID);
+    if (!sigOrError)
+      return sigOrError.takeError();
+
+    auto interfaceTypeOrError = MF.getTypeChecked(interfaceID);
+    if (!interfaceTypeOrError)
+      return interfaceTypeOrError.takeError();
+
+    auto existentialTypeOrError = MF.getTypeChecked(existentialID);
+    if (!existentialTypeOrError)
+      return existentialTypeOrError.takeError();
+
+    auto env = GenericEnvironment::forOpenedArchetypeSignature(
+        existentialTypeOrError.get(), sigOrError.get(), UUID::fromTime());
+    return env->mapTypeIntoContext(interfaceTypeOrError.get())
+        ->castTo<OpenedArchetypeType>();
   }
       
   Expected<Type> deserializeOpaqueArchetypeType(ArrayRef<uint64_t> scratch,

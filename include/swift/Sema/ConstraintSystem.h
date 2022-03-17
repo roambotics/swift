@@ -566,6 +566,13 @@ template <typename T = Decl> T *getAsDecl(ASTNode node) {
   return nullptr;
 }
 
+template <typename T = Stmt>
+T *getAsStmt(ASTNode node) {
+  if (auto *S = node.dyn_cast<Stmt *>())
+    return dyn_cast_or_null<T>(S);
+  return nullptr;
+}
+
 SourceLoc getLoc(ASTNode node);
 SourceRange getSourceRange(ASTNode node);
 
@@ -3939,12 +3946,6 @@ public:
   /// due to a change.
   ConstraintList &getActiveConstraints() { return ActiveConstraints; }
 
-  void findConstraints(SmallVectorImpl<Constraint *> &found,
-                       llvm::function_ref<bool(const Constraint &)> pred) {
-    filterConstraints(ActiveConstraints, pred, found);
-    filterConstraints(InactiveConstraints, pred, found);
-  }
-
   /// Retrieve the representative of the equivalence class containing
   /// this type variable.
   TypeVariableType *getRepresentative(TypeVariableType *typeVar) const {
@@ -4116,16 +4117,6 @@ private:
   /// Introduce the constraints associated with the given type variable
   /// into the worklist.
   void addTypeVariableConstraintsToWorkList(TypeVariableType *typeVar);
-
-  static void
-  filterConstraints(ConstraintList &constraints,
-                    llvm::function_ref<bool(const Constraint &)> pred,
-                    SmallVectorImpl<Constraint *> &found) {
-    for (auto &constraint : constraints) {
-      if (pred(constraint))
-        found.push_back(&constraint);
-    }
-  }
 
 public:
 
@@ -5585,7 +5576,8 @@ Expr *getArgumentLabelTargetExpr(Expr *fn);
 /// the given type variable, type-erase occurences of that opened type
 /// variable and anything that depends on it to their non-dependent bounds.
 Type typeEraseOpenedExistentialReference(Type type, Type existentialBaseType,
-                                         TypeVariableType *openedTypeVar);
+                                         TypeVariableType *openedTypeVar,
+                                         const DeclContext *useDC);
 
 /// Returns true if a reference to a member on a given base type will apply
 /// its curried self parameter, assuming it has one.

@@ -317,6 +317,8 @@ public:
   void visitUnsafeInheritExecutorAttr(UnsafeInheritExecutorAttr *attr);
 
   void checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs);
+
+  void visitKnownToBeLocalAttr(KnownToBeLocalAttr *attr);
 };
 
 } // end anonymous namespace
@@ -1610,6 +1612,13 @@ static Decl *getEnclosingDeclForDecl(Decl *D) {
 void AttributeChecker::visitAvailableAttr(AvailableAttr *attr) {
   if (Ctx.LangOpts.DisableAvailabilityChecking)
     return;
+
+  while (attr->IsSPI) {
+    if (attr->hasPlatform() && attr->Introduced.hasValue())
+      break;
+    diagnoseAndRemoveAttr(attr, diag::spi_available_malformed);
+    break;
+  }
 
   if (auto *PD = dyn_cast<ProtocolDecl>(D->getDeclContext())) {
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
@@ -3522,6 +3531,21 @@ void AttributeChecker::checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs) {
         diagnoseAndRemoveAttr(Attr, diag::attr_not_on_stored_properties, Attr);
         continue;
       }
+    }
+
+    // FIXME(backDeploy): support coroutines rdar://90111169
+    auto diagnoseCoroutineIfNecessary = [&](AccessorDecl *AD) {
+      if (AD->isCoroutine())
+        diagnose(Attr->getLocation(), diag::back_deploy_not_on_coroutine,
+                 Attr, AD->getDescriptiveKind());
+    };
+    if (auto *ASD = dyn_cast<AbstractStorageDecl>(D)) {
+      ASD->visitEmittedAccessors([&](AccessorDecl *AD) {
+        diagnoseCoroutineIfNecessary(AD);
+      });
+    }
+    if (auto *AD = dyn_cast<AccessorDecl>(D)) {
+      diagnoseCoroutineIfNecessary(AD);
     }
 
     auto AtLoc = Attr->AtLoc;
@@ -5673,24 +5697,23 @@ void AttributeChecker::visitDistributedActorAttr(DistributedActorAttr *attr) {
     }
 
     // distributed func must be declared inside an distributed actor
-    if (dc->getSelfClassDecl() &&
-        !dc->getSelfClassDecl()->isDistributedActor()) {
-      diagnoseAndRemoveAttr(
-          attr, diag::distributed_actor_func_not_in_distributed_actor);
-      return;
-    } else if (auto protoDecl = dc->getSelfProtocolDecl()){
-      if (!protoDecl->inheritsFromDistributedActor()) {
-        auto diag = diagnoseAndRemoveAttr(
-            attr, diag::distributed_actor_func_not_in_distributed_actor);
-        diagnoseDistributedFunctionInNonDistributedActorProtocol(
-            protoDecl, diag);
-        return;
+    auto selfTy = dc->getSelfTypeInContext();
+    if (!selfTy->isDistributedActor()) {
+      auto diagnostic = diagnoseAndRemoveAttr(
+        attr, diag::distributed_actor_func_not_in_distributed_actor);
+
+      if (auto *protoDecl = dc->getSelfProtocolDecl()) {
+        diagnoseDistributedFunctionInNonDistributedActorProtocol(protoDecl,
+                                                                 diagnostic);
       }
-    } else if (dc->getSelfStructDecl() || dc->getSelfEnumDecl()) {
-      diagnoseAndRemoveAttr(
-          attr, diag::distributed_actor_func_not_in_distributed_actor);
       return;
     }
+  }
+}
+
+void AttributeChecker::visitKnownToBeLocalAttr(KnownToBeLocalAttr *attr) {
+  if (!D->isImplicit()) {
+    diagnoseAndRemoveAttr(attr, diag::distributed_local_cannot_be_used);
   }
 }
 

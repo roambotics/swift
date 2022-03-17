@@ -376,8 +376,8 @@ namespace {
         if (offset.getQuantity() != 0) {
           auto baseAddrVal =
               IGF.Builder.CreateBitCast(addr.getAddress(), IGF.IGM.Int8PtrTy);
-          baseAddrVal =
-              IGF.Builder.CreateConstGEP1_64(baseAddrVal, offset.getQuantity());
+          baseAddrVal = IGF.Builder.CreateConstGEP1_64(
+              IGF.IGM.Int8Ty, baseAddrVal, offset.getQuantity());
           baseAddr = Address(baseAddrVal, Alignment(1));
         }
 
@@ -429,8 +429,6 @@ namespace {
 
     void addToAggLowering(IRGenModule &IGM, SwiftAggLowering &lowering,
                           Size offset) const override {
-      auto &layout = ClangDecl->getASTContext().getASTRecordLayout(ClangDecl);
-
       forEachNonEmptyBase([&](clang::QualType type, clang::CharUnits offset,
                               clang::CharUnits) {
         lowering.addTypedData(type, offset);

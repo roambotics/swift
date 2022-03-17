@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-distributed -Xfrontend -disable-availability-checking -parse-as-library) | %FileCheck %s
+// RUN: %target-run-simple-swift( -Xfrontend -disable-availability-checking -parse-as-library) | %FileCheck %s
 
 // REQUIRES: executable_test
 // REQUIRES: concurrency
@@ -7,7 +7,7 @@
 // UNSUPPORTED: use_os_stdlib
 // UNSUPPORTED: back_deployment_runtime
 
-import _Distributed
+import Distributed
 
 distributed actor DA: CustomStringConvertible {
   typealias ActorSystem = FakeActorSystem
@@ -179,7 +179,7 @@ class TestEncoder: Encoder {
     }
   }
 
-  func encode<Act: DistributedActor>(_ actor: Act) throws -> String {
+  func encode<Act: DistributedActor>(_ actor: Act) throws -> String where Act.ID: Codable {
     try actor.encode(to: self)
     return self.data!
   }
