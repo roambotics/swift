@@ -17,6 +17,7 @@
 
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Module.h"
 #include <vector>
@@ -155,9 +156,14 @@ getSuperclassBound(Type depType,
   return props->getSuperclassBound(genericParams, term, Map);
 }
 
-bool RequirementMachine::isConcreteType(Type depType) const {
+/// Unlike the other queries, we have occasion to call this on a requirement
+/// machine for a protocol connected component as well as a top-level
+/// generic signature, so plumb through the protocol to use for the root
+/// `Self` generic parameter here.
+bool RequirementMachine::isConcreteType(Type depType,
+                                        const ProtocolDecl *proto) const {
   auto term = Context.getMutableTermForType(depType->getCanonicalType(),
-                                            /*proto=*/nullptr);
+                                            proto);
   System.simplify(term);
   verify(term);
 
@@ -168,11 +174,16 @@ bool RequirementMachine::isConcreteType(Type depType) const {
   return props->isConcreteType();
 }
 
+/// Unlike the other queries, we have occasion to call this on a requirement
+/// machine for a protocol connected component as well as a top-level
+/// generic signature, so plumb through the protocol to use for the root
+/// `Self` generic parameter here.
 Type RequirementMachine::
 getConcreteType(Type depType,
-                TypeArrayView<GenericTypeParamType> genericParams) const {
+                TypeArrayView<GenericTypeParamType> genericParams,
+                const ProtocolDecl *proto) const {
   auto term = Context.getMutableTermForType(depType->getCanonicalType(),
-                                            /*proto=*/nullptr);
+                                            proto);
   System.simplify(term);
   verify(term);
 
@@ -659,8 +670,7 @@ RequirementMachine::lookupNestedType(Type depType, Identifier name) const {
       typeToSearch = props->getSuperclassBound();
 
     if (typeToSearch)
-      if (auto *decl = typeToSearch->getAnyNominal())
-        lookupConcreteNestedType(decl, name, concreteDecls);
+      lookupConcreteNestedType(typeToSearch, name, concreteDecls);
   }
 
   if (bestAssocType) {
@@ -683,9 +693,11 @@ void RequirementMachine::verify(const MutableTerm &term) const {
   if (term.begin()->getKind() == Symbol::Kind::GenericParam) {
     auto *genericParam = term.begin()->getGenericParam();
     TypeArrayView<GenericTypeParamType> genericParams = getGenericParams();
-    auto found = std::find(genericParams.begin(),
-                           genericParams.end(),
-                           genericParam);
+    auto found = std::find_if(genericParams.begin(),
+                              genericParams.end(),
+                              [&](GenericTypeParamType *otherType) {
+                                return genericParam->isEqual(otherType);
+                              });
     if (found == genericParams.end()) {
       llvm::errs() << "Bad generic parameter in " << term << "\n";
       dump(llvm::errs());

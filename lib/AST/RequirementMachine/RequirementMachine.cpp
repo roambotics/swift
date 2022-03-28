@@ -90,13 +90,15 @@ RequirementMachine::initWithProtocolSignatureRequirements(
   builder.initWithProtocolSignatureRequirements(protos);
 
   // Add the initial set of rewrite rules to the rewrite system.
-  System.initialize(/*recordLoops=*/true, protos,
+  System.initialize(/*recordLoops=*/false, protos,
                     std::move(builder.WrittenRequirements),
                     std::move(builder.ImportedRules),
                     std::move(builder.PermanentRules),
                     std::move(builder.RequirementRules));
 
   auto result = computeCompletion(RewriteSystem::DisallowInvalidRequirements);
+
+  freeze();
 
   if (Dump) {
     llvm::dbgs() << "}\n";
@@ -145,6 +147,8 @@ RequirementMachine::initWithGenericSignature(CanGenericSignature sig) {
 
   auto result = computeCompletion(RewriteSystem::DisallowInvalidRequirements);
 
+  freeze();
+
   if (Dump) {
     llvm::dbgs() << "}\n";
   }
@@ -167,22 +171,28 @@ RequirementMachine::initWithGenericSignature(CanGenericSignature sig) {
 /// Returns failure if completion fails within the configured number of steps.
 std::pair<CompletionResult, unsigned>
 RequirementMachine::initWithProtocolWrittenRequirements(
-    ArrayRef<const ProtocolDecl *> protos) {
+    ArrayRef<const ProtocolDecl *> component,
+    const llvm::DenseMap<const ProtocolDecl *,
+                         SmallVector<StructuralRequirement, 4>> protos) {
   FrontendStatsTracer tracer(Stats, "build-rewrite-system");
+
+  // For RequirementMachine::verify() when called by generic signature queries;
+  // We have a single valid generic parameter at depth 0, index 0.
+  Params.push_back(component[0]->getSelfInterfaceType()->getCanonicalType());
 
   if (Dump) {
     llvm::dbgs() << "Adding protocols";
-    for (auto *proto : protos) {
+    for (auto *proto : component) {
       llvm::dbgs() << " " << proto->getName();
     }
     llvm::dbgs() << " {\n";
   }
 
   RuleBuilder builder(Context, System.getReferencedProtocols());
-  builder.initWithProtocolWrittenRequirements(protos);
+  builder.initWithProtocolWrittenRequirements(component, protos);
 
   // Add the initial set of rewrite rules to the rewrite system.
-  System.initialize(/*recordLoops=*/true, protos,
+  System.initialize(/*recordLoops=*/true, component,
                     std::move(builder.WrittenRequirements),
                     std::move(builder.ImportedRules),
                     std::move(builder.PermanentRules),
@@ -295,7 +305,7 @@ RequirementMachine::computeCompletion(RewriteSystem::ValidityPolicy policy) {
       // Check new rules added by the property map against configured limits.
       for (unsigned i = 0; i < rulesAdded; ++i) {
         const auto &newRule = System.getRule(ruleCount + i);
-        if (newRule.getDepth() > MaxRuleLength) {
+        if (newRule.getDepth() > MaxRuleLength + System.getLongestInitialRule()) {
           return std::make_pair(CompletionResult::MaxRuleLength,
                                 ruleCount + i);
         }
@@ -326,6 +336,10 @@ RequirementMachine::computeCompletion(RewriteSystem::ValidityPolicy policy) {
   return std::make_pair(CompletionResult::Success, 0);
 }
 
+void RequirementMachine::freeze() {
+  System.freeze();
+}
+
 std::string RequirementMachine::getRuleAsStringForDiagnostics(
     unsigned ruleID) const {
   const auto &rule = System.getRule(ruleID);
@@ -353,19 +367,18 @@ void RequirementMachine::dump(llvm::raw_ostream &out) const {
   out << "Requirement machine for ";
   if (Sig)
     out << Sig;
-  else if (!Params.empty()) {
-    out << "fresh signature <";
-    for (auto paramTy : Params)
-      out << " " << Type(paramTy);
-    out << " >";
-  } else {
+  else if (!System.getProtocols().empty()) {
     auto protos = System.getProtocols();
-    assert(!protos.empty());
     out << "protocols [";
     for (auto *proto : protos) {
       out << " " << proto->getName();
     }
     out << " ]";
+  } else {
+    out << "fresh signature <";
+    for (auto paramTy : Params)
+      out << " " << Type(paramTy);
+    out << " >";
   }
   out << "\n";
 

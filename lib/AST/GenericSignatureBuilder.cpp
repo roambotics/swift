@@ -8275,7 +8275,7 @@ AbstractGenericSignatureRequest::evaluate(
     if (!rqmResult.getPointer() && !gsbResult.getPointer())
       return rqmResult;
 
-    if (!rqmResult.getInt().contains(GenericSignatureErrorFlags::HasConflict) &&
+    if (!rqmResult.getInt().contains(GenericSignatureErrorFlags::HasInvalidRequirements) &&
         !rqmResult.getInt().contains(GenericSignatureErrorFlags::CompletionFailed) &&
         !rqmResult.getPointer()->isEqual(gsbResult.getPointer())) {
       PrintOptions opts;
@@ -8427,7 +8427,7 @@ AbstractGenericSignatureRequestGSB::evaluate(
 
   GenericSignatureErrors errorFlags;
   if (builder.hadAnyError())
-    errorFlags |= GenericSignatureErrorFlags::HasUnresolvedType;
+    errorFlags |= GenericSignatureErrorFlags::HasInvalidRequirements;
   auto result = std::move(builder).computeGenericSignature(
       /*allowConcreteGenericParams=*/true);
   return GenericSignatureWithError(result, errorFlags);
@@ -8489,7 +8489,7 @@ InferredGenericSignatureRequest::evaluate(
     if (!rqmResult.getPointer() && !gsbResult.getPointer())
       return rqmResult;
 
-    if (!rqmResult.getInt().contains(GenericSignatureErrorFlags::HasConflict) &&
+    if (!rqmResult.getInt().contains(GenericSignatureErrorFlags::HasInvalidRequirements) &&
         !rqmResult.getInt().contains(GenericSignatureErrorFlags::CompletionFailed) &&
         !rqmResult.getPointer()->isEqual(gsbResult.getPointer())) {
       PrintOptions opts;
@@ -8635,7 +8635,7 @@ InferredGenericSignatureRequestGSB::evaluate(
 
   GenericSignatureErrors errorFlags;
   if (builder.hadAnyError())
-    errorFlags |= GenericSignatureErrorFlags::HasUnresolvedType;
+    errorFlags |= GenericSignatureErrorFlags::HasInvalidRequirements;
   auto result = std::move(builder).computeGenericSignature(
       allowConcreteGenericParams);
   return GenericSignatureWithError(result, errorFlags);
@@ -8662,23 +8662,35 @@ RequirementSignatureRequest::evaluate(Evaluator &evaluator,
 
   auto compare = [&](ArrayRef<Requirement> rqmResult,
                      ArrayRef<Requirement> gsbResult) {
-    if (proto->getParentModule()->isStdlibModule() &&
-        (proto->getName().is("Collection") ||
-         proto->getName().is("StringProtocol"))) {
-      if (rqmResult.size() > gsbResult.size())
-        return false;
-    } else {
-      if (rqmResult.size() != gsbResult.size())
-        return false;
+    if (rqmResult.size() > gsbResult.size())
+      return false;
+
+    SmallVector<Requirement, 2> rqmNonSameType;
+    SmallVector<Requirement, 2> gsbNonSameType;
+
+    for (auto req : rqmResult) {
+      if (req.getKind() != RequirementKind::SameType)
+        rqmNonSameType.push_back(req);
     }
 
-    return std::equal(rqmResult.begin(),
-                      rqmResult.end(),
-                      gsbResult.begin(),
-                      [](const Requirement &lhs,
-                         const Requirement &rhs) {
-                        return lhs.getCanonical() == rhs.getCanonical();
-                      });
+    for (auto req : gsbResult) {
+      if (req.getKind() != RequirementKind::SameType)
+        gsbNonSameType.push_back(req);
+    }
+
+    if (rqmNonSameType.size() != gsbNonSameType.size())
+      return false;
+    
+    if (!std::equal(rqmNonSameType.begin(),
+                    rqmNonSameType.end(),
+                    gsbNonSameType.begin(),
+                    [](const Requirement &lhs,
+                       const Requirement &rhs) {
+                      return lhs.getCanonical() == rhs.getCanonical();
+                    }))
+      return false;
+
+    return true;
   };
 
   switch (ctx.LangOpts.RequirementMachineProtocolSignatures) {
@@ -8693,7 +8705,7 @@ RequirementSignatureRequest::evaluate(Evaluator &evaluator,
     auto rqmResult = buildViaRQM();
     auto gsbResult = buildViaGSB();
 
-    if (!rqmResult.getErrors().contains(GenericSignatureErrorFlags::HasConflict) &&
+    if (!rqmResult.getErrors().contains(GenericSignatureErrorFlags::HasInvalidRequirements) &&
         !rqmResult.getErrors().contains(GenericSignatureErrorFlags::CompletionFailed) &&
         !compare(rqmResult.getRequirements(),
                  gsbResult.getRequirements())) {

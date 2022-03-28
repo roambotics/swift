@@ -76,6 +76,9 @@ bool isCodeCompletionAtTopLevel(const DeclContext *DC);
 ///     }
 bool isCompletionDeclContextLocalContext(DeclContext *DC);
 
+/// Returns \c true if \p DC can handles async call.
+bool canDeclContextHandleAsync(const DeclContext *DC);
+
 /// Return \c true if the completion happens at top-level of a library file.
 bool isCodeCompletionAtTopLevelOfLibraryFile(const DeclContext *DC);
 
@@ -112,6 +115,12 @@ class CompletionLookup final : public swift::VisibleDeclConsumer {
 
   /// Expected types of the code completion expression.
   ExpectedTypeContext expectedTypeContext;
+
+  /// Variables whose type was determined while type checking the code
+  /// completion expression and that are thus not recorded in the AST.
+  /// This in particular applies to params of closures that contain the code
+  /// completion token.
+  llvm::SmallDenseMap<const VarDecl *, Type> SolutionSpecificVarTypes;
 
   bool CanCurrDeclContextHandleAsync = false;
   bool HaveDot = false;
@@ -206,6 +215,11 @@ public:
                    const DeclContext *CurrDeclContext,
                    CodeCompletionContext *CompletionContext = nullptr);
 
+  void setSolutionSpecificVarTypes(
+      llvm::SmallDenseMap<const VarDecl *, Type> SolutionSpecificVarTypes) {
+    this->SolutionSpecificVarTypes = SolutionSpecificVarTypes;
+  }
+
   void setHaveDot(SourceLoc DotLoc) {
     HaveDot = true;
     this->DotLoc = DotLoc;
@@ -225,6 +239,10 @@ public:
   }
 
   void setIdealExpectedType(Type Ty) { expectedTypeContext.setIdealType(Ty); }
+
+  void setCanCurrDeclContextHandleAsync(bool CanCurrDeclContextHandleAsync) {
+    this->CanCurrDeclContextHandleAsync = CanCurrDeclContextHandleAsync;
+  }
 
   const ExpectedTypeContext *getExpectedTypeContext() const {
     return &expectedTypeContext;

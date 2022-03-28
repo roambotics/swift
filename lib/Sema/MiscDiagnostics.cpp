@@ -2646,15 +2646,19 @@ public:
     // TODO [OPAQUE SUPPORT]: diagnose multiple opaque types
     SubstitutionMap underlyingSubs = Candidates.front().second;
     if (Candidates.size() > 1) {
-      unsigned mismatchIndex = OpaqueDecl->getOpaqueGenericParams().size();
-      for (auto genericParam : OpaqueDecl->getOpaqueGenericParams()) {
-        unsigned index = genericParam->getIndex();
-        Type underlyingType = Candidates[0].second.getReplacementTypes()[index];
+      Optional<std::pair<unsigned, GenericTypeParamType *>> mismatch;
+
+      auto opaqueParams = OpaqueDecl->getOpaqueGenericParams();
+      for (auto index : indices(opaqueParams)) {
+        auto *genericParam = opaqueParams[index];
+
+        Type underlyingType = Type(genericParam).subst(underlyingSubs);
         bool found = false;
         for (const auto &candidate : Candidates) {
-          Type otherType = candidate.second.getReplacementTypes()[index];
+          Type otherType = Type(genericParam).subst(candidate.second);
+
           if (!underlyingType->isEqual(otherType)) {
-            mismatchIndex = index;
+            mismatch.emplace(index, genericParam);
             found = true;
             break;
           }
@@ -2663,17 +2667,17 @@ public:
         if (found)
           break;
       }
-      assert(mismatchIndex < OpaqueDecl->getOpaqueGenericParams().size());
+      assert(mismatch.hasValue());
 
       if (auto genericParam =
-              OpaqueDecl->getExplicitGenericParam(mismatchIndex)) {
+              OpaqueDecl->getExplicitGenericParam(mismatch->first)) {
         Implementation->diagnose(
             diag::opaque_type_mismatched_underlying_type_candidates_named,
             genericParam->getName())
           .highlight(genericParam->getLoc());
       } else {
         TypeRepr *opaqueRepr =
-            OpaqueDecl->getOpaqueReturnTypeReprs()[mismatchIndex];
+            OpaqueDecl->getOpaqueReturnTypeReprs()[mismatch->first];
         Implementation->diagnose(
             diag::opaque_type_mismatched_underlying_type_candidates,
             opaqueRepr)
@@ -2681,10 +2685,9 @@ public:
       }
 
       for (auto candidate : Candidates) {
-        Ctx.Diags.diagnose(
-           candidate.first->getLoc(),
-           diag::opaque_type_underlying_type_candidate_here,
-           candidate.second.getReplacementTypes()[mismatchIndex]);
+        Ctx.Diags.diagnose(candidate.first->getLoc(),
+                           diag::opaque_type_underlying_type_candidate_here,
+                           Type(mismatch->second).subst(candidate.second));
       }
       return;
     }
@@ -4742,30 +4745,42 @@ static void diagUnqualifiedAccessToMethodNamedSelf(const Expr *E,
       if (!E || isa<ErrorExpr>(E) || !E->getType())
         return {false, E};
 
-      if (auto *declRefExpr = dyn_cast<DeclRefExpr>(E)) {
-        if (declRefExpr->getDecl()->getBaseName() == Ctx.Id_self &&
-            declRefExpr->getType()->is<AnyFunctionType>()) {
-          if (auto typeContext = DC->getInnermostTypeContext()) {
-            // self() is not easily confusable
-            if (!isa<CallExpr>(Parent.getAsExpr())) {
-              auto baseType = typeContext->getDeclaredInterfaceType();
-              if (!baseType->getEnumOrBoundGenericEnum()) {
-                auto baseTypeString = baseType.getString();
+      auto *DRE = dyn_cast<DeclRefExpr>(E);
+      // If this is not an explicit 'self' reference, let's keep searching.
+      if (!DRE || DRE->isImplicit())
+        return {true, E};
 
-                Ctx.Diags.diagnose(E->getLoc(), diag::self_refers_to_method,
-                    baseTypeString);
+      // If this not 'self' or it's not a function reference, it's unrelated.
+      if (!(DRE->getDecl()->getBaseName() == Ctx.Id_self &&
+            DRE->getType()->is<AnyFunctionType>()))
+        return {true, E};
 
-                Ctx.Diags
-                  .diagnose(E->getLoc(),
-                      diag::fix_unqualified_access_member_named_self,
-                      baseTypeString)
-                  .fixItInsert(E->getLoc(), diag::insert_type_qualification,
-                      baseType);
-              }
-            }
-          }
-        }
+      auto typeContext = DC->getInnermostTypeContext();
+      // Use of 'self' in enums is not confusable.
+      if (!typeContext || typeContext->getSelfEnumDecl())
+        return {true, E};
+
+      // self(...) is not easily confusable.
+      if (auto *parentExpr = Parent.getAsExpr()) {
+        if (isa<CallExpr>(parentExpr))
+          return {true, E};
+
+        // Explicit call to a static method 'self' of some type is not
+        // confusable.
+        if (isa<DotSyntaxCallExpr>(parentExpr) && !parentExpr->isImplicit())
+          return {true, E};
       }
+
+      auto baseType = typeContext->getDeclaredInterfaceType();
+      auto baseTypeString = baseType.getString();
+
+      Ctx.Diags.diagnose(E->getLoc(), diag::self_refers_to_method,
+                         baseTypeString);
+
+      Ctx.Diags
+          .diagnose(E->getLoc(), diag::fix_unqualified_access_member_named_self,
+                    baseTypeString)
+          .fixItInsert(E->getLoc(), diag::insert_type_qualification, baseType);
 
       return {true, E};
     }

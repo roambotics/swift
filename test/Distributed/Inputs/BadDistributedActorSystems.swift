@@ -257,8 +257,8 @@ public struct FakeInvocationEncoder : DistributedTargetInvocationEncoder {
     genericSubs.append(type)
   }
 
-  public mutating func recordArgument<Argument: SerializationRequirement>(_ argument: Argument) throws {
-    print(" > encode argument: \(argument)")
+  public mutating func recordArgument<Value: SerializationRequirement>(_ argument: RemoteCallArgument<Value>) throws {
+    print(" > encode argument name:\(argument.effectiveLabel), argument: \(argument.value)")
     arguments.append(argument)
   }
   public mutating func recordErrorType<E: Error>(_ type: E.Type) throws {
@@ -349,7 +349,7 @@ public struct FakeRoundtripResultHandler: DistributedTargetInvocationResultHandl
   }
 
   // FIXME(distributed): can we return void here?
-  public func onReturn<Res>(value: Res) async throws {
+  public func onReturn<Success: SerializationRequirement>(value: Success) async throws {
     print(" << onReturn: \(value)")
     storeReturn(value)
   }

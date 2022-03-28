@@ -363,7 +363,7 @@ private:
     // Generate constraints to initialize the pattern.
     auto initType =
         cs.generateConstraints(pattern, contextualLocator,
-                               /*shouldBindPatternOneWay=*/true,
+                               /*shouldBindPatternOneWay=*/false,
                                /*patternBinding=*/nullptr, /*patternIndex=*/0);
 
     if (!initType) {
@@ -434,7 +434,7 @@ private:
     {
       auto target = SolutionApplicationTarget::forForEachStmt(
           forEachStmt, sequenceProto, closure,
-          /*bindTypeVarsOneWay=*/true,
+          /*bindTypeVarsOneWay=*/false,
           /*contextualPurpose=*/CTP_ForEachSequence);
 
       auto &targetInfo = target.getForEachStmtInfo();
@@ -451,9 +451,9 @@ private:
   }
 
   void visitCaseItemPattern(Pattern *pattern, ContextualTypeInfo context) {
-    Type patternType =
-        cs.generateConstraints(pattern, locator, /*bindPatternVarsOneWay=*/true,
-                               /*patternBinding=*/nullptr, /*patternIndex=*/0);
+    Type patternType = cs.generateConstraints(
+        pattern, locator, /*bindPatternVarsOneWay=*/false,
+        /*patternBinding=*/nullptr, /*patternIndex=*/0);
 
     if (!patternType) {
       hadError = true;
@@ -895,7 +895,9 @@ private:
 
     // Single-expression closures are effectively a `return` statement,
     // so let's give them a special locator as to indicate that.
-    if (closure->hasSingleExpressionBody()) {
+    // Return statements might not have a result if we have a closure whose
+    // implicit returned value is coerced to Void.
+    if (closure->hasSingleExpressionBody() && returnStmt->hasResult()) {
       auto *expr = returnStmt->getResult();
       assert(expr && "single expression closure without expression?");
 
@@ -1347,7 +1349,8 @@ private:
     for (auto *expected : caseStmt->getCaseBodyVariablesOrEmptyArray()) {
       assert(expected->hasName());
       auto prev = expected->getParentVarDecl();
-      auto type = solution.resolveInterfaceType(solution.getType(prev));
+      auto type = solution.resolveInterfaceType(
+          solution.getType(prev)->mapTypeOutOfContext());
       expected->setInterfaceType(type);
     }
 

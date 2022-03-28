@@ -405,10 +405,6 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
                       ConversionInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(ConvertEscapeToNoEscapeInst, convert_escape_to_noescape,
                       ConversionInst, None, DoesNotRelease)
-    SINGLE_VALUE_INST(ThinFunctionToPointerInst, thin_function_to_pointer,
-                      ConversionInst, None, DoesNotRelease)
-    SINGLE_VALUE_INST(PointerToThinFunctionInst, pointer_to_thin_function,
-                      ConversionInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(RefToBridgeObjectInst, ref_to_bridge_object,
                       ConversionInst, None, DoesNotRelease)
     BRIDGED_SINGLE_VALUE_INST(BridgeObjectToRefInst, bridge_object_to_ref,
@@ -425,10 +421,6 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
                       ConversionInst, None, DoesNotRelease)
     BRIDGED_SINGLE_VALUE_INST(ObjCExistentialMetatypeToObjectInst, objc_existential_metatype_to_object,
                       ConversionInst, None, DoesNotRelease)
-    // unconditional_checked_cast_value reads the source value and produces
-    // a new value with a potentially different representation.
-    DYNAMICCAST_SINGLE_VALUE_INST(UnconditionalCheckedCastValueInst, unconditional_checked_cast_value,
-                      ConversionInst, MayRead, MayRelease)
     // unconditional_checked_cast_inst is only MayRead to prevent a subsequent
     // release of the cast's source from being hoisted above the cast:
     // retain X
@@ -687,9 +679,7 @@ ABSTRACT_INST(TermInst, SILInstruction)
              TermInst, None, DoesNotRelease)
   DYNAMICCAST_TERMINATOR(CheckedCastAddrBranchInst, checked_cast_addr_br,
              TermInst, MayHaveSideEffects, MayRelease)
-  DYNAMICCAST_TERMINATOR(CheckedCastValueBranchInst, checked_cast_value_br,
-             TermInst, None, DoesNotRelease)
-  INST_RANGE(TermInst, UnreachableInst, CheckedCastValueBranchInst)
+  INST_RANGE(TermInst, UnreachableInst, CheckedCastAddrBranchInst)
 
 // Deallocation instructions.
 ABSTRACT_INST(DeallocationInst, SILInstruction)

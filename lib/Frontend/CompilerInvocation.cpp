@@ -459,13 +459,8 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableExperimentalVariadicGenerics |=
     Args.hasArg(OPT_enable_experimental_variadic_generics);
 
-  // SwiftOnoneSupport produces different symbols when opening existentials,
-  // so disable it.
-  if (FrontendOpts.ModuleName == SWIFT_ONONE_SUPPORT)
-    Opts.EnableOpenedExistentialTypes = false;
-
-  Opts.EnableExperimentalDistributed |=
-    Args.hasArg(OPT_enable_experimental_distributed);
+  Opts.EnableExperimentalAssociatedTypeInference |=
+      Args.hasArg(OPT_enable_experimental_associated_type_inference);
 
   Opts.EnableExperimentalMoveOnly |=
     Args.hasArg(OPT_enable_experimental_move_only);
@@ -489,12 +484,6 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
 
   Opts.DisableImplicitConcurrencyModuleImport |=
     Args.hasArg(OPT_disable_implicit_concurrency_module_import);
-
-  /// experimental distributed also implicitly enables experimental concurrency
-  Opts.EnableExperimentalDistributed |=
-    Args.hasArg(OPT_enable_experimental_distributed);
-  Opts.EnableExperimentalConcurrency |=
-    Args.hasArg(OPT_enable_experimental_distributed);
 
   if (Args.hasArg(OPT_enable_experimental_async_top_level))
     Diags.diagnose(SourceLoc(), diag::warn_flag_deprecated,
@@ -770,7 +759,6 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableObjCInterop =
       Args.hasFlag(OPT_enable_objc_interop, OPT_disable_objc_interop,
                    Target.isOSDarwin());
-  Opts.EnableSILOpaqueValues |= Args.hasArg(OPT_enable_sil_opaque_values);
 
   Opts.VerifyAllSubstitutionMaps |= Args.hasArg(OPT_verify_all_substitution_maps);
 
@@ -805,17 +793,15 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   // First, set up default minimum inlining target versions.
   auto getDefaultMinimumInliningTargetVersion =
       [&](const llvm::Triple &triple) -> llvm::VersionTuple {
-#if SWIFT_DEFAULT_TARGET_MIN_INLINING_VERSION_TO_MIN
-    // In ABI-stable modules, default to the version when Swift first became
-    // available.
-    if (FrontendOpts.EnableLibraryEvolution)
+    // In API modules, default to the version when Swift first became available.
+    if (Opts.LibraryLevel == LibraryLevel::API)
       if (auto minTriple = minimumAvailableOSVersionForTriple(triple))
-        return minTriple;
-#endif
+        return *minTriple;
 
-    // In ABI-unstable modules, we will never have to interoperate with
-    // older versions of the module, so we should default to the minimum
-    // deployment target.
+    // In other modules, assume that availability is used less consistently
+    // and that library clients will generally raise deployment targets as the
+    // library evolves so the min inlining version should be the deployment
+    // target by default.
     unsigned major, minor, patch;
     if (triple.isMacOSX())
       triple.getMacOSXVersion(major, minor, patch);
@@ -912,9 +898,6 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.DisableSubstSILFunctionTypes =
       Args.hasArg(OPT_disable_subst_sil_function_types);
 
-  Opts.RequirementMachineProtocolSignatures = RequirementMachineMode::Verify;
-  Opts.RequirementMachineAbstractSignatures = RequirementMachineMode::Verify;
-
   if (auto A = Args.getLastArg(OPT_requirement_machine_protocol_signatures_EQ)) {
     auto value = llvm::StringSwitch<Optional<RequirementMachineMode>>(A->getValue())
         .Case("off", RequirementMachineMode::Disabled)
@@ -1001,11 +984,28 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     }
   }
 
+  if (const Arg *A = Args.getLastArg(OPT_requirement_machine_max_split_concrete_equiv_class_attempts)) {
+    unsigned limit;
+    if (StringRef(A->getValue()).getAsInteger(10, limit)) {
+      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
+                     A->getAsString(Args), A->getValue());
+      HadError = true;
+    } else {
+      Opts.RequirementMachineMaxSplitConcreteEquivClassAttempts = limit;
+    }
+  }
+
   if (Args.hasArg(OPT_disable_requirement_machine_concrete_contraction))
     Opts.EnableRequirementMachineConcreteContraction = false;
 
-  if (Args.hasArg(OPT_enable_requirement_machine_loop_normalization))
-    Opts.EnableRequirementMachineLoopNormalization = true;
+  if (Args.hasArg(OPT_disable_requirement_machine_loop_normalization))
+    Opts.EnableRequirementMachineLoopNormalization = false;
+
+  if (Args.hasArg(OPT_disable_requirement_machine_reuse))
+    Opts.EnableRequirementMachineReuse = false;
+
+  if (Args.hasArg(OPT_enable_requirement_machine_opaque_archetypes))
+    Opts.EnableRequirementMachineOpaqueArchetypes = true;
 
   Opts.DumpTypeWitnessSystems = Args.hasArg(OPT_dump_type_witness_systems);
 
@@ -1678,6 +1678,7 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
   Opts.EnableARCOptimizations &= !Args.hasArg(OPT_disable_arc_opts);
   Opts.EnableOSSAModules |= Args.hasArg(OPT_enable_ossa_modules);
   Opts.EnableOSSAOptimizations &= !Args.hasArg(OPT_disable_ossa_opts);
+  Opts.EnableSILOpaqueValues |= Args.hasArg(OPT_enable_sil_opaque_values);
   Opts.EnableSpeculativeDevirtualization |= Args.hasArg(OPT_enable_spec_devirt);
   Opts.EnableActorDataRaceChecks |= Args.hasFlag(
       OPT_enable_actor_data_race_checks,

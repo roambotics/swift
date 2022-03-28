@@ -344,8 +344,16 @@ ConstraintSystem::getAlternativeLiteralTypes(KnownProtocolKind kind,
   return scratch;
 }
 
-bool ConstraintSystem::containsCodeCompletionLoc(Expr *expr) const {
-  SourceRange range = expr->getSourceRange();
+bool ConstraintSystem::containsCodeCompletionLoc(ASTNode node) const {
+  SourceRange range = node.getSourceRange();
+  if (range.isInvalid())
+    return false;
+  return Context.SourceMgr.rangeContainsCodeCompletionLoc(range);
+}
+
+bool ConstraintSystem::containsCodeCompletionLoc(
+    const ArgumentList *args) const {
+  SourceRange range = args->getSourceRange();
   if (range.isInvalid())
     return false;
   return Context.SourceMgr.rangeContainsCodeCompletionLoc(range);
@@ -1786,8 +1794,9 @@ static bool isMainDispatchQueueMember(ConstraintLocator *locator) {
 /// \note If a 'Self'-rooted type parameter is bound to a concrete type, this
 /// routine will recurse into the concrete type.
 static Type
-typeEraseCovariantExistentialSelfReferences(Type refTy, Type baseTy,
-                                            const DeclContext *useDC) {
+typeEraseExistentialSelfReferences(
+    Type refTy, Type baseTy, const DeclContext *useDC,
+    TypePosition outermostPosition) {
   assert(baseTy->isExistentialType());
   if (!refTy->hasTypeParameter()) {
     return refTy;
@@ -1902,12 +1911,12 @@ typeEraseCovariantExistentialSelfReferences(Type refTy, Type baseTy,
     });
   };
 
-  return transformFn(refTy, TypePosition::Covariant);
+  return transformFn(refTy, outermostPosition);
 }
 
 Type constraints::typeEraseOpenedExistentialReference(
     Type type, Type existentialBaseType, TypeVariableType *openedTypeVar,
-    const DeclContext *useDC) {
+    const DeclContext *useDC, TypePosition outermostPosition) {
   Type selfGP = GenericTypeParamType::get(false, 0, 0, type->getASTContext());
 
   // First, temporarily reconstitute the 'Self' generic parameter.
@@ -1924,8 +1933,8 @@ Type constraints::typeEraseOpenedExistentialReference(
   });
 
   // Then, type-erase occurrences of covariant 'Self'-rooted type parameters.
-  type = typeEraseCovariantExistentialSelfReferences(type, existentialBaseType,
-                                                     useDC);
+  type = typeEraseExistentialSelfReferences(
+      type, existentialBaseType, useDC, outermostPosition);
 
   // Finally, swap the 'Self'-corresponding type variable back in.
   return type.transformRec([&](TypeBase *t) -> Optional<Type> {
@@ -1939,6 +1948,38 @@ Type constraints::typeEraseOpenedExistentialReference(
     // Recurse.
     return None;
   });
+}
+
+/// For every parameter in \p type that has an error type, replace that
+/// parameter's type by a placeholder type, where \p value is the declaration
+/// that declared \p type. This is useful for code completion so we can match
+/// the types we do know instead of bailing out completely because \p type
+/// contains an error type.
+static Type replaceParamErrorTypeByPlaceholder(Type type, ValueDecl *value) {
+  if (!type->is<AnyFunctionType>() || !isa<AbstractFunctionDecl>(value)) {
+    return type;
+  }
+  auto funcType = type->castTo<AnyFunctionType>();
+  auto funcDecl = cast<AbstractFunctionDecl>(value);
+
+  auto declParams = funcDecl->getParameters();
+  auto typeParams = funcType->getParams();
+  assert(declParams->size() == typeParams.size());
+  SmallVector<AnyFunctionType::Param, 4> newParams;
+  newParams.reserve(declParams->size());
+  for (auto i : indices(typeParams)) {
+    AnyFunctionType::Param param = typeParams[i];
+    if (param.getPlainType()->is<ErrorType>()) {
+      auto paramDecl = declParams->get(i);
+      auto placeholder =
+          PlaceholderType::get(paramDecl->getASTContext(), paramDecl);
+      newParams.push_back(param.withType(placeholder));
+    } else {
+      newParams.push_back(param);
+    }
+  }
+  assert(newParams.size() == declParams->size());
+  return FunctionType::get(newParams, funcType->getResult());
 }
 
 std::pair<Type, Type>
@@ -2022,6 +2063,10 @@ ConstraintSystem::getTypeOfMemberReference(
 
   if (isa<AbstractFunctionDecl>(value) ||
       isa<EnumElementDecl>(value)) {
+    if (auto ErrorTy = value->getInterfaceType()->getAs<ErrorType>()) {
+      return {ErrorType::get(ErrorTy->getASTContext()),
+              ErrorType::get(ErrorTy->getASTContext())};
+    }
     // This is the easy case.
     funcType = value->getInterfaceType()->castTo<AnyFunctionType>();
 
@@ -2216,7 +2261,8 @@ ConstraintSystem::getTypeOfMemberReference(
         outerDC->getSelfInterfaceType()->getCanonicalType());
     auto openedTypeVar = replacements.lookup(selfGP);
     type =
-        typeEraseOpenedExistentialReference(type, baseObjTy, openedTypeVar, DC);
+        typeEraseOpenedExistentialReference(type, baseObjTy, openedTypeVar, DC,
+                                            TypePosition::Covariant);
   }
 
   // Construct an idealized parameter type of the initializer associated
@@ -2250,6 +2296,12 @@ ConstraintSystem::getTypeOfMemberReference(
   // If we need to wrap the type in an optional, do so now.
   if (isReferenceOptional && !isa<SubscriptDecl>(value))
     type = OptionalType::get(type->getRValueType());
+
+  if (isForCodeCompletion() && type->hasError()) {
+    // In code completion, replace error types by placeholder types so we can
+    // match the types we know instead of bailing out completely.
+    type = replaceParamErrorTypeByPlaceholder(type, value);
+  }
 
   // If we opened up any type variables, record the replacements.
   recordOpenedTypes(locator, replacements);
@@ -3203,7 +3255,13 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
     refType = subscriptTy;
 
     // Increase the score so that actual subscripts get preference.
-    increaseScore(SK_KeyPathSubscript);
+    // ...except if we're solving for code completion and the index expression
+    // contains the completion location
+    auto SE = getAsExpr<SubscriptExpr>(locator->getAnchor());
+    if (!isForCodeCompletion() ||
+        (SE && !containsCodeCompletionLoc(SE->getArgs()))) {
+      increaseScore(SK_KeyPathSubscript);
+    }
     break;
   }
   }
@@ -4501,7 +4559,7 @@ bool ConstraintSystem::diagnoseAmbiguity(ArrayRef<Solution> solutions) {
     auto &overload = diff.overloads[i];
     auto *locator = overload.locator;
 
-    Expr *anchor = nullptr;
+    ASTNode anchor;
 
     // Simplification of member locator would produce a base expression,
     // this is what we want for diagnostics but not for comparisons here
@@ -4511,25 +4569,33 @@ bool ConstraintSystem::diagnoseAmbiguity(ArrayRef<Solution> solutions) {
     // than simplification of `count` would produce `[x]` which is incorrect.
     if (locator->isLastElement<LocatorPathElt::Member>() ||
         locator->isLastElement<LocatorPathElt::ConstructorMember>()) {
-      anchor = getAsExpr(locator->getAnchor());
+      anchor = locator->getAnchor();
     } else {
-      anchor = getAsExpr(simplifyLocatorToAnchor(overload.locator));
+      anchor = simplifyLocatorToAnchor(overload.locator);
     }
 
-    // If we can't resolve the locator to an anchor expression with no path,
+    // If we can't resolve the locator to an anchor with no path,
     // we can't diagnose this well.
     if (!anchor)
       continue;
 
-    auto it = indexMap.find(anchor);
-    if (it == indexMap.end())
-      continue;
-    unsigned index = it->second;
+    // Index and Depth is only applicable to expressions.
+    unsigned index = 0;
+    unsigned depth = 0;
 
-    auto optDepth = getExprDepth(anchor);
-    if (!optDepth)
-      continue;
-    unsigned depth = *optDepth;
+    if (auto *expr = getAsExpr(anchor)) {
+      auto it = indexMap.find(expr);
+      if (it == indexMap.end())
+        continue;
+
+      index = it->second;
+
+      auto optDepth = getExprDepth(expr);
+      if (!optDepth)
+        continue;
+
+      depth = *optDepth;
+    }
 
     // If we don't have a name to hang on to, it'll be hard to diagnose this
     // overload.
@@ -6375,6 +6441,51 @@ bool ConstraintSystem::isReadOnlyKeyPathComponent(
     if (maybeUnavail.hasValue()) {
       return true;
     }
+  }
+
+  return false;
+}
+
+bool ConstraintSystem::isArgumentGenericFunction(Type argType, Expr *argExpr) {
+  // Only makes sense if the argument type involves type variables somehow.
+  if (!argType->hasTypeVariable())
+    return false;
+
+  // Have we bound an overload for the argument already?
+  if (argExpr) {
+    auto locator = getConstraintLocator(argExpr);
+    auto knownOverloadBinding = ResolvedOverloads.find(locator);
+    if (knownOverloadBinding != ResolvedOverloads.end()) {
+      // If the overload choice is a generic function, then we have a generic
+      // function reference.
+      auto choice = knownOverloadBinding->second;
+      if (auto func = dyn_cast_or_null<AbstractFunctionDecl>(
+              choice.choice.getDeclOrNull())) {
+        if (func->isGeneric())
+          return true;
+      }
+
+      return false;
+    }
+  }
+
+  // We might have a type variable referring to an overload set.
+  auto argTypeVar = argType->getAs<TypeVariableType>();
+  if (!argTypeVar)
+    return false;
+
+  auto disjunction = getUnboundBindOverloadDisjunction(argTypeVar);
+  if (!disjunction)
+    return false;
+
+  for (auto constraint : disjunction->getNestedConstraints()) {
+    auto *decl = constraint->getOverloadChoice().getDeclOrNull();
+    if (!decl)
+      continue;
+
+    if (auto func = dyn_cast<AbstractFunctionDecl>(decl))
+      if (func->isGeneric())
+        return true;
   }
 
   return false;

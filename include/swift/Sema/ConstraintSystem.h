@@ -386,6 +386,10 @@ public:
 
   bool isTypeSequence() const;
 
+  /// Determine whether this type variable represents a code completion
+  /// expression.
+  bool isCodeCompletionToken() const;
+
   /// Retrieve the representative of the equivalence class to which this
   /// type variable belongs.
   ///
@@ -974,6 +978,7 @@ public:
     tombstone,
     stmtCondElement,
     expr,
+    closure,
     stmt,
     pattern,
     patternBindingEntry,
@@ -1016,6 +1021,11 @@ public:
     storage.expr = expr;
   }
 
+  SolutionApplicationTargetsKey(const ClosureExpr *closure) {
+    kind = Kind::closure;
+    storage.expr = closure;
+  }
+
   SolutionApplicationTargetsKey(const Stmt *stmt) {
     kind = Kind::stmt;
     storage.stmt = stmt;
@@ -1052,6 +1062,7 @@ public:
       return lhs.storage.stmtCondElement == rhs.storage.stmtCondElement;
 
     case Kind::expr:
+    case Kind::closure:
       return lhs.storage.expr == rhs.storage.expr;
 
     case Kind::stmt:
@@ -1092,6 +1103,7 @@ public:
           DenseMapInfo<void *>::getHashValue(storage.stmtCondElement));
 
     case Kind::expr:
+    case Kind::closure:
       return hash_combine(
           DenseMapInfo<unsigned>::getHashValue(static_cast<unsigned>(kind)),
           DenseMapInfo<void *>::getHashValue(storage.expr));
@@ -1619,6 +1631,7 @@ class SolutionApplicationTarget {
 public:
   enum class Kind {
     expression,
+    closure,
     function,
     stmtCondition,
     caseLabelItem,
@@ -1681,6 +1694,14 @@ private:
     } expression;
 
     struct {
+      /// The closure expression being type-checked.
+      ClosureExpr *closure;
+
+      /// The type to which the expression should be converted.
+      Type convertType;
+    } closure;
+
+    struct {
       AnyFunctionRef function;
       BraceStmt *body;
     } function;
@@ -1729,6 +1750,12 @@ public:
       : SolutionApplicationTarget(expr, dc, CTP_ExprPattern, patternType,
                                   /*isDiscarded=*/false) {
     setPattern(pattern);
+  }
+
+  SolutionApplicationTarget(ClosureExpr *closure, Type convertType) {
+    kind = Kind::closure;
+    this->closure.closure = closure;
+    this->closure.convertType = convertType;
   }
 
   SolutionApplicationTarget(AnyFunctionRef fn)
@@ -1827,6 +1854,7 @@ public:
     case Kind::expression:
       return expression.expression;
 
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -1841,6 +1869,9 @@ public:
     switch (kind) {
     case Kind::expression:
       return expression.dc;
+
+    case Kind::closure:
+      return closure.closure;
 
     case Kind::function:
       return function.function.getAsDeclContext();
@@ -1928,6 +1959,11 @@ public:
     assert(kind == Kind::expression);
     assert(expression.contextualPurpose == CTP_ExprPattern);
     return cast<ExprPattern>(expression.pattern);
+  }
+
+  Type getClosureContextualType() const {
+    assert(kind == Kind::closure);
+    return closure.convertType;
   }
 
   /// For a pattern initialization target, retrieve the contextual pattern.
@@ -2058,6 +2094,7 @@ public:
   Optional<AnyFunctionRef> getAsFunction() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
@@ -2073,6 +2110,7 @@ public:
   Optional<StmtCondition> getAsStmtCondition() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
@@ -2088,6 +2126,7 @@ public:
   Optional<CaseLabelItem *> getAsCaseLabelItem() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::patternBinding:
@@ -2103,6 +2142,7 @@ public:
   PatternBindingDecl *getAsPatternBinding() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2118,6 +2158,7 @@ public:
   VarDecl *getAsUninitializedWrappedVar() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2133,6 +2174,7 @@ public:
   Pattern *getAsUninitializedVar() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2148,6 +2190,7 @@ public:
   Type getTypeOfUninitializedVar() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2163,6 +2206,7 @@ public:
   PatternBindingDecl *getPatternBindingOfUninitializedVar() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2178,6 +2222,7 @@ public:
   unsigned getIndexOfUninitializedVar() const {
     switch (kind) {
     case Kind::expression:
+    case Kind::closure:
     case Kind::function:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
@@ -2205,6 +2250,9 @@ public:
     switch (kind) {
     case Kind::expression:
       return expression.expression->getSourceRange();
+
+    case Kind::closure:
+      return closure.closure->getSourceRange();
 
     case Kind::function:
       return function.body->getSourceRange();
@@ -2235,6 +2283,9 @@ public:
     switch (kind) {
     case Kind::expression:
       return expression.expression->getLoc();
+
+    case Kind::closure:
+      return closure.closure->getLoc();
 
     case Kind::function:
       return function.function.getLoc();
@@ -2408,6 +2459,10 @@ private:
   /// Tracking this information is useful to avoid producing duplicate
   /// diagnostics when result builder has multiple overloads.
   llvm::SmallDenseSet<AnyFunctionRef> InvalidResultBuilderBodies;
+
+  /// Arguments after the code completion token that were thus ignored (i.e.
+  /// assigned fresh type variables) for type checking.
+  llvm::SetVector<Expr *> IgnoredArguments;
 
   /// Maps node types used within all portions of the constraint
   /// system, instead of directly using the types on the
@@ -3174,9 +3229,31 @@ public:
     return TypeVariables.count(typeVar) > 0;
   }
 
-  /// Whether the given expression's source range contains the code
+  /// Whether the given ASTNode's source range contains the code
   /// completion location.
-  bool containsCodeCompletionLoc(Expr *expr) const;
+  bool containsCodeCompletionLoc(ASTNode node) const;
+  bool containsCodeCompletionLoc(const ArgumentList *args) const;
+
+  /// Marks the argument \p Arg as being ignored because it occurs after the
+  /// code completion token. This assumes that the argument is not type checked
+  /// (by assigning it a fresh type variable) and prevents fixes from being
+  /// generated for this argument.
+  void markArgumentIgnoredForCodeCompletion(Expr *Arg) {
+    IgnoredArguments.insert(Arg);
+  }
+
+  /// Whether the argument \p Arg occurs after the code completion token and
+  /// thus should be ignored and not generate any fixes.
+  bool isArgumentIgnoredForCodeCompletion(Expr *Arg) const {
+    return IgnoredArguments.count(Arg) > 0;
+  }
+
+  /// Whether the constraint system has ignored any arguments for code
+  /// completion, i.e. whether there is an expression for which
+  /// \c isArgumentIgnoredForCodeCompletion returns \c true.
+  bool hasArgumentsIgnoredForCodeCompletion() const {
+    return !IgnoredArguments.empty();
+  }
 
   void setClosureType(const ClosureExpr *closure, FunctionType *type) {
     assert(closure);
@@ -5083,6 +5160,10 @@ private:
                                   SourceLoc referenceLoc);
 
 public:
+  /// If the given argument, specified by its type and expression, a reference
+  /// to a generic function?
+  bool isArgumentGenericFunction(Type argType, Expr *argExpr);
+
   // Given a type variable, attempt to find the disjunction of
   // bind overloads associated with it. This may return null in cases where
   // the disjunction has either not been created or binds the type variable
@@ -5537,7 +5618,43 @@ public:
   /// \returns true to indicate that this should cause a failure, false
   /// otherwise.
   virtual bool relabelArguments(ArrayRef<Identifier> newNames);
+
+  /// \returns true if matchCallArguments should try to claim the argument at
+  /// \p argIndex while recovering from a failure. This is used to prevent
+  /// claiming of arguments after the code completion token.
+  virtual bool shouldClaimArgDuringRecovery(unsigned argIdx);
+
+  /// \returns true if \p arg can be claimed even though its argument label
+  /// doesn't match. This is the case for arguments representing the code
+  /// completion token if they don't contain a label. In these cases completion
+  /// will suggest the label.
+  virtual bool
+  canClaimArgIgnoringNameMismatch(const AnyFunctionType::Param &arg);
 };
+
+/// For a callsite containing a code completion expression, stores the index of
+/// the arg containing it along with the index of the first trailing closure and
+/// how many arguments were passed in total.
+struct CompletionArgInfo {
+  unsigned completionIdx;
+  Optional<unsigned> firstTrailingIdx;
+  unsigned argCount;
+
+  /// \returns true if the given argument index is possibly about to be written
+  /// by the user (given the completion index) so shouldn't be penalised as
+  /// missing when ranking solutions.
+  bool allowsMissingArgAt(unsigned argInsertIdx, AnyFunctionType::Param param);
+
+  /// \returns true if the argument containing the completion location is before
+  /// the argument with the given index.
+  bool isBefore(unsigned argIdx) { return completionIdx < argIdx; }
+};
+
+/// Extracts the index of the argument containing the code completion location
+/// from the provided anchor if it's a \c CallExpr, \c SubscriptExpr, or
+/// \c ObjectLiteralExpr.
+Optional<CompletionArgInfo> getCompletionArgInfo(ASTNode anchor,
+                                                 ConstraintSystem &cs);
 
 /// Match the call arguments (as described by the given argument type) to
 /// the parameters (as described by the given parameter type).
@@ -5577,7 +5694,8 @@ Expr *getArgumentLabelTargetExpr(Expr *fn);
 /// variable and anything that depends on it to their non-dependent bounds.
 Type typeEraseOpenedExistentialReference(Type type, Type existentialBaseType,
                                          TypeVariableType *openedTypeVar,
-                                         const DeclContext *useDC);
+                                         const DeclContext *useDC,
+                                         TypePosition outermostPosition);
 
 /// Returns true if a reference to a member on a given base type will apply
 /// its curried self parameter, assuming it has one.

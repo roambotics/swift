@@ -4048,9 +4048,16 @@ GenericParameterReferenceInfo swift::findGenericParameterReferences(
             sig, genericParam, param.getPlainType(), TypePosition::Invariant);
         continue;
       }
+
+      // Parameters are contravariant, but if we're prior to the skipped
+      // parameter treat them as invariant because we're not allowed to
+      // reference the parameter at all.
+      TypePosition position = TypePosition::Contravariant;
+      if (skipParamIndex && paramIdx < *skipParamIndex)
+        position = TypePosition::Invariant;
+
       inputInfo |= ::findGenericParameterReferences(
-          sig, genericParam, param.getParameterType(),
-          TypePosition::Contravariant);
+          sig, genericParam, param.getParameterType(), position);
     }
 
     // A covariant Self result inside a parameter will not be bona fide.
@@ -5619,6 +5626,8 @@ Optional<KnownDerivableProtocolKind>
     return KnownDerivableProtocolKind::Actor;
   case KnownProtocolKind::DistributedActor:
     return KnownDerivableProtocolKind::DistributedActor;
+  case KnownProtocolKind::DistributedActorSystem:
+    return KnownDerivableProtocolKind::DistributedActorSystem;
   default: return None;
   }
 }
@@ -6823,6 +6832,32 @@ ParamDecl *ParamDecl::clone(const ASTContext &Ctx, ParamDecl *PD) {
   return Clone;
 }
 
+ParamDecl *
+ParamDecl::createImplicit(ASTContext &Context, SourceLoc specifierLoc,
+                          SourceLoc argumentNameLoc, Identifier argumentName,
+                          SourceLoc parameterNameLoc, Identifier parameterName,
+                          Type interfaceType, DeclContext *Parent,
+                          ParamSpecifier specifier) {
+  auto decl =
+      new (Context) ParamDecl(specifierLoc, argumentNameLoc, argumentName,
+                              parameterNameLoc, parameterName, Parent);
+  decl->setImplicit();
+  // implicit ParamDecls must have a specifier set
+  decl->setSpecifier(specifier);
+  decl->setInterfaceType(interfaceType);
+  return decl;
+}
+
+ParamDecl *ParamDecl::createImplicit(ASTContext &Context,
+                                     Identifier argumentName,
+                                     Identifier parameterName,
+                                     Type interfaceType, DeclContext *Parent,
+                                     ParamSpecifier specifier) {
+  return ParamDecl::createImplicit(Context, SourceLoc(), SourceLoc(),
+                                   argumentName, SourceLoc(), parameterName,
+                                   interfaceType, Parent, specifier);
+}
+
 /// Retrieve the type of 'self' for the given context.
 Type DeclContext::getSelfTypeInContext() const {
   assert(isTypeContext());
@@ -7031,6 +7066,10 @@ Expr *ParamDecl::getTypeCheckedDefaultExpr() const {
 
 Type ParamDecl::getTypeOfDefaultExpr() const {
   auto &ctx = getASTContext();
+
+  // If this is a caller-side default, the type is determined based on
+  // a particular call site.
+  assert(!hasCallerSideDefaultExpr());
 
   if (Type type = evaluateOrDefault(
           ctx.evaluator,
@@ -7533,9 +7572,10 @@ AbstractFunctionDecl *AbstractFunctionDecl::getAsyncAlternative() const {
     // rename parameter, falling back to the first with a rename. Note that
     // `getAttrs` is in reverse source order, so the last attribute is the
     // first in source
-    if (!attr->Rename.empty() && (attr->Platform == PlatformKind::none ||
-                                  !avAttr))
+    if (!attr->Rename.empty() &&
+        (attr->Platform == PlatformKind::none || !avAttr) && !attr->isNoAsync()) {
       avAttr = attr;
+    }
   }
 
   auto *renamedDecl = evaluateOrDefault(
@@ -9044,24 +9084,9 @@ ActorIsolation swift::getActorIsolationOfContext(DeclContext *dc) {
   if (auto *vd = dyn_cast_or_null<ValueDecl>(dc->getAsDecl()))
     return getActorIsolation(vd);
 
-  // In the context of the initializing or default-value expression of a
-  // stored property, the isolation varies between global and type members:
-  //   - For a static stored property, the isolation matches the VarDecl.
-  //   - For a field of a nominal type, the expression is not isolated.
-  // Without this distinction, a nominal can have non-async initializers
-  // with various kinds of isolation, so an impossible constraint can be
-  // created. See SE-0327 for details.
-  if (auto *var = dc->getNonLocalVarDecl()) {
-
-    // Isolation officially changes, as described above, in Swift 6+
-    if (dc->getASTContext().isSwiftVersionAtLeast(6) &&
-        var->isInstanceMember() &&
-        !var->getAttrs().hasAttribute<LazyAttr>()) {
-      return ActorIsolation::forUnspecified();
-    }
-
+  if (auto *var = dc->getNonLocalVarDecl())
      return getActorIsolation(var);
-  }
+
 
   if (auto *closure = dyn_cast<AbstractClosureExpr>(dc)) {
     switch (auto isolation = closure->getActorIsolation()) {

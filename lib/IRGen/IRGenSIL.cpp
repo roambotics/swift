@@ -1311,8 +1311,6 @@ public:
   
   void visitConvertFunctionInst(ConvertFunctionInst *i);
   void visitConvertEscapeToNoEscapeInst(ConvertEscapeToNoEscapeInst *i);
-  void visitThinFunctionToPointerInst(ThinFunctionToPointerInst *i);
-  void visitPointerToThinFunctionInst(PointerToThinFunctionInst *i);
   void visitUpcastInst(UpcastInst *i);
   void visitAddressToPointerInst(AddressToPointerInst *i);
   void visitPointerToAddressInst(PointerToAddressInst *i);
@@ -1331,8 +1329,6 @@ public:
   void visitObjCToThickMetatypeInst(ObjCToThickMetatypeInst *i);
   void visitUnconditionalCheckedCastInst(UnconditionalCheckedCastInst *i);
   void visitUnconditionalCheckedCastAddrInst(UnconditionalCheckedCastAddrInst *i);
-  void
-  visitUnconditionalCheckedCastValueInst(UnconditionalCheckedCastValueInst *i);
   void visitObjCMetatypeToObjectInst(ObjCMetatypeToObjectInst *i);
   void visitObjCExistentialMetatypeToObjectInst(
                                         ObjCExistentialMetatypeToObjectInst *i);
@@ -1363,7 +1359,6 @@ public:
   void visitSwitchEnumAddrInst(SwitchEnumAddrInst *i);
   void visitDynamicMethodBranchInst(DynamicMethodBranchInst *i);
   void visitCheckedCastBranchInst(CheckedCastBranchInst *i);
-  void visitCheckedCastValueBranchInst(CheckedCastValueBranchInst *i);
   void visitCheckedCastAddrBranchInst(CheckedCastAddrBranchInst *i);
   
   void visitGetAsyncContinuationInst(GetAsyncContinuationInst *i);
@@ -5859,26 +5854,6 @@ void IRGenSILFunction::visitConvertEscapeToNoEscapeInst(
   setLoweredExplosion(i, out);
 }
 
-void IRGenSILFunction::visitThinFunctionToPointerInst(
-                                          swift::ThinFunctionToPointerInst *i) {
-  Explosion in = getLoweredExplosion(i->getOperand());
-  llvm::Value *fn = in.claimNext();
-  fn = Builder.CreateBitCast(fn, IGM.Int8PtrTy);
-  Explosion out;
-  out.add(fn);
-  setLoweredExplosion(i, out);
-}
-
-void IRGenSILFunction::visitPointerToThinFunctionInst(
-                                          swift::PointerToThinFunctionInst *i) {
-  Explosion in = getLoweredExplosion(i->getOperand());
-  llvm::Value *fn = in.claimNext();
-  fn = Builder.CreateBitCast(fn, IGM.FunctionPtrTy);
-  Explosion out;
-  out.add(fn);
-  setLoweredExplosion(i, out);
-}
-
 void IRGenSILFunction::visitAddressToPointerInst(swift::AddressToPointerInst *i)
 {
   Explosion to;
@@ -6368,16 +6343,6 @@ void IRGenSILFunction::visitUnconditionalCheckedCastAddrInst(
                   dest, i->getTargetFormalType(),
                   CastConsumptionKind::TakeAlways,
                   CheckedCastMode::Unconditional);
-}
-
-void IRGenSILFunction::visitUnconditionalCheckedCastValueInst(
-    swift::UnconditionalCheckedCastValueInst *i) {
-  llvm_unreachable("unsupported instruction during IRGen");
-}
-
-void IRGenSILFunction::visitCheckedCastValueBranchInst(
-    swift::CheckedCastValueBranchInst *i) {
-  llvm_unreachable("unsupported instruction during IRGen");
 }
 
 void IRGenSILFunction::visitCheckedCastBranchInst(

@@ -5,6 +5,17 @@ _**Note:** This is in reverse chronological order, so newer entries are added to
 
 ## Swift 5.7
 
+* [SE-0340][]:
+
+  It is now possible to make declarations unavailable from use in asynchronous
+  contexts with the `@available(*, noasync)` attribute.
+
+  This is to protect the consumers of an API against undefined behavior that can
+  occur when the API uses thread-local storage, or encourages using thread-local
+  storage, across suspension points, or protect developers against holding locks
+  across suspension points which may lead to undefined behavior, priority
+  inversions, or deadlocks.
+
 * [SE-0343][]:
 
 Top-level scripts support asynchronous calls.
@@ -54,7 +65,7 @@ func talkTo(greeter: Greeter) async throws {
 
 * The compiler now emits a warning when a non-final class conforms to a protocol that imposes a same-type requirement between `Self` and an associated type. This is because such a requirement makes the conformance unsound for subclasses.
 
-For example, Swift 5.6 would allow the following code, which at runtime would construct an instanec of `C` and not `SubC` as expected:
+For example, Swift 5.6 would allow the following code, which at runtime would construct an instance of `C` and not `SubC` as expected:
 
   ```swift
   protocol P {
@@ -96,7 +107,7 @@ For example, Swift 5.6 would allow the following code, which at runtime would co
 
 * [SE-0341][]:
 
-  Opaque types can now be used in the parameters of functions and subscripts, wher they provide a shorthand syntax for the introduction of a generic parameter. For example, the following:
+  Opaque types can now be used in the parameters of functions and subscripts, when they provide a shorthand syntax for the introduction of a generic parameter. For example, the following:
 
   ```swift
   func horizontal(_ v1: some View, _ v2: some View) -> some View {
@@ -9083,6 +9094,7 @@ Swift 1.0
 [SE-0341]: <https://github.com/apple/swift-evolution/blob/main/proposals/0341-opaque-parameters.md>
 [SE-0336]: <https://github.com/apple/swift-evolution/blob/main/proposals/0336-distributed-actor-isolation.md>
 [SE-0343]: <https://github.com/apple/swift-evolution/blob/main/proposals/0343-top-level-concurrency.md>
+[SE-0340]: <https://github.com/apple/swift-evolution/blob/main/proposals/0340-swift-noasync.md>
 
 [SR-75]: <https://bugs.swift.org/browse/SR-75>
 [SR-106]: <https://bugs.swift.org/browse/SR-106>

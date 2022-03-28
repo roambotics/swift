@@ -43,6 +43,7 @@ static DebugOptions parseDebugFlags(StringRef debugFlags) {
       .Case("redundant-rules-detail", DebugFlags::RedundantRulesDetail)
       .Case("concrete-contraction", DebugFlags::ConcreteContraction)
       .Case("propagate-requirement-ids", DebugFlags::PropagateRequirementIDs)
+      .Case("timers", DebugFlags::Timers)
       .Default(None);
     if (!flag) {
       llvm::errs() << "Unknown debug flag in -debug-requirement-machine "
@@ -70,6 +71,41 @@ RewriteContext::RewriteContext(ASTContext &ctx)
   auto debugFlags = StringRef(ctx.LangOpts.DebugRequirementMachine);
   if (!debugFlags.empty())
     Debug = parseDebugFlags(debugFlags);
+}
+
+void RewriteContext::beginTimer(StringRef name) {
+  auto now = std::chrono::system_clock::now();
+  auto dur = now.time_since_epoch();
+
+  for (unsigned i = 0; i < Timers.size(); ++i)
+    llvm::dbgs() << "| ";
+  llvm::dbgs() << "+ started " << name << " ";
+
+  Timers.push_back(std::chrono::duration_cast<std::chrono::microseconds>(dur).count());
+}
+
+void RewriteContext::endTimer(StringRef name) {
+  auto now = std::chrono::system_clock::now();
+  auto dur = now.time_since_epoch();
+  auto time = (std::chrono::duration_cast<std::chrono::microseconds>(dur).count()
+               - Timers.back());
+  Timers.pop_back();
+
+  // If we're nested inside of another timer, don't charge our time to the parent.
+  if (!Timers.empty()) {
+    Timers.back() += time;
+  }
+
+  for (unsigned i = 0; i < Timers.size(); ++i)
+    llvm::dbgs() << "| ";
+
+  llvm::dbgs() << "+ ";
+
+  if (time > 100000)
+    llvm::dbgs() << "**** SLOW **** ";
+
+  llvm::dbgs() << "finished " << name << " in " << time << "us: ";
+
 }
 
 const llvm::TinyPtrVector<const ProtocolDecl *> &
@@ -127,6 +163,11 @@ RequirementMachine *RewriteContext::getRequirementMachine(
     return machine;
   }
 
+  if (Debug.contains(DebugFlags::Timers)) {
+    beginTimer("getRequirementMachine()");
+    llvm::dbgs() << sig << "\n";
+  }
+
   // Store this requirement machine before adding the signature,
   // to catch re-entrant construction via initWithGenericSignature()
   // below.
@@ -136,6 +177,11 @@ RequirementMachine *RewriteContext::getRequirementMachine(
   // This might re-entrantly invalidate 'machine'.
   auto status = newMachine->initWithGenericSignature(sig);
   newMachine->checkCompletionResult(status.first);
+
+  if (Debug.contains(DebugFlags::Timers)) {
+    endTimer("getRequirementMachine()");
+    llvm::dbgs() << sig << "\n";
+  }
 
   return newMachine;
 }
@@ -147,6 +193,23 @@ bool RewriteContext::isRecursivelyConstructingRequirementMachine(
     return false;
 
   return !found->second->isComplete();
+}
+
+/// Given a requirement machine that built a minimized signature, attempt to
+/// re-use it for subsequent queries against the minimized signature, instead
+/// of building a new one later.
+void RewriteContext::installRequirementMachine(
+    CanGenericSignature sig,
+    std::unique_ptr<RequirementMachine> machine) {
+  if (!Context.LangOpts.EnableRequirementMachineReuse)
+    return;
+
+  auto &entry = Machines[sig];
+  if (entry != nullptr)
+    return;
+
+  machine->freeze();
+  entry = machine.release();
 }
 
 /// Implement Tarjan's algorithm to compute strongly-connected components in
@@ -288,7 +351,8 @@ RewriteContext::getProtocolComponentImpl(const ProtocolDecl *proto) {
 ///
 /// This can only be called once, to prevent multiple requirement machines
 /// for being built with the same component.
-ArrayRef<const ProtocolDecl *> RewriteContext::getProtocolComponent(
+ArrayRef<const ProtocolDecl *>
+RewriteContext::startComputingRequirementSignatures(
     const ProtocolDecl *proto) {
   auto &component = getProtocolComponentImpl(proto);
 
@@ -305,6 +369,17 @@ ArrayRef<const ProtocolDecl *> RewriteContext::getProtocolComponent(
   return component.Protos;
 }
 
+/// Mark the component as having completed, which will ensure that
+/// isRecursivelyComputingRequirementMachine() returns false.
+void RewriteContext::finishComputingRequirementSignatures(
+    const ProtocolDecl *proto) {
+  auto &component = getProtocolComponentImpl(proto);
+
+  assert(component.ComputingRequirementSignatures &&
+         "Didn't call startComputingRequirementSignatures()");
+  component.ComputedRequirementSignatures = true;
+}
+
 /// Get the list of protocols in the strongly connected component (SCC)
 /// of the protocol dependency graph containing the given protocol.
 ///
@@ -312,6 +387,11 @@ ArrayRef<const ProtocolDecl *> RewriteContext::getProtocolComponent(
 /// for being built with the same component.
 RequirementMachine *RewriteContext::getRequirementMachine(
     const ProtocolDecl *proto) {
+  // First, get the requirement signature. If this protocol was written in
+  // source, we'll minimize it and install the machine below, saving us the
+  // effort of recomputing it.
+  (void) proto->getRequirementSignature();
+
   auto &component = getProtocolComponentImpl(proto);
 
   if (component.Machine) {
@@ -326,6 +406,16 @@ RequirementMachine *RewriteContext::getRequirementMachine(
     return component.Machine;
   }
 
+  auto protos = component.Protos;
+
+  if (Debug.contains(DebugFlags::Timers)) {
+    beginTimer("getRequirementMachine()");
+    llvm::dbgs() << "[";
+    for (auto *proto : protos)
+      llvm::dbgs() << " " << proto->getName();
+    llvm::dbgs() << " ]\n";
+  }
+
   // Store this requirement machine before adding the protocols, to catch
   // re-entrant construction via initWithProtocolSignatureRequirements()
   // below.
@@ -333,18 +423,26 @@ RequirementMachine *RewriteContext::getRequirementMachine(
   component.Machine = newMachine;
 
   // This might re-entrantly invalidate 'component.Machine'.
-  auto status = newMachine->initWithProtocolSignatureRequirements(
-      component.Protos);
+  auto status = newMachine->initWithProtocolSignatureRequirements(protos);
   newMachine->checkCompletionResult(status.first);
+
+  if (Debug.contains(DebugFlags::Timers)) {
+    endTimer("getRequirementMachine()");
+    llvm::dbgs() << "[";
+    for (auto *proto : protos)
+      llvm::dbgs() << " " << proto->getName();
+    llvm::dbgs() << " ]\n";
+  }
 
   return newMachine;
 }
 
+/// Note: This doesn't use Evaluator::hasActiveRequest(), because in reality
+/// the active request could be for any protocol in the connected component.
+///
+/// Instead, just check a flag set in the component itself.
 bool RewriteContext::isRecursivelyConstructingRequirementMachine(
     const ProtocolDecl *proto) {
-  if (proto->isRequirementSignatureComputed())
-    return false;
-
   auto found = Protos.find(proto);
   if (found == Protos.end())
     return false;
@@ -353,7 +451,28 @@ bool RewriteContext::isRecursivelyConstructingRequirementMachine(
   if (component == Components.end())
     return false;
 
-  return component->second.ComputingRequirementSignatures;
+  // If we've started but not finished, we're in the middle of computing
+  // requirement signatures.
+  return (component->second.ComputingRequirementSignatures &&
+          !component->second.ComputedRequirementSignatures);
+}
+
+/// Given a requirement machine that built the requirement signatures for a
+/// protocol connected component, attempt to re-use it for subsequent
+/// queries against the connected component, instead of building a new one
+/// later.
+void RewriteContext::installRequirementMachine(
+    const ProtocolDecl *proto,
+    std::unique_ptr<RequirementMachine> machine) {
+  if (!Context.LangOpts.EnableRequirementMachineReuse)
+    return;
+
+  auto &component = getProtocolComponentImpl(proto);
+  if (component.Machine != nullptr)
+    return;
+
+  machine->freeze();
+  component.Machine = machine.release();
 }
 
 /// We print stats in the destructor, which should get executed at the end of

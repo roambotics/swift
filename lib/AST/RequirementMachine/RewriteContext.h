@@ -86,9 +86,13 @@ class RewriteContext final {
     /// The members of this connected component.
     ArrayRef<const ProtocolDecl *> Protos;
 
-    /// Whether we are currently computing the requirement signatures of
+    /// Whether we have started computing the requirement signatures of
     /// the protocols in this component.
     bool ComputingRequirementSignatures = false;
+
+    /// Whether we have finished computing the requirement signatures of
+    /// the protocols in this component.
+    bool ComputedRequirementSignatures = false;
 
     /// Each connected component has a lazily-created requirement machine
     /// built from the requirement signatures of the protocols in this
@@ -111,6 +115,10 @@ class RewriteContext final {
   /// The connected components. Keys are the ComponentID fields of
   /// ProtocolNode.
   llvm::DenseMap<unsigned, ProtocolComponent> Components;
+
+  /// The stack of timers for performance analysis. See beginTimer() and
+  /// endTimer().
+  llvm::SmallVector<uint64_t, 2> Timers;
 
   ASTContext &Context;
 
@@ -144,6 +152,10 @@ public:
   DebugOptions getDebugOptions() const { return Debug; }
 
   ASTContext &getASTContext() const { return Context; }
+
+  void beginTimer(StringRef name);
+
+  void endTimer(StringRef name);
 
   //////////////////////////////////////////////////////////////////////////////
   ///
@@ -194,9 +206,19 @@ public:
   RequirementMachine *getRequirementMachine(CanGenericSignature sig);
   bool isRecursivelyConstructingRequirementMachine(CanGenericSignature sig);
 
-  ArrayRef<const ProtocolDecl *> getProtocolComponent(const ProtocolDecl *proto);
+  void installRequirementMachine(CanGenericSignature sig,
+                                 std::unique_ptr<RequirementMachine> machine);
+
+  ArrayRef<const ProtocolDecl *>
+  startComputingRequirementSignatures(const ProtocolDecl *proto);
+
+  void finishComputingRequirementSignatures(const ProtocolDecl *proto);
+
   RequirementMachine *getRequirementMachine(const ProtocolDecl *proto);
   bool isRecursivelyConstructingRequirementMachine(const ProtocolDecl *proto);
+
+  void installRequirementMachine(const ProtocolDecl *proto,
+                                 std::unique_ptr<RequirementMachine> machine);
 
   ~RewriteContext();
 };

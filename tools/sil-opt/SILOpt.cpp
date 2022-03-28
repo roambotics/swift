@@ -559,8 +559,6 @@ int main(int argc, char **argv) {
   }
   Invocation.getLangOptions().EnableExperimentalConcurrency =
     EnableExperimentalConcurrency;
-  Invocation.getLangOptions().EnableExperimentalDistributed =
-    EnableExperimentalDistributed;
   Optional<bool> enableExperimentalMoveOnly =
       toOptionalBool(EnableExperimentalMoveOnly);
   if (enableExperimentalMoveOnly)
@@ -570,8 +568,6 @@ int main(int argc, char **argv) {
   Invocation.getLangOptions().EnableObjCInterop =
     EnableObjCInterop ? true :
     DisableObjCInterop ? false : llvm::Triple(Target).isOSDarwin();
-
-  Invocation.getLangOptions().EnableSILOpaqueValues = EnableSILOpaqueValues;
 
   Invocation.getLangOptions().OptimizationRemarkPassedPattern =
       createOptRemarkRegex(PassRemarksPassed);
@@ -634,6 +630,7 @@ int main(int argc, char **argv) {
   SILOpts.EnableSpeculativeDevirtualization = EnableSpeculativeDevirtualization;
   SILOpts.IgnoreAlwaysInline = IgnoreAlwaysInline;
   SILOpts.EnableOSSAModules = EnableOSSAModules;
+  SILOpts.EnableSILOpaqueValues = EnableSILOpaqueValues;
 
   if (CopyPropagationState) {
     SILOpts.CopyPropagation = *CopyPropagationState;

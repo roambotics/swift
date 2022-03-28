@@ -300,6 +300,10 @@ function(_add_target_variant_swift_compile_flags
   if(SWIFT_STDLIB_ENABLE_UNICODE_DATA)
     list(APPEND result "-D" "SWIFT_STDLIB_ENABLE_UNICODE_DATA")
   endif()
+  
+  if(SWIFT_STDLIB_ENABLE_VECTOR_TYPES)
+    list(APPEND result "-D" "SWIFT_STDLIB_ENABLE_VECTOR_TYPES")
+  endif()
 
   if(SWIFT_STDLIB_HAS_COMMANDLINE)
     list(APPEND result "-D" "SWIFT_STDLIB_HAS_COMMANDLINE")
@@ -463,6 +467,11 @@ function(_compile_swift_files
         "${SWIFTFILE_ARCHITECTURE}" STREQUAL "x86_64")
       list(APPEND swift_flags "-Xfrontend" "-sil-verify-all")
     endif()
+  endif()
+
+  # The standard library and overlays are built with the Requirement Machine enabled.
+  if(SWIFTFILE_IS_STDLIB)
+    list(APPEND swift_flags "-Xfrontend" "-requirement-machine-inferred-signatures=verify")
   endif()
 
   # The standard library and overlays are built resiliently when SWIFT_STDLIB_STABLE_ABI=On.

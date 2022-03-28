@@ -173,6 +173,10 @@ class ConcreteContraction {
   Type substType(Type type) const;
   Requirement substRequirement(const Requirement &req) const;
 
+  bool preserveSameTypeRequirement(const Requirement &req) const;
+
+  bool hasResolvedMemberTypeOfInterestingParameter(Type t) const;
+
 public:
   ConcreteContraction(bool debug) : Debug(debug) {}
 
@@ -235,19 +239,10 @@ Optional<Type> ConcreteContraction::substTypeParameter(
                     ->substBaseType(module, *substBaseType);
   }
 
-  auto *decl = (*substBaseType)->getAnyNominal();
-  if (decl == nullptr) {
-    if (Debug) {
-      llvm::dbgs() << "@@@ Not a nominal type: " << *substBaseType << "\n";
-    }
-
-    return None;
-  }
-
   // An unresolved DependentMemberType stores an identifier. Handle this
   // by performing a name lookup into the base type.
-  SmallVector<TypeDecl *> concreteDecls;
-  lookupConcreteNestedType(decl, memberType->getName(), concreteDecls);
+  SmallVector<TypeDecl *, 2> concreteDecls;
+  lookupConcreteNestedType(*substBaseType, memberType->getName(), concreteDecls);
 
   auto *typeDecl = findBestConcreteNestedType(concreteDecls);
   if (typeDecl == nullptr) {
@@ -261,8 +256,9 @@ Optional<Type> ConcreteContraction::substTypeParameter(
   }
 
   // Substitute the base type into the member type.
+  auto *dc = typeDecl->getDeclContext();
   auto subMap = (*substBaseType)->getContextSubstitutionMap(
-      decl->getParentModule(), typeDecl->getDeclContext());
+      dc->getParentModule(), dc);
   return typeDecl->getDeclaredInterfaceType().subst(subMap);
 }
 
@@ -392,6 +388,73 @@ ConcreteContraction::substRequirement(const Requirement &req) const {
   }
 }
 
+bool ConcreteContraction::
+hasResolvedMemberTypeOfInterestingParameter(Type type) const {
+  return type.findIf([&](Type t) -> bool {
+    if (auto *memberTy = t->getAs<DependentMemberType>()) {
+      if (memberTy->getAssocType() == nullptr)
+        return false;
+
+      auto baseTy = memberTy->getBase();
+      if (auto *genericParam = baseTy->getAs<GenericTypeParamType>()) {
+        GenericParamKey key(genericParam);
+
+        Type concreteType;
+        {
+          auto found = ConcreteTypes.find(key);
+          if (found != ConcreteTypes.end() && found->second.size() == 1)
+            return true;
+        }
+
+        Type superclass;
+        {
+          auto found = Superclasses.find(key);
+          if (found != Superclasses.end() && found->second.size() == 1)
+            return true;
+        }
+      }
+    }
+
+    return false;
+  });
+}
+
+/// Another silly GenericSignatureBuilder compatibility hack.
+///
+/// Consider this code:
+///
+///     class C<T> {
+///       typealias A = T
+///     }
+///
+///     protocol P {
+///       associatedtype A
+///     }
+///
+///     func f<X, T>(_: X, _: T) where X : P, X : C<T>, X.A == T {}
+///
+/// The GenericSignatureBuilder would introduce an equivalence between
+/// typealias A in class C and associatedtype A in protocol P, so the
+/// requirement 'X.A == T' would effectively constrain _both_.
+///
+/// Simulate this by keeping both the original and substituted same-type
+/// requirement in a narrow case.
+bool ConcreteContraction::preserveSameTypeRequirement(
+    const Requirement &req) const {
+  if (req.getKind() != RequirementKind::SameType)
+    return false;
+
+  if (Superclasses.find(req.getFirstType()->getRootGenericParam())
+      == Superclasses.end())
+    return false;
+
+  if (hasResolvedMemberTypeOfInterestingParameter(req.getFirstType()) ||
+      hasResolvedMemberTypeOfInterestingParameter(req.getSecondType()))
+    return false;
+
+  return true;
+}
+
 /// Substitute all occurrences of generic parameters subject to superclass
 /// or concrete type requirements with their corresponding superclass or
 /// concrete type.
@@ -514,6 +577,18 @@ bool ConcreteContraction::performConcreteContraction(
       llvm::dbgs() << "\n";
     }
 
+    if (preserveSameTypeRequirement(req.req)) {
+      if (Debug) {
+        llvm::dbgs() << "@ Preserving original requirement: ";
+        req.req.dump(llvm::dbgs());
+        llvm::dbgs() << "\n";
+      }
+
+      // Make the duplicated requirement 'inferred' so that we don't diagnose
+      // it as redundant.
+      result.push_back({req.req, SourceLoc(), /*inferred=*/true});
+    }
+
     // Substitute the requirement.
     Optional<Requirement> substReq = substRequirement(req.req);
 
@@ -527,7 +602,7 @@ bool ConcreteContraction::performConcreteContraction(
         llvm::dbgs() << "\n";
       }
 
-      return false;
+      continue;
     }
 
     if (Debug) {

@@ -17,8 +17,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "MiscDiagnostics.h"
-#include "TypeChecker.h"
 #include "TypeCheckAvailability.h"
+#include "TypeChecker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/DiagnosticSuppression.h"
@@ -28,7 +28,7 @@
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Statistic.h"
-#include "swift/Sema/CodeCompletionTypeChecking.h"
+#include "swift/IDE/TypeCheckCompletionCallback.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "swift/Sema/SolutionResult.h"
 #include "llvm/ADT/DenseMap.h"
@@ -128,6 +128,10 @@ bool TypeVariableType::Implementation::isTypeSequence() const {
   return locator
       && locator->isForGenericParameter()
       && locator->getGenericParameter()->isTypeSequence();
+}
+
+bool TypeVariableType::Implementation::isCodeCompletionToken() const {
+  return locator && locator->directlyAt<CodeCompletionExpr>();
 }
 
 void *operator new(size_t bytes, ConstraintSystem& cs,
@@ -309,6 +313,7 @@ void constraints::performSyntacticDiagnosticsForTarget(
     target.getFunctionBody()->walk(walker);
     return;
   }
+  case SolutionApplicationTarget::Kind::closure:
   case SolutionApplicationTarget::Kind::stmtCondition:
   case SolutionApplicationTarget::Kind::caseLabelItem:
   case SolutionApplicationTarget::Kind::patternBinding:
@@ -428,7 +433,11 @@ TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
 Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
                                             DeclContext *DC, Type paramType,
                                             bool isAutoClosure) {
-  assert(paramType && !paramType->hasError());
+  // During normal type checking we don't type check the parameter default if
+  // the param has an error type. For code completion, we also type check the
+  // parameter default because it might contain the code completion token.
+  assert(paramType &&
+         (!paramType->hasError() || DC->getASTContext().CompletionCallback));
 
   auto &ctx = DC->getASTContext();
 
@@ -457,6 +466,11 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
 
     // If inference is disabled, fail.
     if (!ctx.TypeCheckerOpts.EnableTypeInferenceFromDefaultArguments)
+      return Type();
+
+    // Caller-side defaults are always type-checked based on the concrete
+    // type of the argument deduced at a particular call site.
+    if (isa<MagicIdentifierLiteralExpr>(defaultValue))
       return Type();
 
     // Parameter type doesn't have any generic parameters mentioned

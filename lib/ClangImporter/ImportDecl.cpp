@@ -2718,7 +2718,8 @@ namespace {
                                             *correctSwiftName);
 
       Type SwiftType;
-      if (Decl->getDeclContext()->getRedeclContext()->isTranslationUnit()) {
+      auto clangDC = Decl->getDeclContext()->getRedeclContext();
+      if (clangDC->isTranslationUnit() || clangDC->isStdNamespace()) {
         bool IsError;
         StringRef StdlibTypeName;
         MappedTypeNameKind NameMapping;
@@ -4815,12 +4816,12 @@ namespace {
       decl->setIsDynamic(true);
 
       // If the declaration we attached the 'objc' attribute to is within a
-      // class, record it in the class.
+      // type, record it in the type.
       if (auto contextTy = decl->getDeclContext()->getDeclaredInterfaceType()) {
-        if (auto classDecl = contextTy->getClassOrBoundGenericClass()) {
+        if (auto tyDecl = contextTy->getNominalOrBoundGenericNominal()) {
           if (auto method = dyn_cast<AbstractFunctionDecl>(decl)) {
             if (name)
-              classDecl->recordObjCMethod(method, *name);
+              tyDecl->recordObjCMethod(method, *name);
           }
         }
       }

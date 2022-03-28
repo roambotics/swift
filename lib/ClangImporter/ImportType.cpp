@@ -28,6 +28,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/ParameterList.h"
+#include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeVisitor.h"
@@ -211,6 +212,10 @@ namespace {
 
     using TypeVisitor::Visit;
     ImportResult Visit(clang::QualType type) {
+      PrettyStackTraceClangType trace(Impl.getClangASTContext(),
+                                      "importing a clang type",
+                                      type.getTypePtr());
+
       auto IR = Visit(type.getTypePtr());
       return IR;
     }
@@ -454,6 +459,9 @@ namespace {
         return {pointerTypeDecl->getDeclaredInterfaceType(),
                 ImportHint::OtherPointer};
       }
+
+      if (pointeeQualType->isDependentType())
+        return Type();
 
       // All other C pointers to concrete types map to
       // UnsafeMutablePointer<T> or OpaquePointer.
@@ -3071,7 +3079,7 @@ Decl *ClangImporter::Implementation::importDeclByName(StringRef name) {
   clang::LookupResult lookupResult(sema, clangName, clang::SourceLocation(),
                                    clang::Sema::LookupOrdinaryName);
   lookupResult.setAllowHidden(true);
-  if (!sema.LookupName(lookupResult, /*Scope=*/nullptr)) {
+  if (!sema.LookupName(lookupResult, /*Scope=*/sema.TUScope)) {
     return nullptr;
   }
 

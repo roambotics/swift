@@ -1516,7 +1516,8 @@ public:
     for (auto *expected : caseStmt->getCaseBodyVariablesOrEmptyArray()) {
       assert(expected->hasName());
       auto prev = expected->getParentVarDecl();
-      auto type = solution.resolveInterfaceType(solution.getType(prev));
+      auto type = solution.resolveInterfaceType(
+          solution.getType(prev)->mapTypeOutOfContext());
       expected->setInterfaceType(type);
     }
 
@@ -1744,6 +1745,7 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
     for (const auto &solution : solutions) {
       cs.getASTContext().CompletionCallback->sawSolution(solution);
     }
+    return nullptr;
   }
 
   if (solvingFailed || solutions.size() != 1) {
@@ -1873,6 +1875,13 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
     if (auto unhandledNode = visitor.check(fn.getBody())) {
       // If we aren't supposed to attempt fixes, fail.
       if (!shouldAttemptFixes()) {
+        return getTypeMatchFailure(locator);
+      }
+
+      // If we're solving for code completion and the body contains the code
+      // completion location, skipping it won't get us to a useful solution so
+      // just bail.
+      if (isForCodeCompletion() && containsCodeCompletionLoc(fn.getBody())) {
         return getTypeMatchFailure(locator);
       }
 

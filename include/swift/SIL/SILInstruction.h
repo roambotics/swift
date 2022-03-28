@@ -5241,39 +5241,6 @@ public:
   void setLifetimeGuaranteed() { lifetimeGuaranteed = true; }
 };
 
-/// ThinFunctionToPointerInst - Convert a thin function pointer to a
-/// Builtin.RawPointer.
-class ThinFunctionToPointerInst
-  : public UnaryInstructionBase<SILInstructionKind::ThinFunctionToPointerInst,
-                                ConversionInst>
-{
-  friend SILBuilder;
-
-  ThinFunctionToPointerInst(SILDebugLocation DebugLoc, SILValue operand,
-                            SILType ty)
-      : UnaryInstructionBase(DebugLoc, operand, ty) {}
-};
-
-/// PointerToThinFunctionInst - Convert a Builtin.RawPointer to a thin
-/// function pointer.
-class PointerToThinFunctionInst final
-    : public UnaryInstructionWithTypeDependentOperandsBase<
-          SILInstructionKind::PointerToThinFunctionInst,
-          PointerToThinFunctionInst,
-          ConversionInst> {
-  friend SILBuilder;
-
-  PointerToThinFunctionInst(SILDebugLocation DebugLoc, SILValue operand,
-                            ArrayRef<SILValue> TypeDependentOperands,
-                            SILType ty)
-      : UnaryInstructionWithTypeDependentOperandsBase(
-            DebugLoc, operand, TypeDependentOperands, ty) {}
-
-  static PointerToThinFunctionInst *
-  create(SILDebugLocation DebugLoc, SILValue Operand, SILType Ty,
-         SILFunction &F);
-};
-
 /// UpcastInst - Perform a conversion of a class instance to a supertype.
 class UpcastInst final : public UnaryInstructionWithTypeDependentOperandsBase<
                              SILInstructionKind::UpcastInst, UpcastInst,
@@ -5662,39 +5629,6 @@ public:
 
   CanType getTargetFormalType() const { return DestFormalTy; }
   SILType getTargetLoweredType() const { return getType(); }
-};
-
-/// Perform an unconditional checked cast that aborts if the cast fails.
-/// The result of the checked cast is left in the destination.
-class UnconditionalCheckedCastValueInst final
-    : public UnaryInstructionWithTypeDependentOperandsBase<
-          SILInstructionKind::UnconditionalCheckedCastValueInst,
-          UnconditionalCheckedCastValueInst, ConversionInst> {
-  CanType SourceFormalTy;
-  CanType DestFormalTy;
-  friend SILBuilder;
-
-  UnconditionalCheckedCastValueInst(SILDebugLocation DebugLoc,
-                                    SILValue Operand, CanType SourceFormalTy,
-                                    ArrayRef<SILValue> TypeDependentOperands,
-                                    SILType DestLoweredTy, CanType DestFormalTy)
-      : UnaryInstructionWithTypeDependentOperandsBase(
-            DebugLoc, Operand, TypeDependentOperands,
-            DestLoweredTy),
-        SourceFormalTy(SourceFormalTy),
-        DestFormalTy(DestFormalTy) {}
-
-  static UnconditionalCheckedCastValueInst *
-  create(SILDebugLocation DebugLoc,
-         SILValue Operand, CanType SourceFormalTy,
-         SILType DestLoweredTy, CanType DestFormalTy, SILFunction &F);
-
-public:
-  SILType getSourceLoweredType() const { return getOperand()->getType(); }
-  CanType getSourceFormalType() const { return SourceFormalTy; }
-
-  SILType getTargetLoweredType() const { return getType(); }
-  CanType getTargetFormalType() const { return DestFormalTy; }
 };
 
 /// StructInst - Represents a constructed loadable struct.
@@ -8132,7 +8066,6 @@ public:
     case TermKind::SwitchEnumAddrInst:
     case TermKind::DynamicMethodBranchInst:
     case TermKind::CheckedCastAddrBranchInst:
-    case TermKind::CheckedCastValueBranchInst:
     case TermKind::AwaitAsyncContinuationInst:
       return false;
     case TermKind::SwitchEnumInst:
@@ -9160,45 +9093,6 @@ public:
 };
 
 /// Perform a checked cast operation and branch on whether the cast succeeds.
-/// The success branch destination block receives the cast result as a BB
-/// argument.
-class CheckedCastValueBranchInst final
-    : public UnaryInstructionWithTypeDependentOperandsBase<
-          SILInstructionKind::CheckedCastValueBranchInst,
-          CheckedCastValueBranchInst, CastBranchInstBase<TermInst>> {
-  friend SILBuilder;
-
-  CanType SourceFormalTy;
-  SILType DestLoweredTy;
-  CanType DestFormalTy;
-
-  CheckedCastValueBranchInst(SILDebugLocation DebugLoc, SILValue Operand,
-                             CanType SourceFormalTy,
-                             ArrayRef<SILValue> TypeDependentOperands,
-                             SILType DestLoweredTy, CanType DestFormalTy,
-                             SILBasicBlock *SuccessBB, SILBasicBlock *FailureBB)
-      : UnaryInstructionWithTypeDependentOperandsBase(
-            DebugLoc, Operand, TypeDependentOperands, SuccessBB, FailureBB,
-            ProfileCounter(), ProfileCounter()),
-        SourceFormalTy(SourceFormalTy), DestLoweredTy(DestLoweredTy),
-        DestFormalTy(DestFormalTy) {}
-
-  static CheckedCastValueBranchInst *
-  create(SILDebugLocation DebugLoc,
-         SILValue Operand, CanType SourceFormalTy,
-         SILType DestLoweredTy, CanType DestFormalTy,
-         SILBasicBlock *SuccessBB, SILBasicBlock *FailureBB,
-         SILFunction &F);
-
-public:
-  SILType getSourceLoweredType() const { return getOperand()->getType(); }
-  CanType getSourceFormalType() const { return SourceFormalTy; }
-
-  SILType getTargetLoweredType() const { return DestLoweredTy; }
-  CanType getTargetFormalType() const { return DestFormalTy; }
-};
-
-/// Perform a checked cast operation and branch on whether the cast succeeds.
 /// The result of the checked cast is left in the destination address.
 class CheckedCastAddrBranchInst final
     : public AddrCastInstBase<
@@ -9861,6 +9755,19 @@ public:
 
 private:
   void createNode(const SILInstruction &);
+};
+
+template <>
+struct DenseMapInfo<swift::SILDebugVariable> {
+  using KeyTy = swift::SILDebugVariable;
+  static inline KeyTy getEmptyKey() {
+    return KeyTy(KeyTy::IsDenseMapSingleton::IsEmpty);
+  }
+  static inline KeyTy getTombstoneKey() {
+    return KeyTy(KeyTy::IsDenseMapSingleton::IsTombstone);
+  }
+  static unsigned getHashValue(const KeyTy &Val) { return hash_value(Val); }
+  static bool isEqual(const KeyTy &LHS, const KeyTy &RHS) { return LHS == RHS; }
 };
 
 } // end llvm namespace

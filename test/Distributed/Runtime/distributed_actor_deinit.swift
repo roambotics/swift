@@ -15,17 +15,23 @@ import Distributed
 actor A {}
 
 distributed actor DA {
-  init(system: FakeActorSystem) {}
+  init(system: FakeActorSystem) {
+    self.actorSystem = system
+  }
 }
 
 distributed actor DA_userDefined {
-  init(system: FakeActorSystem) {}
+  init(system: FakeActorSystem) {
+    self.actorSystem = system
+  }
 
   deinit {}
 }
 
 distributed actor DA_userDefined2 {
-  init(system: FakeActorSystem) {}
+  init(system: FakeActorSystem) {
+    self.actorSystem = system
+  }
 
   deinit {
     print("Deinitializing \(self.id)")
@@ -37,7 +43,9 @@ distributed actor DA_state {
   var name = "Hello"
   var age = 42
 
-  init(system: FakeActorSystem) {}
+  init(system: FakeActorSystem) {
+    self.actorSystem = system
+  }
 
   deinit {
     print("Deinitializing \(self.id)")
@@ -57,8 +65,9 @@ struct ActorAddress: Sendable, Hashable, Codable {
 final class FakeActorSystem: @unchecked Sendable, DistributedActorSystem {
   typealias ActorID = ActorAddress
   typealias SerializationRequirement = Codable
-  typealias InvocationDecoder = FakeDistributedInvocation
-  typealias InvocationEncoder = FakeDistributedInvocation
+  typealias InvocationDecoder = FakeDistributedInvocationEncoder
+  typealias InvocationEncoder = FakeDistributedInvocationEncoder
+  typealias ResultHandler = FakeResultHandler
 
   var n = 0
 
@@ -119,11 +128,11 @@ final class FakeActorSystem: @unchecked Sendable, DistributedActorSystem {
   }
 }
 
-class FakeDistributedInvocation: DistributedTargetInvocationEncoder, DistributedTargetInvocationDecoder {
+class FakeDistributedInvocationEncoder: DistributedTargetInvocationEncoder, DistributedTargetInvocationDecoder {
   typealias SerializationRequirement = Codable
 
   func recordGenericSubstitution<T>(_ type: T.Type) throws { }
-  func recordArgument<Argument: SerializationRequirement>(_ argument: Argument) throws { }
+  func recordArgument<Value: SerializationRequirement>(_ argument: RemoteCallArgument<Value>) throws { }
   func recordReturnType<R: SerializationRequirement>(_ type: R.Type) throws { }
   func recordErrorType<E: Error>(_ type: E.Type) throws { }
   func doneRecording() throws { }
@@ -141,6 +150,23 @@ class FakeDistributedInvocation: DistributedTargetInvocationEncoder, Distributed
   }
   func decodeErrorType() throws -> Any.Type? {
     nil
+  }
+}
+
+@available(SwiftStdlib 5.5, *)
+public struct FakeResultHandler: DistributedTargetInvocationResultHandler {
+  public typealias SerializationRequirement = Codable
+
+  public func onReturn<Success: SerializationRequirement>(value: Success) async throws {
+    fatalError("Not implemented: \(#function)")
+  }
+
+  public func onReturnVoid() async throws {
+    fatalError("Not implemented: \(#function)")
+  }
+
+  public func onThrow<Err: Error>(error: Err) async throws {
+    fatalError("Not implemented: \(#function)")
   }
 }
 

@@ -52,6 +52,7 @@ public struct FakeActorSystem: DistributedActorSystem {
   public typealias InvocationDecoder = FakeInvocationDecoder
   public typealias InvocationEncoder = FakeInvocationEncoder
   public typealias SerializationRequirement = Codable
+  public typealias ResultHandler = FakeResultHandler
 
   init() {
     print("Initialized new FakeActorSystem")
@@ -115,7 +116,7 @@ public struct FakeInvocationEncoder: DistributedTargetInvocationEncoder {
   public typealias SerializationRequirement = Codable
 
   public mutating func recordGenericSubstitution<T>(_ type: T.Type) throws {}
-  public mutating func recordArgument<Argument: SerializationRequirement>(_ argument: Argument) throws {}
+  public mutating func recordArgument<Value: SerializationRequirement>(_ argument: RemoteCallArgument<Value>) throws {}
   public mutating func recordReturnType<R: SerializationRequirement>(_ type: R.Type) throws {}
   public mutating func recordErrorType<E: Error>(_ type: E.Type) throws {}
   public mutating func doneRecording() throws {}
@@ -129,4 +130,20 @@ public class FakeInvocationDecoder : DistributedTargetInvocationDecoder {
   public func decodeNextArgument<Argument: SerializationRequirement>() throws -> Argument { fatalError() }
   public func decodeReturnType() throws -> Any.Type? { nil }
   public func decodeErrorType() throws -> Any.Type? { nil }
+}
+
+public struct FakeResultHandler: DistributedTargetInvocationResultHandler {
+  public typealias SerializationRequirement = Codable
+
+  public func onReturn<Success: SerializationRequirement>(value: Success) async throws {
+    fatalError("Not implemented: \(#function)")
+  }
+
+  public func onReturnVoid() async throws {
+    fatalError("Not implemented: \(#function)")
+  }
+
+  public func onThrow<Err: Error>(error: Err) async throws {
+    fatalError("Not implemented: \(#function)")
+  }
 }
