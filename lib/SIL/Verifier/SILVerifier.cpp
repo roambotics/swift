@@ -346,7 +346,7 @@ void verifyKeyPathComponent(SILModule &M,
       // TODO: This should probably be unconditionally +1 when we
       // can represent that.
       require(newValueParam.getConvention() == normalArgConvention,
-              "setter value parameter should havee normal arg convention");
+              "setter value parameter should have normal arg convention");
 
       auto baseParam = substSetterType->getParameters()[1];
       require(baseParam.getConvention() == normalArgConvention
@@ -1011,7 +1011,7 @@ public:
 
         // Address-only values are potentially unmovable when borrowed. See also
         // checkOwnershipForwardingInst. A phi implies a move of its arguments
-        // because they can't necessarilly all reuse the same storage.
+        // because they can't necessarily all reuse the same storage.
         require((!arg->getType().isAddressOnly(F)
                  || arg->getOwnershipKind() != OwnershipKind::Guaranteed),
                 "Guaranteed address-only phi not allowed--implies a copy");
@@ -1301,7 +1301,7 @@ public:
     if (!varInfo)
       return;
 
-    // Retrive debug variable type
+    // Retrieve debug variable type
     SILType DebugVarTy;
     if (varInfo->Type)
       DebugVarTy = *varInfo->Type;
@@ -1315,9 +1315,9 @@ public:
       case SILInstructionKind::DebugValueInst:
         DebugVarTy = inst->getOperand(0)->getType();
         if (DebugVarTy.isAddress()) {
-          auto Expr = varInfo->DIExpr.operands();
-          if (!Expr.empty() &&
-              Expr.begin()->getOperator() == SILDIExprOperator::Dereference)
+          // FIXME: op_deref could be applied to address types only.
+          // FIXME: Add this check
+          if (varInfo->DIExpr.startsWithDeref())
             DebugVarTy = DebugVarTy.getObjectType();
         }
         break;
@@ -1343,9 +1343,16 @@ public:
           require(DebugVars[argNum].first == varInfo->Name,
                   "Scope contains conflicting debug variables for one function "
                   "argument");
-          // Check for type
-          require(DebugVars[argNum].second == DebugVarTy,
+          // The source variable might change its location (e.g. due to
+          // optimizations). Check for most common transformations (e.g. loading
+          // to SSA value and vice versa) as well
+          require(DebugVars[argNum].second == DebugVarTy ||
+                  (DebugVars[argNum].second.isAddress() &&
+                   DebugVars[argNum].second.getObjectType() == DebugVarTy) ||
+                  (DebugVarTy.isAddress() &&
+                   DebugVars[argNum].second == DebugVarTy.getObjectType()),
                   "conflicting debug variable type!");
+          DebugVars[argNum].second = DebugVarTy;
         } else {
           // Reserve enough space.
           while (DebugVars.size() <= argNum) {
@@ -1949,9 +1956,9 @@ public:
           return true;
         if (t.getASTType() == t.getASTContext().TheNativeObjectType)
           return true;
-        if (auto clas = t.getClassOrBoundGenericClass())
+        if (auto clazz = t.getClassOrBoundGenericClass())
           // Must be a class defined in Swift.
-          return clas->hasKnownSwiftImplementation();
+          return clazz->hasKnownSwiftImplementation();
         return false;
       };
       
@@ -2304,7 +2311,7 @@ public:
     // those accesses.
     identifyFormalAccess(BAI);
     // FIXME: rdar://57291811 - the following check for valid storage will be
-    // reenabled shortly. A fix is planned. In the meantime, the possiblity that
+    // reenabled shortly. A fix is planned. In the meantime, the possibility that
     // a real miscompilation could be caused by this failure is insignificant.
     // I will probably enable a much broader SILVerification of address-type
     // block arguments first to ensure we never hit this check again.
@@ -3374,8 +3381,9 @@ public:
             "method does not have a witness table entry");
   }
 
-  // Get the expected type of a dynamic method reference.
-  SILType getDynamicMethodType(SILType selfType, SILDeclRef method) {
+  /// Verify the given type of a dynamic or @objc optional method reference.
+  bool verifyDynamicMethodType(CanSILFunctionType verifiedTy, SILType selfType,
+                               SILDeclRef method) {
     auto &C = F.getASTContext();
 
     // The type of the dynamic method must match the usual type of the method,
@@ -3394,28 +3402,50 @@ public:
     }
     assert(!methodTy->isPolymorphic());
 
-    // Replace Self parameter with type of 'self' at the call site.
-    auto params = methodTy->getParameters();
-    SmallVector<SILParameterInfo, 4>
-      dynParams(params.begin(), params.end() - 1);
-    dynParams.push_back(SILParameterInfo(selfType.getASTType(),
-                                         params.back().getConvention()));
+    // Assume the parameter conventions are correct.
+    SmallVector<SILParameterInfo, 4> params;
+    {
+      const auto actualParams = methodTy->getParameters();
+      const auto verifiedParams = verifiedTy->getParameters();
+      if (actualParams.size() != verifiedParams.size())
+        return false;
 
-    auto results = methodTy->getResults();
-    SmallVector<SILResultInfo, 4> dynResults(results.begin(), results.end());    
+      for (const auto idx : indices(actualParams)) {
+        params.push_back(actualParams[idx].getWithConvention(
+            verifiedParams[idx].getConvention()));
+      }
+    }
 
-    // If the method returns Self, substitute AnyObject for the result type.
+    // Have the 'self' parameter assume the type of 'self' at the call site.
+    params.back() = params.back().getWithInterfaceType(selfType.getASTType());
+
+    // Assume the result conventions are correct.
+    SmallVector<SILResultInfo, 4> results;
+    {
+      const auto actualResults = methodTy->getResults();
+      const auto verifiedResults = verifiedTy->getResults();
+      if (actualResults.size() != verifiedResults.size())
+        return false;
+
+      for (const auto idx : indices(actualResults)) {
+        results.push_back(actualResults[idx].getWithConvention(
+            verifiedResults[idx].getConvention()));
+      }
+    }
+
+    // If the method returns dynamic Self, substitute AnyObject for the
+    // result type.
     if (auto fnDecl = dyn_cast<FuncDecl>(method.getDecl())) {
       if (fnDecl->hasDynamicSelfResult()) {
         auto anyObjectTy = C.getAnyObjectType();
-        for (auto &dynResult : dynResults) {
+        for (auto &result : results) {
           auto newResultTy =
-              dynResult
+              result
                   .getReturnValueType(F.getModule(), methodTy,
                                       F.getTypeExpansionContext())
                   ->replaceCovariantResultType(anyObjectTy, 0);
-          dynResult = SILResultInfo(newResultTy->getCanonicalType(),
-                                    dynResult.getConvention());
+          result = SILResultInfo(newResultTy->getCanonicalType(),
+                                 result.getConvention());
         }
       }
     }
@@ -3424,13 +3454,14 @@ public:
                                      methodTy->getExtInfo(),
                                      methodTy->getCoroutineKind(),
                                      methodTy->getCalleeConvention(),
-                                     dynParams,
+                                     params,
                                      methodTy->getYields(),
-                                     dynResults,
+                                     results,
                                      methodTy->getOptionalErrorResult(),
                                      SubstitutionMap(), SubstitutionMap(),
                                      F.getASTContext());
-    return SILType::getPrimitiveObjectType(fnTy);
+
+    return fnTy->isBindableTo(verifiedTy);
   }
 
   /// Visitor class that checks whether a given decl ref has an entry in the
@@ -3970,8 +4001,7 @@ public:
     }
   }
 
-  void verifyCheckedCast(bool isExact, SILType fromTy, SILType toTy,
-                         bool isOpaque = false) {
+  void verifyCheckedCast(bool isExact, SILType fromTy, SILType toTy) {
     // Verify common invariants.
     require(fromTy.isObject() && toTy.isObject(),
             "value checked cast src and dest must be objects");
@@ -3979,8 +4009,8 @@ public:
     auto fromCanTy = fromTy.getASTType();
     auto toCanTy = toTy.getASTType();
 
-    require(isOpaque || canUseScalarCheckedCastInstructions(F.getModule(),
-                                                            fromCanTy, toCanTy),
+    require(canSILUseScalarCheckedCastInstructions(F.getModule(),
+                                                   fromCanTy, toCanTy),
             "invalid value checked cast src or dest types");
 
     // Peel off metatypes. If two types are checked-cast-able, so are their
@@ -4116,7 +4146,7 @@ public:
                       OwnershipKind::Guaranteed,
               "checked_cast_br with an AnyObject typed source cannot forward "
               "guaranteed ownership");
-      require(CBI->isDirectlyForwarding() ||
+      require(CBI->preservesOwnership() ||
                   CBI->getOperand().getOwnershipKind() !=
                       OwnershipKind::Guaranteed,
               "If checked_cast_br is not directly forwarding, it can not have "
@@ -4853,9 +4883,8 @@ public:
             "true bb for dynamic_method_br must take an argument");
 
     auto bbArgTy = DMBI->getHasMethodBB()->args_begin()[0]->getType();
-    require(getDynamicMethodType(operandType, DMBI->getMember())
-              .getASTType()
-              ->isBindableTo(bbArgTy.getASTType()),
+    require(verifyDynamicMethodType(cast<SILFunctionType>(bbArgTy.getASTType()),
+                                    operandType, DMBI->getMember()),
             "bb argument for dynamic_method_br must be of the method's type");
   }
 
@@ -5086,7 +5115,7 @@ public:
     require(IEC->getVerificationType() == IsEscapingClosureInst::ObjCEscaping ||
                 IEC->getVerificationType() ==
                     IsEscapingClosureInst::WithoutActuallyEscaping,
-            "unknown verfication type");
+            "unknown verification type");
   }
 
   void checkDifferentiableFunctionInst(DifferentiableFunctionInst *dfi) {

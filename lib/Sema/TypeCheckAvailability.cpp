@@ -78,6 +78,33 @@ bool swift::isExported(const ValueDecl *VD) {
   return false;
 }
 
+bool swift::isExported(const ExtensionDecl *ED) {
+  // An extension can only be exported if it extends an exported type.
+  if (auto *NTD = ED->getExtendedNominal()) {
+    if (!isExported(NTD))
+      return false;
+  }
+
+  // If there are any exported members then the extension is exported.
+  for (const Decl *D : ED->getMembers()) {
+    if (isExported(D))
+      return true;
+  }
+
+  // If the extension declares a conformance to a public protocol then the
+  // extension is exported.
+  auto protocols = ED->getLocalProtocols(ConformanceLookupKind::OnlyExplicit);
+  for (const ProtocolDecl *PD : protocols) {
+    AccessScope scope =
+      PD->getFormalAccessScope(/*useDC*/nullptr,
+                               /*treatUsableFromInlineAsPublic*/true);
+    if (scope.isPublic())
+      return true;
+  }
+
+  return false;
+}
+
 bool swift::isExported(const Decl *D) {
   if (auto *VD = dyn_cast<ValueDecl>(D)) {
     return isExported(VD);
@@ -91,10 +118,7 @@ bool swift::isExported(const Decl *D) {
     return false;
   }
   if (auto *ED = dyn_cast<ExtensionDecl>(D)) {
-    if (auto *NTD = ED->getExtendedNominal())
-      return isExported(NTD);
-
-    return false;
+    return isExported(ED);
   }
 
   return true;
@@ -392,7 +416,7 @@ public:
 
 private:
   bool walkToDeclPre(Decl *D) override {
-    // Adds in a parent TRC for decls which are syntatically nested but are not
+    // Adds in a parent TRC for decls which are syntactically nested but are not
     // represented that way in the AST. (Particularly, AbstractStorageDecl
     // parents for AccessorDecl children.)
     if (auto ParentTRC = getEffectiveParentContextForDecl(D)) {
@@ -1327,7 +1351,7 @@ static const Decl *findContainingDeclaration(SourceRange ReferenceRange,
 
     // Members of an active #if are represented both inside the
     // IfConfigDecl and in the enclosing context. Skip over the IfConfigDecl
-    // so that that the member declaration is found rather the #if itself.
+    // so that the member declaration is found rather the #if itself.
     if (isa<IfConfigDecl>(D))
       return false;
 
@@ -2584,7 +2608,8 @@ bool swift::diagnoseExplicitUnavailability(const ValueDecl *D, SourceRange R,
 bool swift::diagnoseExplicitUnavailability(SourceLoc loc,
                                            const RootProtocolConformance *rootConf,
                                            const ExtensionDecl *ext,
-                                           const ExportContext &where) {
+                                           const ExportContext &where,
+                                           bool useConformanceAvailabilityErrorsOption) {
   auto *attr = AvailableAttr::isUnavailable(ext);
   if (!attr)
     return false;
@@ -2641,7 +2666,10 @@ bool swift::diagnoseExplicitUnavailability(SourceLoc loc,
   diags.diagnose(loc, diag::conformance_availability_unavailable,
                  type, proto,
                  platform.empty(), platform, EncodedMessage.Message)
-      .limitBehavior(behavior);
+      .limitBehavior(behavior)
+      .warnUntilSwiftVersionIf(useConformanceAvailabilityErrorsOption &&
+                               !ctx.LangOpts.EnableConformanceAvailabilityErrors,
+                               6);
 
   switch (attr->getVersionAvailability(ctx)) {
   case AvailableVersionComparison::Available:
@@ -2823,7 +2851,7 @@ bool swift::diagnoseExplicitUnavailability(
                          rawReplaceKind, newName, EncodedMessage.Message);
       attachRenameFixIts(diag);
   } else if (isSubscriptReturningString(D, ctx)) {
-    diags.diagnose(Loc, diag::availabilty_string_subscript_migration)
+    diags.diagnose(Loc, diag::availability_string_subscript_migration)
       .highlight(R)
       .fixItInsert(R.Start, "String(")
       .fixItInsertAfter(R.End, ")");
@@ -2954,6 +2982,13 @@ public:
         maybeDiagStorageAccess(S->getDecl().getDecl(), S->getSourceRange(), DC);
       }
     }
+    if (auto *RLE = dyn_cast<RegexLiteralExpr>(E)) {
+      // Regex literals require both the Regex<Output> type to be available, as
+      // well as the initializer that is implicitly called.
+      auto Range = RLE->getSourceRange();
+      diagnoseDeclRefAvailability(Context.getRegexDecl(), Range);
+      diagnoseDeclRefAvailability(RLE->getInitializer(), Range);
+    }
     if (auto KP = dyn_cast<KeyPathExpr>(E)) {
       maybeDiagKeyPath(KP);
     }
@@ -2995,7 +3030,8 @@ public:
     
     if (auto EE = dyn_cast<ErasureExpr>(E)) {
       for (ProtocolConformanceRef C : EE->getConformances()) {
-        diagnoseConformanceAvailability(E->getLoc(), C, Where);
+        diagnoseConformanceAvailability(E->getLoc(), C, Where, Type(), Type(),
+                                        /*useConformanceAvailabilityErrorsOpt=*/true);
       }
     }
 
@@ -3136,21 +3172,7 @@ private:
   }
 
   bool shouldWalkIntoClosure(AbstractClosureExpr *closure) const {
-    // Multi-statement closures are collected by ExprWalker::rewriteFunction
-    // and checked by ExprWalker::processDelayed in CSApply.cpp.
-    // Single-statement closures only have the attributes checked
-    // by TypeChecker::checkClosureAttributes in that rewriteFunction.
-    // Multi-statement closures will be checked explicitly later (as the decl
-    // context in the Where). Single-expression closures will not be
-    // revisited, and are not automatically set as the context of the 'where'.
-    // Don't double-check multi-statement closures, but do check
-    // single-statement closures, setting the closure as the decl context.
-    //
-    // Note about SE-0326: When a flag is enabled multi-statement closures
-    // are type-checked together with enclosing context, so walker behavior
-    // should match that of single-expression closures.
-    return closure->hasSingleExpressionBody() ||
-           Context.TypeCheckerOpts.EnableMultiStatementClosureInference;
+    return true;
   }
 
   /// Walk an abstract closure expression, checking for availability
@@ -3791,7 +3813,8 @@ bool
 swift::diagnoseConformanceAvailability(SourceLoc loc,
                                        ProtocolConformanceRef conformance,
                                        const ExportContext &where,
-                                       Type depTy, Type replacementTy) {
+                                       Type depTy, Type replacementTy,
+                                       bool useConformanceAvailabilityErrorsOption) {
   assert(!where.isImplicit());
 
   if (!conformance.isConcrete())
@@ -3825,12 +3848,14 @@ swift::diagnoseConformanceAvailability(SourceLoc loc,
   };
 
   if (auto *ext = dyn_cast<ExtensionDecl>(rootConf->getDeclContext())) {
-    if (TypeChecker::diagnoseConformanceExportability(loc, rootConf, ext, where)) {
+    if (TypeChecker::diagnoseConformanceExportability(loc, rootConf, ext, where,
+                                                      useConformanceAvailabilityErrorsOption)) {
       maybeEmitAssociatedTypeNote();
       return true;
     }
 
-    if (diagnoseExplicitUnavailability(loc, rootConf, ext, where)) {
+    if (diagnoseExplicitUnavailability(loc, rootConf, ext, where,
+                                       useConformanceAvailabilityErrorsOption)) {
       maybeEmitAssociatedTypeNote();
       return true;
     }
@@ -3858,7 +3883,8 @@ swift::diagnoseConformanceAvailability(SourceLoc loc,
   SubstitutionMap subConformanceSubs =
       concreteConf->getSubstitutions(DC->getParentModule());
   if (diagnoseSubstitutionMapAvailability(loc, subConformanceSubs, where,
-                                          depTy, replacementTy))
+                                          depTy, replacementTy,
+                                          useConformanceAvailabilityErrorsOption))
     return true;
 
   return false;
@@ -3868,11 +3894,13 @@ bool
 swift::diagnoseSubstitutionMapAvailability(SourceLoc loc,
                                            SubstitutionMap subs,
                                            const ExportContext &where,
-                                           Type depTy, Type replacementTy) {
+                                           Type depTy, Type replacementTy,
+                                           bool useConformanceAvailabilityErrorsOption) {
   bool hadAnyIssues = false;
   for (ProtocolConformanceRef conformance : subs.getConformances()) {
     if (diagnoseConformanceAvailability(loc, conformance, where,
-                                        depTy, replacementTy))
+                                        depTy, replacementTy,
+                                        useConformanceAvailabilityErrorsOption))
       hadAnyIssues = true;
   }
   return hadAnyIssues;
@@ -3896,11 +3924,14 @@ static bool declNeedsExplicitAvailability(const Decl *decl) {
       decl->isImplicit())
     return false;
 
+  // Skip unavailable decls.
+  if (AvailableAttr::isUnavailable(decl))
+    return false;
+
   // Warn on decls without an introduction version.
   auto &ctx = decl->getASTContext();
   auto safeRangeUnderApprox = AvailabilityInference::availableRange(decl, ctx);
-  return !safeRangeUnderApprox.getOSVersion().hasLowerEndpoint() &&
-         !decl->getAttrs().isUnavailable(ctx);
+  return !safeRangeUnderApprox.getOSVersion().hasLowerEndpoint();
 }
 
 void swift::checkExplicitAvailability(Decl *decl) {

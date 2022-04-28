@@ -209,9 +209,54 @@ struct ParentConditionalConformance {
                            ArrayRef<ParentConditionalConformance> conformances);
 };
 
-/// The result of `checkGenericRequirement`.
-enum class RequirementCheckResult {
-  Success, Failure, SubstitutionFailure
+class CheckGenericArgumentsResult {
+public:
+  enum Kind { Success, RequirementFailure, SubstitutionFailure };
+
+  struct RequirementFailureInfo {
+    /// The failed requirement.
+    Requirement Req;
+
+    /// The failed requirement with substitutions applied.
+    Requirement SubstReq;
+
+    /// The chain of conditional conformances that leads to the failed
+    /// requirement \c Req. Accordingly, \c Req is a conditional requirement of
+    /// the last conformance in the chain (if any).
+    SmallVector<ParentConditionalConformance, 2> ReqPath;
+  };
+
+private:
+  Kind Knd;
+  Optional<RequirementFailureInfo> ReqFailureInfo;
+
+  CheckGenericArgumentsResult(Kind Knd,
+                              Optional<RequirementFailureInfo> ReqFailureInfo)
+      : Knd(Knd), ReqFailureInfo(ReqFailureInfo) {}
+
+public:
+  static CheckGenericArgumentsResult createSuccess() {
+    return CheckGenericArgumentsResult(Success, None);
+  }
+
+  static CheckGenericArgumentsResult createSubstitutionFailure() {
+    return CheckGenericArgumentsResult(SubstitutionFailure, None);
+  }
+
+  static CheckGenericArgumentsResult createRequirementFailure(
+      Requirement Req, Requirement SubstReq,
+      SmallVector<ParentConditionalConformance, 2> ReqPath) {
+    return CheckGenericArgumentsResult(
+        RequirementFailure, RequirementFailureInfo{Req, SubstReq, ReqPath});
+  }
+
+  const RequirementFailureInfo &getRequirementFailureInfo() const {
+    assert(Knd == RequirementFailure);
+
+    return ReqFailureInfo.getValue();
+  }
+
+  operator Kind() const { return Knd; }
 };
 
 /// Describes the kind of checked cast operation being performed.
@@ -446,45 +491,36 @@ void checkProtocolSelfRequirements(ValueDecl *decl);
 /// declaration's type, otherwise we have no way to infer them.
 void checkReferencedGenericParams(GenericContext *dc);
 
-/// Create a text string that describes the bindings of generic parameters
-/// that are relevant to the given set of types, e.g.,
-/// "[with T = Bar, U = Wibble]".
+/// Diagnose a requirement failure.
 ///
-/// \param types The types that will be scanned for generic type parameters,
-/// which will be used in the resulting type.
-///
-/// \param genericParams The generic parameters to use to resugar any
-/// generic parameters that occur within the types.
-///
-/// \param substitutions The generic parameter -> generic argument
-/// substitutions that will have been applied to these types.
-/// These are used to produce the "parameter = argument" bindings in the test.
-std::string gatherGenericParamBindingsText(
-    ArrayRef<Type> types, TypeArrayView<GenericTypeParamType> genericParams,
-    TypeSubstitutionFn substitutions);
-
-/// Check the given set of generic arguments against the requirements in a
-/// generic signature.
-///
-/// \param module The module to use for conformace lookup.
-/// \param loc The location at which any diagnostics should be emitted.
-/// \param noteLoc The location at which any notes will be printed.
-/// \param owner The type that owns the generic signature.
-/// \param genericParams The generic parameters being substituted.
-/// \param requirements The requirements against which the generic arguments
-/// should be checked.
-/// \param substitutions Substitutions from interface types of the signature.
-RequirementCheckResult checkGenericArguments(
-    ModuleDecl *module, SourceLoc loc, SourceLoc noteLoc, Type owner,
+/// \param errorLoc The location at which an error shall be emitted.
+/// \param noteLoc The location at which any notes shall be emitted.
+/// \param targetTy The type whose generic arguments caused the requirement
+/// failure.
+/// \param genericParams The generic parameters that were substituted.
+/// \param substitutions The substitutions that caused the requirement failure.
+void diagnoseRequirementFailure(
+    const CheckGenericArgumentsResult::RequirementFailureInfo &reqFailureInfo,
+    SourceLoc errorLoc, SourceLoc noteLoc, Type targetTy,
     TypeArrayView<GenericTypeParamType> genericParams,
-    ArrayRef<Requirement> requirements, TypeSubstitutionFn substitutions,
-    SubstOptions options = None);
+    TypeSubstitutionFn substitutions, ModuleDecl *module);
 
-/// A lower-level version of the above without diagnostic emission.
-RequirementCheckResult checkGenericArguments(
-    ModuleDecl *module,
-    ArrayRef<Requirement> requirements,
-    TypeSubstitutionFn substitutions);
+/// Check the given generic parameter substitutions against the given
+/// requirements and report on any requirement failures in detail for
+/// diagnostic needs.
+CheckGenericArgumentsResult
+checkGenericArgumentsForDiagnostics(ModuleDecl *module,
+                                    ArrayRef<Requirement> requirements,
+                                    TypeSubstitutionFn substitutions);
+
+/// Check the given generic parameter substitutions against the given
+/// requirements. Unlike \c checkGenericArgumentsForDiagnostics, this version
+/// reports just the result of the check and doesn't provide additional
+/// information on requirement failures that is warranted for diagnostics.
+CheckGenericArgumentsResult::Kind
+checkGenericArguments(ModuleDecl *module, ArrayRef<Requirement> requirements,
+                      TypeSubstitutionFn substitutions,
+                      SubstOptions options = None);
 
 /// Checks whether the generic requirements imposed on the nested type
 /// declaration \p decl (if present) are in agreement with the substitutions
@@ -520,7 +556,7 @@ RequirementCheckResult checkGenericArguments(
 /// }
 /// \endcode
 ///
-/// \param module The module to use for conformace lookup.
+/// \param module The module to use for conformance lookup.
 /// \param contextSig The generic signature that should be used to map
 /// \p parentTy into context. We pass a generic signature to secure on-demand
 /// computation of the associated generic enviroment.
@@ -587,7 +623,7 @@ void filterSolutionsForCodeCompletion(
 /// solutions. Such solutions can have any number of holes in them.
 ///
 /// \returns `true` if target was applicable and it was possible to infer
-/// types for code completion, `false` othrewise.
+/// types for code completion, `false` otherwise.
 bool typeCheckForCodeCompletion(
     constraints::SolutionApplicationTarget &target, bool needsPrecheck,
     llvm::function_ref<void(const constraints::Solution &)> callback);
@@ -630,18 +666,15 @@ bool typeCheckCondition(Expr *&expr, DeclContext *dc);
 ///
 /// \param fromType       The source type of the cast.
 /// \param toType         The destination type of the cast.
+/// \param contextKind    The cast context in which this is being typechecked.
 /// \param dc             The context of the cast.
-/// \param diagLoc        The location at which to report diagnostics.
-/// \param fromExpr       The expression describing the input operand.
-/// \param diagToRange    The source range of the destination type.
 ///
 /// \returns a CheckedCastKind indicating the semantics of the cast. If the
 /// cast is invalid, Unresolved is returned. If the cast represents an implicit
 /// conversion, Coercion is returned.
 CheckedCastKind typeCheckCheckedCast(Type fromType, Type toType,
-                                     CheckedCastContextKind ctxKind,
-                                     DeclContext *dc, SourceLoc diagLoc,
-                                     Expr *fromExpr, SourceRange diagToRange);
+                                     CheckedCastContextKind contextKind,
+                                     DeclContext *dc);
 
 /// Find the Objective-C class that bridges between a value of the given
 /// dynamic type and the given value type.
@@ -755,7 +788,8 @@ Expr *addImplicitLoadExpr(
 /// an empty optional.
 ProtocolConformanceRef containsProtocol(Type T, ProtocolDecl *Proto,
                                         ModuleDecl *M,
-                                        bool skipConditionalRequirements=false);
+                                        bool skipConditionalRequirements=false,
+                                        bool allowMissing=false);
 
 /// Determine whether the given type conforms to the given protocol.
 ///
@@ -966,7 +1000,8 @@ bool diagnoseDeclRefExportability(SourceLoc loc,
 bool diagnoseConformanceExportability(SourceLoc loc,
                                       const RootProtocolConformance *rootConf,
                                       const ExtensionDecl *ext,
-                                      const ExportContext &where);
+                                      const ExportContext &where,
+                                      bool useConformanceAvailabilityErrorsOpt = false);
 
 /// \name Availability checking
 ///
@@ -1078,7 +1113,7 @@ const AvailableAttr *getDeprecated(const Decl *D);
 void diagnoseIfDeprecated(SourceRange SourceRange, const ExportContext &Where,
                           const ValueDecl *DeprecatedDecl, const Expr *Call);
 
-/// Emits a diagnostic for a reference to a conformnace that is deprecated.
+/// Emits a diagnostic for a reference to a conformance that is deprecated.
 bool diagnoseIfDeprecated(SourceLoc loc,
                           const RootProtocolConformance *rootConf,
                           const ExtensionDecl *ext,

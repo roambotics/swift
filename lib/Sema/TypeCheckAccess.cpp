@@ -1546,6 +1546,22 @@ swift::getDisallowedOriginKind(const Decl *decl,
     // Implementation-only imported, cannot be reexported.
     return DisallowedOriginKind::ImplementationOnly;
   } else if ((decl->isSPI() || decl->isAvailableAsSPI()) && !where.isSPI()) {
+    if (decl->isAvailableAsSPI() && !decl->isSPI()) {
+      // Allowing unavailable context to use @_spi_available decls.
+      // Decls with @_spi_available aren't hidden entirely from public interfaces,
+      // thus public interfaces may still refer them. Be forgiving here so public
+      // interfaces can compile.
+      if (where.getUnavailablePlatformKind().hasValue())
+        return DisallowedOriginKind::None;
+      // We should only diagnose SPI_AVAILABLE usage when the library level is API.
+      // Using SPI_AVAILABLE symbols in private frameworks or executable targets
+      // should be allowed.
+      if (auto *mod = where.getDeclContext()->getParentModule()) {
+        if (mod->getLibraryLevel() != LibraryLevel::API) {
+          return DisallowedOriginKind::None;
+        }
+      }
+    }
     // SPI can only be exported in SPI.
     return where.getDeclContext()->getParentModule() == M ?
       DisallowedOriginKind::SPILocal :
@@ -1566,6 +1582,11 @@ class DeclAvailabilityChecker : public DeclVisitor<DeclAvailabilityChecker> {
                  bool allowUnavailableProtocol=false) {
     // Don't bother checking errors.
     if (type && type->hasError())
+      return;
+    
+    // If the decl which references this type is unavailable on the current
+    // platform, don't diagnose the availability of the type.
+    if (AvailableAttr::isUnavailable(context))
       return;
 
     DeclAvailabilityFlags flags = None;
@@ -1858,7 +1879,7 @@ public:
   void checkPrecedenceGroup(const PrecedenceGroupDecl *PGD,
                             const Decl *refDecl, SourceLoc diagLoc,
                             SourceRange refRange) {
-    // Bail on invalid predence groups. This can happen when the user spells a
+    // Bail on invalid precedence groups. This can happen when the user spells a
     // relation element that doesn't actually exist.
     if (!PGD) {
       return;

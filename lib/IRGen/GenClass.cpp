@@ -229,11 +229,14 @@ namespace {
         auto superclassDecl = superclassType.getClassOrBoundGenericClass();
         assert(superclassType && superclassDecl);
 
-        if (IGM.hasResilientMetadata(superclassDecl, ResilienceExpansion::Maximal))
+        if (IGM.hasResilientMetadata(superclassDecl,
+                                     ResilienceExpansion::Maximal,
+                                     rootClass))
           Options |= ClassMetadataFlags::ClassHasResilientAncestry;
 
         // If the superclass has resilient storage, don't walk its fields.
-        if (IGM.isResilient(superclassDecl, ResilienceExpansion::Maximal)) {
+        if (IGM.isResilient(superclassDecl, ResilienceExpansion::Maximal,
+                            rootClass)) {
           Options |= ClassMetadataFlags::ClassHasResilientMembers;
 
           // If the superclass is generic, we have to assume that its layout
@@ -263,10 +266,11 @@ namespace {
       if (classHasIncompleteLayout(IGM, theClass))
         Options |= ClassMetadataFlags::ClassHasMissingMembers;
 
-      if (IGM.hasResilientMetadata(theClass, ResilienceExpansion::Maximal))
+      if (IGM.hasResilientMetadata(theClass, ResilienceExpansion::Maximal,
+                                   rootClass))
         Options |= ClassMetadataFlags::ClassHasResilientAncestry;
 
-      if (IGM.isResilient(theClass, ResilienceExpansion::Maximal)) {
+      if (IGM.isResilient(theClass, ResilienceExpansion::Maximal, rootClass)) {
         Options |= ClassMetadataFlags::ClassHasResilientMembers;
         return;
       }
@@ -448,7 +452,7 @@ ClassTypeInfo::createLayoutWithTailElems(IRGenModule &IGM,
                                                         os.str());
   builder.setAsBodyOfStruct(ResultTy);
 
-  // Create the StructLayout, which is transfered to the caller (the caller is
+  // Create the StructLayout, which is transferred to the caller (the caller is
   // responsible for deleting it).
   return new StructLayout(builder, classType.getClassOrBoundGenericClass(),
                           ResultTy, builder.getElements());
@@ -2566,7 +2570,7 @@ ClassDecl *irgen::getRootClassForMetaclass(IRGenModule &IGM, ClassDecl *C) {
   if (C->hasClangNode()) return C;
   
   // FIXME: If the root class specifies its own runtime ObjC base class,
-  // assume that that base class ultimately inherits NSObject.
+  // assume that base class ultimately inherits NSObject.
   if (C->getAttrs().hasAttribute<SwiftNativeObjCRuntimeBaseAttr>())
     return IGM.getObjCRuntimeBaseClass(
              IGM.Context.getSwiftId(KnownFoundationEntity::NSObject),

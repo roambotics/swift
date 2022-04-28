@@ -24,6 +24,7 @@
 #include "swift/Runtime/Casting.h"
 #include "swift/Runtime/EnvironmentVariables.h"
 #include "swift/Runtime/ExistentialContainer.h"
+#include "swift/Runtime/Heap.h"
 #include "swift/Runtime/HeapObject.h"
 #include "swift/Runtime/Mutex.h"
 #include "swift/Runtime/Once.h"
@@ -770,7 +771,7 @@ _cacheCanonicalSpecializedMetadata(const TypeContextDescriptor *description) {
       assert(result.second.Value == canonicalMetadata);
     }
   } else {
-    auto canonicalMetadatas = description->getCanonicicalMetadataPrespecializations();
+    auto canonicalMetadatas = description->getCanonicalMetadataPrespecializations();
     for (auto &canonicalMetadataPtr : canonicalMetadatas) {
       Metadata *canonicalMetadata = canonicalMetadataPtr.get();
       const void *const *arguments =
@@ -2384,7 +2385,7 @@ static ValueWitnessTable *getMutableVWTableForInit(StructMetadata *self,
   // Otherwise, allocate permanent memory for it and copy the existing table.
   void *memory = allocateMetadata(sizeof(ValueWitnessTable),
                                   alignof(ValueWitnessTable));
-  auto newTable = new (memory) ValueWitnessTable(*oldTable);
+  auto newTable = ::new (memory) ValueWitnessTable(*oldTable);
 
   // If we ever need to check layout-completeness asynchronously from
   // initialization, we'll need this to be a store-release (and rely on
@@ -2762,7 +2763,7 @@ static void initClassVTable(ClassMetadata *self) {
     for (unsigned i = 0, e = vtable->VTableSize; i < e; ++i) {
       auto &methodDescription = descriptors[i];
       swift_ptrauth_init_code_or_data(
-          &classWords[vtableOffset + i], methodDescription.Impl.get(),
+          &classWords[vtableOffset + i], methodDescription.getImpl(),
           methodDescription.Flags.getExtraDiscriminator(),
           !methodDescription.Flags.isAsync());
     }
@@ -2802,9 +2803,8 @@ static void initClassVTable(ClassMetadata *self) {
       auto baseVTable = baseClass->getVTableDescriptor();
       auto offset = (baseVTable->getVTableOffset(baseClass) +
                      (baseMethod - baseClassMethods.data()));
-
       swift_ptrauth_init_code_or_data(&classWords[offset],
-                                      descriptor.Impl.get(),
+                                      descriptor.getImpl(),
                                       baseMethod->Flags.getExtraDiscriminator(),
                                       !baseMethod->Flags.isAsync());
     }
@@ -4183,10 +4183,14 @@ public:
 
   struct Key {
     const NonUniqueExtendedExistentialTypeShape *Candidate;
+    llvm::StringRef TypeString;
+
+    Key(const NonUniqueExtendedExistentialTypeShape *candidate)
+      : Candidate(candidate),
+        TypeString(candidate->getExistentialTypeStringForUniquing()) {}
 
     friend llvm::hash_code hash_value(const Key &key) {
-      auto &candidate = *key.Candidate;
-      return hash_value(candidate.Hash);
+      return hash_value(key.TypeString);
     }
   };
 
@@ -4201,13 +4205,12 @@ public:
     auto self = Data;
     auto other = key.Candidate;
     if (self == other) return true;
-    return other->Hash == self->Hash;
+    return self->getExistentialTypeStringForUniquing() == key.TypeString;
   }
 
   friend llvm::hash_code hash_value(
                         const ExtendedExistentialTypeShapeCacheEntry &value) {
-    Key key = {value.Data};
-    return hash_value(key);
+    return hash_value(Key(value.Data));
   }
 
   static size_t getExtraAllocationSize(Key key) {
@@ -4251,7 +4254,7 @@ swift::swift_getExtendedExistentialTypeShape(
 
   // Find the unique entry.
   auto uniqueEntry = ExtendedExistentialTypeShapes.getOrInsert(
-      ExtendedExistentialTypeShapeCacheEntry::Key{ nonUnique });
+      ExtendedExistentialTypeShapeCacheEntry::Key(nonUnique));
 
   const ExtendedExistentialTypeShape *unique =
     &uniqueEntry.first->Data->LocalCopy;
@@ -4650,7 +4653,7 @@ static const WitnessTable *_getForeignWitnessTable(
   ForeignWitnessTables.getOrInsert(
       key, [&](ForeignWitnessTableCacheEntry *entryPtr, bool created) {
         if (created)
-          new (entryPtr)
+          ::new (entryPtr)
               ForeignWitnessTableCacheEntry(key, witnessTableCandidate);
         result = entryPtr->data;
         return true;
@@ -5139,7 +5142,7 @@ static void initializeResilientWitnessTable(
 
     auto &reqt = requirements[reqDescriptor - requirements.begin()];
     // This is an unsigned pointer formed from a relative address.
-    void *impl = witness.Witness.get();
+    void *impl = witness.getWitness(reqt.Flags);
     initProtocolWitness(&table[witnessIndex], impl, reqt);
   }
 
@@ -5153,7 +5156,7 @@ static void initializeResilientWitnessTable(
     auto &reqt = requirements[i];
     if (!table[witnessIndex]) {
       // This is an unsigned pointer formed from a relative address.
-      void *impl = reqt.DefaultImplementation.get();
+      void *impl = reqt.getDefaultImplementation();
       initProtocolWitness(&table[witnessIndex], impl, reqt);
     }
 
@@ -5622,7 +5625,7 @@ static const WitnessTable *swift_getAssociatedConformanceWitnessSlowImpl(
     // Resolve the relative reference to the witness function.
     int32_t offset;
     memcpy(&offset, mangledName.data() + 1, 4);
-    uintptr_t ptr = detail::applyRelativeOffset(mangledName.data() + 1, offset);
+    void *ptr = TargetCompactFunctionPointer<InProcess, void>::resolve(mangledName.data() + 1, offset);
 
     // Call the witness function.
     AssociatedWitnessTableAccessFunction *witnessFn;
@@ -6154,9 +6157,15 @@ void swift::blockOnMetadataDependency(MetadataDependency root,
 #if !SWIFT_STDLIB_PASSTHROUGH_METADATA_ALLOCATOR
 
 namespace {
-  struct alignas(sizeof(uintptr_t) * 2) PoolRange {
+  struct alignas(2 * sizeof(uintptr_t)) PoolRange
+      : swift::aligned_alloc<2 * sizeof(uintptr_t)> {
     static constexpr uintptr_t PageSize = 16 * 1024;
     static constexpr uintptr_t MaxPoolAllocationSize = PageSize / 2;
+
+    constexpr PoolRange(char *Begin, size_t Remaining)
+        : Begin(Begin), Remaining(Remaining) {}
+
+    PoolRange() : Begin(nullptr), Remaining(0) {}
 
     /// The start of the allocation.
     char *Begin;

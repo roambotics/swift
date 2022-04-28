@@ -506,9 +506,20 @@ struct TargetMethodDescriptor {
   MethodDescriptorFlags Flags;
 
   /// The method implementation.
-  TargetRelativeDirectPointer<Runtime, void> Impl;
+  union {
+    TargetCompactFunctionPointer<Runtime, void> Impl;
+    TargetRelativeDirectPointer<Runtime, void> AsyncImpl;
+  };
 
   // TODO: add method types or anything else needed for reflection.
+
+  void *getImpl() const {
+    if (Flags.isAsync()) {
+      return AsyncImpl.get();
+    } else {
+      return Impl.get();
+    }
+  }
 };
 
 using MethodDescriptor = TargetMethodDescriptor<InProcess>;
@@ -578,7 +589,20 @@ struct TargetMethodOverrideDescriptor {
   TargetRelativeMethodDescriptorPointer<Runtime> Method;
 
   /// The implementation of the override.
-  TargetRelativeDirectPointer<Runtime, void, /*nullable*/ true> Impl;
+  union {
+    TargetCompactFunctionPointer<Runtime, void, /*nullable*/ true> Impl;
+    TargetRelativeDirectPointer<Runtime, void, /*nullable*/ true> AsyncImpl;
+  };
+
+  void *getImpl() const {
+    auto *baseMethod = Method.get();
+    assert(baseMethod && "no base method");
+    if (baseMethod->Flags.isAsync()) {
+      return AsyncImpl.get();
+    } else {
+      return Impl.get();
+    }
+  }
 };
 
 /// Header for a class vtable override descriptor. This is a variable-sized
@@ -1523,7 +1547,18 @@ struct TargetProtocolRequirement {
   // TODO: name, type
 
   /// The optional default implementation of the protocol.
-  RelativeDirectPointer<void, /*nullable*/ true> DefaultImplementation;
+  union {
+    TargetCompactFunctionPointer<Runtime, void, /*nullable*/ true> DefaultFuncImplementation;
+    TargetRelativeDirectPointer<Runtime, void, /*nullable*/ true> DefaultImplementation;
+  };
+
+  void *getDefaultImplementation() const {
+    if (Flags.isFunctionImpl()) {
+      return DefaultFuncImplementation.get();
+    } else {
+      return DefaultImplementation.get();
+    }
+  }
 };
 
 using ProtocolRequirement = TargetProtocolRequirement<InProcess>;
@@ -1820,6 +1855,32 @@ public:
   /// Flags for the existential shape.
   ExtendedExistentialTypeShapeFlags Flags;
 
+  /// The mangling of the generalized existential type, expressed
+  /// (if necessary) in terms of the type parameters of the
+  /// generalization signature.
+  ///
+  /// If this shape is non-unique, this is always a flat string, not a
+  /// "symbolic" mangling which can contain relative references.  This
+  /// allows uniquing to simply compare the string content.
+  ///
+  /// In principle, the content of the requirement signature and type
+  /// expression are derivable from this type.  We store them separately
+  /// so that code which only needs to work with the logical content of
+  /// the type doesn't have to break down the existential type string.
+  /// This both (1) allows those operations to work substantially more
+  /// efficiently (and without needing code to produce a requirement
+  /// signature from an existential type to exist in the runtime) and
+  /// (2) potentially allows old runtimes to support new existential
+  /// types without as much invasive code.
+  ///
+  /// The content of this string is *not* necessarily derivable from
+  /// the requirement signature.  This is because there may be multiple
+  /// existential types that have equivalent logical content but which
+  /// we nonetheless distinguish at compile time.  Storing this also
+  /// allows us to far more easily produce a formal type from this
+  /// shape reflectively.
+  RelativeStringPointer ExistentialType;
+
   /// The header describing the requirement signature of the existential.
   TargetGenericContextDescriptorHeader<Runtime> ReqSigHeader;
 
@@ -1964,7 +2025,7 @@ using ExtendedExistentialTypeShape
 /// existential shape.
 ///
 /// We'd like to use BLAKE3 for this, but pending acceptance of
-/// that into LLVM, we're using SHA-256.  We simply truncaate the
+/// that into LLVM, we're using SHA-256.  We simply truncate the
 /// hash to the desired length.
 struct UniqueHash {
   static_assert(NumBytes_UniqueHash % sizeof(uint32_t) == 0,
@@ -1989,6 +2050,9 @@ struct UniqueHash {
 
 /// A descriptor for an extended existential type descriptor which
 /// needs to be uniqued at runtime.
+///
+/// Uniquing is performed by comparing the existential type strings
+/// of the shapes.
 template <typename Runtime>
 struct TargetNonUniqueExtendedExistentialTypeShape {
   /// A reference to memory that can be used to cache a globally-unique
@@ -1997,10 +2061,12 @@ struct TargetNonUniqueExtendedExistentialTypeShape {
     std::atomic<ConstTargetMetadataPointer<Runtime,
                   TargetExtendedExistentialTypeShape>>> UniqueCache;
 
-  /// A hash of the mangling of the existential shape.
-  ///
-  /// TODO: describe that mangling here
-  UniqueHash Hash;
+  llvm::StringRef getExistentialTypeStringForUniquing() const {
+    // When we have a non-unique shape, we're guaranteed that
+    // ExistentialType contains no symbolic references, so we can just
+    // recover it this way rather than having to parse it.
+    return LocalCopy.ExistentialType.get();
+  }
 
   /// The local copy of the existential shape descriptor.
   TargetExtendedExistentialTypeShape<Runtime> LocalCopy;
@@ -2170,7 +2236,18 @@ using GenericBoxHeapMetadata = TargetGenericBoxHeapMetadata<InProcess>;
 template <typename Runtime>
 struct TargetResilientWitness {
   TargetRelativeProtocolRequirementPointer<Runtime> Requirement;
-  RelativeDirectPointer<void> Witness;
+  union {
+    TargetRelativeDirectPointer<Runtime, void> Impl;
+    TargetCompactFunctionPointer<Runtime, void> FuncImpl;
+  };
+
+  void *getWitness(ProtocolRequirementFlags flags) const {
+    if (flags.isFunctionImpl()) {
+      return FuncImpl.get();
+    } else {
+      return Impl.get();
+    }
+  }
 };
 using ResilientWitness = TargetResilientWitness<InProcess>;
 
@@ -2233,10 +2310,13 @@ struct TargetGenericWitnessTable {
   uint16_t WitnessTablePrivateSizeInWordsAndRequiresInstantiation;
 
   /// The instantiation function, which is called after the template is copied.
-  RelativeDirectPointer<void(TargetWitnessTable<Runtime> *instantiatedTable,
-                             const TargetMetadata<Runtime> *type,
-                             const void * const *instantiationArgs),
-                        /*nullable*/ true> Instantiator;
+  TargetCompactFunctionPointer<
+      Runtime,
+      void(TargetWitnessTable<Runtime> *instantiatedTable,
+           const TargetMetadata<Runtime> *type,
+           const void *const *instantiationArgs),
+      /*nullable*/ true>
+      Instantiator;
 
   using PrivateDataType = void *[swift::NumGenericMetadataPrivateDataWords];
 
@@ -2968,12 +3048,12 @@ using MetadataCompleter =
 template <typename Runtime>
 struct TargetGenericMetadataPattern {
   /// The function to call to instantiate the template.
-  TargetRelativeDirectPointer<Runtime, MetadataInstantiator>
+  TargetCompactFunctionPointer<Runtime, MetadataInstantiator>
     InstantiationFunction;
 
   /// The function to call to complete the instantiation.  If this is null,
   /// the instantiation function must always generate complete metadata.
-  TargetRelativeDirectPointer<Runtime, MetadataCompleter, /*nullable*/ true>
+  TargetCompactFunctionPointer<Runtime, MetadataCompleter, /*nullable*/ true>
     CompletionFunction;
 
   /// Flags describing the layout of this instantiation pattern.
@@ -3080,10 +3160,10 @@ struct TargetGenericClassMetadataPattern final :
   using TargetGenericMetadataPattern<Runtime>::PatternFlags;
 
   /// The heap-destructor function.
-  TargetRelativeDirectPointer<Runtime, HeapObjectDestroyer> Destroy;
+  TargetCompactFunctionPointer<Runtime, HeapObjectDestroyer> Destroy;
 
   /// The ivar-destructor function.
-  TargetRelativeDirectPointer<Runtime, ClassIVarDestroyer, /*nullable*/ true>
+  TargetCompactFunctionPointer<Runtime, ClassIVarDestroyer, /*nullable*/ true>
     IVarDestroyer;
 
   /// The class flags.
@@ -3284,7 +3364,7 @@ private:
 template <typename Runtime>
 struct TargetForeignMetadataInitialization {
   /// The completion function.  The pattern will always be null.
-  TargetRelativeDirectPointer<Runtime, MetadataCompleter, /*nullable*/ true>
+  TargetCompactFunctionPointer<Runtime, MetadataCompleter, /*nullable*/ true>
     CompletionFunction;
 };
 
@@ -3329,14 +3409,14 @@ struct TargetResilientClassMetadataPattern {
   ///
   /// If this is null, the runtime instead calls swift_relocateClassMetadata(),
   /// passing in the class descriptor and this pattern.
-  TargetRelativeDirectPointer<Runtime, MetadataRelocator, /*nullable*/ true>
+  TargetCompactFunctionPointer<Runtime, MetadataRelocator, /*nullable*/ true>
     RelocationFunction;
 
   /// The heap-destructor function.
-  TargetRelativeDirectPointer<Runtime, HeapObjectDestroyer> Destroy;
+  TargetCompactFunctionPointer<Runtime, HeapObjectDestroyer> Destroy;
 
   /// The ivar-destructor function.
-  TargetRelativeDirectPointer<Runtime, ClassIVarDestroyer, /*nullable*/ true>
+  TargetCompactFunctionPointer<Runtime, ClassIVarDestroyer, /*nullable*/ true>
     IVarDestroyer;
 
   /// The class flags.
@@ -3380,7 +3460,7 @@ struct TargetSingletonMetadataInitialization {
 
   /// The completion function.  The pattern will always be null, even
   /// for a resilient class.
-  TargetRelativeDirectPointer<Runtime, MetadataCompleter>
+  TargetCompactFunctionPointer<Runtime, MetadataCompleter>
     CompletionFunction;
 
   bool hasResilientClassPattern(
@@ -3409,7 +3489,7 @@ struct TargetCanonicalSpecializedMetadatasListEntry {
 
 template <typename Runtime>
 struct TargetCanonicalSpecializedMetadataAccessorsListEntry {
-  TargetRelativeDirectPointer<Runtime, MetadataResponse(MetadataRequest), /*Nullable*/ false> accessor;
+  TargetCompactFunctionPointer<Runtime, MetadataResponse(MetadataRequest), /*Nullable*/ false> accessor;
 };
 
 template <typename Runtime>
@@ -3429,7 +3509,7 @@ public:
   /// The function type here is a stand-in. You should use getAccessFunction()
   /// to wrap the function pointer in an accessor that uses the proper calling
   /// convention for a given number of arguments.
-  TargetRelativeDirectPointer<Runtime, MetadataResponse(...),
+  TargetCompactFunctionPointer<Runtime, MetadataResponse(...),
                               /*Nullable*/ true> AccessFunctionPtr;
   
   /// A pointer to the field descriptor for the type, if any.
@@ -3461,12 +3541,12 @@ public:
     return getTypeContextDescriptorFlags().hasSingletonMetadataInitialization();
   }
 
-  /// Does this type have "foreign" metadata initialiation?
+  /// Does this type have "foreign" metadata initialization?
   bool hasForeignMetadataInitialization() const {
     return getTypeContextDescriptorFlags().hasForeignMetadataInitialization();
   }
 
-  bool hasCanonicicalMetadataPrespecializations() const {
+  bool hasCanonicalMetadataPrespecializations() const {
     return getTypeContextDescriptorFlags().hasCanonicalMetadataPrespecializations();
   }
 
@@ -3508,7 +3588,7 @@ public:
   }
 
   const llvm::ArrayRef<TargetRelativeDirectPointer<Runtime, TargetMetadata<Runtime>, /*Nullable*/ false>>
-  getCanonicicalMetadataPrespecializations() const;
+  getCanonicalMetadataPrespecializations() const;
 
   swift_once_t *getCanonicalMetadataPrespecializationCachingOnceToken() const;
 
@@ -3694,7 +3774,7 @@ public:
   using MetadataListEntry = 
     TargetCanonicalSpecializedMetadatasListEntry<Runtime>;
   using MetadataAccessor = 
-    TargetRelativeDirectPointer<Runtime, MetadataResponse(MetadataRequest), /*Nullable*/ false>;
+    TargetCompactFunctionPointer<Runtime, MetadataResponse(MetadataRequest), /*Nullable*/ false>;
   using MetadataAccessorListEntry =
       TargetCanonicalSpecializedMetadataAccessorsListEntry<Runtime>;
   using MetadataCachingOnceToken =
@@ -3819,25 +3899,25 @@ private:
   }
 
   size_t numTrailingObjects(OverloadToken<MetadataListCount>) const {
-    return this->hasCanonicicalMetadataPrespecializations() ?
+    return this->hasCanonicalMetadataPrespecializations() ?
       1
       : 0;
   }
 
   size_t numTrailingObjects(OverloadToken<MetadataListEntry>) const {
-    return this->hasCanonicicalMetadataPrespecializations() ?
+    return this->hasCanonicalMetadataPrespecializations() ?
       this->template getTrailingObjects<MetadataListCount>()->count
       : 0;
   }
 
   size_t numTrailingObjects(OverloadToken<MetadataAccessorListEntry>) const {
-    return this->hasCanonicicalMetadataPrespecializations() ?
+    return this->hasCanonicalMetadataPrespecializations() ?
       this->template getTrailingObjects<MetadataListCount>()->count
       : 0;
   }
 
   size_t numTrailingObjects(OverloadToken<MetadataCachingOnceToken>) const {
-    return this->hasCanonicicalMetadataPrespecializations() ? 1 : 0;
+    return this->hasCanonicalMetadataPrespecializations() ? 1 : 0;
   }
 
 public:
@@ -3985,8 +4065,8 @@ public:
       ->Stub.get();
   }
 
-  llvm::ArrayRef<Metadata> getCanonicicalMetadataPrespecializations() const {
-    if (!this->hasCanonicicalMetadataPrespecializations()) {
+  llvm::ArrayRef<Metadata> getCanonicalMetadataPrespecializations() const {
+    if (!this->hasCanonicalMetadataPrespecializations()) {
       return {};
     }
 
@@ -3999,7 +4079,7 @@ public:
   }
 
   llvm::ArrayRef<MetadataAccessor> getCanonicalMetadataPrespecializationAccessors() const {
-    if (!this->hasCanonicicalMetadataPrespecializations()) {
+    if (!this->hasCanonicalMetadataPrespecializations()) {
       return {};
     }
 
@@ -4012,7 +4092,7 @@ public:
   }
 
   swift_once_t *getCanonicalMetadataPrespecializationCachingOnceToken() const {
-    if (!this->hasCanonicicalMetadataPrespecializations()) {
+    if (!this->hasCanonicalMetadataPrespecializations()) {
       return nullptr;
     }
     auto box = this->template getTrailingObjects<MetadataCachingOnceToken>();
@@ -4089,19 +4169,19 @@ private:
   }
 
   size_t numTrailingObjects(OverloadToken<MetadataListCount>) const {
-    return this->hasCanonicicalMetadataPrespecializations() ?
+    return this->hasCanonicalMetadataPrespecializations() ?
       1
       : 0;
   }
 
   size_t numTrailingObjects(OverloadToken<MetadataListEntry>) const {
-    return this->hasCanonicicalMetadataPrespecializations() ?
+    return this->hasCanonicalMetadataPrespecializations() ?
       this->template getTrailingObjects<MetadataListCount>()->count
       : 0;
   }
 
   size_t numTrailingObjects(OverloadToken<MetadataCachingOnceToken>) const {
-    return this->hasCanonicicalMetadataPrespecializations() ? 1 : 0;
+    return this->hasCanonicalMetadataPrespecializations() ? 1 : 0;
   }
 
 public:
@@ -4136,8 +4216,8 @@ public:
     return TargetStructMetadata<Runtime>::getGenericArgumentOffset();
   }
 
-  llvm::ArrayRef<Metadata> getCanonicicalMetadataPrespecializations() const {
-    if (!this->hasCanonicicalMetadataPrespecializations()) {
+  llvm::ArrayRef<Metadata> getCanonicalMetadataPrespecializations() const {
+    if (!this->hasCanonicalMetadataPrespecializations()) {
       return {};
     }
 
@@ -4150,7 +4230,7 @@ public:
   }
 
   swift_once_t *getCanonicalMetadataPrespecializationCachingOnceToken() const {
-    if (!this->hasCanonicicalMetadataPrespecializations()) {
+    if (!this->hasCanonicalMetadataPrespecializations()) {
       return nullptr;
     }
     auto box = this->template getTrailingObjects<MetadataCachingOnceToken>();
@@ -4216,19 +4296,19 @@ private:
   }
 
   size_t numTrailingObjects(OverloadToken<MetadataListCount>) const {
-    return this->hasCanonicicalMetadataPrespecializations() ?
+    return this->hasCanonicalMetadataPrespecializations() ?
       1
       : 0;
   }
 
   size_t numTrailingObjects(OverloadToken<MetadataListEntry>) const {
-    return this->hasCanonicicalMetadataPrespecializations() ?
+    return this->hasCanonicalMetadataPrespecializations() ?
       this->template getTrailingObjects<MetadataListCount>()->count
       : 0;
   }
 
   size_t numTrailingObjects(OverloadToken<MetadataCachingOnceToken>) const {
-    return this->hasCanonicicalMetadataPrespecializations() ? 1 : 0;
+    return this->hasCanonicalMetadataPrespecializations() ? 1 : 0;
   }
 
 public:
@@ -4277,8 +4357,8 @@ public:
     return *this->template getTrailingObjects<SingletonMetadataInitialization>();
   }
 
-  llvm::ArrayRef<Metadata> getCanonicicalMetadataPrespecializations() const {
-    if (!this->hasCanonicicalMetadataPrespecializations()) {
+  llvm::ArrayRef<Metadata> getCanonicalMetadataPrespecializations() const {
+    if (!this->hasCanonicalMetadataPrespecializations()) {
       return {};
     }
 
@@ -4291,7 +4371,7 @@ public:
   }
 
   swift_once_t *getCanonicalMetadataPrespecializationCachingOnceToken() const {
-    if (!this->hasCanonicicalMetadataPrespecializations()) {
+    if (!this->hasCanonicalMetadataPrespecializations()) {
       return nullptr;
     }
     auto box = this->template getTrailingObjects<MetadataCachingOnceToken>();
@@ -4434,17 +4514,17 @@ TargetTypeContextDescriptor<Runtime>::getSingletonMetadataInitialization() const
 
 template<typename Runtime>
 inline const llvm::ArrayRef<TargetRelativeDirectPointer<Runtime, TargetMetadata<Runtime>, /*Nullable*/ false>>
-TargetTypeContextDescriptor<Runtime>::getCanonicicalMetadataPrespecializations() const {
+TargetTypeContextDescriptor<Runtime>::getCanonicalMetadataPrespecializations() const {
   switch (this->getKind()) {
   case ContextDescriptorKind::Enum:
     return llvm::cast<TargetEnumDescriptor<Runtime>>(this)
-        ->getCanonicicalMetadataPrespecializations();
+        ->getCanonicalMetadataPrespecializations();
   case ContextDescriptorKind::Struct:
     return llvm::cast<TargetStructDescriptor<Runtime>>(this)
-        ->getCanonicicalMetadataPrespecializations();
+        ->getCanonicalMetadataPrespecializations();
   case ContextDescriptorKind::Class:
     return llvm::cast<TargetClassDescriptor<Runtime>>(this)
-        ->getCanonicicalMetadataPrespecializations();
+        ->getCanonicalMetadataPrespecializations();
   default:
     swift_unreachable("Not a type context descriptor.");
   }
@@ -4495,11 +4575,22 @@ class DynamicReplacementDescriptor {
                           DynamicReplacementKey *
                               __ptrauth_swift_dynamic_replacement_key>>
       replacedFunctionKey;
-  RelativeDirectPointer<void, false> replacementFunction;
+  union {
+    TargetCompactFunctionPointer<InProcess, void, false> replacementFunction;
+    TargetRelativeDirectPointer<InProcess, void, false> replacementAsyncFunction;
+  };
   RelativeDirectPointer<DynamicReplacementChainEntry, false> chainEntry;
   uint32_t flags;
 
   enum : uint32_t { EnableChainingMask = 0x1 };
+
+  void *getReplacementFunction() const {
+    if (replacedFunctionKey->isAsync()) {
+      return replacementAsyncFunction.get();
+    } else {
+      return replacementFunction.get();
+    }
+  }
 
 public:
   /// Enable this replacement by changing the function's replacement chain's

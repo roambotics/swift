@@ -58,6 +58,20 @@ namespace swift {
     Complete,
   };
 
+  /// Describes how strict concurrency checking should be.
+  enum class StrictConcurrency {
+    /// Enforce Sendable constraints where it has been explicitly adopted and
+    /// perform actor-isolation checking wherever code has adopted concurrency.
+    Minimal,
+    /// Enforce Sendable constraints and perform actor-isolation checking
+    /// wherever code has adopted concurrency, including code that has
+    /// explicitly adopted Sendable.
+    Targeted,
+    /// Enforce Sendable constraints and actor-isolation checking throughout
+    /// the entire module.
+    Complete,
+  };
+
   /// Access or distribution level of a library.
   enum class LibraryLevel : uint8_t {
     /// Application Programming Interface that is publicly distributed so
@@ -209,6 +223,9 @@ namespace swift {
     /// Emit a remark after loading a module.
     bool EnableModuleLoadingRemarks = false;
 
+    /// Resolve main function as though it were called from an async context
+    bool EnableAsyncMainResolution = false;
+
     ///
     /// Support for alternate usage modes
     ///
@@ -264,6 +281,9 @@ namespace swift {
     /// disabled because it is not complete.
     bool EnableCXXInterop = false;
 
+    /// Imports getters and setters as computed properties.
+    bool CxxInteropGettersSettersAsProperties = false;
+
     /// On Darwin platforms, use the pre-stable ABI's mark bit for Swift
     /// classes instead of the stable ABI's bit. This is needed when
     /// targeting OSes prior to macOS 10.14.4 and iOS 12.2, where
@@ -307,11 +327,8 @@ namespace swift {
     /// optimized custom allocator, so that memory debugging tools can be used.
     bool UseMalloc = false;
 
-    /// Provide additional warnings about code that is unsafe in the
-    /// eventual Swift concurrency model, and will eventually become errors
-    /// in a future Swift language version, but are too noisy for existing
-    /// language modes.
-    bool WarnConcurrency = false;
+    /// Specifies how strict concurrency checking will be.
+    StrictConcurrency StrictConcurrencyLevel = StrictConcurrency::Targeted;
 
     /// Enable experimental #assert feature.
     bool EnableExperimentalStaticAssert = false;
@@ -327,9 +344,9 @@ namespace swift {
     /// in calls to generic functions.
     bool EnableOpenedExistentialTypes = false;
 
-    /// Enable support for protocol types parameterized by primary
-    /// associated type.
-    bool EnableParameterizedProtocolTypes = false;
+    /// Enable support for parameterized protocol types in existential
+    /// position.
+    bool EnableParameterizedExistentialTypes = false;
 
     /// Enable experimental flow-sensitive concurrent captures.
     bool EnableExperimentalFlowSensitiveConcurrentCaptures = false;
@@ -346,9 +363,6 @@ namespace swift {
     /// Enable experimental 'move only' features.
     bool EnableExperimentalMoveOnly = false;
 
-    /// Enable experimental pairwise `buildBlock` for result builders.
-    bool EnableExperimentalPairwiseBuildBlock = false;
-
     /// Enable variadic generics.
     bool EnableExperimentalVariadicGenerics = false;
 
@@ -359,6 +373,9 @@ namespace swift {
     /// Disable the implicit import of the _Concurrency module.
     bool DisableImplicitConcurrencyModuleImport =
         !SWIFT_IMPLICIT_CONCURRENCY_IMPORT;
+
+    /// Disable the implicit import of the _StringProcessing module.
+    bool DisableImplicitStringProcessingModuleImport = false;
 
     /// Should we check the target OSs of serialized modules to see that they're
     /// new enough?
@@ -528,17 +545,17 @@ namespace swift {
     /// Enable the new experimental protocol requirement signature minimization
     /// algorithm.
     RequirementMachineMode RequirementMachineProtocolSignatures =
-        RequirementMachineMode::Verify;
+        RequirementMachineMode::Enabled;
 
     /// Enable the new experimental generic signature minimization algorithm
     /// for abstract generic signatures.
     RequirementMachineMode RequirementMachineAbstractSignatures =
-        RequirementMachineMode::Verify;
+        RequirementMachineMode::Enabled;
 
     /// Enable the new experimental generic signature minimization algorithm
     /// for user-written generic signatures.
     RequirementMachineMode RequirementMachineInferredSignatures =
-        RequirementMachineMode::Verify;
+        RequirementMachineMode::Enabled;
 
     /// Enable preprocessing pass to eliminate conformance requirements
     /// on generic parameters which are made concrete. Usually you want this
@@ -560,6 +577,10 @@ namespace swift {
 
     /// Enables dumping type witness systems from associated type inference.
     bool DumpTypeWitnessSystems = false;
+
+    /// Enables `/.../` syntax regular-expression literals. This requires
+    /// experimental string processing. Note this does not affect `#/.../#`.
+    bool EnableBareSlashRegexLiterals = false;
 
     /// Sets the target we are building for and updates platform conditions
     /// to match.
@@ -742,14 +763,6 @@ namespace swift {
     /// parameters of closures.
     bool EnableOneWayClosureParameters = false;
 
-    /// Enable experimental support for type inference through multi-statement
-    /// closures.
-    bool EnableMultiStatementClosureInference = true;
-
-    /// Enable experimental support for generic parameter inference in
-    /// parameter positions from associated default expressions.
-    bool EnableTypeInferenceFromDefaultArguments = false;
-
     /// See \ref FrontendOptions.PrintFullConvention
     bool PrintFullConvention = false;
   };
@@ -828,7 +841,7 @@ namespace swift {
     bool DisableOverlayModules = false;
 
     /// When set, import SPI_AVAILABLE symbols with Swift SPI attribtues.
-    bool EnableClangSPI = false;
+    bool EnableClangSPI = true;
 
     /// When set, don't enforce warnings with -Werror.
     bool DebuggerSupport = false;

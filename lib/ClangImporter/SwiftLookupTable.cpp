@@ -1925,11 +1925,27 @@ void importer::addEntryToLookupTable(SwiftLookupTable &table,
   // Walk the members of any context that can have nested members.
   if (isa<clang::TagDecl>(named) || isa<clang::ObjCInterfaceDecl>(named) ||
       isa<clang::ObjCProtocolDecl>(named) ||
-      isa<clang::ObjCCategoryDecl>(named) || isa<clang::NamespaceDecl>(named)) {
+      isa<clang::ObjCCategoryDecl>(named)) {
     clang::DeclContext *dc = cast<clang::DeclContext>(named);
     for (auto member : dc->decls()) {
       if (auto namedMember = dyn_cast<clang::NamedDecl>(member))
         addEntryToLookupTable(table, namedMember, nameImporter);
+    }
+  }
+  if (isa<clang::NamespaceDecl>(named)) {
+    llvm::SmallPtrSet<clang::Decl *, 8> alreadyAdded;
+    alreadyAdded.insert(named->getCanonicalDecl());
+
+    for (auto redecl : named->redecls()) {
+      auto dc = cast<clang::DeclContext>(redecl);
+      for (auto member : dc->decls()) {
+        auto canonicalMember = member->getCanonicalDecl();
+        if (!alreadyAdded.insert(canonicalMember).second)
+          continue;
+
+        if (auto namedMember = dyn_cast<clang::NamedDecl>(canonicalMember))
+          addEntryToLookupTable(table, namedMember, nameImporter);
+      }
     }
   }
 }
@@ -1969,12 +1985,6 @@ void importer::addMacrosToLookupTable(SwiftLookupTable &table,
 
       // If we're in a module, we really need moduleMacro to be valid.
       if (isModule && !moduleMacro) {
-#ifndef NDEBUG
-        // Refetch this just for the assertion.
-        clang::MacroDirective *MD = pp.getLocalMacroDirective(macro.first);
-        assert(isa<clang::VisibilityMacroDirective>(MD));
-#endif
-
         // FIXME: "public" visibility macros should actually be added to the 
         // table.
         return;

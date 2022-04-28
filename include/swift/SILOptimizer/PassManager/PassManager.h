@@ -50,6 +50,9 @@ class SwiftPassInvocation {
   /// Backlink to the pass manager.
   SILPassManager *passManager;
 
+  /// The current transform.
+  SILTransform *transform = nullptr;
+
   /// The currently optimized function.
   SILFunction *function = nullptr;
 
@@ -76,6 +79,8 @@ public:
     passManager(passManager) {}
 
   SILPassManager *getPassManager() const { return passManager; }
+  
+  SILTransform *getTransform() const { return transform; }
 
   SILFunction *getFunction() const { return function; }
 
@@ -94,7 +99,7 @@ public:
   void notifyChanges(SILAnalysis::InvalidationKind invalidationKind);
 
   /// Called by the pass manager before the pass starts running.
-  void startFunctionPassRun(SILFunction *function);
+  void startFunctionPassRun(SILFunctionTransform *transform);
 
   /// Called by the SILCombiner before the instruction pass starts running.
   void startInstructionPassRun(SILInstruction *inst);
@@ -329,11 +334,7 @@ public:
   ~SILPassManager();
 
   /// Verify all analyses.
-  void verifyAnalyses() const {
-    for (auto *A : Analyses) {
-      A->verify();
-    }
-  }
+  void verifyAnalyses() const;
 
   /// Precompute all analyses.
   void forcePrecomputeAnalyses(SILFunction *F) {
@@ -348,11 +349,7 @@ public:
   /// Discussion: We leave it up to the analyses to decide how to implement
   /// this. If no override is provided the SILAnalysis should just call the
   /// normal verify method.
-  void verifyAnalyses(SILFunction *F) const {
-    for (auto *A : Analyses) {
-      A->verify(F);
-    }
-  }
+  void verifyAnalyses(SILFunction *F) const;
 
   void executePassPipelinePlan(const SILPassPipelinePlan &Plan);
 

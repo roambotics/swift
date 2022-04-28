@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -swift-version 5 -experimental-multi-statement-closures -enable-experimental-static-assert
+// RUN: %target-typecheck-verify-swift -swift-version 5 -enable-experimental-static-assert
 
 func isInt<T>(_ value: T) -> Bool {
   return value is Int
@@ -290,5 +290,29 @@ func test_pattern_matches_only_cases() {
     case let ParsingError.ok(result): print(result) // Ok
     default: break
     }
+  }
+}
+
+// rdar://91225620 - type of expression is ambiguous without more context in closure
+func test_wrapped_var_without_initializer() {
+  @propertyWrapper
+  struct Wrapper {
+    private let name: String
+
+    var wrappedValue: Bool {
+      didSet {}
+    }
+
+    init(name: String) {
+      self.wrappedValue = false
+      self.name = name
+    }
+  }
+
+  func fn(_: () -> Void) {}
+
+  fn {
+    @Wrapper(name: "foo")
+    var v;
   }
 }

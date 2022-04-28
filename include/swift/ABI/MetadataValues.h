@@ -611,6 +611,21 @@ public:
 
   int_type getIntValue() const { return Value; }
 
+  /// Is the method implementation is represented as a native function pointer?
+  bool isFunctionImpl() const {
+    switch (getKind()) {
+    case ProtocolRequirementFlags::Kind::Method:
+    case ProtocolRequirementFlags::Kind::Init:
+    case ProtocolRequirementFlags::Kind::Getter:
+    case ProtocolRequirementFlags::Kind::Setter:
+    case ProtocolRequirementFlags::Kind::ReadCoroutine:
+    case ProtocolRequirementFlags::Kind::ModifyCoroutine:
+      return !isAsync();
+    default:
+      return false;
+    }
+  }
+
   enum : uintptr_t {
     /// Bit used to indicate that an associated type witness is a pointer to
     /// a mangled name (vs. a pointer to metadata).
@@ -850,7 +865,7 @@ public:
       (Data & ~SpecialKindMask) | (int_type(kind) << SpecialKindShift));
   }
   constexpr ExtendedExistentialTypeShapeFlags
-  withHasTypeExpresssion(bool hasTypeExpression) const {
+  withHasTypeExpression(bool hasTypeExpression) const {
     return ExtendedExistentialTypeShapeFlags(
       hasTypeExpression ? (Data | HasTypeExpression)
                         : (Data & ~HasTypeExpression));
@@ -1409,6 +1424,9 @@ namespace SpecialPointerAuthDiscriminators {
 
   /// Dispatch integration.
   const uint16_t DispatchInvokeFunction = 0xf493; // = 62611
+
+  /// Functions accessible at runtime (i.e. distributed method accessors).
+  const uint16_t AccessibleFunctionRecord = 0x438c; // = 17292
 }
 
 /// The number of arguments that will be passed directly to a generic

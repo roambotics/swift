@@ -131,7 +131,7 @@ public:
   static ExportContext forFunctionBody(DeclContext *DC, SourceLoc loc);
 
   /// Create an instance describing associated conformances that can be
-  /// referenced from the the conformance defined by the given DeclContext,
+  /// referenced from the conformance defined by the given DeclContext,
   /// which must be a NominalTypeDecl or ExtensionDecl.
   static ExportContext forConformance(DeclContext *DC, ProtocolDecl *proto);
 
@@ -142,7 +142,7 @@ public:
   /// Produce a new context with the same properties as this one, except
   /// that if 'exported' is false, the resulting context can reference
   /// declarations that are not exported. If 'exported' is true, the
-  /// resulting context is indentical to this one.
+  /// resulting context is identical to this one.
   ///
   /// That is, this will perform a 'bitwise and' on the 'exported' bit.
   ExportContext withExported(bool exported) const;
@@ -183,9 +183,10 @@ public:
   Optional<ExportabilityReason> getExportabilityReason() const;
 };
 
-/// Check if a public declaration is part of a module's API; that is, this
-/// will return false if the declaration is @_spi or @_implementationOnly.
+/// Check if a declaration is exported as part of a module's external interface.
+/// This includes public and @usableFromInline decls.
 bool isExported(const ValueDecl *VD);
+bool isExported(const ExtensionDecl *ED);
 bool isExported(const Decl *D);
 
 /// Diagnose uses of unavailable declarations in expressions.
@@ -220,14 +221,16 @@ diagnoseConformanceAvailability(SourceLoc loc,
                                 ProtocolConformanceRef conformance,
                                 const ExportContext &context,
                                 Type depTy=Type(),
-                                Type replacementTy=Type());
+                                Type replacementTy=Type(),
+                                bool useConformanceAvailabilityErrorsOption = false);
 
 bool
 diagnoseSubstitutionMapAvailability(SourceLoc loc,
                                     SubstitutionMap subs,
                                     const ExportContext &context,
                                     Type depTy=Type(),
-                                    Type replacementTy=Type());
+                                    Type replacementTy=Type(),
+                                    bool useConformanceAvailabilityErrorsOption = false);
 
 /// Diagnose uses of unavailable declarations. Returns true if a diagnostic
 /// was emitted.
@@ -261,7 +264,8 @@ bool diagnoseExplicitUnavailability(
     SourceLoc loc,
     const RootProtocolConformance *rootConf,
     const ExtensionDecl *ext,
-    const ExportContext &where);
+    const ExportContext &where,
+    bool useConformanceAvailabilityErrorsOption = false);
 
 /// Check if \p decl has a introduction version required by -require-explicit-availability
 void checkExplicitAvailability(Decl *decl);

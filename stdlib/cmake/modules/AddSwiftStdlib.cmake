@@ -302,6 +302,10 @@ function(_add_target_variant_c_compile_flags)
     list(APPEND result "-DSWIFT_OBJC_INTEROP=0")
   endif()
 
+  if(SWIFT_STDLIB_COMPACT_ABSOLUTE_FUNCTION_POINTER)
+    list(APPEND result "-DSWIFT_COMPACT_ABSOLUTE_FUNCTION_POINTER=1")
+  endif()
+
   if(SWIFT_STDLIB_STABLE_ABI)
     list(APPEND result "-DSWIFT_LIBRARY_EVOLUTION=1")
   else()
@@ -1750,10 +1754,10 @@ function(add_swift_target_library name)
   # Turn off implicit import of _Concurrency when building libraries
   list(APPEND SWIFTLIB_SWIFT_COMPILE_FLAGS "-Xfrontend;-disable-implicit-concurrency-module-import")
 
-  # Turn off implicit import of Distributed when building libraries
-  if(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED)
+  # Turn off implicit import of _StringProcessing when building libraries
+  if(SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING)
     list(APPEND SWIFTLIB_SWIFT_COMPILE_FLAGS
-                      "-Xfrontend;-disable-implicit-distributed-module-import")
+                      "-Xfrontend;-disable-implicit-string-processing-module-import")
   endif()
 
   if(SWIFTLIB_IS_STDLIB AND SWIFT_STDLIB_ENABLE_PRESPECIALIZATION)
@@ -1863,7 +1867,7 @@ function(add_swift_target_library name)
            ${SWIFTLIB_FRAMEWORK_DEPENDS_IOS_TVOS})
     endif()
 
-    # Collect architecutre agnostic compiler flags
+    # Collect architecture agnostic compiler flags
     set(swiftlib_swift_compile_flags_all ${SWIFTLIB_SWIFT_COMPILE_FLAGS})
     if(${sdk} STREQUAL OSX)
       list(APPEND swiftlib_swift_compile_flags_all
@@ -2338,7 +2342,7 @@ function(add_swift_target_library name)
         endif()
       endforeach()
 
-      # Add the swiftmodule-only targets to the lipo target depdencies.
+      # Add the swiftmodule-only targets to the lipo target dependencies.
       foreach(arch ${SWIFT_SDK_${sdk}_MODULE_ARCHITECTURES})
         set(_variant_name "${name}-${SWIFT_SDK_${sdk}_LIB_SUBDIR}-${arch}")
         if(maccatalyst_build_flavor STREQUAL "ios-like")

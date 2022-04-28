@@ -2846,8 +2846,10 @@ namespace {
         // or the original C type.
         clang::QualType ClangType = Decl->getUnderlyingType();
         SwiftType = Impl.importTypeIgnoreIUO(
-            ClangType, ImportTypeKind::Typedef, isInSystemModule(DC),
-            getTypedefBridgeability(Decl), OTK_Optional);
+            ClangType, ImportTypeKind::Typedef,
+            ImportDiagnosticAdder(Impl, Decl, Decl->getLocation()),
+            isInSystemModule(DC), getTypedefBridgeability(Decl),
+            getImportTypeAttrs(Decl), OTK_Optional);
       }
 
       if (!SwiftType)
@@ -2860,14 +2862,6 @@ namespace {
                                       SourceLoc(), Name,
                                       Loc,
                                       /*genericparams*/nullptr, DC);
-
-      // If the typedef is marked with @Sendable and not @_nonSendable, make
-      // any function type in it Sendable.
-      auto sendability = Result->getAttrs().getEffectiveSendableAttr();
-      if (isa_and_nonnull<SendableAttr>(sendability))
-        SwiftType = applyToFunctionType(SwiftType, [](ASTExtInfo info) {
-          return info.withConcurrent();
-        });
 
       Result->setUnderlyingType(SwiftType);
 
@@ -2950,6 +2944,7 @@ namespace {
       auto name = importedName.getDeclName().getBaseIdentifier();
 
       // Create the enum declaration and record it.
+      ImportDiagnosticAdder addDiag(Impl, decl, decl->getLocation());
       StructDecl *errorWrapper = nullptr;
       NominalTypeDecl *result;
       auto enumInfo = Impl.getEnumInfo(decl);
@@ -2964,8 +2959,8 @@ namespace {
       case EnumKind::Unknown: {
         // Compute the underlying type of the enumeration.
         auto underlyingType = Impl.importTypeIgnoreIUO(
-            decl->getIntegerType(), ImportTypeKind::Enum, isInSystemModule(dc),
-            Bridgeability::None);
+            decl->getIntegerType(), ImportTypeKind::Enum, addDiag,
+            isInSystemModule(dc), Bridgeability::None, ImportTypeAttrs());
         if (!underlyingType)
           return nullptr;
 
@@ -2997,8 +2992,8 @@ namespace {
 
         // Compute the underlying type.
         auto underlyingType = Impl.importTypeIgnoreIUO(
-            decl->getIntegerType(), ImportTypeKind::Enum, isInSystemModule(dc),
-            Bridgeability::None);
+            decl->getIntegerType(), ImportTypeKind::Enum, addDiag,
+            isInSystemModule(dc), Bridgeability::None, ImportTypeAttrs());
         if (!underlyingType)
           return nullptr;
 
@@ -3777,6 +3772,12 @@ namespace {
       if (!Impl.SwiftContext.LangOpts.EnableCXXInterop)
         return VisitRecordDecl(decl);
 
+      decl = decl->getDefinition();
+      if (!decl) {
+        forwardDeclaration = true;
+        return nullptr;
+      }
+
       auto &clangSema = Impl.getClangSema();
       // Make Clang define any implicit constructors it may need (copy,
       // default). Make sure we only do this if the class has been fully defined
@@ -3929,7 +3930,8 @@ namespace {
         auto &clangContext = Impl.getClangASTContext();
         auto type = Impl.importTypeIgnoreIUO(
             clangContext.getTagDeclType(clangEnum), ImportTypeKind::Value,
-            isInSystemModule(dc), Bridgeability::None);
+            ImportDiagnosticAdder(Impl, clangEnum, clangEnum->getLocation()),
+            isInSystemModule(dc), Bridgeability::None, ImportTypeAttrs());
         if (!type)
           return nullptr;
 
@@ -3995,7 +3997,9 @@ namespace {
 
       auto importedType =
           Impl.importType(decl->getType(), ImportTypeKind::Variable,
-                          isInSystemModule(dc), Bridgeability::None);
+                          ImportDiagnosticAdder(Impl, decl, decl->getLocation()),
+                          isInSystemModule(dc), Bridgeability::None,
+                          getImportTypeAttrs(decl));
       if (!importedType)
         return nullptr;
 
@@ -4127,6 +4131,11 @@ namespace {
       auto dc =
           Impl.importDeclContextOf(decl, importedName.getEffectiveContext());
       if (!dc)
+        return nullptr;
+
+      // Support for importing operators is temporarily disabled: rdar://91070109
+      if (decl->getDeclName().getNameKind() == clang::DeclarationName::CXXOperatorName &&
+          decl->getDeclName().getCXXOverloadedOperator() != clang::OO_Subscript)
         return nullptr;
 
       // Handle cases where 2 CXX methods differ strictly in "constness"
@@ -4471,13 +4480,15 @@ namespace {
     Decl *VisitCXXMethodDecl(const clang::CXXMethodDecl *decl) {
       auto method = VisitFunctionDecl(decl);
 
-      CXXMethodBridging bridgingInfo(decl);
-      if (bridgingInfo.classify() == CXXMethodBridging::Kind::getter) {
-        auto name = bridgingInfo.getClangName().drop_front(3);
-        Impl.GetterSetterMap[name].first = static_cast<FuncDecl *>(method);
-      } else if (bridgingInfo.classify() == CXXMethodBridging::Kind::setter) {
-        auto name = bridgingInfo.getClangName().drop_front(3);
-        Impl.GetterSetterMap[name].second = static_cast<FuncDecl *>(method);
+      if (Impl.SwiftContext.LangOpts.CxxInteropGettersSettersAsProperties) {
+        CXXMethodBridging bridgingInfo(decl);
+        if (bridgingInfo.classify() == CXXMethodBridging::Kind::getter) {
+          auto name = bridgingInfo.getClangName().drop_front(3);
+          Impl.GetterSetterMap[name].first = static_cast<FuncDecl *>(method);
+        } else if (bridgingInfo.classify() == CXXMethodBridging::Kind::setter) {
+          auto name = bridgingInfo.getClangName().drop_front(3);
+          Impl.GetterSetterMap[name].second = static_cast<FuncDecl *>(method);
+        }
       }
 
       return method;
@@ -4517,7 +4528,9 @@ namespace {
 
       auto importedType =
           Impl.importType(decl->getType(), ImportTypeKind::RecordField,
-                          isInSystemModule(dc), Bridgeability::None);
+                          ImportDiagnosticAdder(Impl, decl, decl->getLocation()),
+                          isInSystemModule(dc), Bridgeability::None,
+                          getImportTypeAttrs(decl));
       if (!importedType) {
         Impl.addImportDiagnostic(
             decl, Diagnostic(diag::record_field_not_imported, decl),
@@ -4643,7 +4656,9 @@ namespace {
           Impl.importType(declType,
                           (isAudited ? ImportTypeKind::AuditedVariable
                                      : ImportTypeKind::Variable),
-                          isInSystemModule(dc), Bridgeability::None);
+                          ImportDiagnosticAdder(Impl, decl, decl->getLocation()),
+                          isInSystemModule(dc), Bridgeability::None,
+                          getImportTypeAttrs(decl));
 
       if (!importedType)
         return nullptr;
@@ -5670,7 +5685,8 @@ namespace {
       auto result = Impl.createDeclWithClangNode<ProtocolDecl>(
           decl, AccessLevel::Public, dc,
           Impl.importSourceLoc(decl->getBeginLoc()),
-          Impl.importSourceLoc(decl->getLocation()), name, None,
+          Impl.importSourceLoc(decl->getLocation()), name,
+          ArrayRef<PrimaryAssociatedTypeName>(), None,
           /*TrailingWhere=*/nullptr);
 
       addObjCAttribute(result, Impl.importIdentifier(decl->getIdentifier()));
@@ -5844,8 +5860,9 @@ namespace {
         clangSuperclassType =
           clangCtx.getObjCObjectPointerType(clangSuperclassType);
         superclassType = Impl.importTypeIgnoreIUO(
-            clangSuperclassType, ImportTypeKind::Abstract, isInSystemModule(dc),
-            Bridgeability::None);
+            clangSuperclassType, ImportTypeKind::Abstract,
+            ImportDiagnosticAdder(Impl, decl, decl->getLocation()),
+            isInSystemModule(dc), Bridgeability::None, ImportTypeAttrs());
         if (superclassType) {
           assert(superclassType->is<ClassType>() ||
                  superclassType->is<BoundGenericClassType>());
@@ -6439,9 +6456,10 @@ SwiftDeclConverter::importSwiftNewtype(const clang::TypedefNameDecl *decl,
       decl, AccessLevel::Public, Loc, name, Loc, None, nullptr, dc);
 
   // Import the type of the underlying storage
+  ImportDiagnosticAdder addImportDiag(Impl, decl, decl->getLocation());
   auto storedUnderlyingType = Impl.importTypeIgnoreIUO(
-      decl->getUnderlyingType(), ImportTypeKind::Value, isInSystemModule(dc),
-      Bridgeability::None, OTK_None);
+      decl->getUnderlyingType(), ImportTypeKind::Value, addImportDiag,
+      isInSystemModule(dc), Bridgeability::None, ImportTypeAttrs(), OTK_None);
 
   if (!storedUnderlyingType)
     return nullptr;
@@ -6461,8 +6479,8 @@ SwiftDeclConverter::importSwiftNewtype(const clang::TypedefNameDecl *decl,
 
   // Find a bridged type, which may be different
   auto computedPropertyUnderlyingType = Impl.importTypeIgnoreIUO(
-      decl->getUnderlyingType(), ImportTypeKind::Property, isInSystemModule(dc),
-      Bridgeability::Full, OTK_None);
+      decl->getUnderlyingType(), ImportTypeKind::Property, addImportDiag,
+      isInSystemModule(dc), Bridgeability::Full, ImportTypeAttrs(), OTK_None);
   if (auto objTy = computedPropertyUnderlyingType->getOptionalObjectType())
     computedPropertyUnderlyingType = objTy;
 
@@ -6721,8 +6739,9 @@ SwiftDeclConverter::importAsOptionSetType(DeclContext *dc, Identifier name,
 
   // Compute the underlying type.
   auto underlyingType = Impl.importTypeIgnoreIUO(
-      decl->getIntegerType(), ImportTypeKind::Enum, isInSystemModule(dc),
-      Bridgeability::None);
+      decl->getIntegerType(), ImportTypeKind::Enum,
+      ImportDiagnosticAdder(Impl, decl, decl->getLocation()),
+      isInSystemModule(dc), Bridgeability::None, ImportTypeAttrs());
   if (!underlyingType)
     return nullptr;
 
@@ -6941,8 +6960,10 @@ SwiftDeclConverter::getImplicitProperty(ImportedName importedName,
   bool isFromSystemModule = isInSystemModule(dc);
   auto importedType = Impl.importType(
       propertyType, ImportTypeKind::Property,
+      ImportDiagnosticAdder(Impl, getter, getter->getLocation()),
       Impl.shouldAllowNSUIntegerAsInt(isFromSystemModule, getter),
-      Bridgeability::Full, OTK_ImplicitlyUnwrappedOptional);
+      Bridgeability::Full, getImportTypeAttrs(accessor),
+      OTK_ImplicitlyUnwrappedOptional);
   if (!importedType)
     return nullptr;
 
@@ -7358,7 +7379,7 @@ ConstructorDecl *SwiftDeclConverter::importConstructor(
 }
 
 void SwiftDeclConverter::recordObjCOverride(AbstractFunctionDecl *decl) {
-  // Make sure that we always set the overriden declarations.
+  // Make sure that we always set the overridden declarations.
   SWIFT_DEFER {
     if (!decl->overriddenDeclsComputed())
       decl->setOverriddenDecls({ });
@@ -8125,9 +8146,12 @@ Optional<GenericParamList *> SwiftDeclConverter::importObjCGenericParams(
       if (clangBound->getInterfaceDecl()) {
         auto unqualifiedClangBound =
             clangBound->stripObjCKindOfTypeAndQuals(Impl.getClangASTContext());
+        assert(!objcGenericParam->hasAttrs()
+               && "ObjC generics can have attributes now--we should use 'em");
         Type superclassType = Impl.importTypeIgnoreIUO(
             clang::QualType(unqualifiedClangBound, 0), ImportTypeKind::Abstract,
-            false, Bridgeability::None);
+            ImportDiagnosticAdder(Impl, decl, decl->getLocation()),
+            false, Bridgeability::None, ImportTypeAttrs());
         if (!superclassType) {
           return None;
         }
@@ -8771,74 +8795,86 @@ ClangImporter::Implementation::importSwiftAttrAttributes(Decl *MappedDecl) {
   Optional<const clang::SwiftAttrAttr *> SeenMainActorAttr;
   PatternBindingInitializer *initContext = nullptr;
 
-  //
-  // __attribute__((swift_attr("attribute")))
-  //
-  for (auto swiftAttr : ClangDecl->specific_attrs<clang::SwiftAttrAttr>()) {
-    // FIXME: Hard-code @MainActor and @UIActor, because we don't have a
-    // point at which to do name lookup for imported entities.
-    if (isMainActorAttr(swiftAttr)) {
-      if (SeenMainActorAttr) {
-        // Cannot add main actor annotation twice. We'll keep the first
-        // one and raise a warning about the duplicate.
-        HeaderLoc attrLoc(swiftAttr->getLocation());
-        diagnose(attrLoc, diag::import_multiple_mainactor_attr,
-                 swiftAttr->getAttribute(),
-                 SeenMainActorAttr.getValue()->getAttribute());
+  auto importAttrsFromDecl = [&](const clang::NamedDecl *ClangDecl) {
+    //
+    // __attribute__((swift_attr("attribute")))
+    //
+    for (auto swiftAttr : ClangDecl->specific_attrs<clang::SwiftAttrAttr>()) {
+      // FIXME: Hard-code @MainActor and @UIActor, because we don't have a
+      // point at which to do name lookup for imported entities.
+      if (isMainActorAttr(swiftAttr)) {
+        if (SeenMainActorAttr) {
+          // Cannot add main actor annotation twice. We'll keep the first
+          // one and raise a warning about the duplicate.
+          HeaderLoc attrLoc(swiftAttr->getLocation());
+          diagnose(attrLoc, diag::import_multiple_mainactor_attr,
+                   swiftAttr->getAttribute(),
+                   SeenMainActorAttr.getValue()->getAttribute());
+          continue;
+        }
+
+        if (Type mainActorType = SwiftContext.getMainActorType()) {
+          auto typeExpr = TypeExpr::createImplicit(mainActorType, SwiftContext);
+          auto attr = CustomAttr::create(SwiftContext, SourceLoc(), typeExpr);
+          MappedDecl->getAttrs().add(attr);
+          SeenMainActorAttr = swiftAttr;
+        }
+
         continue;
       }
 
-      if (Type mainActorType = SwiftContext.getMainActorType()) {
-        auto typeExpr = TypeExpr::createImplicit(mainActorType, SwiftContext);
-        auto attr = CustomAttr::create(SwiftContext, SourceLoc(), typeExpr);
+      // Hard-code @actorIndependent, until Objective-C clients start
+      // using nonisolated.
+      if (swiftAttr->getAttribute() == "@actorIndependent") {
+        auto attr = new (SwiftContext) NonisolatedAttr(/*isImplicit=*/true);
         MappedDecl->getAttrs().add(attr);
-        SeenMainActorAttr = swiftAttr;
+        continue;
       }
 
-      continue;
+      // Dig out a buffer with the attribute text.
+      unsigned bufferID = getClangSwiftAttrSourceBuffer(
+          swiftAttr->getAttribute());
+
+      // Dig out a source file we can use for parsing.
+      auto &sourceFile = getClangSwiftAttrSourceFile(
+          *MappedDecl->getDeclContext()->getParentModule());
+
+      // Spin up a parser.
+      swift::Parser parser(
+          bufferID, sourceFile, &SwiftContext.Diags, nullptr, nullptr);
+      // Prime the lexer.
+      parser.consumeTokenWithoutFeedingReceiver();
+
+      bool hadError = false;
+      SourceLoc atLoc;
+      if (parser.consumeIf(tok::at_sign, atLoc)) {
+        hadError = parser.parseDeclAttribute(
+            MappedDecl->getAttrs(), atLoc, initContext,
+            /*isFromClangAttribute=*/true).isError();
+      } else {
+        SourceLoc staticLoc;
+        StaticSpellingKind staticSpelling;
+        hadError = parser.parseDeclModifierList(
+            MappedDecl->getAttrs(), staticLoc, staticSpelling,
+            /*isFromClangAttribute=*/true);
+      }
+
+      if (hadError) {
+        // Complain about the unhandled attribute or modifier.
+        HeaderLoc attrLoc(swiftAttr->getLocation());
+        diagnose(attrLoc, diag::clang_swift_attr_unhandled,
+                 swiftAttr->getAttribute());
+      }
     }
+  };
+  importAttrsFromDecl(ClangDecl);
 
-    // Hard-code @actorIndependent, until Objective-C clients start
-    // using nonisolated.
-    if (swiftAttr->getAttribute() == "@actorIndependent") {
-      auto attr = new (SwiftContext) NonisolatedAttr(/*isImplicit=*/true);
-      MappedDecl->getAttrs().add(attr);
-      continue;
-    }
-
-    // Dig out a buffer with the attribute text.
-    unsigned bufferID = getClangSwiftAttrSourceBuffer(
-        swiftAttr->getAttribute());
-
-    // Dig out a source file we can use for parsing.
-    auto &sourceFile = getClangSwiftAttrSourceFile(
-        *MappedDecl->getDeclContext()->getParentModule());
-
-    // Spin up a parser.
-    swift::Parser parser(
-        bufferID, sourceFile, &SwiftContext.Diags, nullptr, nullptr);
-    // Prime the lexer.
-    parser.consumeTokenWithoutFeedingReceiver();
-
-    bool hadError = false;
-    SourceLoc atLoc;
-    if (parser.consumeIf(tok::at_sign, atLoc)) {
-      hadError = parser.parseDeclAttribute(
-          MappedDecl->getAttrs(), atLoc, initContext,
-          /*isFromClangAttribute=*/true).isError();
-    } else {
-      SourceLoc staticLoc;
-      StaticSpellingKind staticSpelling;
-      hadError = parser.parseDeclModifierList(
-          MappedDecl->getAttrs(), staticLoc, staticSpelling,
-          /*isFromClangAttribute=*/true);
-    }
-
-    if (hadError) {
-      // Complain about the unhandled attribute or modifier.
-      HeaderLoc attrLoc(swiftAttr->getLocation());
-      diagnose(attrLoc, diag::clang_swift_attr_unhandled,
-               swiftAttr->getAttribute());
+  // If the Clang declaration is from an anonymous tag that was given a
+  // name via a typedef, look for attributes on the typedef as well.
+  if (auto tag = dyn_cast<clang::TagDecl>(ClangDecl)) {
+    if (tag->getName().empty()) {
+      if (auto typedefDecl = tag->getTypedefNameForAnonDecl())
+        importAttrsFromDecl(typedefDecl);
     }
   }
 
@@ -8846,6 +8882,15 @@ ClangImporter::Implementation::importSwiftAttrAttributes(Decl *MappedDecl) {
   // affect typealiases, even when there's an underlying nominal type in clang.
   if (isa<TypeAliasDecl>(MappedDecl))
     return;
+
+  // `@Sendable` on non-types is treated as an `ImportTypeAttr` and shouldn't
+  // be treated as an attribute on the declaration. (Particularly, @Sendable on
+  // a function or method should be treated as making the return value Sendable,
+  // *not* as making the function/method itself Sendable, because
+  // `@Sendable func` is primarily meant for local functions.)
+  if (!isa<TypeDecl>(MappedDecl))
+    while (auto attr = MappedDecl->getAttrs().getEffectiveSendableAttr())
+      MappedDecl->getAttrs().removeAttribute(attr);
 
   // Some types have an implicit '@Sendable' attribute.
   if (ClangDecl->hasAttr<clang::SwiftNewTypeAttr>() ||
@@ -9064,7 +9109,7 @@ void ClangImporter::Implementation::importAttributes(
                                           obsoleted,
                                           /*ObsoletedRange=*/SourceRange(),
                                           PlatformAgnostic, /*Implicit=*/false,
-                                          IsSPI);
+                                          EnableClangSPI && IsSPI);
 
       MappedDecl->getAttrs().add(AvAttr);
     }

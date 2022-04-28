@@ -173,6 +173,8 @@ void Function_register(SwiftMetatype metatype,
             FunctionCopyEffectsFn copyEffectsFn,
             FunctionGetEffectFlagsFn hasEffectsFn);
 
+SwiftInt PassContext_continueWithNextSubpassRun(BridgedPassContext passContext,
+                                                OptionalBridgedInstruction inst);
 void PassContext_notifyChanges(BridgedPassContext passContext,
                                enum ChangeNotificationKind changeKind);
 void PassContext_eraseInstruction(BridgedPassContext passContext,
@@ -211,12 +213,15 @@ BridgedInstruction Operand_getUser(BridgedOperand);
 SwiftInt Operand_isTypeDependent(BridgedOperand);
 
 BridgedStringRef SILNode_debugDescription(BridgedNode node);
+BridgedFunction SILNode_getFunction(BridgedNode node);
 OptionalBridgedOperand SILValue_firstUse(BridgedValue value);
 BridgedType SILValue_getType(BridgedValue value);
 
 BridgedStringRef SILType_debugDescription(BridgedType);
 SwiftInt SILType_isAddress(BridgedType);
 SwiftInt SILType_isTrivial(BridgedType, BridgedFunction);
+SwiftInt SILType_isReferenceCounted(BridgedType type, BridgedFunction);
+SwiftInt SILType_isNonTrivialOrContainsRawPointer(BridgedType, BridgedFunction);
 SwiftInt SILType_isNominal(BridgedType type);
 SwiftInt SILType_isClass(BridgedType type);
 SwiftInt SILType_isStruct(BridgedType type);
@@ -232,6 +237,7 @@ SwiftInt SILType_getFieldIdxOfNominalType(BridgedType type,
 BridgedSubstitutionMap SILType_getContextSubstitutionMap(BridgedType);
 
 BridgedBasicBlock SILArgument_getParent(BridgedArgument argument);
+SwiftInt SILArgument_isExclusiveIndirectParameter(BridgedArgument argument);
 
 OptionalBridgedInstruction SILInstruction_next(BridgedInstruction inst);
 OptionalBridgedInstruction SILInstruction_previous(BridgedInstruction inst);
@@ -244,6 +250,7 @@ BridgedMemoryBehavior SILInstruction_getMemBehavior(BridgedInstruction inst);
 bool SILInstruction_mayRelease(BridgedInstruction inst);
 
 BridgedInstruction MultiValueInstResult_getParent(BridgedMultiValueResult result);
+SwiftInt MultiValueInstResult_getIndex(BridgedMultiValueResult result);
 SwiftInt MultipleValueInstruction_getNumResults(BridgedInstruction inst);
 BridgedMultiValueResult
   MultipleValueInstruction_getResult(BridgedInstruction inst, SwiftInt index);
@@ -254,16 +261,23 @@ BridgedStringRef CondFailInst_getMessage(BridgedInstruction cfi);
 BridgedBuiltinID BuiltinInst_getID(BridgedInstruction bi);
 BridgedGlobalVar GlobalAccessInst_getGlobal(BridgedInstruction globalInst);
 BridgedFunction FunctionRefInst_getReferencedFunction(BridgedInstruction fri);
+BridgedStringRef StringLiteralInst_getValue(BridgedInstruction sli);
 SwiftInt TupleExtractInst_fieldIndex(BridgedInstruction tei);
 SwiftInt TupleElementAddrInst_fieldIndex(BridgedInstruction teai);
 SwiftInt StructExtractInst_fieldIndex(BridgedInstruction sei);
 OptionalBridgedValue StructInst_getUniqueNonTrivialFieldValue(BridgedInstruction si);
 SwiftInt StructElementAddrInst_fieldIndex(BridgedInstruction seai);
+SwiftInt ProjectBoxInst_fieldIndex(BridgedInstruction pbi);
 SwiftInt EnumInst_caseIndex(BridgedInstruction ei);
 SwiftInt UncheckedEnumDataInst_caseIndex(BridgedInstruction uedi);
+SwiftInt InitEnumDataAddrInst_caseIndex(BridgedInstruction idea);
+SwiftInt UncheckedTakeEnumDataAddrInst_caseIndex(BridgedInstruction utedi);
+SwiftInt InjectEnumAddrInst_caseIndex(BridgedInstruction ieai);
 SwiftInt RefElementAddrInst_fieldIndex(BridgedInstruction reai);
 SwiftInt PartialApplyInst_numArguments(BridgedInstruction ai);
 SwiftInt ApplyInst_numArguments(BridgedInstruction ai);
+SwiftInt PartialApply_getCalleeArgIndexOfFirstAppliedArg(BridgedInstruction pai);
+SwiftInt PartialApplyInst_isOnStack(BridgedInstruction pai);
 SwiftInt AllocRefInstBase_isObjc(BridgedInstruction arb);
 SwiftInt AllocRefInstBase_canAllocOnStack(BridgedInstruction arb);
 SwiftInt BeginApplyInst_numArguments(BridgedInstruction ai);
@@ -272,8 +286,11 @@ BridgedBasicBlock BranchInst_getTargetBlock(BridgedInstruction bi);
 SwiftInt SwitchEnumInst_getNumCases(BridgedInstruction se);
 SwiftInt SwitchEnumInst_getCaseIndex(BridgedInstruction se, SwiftInt idx);
 SwiftInt StoreInst_getStoreOwnership(BridgedInstruction store);
+SwiftInt CopyAddrInst_isTakeOfSrc(BridgedInstruction copyAddr);
+SwiftInt CopyAddrInst_isInitializationOfDest(BridgedInstruction copyAddr);
 void RefCountingInst_setIsAtomic(BridgedInstruction rc, bool isAtomic);
 bool RefCountingInst_getIsAtomic(BridgedInstruction rc);
+SwiftInt CondBranchInst_getNumTrueArgs(BridgedInstruction cbr);
 
 BridgedInstruction SILBuilder_createBuiltinBinaryFunction(
           BridgedInstruction insertionPoint,

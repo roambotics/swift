@@ -38,6 +38,8 @@
 #include <functional>
 #include <vector>
 #include <list>
+#include <new>
+#include <cstring>
 
 using namespace swift;
 using namespace Demangle;
@@ -76,7 +78,16 @@ static uintptr_t resolveSymbolicReferenceOffset(SymbolicReferenceKind kind,
                                                 Directness isIndirect,
                                                 int32_t offset,
                                                 const void *base) {
-  auto ptr = detail::applyRelativeOffset(base, offset);
+  uintptr_t ptr;
+  // Function references may be resolved differently than other data references.
+  switch (kind) {
+  case SymbolicReferenceKind::AccessorFunctionReference:
+    ptr = (uintptr_t)TargetCompactFunctionPointer<InProcess, void>::resolve(base, offset);
+    break;
+  default:
+    ptr = detail::applyRelativeOffset(base, offset);
+    break;
+  }
 
   // Indirect references may be authenticated in a way appropriate for the
   // referent.
@@ -462,6 +473,16 @@ static bool sameObjCTypeManglings(Demangle::NodePointer node1,
 }
 #endif
 
+/// Optimization for the case where we need to compare a StringRef and a null terminated C string
+/// Not converting s2 to a StringRef avoids the need to call both strlen and memcmp when non-matching
+/// but equal length
+static bool stringRefEqualsCString(StringRef s1, const char *s2) {
+  size_t length = s1.size();
+  // It may be possible for s1 to contain embedded NULL characters
+  // so additionally validate that the lengths match
+  return strncmp(s1.data(), s2, length) == 0 && strlen(s2) == length;
+}
+
 bool
 swift::_contextDescriptorMatchesMangling(const ContextDescriptor *context,
                                          Demangle::NodePointer node) {
@@ -486,7 +507,7 @@ swift::_contextDescriptorMatchesMangling(const ContextDescriptor *context,
       // Match to a mangled module name.
       if (node->getKind() != Demangle::Node::Kind::Module)
         return false;
-      if (!node->getText().equals(module->Name.get()))
+      if (!stringRefEqualsCString(node->getText(), module->Name.get()))
         return false;
       
       node = nullptr;
@@ -558,7 +579,7 @@ swift::_contextDescriptorMatchesMangling(const ContextDescriptor *context,
         auto nameNode = node->getChild(1);
         if (nameNode->getKind() != Demangle::Node::Kind::Identifier)
           return false;
-        if (nameNode->getText() == proto->Name.get()) {
+        if (stringRefEqualsCString(nameNode->getText(), proto->Name.get())) {
           node = node->getChild(0);
           break;
         }
@@ -765,7 +786,7 @@ _findContextDescriptor(Demangle::NodePointer node,
                                                     *entry,
                                                 bool created) {
       if (created)
-        new (entry) NominalTypeDescriptorCacheEntry{mangledName, foundContext};
+        ::new (entry) NominalTypeDescriptorCacheEntry{mangledName, foundContext};
       return true;
     });
 
@@ -922,7 +943,7 @@ _findProtocolDescriptor(NodePointer node,
                                                      *entry,
                                                  bool created) {
       if (created)
-        new (entry) ProtocolDescriptorCacheEntry{mangledName, foundProtocol};
+        ::new (entry) ProtocolDescriptorCacheEntry{mangledName, foundProtocol};
       return true;
     });
   }
@@ -1966,7 +1987,7 @@ static NodePointer getParameterList(NodePointer funcType) {
       funcType->findByKind(Node::Kind::ArgumentTuple, /*maxDepth=*/1);
   assert(parameterContainer->getNumChildren() > 0);
 
-  // This is a type that convers entire parameter list.
+  // This is a type that covers entire parameter list.
   auto parameterList = parameterContainer->getFirstChild();
   assert(parameterList->getKind() == Node::Kind::Type);
 
@@ -2600,10 +2621,10 @@ void DynamicReplacementDescriptor::enableReplacement() const {
 
   // Link the replacement entry.
   chainRoot->next = chainEntry.get();
-  // chainRoot->implementationFunction = replacementFunction.get();
+  // chainRoot->implementationFunction = getReplacementFunction();
   swift_ptrauth_init_code_or_data(
       reinterpret_cast<void **>(&chainRoot->implementationFunction),
-      reinterpret_cast<void *>(replacementFunction.get()),
+      reinterpret_cast<void *>(getReplacementFunction()),
       replacedFunctionKey->getExtraDiscriminator(),
       !replacedFunctionKey->isAsync());
 }
@@ -2633,7 +2654,7 @@ void DynamicReplacementDescriptor::disableReplacement() const {
       !replacedFunctionKey->isAsync(), /*allowNull*/ false);
 }
 
-/// An automatic dymamic replacement entry.
+/// An automatic dynamic replacement entry.
 namespace {
 class AutomaticDynamicReplacementEntry {
   RelativeDirectPointer<DynamicReplacementScope, false> replacementScope;

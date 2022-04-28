@@ -157,6 +157,7 @@ set(SWIFTLIB_ESSENTIAL
   StringProtocol.swift
   StringIndex.swift
   StringIndexConversions.swift
+  StringIndexValidation.swift
   StringInterpolation.swift
   StringLegacy.swift
   StringNormalization.swift
@@ -182,6 +183,7 @@ set(SWIFTLIB_ESSENTIAL
   UnicodeParser.swift
   UnicodeScalarProperties.swift
   CharacterProperties.swift # ORDER DEPENDENCY: UnicodeScalarProperties.swift
+  UnicodeSPI.swift
   Unmanaged.swift
   UnmanagedOpaqueString.swift
   UnmanagedString.swift
@@ -295,7 +297,7 @@ endif()
 set(swift_core_incorporate_object_libraries)
 list(APPEND swift_core_incorporate_object_libraries swiftRuntime)
 list(APPEND swift_core_incorporate_object_libraries swiftLLVMSupport)
-list(APPEND swift_core_incorporate_object_libraries swiftDemanglingForCore)
+list(APPEND swift_core_incorporate_object_libraries swiftDemangling)
 list(APPEND swift_core_incorporate_object_libraries swiftStdlibStubs)
 if(SWIFT_STDLIB_HAS_COMMANDLINE)
   list(APPEND swift_core_incorporate_object_libraries swiftCommandLineSupport)

@@ -1,6 +1,6 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend-emit-module -emit-module-path %t/InferViaDefaults.swiftmodule -enable-experimental-type-inference-from-defaults -module-name InferViaDefaults %S/Inputs/type_inference_via_defaults_other_module.swift
-// RUN: %target-swift-frontend -enable-experimental-type-inference-from-defaults -module-name main -typecheck -verify -I %t %s %S/Inputs/type_inference_via_defaults_other_module.swift
+// RUN: %target-swift-frontend-emit-module -emit-module-path %t/InferViaDefaults.swiftmodule -module-name InferViaDefaults %S/Inputs/type_inference_via_defaults_other_module.swift
+// RUN: %target-swift-frontend -module-name main -typecheck -verify -I %t %s %S/Inputs/type_inference_via_defaults_other_module.swift
 
 func testInferFromResult<T>(_: T = 42) -> T { fatalError() } // Ok
 
@@ -174,4 +174,60 @@ func test_magic_defaults() {
 
   let _ = with_magic()
   let _: String = generic_with_magic()
+}
+
+// SR-16069
+func test_allow_same_type_between_dependent_types() {
+  struct Default : P {
+    typealias X = Int
+  }
+
+  struct Other : P {
+    typealias X = Int
+  }
+
+  struct S<T: P> {
+    func test<U: P>(_: U = Default()) where U.X == T.X { // expected-note {{where 'T.X' = 'String', 'U.X' = 'Default.X' (aka 'Int')}}
+    }
+  }
+
+  func test_ok<T: P>(s: S<T>) where T.X == Int {
+    s.test() // Ok: U == Default
+  }
+
+  func test_bad<T: P>(s: S<T>) where T.X == String {
+    s.test() // expected-error {{instance method 'test' requires the types 'String' and 'Default.X' (aka 'Int') be equivalent}}
+  }
+}
+
+// Crash when default type is requested before inherited constructor is type-checked
+
+protocol StorageType {
+  var identifier: String { get }
+}
+
+class Storage {
+}
+
+extension Storage {
+  struct Test {
+    static let test = CustomStorage<String>("") // triggers default type request
+  }
+}
+
+class BaseStorage<T> : Storage, StorageType {
+  enum StorageType {
+  case standard
+  }
+
+  let identifier: String
+  let type: StorageType
+
+  init(_ id: String, type: StorageType = .standard) {
+    self.identifier = id
+    self.type = type
+  }
+}
+
+final class CustomStorage<T>: BaseStorage<T> { // Ok - no crash typechecking inherited init
 }

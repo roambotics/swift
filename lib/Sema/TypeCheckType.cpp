@@ -518,28 +518,32 @@ bool TypeChecker::checkContextualRequirements(GenericTypeDecl *decl,
   const auto subMap = parentTy->getContextSubstitutions(decl->getDeclContext());
   const auto genericSig = decl->getGenericSignature();
 
-  const auto result =
-    TypeChecker::checkGenericArguments(
-        module, loc, noteLoc,
-        decl->getDeclaredInterfaceType(),
-        genericSig.getGenericParams(),
-        genericSig.getRequirements(),
-        [&](SubstitutableType *type) -> Type {
-          auto result = QueryTypeSubstitutionMap{subMap}(type);
-          if (result->hasTypeParameter()) {
-            if (contextSig) {
-              auto *genericEnv = contextSig.getGenericEnvironment();
-              return genericEnv->mapTypeIntoContext(result);
-            }
-          }
-          return result;
-        });
+  const auto substitutions = [&](SubstitutableType *type) -> Type {
+    auto result = QueryTypeSubstitutionMap{subMap}(type);
+    if (result->hasTypeParameter()) {
+      if (contextSig) {
+        auto *genericEnv = contextSig.getGenericEnvironment();
+        return genericEnv->mapTypeIntoContext(result);
+      }
+    }
+    return result;
+  };
 
+  const auto result = TypeChecker::checkGenericArgumentsForDiagnostics(
+      module, genericSig.getRequirements(), substitutions);
   switch (result) {
-  case RequirementCheckResult::Failure:
-  case RequirementCheckResult::SubstitutionFailure:
+  case CheckGenericArgumentsResult::RequirementFailure:
+    if (loc.isValid()) {
+      TypeChecker::diagnoseRequirementFailure(
+          result.getRequirementFailureInfo(), loc, noteLoc,
+          decl->getDeclaredInterfaceType(), genericSig.getGenericParams(),
+          substitutions, module);
+    }
+
     return false;
-  case RequirementCheckResult::Success:
+  case CheckGenericArgumentsResult::SubstitutionFailure:
+    return false;
+  case CheckGenericArgumentsResult::Success:
     return true;
   }
   llvm_unreachable("invalid requirement check type");
@@ -624,48 +628,48 @@ static Type applyGenericArguments(Type type, TypeResolution resolution,
   auto &ctx = dc->getASTContext();
   auto &diags = ctx.Diags;
 
-  if (ctx.LangOpts.EnableParameterizedProtocolTypes) {
-    if (auto *protoType = type->getAs<ProtocolType>()) {
-      // Build ParameterizedProtocolType if the protocol has a primary associated
-      // type and we're in a supported context (for now just generic requirements,
-      // inheritance clause, extension binding).
-      if (!resolution.getOptions().isParameterizedProtocolSupported()) {
-        diags.diagnose(loc, diag::parameterized_protocol_not_supported);
-        return ErrorType::get(ctx);
-      }
-
-      auto *protoDecl = protoType->getDecl();
-      auto assocTypes = protoDecl->getPrimaryAssociatedTypes();
-      if (assocTypes.empty()) {
-        diags.diagnose(loc, diag::protocol_does_not_have_primary_assoc_type,
-                       protoType);
-
-        return ErrorType::get(ctx);
-      }
-
-      auto genericArgs = generic->getGenericArgs();
-
-      if (genericArgs.size() > assocTypes.size()) {
-        diags.diagnose(loc, diag::parameterized_protocol_too_many_type_arguments,
-                       protoType, genericArgs.size(), assocTypes.size());
-
-        return ErrorType::get(ctx);
-      }
-
-      auto genericResolution =
-        resolution.withOptions(adjustOptionsForGenericArgs(options));
-
-      SmallVector<Type, 2> argTys;
-      for (auto *genericArg : genericArgs) {
-        Type argTy = genericResolution.resolveType(genericArg, silParams);
-        if (!argTy || argTy->hasError())
-          return ErrorType::get(ctx);
-
-        argTys.push_back(argTy);
-      }
-
-      return ParameterizedProtocolType::get(ctx, protoType, argTys);
+  if (auto *protoType = type->getAs<ProtocolType>()) {
+    // Build ParameterizedProtocolType if the protocol has a primary associated
+    // type and we're in a supported context (for now just generic requirements,
+    // inheritance clause, extension binding).
+    if (!resolution.getOptions().isParameterizedProtocolSupported(ctx.LangOpts)) {
+      diags.diagnose(loc, diag::parameterized_protocol_not_supported);
+      return ErrorType::get(ctx);
     }
+
+    auto *protoDecl = protoType->getDecl();
+    auto assocTypes = protoDecl->getPrimaryAssociatedTypes();
+    if (assocTypes.empty()) {
+      diags.diagnose(loc, diag::protocol_does_not_have_primary_assoc_type,
+                     protoType);
+
+      return ErrorType::get(ctx);
+    }
+
+    auto genericArgs = generic->getGenericArgs();
+
+    if (genericArgs.size() != assocTypes.size()) {
+      diags.diagnose(loc,
+                     diag::parameterized_protocol_type_argument_count_mismatch,
+                     protoType, genericArgs.size(), assocTypes.size(),
+                     (genericArgs.size() < assocTypes.size()) ? 1 : 0);
+
+      return ErrorType::get(ctx);
+    }
+
+    auto genericResolution =
+      resolution.withOptions(adjustOptionsForGenericArgs(options));
+
+    SmallVector<Type, 2> argTys;
+    for (auto *genericArg : genericArgs) {
+      Type argTy = genericResolution.resolveType(genericArg, silParams);
+      if (!argTy || argTy->hasError())
+        return ErrorType::get(ctx);
+
+      argTys.push_back(argTy);
+    }
+
+    return ParameterizedProtocolType::get(ctx, protoType, argTys);
   }
 
   // We must either have an unbound generic type, or a generic type alias.
@@ -949,26 +953,32 @@ Type TypeResolution::applyUnboundGenericArguments(
       noteLoc = loc;
 
     auto genericSig = decl->getGenericSignature();
-    auto result = TypeChecker::checkGenericArguments(
-        module, loc, noteLoc,
-        UnboundGenericType::get(decl, parentTy, getASTContext()),
-        genericSig.getGenericParams(), genericSig.getRequirements(),
-        [&](SubstitutableType *type) -> Type {
-          auto result = QueryTypeSubstitutionMap{subs}(type);
-          if (result->hasTypeParameter()) {
-            if (const auto contextSig = getGenericSignature()) {
-              auto *genericEnv = contextSig.getGenericEnvironment();
-              return genericEnv->mapTypeIntoContext(result);
-            }
-          }
-          return result;
-        });
+    const auto substitutions = [&](SubstitutableType *type) -> Type {
+      auto result = QueryTypeSubstitutionMap{subs}(type);
+      if (result->hasTypeParameter()) {
+        if (const auto contextSig = getGenericSignature()) {
+          auto *genericEnv = contextSig.getGenericEnvironment();
+          return genericEnv->mapTypeIntoContext(result);
+        }
+      }
+      return result;
+    };
 
+    const auto result = TypeChecker::checkGenericArgumentsForDiagnostics(
+        module, genericSig.getRequirements(), substitutions);
     switch (result) {
-    case RequirementCheckResult::Failure:
-    case RequirementCheckResult::SubstitutionFailure:
+    case CheckGenericArgumentsResult::RequirementFailure:
+      if (loc.isValid()) {
+        TypeChecker::diagnoseRequirementFailure(
+            result.getRequirementFailureInfo(), loc, noteLoc,
+            UnboundGenericType::get(decl, parentTy, getASTContext()),
+            genericSig.getGenericParams(), substitutions, module);
+      }
+
+      LLVM_FALLTHROUGH;
+    case CheckGenericArgumentsResult::SubstitutionFailure:
       return ErrorType::get(getASTContext());
-    case RequirementCheckResult::Success:
+    case CheckGenericArgumentsResult::Success:
       break;
     }
   }
@@ -3608,7 +3618,7 @@ TypeResolver::resolveIsolatedTypeRepr(IsolatedTypeRepr *repr,
 NeverNullType
 TypeResolver::resolveCompileTimeConstTypeRepr(CompileTimeConstTypeRepr *repr,
                                               TypeResolutionOptions options) {
-  // TODO: more diagnotics
+  // TODO: more diagnostics
   return resolveType(repr->getBase(), options);
 }
 
@@ -3945,9 +3955,24 @@ TypeResolver::resolveExistentialType(ExistentialTypeRepr *repr,
   if (constraintType->hasError())
     return ErrorType::get(getASTContext());
 
-  auto anyStart = repr->getAnyLoc();
-  auto anyEnd = Lexer::getLocForEndOfToken(getASTContext().SourceMgr, anyStart);
   if (!constraintType->isExistentialType()) {
+    // Emit a tailored diagnostic for the incorrect optional
+    // syntax 'any P?' with a fix-it to add parenthesis.
+    auto wrapped = constraintType->getOptionalObjectType();
+    if (wrapped && (wrapped->is<ExistentialType>() ||
+                    wrapped->is<ExistentialMetatypeType>())) {
+      std::string fix;
+      llvm::raw_string_ostream OS(fix);
+      constraintType->print(OS, PrintOptions::forDiagnosticArguments());
+      diagnose(repr->getLoc(), diag::incorrect_optional_any,
+               constraintType)
+        .fixItReplace(repr->getSourceRange(), fix);
+      return constraintType;
+    }
+
+    auto anyStart = repr->getAnyLoc();
+    auto anyEnd = Lexer::getLocForEndOfToken(getASTContext().SourceMgr,
+                                             anyStart);
     diagnose(repr->getLoc(), diag::any_not_existential,
              constraintType->isTypeParameter(),
              constraintType)
@@ -3983,6 +4008,30 @@ NeverNullType TypeResolver::resolveMetatypeType(MetatypeTypeRepr *repr,
 NeverNullType
 TypeResolver::buildMetatypeType(MetatypeTypeRepr *repr, Type instanceType,
                                 Optional<MetatypeRepresentation> storedRepr) {
+  // If the instance type is an existential metatype, figure out if
+  // the syntax is of the form '(any <protocol metatype>).Type'. In
+  // this case, type resolution should produce the static metatype
+  // of that existential metatype, versus another existential metatype
+  // via the old '<protocol metatype>.Type' syntax.
+  if (instanceType->is<ExistentialMetatypeType>()) {
+    // First, look for the paren type.
+    auto *tuple = dyn_cast<TupleTypeRepr>(repr->getBase());
+    if (tuple && tuple->isParenType()) {
+      // Then, look through parens for the 'any' keyword.
+      auto *element = tuple->getWithoutParens();
+      if (auto *existential = dyn_cast<ExistentialTypeRepr>(element)) {
+        // Finally, look for a constraint ending with '.Type'. Assume the
+        // base is a protocol, otherwise resolveExistentialType would
+        // have emitted an error message and returned the concrete type
+        // instead of an existential metatype.
+        auto *constraint = existential->getConstraint()->getWithoutParens();
+        if (isa<MetatypeTypeRepr>(constraint)) {
+          return MetatypeType::get(instanceType, storedRepr);
+        }
+      }
+    }
+  }
+
   if (instanceType->isAnyExistentialType() &&
       !instanceType->is<ExistentialType>()) {
     // TODO: diagnose invalid representations?
@@ -4257,7 +4306,6 @@ public:
                            proto->getDeclaredInterfaceType(),
                            proto->getExistentialType(),
                            /*isAlias=*/false)
-            .limitBehavior(DiagnosticBehavior::Warning)
             .fixItReplace(replaceRepr->getSourceRange(), fix);
       }
     } else if (auto *alias = dyn_cast_or_null<TypeAliasDecl>(comp->getBoundDecl())) {
@@ -4267,8 +4315,7 @@ public:
       // existential type.
       if (type->isConstraintType()) {
         auto layout = type->getExistentialLayout();
-        for (auto *proto : layout.getProtocols()) {
-          auto *protoDecl = proto->getDecl();
+        for (auto *protoDecl : layout.getProtocols()) {
           if (!protoDecl->existentialRequiresAny())
             continue;
 
@@ -4277,7 +4324,6 @@ public:
                              alias->getDeclaredInterfaceType(),
                              ExistentialType::get(alias->getDeclaredInterfaceType()),
                              /*isAlias=*/true)
-              .limitBehavior(DiagnosticBehavior::Warning)
               .fixItReplace(replaceRepr->getSourceRange(), fix);
         }
       }

@@ -221,7 +221,7 @@ private:
   // It is used if a function has no source-file association.
   llvm::DenseMap<SILFunction *, IRGenModule *> DefaultIGMForFunction;
 
-  // The IGMs where sepecializations of functions are emitted. The key is the
+  // The IGMs where specializations of functions are emitted. The key is the
   // non-specialized function.
   // Storing all specializations of a function in the same IGM increases the
   // chances of function merging.
@@ -575,6 +575,9 @@ enum class MangledTypeRefRole {
   /// The mangled type reference is used for a default associated type
   /// witness.
   DefaultAssociatedTypeWitness,
+  /// The mangled type reference must be a flat string (i.e. no
+  /// symbolic references) and unique for the target type.
+  FlatUnique,
 };
 
 /// IRGenModule - Primary class for emitting IR for global declarations.
@@ -893,10 +896,18 @@ public:
   std::string GetObjCSectionName(StringRef Section, StringRef MachOAttributes);
   void SetCStringLiteralSection(llvm::GlobalVariable *GV, ObjCLabelType Type);
 
-  // Mapping of AsyncFunctionPointer records to their corresponding
-  // `@llvm.coro.id.async` intrinsic tag in the function implementation.
-  llvm::DenseMap<llvm::GlobalVariable*, llvm::CallInst*> AsyncCoroIDs;
-
+  void addAsyncCoroIDMapping(llvm::GlobalVariable *asyncFunctionPointer,
+                             llvm::CallInst *coro_id_builtin);
+  
+  llvm::CallInst *getAsyncCoroIDMapping(
+                                    llvm::GlobalVariable *asyncFunctionPointer);
+  
+  void markAsyncFunctionPointerForPadding(
+                                    llvm::GlobalVariable *asyncFunctionPointer);
+  
+  bool isAsyncFunctionPointerMarkedForPadding(
+                                    llvm::GlobalVariable *asyncFunctionPointer);
+  
 private:
   Size PtrSize;
   Size AtomicBoolSize;
@@ -911,7 +922,18 @@ private:
   llvm::PointerType *EnumValueWitnessTablePtrTy = nullptr;
 
   llvm::DenseMap<llvm::Type *, SpareBitVector> SpareBitsForTypes;
-  
+
+  // Mapping of AsyncFunctionPointer records to their corresponding
+  // `@llvm.coro.id.async` intrinsic tag in the function implementation.
+  // This is used for a runtime bug workaround where we need to pad the initial
+  // context size for tasks used as `async let` entry points.
+  //
+  // An entry in the map may have a null value, to indicate that a not-yet-
+  // emitted async function pointer should get the padding applied when it is
+  // emitted.
+  llvm::DenseMap<llvm::GlobalVariable*, llvm::CallInst*> AsyncCoroIDsForPadding;
+
+
 //--- Types -----------------------------------------------------------------
 public:
   const ProtocolInfo &getProtocolInfo(ProtocolDecl *D, ProtocolInfoKind kind);
@@ -977,8 +999,10 @@ public:
   substOpaqueTypesWithUnderlyingTypes(CanType type,
                                       ProtocolConformanceRef conformance);
 
-  bool isResilient(NominalTypeDecl *decl, ResilienceExpansion expansion);
-  bool hasResilientMetadata(ClassDecl *decl, ResilienceExpansion expansion);
+  bool isResilient(NominalTypeDecl *decl, ResilienceExpansion expansion,
+                   ClassDecl *asViewedFromRootClass = nullptr);
+  bool hasResilientMetadata(ClassDecl *decl, ResilienceExpansion expansion,
+                            ClassDecl *asViewedFromRootClass = nullptr);
   ResilienceExpansion getResilienceExpansionForAccess(NominalTypeDecl *decl);
   ResilienceExpansion getResilienceExpansionForLayout(NominalTypeDecl *decl);
   ResilienceExpansion getResilienceExpansionForLayout(SILGlobalVariable *var);
@@ -1040,6 +1064,10 @@ public:
   ConstantReference getConstantReferenceForProtocolDescriptor(ProtocolDecl *proto);
 
   ConstantIntegerLiteral getConstantIntegerLiteral(APInt value);
+
+  llvm::Constant *getOrCreateLazyGlobalVariable(LinkEntity entity,
+      llvm::function_ref<ConstantInitFuture(ConstantInitBuilder &)> build,
+      llvm::function_ref<void(llvm::GlobalVariable *)> finish);
 
   void addUsedGlobal(llvm::GlobalValue *global);
   void addCompilerUsedGlobal(llvm::GlobalValue *global);

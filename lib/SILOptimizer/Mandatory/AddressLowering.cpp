@@ -37,7 +37,7 @@
 ///
 /// 1. Reused-storage: Some operations are guaranteed to reuse their operand's
 /// storage. This includes extracting an enum payload and opening an existential
-/// value. This is required avoid introducing new copies or moves.
+/// value. This is required to avoid introducing new copies or moves.
 ///
 ///   // %data's storage must reuse storage allocated for %enum
 ///   %data = unchecked_enum_data %enum : $Optional<T>, #Optional.some!enumelt
@@ -798,6 +798,8 @@ static Operand *getProjectedDefOperand(SILValue value) {
 /// is address-only, then the operand must be address-only and therefore must
 /// mapped to ValueStorage.
 ///
+/// If \p value is an unchecked_bitwise_cast, then return the cast operand.
+///
 /// open_existential_value must reuse storage because the boxed value is shared
 /// with other instances of the existential. An explicit copy is needed to
 /// obtain an owned value.
@@ -812,12 +814,18 @@ static Operand *getReusedStorageOperand(SILValue value) {
   case ValueKind::OpenExistentialValueInst:
   case ValueKind::OpenExistentialBoxValueInst:
   case ValueKind::UncheckedEnumDataInst:
+  case ValueKind::UncheckedBitwiseCastInst:
     return &cast<SingleValueInstruction>(value)->getOperandRef(0);
 
   case ValueKind::SILPhiArgument: {
     if (auto *term = cast<SILPhiArgument>(value)->getTerminatorForResult()) {
       if (auto *switchEnum = dyn_cast<SwitchEnumInst>(term)) {
         return &switchEnum->getAllOperands()[0];
+      }
+      if (auto *checkedCastBr = dyn_cast<CheckedCastBranchInst>(term)) {
+        if (value->getParentBlock() == checkedCastBr->getFailureBB()) {
+          return &checkedCastBr->getAllOperands()[0];
+        }
       }
     }
     break;
@@ -2500,12 +2508,6 @@ protected:
   // types.
   void visitOpenExistentialValueInst(OpenExistentialValueInst *openExistential);
 
-  void visitOpenExistentialBoxValueInst(
-      OpenExistentialBoxValueInst *openExistentialBox) {
-    // FIXME: Unimplemented
-    llvm::report_fatal_error("Unimplemented OpenExistentialBox use.");
-  }
-
   void visitReturnInst(ReturnInst *returnInst) {
     // Returns are rewritten for any function with indirect results after
     // opaque value rewriting.
@@ -2551,10 +2553,22 @@ protected:
   // Extract from an opaque tuple.
   void visitTupleExtractInst(TupleExtractInst *extractInst);
 
-  void visitUncheckedBitwiseCast(UncheckedBitwiseCastInst *uncheckedCastInst) {
-    // FIXME: Unimplemented
-    llvm::report_fatal_error("Unimplemented UncheckedBitwiseCast use.");
+  void
+  visitUncheckedBitwiseCastInst(UncheckedBitwiseCastInst *uncheckedCastInst) {
+    SILValue srcVal = uncheckedCastInst->getOperand();
+    SILValue srcAddr = pass.valueStorageMap.getStorage(srcVal).storageAddress;
+
+    auto destAddr = builder.createUncheckedAddrCast(
+        uncheckedCastInst->getLoc(), srcAddr,
+        uncheckedCastInst->getType().getAddressType());
+
+    markRewritten(uncheckedCastInst, destAddr);
   }
+
+  void visitUnconditionalCheckedCastInst(
+      UnconditionalCheckedCastInst *uncondCheckedCast);
+
+  void visitCheckedCastBranchInst(CheckedCastBranchInst *checkedCastBranch);
 
   void visitUncheckedEnumDataInst(UncheckedEnumDataInst *enumDataInst);
 };
@@ -2615,15 +2629,7 @@ void UseRewriter::visitOpenExistentialValueInst(
       openExistential->getType().getAddressType(),
       OpenedExistentialAccess::Immutable);
 
-  SmallVector<Operand *, 4> typeUses;
-  for (Operand *use : openExistential->getUses()) {
-    if (use->isTypeDependent()) {
-      typeUses.push_back(use);
-    }
-  }
-  for (Operand *use : typeUses) {
-    use->set(openAddr);
-  }
+  openExistential->replaceAllTypeDependentUsesWith(openAddr);
   markRewritten(openExistential, openAddr);
 }
 
@@ -2805,6 +2811,89 @@ void UseRewriter::visitSwitchEnumInst(SwitchEnumInst * switchEnum) {
                                defaultCounter);
 }
 
+void UseRewriter::visitCheckedCastBranchInst(
+    CheckedCastBranchInst *checkedCastBranch) {
+  auto loc = checkedCastBranch->getLoc();
+  auto *func = checkedCastBranch->getFunction();
+  auto *successBB = checkedCastBranch->getSuccessBB();
+  auto *failureBB = checkedCastBranch->getFailureBB();
+  auto *oldSuccessVal = successBB->getArgument(0);
+  auto *oldFailureVal = failureBB->getArgument(0);
+  auto termBuilder = pass.getTermBuilder(checkedCastBranch);
+  auto successBuilder = pass.getBuilder(successBB->begin());
+  auto failureBuilder = pass.getBuilder(failureBB->begin());
+  bool isAddressOnlyTarget = oldSuccessVal->getType().isAddressOnly(*func);
+
+  auto srcAddr = pass.valueStorageMap.getStorage(use->get()).storageAddress;
+
+  if (isAddressOnlyTarget) {
+    // If target is opaque, use the storage address mapped to success
+    // block's argument as the destination for checked_cast_addr_br.
+    SILValue destAddr =
+        pass.valueStorageMap.getStorage(oldSuccessVal).storageAddress;
+
+    termBuilder.createCheckedCastAddrBranch(
+        loc, CastConsumptionKind::TakeOnSuccess, srcAddr,
+        checkedCastBranch->getSourceFormalType(), destAddr,
+        checkedCastBranch->getTargetFormalType(), successBB, failureBB,
+        checkedCastBranch->getTrueBBCount(),
+        checkedCastBranch->getFalseBBCount());
+
+    // In this case, since both success and failure block's args are opaque,
+    // create dummy loads from their storage addresses that will later be
+    // rewritten to copy_addr in DefRewriter::visitLoadInst
+    auto newSuccessVal = successBuilder.createTrivialLoadOr(
+        loc, destAddr, LoadOwnershipQualifier::Take);
+    oldSuccessVal->replaceAllUsesWith(newSuccessVal);
+    successBB->eraseArgument(0);
+
+    pass.valueStorageMap.replaceValue(oldSuccessVal, newSuccessVal);
+
+    auto newFailureVal = failureBuilder.createTrivialLoadOr(
+        loc, srcAddr, LoadOwnershipQualifier::Take);
+    oldFailureVal->replaceAllUsesWith(newFailureVal);
+    failureBB->eraseArgument(0);
+
+    pass.valueStorageMap.replaceValue(oldFailureVal, newFailureVal);
+    markRewritten(newFailureVal, srcAddr);
+  } else {
+    // If the target is loadable, create a stack temporary to be used as the
+    // destination for checked_cast_addr_br.
+    SILValue destAddr = termBuilder.createAllocStack(
+        loc, checkedCastBranch->getTargetLoweredType());
+
+    termBuilder.createCheckedCastAddrBranch(
+        loc, CastConsumptionKind::TakeOnSuccess, srcAddr,
+        checkedCastBranch->getSourceFormalType(), destAddr,
+        checkedCastBranch->getTargetFormalType(), successBB, failureBB,
+        checkedCastBranch->getTrueBBCount(),
+        checkedCastBranch->getFalseBBCount());
+
+    // Replace the success block arg with loaded value from destAddr, and delete
+    // the success block arg.
+    auto newSuccessVal = successBuilder.createTrivialLoadOr(
+        loc, destAddr, LoadOwnershipQualifier::Take);
+    oldSuccessVal->replaceAllUsesWith(newSuccessVal);
+    successBB->eraseArgument(0);
+
+    successBuilder.createDeallocStack(loc, destAddr);
+    failureBuilder.createDeallocStack(loc, destAddr);
+
+    // Since failure block arg is opaque, create dummy load from its storage
+    // address. This will be replaced later with copy_addr in
+    // DefRewriter::visitLoadInst.
+    auto newFailureVal = failureBuilder.createTrivialLoadOr(
+        loc, srcAddr, LoadOwnershipQualifier::Take);
+    oldFailureVal->replaceAllUsesWith(newFailureVal);
+    failureBB->eraseArgument(0);
+
+    pass.valueStorageMap.replaceValue(oldFailureVal, newFailureVal);
+    markRewritten(newFailureVal, srcAddr);
+  }
+
+  pass.deleter.forceDelete(checkedCastBranch);
+}
+
 void UseRewriter::visitUncheckedEnumDataInst(
     UncheckedEnumDataInst *enumDataInst) {
   assert(use == getReusedStorageOperand(enumDataInst));
@@ -2823,6 +2912,38 @@ void UseRewriter::visitUncheckedEnumDataInst(
       builder.createUncheckedTakeEnumDataAddr(loc, srcAddr, elt, destTy);
 
   markRewritten(enumDataInst, enumAddrInst);
+}
+
+void UseRewriter::visitUnconditionalCheckedCastInst(
+    UnconditionalCheckedCastInst *uncondCheckedCast) {
+  SILValue srcVal = uncondCheckedCast->getOperand();
+  assert(srcVal->getType().isAddressOnly(*pass.function));
+  SILValue srcAddr = pass.valueStorageMap.getStorage(srcVal).storageAddress;
+
+  if (uncondCheckedCast->getType().isAddressOnly(*pass.function)) {
+    // When cast destination has address only type, use the storage address
+    SILValue destAddr = addrMat.materializeAddress(uncondCheckedCast);
+    markRewritten(uncondCheckedCast, destAddr);
+    builder.createUnconditionalCheckedCastAddr(
+        uncondCheckedCast->getLoc(), srcAddr, srcAddr->getType().getASTType(),
+        destAddr, destAddr->getType().getASTType());
+    return;
+  }
+  // For loadable cast destination type, create a stack temporary
+  SILValue destAddr = builder.createAllocStack(uncondCheckedCast->getLoc(),
+                                               uncondCheckedCast->getType());
+  builder.createUnconditionalCheckedCastAddr(
+      uncondCheckedCast->getLoc(), srcAddr, srcAddr->getType().getASTType(),
+      destAddr, destAddr->getType().getASTType());
+  auto nextBuilder =
+      pass.getBuilder(uncondCheckedCast->getNextInstruction()->getIterator());
+  auto dest = nextBuilder.createLoad(
+      uncondCheckedCast->getLoc(), destAddr,
+      destAddr->getType().isTrivial(*uncondCheckedCast->getFunction())
+          ? LoadOwnershipQualifier::Trivial
+          : LoadOwnershipQualifier::Copy);
+  nextBuilder.createDeallocStack(uncondCheckedCast->getLoc(), destAddr);
+  uncondCheckedCast->replaceAllUsesWith(dest);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2854,7 +2975,6 @@ public:
   static void rewriteValue(SILValue value, AddressLoweringState &pass) {
     if (auto *inst = value->getDefiningInstruction()) {
       DefRewriter(pass, value, inst->getIterator()).visit(inst);
-
     } else {
       // function args are already rewritten.
       auto *blockArg = cast<SILPhiArgument>(value);
@@ -2871,6 +2991,14 @@ protected:
       LLVM_DEBUG(llvm::dbgs() << "  STORAGE "; storage.storageAddress->dump());
 
     storage.storageAddress = addrMat.materializeAddress(arg);
+  }
+
+  void setStorageAddress(SILValue oldValue, SILValue addr) {
+    auto &storage = pass.valueStorageMap.getStorage(oldValue);
+    // getReusedStorageOperand() ensures that oldValue does not already have
+    // separate storage. So there's no need to delete its alloc_stack.
+    assert(!storage.storageAddress || storage.storageAddress == addr);
+    storage.storageAddress = addr;
   }
 
   void beforeVisit(SILInstruction *inst) {
@@ -2929,11 +3057,18 @@ protected:
     addrMat.initializeComposingUse(&initExistentialValue->getOperandRef());
   }
 
-  // Project an opaque value out of a box-type existential.
   void visitOpenExistentialBoxValueInst(
-      OpenExistentialBoxValueInst *openExistentialBox) {
-    // FIXME: Unimplemented
-    llvm::report_fatal_error("Unimplemented OpenExistentialBoxValue def.");
+      OpenExistentialBoxValueInst *openExistentialBoxValue) {
+    // Replace the module's openedArchetypesDef
+    pass.getModule()->willDeleteInstruction(openExistentialBoxValue);
+
+    auto *openAddr = builder.createOpenExistentialBox(
+        openExistentialBoxValue->getLoc(),
+        openExistentialBoxValue->getOperand(),
+        openExistentialBoxValue->getType().getAddressType());
+
+    openExistentialBoxValue->replaceAllTypeDependentUsesWith(openAddr);
+    setStorageAddress(openExistentialBoxValue, openAddr);
   }
 
   // Load an opaque value.
@@ -2967,6 +3102,29 @@ protected:
     // may be loadable types.
     for (Operand &operand : tupleInst->getAllOperands())
       addrMat.initializeComposingUse(&operand);
+  }
+
+  void visitUnconditionalCheckedCastInst(
+      UnconditionalCheckedCastInst *uncondCheckedCast) {
+    SILValue srcVal = uncondCheckedCast->getOperand();
+    assert(srcVal->getType().isLoadable(*pass.function));
+    assert(uncondCheckedCast->getType().isAddressOnly(*pass.function));
+
+    // Create a stack temporary to store the srcVal
+    SILValue srcAddr = builder.createAllocStack(uncondCheckedCast->getLoc(),
+                                                srcVal->getType());
+    builder.createStore(uncondCheckedCast->getLoc(), srcVal, srcAddr,
+                        srcVal->getType().isTrivial(*srcVal->getFunction())
+                            ? StoreOwnershipQualifier::Trivial
+                            : StoreOwnershipQualifier::Init);
+    // Use the storage address as destination
+    SILValue destAddr = addrMat.materializeAddress(uncondCheckedCast);
+    builder.createUnconditionalCheckedCastAddr(
+        uncondCheckedCast->getLoc(), srcAddr, srcAddr->getType().getASTType(),
+        destAddr, destAddr->getType().getASTType());
+
+    pass.getBuilder(uncondCheckedCast->getNextInstruction()->getIterator())
+        .createDeallocStack(uncondCheckedCast->getLoc(), srcAddr);
   }
 };
 } // end anonymous namespace
@@ -3122,7 +3280,8 @@ static void deleteRewrittenInstructions(AddressLoweringState &pass) {
       }
     }
     LLVM_DEBUG(llvm::dbgs() << "DEAD "; deadInst->dump());
-    if (!isa<OpenExistentialValueInst>(deadInst)) {
+    if (!isa<OpenExistentialValueInst>(deadInst) &&
+        !isa<OpenExistentialBoxValueInst>(deadInst)) {
       pass.deleter.forceDeleteWithUsers(deadInst);
       continue;
     }

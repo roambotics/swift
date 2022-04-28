@@ -58,8 +58,18 @@ template <class I = SILInstruction> I *castToInst(BridgedInstruction inst) {
   return cast<I>(static_cast<SILNode *>(inst.obj)->castToInstruction());
 }
 
+template <class I = SILInstruction> I *castToInst(OptionalBridgedInstruction inst) {
+  if (!inst.obj)
+    return nullptr;
+  return cast<I>(static_cast<SILNode *>(inst.obj)->castToInstruction());
+}
+
 inline SILBasicBlock *castToBasicBlock(BridgedBasicBlock block) {
   return static_cast<SILBasicBlock *>(block.obj);
+}
+
+template <class A = SILArgument> A *castToArgument(BridgedArgument argument) {
+  return cast<A>(static_cast<SILArgument *>(argument.obj));
 }
 
 inline SILFunction *castToFunction(BridgedFunction function) {
