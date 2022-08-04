@@ -899,6 +899,7 @@ public:
   SpecialKind getSpecialKind() const {
     return SpecialKind((Data & SpecialKindMask) >> SpecialKindShift);
   }
+  bool isOpaque() const { return getSpecialKind() == SpecialKind::None; }
   bool isClassConstrained() const {
     return getSpecialKind() == SpecialKind::Class;
   }
@@ -1347,6 +1348,11 @@ namespace SpecialPointerAuthDiscriminators {
 
   /// Protocol conformance descriptors.
   const uint16_t ProtocolConformanceDescriptor = 0xc6eb;
+
+  /// Pointer to value witness table stored in type metadata.
+  ///
+  /// Computed with ptrauth_string_discriminator("value_witness_table_t").
+  const uint16_t ValueWitnessTable = 0x2e3f;
 
   /// Extended existential type shapes.
   const uint16_t ExtendedExistentialTypeShape = 0x5a3d; // = 23101
@@ -2359,6 +2365,8 @@ enum class TaskOptionRecordKind : uint8_t {
   AsyncLet  = 2,
   /// Request a child task for an 'async let'.
   AsyncLetWithBuffer = 3,
+  /// Request a child task for swift_task_run_inline.
+  RunInline = UINT8_MAX,
 };
 
 /// Flags for cancellation records.

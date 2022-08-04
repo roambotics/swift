@@ -53,7 +53,7 @@ bool canOpcodeForwardGuaranteedValues(Operand *use);
 // This is the use-def equivalent of use->getOperandOwnership() ==
 // OperandOwnership::ForwardingBorrow.
 inline bool isForwardingBorrow(SILValue value) {
-  assert(value.getOwnershipKind() == OwnershipKind::Guaranteed);
+  assert(value->getOwnershipKind() == OwnershipKind::Guaranteed);
   return canOpcodeForwardGuaranteedValues(value);
 }
 
@@ -74,7 +74,7 @@ bool canOpcodeForwardOwnedValues(Operand *use);
 // This is the use-def equivalent of use->getOperandOwnership() ==
 // OperandOwnership::ForwardingConsume.
 inline bool isForwardingConsume(SILValue value) {
-  assert(value.getOwnershipKind() == OwnershipKind::Owned);
+  assert(value->getOwnershipKind() == OwnershipKind::Owned);
   return canOpcodeForwardOwnedValues(value);
 }
 
@@ -445,7 +445,7 @@ private:
 
 public:
   static BorrowedValueKind get(SILValue value) {
-    if (value.getOwnershipKind() != OwnershipKind::Guaranteed)
+    if (value->getOwnershipKind() != OwnershipKind::Guaranteed)
       return Kind::Invalid;
     switch (value->getKind()) {
     default:
@@ -578,14 +578,19 @@ struct BorrowedValue {
   ///
   /// \p deadEndBlocks is optional during transition. It will be completely
   /// removed in an upcoming commit.
-  bool areUsesWithinLocalScope(ArrayRef<Operand *> uses,
-                               DeadEndBlocks *deadEndBlocks) const;
+  bool areUsesWithinTransitiveScope(ArrayRef<Operand *> uses,
+                                    DeadEndBlocks *deadEndBlocks) const;
 
   /// Given a local borrow scope introducer, visit all non-forwarding consuming
   /// users. This means that this looks through guaranteed block arguments. \p
   /// visitor is *not* called on Reborrows, only on final scope ending uses.
   bool
   visitExtendedScopeEndingUses(function_ref<bool(Operand *)> visitor) const;
+
+  /// Visit all lifetime ending operands of the entire borrow scope including
+  /// reborrows
+  bool
+  visitTransitiveLifetimeEndingUses(function_ref<bool(Operand *)> func) const;
 
   void print(llvm::raw_ostream &os) const;
   SWIFT_DEBUG_DUMP { print(llvm::dbgs()); }
@@ -1020,7 +1025,7 @@ private:
 
 public:
   static OwnedValueIntroducerKind get(SILValue value) {
-    if (value.getOwnershipKind() != OwnershipKind::Owned)
+    if (value->getOwnershipKind() != OwnershipKind::Owned)
       return Kind::Invalid;
 
     switch (value->getKind()) {
@@ -1211,6 +1216,14 @@ using BaseValueSet = SmallPtrSet<SILValue, 8>;
 void findTransitiveReborrowBaseValuePairs(
     BorrowingOperand initialScopeOperand, SILValue origBaseValue,
     function_ref<void(SILPhiArgument *, SILValue)> visitReborrowBaseValuePair);
+
+/// Visit the phis in the same block as \p phi which are reborrows of a borrow
+/// of one of the values reaching \p phi.
+///
+/// If the visitor returns false, stops visiting and returns false.  Otherwise,
+/// returns true.
+bool visitAdjacentReborrowsOfPhi(SILPhiArgument *phi,
+                                 function_ref<bool(SILPhiArgument *)> visitor);
 
 /// Given a begin of a borrow scope, visit all end_borrow users of the borrow or
 /// its reborrows.

@@ -224,7 +224,7 @@ ValueOwnershipKindClassifier::visitForwardingInst(SILInstruction *i,
       ops, [&i](const Operand &op) -> Optional<ValueOwnershipKind> {
         if (i->isTypeDependentOperand(op))
           return None;
-        return op.get().getOwnershipKind();
+        return op.get()->getOwnershipKind();
       }));
 
   if (!mergedValue) {
@@ -275,6 +275,8 @@ FORWARDING_OWNERSHIP_INST(InitExistentialRef)
 FORWARDING_OWNERSHIP_INST(DifferentiableFunction)
 FORWARDING_OWNERSHIP_INST(LinearFunction)
 FORWARDING_OWNERSHIP_INST(MarkMustCheck)
+FORWARDING_OWNERSHIP_INST(MoveOnlyWrapperToCopyableValue)
+FORWARDING_OWNERSHIP_INST(CopyableToMoveOnlyWrapperValue)
 #undef FORWARDING_OWNERSHIP_INST
 
 ValueOwnershipKind
@@ -559,6 +561,7 @@ CONSTANT_OWNERSHIP_BUILTIN(None, StartAsyncLetWithLocalBuffer)
 CONSTANT_OWNERSHIP_BUILTIN(None, EndAsyncLetLifetime)
 CONSTANT_OWNERSHIP_BUILTIN(None, CreateTaskGroup)
 CONSTANT_OWNERSHIP_BUILTIN(None, DestroyTaskGroup)
+CONSTANT_OWNERSHIP_BUILTIN(None, TaskRunInline)
 CONSTANT_OWNERSHIP_BUILTIN(None, Move)
 CONSTANT_OWNERSHIP_BUILTIN(None, Copy)
 

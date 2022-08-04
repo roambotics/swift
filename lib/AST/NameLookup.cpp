@@ -36,6 +36,7 @@
 #include "swift/Basic/Statistic.h"
 #include "swift/ClangImporter/ClangImporterRequests.h"
 #include "swift/Parse/Lexer.h"
+#include "swift/Strings.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/Basic/Specifiers.h"
 #include "llvm/ADT/DenseMap.h"
@@ -172,16 +173,148 @@ void UsableFilteringDeclConsumer::foundDecl(ValueDecl *D,
 
   switch (reason) {
   case DeclVisibilityKind::LocalVariable:
-    // Skip if Loc is before the found decl, unless its a TypeDecl (whose use
-    // before its declaration is still allowed)
-    if (!isa<TypeDecl>(D) && !SM.isBeforeInBuffer(D->getLoc(), Loc))
+  case DeclVisibilityKind::FunctionParameter:
+    // Skip if Loc is before the found decl if the decl is a var/let decl.
+    // Type and func decls can be referenced before its declaration, or from
+    // within nested type decls.
+    if (isa<VarDecl>(D)) {
+      if (reason == DeclVisibilityKind::LocalVariable) {
+        // Workaround for fast-completion. A loc in the current context might be
+        // in a loc
+        auto tmpLoc = Loc;
+        if (D->getDeclContext() != DC) {
+          if (auto *contextD = DC->getAsDecl())
+            tmpLoc = contextD->getStartLoc();
+        }
+        if (!SM.isBeforeInBuffer(D->getLoc(), Loc))
+          return;
+      }
+
+      // A type context cannot close over values defined in outer type contexts.
+      if (D->getDeclContext()->getInnermostTypeContext() != typeContext)
+        return;
+    }
+    break;
+
+  case DeclVisibilityKind::MemberOfOutsideNominal:
+    // A type context cannot close over members of outer type contexts, except
+    // for type decls.
+    if (!isa<TypeDecl>(D) && !D->isStatic())
       return;
     break;
-  default:
-    // The rest of the file is currently skipped, so no need to check
-    // decl location for VisibleAtTopLevel. Other visibility kinds are always
-    // usable
+
+  case DeclVisibilityKind::MemberOfCurrentNominal:
+  case DeclVisibilityKind::MemberOfSuper:
+  case DeclVisibilityKind::MemberOfProtocolConformedToByCurrentNominal:
+  case DeclVisibilityKind::MemberOfProtocolDerivedByCurrentNominal:
+  case DeclVisibilityKind::DynamicLookup:
+    // Members on 'Self' including inherited/derived ones are always usable.
     break;
+
+  case DeclVisibilityKind::GenericParameter:
+    // Generic params are type decls and are always usable from nested context.
+    break;
+
+  case DeclVisibilityKind::VisibleAtTopLevel:
+    // The rest of the file is currently skipped, so no need to check
+    // decl location for VisibleAtTopLevel.
+    break;
+  }
+
+  // Filter out shadowed decls. Do this for only usable values even though
+  // unusable values actually can shadow outer values, because compilers might
+  // be able to diagnose it with fix-it to add the qualification. E.g.
+  //   func foo(global: T) {}
+  //   struct Outer {
+  //     func foo(outer: T) {}
+  //     func test() {
+  //       struct Inner {
+  //         func test() {
+  //           <HERE>
+  //         }
+  //       }
+  //     }
+  //   }
+  // In this case 'foo(global:)' is shadowed by 'foo(outer:)', but 'foo(outer:)'
+  // is _not_ usable because it's outside the current type context, whereas
+  // 'foo(global:)' is still usable with 'ModuleName.' qualification.
+  // FIXME: (for code completion,) If a global value or a static type member is
+  // shadowd, we should suggest it with prefix (e.g. 'ModuleName.value').
+  auto inserted = SeenNames.insert({D->getBaseName(), {D, reason}});
+  if (!inserted.second) {
+    auto shadowingReason = inserted.first->second.second;
+    auto *shadowingD = inserted.first->second.first;
+
+    // A type decl cannot have overloads, and shadows everything outside the
+    // scope.
+    if (isa<TypeDecl>(shadowingD))
+      return;
+
+    switch (shadowingReason) {
+    case DeclVisibilityKind::LocalVariable:
+    case DeclVisibilityKind::FunctionParameter:
+      // Local func and var/let with a conflicting name.
+      //   func foo() {
+      //     func value(arg: Int) {}
+      //     var value = ""
+      //   }
+      // In this case, 'var value' wins, regardless of their source order.
+      // So, for confilicting local values in the same decl context, even if the
+      // 'var value' is reported after 'func value', don't shadow it, but we
+      // shadow everything with the name after that.
+      if (reason == DeclVisibilityKind::LocalVariable &&
+          isa<VarDecl>(D) && !isa<VarDecl>(shadowingD) &&
+          shadowingD->getDeclContext() == D->getDeclContext()) {
+        // Replace the shadowing decl so we shadow subsequent conflicting decls.
+        inserted.first->second = {D, reason};
+        break;
+      }
+
+      // Otherwise, a local value shadows everything outside the scope.
+      return;
+
+    case DeclVisibilityKind::GenericParameter:
+      // A Generic parameter is a type name. It shadows everything outside the
+      // generic context.
+      return;
+
+    case DeclVisibilityKind::MemberOfCurrentNominal:
+    case DeclVisibilityKind::MemberOfSuper:
+    case DeclVisibilityKind::MemberOfProtocolConformedToByCurrentNominal:
+    case DeclVisibilityKind::MemberOfProtocolDerivedByCurrentNominal:
+    case DeclVisibilityKind::DynamicLookup:
+      switch (reason) {
+      case DeclVisibilityKind::MemberOfCurrentNominal:
+      case DeclVisibilityKind::MemberOfSuper:
+      case DeclVisibilityKind::MemberOfProtocolConformedToByCurrentNominal:
+      case DeclVisibilityKind::MemberOfProtocolDerivedByCurrentNominal:
+      case DeclVisibilityKind::DynamicLookup:
+        // Members on the current type context don't shadow members with the
+        // same base name on the current type contxt. They are overloads.
+        break;
+      default:
+        // Members of a type context shadows values/types outside.
+        return;
+      }
+      break;
+
+    case DeclVisibilityKind::MemberOfOutsideNominal:
+      // For static values, it's unclear _which_ type context (i.e. this type,
+      // super classes, conforming protocols) this decl was found in. For now,
+      // consider all the outer nominals are the same.
+
+      if (reason == DeclVisibilityKind::MemberOfOutsideNominal)
+        break;
+
+      // Values outside the nominal are shadowed.
+      return;
+
+    case DeclVisibilityKind::VisibleAtTopLevel:
+      // Top level decls don't shadow anything.
+      // Well, that's not true. Decls in the current module shadows decls in
+      // the imported modules. But we don't care them here.
+      break;
+    }
   }
 
   ChainedConsumer.foundDecl(D, reason, dynamicLookupInfo);
@@ -518,6 +651,22 @@ static void recordShadowedDeclsAfterTypeMatch(
         if ((firstModule == concurModule) != (secondModule == concurModule)) {
           // If second module is _Concurrency, then it is shadowed by first.
           if (secondModule == concurModule) {
+            shadowed.insert(secondDecl);
+            continue;
+          }
+
+          // Otherwise, the first declaration is shadowed by the second.
+          shadowed.insert(firstDecl);
+          break;
+        }
+      }
+
+      // Next, prefer any other module over the _StringProcessing module.
+      if (auto spModule = ctx.getLoadedModule(ctx.Id_StringProcessing)) {
+        if ((firstModule == spModule) != (secondModule == spModule)) {
+          // If second module is _StringProcessing, then it is shadowed by
+          // first.
+          if (secondModule == spModule) {
             shadowed.insert(secondDecl);
             continue;
           }
@@ -1162,7 +1311,24 @@ class swift::ObjCMethodLookupTable
         : public llvm::DenseMap<std::pair<ObjCSelector, char>,
                                 StoredObjCMethods>,
           public ASTAllocated<ObjCMethodLookupTable>
-{};
+{
+  SWIFT_DEBUG_DUMP {
+    llvm::errs() << "ObjCMethodLookupTable:\n";
+    for (auto pair : *this) {
+      auto selector = pair.getFirst().first;
+      auto isInstanceMethod = pair.getFirst().second;
+      auto &methods = pair.getSecond();
+
+      llvm::errs() << "  \"" << (isInstanceMethod ? "-" : "+") << selector
+                   << "\":\n";
+      for (auto method : methods.Methods) {
+        llvm::errs() << "  - \"";
+        method->dumpRef(llvm::errs());
+        llvm::errs() << "\"\n";
+      }
+    }
+  }
+};
 
 MemberLookupTable::MemberLookupTable(ASTContext &ctx) {
   // Register a cleanup with the ASTContext to call the lookup table
@@ -1551,6 +1717,36 @@ NominalTypeDecl::lookupDirect(ObjCSelector selector, bool isInstance) {
   return stored.Methods;
 }
 
+/// If there is an apparent conflict between \p newDecl and one of the methods
+/// in \p vec, should we diagnose it?
+static bool
+shouldDiagnoseConflict(NominalTypeDecl *ty, AbstractFunctionDecl *newDecl,
+                       llvm::TinyPtrVector<AbstractFunctionDecl *> &vec) {
+  // Are all conflicting methods imported from ObjC and in our ObjC half or a
+  // bridging header? Some code bases implement ObjC methods in Swift even
+  // though it's not exactly supported.
+  auto newDeclModuleName = newDecl->getModuleContext()->getName();
+  if (llvm::all_of(vec, [&](AbstractFunctionDecl *oldDecl) {
+    if (!oldDecl->hasClangNode())
+      return false;
+    auto oldDeclModuleName = oldDecl->getModuleContext()->getName();
+    return oldDeclModuleName == newDeclModuleName
+               || oldDeclModuleName.str() == CLANG_HEADER_MODULE_NAME;
+  }))
+    return false;
+
+  // If we're looking at protocol requirements, is the new method an async
+  // alternative of any existing method, or vice versa?
+  if (isa<ProtocolDecl>(ty) &&
+      llvm::any_of(vec, [&](AbstractFunctionDecl *oldDecl) {
+    return newDecl->getAsyncAlternative(/*isKnownObjC=*/true) == oldDecl
+              || oldDecl->getAsyncAlternative(/*isKnownObjC=*/true) == newDecl;
+  }))
+    return false;
+
+  return true;
+}
+
 void NominalTypeDecl::recordObjCMethod(AbstractFunctionDecl *method,
                                        ObjCSelector selector) {
   if (!ObjCMethodLookup && !createObjCMethodLookup())
@@ -1566,12 +1762,11 @@ void NominalTypeDecl::recordObjCMethod(AbstractFunctionDecl *method,
     return;
 
   if (auto *sf = method->getParentSourceFile()) {
-    if (vec.size() == 1) {
-      // We have a conflict.
-      sf->ObjCMethodConflicts.push_back(std::make_tuple(this, selector,
-                                                        isInstanceMethod));
-    } if (vec.empty()) {
+    if (vec.empty()) {
       sf->ObjCMethodList.push_back(method);
+    } else if (shouldDiagnoseConflict(this, method, vec)) {
+      // We have a conflict.
+      sf->ObjCMethodConflicts.insert({ this, selector, isInstanceMethod });
     }
   }
 
@@ -1703,6 +1898,12 @@ void namelookup::extractDirectlyReferencedNominalTypes(
   }
 
   llvm_unreachable("Not a type containing nominal types?");
+}
+
+void namelookup::tryExtractDirectlyReferencedNominalTypes(
+    Type type, SmallVectorImpl<NominalTypeDecl *> &decls) {
+  if (!type->is<ModuleType>() && type->mayHaveMembers())
+    namelookup::extractDirectlyReferencedNominalTypes(type, decls);
 }
 
 bool DeclContext::lookupQualified(Type type,
@@ -2853,6 +3054,102 @@ swift::getDirectlyInheritedNominalTypeDecls(
   return result;
 }
 
+bool IsCallAsFunctionNominalRequest::evaluate(Evaluator &evaluator,
+                                              NominalTypeDecl *decl,
+                                              DeclContext *dc) const {
+  auto &ctx = dc->getASTContext();
+
+  // Do a qualified lookup for `callAsFunction`. We want to ignore access, as
+  // that will be checked when we actually try to solve with a `callAsFunction`
+  // member access.
+  SmallVector<ValueDecl *, 4> results;
+  auto opts = NL_QualifiedDefault | NL_ProtocolMembers | NL_IgnoreAccessControl;
+  dc->lookupQualified(decl, DeclNameRef(ctx.Id_callAsFunction), opts, results);
+
+  return llvm::any_of(results, [](ValueDecl *decl) -> bool {
+    if (auto *fd = dyn_cast<FuncDecl>(decl))
+      return fd->isCallAsFunctionMethod();
+    return false;
+  });
+}
+
+bool TypeBase::isCallAsFunctionType(DeclContext *dc) {
+  // We can perform the lookup at module scope to allow us to better cache the
+  // result across different contexts. Given we'll be doing a qualified lookup,
+  // this shouldn't make a difference.
+  dc = dc->getModuleScopeContext();
+
+  // Note this excludes AnyObject.
+  SmallVector<NominalTypeDecl *, 4> decls;
+  tryExtractDirectlyReferencedNominalTypes(this, decls);
+
+  auto &ctx = dc->getASTContext();
+  return llvm::any_of(decls, [&](auto *decl) {
+    IsCallAsFunctionNominalRequest req(decl, dc);
+    return evaluateOrDefault(ctx.evaluator, req, false);
+  });
+}
+
+template <class DynamicAttribute, class Req>
+static bool checkForDynamicAttribute(Evaluator &eval, NominalTypeDecl *decl) {
+  // If this type has the attribute on it, then yes!
+  if (decl->getAttrs().hasAttribute<DynamicAttribute>())
+    return true;
+
+  auto hasAttribute = [&](NominalTypeDecl *decl) -> bool {
+    return evaluateOrDefault(eval, Req{decl}, false);
+  };
+
+  // Check the protocols the type conforms to.
+  for (auto *proto : decl->getAllProtocols()) {
+    if (hasAttribute(proto))
+      return true;
+  }
+
+  // Check the superclass if present.
+  if (auto *classDecl = dyn_cast<ClassDecl>(decl)) {
+    if (auto *superclass = classDecl->getSuperclassDecl()) {
+      if (hasAttribute(superclass))
+        return true;
+    }
+  }
+  return false;
+}
+
+bool HasDynamicMemberLookupAttributeRequest::evaluate(
+    Evaluator &eval, NominalTypeDecl *decl) const {
+  using Req = HasDynamicMemberLookupAttributeRequest;
+  return checkForDynamicAttribute<DynamicMemberLookupAttr, Req>(eval, decl);
+}
+
+bool TypeBase::hasDynamicMemberLookupAttribute() {
+  SmallVector<NominalTypeDecl *, 4> decls;
+  tryExtractDirectlyReferencedNominalTypes(this, decls);
+
+  auto &ctx = getASTContext();
+  return llvm::any_of(decls, [&](auto *decl) {
+    HasDynamicMemberLookupAttributeRequest req(decl);
+    return evaluateOrDefault(ctx.evaluator, req, false);
+  });
+}
+
+bool HasDynamicCallableAttributeRequest::evaluate(Evaluator &eval,
+                                                  NominalTypeDecl *decl) const {
+  using Req = HasDynamicCallableAttributeRequest;
+  return checkForDynamicAttribute<DynamicCallableAttr, Req>(eval, decl);
+}
+
+bool TypeBase::hasDynamicCallableAttribute() {
+  SmallVector<NominalTypeDecl *, 4> decls;
+  tryExtractDirectlyReferencedNominalTypes(this, decls);
+
+  auto &ctx = getASTContext();
+  return llvm::any_of(decls, [&](auto *decl) {
+    HasDynamicCallableAttributeRequest req(decl);
+    return evaluateOrDefault(ctx.evaluator, req, false);
+  });
+}
+
 void FindLocalVal::checkPattern(const Pattern *Pat, DeclVisibilityKind Reason) {
   Pat->forEachVariable([&](VarDecl *VD) { checkValueDecl(VD, Reason); });
 }
@@ -2962,7 +3259,7 @@ void FindLocalVal::visitForEachStmt(ForEachStmt *S) {
   if (!isReferencePointInRange(S->getSourceRange()))
     return;
   visit(S->getBody());
-  if (!isReferencePointInRange(S->getSequence()->getSourceRange()))
+  if (!isReferencePointInRange(S->getParsedSequence()->getSourceRange()))
     checkPattern(S->getPattern(), DeclVisibilityKind::LocalVariable);
 }
 

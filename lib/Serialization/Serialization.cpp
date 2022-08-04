@@ -1004,7 +1004,7 @@ void Serializer::writeHeader(const SerializationOptions &options) {
     static const char* forcedDebugRevision =
       ::getenv("SWIFT_DEBUG_FORCE_SWIFTMODULE_REVISION");
     auto revision = forcedDebugRevision ?
-      forcedDebugRevision : version::getSwiftRevision();
+      forcedDebugRevision : version::getCurrentCompilerTag();
     Revision.emit(ScratchRecord, revision);
 
     IsOSSA.emit(ScratchRecord, options.IsOSSA);
@@ -1088,8 +1088,11 @@ void Serializer::writeHeader(const SerializationOptions &options) {
               ++Arg;
               continue;
             }
-          } else if (arg.startswith("-fdebug-prefix-map=")) {
-            // We don't serialize the debug prefix map flags as these
+          } else if (arg.startswith("-fdebug-prefix-map=") ||
+              arg.startswith("-ffile-prefix-map=") ||
+              arg.startswith("-fcoverage-prefix-map=") ||
+              arg.startswith("-fmacro-prefix-map=")) {
+            // We don't serialize any of the prefix map flags as these flags
             // contain absolute paths that are not usable on different
             // machines. These flags are not necessary to compile the
             // clang modules again so are safe to remove.
@@ -1528,6 +1531,7 @@ void Serializer::writeASTBlockEntity(const SILLayout *layout) {
   SILLayoutLayout::emitRecord(
                         Out, ScratchRecord, abbrCode,
                         addGenericSignatureRef(layout->getGenericSignature()),
+                        layout->capturesGenericEnvironment(),
                         layout->getFields().size(),
                         data);
 }
@@ -1589,6 +1593,7 @@ void Serializer::writeLocalNormalProtocolConformance(
         subs = subs.mapReplacementTypesOutOfContext();
 
       data.push_back(addSubstitutionMapRef(subs));
+      data.push_back(witness.getEnterIsolation().hasValue() ? 1 : 0);
   });
 
   unsigned abbrCode
@@ -2779,7 +2784,7 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       auto abbrCode = S.DeclTypeAbbrCodes[DerivativeDeclAttrLayout::Code];
       auto *attr = cast<DerivativeAttr>(DA);
       auto &ctx = S.getASTContext();
-      assert(attr->getOriginalFunction(ctx) &&
+      assert(attr->getOriginalFunction(ctx) && attr->getOriginalDeclaration() &&
              "`@derivative` attribute should have original declaration set "
              "during construction or parsing");
       auto origDeclNameRef = attr->getOriginalFunctionName();
@@ -3383,20 +3388,27 @@ public:
 
     SmallVector<DeclID, 8> relations;
     for (auto &rel : group->getHigherThan()) {
-      assert(rel.Group && "Undiagnosed invalid precedence group!");
-      relations.push_back(S.addDeclRef(rel.Group));
+      if (rel.Group) {
+        relations.push_back(S.addDeclRef(rel.Group));
+      } else if (!S.allowCompilerErrors()) {
+        assert(rel.Group && "Undiagnosed invalid precedence group!");
+      }
     }
+
+    size_t numHigher = relations.size();
     for (auto &rel : group->getLowerThan()) {
-      assert(rel.Group && "Undiagnosed invalid precedence group!");
-      relations.push_back(S.addDeclRef(rel.Group));
+      if (rel.Group) {
+        relations.push_back(S.addDeclRef(rel.Group));
+      } else if (!S.allowCompilerErrors()) {
+        assert(rel.Group && "Undiagnosed invalid precedence group!");
+      }
     }
 
     unsigned abbrCode = S.DeclTypeAbbrCodes[PrecedenceGroupLayout::Code];
     PrecedenceGroupLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
                                       nameID, contextID.getOpaqueValue(),
                                       associativity, group->isAssignment(),
-                                      group->getHigherThan().size(),
-                                      relations);
+                                      numHigher, relations);
   }
 
   void visitInfixOperatorDecl(const InfixOperatorDecl *op) {
@@ -3886,6 +3898,7 @@ public:
                            fn->needsNewVTableEntry(),
                            S.addDeclRef(fn->getOpaqueResultTypeDecl()),
                            fn->isUserAccessible(),
+                           fn->isDistributedThunk(),
                            nameComponentsAndDependencies);
 
     writeGenericParams(fn->getGenericParams());
@@ -3939,17 +3952,20 @@ public:
           S.DeclTypeAbbrCodes[ConditionalSubstitutionLayout::Code];
       for (const auto *subs :
            opaqueDecl->getConditionallyAvailableSubstitutions().drop_back()) {
-        SmallVector<IdentifierID, 4> conditions;
-
-        for (const auto &condition : subs->getAvailability()) {
-          auto lowerEndpoint = condition.getLowerEndpoint();
-          conditions.push_back(
-              S.addUniquedStringRef(lowerEndpoint.getAsString()));
-        }
-
         ConditionalSubstitutionLayout::emitRecord(
             S.Out, S.ScratchRecord, abbrCode,
-            S.addSubstitutionMapRef(subs->getSubstitutions()), conditions);
+            S.addSubstitutionMapRef(subs->getSubstitutions()));
+
+        unsigned condAbbrCode =
+            S.DeclTypeAbbrCodes[ConditionalSubstitutionConditionLayout::Code];
+        for (const auto &condition : subs->getAvailability()) {
+          ENCODE_VER_TUPLE(osVersion, llvm::Optional<llvm::VersionTuple>(
+                                          condition.first.getLowerEndpoint()));
+          ConditionalSubstitutionConditionLayout::emitRecord(
+              S.Out, S.ScratchRecord, condAbbrCode,
+              /*isUnavailable=*/condition.second,
+              LIST_VER_TUPLE_PIECES(osVersion));
+        }
       }
     }
   }
@@ -3997,6 +4013,7 @@ public:
                                rawAccessLevel,
                                fn->needsNewVTableEntry(),
                                fn->isTransparent(),
+                               fn->isDistributedThunk(),
                                dependencies);
 
     writeGenericParams(fn->getGenericParams());
@@ -4518,7 +4535,6 @@ public:
 
   void visitParenType(const ParenType *parenTy) {
     using namespace decls_block;
-    assert(parenTy->getParameterFlags().isNone());
     serializeSimpleWrapper<ParenTypeLayout>(parenTy->getUnderlyingType());
   }
 
@@ -4529,7 +4545,6 @@ public:
 
     abbrCode = S.DeclTypeAbbrCodes[TupleTypeEltLayout::Code];
     for (auto &elt : tupleTy->getElements()) {
-      assert(elt.getParameterFlags().isNone());
       TupleTypeEltLayout::emitRecord(
           S.Out, S.ScratchRecord, abbrCode,
           S.addDeclBaseNameRef(elt.getName()),
@@ -4714,6 +4729,12 @@ public:
     using namespace decls_block;
     serializeSimpleWrapper<SILBlockStorageTypeLayout>(
         storageTy->getCaptureType());
+  }
+
+  void visitSILMoveOnlyWrappedType(const SILMoveOnlyWrappedType *moveOnlyTy) {
+    using namespace decls_block;
+    serializeSimpleWrapper<SILMoveOnlyWrappedTypeLayout>(
+        moveOnlyTy->getInnerType());
   }
 
   void visitSILBoxType(const SILBoxType *boxTy) {
@@ -5121,6 +5142,7 @@ void Serializer::writeAllDeclsAndTypes() {
   registerDeclTypeAbbr<XRefLayout>();
 
   registerDeclTypeAbbr<ConditionalSubstitutionLayout>();
+  registerDeclTypeAbbr<ConditionalSubstitutionConditionLayout>();
 
 #define DECL_ATTR(X, NAME, ...) \
   registerDeclTypeAbbr<NAME##DeclAttrLayout>();
@@ -5529,10 +5551,10 @@ static void collectInterestingNestedDeclarations(
       if (isLocal)
         return;
 
-      if (auto owningClass = func->getDeclContext()->getSelfClassDecl()) {
+      if (auto owningType = func->getDeclContext()->getSelfNominalTypeDecl()) {
         if (func->isObjC()) {
           Mangle::ASTMangler mangler;
-          std::string ownerName = mangler.mangleNominalType(owningClass);
+          std::string ownerName = mangler.mangleNominalType(owningType);
           assert(!ownerName.empty() && "Mangled type came back empty!");
 
           objcMethods[func->getObjCSelector()].push_back(

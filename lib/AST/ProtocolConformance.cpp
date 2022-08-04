@@ -42,11 +42,12 @@ STATISTIC(NumConformanceLookupTables, "# of conformance lookup tables built");
 using namespace swift;
 
 Witness::Witness(ValueDecl *decl, SubstitutionMap substitutions,
-                 GenericEnvironment *syntheticEnv,
-                 SubstitutionMap reqToSynthesizedEnvSubs,
-                 GenericSignature derivativeGenSig) {
-  if (!syntheticEnv && substitutions.empty() &&
-      reqToSynthesizedEnvSubs.empty()) {
+                 GenericSignature witnessThunkSig,
+                 SubstitutionMap reqToWitnessThunkSigSubs,
+                 GenericSignature derivativeGenSig,
+                 Optional<ActorIsolation> enterIsolation) {
+  if (!witnessThunkSig && substitutions.empty() &&
+      reqToWitnessThunkSigSubs.empty() && !enterIsolation) {
     storage = decl;
     return;
   }
@@ -54,11 +55,17 @@ Witness::Witness(ValueDecl *decl, SubstitutionMap substitutions,
   auto &ctx = decl->getASTContext();
   auto declRef = ConcreteDeclRef(decl, substitutions);
   auto storedMem = ctx.Allocate(sizeof(StoredWitness), alignof(StoredWitness));
-  auto stored = new (storedMem) StoredWitness{declRef, syntheticEnv,
-                                              reqToSynthesizedEnvSubs,
-                                              derivativeGenSig};
+  auto stored = new (storedMem) StoredWitness{declRef, witnessThunkSig,
+                                              reqToWitnessThunkSigSubs,
+                                              derivativeGenSig, enterIsolation};
 
   storage = stored;
+}
+
+Witness Witness::withEnterIsolation(ActorIsolation enterIsolation) const {
+  return Witness(getDecl(), getSubstitutions(), getWitnessThunkSignature(),
+                 getRequirementToWitnessThunkSubs(),
+                 getDerivativeGenericSignature(), enterIsolation);
 }
 
 void Witness::dump() const { dump(llvm::errs()); }
@@ -866,7 +873,8 @@ void NormalProtocolConformance::finishSignatureConformances() {
     if (substTy->hasTypeParameter())
       substTy = getDeclContext()->mapTypeIntoContext(substTy);
 
-    reqConformances.push_back(module->lookupConformance(substTy, reqProto)
+    reqConformances.push_back(module->lookupConformance(substTy, reqProto,
+                                                        /*allowMissing=*/true)
                                   .mapConformanceOutOfContext());
   }
   setSignatureConformances(reqConformances);
@@ -902,7 +910,7 @@ NormalProtocolConformance::getWitnessUncached(ValueDecl *requirement) const {
 
 Witness SelfProtocolConformance::getWitness(ValueDecl *requirement) const {
   return Witness(requirement, SubstitutionMap(), nullptr, SubstitutionMap(),
-                 GenericSignature());
+                 GenericSignature(), None);
 }
 
 ConcreteDeclRef
@@ -911,13 +919,13 @@ RootProtocolConformance::getWitnessDeclRef(ValueDecl *requirement) const {
     auto *witnessDecl = witness.getDecl();
 
     // If the witness is generic, you have to call getWitness() and build
-    // your own substitutions in terms of the synthetic environment.
+    // your own substitutions in terms of the witness thunk signature.
     if (auto *witnessDC = dyn_cast<DeclContext>(witnessDecl))
       assert(!witnessDC->isInnermostContextGeneric());
 
     // If the witness is not generic, use type substitutions from the
     // witness's parent. Don't use witness.getSubstitutions(), which
-    // are written in terms of the synthetic environment.
+    // are written in terms of the witness thunk signature.
     auto subs =
       getType()->getContextSubstitutionMap(getDeclContext()->getParentModule(),
                                            witnessDecl->getDeclContext());
@@ -938,6 +946,12 @@ void NormalProtocolConformance::setWitness(ValueDecl *requirement,
           requirement->getAttrs().isUnavailable(
                                         requirement->getASTContext())) &&
          "Conformance already complete?");
+  Mapping[requirement] = witness;
+}
+
+void NormalProtocolConformance::overrideWitness(ValueDecl *requirement,
+                                                Witness witness) {
+  assert(Mapping.count(requirement) == 1 && "Witness not known");
   Mapping[requirement] = witness;
 }
 
@@ -1270,7 +1284,8 @@ void NominalTypeDecl::prepareConformanceTable() const {
   auto addSynthesized = [&](KnownProtocolKind kind) {
     if (auto *proto = getASTContext().getProtocol(kind)) {
       if (protocols.count(proto) == 0) {
-        ConformanceTable->addSynthesizedConformance(mutableThis, proto);
+        ConformanceTable->addSynthesizedConformance(
+            mutableThis, proto, mutableThis);
         protocols.insert(proto);
       }
     }
@@ -1741,6 +1756,31 @@ SourceLoc swift::extractNearestSourceLoc(const ProtocolConformanceRef conformanc
     return extractNearestSourceLoc(conformanceRef.getConcrete());
   }
   return SourceLoc();
+}
+
+bool ProtocolConformanceRef::hasUnavailableConformance() const {
+  if (isInvalid())
+    return false;
+
+  // Abstract conformances are never unavailable.
+  if (!isConcrete())
+    return false;
+
+  // Check whether this conformance is on an unavailable extension.
+  auto concrete = getConcrete();
+  auto ext = dyn_cast<ExtensionDecl>(concrete->getDeclContext());
+  if (ext && AvailableAttr::isUnavailable(ext))
+    return true;
+
+  // Check the conformances in the substitution map.
+  auto module = concrete->getDeclContext()->getParentModule();
+  auto subMap = concrete->getSubstitutions(module);
+  for (auto subConformance : subMap.getConformances()) {
+    if (subConformance.hasUnavailableConformance())
+      return true;
+  }
+
+  return false;
 }
 
 bool ProtocolConformanceRef::hasMissingConformance(ModuleDecl *module) const {

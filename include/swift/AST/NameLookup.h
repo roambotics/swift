@@ -420,13 +420,17 @@ public:
 class UsableFilteringDeclConsumer final : public VisibleDeclConsumer {
   const SourceManager &SM;
   const DeclContext *DC;
+  const DeclContext *typeContext;
   SourceLoc Loc;
+  llvm::DenseMap<DeclBaseName, std::pair<ValueDecl *, DeclVisibilityKind>>
+      SeenNames;
   VisibleDeclConsumer &ChainedConsumer;
 
 public:
   UsableFilteringDeclConsumer(const SourceManager &SM, const DeclContext *DC,
                               SourceLoc loc, VisibleDeclConsumer &consumer)
-      : SM(SM), DC(DC), Loc(loc), ChainedConsumer(consumer) {}
+      : SM(SM), DC(DC), typeContext(DC->getInnermostTypeContext()), Loc(loc),
+        ChainedConsumer(consumer) {}
 
   void foundDecl(ValueDecl *D, DeclVisibilityKind reason,
                  DynamicLookupInfo dynamicLookupInfo) override;
@@ -494,7 +498,14 @@ namespace namelookup {
 /// Add semantic members to \p type before attempting a semantic lookup.
 void installSemanticMembersIfNeeded(Type type, DeclNameRef name);
 
+/// Extracts directly referenced nominal type decls from a given type, asserting
+/// if the type does not contain any references to a nominal.
 void extractDirectlyReferencedNominalTypes(
+    Type type, SmallVectorImpl<NominalTypeDecl *> &decls);
+
+/// Extracts directly referenced nominal type decls from a given type, or leaves
+/// the vector empty if the type does not contain any references to a nominal.
+void tryExtractDirectlyReferencedNominalTypes(
     Type type, SmallVectorImpl<NominalTypeDecl *> &decls);
 
 /// Once name lookup has gathered a set of results, perform any necessary

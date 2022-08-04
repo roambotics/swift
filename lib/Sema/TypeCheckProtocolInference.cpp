@@ -211,9 +211,10 @@ AssociatedTypeInference::inferTypeWitnessesViaValueWitnesses(
     // so won't be affected by whatever answer inference comes up with.
     auto *module = dc->getParentModule();
     auto checkConformance = [&](ProtocolDecl *proto) {
-      auto otherConf = module->lookupConformance(conformance->getType(),
-                                                 proto);
-      return (otherConf && otherConf.getConditionalRequirements().empty());
+      auto typeInContext = dc->mapTypeIntoContext(conformance->getType());
+      auto otherConf = TypeChecker::conformsToProtocol(
+          typeInContext, proto, module);
+      return !otherConf.isInvalid();
     };
 
     // First check the extended protocol itself.
@@ -249,8 +250,10 @@ AssociatedTypeInference::inferTypeWitnessesViaValueWitnesses(
     // type can't use it regardless of what associated types we end up
     // inferring, skip the witness.
     if (auto extension = dyn_cast<ExtensionDecl>(witness->getDeclContext()))
-      if (!isExtensionUsableForInference(extension))
+      if (!isExtensionUsableForInference(extension)) {
+        LLVM_DEBUG(llvm::dbgs() << "Extension not usable for inference\n");
         continue;
+      }
 
     // Try to resolve the type witness via this value witness.
     auto witnessResult = inferTypeWitnessesViaValueWitness(req, witness);
@@ -1206,7 +1209,7 @@ AssociatedTypeDecl *AssociatedTypeInference::inferAbstractTypeWitnesses(
   // not resolve otherwise.
   llvm::SmallVector<AbstractTypeWitness, 2> abstractTypeWitnesses;
 
-  if (ctx.LangOpts.EnableExperimentalAssociatedTypeInference) {
+  if (ctx.LangOpts.hasFeature(Feature::TypeWitnessSystemInference)) {
     TypeWitnessSystem system(unresolvedAssocTypes);
     collectAbstractTypeWitnesses(system, unresolvedAssocTypes);
 

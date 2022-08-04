@@ -279,6 +279,10 @@ static void diagnoseUnnecessaryPreconcurrencyImports(SourceFile &sf) {
   }
 
   ASTContext &ctx = sf.getASTContext();
+
+  if (ctx.TypeCheckerOpts.SkipFunctionBodies != FunctionBodySkipping::None)
+    return;
+
   for (const auto &import : sf.getImports()) {
     if (import.options.contains(ImportFlags::Preconcurrency) &&
         import.importLoc.isValid() &&
@@ -375,11 +379,49 @@ void swift::performWholeModuleTypeChecking(SourceFile &SF) {
   }
 }
 
+void swift::loadDerivativeConfigurations(SourceFile &SF) {
+  if (!isDifferentiableProgrammingEnabled(SF))
+    return;
+
+  auto &Ctx = SF.getASTContext();
+  FrontendStatsTracer tracer(Ctx.Stats,
+                             "load-derivative-configurations");
+
+  class DerivativeFinder : public ASTWalker {
+  public:
+    DerivativeFinder() {}
+
+    bool walkToDeclPre(Decl *D) override {
+      if (auto *afd = dyn_cast<AbstractFunctionDecl>(D)) {
+        for (auto *derAttr : afd->getAttrs().getAttributes<DerivativeAttr>()) {
+          // Resolve derivative function configurations from `@derivative`
+          // attributes by type-checking them.
+          (void)derAttr->getOriginalFunction(D->getASTContext());
+        }
+      }
+
+      return true;
+    }
+  };
+
+  switch (SF.Kind) {
+  case SourceFileKind::Library:
+  case SourceFileKind::Main: {
+    DerivativeFinder finder;
+    SF.walkContext(finder);
+    return;
+  }
+  case SourceFileKind::SIL:
+  case SourceFileKind::Interface:
+    return;
+  }
+}
+
 bool swift::isAdditiveArithmeticConformanceDerivationEnabled(SourceFile &SF) {
   auto &ctx = SF.getASTContext();
   // Return true if `AdditiveArithmetic` derived conformances are explicitly
   // enabled.
-  if (ctx.LangOpts.EnableExperimentalAdditiveArithmeticDerivedConformances)
+  if (ctx.LangOpts.hasFeature(Feature::AdditiveArithmeticDerivedConformances))
     return true;
   // Otherwise, return true iff differentiable programming is enabled.
   // Differentiable programming depends on `AdditiveArithmetic` derived
@@ -464,7 +506,7 @@ swift::handleSILGenericParams(GenericParamList *genericParams,
   }
 
   auto request = InferredGenericSignatureRequest{
-      DC->getParentModule(), /*parentSig=*/nullptr,
+      /*parentSig=*/nullptr,
       nestedList.back(), WhereClauseOwner(),
       {}, {}, /*allowConcreteGenericParams=*/true};
   auto sig = evaluateOrDefault(DC->getASTContext().evaluator, request,
@@ -490,12 +532,13 @@ void swift::typeCheckPatternBinding(PatternBindingDecl *PBD,
                                        /*patternType=*/Type(), options);
 }
 
-bool swift::typeCheckASTNodeAtLoc(DeclContext *DC, SourceLoc TargetLoc) {
-  auto &Ctx = DC->getASTContext();
+bool swift::typeCheckASTNodeAtLoc(TypeCheckASTNodeAtLocContext TypeCheckCtx,
+                                  SourceLoc TargetLoc) {
+  auto &Ctx = TypeCheckCtx.getDeclContext()->getASTContext();
   DiagnosticSuppression suppression(Ctx.Diags);
-  return !evaluateOrDefault(Ctx.evaluator,
-                            TypeCheckASTNodeAtLocRequest{DC, TargetLoc},
-                            true);
+  return !evaluateOrDefault(
+      Ctx.evaluator, TypeCheckASTNodeAtLocRequest{TypeCheckCtx, TargetLoc},
+      true);
 }
 
 bool swift::typeCheckForCodeCompletion(

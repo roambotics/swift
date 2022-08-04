@@ -1,9 +1,6 @@
 #ifndef TEST_INTEROP_CXX_OPERATORS_INPUTS_MEMBER_INLINE_H
 #define TEST_INTEROP_CXX_OPERATORS_INPUTS_MEMBER_INLINE_H
 
-template <class From, class To>
-To __swift_interopStaticCast(From from) { return from; }
-
 struct LoadableIntWrapper {
   int value;
   LoadableIntWrapper operator-(LoadableIntWrapper rhs) {
@@ -19,6 +16,21 @@ struct LoadableIntWrapper {
   int operator()(int x, int y) {
     return value + x * y;
   }
+
+  LoadableIntWrapper &operator++() {
+    value++;
+    return *this;
+  }
+
+  // Friend functions
+  friend bool operator==(const LoadableIntWrapper lhs,
+                         const LoadableIntWrapper &rhs) {
+    return lhs.value == rhs.value;
+  }
+
+  friend LoadableIntWrapper operator-(const LoadableIntWrapper& obj) {
+    return LoadableIntWrapper{.value = -obj.value};
+  }
 };
 
 struct LoadableBoolWrapper {
@@ -28,7 +40,7 @@ struct LoadableBoolWrapper {
   }
 };
 
-struct AddressOnlyIntWrapper {
+struct __attribute__((swift_attr("import_owned"))) AddressOnlyIntWrapper {
   int value;
 
   AddressOnlyIntWrapper(int value) : value(value) {}
@@ -43,6 +55,34 @@ struct AddressOnlyIntWrapper {
   int operator()(int x, int y) {
     return value + x * y;
   }
+
+  AddressOnlyIntWrapper operator-(AddressOnlyIntWrapper rhs) const {
+    return AddressOnlyIntWrapper(value - rhs.value);
+  }
+  AddressOnlyIntWrapper &operator++() {
+    value++;
+    return *this;
+  }
+  AddressOnlyIntWrapper operator++(int) {
+    // This shouldn't be called, since we only support pre-increment operators.
+    return AddressOnlyIntWrapper(-777);
+  }
+};
+
+struct HasPostIncrementOperator {
+  HasPostIncrementOperator operator++(int) {
+    return HasPostIncrementOperator();
+  }
+};
+
+struct HasPreIncrementOperatorWithAnotherReturnType {
+  int value = 0;
+  const int &operator++() { return ++value; }
+};
+
+struct HasPreIncrementOperatorWithVoidReturnType {
+  int value = 0;
+  void operator++() { ++value; }
 };
 
 struct HasDeletedOperator {
@@ -72,7 +112,7 @@ public:
   };
 };
 
-struct ReadOnlyIntArray {
+struct __attribute__((swift_attr("import_owned"))) ReadOnlyIntArray {
 private:
   int values[5] = { 1, 2, 3, 4, 5 };
 
@@ -134,7 +174,7 @@ struct TemplatedArray {
 };
 typedef TemplatedArray<double> TemplatedDoubleArray;
 
-struct TemplatedSubscriptArray {
+struct __attribute__((swift_attr("import_unsafe"))) TemplatedSubscriptArray {
   int *ptr;
 
   template<class T>
@@ -155,7 +195,7 @@ private:
   int values[3] = { 1, 2, 3 };
 };
 
-struct NonTrivialIntArrayByVal {
+struct __attribute__((swift_attr("import_owned"))) NonTrivialIntArrayByVal {
   NonTrivialIntArrayByVal(int first) { values[0] = first; }
   NonTrivialIntArrayByVal(const NonTrivialIntArrayByVal &other) {
     for (int i = 0; i < 5; i++)
@@ -186,14 +226,28 @@ template<class T> struct TemplatedArrayByVal {
   T ts[];
   T operator[](int i) { return ts[i]; }
 };
+
 typedef TemplatedArrayByVal<double> TemplatedDoubleArrayByVal;
 
-struct TemplatedSubscriptArrayByVal {
-  int *ptr;
-  template<class T> T operator[](T i) { return ptr[i]; }
+template <class T>
+struct TemplatedByVal {
+  T val;
+  TemplatedByVal<T> operator+(TemplatedByVal other) {
+    return TemplatedByVal{.val = val + other.val};
+  }
 };
 
-struct NonTrivial {
+struct __attribute__((swift_attr("import_unsafe")))
+TemplatedOperatorArrayByVal {
+  int *ptr;
+  template<class T> T operator[](T i) { return ptr[i]; }
+  template <class T>
+  T *operator+(T i) {
+    return ptr + i;
+  }
+};
+
+struct __attribute__((swift_attr("import_owned"))) NonTrivial {
   char *Str;
   long long a;
   short b;
@@ -225,7 +279,7 @@ private:
   int a = 64;
 };
 
-struct RefToPtr {
+struct __attribute__((swift_attr("import_unsafe"))) RefToPtr {
   RefToPtr() { b = &a; }
   int *&operator[](int x) { return b; }
 private:
@@ -233,7 +287,7 @@ private:
   int *b = nullptr;
 };
 
-struct PtrToPtr {
+struct __attribute__((swift_attr("import_unsafe"))) PtrToPtr {
   PtrToPtr() { b = &a; }
   int **operator[](int x) { return &b; }
 private:
@@ -260,5 +314,26 @@ struct DerivedFromAddressOnlyIntWrapper : AddressOnlyIntWrapper {
 struct DerivedFromReadWriteIntArray : ReadWriteIntArray {};
 
 struct DerivedFromNonTrivialArrayByVal : NonTrivialArrayByVal {};
+
+struct Iterator {
+private:
+  int value = 123;
+public:
+  int &operator*() { return value; }
+};
+
+struct ConstIterator {
+private:
+  int value = 234;
+public:
+  const int &operator*() const { return value; }
+};
+
+struct ConstIteratorByVal {
+private:
+  int value = 456;
+public:
+  int operator*() const { return value; }
+};
 
 #endif

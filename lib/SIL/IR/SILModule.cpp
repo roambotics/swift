@@ -90,9 +90,11 @@ class SILModule::SerializationCallback final
 };
 
 SILModule::SILModule(llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
-                     Lowering::TypeConverter &TC, const SILOptions &Options)
+                     Lowering::TypeConverter &TC, const SILOptions &Options,
+                     const IRGenOptions *irgenOptions)
     : Stage(SILStage::Raw), loweredAddresses(!Options.EnableSILOpaqueValues),
-      indexTrieRoot(new IndexTrieNode()), Options(Options), serialized(false),
+      indexTrieRoot(new IndexTrieNode()), Options(Options),
+      irgenOptions(irgenOptions), serialized(false),
       regDeserializationNotificationHandlerForNonTransparentFuncOME(false),
       regDeserializationNotificationHandlerForAllFuncOME(false),
       prespecializedFunctionDeclsImported(false), SerializeSILAction(),
@@ -159,14 +161,20 @@ void SILModule::checkForLeaks() const {
   int instsInModule = std::distance(scheduledForDeletion.begin(),
                                     scheduledForDeletion.end());
   for (const SILFunction &F : *this) {
-    for (const SILBasicBlock &block : F) {
-      instsInModule += std::distance(block.begin(), block.end());
-    }
+    const SILFunction *sn = &F;
+    do {
+      for (const SILBasicBlock &block : *sn) {
+        instsInModule += std::distance(block.begin(), block.end());
+      }
+    } while ((sn = sn->snapshots) != nullptr);
   }
   for (const SILFunction &F : zombieFunctions) {
-    for (const SILBasicBlock &block : F) {
-      instsInModule += std::distance(block.begin(), block.end());
-    }
+    const SILFunction *sn = &F;
+    do {
+      for (const SILBasicBlock &block : F) {
+        instsInModule += std::distance(block.begin(), block.end());
+      }
+    } while ((sn = sn->snapshots) != nullptr);
   }
   for (const SILGlobalVariable &global : getSILGlobals()) {
       instsInModule += std::distance(global.StaticInitializerBlock.begin(),
@@ -203,8 +211,10 @@ void SILModule::checkForLeaksAfterDestruction() {
 
 std::unique_ptr<SILModule> SILModule::createEmptyModule(
     llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
-    Lowering::TypeConverter &TC, const SILOptions &Options) {
-  return std::unique_ptr<SILModule>(new SILModule(context, TC, Options));
+    Lowering::TypeConverter &TC, const SILOptions &Options,
+    const IRGenOptions *irgenOptions) {
+  return std::unique_ptr<SILModule>(new SILModule(context, TC, Options,
+                                                  irgenOptions));
 }
 
 ASTContext &SILModule::getASTContext() const {
@@ -430,13 +440,14 @@ void SILModule::invalidateSILLoaderCaches() {
 
 SILFunction *SILModule::removeFromZombieList(StringRef Name) {
   if (auto *Zombie = ZombieFunctionTable.lookup(Name)) {
+    assert(Zombie->snapshotID == 0 && "zombie cannot be a snapthot function");
     ZombieFunctionTable.erase(Name);
     zombieFunctions.remove(Zombie);
 
     // The owner of the function's Name is the ZombieFunctionTable key, which is
     // freed by erase().
     // Make sure nobody accesses the name string after it is freed.
-    Zombie->Name = StringRef();
+    Zombie->setName(StringRef());
     return Zombie;
   }
   return nullptr;
@@ -445,6 +456,7 @@ SILFunction *SILModule::removeFromZombieList(StringRef Name) {
 /// Erase a function from the module.
 void SILModule::eraseFunction(SILFunction *F) {
   assert(!F->isZombie() && "zombie function is in list of alive functions");
+  assert(F->snapshotID == 0 && "cannot erase a snapshot function");
 
   llvm::StringMapEntry<SILFunction*> *entry =
       &*ZombieFunctionTable.insert(std::make_pair(F->getName(), nullptr)).first;
@@ -455,7 +467,7 @@ void SILModule::eraseFunction(SILFunction *F) {
   // the function from the table we need to use the allocated name string from
   // the ZombieFunctionTable.
   FunctionTable.erase(F->getName());
-  F->Name = zombieName;
+  F->setName(zombieName);
 
   // The function is dead, but we need it later (at IRGen) for debug info
   // or vtable stub generation. So we move it into the zombie list.
@@ -667,6 +679,48 @@ bool SILModule::hasUnresolvedOpenedArchetypeDefinitions() {
   return numUnresolvedOpenedArchetypes != 0;
 }
 
+/// Get a unique index for a struct or class field in layout order.
+unsigned SILModule::getFieldIndex(NominalTypeDecl *decl, VarDecl *field) {
+
+  auto iter = fieldIndices.find({decl, field});
+  if (iter != fieldIndices.end())
+    return iter->second;
+
+  unsigned index = 0;
+  if (auto *classDecl = dyn_cast<ClassDecl>(decl)) {
+    for (auto *superDecl = classDecl->getSuperclassDecl(); superDecl != nullptr;
+         superDecl = superDecl->getSuperclassDecl()) {
+      index += superDecl->getStoredProperties().size();
+    }
+  }
+  for (VarDecl *property : decl->getStoredProperties()) {
+    if (field == property) {
+      fieldIndices[{decl, field}] = index;
+      return index;
+    }
+    ++index;
+  }
+  llvm_unreachable("The field decl for a struct_extract, struct_element_addr, "
+                   "or ref_element_addr must be an accessible stored "
+                   "property of the operand type");
+}
+
+unsigned SILModule::getCaseIndex(EnumElementDecl *enumElement) {
+  auto iter = enumCaseIndices.find(enumElement);
+  if (iter != enumCaseIndices.end())
+    return iter->second;
+
+  unsigned idx = 0;
+  for (EnumElementDecl *e : enumElement->getParentEnum()->getAllElements()) {
+    if (e == enumElement) {
+      enumCaseIndices[enumElement] = idx;
+      return idx;
+    }
+    ++idx;
+  }
+  llvm_unreachable("enum element not found in enum decl");
+}
+
 void SILModule::notifyAddedInstruction(SILInstruction *inst) {
   if (auto *svi = dyn_cast<SingleValueInstruction>(inst)) {
     if (const CanOpenedArchetypeType archeTy =
@@ -750,12 +804,6 @@ shouldSerializeEntitiesAssociatedWithDeclContext(const DeclContext *DC) const {
 bool SILModule::isOptimizedOnoneSupportModule() const {
   return getOptions().shouldOptimize() &&
          getSwiftModule()->isOnoneSupportModule();
-}
-
-void SILModule::addPublicCMOSymbol(StringRef symbol) {
-  if (!publicCMOSymbols)
-    publicCMOSymbols = std::make_shared<TBDSymbolSet>();
-  publicCMOSymbols->insert(symbol.str());
 }
 
 void SILModule::setSerializeSILAction(SILModule::ActionCallback Action) {

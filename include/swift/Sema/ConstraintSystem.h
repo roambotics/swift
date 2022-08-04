@@ -80,6 +80,10 @@ Optional<constraints::SolutionApplicationTarget>
 typeCheckExpression(constraints::SolutionApplicationTarget &target,
                     OptionSet<TypeCheckExprFlags> options);
 
+Optional<constraints::SolutionApplicationTarget>
+typeCheckTarget(constraints::SolutionApplicationTarget &target,
+                OptionSet<TypeCheckExprFlags> options);
+
 Type typeCheckParameterDefault(Expr *&, DeclContext *, Type, bool);
 
 } // end namespace TypeChecker
@@ -129,6 +133,8 @@ public:
   NominalTypeDecl *getBuilderDecl() const {
     return BuilderType->getAnyNominal();
   }
+
+  VarDecl *getBuilderSelf() const { return BuilderSelf; }
 
   Identifier getBuildOptionalId() const { return BuildOptionalId; }
 
@@ -584,6 +590,19 @@ public:
 
   /// Print the type variable to the given output stream.
   void print(llvm::raw_ostream &OS);
+  
+private:
+  StringRef getTypeVariableOptions(TypeVariableOptions TVO) const {
+  #define ENTRY(Kind, String) case TypeVariableOptions::Kind: return String
+    switch (TVO) {
+    ENTRY(TVO_CanBindToLValue, "lvalue");
+    ENTRY(TVO_CanBindToInOut, "inout");
+    ENTRY(TVO_CanBindToNoEscape, "noescape");
+    ENTRY(TVO_CanBindToHole, "hole");
+    ENTRY(TVO_PrefersSubtypeBinding, "");
+    }
+  #undef ENTRY
+  }
 };
 
 namespace constraints {
@@ -623,6 +642,17 @@ T *getAsStmt(ASTNode node) {
   return nullptr;
 }
 
+template <typename T = Pattern>
+T *getAsPattern(ASTNode node) {
+  if (auto *P = node.dyn_cast<Pattern *>())
+    return dyn_cast_or_null<T>(P);
+  return nullptr;
+}
+
+template <typename T = Stmt> T *castToStmt(ASTNode node) {
+  return cast<T>(node.get<Stmt *>());
+}
+
 SourceLoc getLoc(ASTNode node);
 SourceRange getSourceRange(ASTNode node);
 
@@ -654,11 +684,19 @@ struct SelectedOverload {
   /// we're referencing a member.
   const Type openedFullType;
 
+  /// The opened type of the base of the reference to this overload, adjusted
+  /// for `@preconcurrency` or other contextual type-altering attributes.
+  const Type adjustedOpenedFullType;
+
   /// The opened type produced by referring to this overload.
   const Type openedType;
 
+  /// The opened type produced by referring to this overload, adjusted for
+  /// `@preconcurrency` or other contextual type-altering attributes.
+  const Type adjustedOpenedType;
+
   /// The type that this overload binds. Note that this may differ from
-  /// openedType, for example it will include any IUO unwrapping that has taken
+  /// adjustedOpenedType, for example it will include any IUO unwrapping that has taken
   /// place.
   const Type boundType;
 };
@@ -807,7 +845,7 @@ public:
 
 /// Describes an aspect of a solution that affects its overall score, i.e., a
 /// user-defined conversions.
-enum ScoreKind {
+enum ScoreKind: unsigned int {
   // These values are used as indices into a Score value.
 
   /// A fix needs to be applied to the source.
@@ -877,6 +915,10 @@ struct AppliedBuilderTransform {
   /// The result type of the body, to which the returned expression will be
   /// converted. Opaque types should be unopened.
   Type bodyResultType;
+
+  /// The version of the original body with result builder applied
+  /// as AST transformation.
+  NullablePtr<BraceStmt> transformedBody;
 
   /// An expression whose value has been recorded for later use.
   struct RecordedExpr {
@@ -997,13 +1039,8 @@ struct CaseLabelItemInfo {
 /// Describes information about a for-each loop that needs to be tracked
 /// within the constraint system.
 struct ForEachStmtInfo {
-  ForEachStmt *stmt;
-
   /// The type of the sequence.
   Type sequenceType;
-
-  /// The type of the iterator.
-  Type iteratorType;
 
   /// The type of an element in the sequence.
   Type elementType;
@@ -1011,8 +1048,11 @@ struct ForEachStmtInfo {
   /// The type of the pattern that matches the elements.
   Type initType;
 
-  /// The "where" expression, if there is one.
-  Expr *whereExpr;
+  /// Implicit `$iterator = <sequence>.makeIterator()`
+  PatternBindingDecl *makeIteratorVar;
+
+  /// Implicit `$iterator.next()` call.
+  Expr *nextCall;
 };
 
 /// Key to the constraint solver's mapping from AST nodes to their corresponding
@@ -1029,6 +1069,7 @@ public:
     pattern,
     patternBindingEntry,
     varDecl,
+    functionRef,
   };
 
 private:
@@ -1049,6 +1090,8 @@ private:
     } patternBindingEntry;
 
     const VarDecl *varDecl;
+
+    const DeclContext *functionRef;
   } storage;
 
 public:
@@ -1094,6 +1137,11 @@ public:
     storage.varDecl = varDecl;
   }
 
+  SolutionApplicationTargetsKey(const AnyFunctionRef functionRef) {
+    kind = Kind::functionRef;
+    storage.functionRef = functionRef.getAsDeclContext();
+  }
+
   friend bool operator==(
       SolutionApplicationTargetsKey lhs, SolutionApplicationTargetsKey rhs) {
     if (lhs.kind != rhs.kind)
@@ -1125,6 +1173,9 @@ public:
 
     case Kind::varDecl:
       return lhs.storage.varDecl == rhs.storage.varDecl;
+
+    case Kind::functionRef:
+      return lhs.storage.functionRef == rhs.storage.functionRef;
     }
     llvm_unreachable("invalid SolutionApplicationTargetsKey kind");
   }
@@ -1176,9 +1227,17 @@ public:
       return hash_combine(
           DenseMapInfo<unsigned>::getHashValue(static_cast<unsigned>(kind)),
           DenseMapInfo<void *>::getHashValue(storage.varDecl));
+
+    case Kind::functionRef:
+      return hash_combine(
+          DenseMapInfo<unsigned>::getHashValue(static_cast<unsigned>(kind)),
+          DenseMapInfo<void *>::getHashValue(storage.functionRef));
     }
     llvm_unreachable("invalid statement kind");
   }
+
+  SWIFT_DEBUG_DUMP;
+  void dump(raw_ostream &OS) const LLVM_ATTRIBUTE_USED;
 };
 
 /// Describes the arguments to which a parameter binds.
@@ -1309,6 +1368,10 @@ public:
 
   /// The set of parameters that have been inferred to be 'isolated'.
   llvm::SmallVector<ParamDecl *, 2> isolatedParams;
+
+  /// The set of closures that have been inferred to be "isolated by
+  /// preconcurrency".
+  llvm::SmallVector<const ClosureExpr *, 2> preconcurrencyClosures;
 
   /// The set of functions that have been transformed by a result builder.
   llvm::MapVector<AnyFunctionRef, AppliedBuilderTransform>
@@ -1452,6 +1515,15 @@ public:
   /// types where possible.
   Type resolveInterfaceType(Type type) const;
 
+  Type getContextualType(ASTNode anchor) const {
+    for (const auto &entry : contextualTypes) {
+      if (entry.first == anchor) {
+        return simplifyType(entry.second.getType());
+      }
+    }
+    return Type();
+  }
+
   /// For a given locator describing a function argument conversion, or a
   /// constraint within an argument conversion, returns information about the
   /// application of the argument to its parameter. If the locator is not
@@ -1528,28 +1600,24 @@ enum class ConstraintSystemFlags {
   /// left in-tact.
   AllowUnresolvedTypeVariables = 0x04,
 
-  /// If set, constraint system always reuses type of pre-typechecked
-  /// expression, and doesn't dig into its subexpressions.
-  ReusePrecheckedType = 0x08,
-
   /// If set, verbose output is enabled for this constraint system.
   ///
   /// Note that this flag is automatically applied to all constraint systems,
   /// when \c DebugConstraintSolver is set in \c TypeCheckerOptions. It can be
   /// automatically enabled for select constraint solving attempts by setting
-  /// \c DebugConstraintSolverAttempt. Finally, it can also be automatically 
+  /// \c DebugConstraintSolverAttempt. Finally, it can also be automatically
   /// enabled for a pre-configured set of expressions on line numbers by setting
   /// \c DebugConstraintSolverOnLines.
-  DebugConstraints = 0x10,
+  DebugConstraints = 0x08,
 
   /// Don't try to type check closure bodies, and leave them unchecked. This is
   /// used for source tooling functionalities.
-  LeaveClosureBodyUnchecked = 0x20,
+  LeaveClosureBodyUnchecked = 0x10,
 
   /// If set, we are solving specifically to determine the type of a
   /// CodeCompletionExpr, and should continue in the presence of errors wherever
   /// possible.
-  ForCodeCompletion = 0x40,
+  ForCodeCompletion = 0x20,
 
   /// Include Clang function types when checking equality for function types.
   ///
@@ -1560,11 +1628,10 @@ enum class ConstraintSystemFlags {
   /// should be treated as semantically different, as they may have different
   /// calling conventions, say due to Clang attributes such as
   /// `__attribute__((ns_consumed))`.
-  UseClangFunctionTypes = 0x80,
+  UseClangFunctionTypes = 0x40,
 
-  /// When set, nominal typedecl contexts are asynchronous contexts.
-  /// This is set while searching for the main function
-  ConsiderNominalTypeContextsAsync = 0x100,
+  /// When set, ignore async/sync mismatches
+  IgnoreAsyncSyncMismatch = 0x80,
 };
 
 /// Options that affect the constraint system as a whole.
@@ -1685,6 +1752,13 @@ struct DynamicCallableMethods {
     keywordArgumentsMethods.insert(method);
   }
 
+  void addMethods(const DynamicCallableMethods &other) {
+    argumentsMethods.insert(other.argumentsMethods.begin(),
+                            other.argumentsMethods.end());
+    keywordArgumentsMethods.insert(other.keywordArgumentsMethods.begin(),
+                                   other.keywordArgumentsMethods.end());
+  }
+
   /// Returns true if type defines either of the @dynamicCallable
   /// required methods. Returns false iff type does not satisfy @dynamicCallable
   /// requirements.
@@ -1705,6 +1779,7 @@ public:
     caseLabelItem,
     patternBinding,
     uninitializedVar,
+    forEachStmt,
   } kind;
 
 private:
@@ -1756,8 +1831,6 @@ private:
           /// The index into the pattern binding declaration, if any.
           unsigned patternBindingIndex;
         } initialization;
-
-        ForEachStmtInfo forEachStmt;
       };
     } expression;
 
@@ -1792,6 +1865,14 @@ private:
       /// Type associated with the declaration.
       Type type;
     } uninitializedVar;
+
+    struct {
+      ForEachStmt *stmt;
+      DeclContext *dc;
+      Pattern *pattern;
+      bool bindPatternVarsOneWay;
+      ForEachStmtInfo info;
+    } forEachStmt;
 
     PatternBindingDecl *patternBinding;
   };
@@ -1876,6 +1957,14 @@ public:
     uninitializedVar.type = patternTy;
   }
 
+  SolutionApplicationTarget(ForEachStmt *stmt, DeclContext *dc,
+                            bool bindPatternVarsOneWay)
+    : kind(Kind::forEachStmt) {
+    forEachStmt.stmt = stmt;
+    forEachStmt.dc = dc;
+    forEachStmt.bindPatternVarsOneWay = bindPatternVarsOneWay;
+  }
+
   /// Form a target for the initialization of a pattern from an expression.
   static SolutionApplicationTarget forInitialization(
       Expr *initializer, DeclContext *dc, Type patternType, Pattern *pattern,
@@ -1888,11 +1977,10 @@ public:
       PatternBindingDecl *patternBinding, unsigned patternBindingIndex,
       bool bindPatternVarsOneWay);
 
-  /// Form a target for a for-each loop.
+  /// Form a target for a for-in loop.
   static SolutionApplicationTarget forForEachStmt(
-      ForEachStmt *stmt, ProtocolDecl *sequenceProto, DeclContext *dc,
-      bool bindPatternVarsOneWay,
-      ContextualTypePurpose purpose = CTP_ForEachStmt);
+      ForEachStmt *stmt, DeclContext *dc,
+      bool bindPatternVarsOneWay);
 
   /// Form a target for a property with an attached property wrapper that is
   /// initialized out-of-line.
@@ -1917,6 +2005,39 @@ public:
     return {expr, dc, pattern, patternTy};
   }
 
+  /// This is useful for code completion.
+  ASTNode getAsASTNode() const {
+    switch (kind) {
+    case Kind::expression:
+      return expression.expression;
+
+    case Kind::closure:
+      return closure.closure;
+
+    case Kind::function: {
+      auto ref = *getAsFunction();
+      if (auto *func = ref.getAbstractFunctionDecl())
+        return func;
+      return ref.getAbstractClosureExpr();
+    }
+
+    case Kind::forEachStmt:
+      return getAsForEachStmt();
+
+    case Kind::stmtCondition:
+      return ASTNode();
+
+    case Kind::caseLabelItem:
+      return *getAsCaseLabelItem();
+
+    case Kind::patternBinding:
+      return getAsPatternBinding();
+
+    case Kind::uninitializedVar:
+      return getAsUninitializedVar();
+    }
+  }
+
   Expr *getAsExpr() const {
     switch (kind) {
     case Kind::expression:
@@ -1928,6 +2049,7 @@ public:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
     case Kind::uninitializedVar:
+    case Kind::forEachStmt:
       return nullptr;
     }
     llvm_unreachable("invalid expression type");
@@ -1960,6 +2082,9 @@ public:
 
       return uninitializedVar.binding->getInitContext(uninitializedVar.index);
     }
+
+    case Kind::forEachStmt:
+      return forEachStmt.dc;
     }
     llvm_unreachable("invalid decl context type");
   }
@@ -2039,9 +2164,7 @@ public:
 
   /// Whether this target is for a for-in statement.
   bool isForEachStmt() const {
-    return kind == Kind::expression &&
-           (getExprContextualTypePurpose() == CTP_ForEachStmt ||
-            getExprContextualTypePurpose() == CTP_ForEachSequence);
+    return kind == Kind::forEachStmt;
   }
 
   /// Whether this is an initialization for an Optional.Some pattern.
@@ -2066,7 +2189,13 @@ public:
   /// Whether to bind the types of any variables within the pattern via
   /// one-way constraints.
   bool shouldBindPatternVarsOneWay() const {
-    return kind == Kind::expression && expression.bindPatternVarsOneWay;
+    if (kind == Kind::expression)
+      return expression.bindPatternVarsOneWay;
+
+    if (kind == Kind::forEachStmt)
+      return forEachStmt.bindPatternVarsOneWay;
+
+    return false;
   }
 
   /// Whether or not an opaque value placeholder should be injected into the
@@ -2120,12 +2249,12 @@ public:
 
   const ForEachStmtInfo &getForEachStmtInfo() const {
     assert(isForEachStmt());
-    return expression.forEachStmt;
+    return forEachStmt.info;
   }
 
   ForEachStmtInfo &getForEachStmtInfo() {
     assert(isForEachStmt());
-    return expression.forEachStmt;
+    return forEachStmt.info;
   }
 
   /// Whether this context infers an opaque return type.
@@ -2151,6 +2280,11 @@ public:
       return;
     }
 
+    if (kind == Kind::forEachStmt) {
+      forEachStmt.pattern = pattern;
+      return;
+    }
+
     assert(kind == Kind::expression);
     assert(expression.contextualPurpose == CTP_Initialization ||
            expression.contextualPurpose == CTP_ForEachStmt ||
@@ -2167,6 +2301,7 @@ public:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
     case Kind::uninitializedVar:
+    case Kind::forEachStmt:
       return None;
 
     case Kind::function:
@@ -2183,6 +2318,7 @@ public:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
     case Kind::uninitializedVar:
+    case Kind::forEachStmt:
       return None;
 
     case Kind::stmtCondition:
@@ -2199,6 +2335,7 @@ public:
     case Kind::stmtCondition:
     case Kind::patternBinding:
     case Kind::uninitializedVar:
+    case Kind::forEachStmt:
       return None;
 
     case Kind::caseLabelItem:
@@ -2215,6 +2352,7 @@ public:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
     case Kind::uninitializedVar:
+    case Kind::forEachStmt:
       return nullptr;
 
     case Kind::patternBinding:
@@ -2231,6 +2369,7 @@ public:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
+    case Kind::forEachStmt:
       return nullptr;
 
     case Kind::uninitializedVar:
@@ -2247,10 +2386,28 @@ public:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
+    case Kind::forEachStmt:
       return nullptr;
 
     case Kind::uninitializedVar:
       return uninitializedVar.declaration.dyn_cast<Pattern *>();
+    }
+    llvm_unreachable("invalid case label type");
+  }
+
+  ForEachStmt *getAsForEachStmt() const {
+    switch (kind) {
+    case Kind::expression:
+    case Kind::closure:
+    case Kind::function:
+    case Kind::stmtCondition:
+    case Kind::caseLabelItem:
+    case Kind::patternBinding:
+    case Kind::uninitializedVar:
+      return nullptr;
+
+    case Kind::forEachStmt:
+      return forEachStmt.stmt;
     }
     llvm_unreachable("invalid case label type");
   }
@@ -2263,6 +2420,7 @@ public:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
+    case Kind::forEachStmt:
       return nullptr;
 
     case Kind::uninitializedVar:
@@ -2279,6 +2437,7 @@ public:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
+    case Kind::forEachStmt:
       return nullptr;
 
     case Kind::uninitializedVar:
@@ -2295,6 +2454,7 @@ public:
     case Kind::stmtCondition:
     case Kind::caseLabelItem:
     case Kind::patternBinding:
+    case Kind::forEachStmt:
       return 0;
 
     case Kind::uninitializedVar:
@@ -2342,6 +2502,18 @@ public:
       }
       return uninitializedVar.declaration.get<Pattern *>()->getSourceRange();
     }
+
+    // For-in statement target doesn't cover the body.
+    case Kind::forEachStmt:
+      auto *stmt = forEachStmt.stmt;
+      SourceLoc startLoc = stmt->getForLoc();
+      SourceLoc endLoc = stmt->getParsedSequence()->getEndLoc();
+
+      if (auto *whereExpr = stmt->getWhere()) {
+        endLoc = whereExpr->getEndLoc();
+      }
+
+      return {startLoc, endLoc};
     }
     llvm_unreachable("invalid target type");
   }
@@ -2374,6 +2546,9 @@ public:
       }
       return uninitializedVar.declaration.get<Pattern *>()->getLoc();
     }
+
+    case Kind::forEachStmt:
+      return forEachStmt.stmt->getStartLoc();
     }
     llvm_unreachable("invalid target type");
   }
@@ -2413,6 +2588,38 @@ struct GetClosureType {
   Type operator()(const AbstractClosureExpr *expr) const;
 };
 
+/// Retrieve the closure type from the constraint system.
+struct ClosureIsolatedByPreconcurrency {
+  ConstraintSystem &cs;
+
+  bool operator()(const ClosureExpr *expr) const;
+};
+
+/// Describes the type produced when referencing a declaration.
+struct DeclReferenceType {
+  /// The "opened" type, which is the type of the declaration where any
+  /// generic parameters have been replaced with type variables.
+  ///
+  /// The mapping from generic parameters to type variables will have been
+  /// recorded by \c recordOpenedTypes when this type is produced.
+  Type openedType;
+
+  /// The opened type, after performing contextual type adjustments such as
+  /// removing concurrency-related annotations for a `@preconcurrency`
+  /// operation.
+  Type adjustedOpenedType;
+
+  /// The type of the reference, based on the original opened type. This is the
+  /// type that the expression used to form the declaration reference would
+  /// have if no adjustments had been applied.
+  Type referenceType;
+
+  /// The type of the reference, which is the adjusted opened type after
+  /// (e.g.) applying the base of a member access. This is the type of the
+  /// expression used to form the declaration reference.
+  Type adjustedReferenceType;
+};
+
 /// Describes a system of constraints on type variables, the
 /// solution of which assigns concrete types to each of the type variables.
 /// Constraint systems are typically generated given an (untyped) expression.
@@ -2442,6 +2649,7 @@ public:
   friend class ConjunctionElement;
   friend class RequirementFailure;
   friend class MissingMemberFailure;
+  friend struct ClosureIsolatedByPreconcurrency;
 
   class SolverScope;
 
@@ -2528,6 +2736,14 @@ private:
   /// diagnostics when result builder has multiple overloads.
   llvm::SmallDenseSet<AnyFunctionRef> InvalidResultBuilderBodies;
 
+  /// The *global* set of all functions that have a particular result builder
+  /// applied.
+  ///
+  /// The value here is `$__builderSelf` variable and a transformed body.
+  llvm::DenseMap<std::pair<AnyFunctionRef, NominalTypeDecl *>,
+                 std::pair<VarDecl *, BraceStmt *>>
+      BuilderTransformedBodies;
+
   /// Arguments after the code completion token that were thus ignored (i.e.
   /// assigned fresh type variables) for type checking.
   llvm::SetVector<Expr *> IgnoredArguments;
@@ -2571,6 +2787,10 @@ private:
 
   /// The set of parameters that have been inferred to be 'isolated'.
   llvm::SmallSetVector<ParamDecl *, 2> isolatedParams;
+
+  /// The set of closures that have been inferred to be "isolated by
+  /// preconcurrency".
+  llvm::SmallSetVector<const ClosureExpr *, 2> preconcurrencyClosures;
 
   /// Maps closure parameters to type variables.
   llvm::DenseMap<const ParamDecl *, TypeVariableType *>
@@ -2657,7 +2877,8 @@ public:
 
   /// A cache that stores the @dynamicCallable required methods implemented by
   /// types.
-  llvm::DenseMap<CanType, DynamicCallableMethods> DynamicCallableCache;
+  llvm::DenseMap<NominalTypeDecl *, DynamicCallableMethods>
+      DynamicCallableCache;
 
   /// A cache of implicitly generated dot-member expressions used as roots
   /// for some `.callAsFunction` calls. The key here is "base" locator for
@@ -3142,6 +3363,9 @@ public:
     /// The length of \c isolatedParams.
     unsigned numIsolatedParams;
 
+    /// The length of \c PreconcurrencyClosures.
+    unsigned numPreconcurrencyClosures;
+
     /// The length of \c ImplicitValueConversions.
     unsigned numImplicitValueConversions;
 
@@ -3212,6 +3436,10 @@ private:
   friend Optional<SolutionApplicationTarget>
   swift::TypeChecker::typeCheckExpression(
       SolutionApplicationTarget &target, OptionSet<TypeCheckExprFlags> options);
+
+  friend Optional<SolutionApplicationTarget>
+  swift::TypeChecker::typeCheckTarget(SolutionApplicationTarget &target,
+                                      OptionSet<TypeCheckExprFlags> options);
 
   friend Type swift::TypeChecker::typeCheckParameterDefault(Expr *&,
                                                             DeclContext *, Type,
@@ -3520,6 +3748,35 @@ public:
     return known->second;
   }
 
+  Optional<AppliedBuilderTransform>
+  getAppliedResultBuilderTransform(AnyFunctionRef fn) const {
+    auto transformed = resultBuilderTransformed.find(fn);
+    if (transformed != resultBuilderTransformed.end())
+      return transformed->second;
+    return None;
+  }
+
+  void setBuilderTransformedBody(AnyFunctionRef fn, NominalTypeDecl *builder,
+                                 NullablePtr<VarDecl> builderSelf,
+                                 NullablePtr<BraceStmt> body) {
+    assert(builder->getAttrs().hasAttribute<ResultBuilderAttr>());
+    assert(body);
+    assert(builderSelf);
+
+    auto existing = BuilderTransformedBodies.insert(
+        {{fn, builder}, {builderSelf.get(), body.get()}});
+    assert(existing.second && "Duplicate result builder transform");
+    (void)existing;
+  }
+
+  Optional<std::pair<VarDecl *, BraceStmt *>>
+  getBuilderTransformedBody(AnyFunctionRef fn, NominalTypeDecl *builder) const {
+    auto result = BuilderTransformedBodies.find({fn, builder});
+    if (result == BuilderTransformedBodies.end())
+      return None;
+    return result->second;
+  }
+
   void setCaseLabelItemInfo(const CaseLabelItem *item, CaseLabelItemInfo info) {
     assert(item != nullptr);
     assert(caseLabelItems.count(item) == 0);
@@ -3596,6 +3853,12 @@ public:
   ConstraintLocator *
   getConstraintLocator(const ConstraintLocatorBuilder &builder);
 
+  /// Compute a constraint locator for an implicit value-to-value
+  /// conversion rooted at the given location.
+  ConstraintLocator *
+  getImplicitValueConversionLocator(ConstraintLocatorBuilder root,
+                                    ConversionRestrictionKind restriction);
+
   /// Lookup and return parent associated with given expression.
   Expr *getParentExpr(Expr *expr) {
     if (auto result = getExprDepthAndParent(expr))
@@ -3660,6 +3923,10 @@ public:
         });
   }
 
+  /// Determine whether the callee for the given locator is marked as
+  /// `@preconcurrency`.
+  bool hasPreconcurrencyCallee(ConstraintLocatorBuilder locator);
+
   /// Determine whether the given declaration is unavailable from the
   /// current context.
   bool isDeclUnavailable(const Decl *D,
@@ -3684,10 +3951,6 @@ public:
 
   bool shouldSuppressDiagnostics() const {
     return Options.contains(ConstraintSystemFlags::SuppressDiagnostics);
-  }
-
-  bool shouldReusePrecheckedType() const {
-    return Options.contains(ConstraintSystemFlags::ReusePrecheckedType);
   }
 
   /// Whether we are solving to determine the possible types of a
@@ -3940,26 +4203,6 @@ public:
                                    useDC, functionRefKind,
                                    getConstraintLocator(locator)));
       }
-      break;
-    }
-  }
-
-  /// Add a value witness constraint to the constraint system.
-  void addValueWitnessConstraint(
-      Type baseTy, ValueDecl *requirement, Type memberTy, DeclContext *useDC,
-      FunctionRefKind functionRefKind, ConstraintLocatorBuilder locator) {
-    assert(baseTy);
-    assert(memberTy);
-    assert(requirement);
-    assert(useDC);
-    switch (simplifyValueWitnessConstraint(
-        ConstraintKind::ValueWitness, baseTy, requirement, memberTy, useDC,
-        functionRefKind, TMF_GenerateConstraints, locator)) {
-    case SolutionKind::Unsolved:
-      llvm_unreachable("Unsolved result when generating constraints!");
-
-    case SolutionKind::Solved:
-    case SolutionKind::Error:
       break;
     }
   }
@@ -4375,10 +4618,11 @@ public:
          const OpenedTypeMap &replacements);
 
   /// Wrapper over swift::adjustFunctionTypeForConcurrency that passes along
-  /// the appropriate closure-type extraction function.
+  /// the appropriate closure-type and opening extraction functions.
   AnyFunctionType *adjustFunctionTypeForConcurrency(
     AnyFunctionType *fnType, ValueDecl *decl, DeclContext *dc,
-    unsigned numApplies, bool isMainDispatchQueue);
+    unsigned numApplies, bool isMainDispatchQueue,
+    OpenedTypeMap &replacements);
 
   /// Retrieve the type of a reference to the given value declaration.
   ///
@@ -4388,9 +4632,8 @@ public:
   ///
   /// \param decl The declarations whose type is being computed.
   ///
-  /// \returns a pair containing the full opened type (if applicable) and
-  /// opened type of a reference to declaration.
-  std::pair<Type, Type> getTypeOfReference(
+  /// \returns a description of the type of this declaration reference.
+  DeclReferenceType getTypeOfReference(
                           ValueDecl *decl,
                           FunctionRefKind functionRefKind,
                           ConstraintLocatorBuilder locator,
@@ -4436,7 +4679,19 @@ public:
       llvm::function_ref<Type(const AbstractClosureExpr *)> getClosureType =
         [](const AbstractClosureExpr *) {
           return Type();
+        },
+      llvm::function_ref<bool(const ClosureExpr *)> isolatedByPreconcurrency =
+        [](const ClosureExpr *closure) {
+          return closure->isIsolatedByPreconcurrency();
         });
+
+  /// Given the opened type and a pile of information about a member reference,
+  /// determine the reference type of the member reference.
+  Type getMemberReferenceTypeFromOpenedType(
+      Type &openedType, Type baseObjTy, ValueDecl *value, DeclContext *outerDC,
+      ConstraintLocator *locator, bool hasAppliedSelf,
+      bool isStaticMemberRefOnProtocol, bool isDynamicResult,
+      OpenedTypeMap &replacements);
 
   /// Retrieve the type of a reference to the given value declaration,
   /// as a member with a base of the given type.
@@ -4448,9 +4703,8 @@ public:
   /// \param isDynamicResult Indicates that this declaration was found via
   /// dynamic lookup.
   ///
-  /// \returns a pair containing the full opened type (which includes the opened
-  /// base) and opened type of a reference to this member.
-  std::pair<Type, Type> getTypeOfMemberReference(
+  /// \returns a description of the type of this declaration reference.
+  DeclReferenceType getTypeOfMemberReference(
                           Type baseTy, ValueDecl *decl, DeclContext *useDC,
                           bool isDynamicResult,
                           FunctionRefKind functionRefKind,
@@ -4589,6 +4843,7 @@ public:
   /// Generate constraints for the given solution target.
   ///
   /// \returns true if an error occurred, false otherwise.
+  LLVM_NODISCARD
   bool generateConstraints(SolutionApplicationTarget &target,
                            FreeTypeVariableBinding allowFreeTypeVariables);
 
@@ -4597,11 +4852,23 @@ public:
   /// \param closure the closure expression
   ///
   /// \returns \c true if constraint generation failed, \c false otherwise
+  LLVM_NODISCARD
   bool generateConstraints(ClosureExpr *closure);
+
+  /// Generate constraints for the body of the given function.
+  ///
+  /// \param fn The function or closure expression
+  /// \param body The body of the given function that should be
+  /// used for constraint generation.
+  ///
+  /// \returns \c true if constraint generation failed, \c false otherwise
+  LLVM_NODISCARD
+  bool generateConstraints(AnyFunctionRef fn, BraceStmt *body);
 
   /// Generate constraints for the given (unchecked) expression.
   ///
   /// \returns a possibly-sanitized expression, or null if an error occurred.
+  LLVM_NODISCARD
   Expr *generateConstraints(Expr *E, DeclContext *dc,
                             bool isInputExpression = true);
 
@@ -4609,6 +4876,7 @@ public:
   /// value of the given expression.
   ///
   /// \returns a possibly-sanitized initializer, or null if an error occurred.
+  LLVM_NODISCARD
   Type generateConstraints(Pattern *P, ConstraintLocatorBuilder locator,
                            bool bindPatternVarsOneWay,
                            PatternBindingDecl *patternBinding,
@@ -4618,6 +4886,7 @@ public:
   ///
   /// \returns true if there was an error in constraint generation, false
   /// if generation succeeded.
+  LLVM_NODISCARD
   bool generateConstraints(StmtCondition condition, DeclContext *dc);
 
   /// Generate constraints for a case statement.
@@ -4627,6 +4896,7 @@ public:
   ///
   /// \returns true if there was an error in constraint generation, false
   /// if generation succeeded.
+  LLVM_NODISCARD
   bool generateConstraints(CaseStmt *caseStmt, DeclContext *dc,
                            Type subjectType, ConstraintLocator *locator);
 
@@ -4670,6 +4940,7 @@ public:
   /// \param propertyType The type of the wrapped property.
   ///
   /// \returns true if there is an error.
+  LLVM_NODISCARD
   bool generateWrappedPropertyTypeConstraints(VarDecl *wrappedVar,
                                               Type initializerType,
                                               Type propertyType);
@@ -4915,7 +5186,8 @@ public:
   ///
   /// An expression needs type erasure if:
   ///  1. The expression is a return value.
-  ///  2. The enclosing function is dynamic or a dynamic replacement.
+  ///  2. The enclosing function is dynamic, a dynamic replacement, or
+  ///     `-enable-experimental-opaque-type-erasure` is used.
   ///  3. The enclosing function returns an opaque type.
   ///  4. The opaque type conforms to (exactly) one protocol, and the protocol
   ///     has a declared type eraser.
@@ -5441,14 +5713,14 @@ public:
   ///
   ///
   /// \param solution The solution to apply.
-  /// \param closure The closure to which the solution is being applied.
+  /// \param fn The function or closure to which the solution is being applied.
   /// \param currentDC The declaration context in which transformations
   /// will be applied.
   /// \param rewriteTarget Function that performs a rewrite of any
   /// solution application target within the context.
   ///
   /// \returns true if solution cannot be applied.
-  bool applySolutionToBody(Solution &solution, ClosureExpr *closure,
+  bool applySolutionToBody(Solution &solution, AnyFunctionRef fn,
                            DeclContext *&currentDC,
                            std::function<Optional<SolutionApplicationTarget>(
                                SolutionApplicationTarget)>
@@ -5507,7 +5779,7 @@ public:
     return false;
   }
 
-  bool isTooComplex(SmallVectorImpl<Solution> const &solutions) {
+  bool isTooComplex(ArrayRef<Solution> solutions) {
     if (isAlreadyTooComplex.first)
       return true;
 
@@ -5936,7 +6208,7 @@ public:
   bool isSymmetricOperator() const;
   bool isUnaryOperator() const;
 
-  void print(llvm::raw_ostream &Out, SourceManager *SM) const {
+  void print(llvm::raw_ostream &Out, SourceManager *SM, unsigned indent = 0) const {
     Out << "disjunction choice ";
     Choice->print(Out, SM);
   }
@@ -5968,9 +6240,9 @@ public:
 
   ConstraintLocator *getLocator() const { return Element->getLocator(); }
 
-  void print(llvm::raw_ostream &Out, SourceManager *SM) const {
+  void print(llvm::raw_ostream &Out, SourceManager *SM, unsigned indent) const {
     Out << "conjunction element ";
-    Element->print(Out, SM);
+    Element->print(Out, SM, indent);
   }
 
 private:
@@ -6005,7 +6277,7 @@ public:
   Optional<std::pair<ConstraintFix *, unsigned>>
   fixForHole(ConstraintSystem &cs) const;
 
-  void print(llvm::raw_ostream &Out, SourceManager *) const {
+  void print(llvm::raw_ostream &Out, SourceManager *, unsigned indent) const {
     PrintOptions PO;
     PO.PrintTypesForDebugging = true;
     Out << "type variable " << TypeVar->getString(PO)
@@ -6285,6 +6557,13 @@ bool isOperatorDisjunction(Constraint *disjunction);
 /// declarations, or statements directly in its body (no in other closures
 /// or nested declarations).
 ASTNode findAsyncNode(ClosureExpr *closure);
+
+/// Check whether the given binding represents a placeholder variable that
+/// has to get its type inferred at a first use site.
+///
+/// \returns The currently assigned type if it's a placeholder,
+/// empty type otherwise.
+Type isPlaceholderVar(PatternBindingDecl *PB);
 
 } // end namespace constraints
 

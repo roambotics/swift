@@ -27,6 +27,7 @@
 #include "swift/AST/Types.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Sema/ConstraintSystem.h"
+#include "swift/Sema/FixBehavior.h"
 #include "swift/Sema/OverloadChoice.h"
 #include "llvm/ADT/ArrayRef.h"
 #include <tuple>
@@ -42,17 +43,17 @@ class FunctionArgApplyInfo;
 class FailureDiagnostic {
   const Solution &S;
   ConstraintLocator *Locator;
-  bool isWarning;
+  FixBehavior fixBehavior;
 
 public:
   FailureDiagnostic(const Solution &solution, ConstraintLocator *locator,
-                    bool isWarning = false)
-      : S(solution), Locator(locator), isWarning(isWarning) {}
+                    FixBehavior fixBehavior = FixBehavior::Error)
+      : S(solution), Locator(locator), fixBehavior(fixBehavior) {}
 
   FailureDiagnostic(const Solution &solution, ASTNode anchor,
-                    bool isWarning = false)
+                    FixBehavior fixBehavior = FixBehavior::Error)
       : FailureDiagnostic(solution, solution.getConstraintLocator(anchor),
-                          isWarning) { }
+                          fixBehavior) { }
 
   virtual ~FailureDiagnostic();
 
@@ -605,7 +606,8 @@ class ContextualFailure : public FailureDiagnostic {
 
 public:
   ContextualFailure(const Solution &solution, Type lhs, Type rhs,
-                    ConstraintLocator *locator, bool isWarning = false)
+                    ConstraintLocator *locator,
+                    FixBehavior fixBehavior = FixBehavior::Error)
       : ContextualFailure(
             solution,
             locator->isForContextualType()
@@ -613,12 +615,12 @@ public:
                       .getPurpose()
                 : solution.getConstraintSystem().getContextualTypePurpose(
                       locator->getAnchor()),
-            lhs, rhs, locator, isWarning) {}
+            lhs, rhs, locator, fixBehavior) {}
 
   ContextualFailure(const Solution &solution, ContextualTypePurpose purpose,
                     Type lhs, Type rhs, ConstraintLocator *locator,
-                    bool isWarning = false)
-      : FailureDiagnostic(solution, locator, isWarning), CTP(purpose),
+                    FixBehavior fixBehavior = FixBehavior::Error)
+      : FailureDiagnostic(solution, locator, fixBehavior), CTP(purpose),
         RawFromType(lhs), RawToType(rhs) {
     assert(lhs && "Expected a valid 'from' type");
     assert(rhs && "Expected a valid 'to' type");
@@ -759,8 +761,9 @@ public:
   AttributedFuncToTypeConversionFailure(const Solution &solution, Type fromType,
                                         Type toType, ConstraintLocator *locator,
                                         AttributeKind attributeKind,
-                                        bool isWarning = false)
-      : ContextualFailure(solution, fromType, toType, locator, isWarning),
+                                        FixBehavior fixBehavior =
+                                            FixBehavior::Error)
+      : ContextualFailure(solution, fromType, toType, locator, fixBehavior),
         attributeKind(attributeKind) {}
 
   bool diagnoseAsError() override;
@@ -784,8 +787,8 @@ class DroppedGlobalActorFunctionAttr final : public ContextualFailure {
 public:
   DroppedGlobalActorFunctionAttr(const Solution &solution, Type fromType,
                                  Type toType, ConstraintLocator *locator,
-                                 bool isWarning)
-    : ContextualFailure(solution, fromType, toType, locator, isWarning) { }
+                                 FixBehavior fixBehavior)
+    : ContextualFailure(solution, fromType, toType, locator, fixBehavior) { }
 
   bool diagnoseAsError() override;
 };
@@ -1188,6 +1191,12 @@ public:
       : InvalidMemberRefFailure(solution, baseType, memberName, locator) {}
 
   SourceLoc getLoc() const override {
+    auto *locator = getLocator();
+
+    if (locator->findLast<LocatorPathElt::SyntacticElement>()) {
+      return constraints::getLoc(getAnchor());
+    }
+
     // Diagnostic should point to the member instead of its base expression.
     return constraints::getLoc(getRawAnchor());
   }
@@ -1800,8 +1809,7 @@ public:
                                       ConstraintLocator *locator)
       : ContextualFailure(solution, type, protocolType, locator),
         Context(context) {
-    assert(protocolType->is<ProtocolType>() ||
-           protocolType->is<ProtocolCompositionType>());
+    assert(protocolType->isExistentialType());
   }
 
   bool diagnoseAsError() override;
@@ -1950,8 +1958,9 @@ class ArgumentMismatchFailure : public ContextualFailure {
 public:
   ArgumentMismatchFailure(const Solution &solution, Type argType,
                           Type paramType, ConstraintLocator *locator,
-                          bool warning = false)
-      : ContextualFailure(solution, argType, paramType, locator, warning),
+                          FixBehavior fixBehavior =
+                              FixBehavior::Error)
+      : ContextualFailure(solution, argType, paramType, locator, fixBehavior),
         Info(*getFunctionArgApplyInfo(getLocator())) {}
 
   bool diagnoseAsError() override;
@@ -1991,6 +2000,10 @@ public:
   /// Are currently impossible to fix correctly,
   /// so we have to attend to that in diagnostics.
   bool diagnoseMisplacedMissingArgument() const;
+
+  /// Diagnose an attempt to pass a trailing closure to a Regex initializer
+  /// without importing RegexBuilder.
+  bool diagnoseAttemptedRegexBuilder() const;
 
 protected:
   /// \returns The position of the argument being diagnosed, starting at 1.
@@ -2126,8 +2139,9 @@ public:
                                 ConstraintLocator *locator, Type fromType,
                                 Type toType,
                                 ConversionRestrictionKind conversionKind,
-                                bool warning)
-      : ArgumentMismatchFailure(solution, fromType, toType, locator, warning),
+                                FixBehavior fixBehavior)
+      : ArgumentMismatchFailure(
+            solution, fromType, toType, locator, fixBehavior),
         ConversionKind(conversionKind) {
   }
 
@@ -2706,6 +2720,89 @@ public:
 
   SourceLoc getLoc() const override {
     return constraints::getLoc(getLocator()->getAnchor());
+  }
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose situations where inferring existential type for result of
+/// a call would result in loss of generic requirements.
+///
+/// \code
+/// protocol P {
+///  associatedtype A
+/// }
+///
+/// protocol Q {
+///  associatedtype B: P where B.A == Int
+/// }
+///
+/// func getB<T: Q>(_: T) -> T.B { ... }
+///
+/// func test(v: any Q) {
+///   let _ = getB(v) // <- produces `any P` which looses A == Int
+/// }
+/// \endcode
+class MissingExplicitExistentialCoercion final : public FailureDiagnostic {
+  Type ErasedResultType;
+
+public:
+  MissingExplicitExistentialCoercion(const Solution &solution,
+                                     Type erasedResultTy,
+                                     ConstraintLocator *locator,
+                                     FixBehavior fixBehavior)
+      : FailureDiagnostic(solution, locator, fixBehavior),
+        ErasedResultType(resolveType(erasedResultTy)) {}
+
+  SourceRange getSourceRange() const override {
+    auto rawAnchor = getRawAnchor();
+    return {rawAnchor.getStartLoc(), rawAnchor.getEndLoc()};
+  }
+
+  bool diagnoseAsError() override;
+  bool diagnoseAsNote() override;
+
+private:
+  void fixIt(InFlightDiagnostic &diagnostic) const;
+
+  /// Determine whether the fix-it to add `as any ...` requires parens.
+  ///
+  /// Parens are required to avoid suppressing existential opening
+  /// if result of the call is passed as an argument to another call
+  /// that requires such opening.
+  bool fixItRequiresParens() const;
+};
+
+/// Diagnose situations where pattern variables with the same name
+/// have conflicting types:
+///
+/// \code
+/// enum E {
+/// case a(Int)
+/// case b(String)
+/// }
+///
+/// func test(e: E) {
+///   switch e {
+///    case .a(let x), .b(let x): ...
+///   }
+/// }
+/// \endcode
+///
+/// In this example `x` is bound to `Int` and `String` at the same
+/// time which is incorrect.
+class ConflictingPatternVariables final : public FailureDiagnostic {
+  Type ExpectedType;
+  SmallVector<VarDecl *, 4> Vars;
+
+public:
+  ConflictingPatternVariables(const Solution &solution, Type expectedTy,
+                              ArrayRef<VarDecl *> conflicts,
+                              ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator),
+        ExpectedType(resolveType(expectedTy)),
+        Vars(conflicts.begin(), conflicts.end()) {
+    assert(!Vars.empty());
   }
 
   bool diagnoseAsError() override;

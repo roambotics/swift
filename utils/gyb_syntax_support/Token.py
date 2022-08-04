@@ -1,5 +1,5 @@
 from .Classification import classification_by_name
-from .Node import error  # noqa: I201
+from .Utils import error  # noqa: I201
 from .kinds import lowercase_first_word  # noqa: I201
 
 
@@ -214,7 +214,8 @@ SYNTAX_TOKENS = [
     # Punctuators
     Punctuator('LeftParen', 'l_paren', text='(', serialization_code=88),
     Punctuator('RightParen', 'r_paren', text=')', serialization_code=89),
-    Punctuator('LeftBrace', 'l_brace', text='{', serialization_code=90),
+    Punctuator('LeftBrace', 'l_brace', text='{', requires_leading_space=True,
+               serialization_code=90),
     Punctuator('RightBrace', 'r_brace', text='}', serialization_code=91),
     Punctuator('LeftSquareBracket', 'l_square', text='[',
                serialization_code=92),
@@ -243,9 +244,8 @@ SYNTAX_TOKENS = [
     Punctuator('PrefixAmpersand', 'amp_prefix', text='&',
                requires_leading_space=True, requires_trailing_space=True, 
                serialization_code=96),
-    Punctuator('Arrow', 'arrow', text='->', requires_trailing_space=True,
-               serialization_code=78),
-
+    Punctuator('Arrow', 'arrow', text='->', requires_leading_space=True,
+               requires_trailing_space=True, serialization_code=78),
 
     Punctuator('Backtick', 'backtick', text='`', serialization_code=79),
 

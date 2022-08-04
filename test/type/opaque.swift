@@ -274,7 +274,7 @@ func associatedTypeIdentity() {
   sameType(gary(candace()).r_out(), gary(candace()).r_out())
   sameType(gary(doug()).r_out(), gary(doug()).r_out())
   // TODO(diagnostics): This is not great but the problem comes from the way solver discovers and attempts bindings, if we could detect that
-  // `(some R).S` from first reference to `gary()` in incosistent with the second one based on the parent type of `S` it would be much easier to diagnose.
+  // `(some R).S` from first reference to `gary()` in inconsistent with the second one based on the parent type of `S` it would be much easier to diagnose.
   sameType(gary(doug()).r_out(), gary(candace()).r_out())
   // expected-error@-1:12 {{conflicting arguments to generic parameter 'T' ('some R' (result type of 'doug') vs. 'some R' (result type of 'candace'))}}
   // expected-error@-2:34 {{conflicting arguments to generic parameter 'T' ('some R' (result type of 'doug') vs. 'some R' (result type of 'candace'))}}
@@ -488,8 +488,11 @@ func foo_repl<S>(_ s: S) -> some Proto {
 
 protocol SomeProtocolA {}
 protocol SomeProtocolB {}
-struct SomeStructC: SomeProtocolA, SomeProtocolB {}
+protocol SomeProtocolC {}
+struct SomeStructC: SomeProtocolA, SomeProtocolB, SomeProtocolC {}
 let someProperty: SomeProtocolA & some SomeProtocolB = SomeStructC() // expected-error {{'some' should appear at the beginning of a composition}}{{35-40=}}{{19-19=some }}
+let someOtherProperty: some SomeProtocolA & some SomeProtocolB = SomeStructC() // expected-error {{'some' should appear at the beginning of a composition}}{{45-50=}}
+let someThirdProperty: some SomeProtocolA & SomeProtocolB & some SomeProtocolC = SomeStructC() // expected-error {{'some' should appear at the beginning of a composition}}{{61-66=}}
 
 // An opaque result type on a protocol extension member effectively
 // contains an invariant reference to 'Self', and therefore cannot

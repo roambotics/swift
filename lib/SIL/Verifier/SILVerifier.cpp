@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-verifier"
+
 #include "VerifierPrivate.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/AnyFunctionRef.h"
@@ -36,6 +37,7 @@
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILFunction.h"
+#include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILVTable.h"
 #include "swift/SIL/SILVTableVisitor.h"
@@ -1092,7 +1094,7 @@ public:
     // If we do not have qualified ownership, then do not verify value base
     // ownership.
     if (!F->hasOwnership()) {
-      require(SILValue(V).getOwnershipKind() == OwnershipKind::None,
+      require(SILValue(V)->getOwnershipKind() == OwnershipKind::None,
               "Once ownership is gone, all values should have none ownership");
       return;
     }
@@ -1469,10 +1471,8 @@ public:
               "Operand is of an ArchetypeType that does not exist in the "
               "Caller's generic param list.");
       if (auto OpenedA = getOpenedArchetypeOf(A)) {
-        const auto root =
-            cast<OpenedArchetypeType>(CanType(OpenedA->getRoot()));
         auto *openingInst =
-            F->getModule().getRootOpenedArchetypeDefInst(root, F);
+            F->getModule().getRootOpenedArchetypeDefInst(OpenedA.getRoot(), F);
         require(I == nullptr || openingInst == I ||
                     properlyDominates(openingInst, I),
                 "Use of an opened archetype should be dominated by a "
@@ -1605,7 +1605,7 @@ public:
         require(isArchetypeValidInFunction(A, AI->getFunction()),
                 "Archetype to be substituted must be valid in function.");
 
-        const auto root = cast<OpenedArchetypeType>(CanType(A->getRoot()));
+        const auto root = A.getRoot();
 
         // Collect all root opened archetypes used in the substitutions list.
         FoundRootOpenedArchetypes.insert(root);
@@ -1846,9 +1846,6 @@ public:
     SILFunctionConventions substConv(substTy, F.getModule());
     unsigned appliedArgStartIdx =
         substConv.getNumSILArguments() - PAI->getNumArguments();
-    bool isSendableAndStageIsCanonical =
-        PAI->getFunctionType()->isSendable() &&
-        F.getModule().getStage() >= SILStage::Canonical;
     for (auto p : llvm::enumerate(PAI->getArguments())) {
       requireSameType(
           p.value()->getType(),
@@ -1856,14 +1853,6 @@ public:
                                        F.getTypeExpansionContext()),
           "applied argument types do not match suffix of function type's "
           "inputs");
-
-      // TODO: Expand this to also be true for address only types.
-      if (isSendableAndStageIsCanonical)
-        require(
-            !p.value()->getType().getASTType()->is<SILBoxType>() ||
-                p.value()->getType().getSILBoxFieldType(&F).isAddressOnly(F),
-            "Concurrent partial apply in canonical SIL with a loadable box "
-            "type argument?!");
     }
 
     // The arguments to the result function type must match the prefix of the
@@ -2409,7 +2398,7 @@ public:
           "Inst with qualified ownership in a function that is not qualified");
       SILValue Src = SI->getSrc();
       require(Src->getType().isTrivial(*SI->getFunction()) ||
-                  Src.getOwnershipKind() == OwnershipKind::None,
+                  Src->getOwnershipKind() == OwnershipKind::None,
               "A store with trivial ownership must store a type with trivial "
               "ownership");
       break;
@@ -2711,6 +2700,9 @@ public:
     require(!fnConv.useLoweredAddresses() || F.hasOwnership(),
             "copy_value is only valid in functions with qualified "
             "ownership");
+    require(I->getModule().getStage() == SILStage::Raw ||
+                !I->getOperand()->getType().isMoveOnly(),
+            "'MoveOnly' types can only be copied in Raw SIL?!");
   }
 
   void checkDestroyValueInst(DestroyValueInst *I) {
@@ -2999,8 +2991,7 @@ public:
     // metatype with the same constraint type as its existential operand.
     auto formalInstanceTy
       = MI->getType().castTo<ExistentialMetatypeType>().getInstanceType();
-    if (formalInstanceTy->isConstraintType() &&
-        !(formalInstanceTy->isAny() || formalInstanceTy->isAnyObject())) {
+    if (formalInstanceTy->isConstraintType()) {
       require(MI->getOperand()->getType().is<ExistentialType>(),
               "existential_metatype operand must be an existential type");
       formalInstanceTy =
@@ -4074,10 +4065,8 @@ public:
     Ty.visit([&](CanType t) {
       SILValue Def;
       if (const auto archetypeTy = dyn_cast<OpenedArchetypeType>(t)) {
-        const auto root =
-            cast<OpenedArchetypeType>(CanType(archetypeTy->getRoot()));
-        Def = I->getModule().getRootOpenedArchetypeDefInst(root,
-                                                           I->getFunction());
+        Def = I->getModule().getRootOpenedArchetypeDefInst(
+            archetypeTy.getRoot(), I->getFunction());
         require(Def, "Root opened archetype should be registered in SILModule");
       } else if (t->hasDynamicSelfType()) {
         require(I->getFunction()->hasSelfParam() ||
@@ -4124,13 +4113,13 @@ public:
       auto succOwnershipKind =
           CBI->getSuccessBB()->args_begin()[0]->getOwnershipKind();
       require(succOwnershipKind.isCompatibleWith(
-                  CBI->getOperand().getOwnershipKind()),
+                  CBI->getOperand()->getOwnershipKind()),
               "succ dest block argument must have ownership compatible with "
               "the checked_cast_br operand");
       auto failOwnershipKind =
           CBI->getFailureBB()->args_begin()[0]->getOwnershipKind();
       require(failOwnershipKind.isCompatibleWith(
-                  CBI->getOperand().getOwnershipKind()),
+                  CBI->getOperand()->getOwnershipKind()),
               "failure dest block argument must have ownership compatible with "
               "the checked_cast_br operand");
 
@@ -4142,12 +4131,12 @@ public:
       // boxed AnyHashable (ClassType). This breaks with the guarantees of
       // checked_cast_br guaranteed, so we ban it.
       require(!CBI->getOperand()->getType().isAnyObject() ||
-                  CBI->getOperand().getOwnershipKind() !=
+                  CBI->getOperand()->getOwnershipKind() !=
                       OwnershipKind::Guaranteed,
               "checked_cast_br with an AnyObject typed source cannot forward "
               "guaranteed ownership");
       require(CBI->preservesOwnership() ||
-                  CBI->getOperand().getOwnershipKind() !=
+                  CBI->getOperand()->getOwnershipKind() !=
                       OwnershipKind::Guaranteed,
               "If checked_cast_br is not directly forwarding, it can not have "
               "guaranteed ownership");
@@ -5395,6 +5384,31 @@ public:
     require(i->getModule().getStage() == SILStage::Raw,
             "Only valid in Raw SIL! Should have been eliminated by /some/ "
             "diagnostic pass");
+  }
+
+  void checkMoveOnlyWrapperToCopyableValueInst(
+      MoveOnlyWrapperToCopyableValueInst *cvt) {
+    require(cvt->getOperand()->getType().isObject(),
+            "Operand value should be an object");
+    require(!cvt->getType().isMoveOnlyWrapped(), "Output should not move only");
+    require(cvt->getType() ==
+                cvt->getOperand()->getType().removingMoveOnlyWrapper(),
+            "Result and operand must have the same type, today.");
+  }
+
+  void checkCopyableToMoveOnlyWrapperValueInst(
+      CopyableToMoveOnlyWrapperValueInst *cvt) {
+    require(cvt->getInitialKind() ==
+                    CopyableToMoveOnlyWrapperValueInst::Owned ||
+                !cvt->getOperand()->getType().isTrivial(*cvt->getFunction()),
+            "To convert from a trivial value to a move only wrapper value use "
+            "TrivialToGuaranteedMoveOnlyWrapperValueInst");
+    require(cvt->getOperand()->getType().isObject(),
+            "Operand value should be an object");
+    require(cvt->getType().isMoveOnlyWrapped(), "Output should be move only");
+    require(cvt->getType() ==
+                cvt->getOperand()->getType().addingMoveOnlyWrapper(),
+            "Result and operand must have the same type, today.");
   }
 
   void verifyEpilogBlocks(SILFunction *F) {

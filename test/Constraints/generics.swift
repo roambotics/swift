@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -enable-objc-interop -requirement-machine-protocol-signatures=on -requirement-machine-inferred-signatures=on
+// RUN: %target-typecheck-verify-swift -enable-objc-interop
 
 infix operator +++
 
@@ -902,7 +902,8 @@ func rdar78781552() {
     // expected-error@-1 {{generic struct 'Test' requires that '(((Int) throws -> Bool) throws -> [Int])?' conform to 'RandomAccessCollection'}}
     // expected-error@-2 {{generic parameter 'Content' could not be inferred}} expected-note@-2 {{explicitly specify the generic arguments to fix this issue}}
     // expected-error@-3 {{cannot convert value of type '(((Int) throws -> Bool) throws -> [Int])?' to expected argument type '[(((Int) throws -> Bool) throws -> [Int])?]'}}
-    // expected-error@-4 {{missing argument for parameter 'filter' in call}}
+    // expected-error@-4 {{missing argument label 'data:' in call}}
+    // expected-error@-5 {{missing argument for parameter 'filter' in call}}
   }
 }
 
@@ -940,4 +941,39 @@ do {
       return Inner()
     }
   }
+}
+
+// https://github.com/apple/swift/issues/43527
+do {
+  struct Box<Contents, U> {}
+
+  class Sweets {}
+  class Chocolate {}
+
+  struct Gift<Contents> {
+    // expected-note@-1 2 {{arguments to generic parameter 'Contents' ('Chocolate' and 'Sweets') are expected to be equal}}
+
+    init(_: Box<[Contents], Never>) {}
+  }
+
+  let box = Box<[Chocolate], Never>()
+
+  var g1: Gift<Sweets>
+  g1 = Gift<Chocolate>(box)
+  // expected-error@-1 {{cannot assign value of type 'Gift<Chocolate>' to type 'Gift<Sweets>'}}
+
+  let g2: Gift<Sweets> = Gift<Chocolate>(box)
+  // expected-error@-1 {{cannot assign value of type 'Gift<Chocolate>' to type 'Gift<Sweets>'}}
+}
+
+func testOverloadGenericVarFn() {
+  struct S<T> {
+    var foo: T
+    func foo(_ y: Int) {}
+    init() { fatalError() }
+  }
+  // Make sure we can pick the variable overload over the function.
+  S<(String) -> Void>().foo("")
+  S<((String) -> Void)?>().foo?("")
+  S<((String) -> Void)?>().foo!("")
 }

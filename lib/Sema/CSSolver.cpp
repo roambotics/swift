@@ -182,6 +182,8 @@ Solution ConstraintSystem::finalize() {
   solution.solutionApplicationTargets = solutionApplicationTargets;
   solution.caseLabelItems = caseLabelItems;
   solution.isolatedParams.append(isolatedParams.begin(), isolatedParams.end());
+  solution.preconcurrencyClosures.append(preconcurrencyClosures.begin(),
+                                         preconcurrencyClosures.end());
 
   for (const auto &transformed : resultBuilderTransformed) {
     solution.resultBuilderTransformed.insert(transformed);
@@ -293,6 +295,10 @@ void ConstraintSystem::applySolution(const Solution &solution) {
 
   for (auto param : solution.isolatedParams) {
     isolatedParams.insert(param);
+  }
+
+  for (auto closure : solution.preconcurrencyClosures) {
+    preconcurrencyClosures.insert(closure);
   }
 
   for (const auto &transformed : solution.resultBuilderTransformed) {
@@ -535,6 +541,7 @@ ConstraintSystem::SolverScope::SolverScope(ConstraintSystem &cs)
   numSolutionApplicationTargets = cs.solutionApplicationTargets.size();
   numCaseLabelItems = cs.caseLabelItems.size();
   numIsolatedParams = cs.isolatedParams.size();
+  numPreconcurrencyClosures = cs.preconcurrencyClosures.size();
   numImplicitValueConversions = cs.ImplicitValueConversions.size();
   numArgumentLists = cs.ArgumentLists.size();
   numImplicitCallAsFunctionRoots = cs.ImplicitCallAsFunctionRoots.size();
@@ -645,6 +652,9 @@ ConstraintSystem::SolverScope::~SolverScope() {
 
   // Remove any isolated parameters.
   truncate(cs.isolatedParams, numIsolatedParams);
+
+  // Remove any preconcurrency closures.
+  truncate(cs.preconcurrencyClosures, numPreconcurrencyClosures);
 
   // Remove any implicit value conversions.
   truncate(cs.ImplicitValueConversions, numImplicitValueConversions);
@@ -1552,15 +1562,16 @@ void ConstraintSystem::solveForCodeCompletion(
 
 bool ConstraintSystem::solveForCodeCompletion(
     SolutionApplicationTarget &target, SmallVectorImpl<Solution> &solutions) {
-  auto *expr = target.getAsExpr();
-  // Tell the constraint system what the contextual type is.
-  setContextualType(expr, target.getExprContextualTypeLoc(),
-                    target.getExprContextualTypePurpose());
+  if (auto *expr = target.getAsExpr()) {
+    // Tell the constraint system what the contextual type is.
+    setContextualType(expr, target.getExprContextualTypeLoc(),
+                      target.getExprContextualTypePurpose());
 
-  // Set up the expression type checker timer.
-  Timer.emplace(expr, *this);
+    // Set up the expression type checker timer.
+    Timer.emplace(expr, *this);
 
-  shrink(expr);
+    shrink(expr);
+  }
 
   if (isDebugMode()) {
     auto &log = llvm::errs();

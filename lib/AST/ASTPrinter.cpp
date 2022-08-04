@@ -57,6 +57,7 @@
 #include "clang/AST/DeclObjC.h"
 #include "clang/Basic/Module.h"
 #include "clang/Basic/SourceManager.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ConvertUTF.h"
@@ -107,6 +108,17 @@ static bool isPublicOrUsableFromInline(Type ty) {
   });
 }
 
+static bool isPrespecilizationDeclWithTarget(const ValueDecl *vd) {
+  // Add exported prespecialized symbols.
+  for (auto *attr : vd->getAttrs().getAttributes<SpecializeAttr>()) {
+    if (!attr->isExported())
+      continue;
+    if (auto *targetFun = attr->getTargetFunctionDecl(vd))
+      return true;
+  }
+  return false;
+}
+
 static bool contributesToParentTypeStorage(const AbstractStorageDecl *ASD) {
   auto *DC = ASD->getDeclContext()->getAsDecl();
   if (!DC) return false;
@@ -144,6 +156,8 @@ PrintOptions PrintOptions::printSwiftInterfaceFile(ModuleDecl *ModuleToPrint,
       PrintOptions::FunctionRepresentationMode::Full;
   result.AlwaysTryPrintParameterLabels = true;
   result.PrintSPIs = printSPIs;
+  result.PrintExplicitAny = true;
+  result.DesugarExistentialConstraint = true;
 
   // We should print __consuming, __owned, etc for the module interface file.
   result.SkipUnderscoredKeywords = false;
@@ -177,9 +191,11 @@ PrintOptions PrintOptions::printSwiftInterfaceFile(ModuleDecl *ModuleToPrint,
       if (!options.PrintSPIs && D->isSPI())
         return false;
 
-      // Skip anything that isn't 'public' or '@usableFromInline'.
+      // Skip anything that isn't 'public' or '@usableFromInline' or has a
+      // _specialize attribute with a targetFunction parameter.
       if (auto *VD = dyn_cast<ValueDecl>(D)) {
-        if (!isPublicOrUsableFromInline(VD)) {
+        if (!isPublicOrUsableFromInline(VD) &&
+            !isPrespecilizationDeclWithTarget(VD)) {
           // We do want to print private stored properties, without their
           // original names present.
           if (auto *ASD = dyn_cast<AbstractStorageDecl>(VD))
@@ -2889,6 +2905,8 @@ static bool usesFeatureBuiltinMove(Decl *decl) {
 
 static bool usesFeatureBuiltinCopy(Decl *decl) { return false; }
 
+static bool usesFeatureBuiltinTaskRunInline(Decl *) { return false; }
+
 static bool usesFeatureSpecializeAttributeWithAvailability(Decl *decl) {
   if (auto func = dyn_cast<AbstractFunctionDecl>(decl)) {
     for (auto specialize : func->getAttrs().getAttributes<SpecializeAttr>()) {
@@ -2958,6 +2976,10 @@ static bool usesFeaturePrimaryAssociatedTypes2(Decl *decl) {
   return false;
 }
 
+static bool usesFeatureSendableCompletionHandlers(Decl *decl) {
+  return false;
+}
+
 static void suppressingFeaturePrimaryAssociatedTypes2(PrintOptions &options,
                                          llvm::function_ref<void()> action) {
   bool originalPrintPrimaryAssociatedTypes = options.PrintPrimaryAssociatedTypes;
@@ -2981,6 +3003,62 @@ suppressingFeatureUnavailableFromAsync(PrintOptions &options,
 
 static bool usesFeatureNoAsyncAvailability(Decl *decl) {
    return decl->getAttrs().getNoAsync(decl->getASTContext()) != nullptr;
+}
+
+static bool usesFeatureConciseMagicFile(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureForwardTrailingClosures(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureBareSlashRegexLiterals(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureVariadicGenerics(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureNamedOpaqueTypes(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureFlowSensitiveConcurrencyCaptures(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureMoveOnly(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureOneWayClosureParameters(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureResultBuilderASTTransform(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureTypeWitnessSystemInference(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureOpaqueTypeErasure(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureDifferentiableProgramming(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureForwardModeDifferentiation(Decl *decl) {
+  return false;
+}
+
+static bool usesFeatureAdditiveArithmeticDerivedConformances(Decl *decl) {
+  return false;
 }
 
 static void
@@ -3515,8 +3593,9 @@ void PrintAST::printPrimaryAssociatedTypes(ProtocolDecl *decl) {
       [&](AssociatedTypeDecl *assocType) {
         Printer.callPrintStructurePre(PrintStructureKind::GenericParameter,
                                       assocType);
-        Printer.printName(assocType->getName(),
-                          PrintNameContext::GenericParameter);
+        Printer.printTypeRef(assocType->getDeclaredInterfaceType(), assocType,
+                             assocType->getName(),
+                             PrintNameContext::GenericParameter);
         Printer.printStructurePost(PrintStructureKind::GenericParameter,
                                    assocType);
       },
@@ -4476,6 +4555,9 @@ void PrintAST::visitPackExpr(PackExpr *expr) {
 void PrintAST::visitReifyPackExpr(ReifyPackExpr *expr) {
 }
 
+void PrintAST::visitTypeJoinExpr(TypeJoinExpr *expr) {
+}
+
 void PrintAST::visitAssignExpr(AssignExpr *expr) {
   visit(expr->getDest());
   Printer << " = ";
@@ -5127,7 +5209,7 @@ class TypePrinter : public TypeVisitor<TypePrinter> {
         llvm_unreachable("bad opaque-return-type printing mode");
       }
     } else if (auto existential = dyn_cast<ExistentialType>(T.getPointer())) {
-      if (!Options.PrintExplicitAny)
+      if (!Options.PrintExplicitAny || !existential->shouldPrintWithAny())
         return isSimpleUnderPrintOptions(existential->getConstraintType());
     } else if (auto existential = dyn_cast<ExistentialMetatypeType>(T.getPointer())) {
       if (!Options.PrintExplicitAny)
@@ -5233,6 +5315,16 @@ class TypePrinter : public TypeVisitor<TypePrinter> {
     Identifier Name = Mod->getRealName();
     if (Options.UseExportedModuleNames && !ExportedModuleName.empty()) {
       Name = Mod->getASTContext().getIdentifier(ExportedModuleName);
+    }
+
+    if (Options.UseOriginallyDefinedInModuleNames) {
+      Decl *D = Ty->getDecl();
+      for (auto attr: D->getAttrs().getAttributes<OriginallyDefinedInAttr>()) {
+        Name = Mod->getASTContext()
+          .getIdentifier(const_cast<OriginallyDefinedInAttr*>(attr)
+                         ->OriginalModuleName);
+        break;
+      }
     }
 
     Printer.printModuleRef(Mod, Name);
@@ -5413,8 +5505,6 @@ public:
 
   void visitParenType(ParenType *T) {
     Printer << "(";
-    printParameterFlags(Printer, Options, T->getParameterFlags(),
-                        /*escaping*/ false);
     visit(T->getUnderlyingType()->getInOutObjectType());
     Printer << ")";
   }
@@ -5449,7 +5539,7 @@ public:
       if (i)
         Printer << ", ";
       const TupleTypeElt &TD = Fields[i];
-      Type EltType = TD.getRawType();
+      Type EltType = TD.getType();
 
       Printer.callPrintStructurePre(PrintStructureKind::TupleElement);
       SWIFT_DEFER {
@@ -5460,14 +5550,7 @@ public:
         Printer.printName(TD.getName(), PrintNameContext::TupleElement);
         Printer << ": ";
       }
-      if (TD.isVararg()) {
-        visit(TD.getVarargBaseTy());
-        Printer << "...";
-      } else {
-        printParameterFlags(Printer, Options, TD.getParameterFlags(),
-                            /*escaping*/ false);
-        visit(EltType);
-      }
+      visit(EltType);
     }
     Printer << ")";
   }
@@ -5553,31 +5636,30 @@ public:
     }
 
     Type instanceType = T->getInstanceType();
-    if (Options.PrintExplicitAny) {
-      if (T->is<ExistentialMetatypeType>()) {
-        Printer << "any ";
+    if (Options.PrintExplicitAny && T->is<ExistentialMetatypeType>()) {
+      Printer << "any ";
 
-        // FIXME: We need to replace nested existential metatypes so that
-        // we don't print duplicate 'any'. This will be unnecessary once
-        // ExistentialMetatypeType is split into ExistentialType(MetatypeType).
-        instanceType = Type(instanceType).transform([](Type type) -> Type {
-          if (auto existential = type->getAs<ExistentialMetatypeType>())
-            return MetatypeType::get(existential->getInstanceType());
+      // FIXME: We need to replace nested existential metatypes so that
+      // we don't print duplicate 'any'. This will be unnecessary once
+      // ExistentialMetatypeType is split into ExistentialType(MetatypeType).
+      printWithParensIfNotSimple(instanceType.transform([](Type type) -> Type {
+        if (auto existential = type->getAs<ExistentialMetatypeType>())
+          return MetatypeType::get(existential->getInstanceType());
 
-          return type;
-        });
-      } else if (instanceType->isAny() || instanceType->isAnyObject()) {
-        // FIXME: 'any' is needed to distinguish between '(any Any).Type'
-        // and 'any Any.Type'. However, this combined with the above hack
-        // to replace nested existential metatypes with metatypes causes
-        // a bug in printing nested existential metatypes for Any and AnyObject,
-        // e.g. 'any (any Any).Type.Type'. This will be fixed by using
-        // ExistentialType for Any and AnyObject.
-        instanceType = ExistentialType::get(instanceType, /*forceExistential=*/true);
-      }
+        return type;
+      }));
+    } else if (T->is<MetatypeType>() && instanceType->is<ExistentialType>()) {
+      // The 'any' keyword is needed to distinguish between existential
+      // metatypes and singleton metatypes. However, 'any' usually isn't
+      // printed for Any and AnyObject, because it's unnecessary to write
+      // 'any' with these specific constraints. Force printing with 'any'
+      // for the existential instance type in this case.
+      instanceType->getAs<ExistentialType>()->forcePrintWithAny([&](Type ty) {
+        printWithParensIfNotSimple(ty);
+      });
+    } else {
+      printWithParensIfNotSimple(instanceType);
     }
-
-    printWithParensIfNotSimple(instanceType);
 
     // We spell normal metatypes of existential types as .Protocol.
     if (isa<MetatypeType>(T) &&
@@ -6085,6 +6167,11 @@ public:
   }
 
   void visitSILBoxType(SILBoxType *T) {
+    // Print attributes.
+    if (T->getLayout()->capturesGenericEnvironment()) {
+      Printer << "@captures_generics ";
+    }
+    
     {
       // A box layout has its own independent generic environment. Don't try
       // to print it with the environment's generic params.
@@ -6118,6 +6205,11 @@ public:
     if (auto subMap = T->getSubstitutions()) {
       printSubstitutions(subMap);
     }
+  }
+
+  void visitSILMoveOnlyWrappedType(SILMoveOnlyWrappedType *T) {
+    Printer << "@moveOnly ";
+    printWithParensIfNotSimple(T->getInnerType());
   }
 
   void visitArraySliceType(ArraySliceType *T) {
@@ -6189,10 +6281,19 @@ public:
   }
 
   void visitExistentialType(ExistentialType *T) {
-    if (Options.PrintExplicitAny)
+    if (Options.PrintExplicitAny && T->shouldPrintWithAny())
       Printer << "any ";
 
-    visit(T->getConstraintType());
+    // FIXME: The desugared type is used here only to support
+    // existential types with protocol typealiases in Swift
+    // interfaces. Verifying that the underlying type of a
+    // protocol typealias is a constriant type is fundamentally
+    // circular, so the desugared type should be written in source.
+    if (Options.DesugarExistentialConstraint && !T->isAnyObject()) {
+      visit(T->getConstraintType()->getDesugaredType());
+    } else {
+      visit(T->getConstraintType());
+    }
   }
 
   void visitLValueType(LValueType *T) {
@@ -6207,8 +6308,7 @@ public:
 
   void visitOpenedArchetypeType(OpenedArchetypeType *T) {
     if (auto parent = T->getParent()) {
-      visitParentType(parent);
-      printArchetypeCommon(T, getAbstractTypeParamDecl(T));
+      printArchetypeCommon(T);
       return;
     }
 
@@ -6217,8 +6317,20 @@ public:
     visit(T->getExistentialType());
   }
 
-  void printArchetypeCommon(ArchetypeType *T,
-                            const AbstractTypeParamDecl *Decl) {
+  void printDependentMember(DependentMemberType *T) {
+    if (auto *const Assoc = T->getAssocType()) {
+      if (Options.ProtocolQualifiedDependentMemberTypes) {
+        Printer << "[";
+        Printer.printName(Assoc->getProtocol()->getName());
+        Printer << "]";
+      }
+      Printer.printTypeRef(T, Assoc, T->getName());
+    } else {
+      Printer.printName(T->getName());
+    }
+  }
+
+  void printArchetypeCommon(ArchetypeType *T) {
     if (Options.AlternativeTypeNames) {
       auto found = Options.AlternativeTypeNames->find(T->getCanonicalType());
       if (found != Options.AlternativeTypeNames->end()) {
@@ -6227,36 +6339,22 @@ public:
       }
     }
 
-    const auto Name = T->getName();
-    if (Name.empty()) {
-      Printer << "<anonymous>";
-    } else if (Decl) {
-      Printer.printTypeRef(T, Decl, Name);
+    auto interfaceType = T->getInterfaceType();
+    if (auto *dependentMember = interfaceType->getAs<DependentMemberType>()) {
+      visitParentType(T->getParent());
+      printDependentMember(dependentMember);
     } else {
-      Printer.printName(Name);
+      visit(interfaceType);
     }
-  }
-
-  static AbstractTypeParamDecl *getAbstractTypeParamDecl(ArchetypeType *T) {
-    if (auto gp = T->getInterfaceType()->getAs<GenericTypeParamType>()) {
-      return gp->getDecl();
-    }
-
-    auto depMemTy = T->getInterfaceType()->castTo<DependentMemberType>();
-    return depMemTy->getAssocType();
   }
 
   void visitPrimaryArchetypeType(PrimaryArchetypeType *T) {
-    if (auto parent = T->getParent())
-      visitParentType(parent);
-
-    printArchetypeCommon(T, getAbstractTypeParamDecl(T));
+    printArchetypeCommon(T);
   }
 
   void visitOpaqueTypeArchetypeType(OpaqueTypeArchetypeType *T) {
     if (auto parent = T->getParent()) {
-      visitParentType(parent);
-      printArchetypeCommon(T, getAbstractTypeParamDecl(T));
+      printArchetypeCommon(T);
       return;
     }
 
@@ -6333,9 +6431,7 @@ public:
   }
 
   void visitSequenceArchetypeType(SequenceArchetypeType *T) {
-    if (auto parent = T->getParent())
-      visitParentType(parent);
-    printArchetypeCommon(T, getAbstractTypeParamDecl(T));
+    printArchetypeCommon(T);
   }
 
   void visitGenericTypeParamType(GenericTypeParamType *T) {
@@ -6368,10 +6464,16 @@ public:
 
       // Print based on the type.
       Printer << "some ";
-      if (auto inheritedType = decl->getInherited().front().getType())
-        inheritedType->print(Printer, Options);
-      else
+      if (!decl->getConformingProtocols().empty()) {
+        llvm::interleave(decl->getConformingProtocols(), Printer, [&](ProtocolDecl *proto){
+          if (auto printType = proto->getDeclaredType())
+            printType->print(Printer, Options);
+          else
+            Printer << proto->getNameStr();
+        }, " & ");
+      } else {
         Printer << "Any";
+      }
       return;
     }
 
@@ -6387,16 +6489,7 @@ public:
 
   void visitDependentMemberType(DependentMemberType *T) {
     visitParentType(T->getBase());
-    if (auto *const Assoc = T->getAssocType()) {
-      if (Options.ProtocolQualifiedDependentMemberTypes) {
-        Printer << "[";
-        Printer.printName(Assoc->getProtocol()->getName());
-        Printer << "]";
-      }
-      Printer.printTypeRef(T, Assoc, T->getName());
-    } else {
-      Printer.printName(T->getName());
-    }
+    printDependentMember(T);
   }
 
 #define REF_STORAGE(Name, name, ...) \

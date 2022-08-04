@@ -11,11 +11,17 @@
 //===----------------------------------------------------------------------===//
 
 #include "ClangSyntaxPrinter.h"
+#include "swift/ABI/MetadataValues.h"
+#include "swift/AST/Module.h"
 
 using namespace swift;
 using namespace cxx_synthesis;
 
 StringRef cxx_synthesis::getCxxImplNamespaceName() { return "_impl"; }
+
+StringRef cxx_synthesis::getCxxOpaqueStorageClassName() {
+  return "OpaqueStorage";
+}
 
 bool ClangSyntaxPrinter::isClangKeyword(StringRef name) {
   static const llvm::DenseSet<StringRef> keywords = [] {
@@ -43,6 +49,23 @@ void ClangSyntaxPrinter::printIdentifier(StringRef name) {
     os << '_';
 }
 
+void ClangSyntaxPrinter::printBaseName(const ValueDecl *decl) {
+  assert(decl->getName().isSimpleName());
+  printIdentifier(decl->getBaseIdentifier().str());
+}
+
+void ClangSyntaxPrinter::printModuleNameCPrefix(const ModuleDecl &mod) {
+  os << mod.getName().str() << '_';
+}
+
+void ClangSyntaxPrinter::printModuleNamespaceQualifiersIfNeeded(
+    const ModuleDecl *referencedModule, const ModuleDecl *currentContext) {
+  if (referencedModule == currentContext)
+    return;
+  printBaseName(referencedModule);
+  os << "::";
+}
+
 /// Print a C++ namespace declaration with the give name and body.
 void ClangSyntaxPrinter::printNamespace(
     llvm::function_ref<void(raw_ostream &OS)> namePrinter,
@@ -60,6 +83,21 @@ void ClangSyntaxPrinter::printNamespace(
     StringRef name,
     llvm::function_ref<void(raw_ostream &OS)> bodyPrinter) const {
   printNamespace([&](raw_ostream &os) { os << name; }, bodyPrinter);
+}
+
+void ClangSyntaxPrinter::printExternC(
+    llvm::function_ref<void(raw_ostream &OS)> bodyPrinter) const {
+  os << "#ifdef __cplusplus\n";
+  os << "extern \"C\" {\n";
+  os << "#endif\n\n";
+  bodyPrinter(os);
+  os << "\n#ifdef __cplusplus\n";
+  os << "}\n";
+  os << "#endif\n";
+}
+
+void ClangSyntaxPrinter::printSwiftImplQualifier() const {
+  os << "swift::" << cxx_synthesis::getCxxImplNamespaceName() << "::";
 }
 
 void ClangSyntaxPrinter::printNullability(
@@ -101,4 +139,32 @@ void ClangSyntaxPrinter::printNullability(
 
   if (printKind != NullabilityPrintKind::After)
     os << ' ';
+}
+
+void ClangSyntaxPrinter::printSwiftTypeMetadataAccessFunctionCall(
+    StringRef name) {
+  os << name << "(0)";
+}
+
+void ClangSyntaxPrinter::printValueWitnessTableAccessSequenceFromTypeMetadata(
+    StringRef metadataVariable, StringRef vwTableVariable, int indent) {
+  os << std::string(indent, ' ');
+  os << "auto *vwTableAddr = ";
+  os << "reinterpret_cast<";
+  printSwiftImplQualifier();
+  os << "ValueWitnessTable **>(" << metadataVariable << "._0) - 1;\n";
+  os << "#ifdef __arm64e__\n";
+  os << std::string(indent, ' ');
+  os << "auto *" << vwTableVariable << " = ";
+  os << "reinterpret_cast<";
+  printSwiftImplQualifier();
+  os << "ValueWitnessTable *>(ptrauth_auth_data(";
+  os << "reinterpret_cast<void *>(*vwTableAddr), "
+        "ptrauth_key_process_independent_data, ";
+  os << "ptrauth_blend_discriminator(vwTableAddr, "
+     << SpecialPointerAuthDiscriminators::ValueWitnessTable << ")));\n";
+  os << "#else\n";
+  os << std::string(indent, ' ');
+  os << "auto *" << vwTableVariable << " = *vwTableAddr;\n";
+  os << "#endif\n";
 }

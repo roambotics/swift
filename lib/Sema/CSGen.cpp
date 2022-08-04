@@ -88,20 +88,12 @@ namespace {
   class LinkedExprCollector : public ASTWalker {
     
     llvm::SmallVectorImpl<Expr*> &LinkedExprs;
-    ConstraintSystem &CS;
 
   public:
-    LinkedExprCollector(llvm::SmallVectorImpl<Expr *> &linkedExprs,
-                        ConstraintSystem &cs)
-        : LinkedExprs(linkedExprs), CS(cs) {}
+    LinkedExprCollector(llvm::SmallVectorImpl<Expr *> &linkedExprs)
+        : LinkedExprs(linkedExprs) {}
 
     std::pair<bool, Expr *> walkToExprPre(Expr *expr) override {
-
-      if (CS.shouldReusePrecheckedType() &&
-          !CS.getType(expr)->hasTypeVariable()) {
-        return { false, expr };
-      }
-
       if (isa<ClosureExpr>(expr))
         return {false, expr};
 
@@ -161,12 +153,6 @@ namespace {
         LTI(lti), CS(cs) {}
     
     std::pair<bool, Expr *> walkToExprPre(Expr *expr) override {
-
-      if (CS.shouldReusePrecheckedType() &&
-          !CS.getType(expr)->hasTypeVariable()) {
-        return { false, expr };
-      }
-
       if (isa<LiteralExpr>(expr)) {
         LTI.hasLiteral = true;
         return { false, expr };
@@ -791,11 +777,6 @@ namespace {
       if (CS.isArgumentIgnoredForCodeCompletion(expr)) {
         return {false, expr};
       }
-
-      if (CS.shouldReusePrecheckedType() &&
-          !CS.getType(expr)->hasTypeVariable()) {
-        return { false, expr };
-      }
       
       if (auto applyExpr = dyn_cast<ApplyExpr>(expr)) {
         if (isa<PrefixUnaryExpr>(applyExpr) ||
@@ -887,7 +868,7 @@ namespace {
       case TypeKind::Tuple: {
         auto tupleTy = cast<TupleType>(ty.getPointer());
         for (auto &elt : tupleTy->getElements())
-          result.emplace_back(elt.getRawType(), elt.getName());
+          result.emplace_back(elt.getType(), elt.getName());
         return;
       }
       case TypeKind::Paren: {
@@ -909,6 +890,11 @@ namespace {
       // that member through the base returns a value convertible to the type
       // of this expression.
       auto baseTy = CS.getType(base);
+      if (isa<ErrorExpr>(base)) {
+        return CS.createTypeVariable(
+            CS.getConstraintLocator(expr, ConstraintLocator::Member),
+            TVO_CanBindToHole);
+      }
       auto tv = CS.createTypeVariable(
                   CS.getConstraintLocator(expr, ConstraintLocator::Member),
                   TVO_CanBindToLValue | TVO_CanBindToNoEscape);
@@ -1087,19 +1073,11 @@ namespace {
     ConstraintSystem &getConstraintSystem() const { return CS; }
 
     virtual Type visitErrorExpr(ErrorExpr *E) {
-      if (!CS.isForCodeCompletion())
-        return nullptr;
+      CS.recordFix(
+          IgnoreInvalidASTNode::create(CS, CS.getConstraintLocator(E)));
 
-      // For code completion, treat error expressions that don't contain
-      // the completion location itself as holes. If an ErrorExpr contains the
-      // code completion location, a fallback typecheck is called on the
-      // ErrorExpr's OriginalExpr (valid sub-expression) if it had one,
-      // independent of the wider expression containing the ErrorExpr, so
-      // there's no point attempting to produce a solution for it.
-      if (CS.containsCodeCompletionLoc(E))
-        return nullptr;
-
-      return PlaceholderType::get(CS.getASTContext(), E);
+      return CS.createTypeVariable(CS.getConstraintLocator(E),
+                                   TVO_CanBindToHole);
     }
 
     virtual Type visitCodeCompletionExpr(CodeCompletionExpr *E) {
@@ -1301,7 +1279,7 @@ namespace {
                            ctx.Id_Regex.str());
         return Type();
       }
-      SmallVector<TupleTypeElt, 4> matchElements {ctx.getSubstringType()};
+      SmallVector<TupleTypeElt, 4> matchElements;
       if (decodeRegexCaptureTypes(ctx,
                                   E->getSerializedCaptureStructure(),
                                   /*atomType*/ ctx.getSubstringType(),
@@ -1310,6 +1288,7 @@ namespace {
                            diag::regex_capture_types_failed_to_decode);
         return Type();
       }
+      assert(!matchElements.empty() && "Should have decoded at least an atom");
       if (matchElements.size() == 1)
         return BoundGenericStructType::get(
             regexDecl, Type(), matchElements.front().getType());
@@ -1392,7 +1371,11 @@ namespace {
       const auto result = TypeResolution::resolveContextualType(
           repr, CS.DC, resCtx, genericOpener, placeholderHandler);
       if (result->hasError()) {
-        return Type();
+        CS.recordFix(
+            IgnoreInvalidASTNode::create(CS, CS.getConstraintLocator(locator)));
+
+        return CS.createTypeVariable(CS.getConstraintLocator(repr),
+                                     TVO_CanBindToHole);
       }
       // Diagnose top-level usages of placeholder types.
       if (isa<PlaceholderTypeRepr>(repr->getWithoutParens())) {
@@ -1557,7 +1540,7 @@ namespace {
       auto &ctx = CS.getASTContext();
       auto typeOperation = getTypeOperation(expr, ctx);
       if (typeOperation != TypeOperation::None)
-        return ctx.TheAnyType;
+        return ctx.getAnyExistentialType();
 
       // If this is `Builtin.trigger_fallback_diagnostic()`, fail
       // without producing any diagnostics, in order to test fallback error.
@@ -1618,7 +1601,11 @@ namespace {
 
     Type visitUnresolvedSpecializeExpr(UnresolvedSpecializeExpr *expr) {
       auto baseTy = CS.getType(expr->getSubExpr());
-      
+
+      if (baseTy->isTypeVariableOrMember()) {
+        return baseTy;
+      }
+
       // We currently only support explicit specialization of generic types.
       // FIXME: We could support explicit function specialization.
       auto &de = CS.getASTContext().Diags;
@@ -1718,9 +1705,48 @@ namespace {
       if (!optTy)
         return Type();
 
-      // Prior to Swift 5, 'try?' always adds an additional layer of optionality,
-      // even if the sub-expression was already optional.
-      if (CS.getASTContext().LangOpts.isSwiftVersionAtLeast(5)) {
+      bool isDelegationToOptionalInit = false;
+      {
+        Expr *e = expr->getSubExpr();
+        while (true) {
+          e = e->getSemanticsProvidingExpr();
+
+          // Look through force-value expressions.
+          if (auto *FVE = dyn_cast<ForceValueExpr>(e)) {
+            e = FVE->getSubExpr();
+            continue;
+          }
+
+          break;
+        }
+
+        if (auto *CE = dyn_cast<CallExpr>(e)) {
+          if (auto *UDE = dyn_cast<UnresolvedDotExpr>(CE->getFn())) {
+            if (!CS.getType(UDE->getBase())->is<AnyMetatypeType>()) {
+              auto overload =
+                  CS.findSelectedOverloadFor(CS.getConstraintLocator(
+                      UDE, ConstraintLocator::ConstructorMember));
+              if (overload) {
+                auto *decl = overload->choice.getDeclOrNull();
+                if (decl && isa<ConstructorDecl>(decl) &&
+                    decl->getDeclContext()
+                        ->getSelfNominalTypeDecl()
+                        ->isOptionalDecl())
+                  isDelegationToOptionalInit = true;
+              }
+            }
+          }
+        }
+      }
+
+      // Prior to Swift 5, 'try?' always adds an additional layer of
+      // optionality, even if the sub-expression was already optional.
+      //
+      // NB Keep adding the additional layer in Swift 5 and on if this 'try?'
+      // applies to a delegation to an 'Optional' initializer, or else we won't
+      // discern the difference between a failure and a constructed value.
+      if (CS.getASTContext().LangOpts.isSwiftVersionAtLeast(5) &&
+          !isDelegationToOptionalInit) {
         CS.addConstraint(ConstraintKind::Conversion,
                          CS.getType(expr->getSubExpr()), optTy,
                          CS.getConstraintLocator(expr));
@@ -1736,11 +1762,7 @@ namespace {
       if (auto favoredTy = CS.getFavoredType(expr->getSubExpr())) {
         CS.setFavoredType(expr, favoredTy);
       }
-
-      auto &ctx = CS.getASTContext();
-      auto parenType = CS.getType(expr->getSubExpr())->getInOutObjectType();
-      auto parenFlags = ParameterTypeFlags().withInOut(expr->isSemanticallyInOutExpr());
-      return ParenType::get(ctx, parenType, parenFlags);
+      return ParenType::get(CS.getASTContext(), CS.getType(expr->getSubExpr()));
     }
 
     Type visitTupleExpr(TupleExpr *expr) {
@@ -1900,7 +1922,7 @@ namespace {
 
       // The array element type defaults to 'Any'.
       CS.addConstraint(ConstraintKind::Defaultable, arrayElementTy,
-                       CS.getASTContext().TheAnyType, locator);
+                       CS.getASTContext().getAnyExistentialType(), locator);
 
       return arrayTy;
     }
@@ -2064,7 +2086,7 @@ namespace {
       // The dictionary value type defaults to 'Any'.
       if (dictionaryValueTy->isTypeVariableOrMember()) {
         CS.addConstraint(ConstraintKind::Defaultable, dictionaryValueTy,
-                         ctx.TheAnyType, locator);
+                         ctx.getAnyExistentialType(), locator);
       }
 
       return dictionaryTy;
@@ -2301,8 +2323,10 @@ namespace {
         }
 
         if (!varType) {
-          varType = CS.createTypeVariable(CS.getConstraintLocator(locator),
-                                          TVO_CanBindToNoEscape);
+          varType = CS.createTypeVariable(
+              CS.getConstraintLocator(pattern,
+                                      LocatorPathElt::NamedPatternDecl()),
+              TVO_CanBindToNoEscape | TVO_CanBindToHole);
 
           // If this is either a `weak` declaration or capture e.g.
           // `weak var ...` or `[weak self]`. Let's wrap type variable
@@ -3496,6 +3520,26 @@ namespace {
       return tv;
     }
 
+    Type visitTypeJoinExpr(TypeJoinExpr *expr) {
+      auto *locator = CS.getConstraintLocator(expr);
+      SmallVector<std::pair<Type, ConstraintLocator *>, 4> elements;
+      elements.reserve(expr->getNumElements());
+
+      for (auto *element : expr->getElements()) {
+        elements.emplace_back(CS.getType(element),
+                              CS.getConstraintLocator(element));
+      }
+
+      auto resultTy = CS.getType(expr->getVar());
+      // The type of a join expression is obtained by performing
+      // a "join-meet" operation on deduced types of its elements
+      // and the underlying variable.
+      auto joinedTy = CS.addJoinConstraint(locator, elements);
+
+      CS.addConstraint(ConstraintKind::Equal, resultTy, joinedTy, locator);
+      return resultTy;
+    }
+
     static bool isTriggerFallbackDiagnosticBuiltin(UnresolvedDotExpr *UDE,
                                                    ASTContext &Context) {
       auto *DRE = dyn_cast<DeclRefExpr>(UDE->getBase());
@@ -3612,7 +3656,7 @@ namespace {
           llvm_unreachable("Unexpected result from join - it should not have been computable!");
 
         // The return value is unimportant.
-        return MetatypeType::get(ctx.TheAnyType)->getCanonicalType();
+        return MetatypeType::get(ctx.getAnyExistentialType())->getCanonicalType();
       }
       }
       llvm_unreachable("unhandled operation");
@@ -3651,15 +3695,6 @@ namespace {
       if (CS.isArgumentIgnoredForCodeCompletion(expr)) {
         CG.setTypeForArgumentIgnoredForCompletion(expr);
         return {false, expr};
-      }
-
-      if (CG.getConstraintSystem().shouldReusePrecheckedType()) {
-        if (expr->getType()) {
-          assert(!expr->getType()->hasTypeVariable());
-          assert(!expr->getType()->hasPlaceholder());
-          CG.getConstraintSystem().cacheType(expr);
-          return { false, expr };
-        }
       }
 
       // Note that the subexpression of a #selector expression is
@@ -3879,44 +3914,127 @@ static bool generateInitPatternConstraints(
   return false;
 }
 
-/// Generate constraints for a for-each statement.
 static Optional<SolutionApplicationTarget>
 generateForEachStmtConstraints(
-    ConstraintSystem &cs, SolutionApplicationTarget target, Expr *sequence) {
+  ConstraintSystem &cs, SolutionApplicationTarget target) {
+  ASTContext &ctx = cs.getASTContext();
   auto forEachStmtInfo = target.getForEachStmtInfo();
-  ForEachStmt *stmt = forEachStmtInfo.stmt;
+  ForEachStmt *stmt = target.getAsForEachStmt();
   bool isAsync = stmt->getAwaitLoc().isValid();
-
-  auto locator = cs.getConstraintLocator(sequence);
+  auto *sequenceExpr = stmt->getParsedSequence();
+  auto *dc = target.getDeclContext();
   auto contextualLocator = cs.getConstraintLocator(
-      sequence, LocatorPathElt::ContextualType(CTP_ForEachStmt));
+      sequenceExpr, LocatorPathElt::ContextualType(CTP_ForEachSequence));
 
   // The expression type must conform to the Sequence protocol.
   auto sequenceProto = TypeChecker::getProtocol(
-      cs.getASTContext(), stmt->getForLoc(), 
-      isAsync ? 
-      KnownProtocolKind::AsyncSequence : KnownProtocolKind::Sequence);
-  if (!sequenceProto) {
+      cs.getASTContext(), stmt->getForLoc(),
+      isAsync ? KnownProtocolKind::AsyncSequence : KnownProtocolKind::Sequence);
+  if (!sequenceProto)
     return None;
+
+  std::string name;
+  {
+    if (auto np = dyn_cast_or_null<NamedPattern>(stmt->getPattern()))
+      name = "$"+np->getBoundName().str().str();
+    name += "$generator";
   }
 
-  Type sequenceType = cs.createTypeVariable(locator, TVO_CanBindToNoEscape);
-  cs.addConstraint(ConstraintKind::Conversion, cs.getType(sequence),
-                   sequenceType, locator);
-  cs.addConstraint(ConstraintKind::ConformsTo, sequenceType,
-                   sequenceProto->getDeclaredInterfaceType(),
-                   contextualLocator);
+  auto *makeIteratorVar = new (ctx)
+      VarDecl(/*isStatic=*/false, VarDecl::Introducer::Var,
+              sequenceExpr->getStartLoc(), ctx.getIdentifier(name), dc);
+  makeIteratorVar->setImplicit();
 
-  // Check the element pattern.
-  ASTContext &ctx = cs.getASTContext();
-  auto dc = target.getDeclContext();
+  // First, let's form a call from sequence to `.makeIterator()` and save
+  // that in a special variable which is going to be used by SILGen.
+  {
+    FuncDecl *makeIterator = isAsync ? ctx.getAsyncSequenceMakeAsyncIterator()
+                                     : ctx.getSequenceMakeIterator();
+
+    auto *makeIteratorRef = UnresolvedDotExpr::createImplicit(
+        ctx, sequenceExpr, makeIterator->getName());
+    makeIteratorRef->setFunctionRefKind(FunctionRefKind::SingleApply);
+
+    auto *makeIteratorCall =
+        CallExpr::createImplicitEmpty(ctx, makeIteratorRef);
+
+    Pattern *pattern = NamedPattern::createImplicit(ctx, makeIteratorVar);
+    auto *PB = PatternBindingDecl::createImplicit(
+        ctx, StaticSpellingKind::None, pattern, makeIteratorCall, dc);
+
+    auto makeIteratorTarget = SolutionApplicationTarget::forInitialization(
+        makeIteratorCall, dc, /*patternType=*/Type(), PB, /*index=*/0,
+        /*shouldBindPatternsOneWay=*/false);
+
+    cs.setContextualType(
+        sequenceExpr,
+        TypeLoc::withoutLoc(sequenceProto->getDeclaredInterfaceType()),
+        CTP_ForEachSequence);
+
+    if (cs.generateConstraints(makeIteratorTarget,
+                               FreeTypeVariableBinding::Disallow))
+      return None;
+
+    forEachStmtInfo.makeIteratorVar = PB;
+
+    // Type of sequence expression has to conform to Sequence protocol.
+    //
+    // Note that the following emulates having `$generator` separately
+    // type-checked by introducing a `TVO_PrefersSubtypeBinding` type
+    // variable that would make sure that result of `.makeIterator` would
+    // get ranked standalone.
+    {
+      auto *externalIteratorType = cs.createTypeVariable(
+          cs.getConstraintLocator(sequenceExpr), TVO_PrefersSubtypeBinding);
+
+      cs.addConstraint(ConstraintKind::Equal, externalIteratorType,
+                       cs.getType(sequenceExpr),
+                       externalIteratorType->getImpl().getLocator());
+
+      cs.addConstraint(ConstraintKind::ConformsTo, externalIteratorType,
+                       sequenceProto->getDeclaredInterfaceType(),
+                       contextualLocator);
+
+      forEachStmtInfo.sequenceType = cs.getType(sequenceExpr);
+    }
+
+    cs.setSolutionApplicationTarget({PB, /*index=*/0}, makeIteratorTarget);
+  }
+
+  // Now, result type of `.makeIterator()` is used to form a call to
+  // `.next()`. `next()` is called on each iteration of the loop.
+  {
+    auto *nextRef = UnresolvedDotExpr::createImplicit(
+      ctx,
+      new (ctx) DeclRefExpr(makeIteratorVar, DeclNameLoc(),
+                            /*Implicit=*/true),
+      ctx.Id_next, /*labels=*/ArrayRef<Identifier>());
+    nextRef->setFunctionRefKind(FunctionRefKind::SingleApply);
+
+    Expr *nextCall = CallExpr::createImplicitEmpty(ctx, nextRef);
+
+    // `next` is always async but witness might not be throwing
+    if (isAsync) {
+      nextCall =
+          AwaitExpr::createImplicit(ctx, /*awaitLoc=*/SourceLoc(), nextCall);
+    }
+
+    SolutionApplicationTarget nextTarget(nextCall, dc, CTP_Unused,
+                                         /*contextualType=*/Type(),
+                                         /*isDiscarded=*/false);
+    if (cs.generateConstraints(nextTarget, FreeTypeVariableBinding::Disallow))
+      return None;
+
+    forEachStmtInfo.nextCall = nextTarget.getAsExpr();
+    cs.setSolutionApplicationTarget(forEachStmtInfo.nextCall, nextTarget);
+  }
+
   Pattern *pattern = TypeChecker::resolvePattern(stmt->getPattern(), dc,
-                                                 /*isStmtCondition*/false);
+                                                 /*isStmtCondition*/ false);
   if (!pattern)
     return None;
 
-  auto contextualPattern =
-      ContextualPattern::forRawPattern(pattern, dc);
+  auto contextualPattern = ContextualPattern::forRawPattern(pattern, dc);
   Type patternType = TypeChecker::typeCheckPattern(contextualPattern);
   if (patternType->hasError()) {
     return None;
@@ -3924,48 +4042,32 @@ generateForEachStmtConstraints(
 
   // Collect constraints from the element pattern.
   auto elementLocator = cs.getConstraintLocator(
-    contextualLocator, ConstraintLocator::SequenceElementType);
-  Type initType = cs.generateConstraints(
-      pattern, contextualLocator, target.shouldBindPatternVarsOneWay(),
-      nullptr, 0);
+      sequenceExpr, ConstraintLocator::SequenceElementType);
+  Type initType =
+      cs.generateConstraints(pattern, elementLocator,
+                             target.shouldBindPatternVarsOneWay(), nullptr, 0);
   if (!initType)
     return None;
 
   // Add a conversion constraint between the element type of the sequence
   // and the type of the element pattern.
-  auto elementAssocType =
-      sequenceProto->getAssociatedType(cs.getASTContext().Id_Element);
-  Type elementType = DependentMemberType::get(sequenceType, elementAssocType);
-  cs.addConstraint(ConstraintKind::Conversion, elementType, initType,
-                   elementLocator);
-
-  // Determine the iterator type.
-  auto iteratorAssocType =
-      sequenceProto->getAssociatedType(isAsync ? 
-        cs.getASTContext().Id_AsyncIterator : cs.getASTContext().Id_Iterator);
-  Type iteratorType = DependentMemberType::get(sequenceType, iteratorAssocType);
-
-  // The iterator type must conform to IteratorProtocol.
-  ProtocolDecl *iteratorProto = TypeChecker::getProtocol(
-      cs.getASTContext(), stmt->getForLoc(),
-      isAsync ? 
-        KnownProtocolKind::AsyncIteratorProtocol : KnownProtocolKind::IteratorProtocol);
-  if (!iteratorProto)
-    return None;
-
-  // Reference the makeIterator witness.
-  FuncDecl *makeIterator = isAsync ? 
-    ctx.getAsyncSequenceMakeAsyncIterator() : ctx.getSequenceMakeIterator();
-  
-  Type makeIteratorType =
-      cs.createTypeVariable(locator, TVO_CanBindToNoEscape);
-  cs.addValueWitnessConstraint(
-      LValueType::get(sequenceType), makeIterator,
-      makeIteratorType, dc, FunctionRefKind::Compound,
-      contextualLocator);
+  auto *elementTypeLoc = cs.getConstraintLocator(
+      elementLocator, ConstraintLocator::OptionalPayload);
+  auto elementType = cs.createTypeVariable(elementTypeLoc,
+                                           /*flags=*/0);
+  {
+    auto nextType = cs.getType(forEachStmtInfo.nextCall);
+    // Note that `OptionalObject` is not used here. This is due to inference
+    // behavior where it would bind `elementType` to the `initType` before
+    // resolving `optional object` constraint which is sometimes too eager.
+    cs.addConstraint(ConstraintKind::Conversion, nextType,
+                     OptionalType::get(elementType), elementTypeLoc);
+    cs.addConstraint(ConstraintKind::Conversion, elementType, initType,
+                     elementLocator);
+  }
 
   // Generate constraints for the "where" expression, if there is one.
-  if (forEachStmtInfo.whereExpr) {
+  if (auto *whereExpr = stmt->getWhere()) {
     auto *boolDecl = dc->getASTContext().getBoolDecl();
     if (!boolDecl)
       return None;
@@ -3974,23 +4076,20 @@ generateForEachStmtConstraints(
     if (!boolType)
       return None;
 
-    SolutionApplicationTarget whereTarget(
-        forEachStmtInfo.whereExpr, dc, CTP_Condition, boolType,
-        /*isDiscarded=*/false);
+    SolutionApplicationTarget whereTarget(whereExpr, dc, CTP_Condition,
+                                          boolType,
+                                          /*isDiscarded=*/false);
     if (cs.generateConstraints(whereTarget, FreeTypeVariableBinding::Disallow))
       return None;
 
-    cs.setContextualType(forEachStmtInfo.whereExpr,
-                         TypeLoc::withoutLoc(boolType), CTP_Condition);
-
-    forEachStmtInfo.whereExpr = whereTarget.getAsExpr();
+    cs.setSolutionApplicationTarget(whereExpr, whereTarget);
+    cs.setContextualType(whereExpr, TypeLoc::withoutLoc(boolType),
+                         CTP_Condition);
   }
 
   // Populate all of the information for a for-each loop.
   forEachStmtInfo.elementType = elementType;
-  forEachStmtInfo.iteratorType = iteratorType;
   forEachStmtInfo.initType = initType;
-  forEachStmtInfo.sequenceType = sequenceType;
   target.setPattern(pattern);
   target.getForEachStmtInfo() = forEachStmtInfo;
   return target;
@@ -4073,16 +4172,6 @@ bool ConstraintSystem::generateConstraints(
     if (target.getExprContextualTypePurpose() == CTP_Initialization &&
         generateInitPatternConstraints(*this, target, expr)) {
       return true;
-    }
-
-    // For a for-each statement, generate constraints for the pattern, where
-    // clause, and sequence traversal.
-    if (target.getExprContextualTypePurpose() == CTP_ForEachStmt) {
-      auto resultTarget = generateForEachStmtConstraints(*this, target, expr);
-      if (!resultTarget)
-        return true;
-
-      target = *resultTarget;
     }
 
     if (isDebugMode()) {
@@ -4179,6 +4268,17 @@ bool ConstraintSystem::generateConstraints(
 
       return !patternType;
     }
+  }
+
+  case SolutionApplicationTarget::Kind::forEachStmt: {
+    // For a for-each statement, generate constraints for the pattern, where
+    // clause, and sequence traversal.
+    auto resultTarget = generateForEachStmtConstraints(*this, target);
+    if (!resultTarget)
+      return true;
+
+    target = *resultTarget;
+    return false;
   }
   }
 }
@@ -4370,7 +4470,7 @@ void ConstraintSystem::optimizeConstraints(Expr *e) {
   SmallVector<Expr *, 16> linkedExprs;
   
   // Collect any linked expressions.
-  LinkedExprCollector collector(linkedExprs, *this);
+  LinkedExprCollector collector(linkedExprs);
   e->walk(collector);
   
   // Favor types, as appropriate.
@@ -4417,11 +4517,10 @@ getMemberDecls(InterestedMemberKind Kind) {
   llvm_unreachable("unhandled kind");
 }
 
-ResolvedMemberResult
-swift::resolveValueMember(DeclContext &DC, Type BaseTy, DeclName Name,
-                          ConstraintSystemOptions Options) {
+ResolvedMemberResult swift::resolveValueMember(DeclContext &DC, Type BaseTy,
+                                               DeclName Name) {
   ResolvedMemberResult Result;
-  ConstraintSystem CS(&DC, Options);
+  ConstraintSystem CS(&DC, None);
 
   // Look up all members of BaseTy with the given Name.
   MemberLookupResult LookupResult = CS.performMemberLookup(

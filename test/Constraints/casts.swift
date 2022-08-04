@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -enable-objc-interop -requirement-machine-inferred-signatures=on
+// RUN: %target-typecheck-verify-swift -enable-objc-interop
 
 class B { 
   init() {} 
@@ -485,8 +485,8 @@ func protocol_composition(_ c: ProtocolP & ProtocolQ, _ c1: ProtocolP & Composit
   _ = c1 as? ConcretePQ1 // OK
   _ = c1 as? ConcretePPQ1 // Ok
   _ = c1 as? NotConforms // Ok
-  _ = c1 as? StructNotComforms // expected-warning {{cast from 'any ProtocolP & Composition' (aka 'ProtocolP & ProtocolP1 & ProtocolQ1') to unrelated type 'StructNotComforms' always fails}}
-  _ = c1 as? NotConformsFinal // expected-warning {{cast from 'any ProtocolP & Composition' (aka 'ProtocolP & ProtocolP1 & ProtocolQ1') to unrelated type 'NotConformsFinal' always fails}}
+  _ = c1 as? StructNotComforms // expected-warning {{cast from 'any ProtocolP & Composition' (aka 'any ProtocolP & ProtocolP1 & ProtocolQ1') to unrelated type 'StructNotComforms' always fails}}
+  _ = c1 as? NotConformsFinal // expected-warning {{cast from 'any ProtocolP & Composition' (aka 'any ProtocolP & ProtocolP1 & ProtocolQ1') to unrelated type 'NotConformsFinal' always fails}}
 }
 
 // SR-13899
@@ -692,4 +692,17 @@ func SR_16058_tests() {
 
   // More than one optionality wrapping
   let _: String? = foo.flatMap { dict.SR16058(_: $0) } as? String // OK
+}
+
+// https://github.com/apple/swift/issues/59405
+func isHashable(_ error: Error) -> Bool {
+  (error as? AnyHashable) != nil // OK
+}
+
+func isHashable_is(_ error: Error) -> Bool {
+  error is AnyHashable // OK
+}
+
+func isHashable_composition(_ error: Error & AnyObject) -> Bool {
+  error is AnyHashable // OK
 }

@@ -3,8 +3,8 @@
 // CHECK:      struct VoidGetter {
 // CHECK-NOT:     var
 // CHECK-NEXT:    init()
-// CHECK-NEXT:    mutating func getXMutating()
-// CHECK-NEXT:    mutating func setXMutating(_: Int32)
+// CHECK-NEXT:    mutating func getX()
+// CHECK-NEXT:    mutating func setX(_: Int32)
 // CHECK-NEXT: }
 
 // CHECK:      struct VoidSetterNoName {
@@ -16,13 +16,13 @@
 // CHECK:      struct IllegalIntReturnSetter {
 // CHECK-NOT:     var
 // CHECK-NEXT:    init()
-// CHECK-NEXT:    mutating func setXMutating(_: Int32) -> Int32
+// CHECK-NEXT:    mutating func setX(_: Int32) -> Int32
 // CHECK-NEXT: }
 
 // CHECK:      struct TwoParameterSetter {
 // CHECK-NOT:     var
 // CHECK-NEXT:    init()
-// CHECK-NEXT:    mutating func setXMutating(_: Int32, _: Int32)
+// CHECK-NEXT:    mutating func setX(_: Int32, _: Int32)
 // CHECK-NEXT: }
 
 // CHECK:      struct NoNameSetter {
@@ -88,7 +88,7 @@
 
 // CHECK:      struct NotypeSetter {
 // CHECK-NEXT:    init()
-// CHECK-NEXT:    mutating func setXMutating()
+// CHECK-NEXT:    mutating func setX()
 // CHECK-NEXT: }
 
 // CHECK:      struct IntGetterSetter {
@@ -96,7 +96,7 @@
 // CHECK-NEXT:    init(val: Int32)
 // CHECK-NEXT:    var x: Int32
 // CHECK-NEXT:    func getX() -> Int32
-// CHECK-NEXT:    mutating func setXMutating(_ v: Int32)
+// CHECK-NEXT:    mutating func setX(_ v: Int32)
 // CHECK-NEXT:    var val: Int32
 // CHECK-NEXT: }
 
@@ -111,6 +111,7 @@
 // CHECK:      struct IntGetterSetterSnakeCase {
 // CHECK-NEXT:    init()
 // CHECK-NEXT:    init(val: Int32)
+// CHECK-NEXT:    var x: Int32
 // CHECK-NEXT:    func get_x() -> Int32
 // CHECK-NEXT:    mutating func set_x(_ v: Int32)
 // CHECK-NEXT:    var val: Int32
@@ -119,7 +120,7 @@
 // CHECK:      struct GetterHasArg {
 // CHECK-NEXT:    init()
 // CHECK-NEXT:    func getX(_ v: Int32) -> Int32
-// CHECK-NEXT:    mutating func setXMutating(_ v: Int32)
+// CHECK-NEXT:    mutating func setX(_ v: Int32)
 // CHECK-NEXT: }
 
 // CHECK:      struct GetterSetterIsUpper {
@@ -171,8 +172,8 @@
 // CHECK-NEXT:    init()
 // CHECK-NEXT:    init(val: Int32)
 // CHECK-NEXT:    var x: Int32 { mutating get set }
-// CHECK-NEXT:    mutating func getXMutating() -> Int32
-// CHECK-NEXT:    mutating func setXMutating(_ v: Int32)
+// CHECK-NEXT:    mutating func getX() -> Int32
+// CHECK-NEXT:    mutating func setX(_ v: Int32)
 // CHECK-NEXT:    var val: Int32
 // CHECK-NEXT: }
 
@@ -190,7 +191,7 @@
 // CHECK-NEXT:    init()
 // CHECK-NEXT:    var x: Int32
 // CHECK-NEXT:    func getX() -> Int32
-// CHECK-NEXT:    mutating func setXMutating(_ a: Int32, _ b: Int32)
+// CHECK-NEXT:    mutating func setX(_ a: Int32, _ b: Int32)
 // CHECK-NEXT: }
 
 // CHECK:      struct NonTrivial {
@@ -203,16 +204,16 @@
 // CHECK-NEXT:    init()
 // CHECK-NEXT:    init(value: Int32)
 // CHECK-NEXT:    var x: UnsafeMutablePointer<Int32>? { mutating get set }
-// CHECK-NEXT:    mutating func getXMutating() -> UnsafeMutablePointer<Int32>!
-// CHECK-NEXT:    mutating func setXMutating(_ v: UnsafeMutablePointer<Int32>!)
+// CHECK-NEXT:    mutating func getX() -> UnsafeMutablePointer<Int32>!
+// CHECK-NEXT:    mutating func setX(_ v: UnsafeMutablePointer<Int32>!)
 // CHECK-NEXT:    var value: Int32
 // CHECK-NEXT: }
 
 // CHECK:      struct RefGetterSetter {
 // CHECK-NEXT:    init()
 // CHECK-NEXT:    init(value: Int32)
-// CHECK-NEXT:    mutating func getXMutating() -> UnsafePointer<Int32>
-// CHECK-NEXT:    mutating func setXMutating(_ v: Int32)
+// CHECK-NEXT:    mutating func getX() -> UnsafePointer<Int32>
+// CHECK-NEXT:    mutating func setX(_ v: Int32)
 // CHECK-NEXT:    var value: Int32
 // CHECK-NEXT: }
 
@@ -220,16 +221,16 @@
 // CHECK-NEXT:    init()
 // CHECK-NEXT:    init(value: NonTrivial)
 // CHECK-NEXT:    var x: NonTrivial { mutating get set }
-// CHECK-NEXT:    mutating func getXMutating() -> NonTrivial
-// CHECK-NEXT:    mutating func setXMutating(_ v: NonTrivial)
+// CHECK-NEXT:    mutating func getX() -> NonTrivial
+// CHECK-NEXT:    mutating func setX(_ v: NonTrivial)
 // CHECK-NEXT:    var value: NonTrivial
 // CHECK-NEXT: }
 
 // CHECK:      struct DifferentTypes {
 // CHECK-NEXT:    init()
 // CHECK-NEXT:    init(value: NonTrivial)
-// CHECK-NEXT:    mutating func getXMutating() -> NonTrivial
-// CHECK-NEXT:    mutating func setXMutating(_ v: Int32)
+// CHECK-NEXT:    mutating func getX() -> NonTrivial
+// CHECK-NEXT:    mutating func setX(_ v: Int32)
 // CHECK-NEXT:    var value: NonTrivial
 // CHECK-NEXT: }
 
@@ -265,4 +266,31 @@
 // CHECK-NEXT:    var value: Int32
 // CHECK-NEXT:    func getValue() -> Int32
 // CHECK-NEXT:    mutating func setValue(_ i: Int32)
+// CHECK-NEXT: }
+
+// CHECK:      struct SnakeCaseGetterSetter {
+// CHECK-NEXT:    init()
+// CHECK-NEXT:    init(value: Int32)
+// CHECK-NEXT:    var foo: Int32
+// CHECK-NEXT:    func get_foo() -> Int32
+// CHECK-NEXT:    mutating func set_foo(_ v: Int32)
+// CHECK-NEXT:    var value: Int32
+// CHECK-NEXT: }
+
+// CHECK:      struct SnakeCaseUTF8Str {
+// CHECK-NEXT:    init()
+// CHECK-NEXT:    init(value: Int32)
+// CHECK-NEXT:    var utf8String: Int32
+// CHECK-NEXT:    func get_utf8_string() -> Int32
+// CHECK-NEXT:    mutating func set_utf8_string(_ v: Int32)
+// CHECK-NEXT:    var value: Int32
+// CHECK-NEXT: }
+
+// CHECK:      struct SnakeCaseTrailing {
+// CHECK-NEXT:    init()
+// CHECK-NEXT:    init(value: Int32)
+// CHECK-NEXT:    var x: Int32
+// CHECK-NEXT:    func get_x_() -> Int32
+// CHECK-NEXT:    mutating func set_x_(_ v: Int32)
+// CHECK-NEXT:    var value: Int32
 // CHECK-NEXT: }

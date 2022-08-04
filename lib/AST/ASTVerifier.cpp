@@ -1130,13 +1130,6 @@ public:
           Out << elt->getType() << "\n";
           abort();
         }
-        if (!field.getParameterFlags().isNone()) {
-          Out << "TupleExpr has non-empty parameter flags?\n";
-          Out << "sub expr: \n";
-          elt->dump(Out);
-          Out << "\n";
-          abort();
-        }
       });
       verifyCheckedBase(E);
     }
@@ -1982,10 +1975,6 @@ public:
         Out << "ParenExpr not of ParenType\n";
         abort();
       }
-      if (!ty->getParameterFlags().isNone()) {
-        Out << "ParenExpr has non-empty parameter flags?\n";
-        abort();
-      }
       verifyCheckedBase(E);
     }
 
@@ -2714,21 +2703,6 @@ public:
                 << "." << req->getBaseName()
                 << "\n";
             abort();
-          }
-
-          // Check the witness substitutions.
-          const auto &witness = normal->getWitnessUncached(req);
-
-          if (auto *genericEnv = witness.getSyntheticEnvironment())
-            Generics.push_back(genericEnv->getGenericSignature());
-
-          verifyChecked(witness.getRequirementToSyntheticSubs());
-          verifyChecked(witness.getSubstitutions());
-
-          if (auto *genericEnv = witness.getSyntheticEnvironment()) {
-            assert(Generics.back().get<GenericSignature>().getPointer()
-                   == genericEnv->getGenericSignature().getPointer());
-            Generics.pop_back();
           }
 
           continue;

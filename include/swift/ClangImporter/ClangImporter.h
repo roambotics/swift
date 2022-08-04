@@ -309,7 +309,7 @@ public:
                               unsigned previousGeneration) override;
 
   virtual void loadObjCMethods(
-                 ClassDecl *classDecl,
+                 NominalTypeDecl *typeDecl,
                  ObjCSelector selector,
                  bool isInstanceMethod,
                  unsigned previousGeneration,
@@ -515,6 +515,8 @@ public:
                                  SubstitutionMap subst) override;
 
   bool isCXXMethodMutating(const clang::CXXMethodDecl *method) override;
+
+  bool isAnnotatedWith(const clang::CXXMethodDecl *method, StringRef attr);
 
   /// Find the lookup table that corresponds to the given Clang module.
   ///

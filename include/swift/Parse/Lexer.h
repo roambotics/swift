@@ -180,7 +180,7 @@ class Lexer {
   /// Retrieve the underlying diagnostic engine we emit diagnostics to. Note
   /// this should only be used for diagnostics not concerned with the current
   /// token.
-  DiagnosticEngine *getUnderlyingDiags() {
+  DiagnosticEngine *getUnderlyingDiags() const {
     return DiagQueue ? &DiagQueue->getUnderlyingDiags() : nullptr;
   }
 
@@ -218,7 +218,10 @@ public:
   /// \param Parent the parent lexer that scans the whole buffer
   /// \param BeginState start of the subrange
   /// \param EndState end of the subrange
-  Lexer(Lexer &Parent, State BeginState, State EndState);
+  /// \param EnableDiagnostics Whether to inherit the diagnostic engine of
+  /// \p Parent. If \c false, diagnostics will be disabled.
+  Lexer(const Lexer &Parent, State BeginState, State EndState,
+        bool EnableDiagnostics = true);
 
   /// Returns true if this lexer will produce a code completion token.
   bool isCodeCompletion() const {
@@ -565,10 +568,24 @@ public:
     void operator=(const SILBodyRAII&) = delete;
   };
 
-  /// Attempt to re-lex a regex literal with forward slashes `/.../` from a
-  /// given lexing state. If \p mustBeRegex is set to true, a regex literal will
-  /// always be lexed. Otherwise, it will not be lexed if it may be ambiguous.
-  void tryLexForwardSlashRegexLiteralFrom(State S, bool mustBeRegex);
+  /// A RAII object for switching the lexer into forward slash regex `/.../`
+  /// lexing mode.
+  class ForwardSlashRegexRAII final {
+    llvm::SaveAndRestore<LexerForwardSlashRegexMode> Scope;
+
+  public:
+    ForwardSlashRegexRAII(Lexer &L, bool MustBeRegex)
+        : Scope(L.ForwardSlashRegexMode,
+                MustBeRegex ? LexerForwardSlashRegexMode::Always
+                            : LexerForwardSlashRegexMode::Tentative) {}
+  };
+
+  /// Checks whether a given token could potentially contain the start of an
+  /// unskippable `/.../` regex literal. Such tokens need to go through the
+  /// parser, as they may become regex literal tokens. This includes operator
+  /// tokens such as `!/` which could be split into prefix `!` on a regex
+  /// literal.
+  bool isPotentialUnskippableBareSlashRegexLiteral(const Token &Tok) const;
 
 private:
   /// Nul character meaning kind.
@@ -633,6 +650,12 @@ private:
                         unsigned CustomDelimiterLen = 0);
   void lexStringLiteral(unsigned CustomDelimiterLen = 0);
   void lexEscapedIdentifier();
+
+  /// Attempt to scan a regex literal, returning the end pointer, or `nullptr`
+  /// if a regex literal cannot be scanned.
+  const char *tryScanRegexLiteral(const char *TokStart, bool MustBeRegex,
+                                  DiagnosticEngine *Diags,
+                                  bool &CompletelyErroneous) const;
 
   /// Attempt to lex a regex literal, returning true if lexing should continue,
   /// false if this is not a regex literal.

@@ -36,6 +36,7 @@ class SILModule;
 class SILFunctionBuilder;
 class SILProfiler;
 class BasicBlockBitfield;
+class NodeBitfield;
 
 namespace Lowering {
 class TypeLowering;
@@ -169,7 +170,9 @@ private:
   friend class SILModule;
   friend class SILFunctionBuilder;
   template <typename, unsigned> friend class BasicBlockData;
+  template <class, class> friend class SILBitfield;
   friend class BasicBlockBitfield;
+  friend class NodeBitfield;
 
   /// Module - The SIL module that the function belongs to.
   SILModule &Module;
@@ -177,6 +180,16 @@ private:
   /// The mangled name of the SIL function, which will be propagated
   /// to the binary.  A pointer into the module's lookup table.
   StringRef Name;
+
+  /// A single-linked list of snapshots of the function.
+  ///
+  /// Snapshots are copies of the current function at a given point in time.
+  SILFunction *snapshots = nullptr;
+  
+  /// The snapshot ID of this function.
+  ///
+  /// 0 means, it's not a snapshot, but the original function.
+  int snapshotID = 0;
 
   /// The lowered type of the function.
   CanSILFunctionType LoweredType;
@@ -226,14 +239,15 @@ private:
   Identifier ObjCReplacementFor;
 
   /// The head of a single-linked list of currently alive BasicBlockBitfield.
-  BasicBlockBitfield *newestAliveBitfield = nullptr;
+  BasicBlockBitfield *newestAliveBlockBitfield = nullptr;
+
+  /// The head of a single-linked list of currently alive NodeBitfield.
+  NodeBitfield *newestAliveNodeBitfield = nullptr;
 
   /// A monotonically increasing ID which is incremented whenever a
-  /// BasicBlockBitfield is constructed.
-  /// Usually this stays below 100000, so a 32-bit unsigned is more than
-  /// sufficient.
-  /// For details see BasicBlockBitfield::bitfieldID;
-  unsigned currentBitfieldID = 1;
+  /// BasicBlockBitfield or NodeBitfield is constructed.
+  /// For details see SILBitfield::bitfieldID;
+  uint64_t currentBitfieldID = 1;
 
   /// Unique identifier for vector indexing and deterministic sorting.
   /// May be reused when zombie functions are recovered.
@@ -433,10 +447,30 @@ private:
   /// Only for use by FunctionBuilders!
   void setHasOwnership(bool newValue) { HasOwnership = newValue; }
 
+  void setName(StringRef name) {
+    // All the snapshots share the same name.
+    SILFunction *sn = this;
+    do {
+      sn->Name = name;
+    } while ((sn = sn->snapshots) != nullptr);
+  }
+
 public:
   ~SILFunction();
 
   SILModule &getModule() const { return Module; }
+
+  /// Creates a snapshot with a given `ID` from the current function.
+  void createSnapshot(int ID);
+  
+  /// Returns the snapshot with the given `ID` or null if no such snapshot exists.
+  SILFunction *getSnapshot(int ID);
+  
+  /// Restores the current function from a given snapshot.
+  void restoreFromSnapshot(int ID);
+  
+  /// Deletes a snapshot with the `ID`.
+  void deleteSnapshot(int ID);
 
   SILType getLoweredType() const {
     return SILType::getPrimitiveObjectType(LoweredType);
@@ -468,6 +502,9 @@ public:
   SILFunction *getDynamicallyReplacedFunction() const {
     return ReplacedFunction;
   }
+
+  static SILFunction *getFunction(SILDeclRef ref, SILModule &M);
+
   void setDynamicallyReplacedFunction(SILFunction *f) {
     assert(ReplacedFunction == nullptr && "already set");
     assert(!hasObjCReplacement());
@@ -1118,6 +1155,32 @@ public:
     if (auto *dc = getDeclContext())
       if (auto *decl = dyn_cast_or_null<FuncDecl>(dc->getAsDecl()))
         return decl->isDeferBody();
+    return false;
+  }
+
+  /// Returns true if this function belongs to a declaration that
+  /// has `@_alwaysEmitIntoClient` attribute.
+  bool markedAsAlwaysEmitIntoClient() const {
+    if (!hasLocation())
+      return false;
+
+    auto *V = getLocation().getAsASTNode<ValueDecl>();
+    return V && V->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>();
+  }
+
+  /// Returns true if this function belongs to a declaration that returns
+  /// an opaque result type with one or more availability conditions that are
+  /// allowed to produce a different underlying type at runtime.
+  bool hasOpaqueResultTypeWithAvailabilityConditions() const {
+    if (!hasLocation())
+      return false;
+
+    if (auto *V = getLocation().getAsASTNode<ValueDecl>()) {
+      auto *opaqueResult = V->getOpaqueResultTypeDecl();
+      return opaqueResult &&
+             opaqueResult->hasConditionallyAvailableSubstitutions();
+    }
+
     return false;
   }
 

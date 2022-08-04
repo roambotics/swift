@@ -892,9 +892,19 @@ void swift::findGuaranteedReferenceRoots(SILValue value,
         if (addAllOperandsToWorklist(result)) {
           continue;
         }
+      } else if (auto *mvi =
+                     dyn_cast<MoveOnlyWrapperToCopyableValueInst>(inst)) {
+        if (addAllOperandsToWorklist(mvi)) {
+          continue;
+        }
+      } else if (auto *c = dyn_cast<CopyableToMoveOnlyWrapperValueInst>(inst)) {
+        if (addAllOperandsToWorklist(c)) {
+          continue;
+        }
       }
     }
-    if (value.getOwnershipKind() == OwnershipKind::Guaranteed)
+
+    if (value->getOwnershipKind() == OwnershipKind::Guaranteed)
       roots.push_back(value);
   }
 }
@@ -1400,6 +1410,11 @@ void swift::visitProductLeafAccessPathNodes(
         worklist.push_back({silType.getTupleElementType(index), elementNode});
       }
     } else if (auto *decl = silType.getStructOrBoundGenericStruct()) {
+      if (decl->isResilient(tec.getContext()->getParentModule(),
+                            tec.getResilienceExpansion())) {
+        visitor(AccessPath::PathNode(node), silType);
+        continue;
+      }
       unsigned index = 0;
       for (auto *field : decl->getStoredProperties()) {
         auto *fieldNode = node->getChild(index);
@@ -2423,6 +2438,11 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
 
       visitor(&builtin->getAllOperands()[1]);
       visitor(&builtin->getAllOperands()[2]);
+      return;
+
+    // Writes back to the first operand.
+    case BuiltinValueKind::TaskRunInline:
+      visitor(&builtin->getAllOperands()[0]);
       return;
 
     // These effect both operands.

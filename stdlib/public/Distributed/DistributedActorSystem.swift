@@ -12,7 +12,12 @@
 import Swift
 import _Concurrency
 
-/// A distributed actor system
+/// A distributed actor system is what enables all functionality of distributed actors.
+///
+/// Distributed actors must always be associated with a concrete distributed actor system,
+/// and do so by declaring a `typealias ActorSystem = ...`, or by having a module wide
+/// `typealias DefaultDistributedActorSystem` declared which then applies to all distributed
+/// actors that do not declare a specific type alias in their bodies.
 @available(SwiftStdlib 5.7, *)
 public protocol DistributedActorSystem: Sendable {
   /// The identity used by actors that communicate via this transport
@@ -64,7 +69,7 @@ public protocol DistributedActorSystem: Sendable {
   // - MARK: Actor Lifecycle
   /// Create an `ActorID` for the passed actor type.
   ///
-  /// This function is invoked by an distributed actor during its initialization,
+  /// This function is invoked by a distributed actor during its initialization,
   /// and the returned address value is stored along with it for the time of its
   /// lifetime.
   ///
@@ -74,7 +79,7 @@ public protocol DistributedActorSystem: Sendable {
   /// to the same actor.
   func assignID<Act>(_ actorType: Act.Type) -> ActorID
     where Act: DistributedActor,
-    Act.ID == ActorID
+          Act.ID == ActorID
 
   /// Invoked during a distributed actor's initialization, as soon as it becomes fully initialized.
   ///
@@ -93,7 +98,7 @@ public protocol DistributedActorSystem: Sendable {
   /// - Parameter actor: reference to the (local) actor that was just fully initialized.
   func actorReady<Act>(_ actor: Act)
     where Act: DistributedActor,
-    Act.ID == ActorID
+          Act.ID == ActorID
 
   /// Called during when a distributed actor is deinitialized, or fails to initialize completely (e.g. by throwing
   /// out of an `init` that did not completely initialize all of the actors stored properties yet).
@@ -207,6 +212,10 @@ extension DistributedActorSystem {
   ///           some other mismatch between them happens. In general, this
   ///           method is allowed to throw in any situation that might otherwise
   ///           result in an illegal or unexpected invocation being performed.
+  ///
+  ///           Throws ``ExecuteDistributedTargetMissingAccessorError`` if the `target`
+  ///           does not resolve to a valid distributed function accessor, i.e. the
+  ///           call identifier is incorrect, corrupted, or simply not present in this process.
   public func executeDistributedTarget<Act>(
     on actor: Act,
     target: RemoteCallTarget,
@@ -569,10 +578,28 @@ public protocol DistributedActorSystemError: Error {}
 
 @available(SwiftStdlib 5.7, *)
 public struct ExecuteDistributedTargetError: DistributedActorSystemError {
-  let message: String
+  public let errorCode: ErrorCode
+  public let message: String
+
+  public enum ErrorCode {
+    /// Thrown when unable to resolve the target identifier to a function accessor.
+    /// This can happen when the identifier is corrupt, illegal, or wrong in the
+    /// sense that the caller and callee do not have the called function recorded
+    /// using the same identifier.
+    case targetAccessorNotFound
+
+    /// A general issue during the execution of the distributed call target ocurred.
+    case other
+  }
 
   public init(message: String) {
     self.message = message
+    self.errorCode = .other
+  }
+
+  public init(message: String, errorCode: ErrorCode) {
+    self.message = message
+    self.errorCode = errorCode
   }
 }
 

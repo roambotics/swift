@@ -15,7 +15,7 @@ GENERIC_NODES = [
          element_name='GenericRequirement'),
 
     # generic-requirement ->
-    #     (same-type-requrement|conformance-requirement) ','?
+    #     (same-type-requirement|conformance-requirement|layout-requirement) ','?
     Node('GenericRequirement', kind='Syntax',
          traits=['WithTrailingComma'],
          children=[
@@ -25,6 +25,8 @@ GENERIC_NODES = [
                              kind='SameTypeRequirement'),
                        Child('ConformanceRequirement',
                              kind='ConformanceRequirement'),
+                       Child('LayoutRequirement',
+                             kind='LayoutRequirement'),
                    ]),
              Child('TrailingComma', kind='CommaToken',
                    is_optional=True),
@@ -42,6 +44,23 @@ GENERIC_NODES = [
                        'PostfixOperatorToken',
                    ]),
              Child('RightTypeIdentifier', kind='Type'),
+         ]),
+
+    # layout-requirement -> type-name : layout-constraint
+    # layout-constraint -> identifier '('? integer-literal? ','? integer-literal? ')'?
+    Node('LayoutRequirement', kind='Syntax',
+         children=[
+             Child('TypeIdentifier', kind='Type'),
+             Child('Colon', kind='ColonToken'),
+             Child('LayoutConstraint', kind='IdentifierToken'),
+             Child('LeftParen', kind='LeftParenToken',
+                   is_optional=True),
+             Child('Size', kind='IntegerLiteralToken', is_optional=True),
+             Child('Comma', kind='CommaToken',
+                   is_optional=True),
+             Child('Alignment', kind='IntegerLiteralToken', is_optional=True),
+             Child('RightParen', kind='RightParenToken',
+                   is_optional=True),
          ]),
 
     Node('GenericParameterList', kind='SyntaxCollection',
@@ -67,20 +86,11 @@ GENERIC_NODES = [
     Node('PrimaryAssociatedTypeList', kind='SyntaxCollection',
          element='PrimaryAssociatedType'),
 
-    # primary-associated-type -> type-name
-    #                          | type-name (: type-identifier)? (= type)?
+    # primary-associated-type -> type-name ','?
     Node('PrimaryAssociatedType', kind='Syntax',
          traits=['WithTrailingComma'],
          children=[
-             Child('Attributes', kind='AttributeList',
-                   collection_element_name='Attribute', is_optional=True),
              Child('Name', kind='IdentifierToken'),
-             Child('Colon', kind='ColonToken',
-                   is_optional=True),
-             Child('InheritedType', kind='Type',
-                   is_optional=True),
-             Child('Initializer', kind='TypeInitializerClause',
-                   is_optional=True),
              Child('TrailingComma', kind='CommaToken',
                    is_optional=True),
          ]),

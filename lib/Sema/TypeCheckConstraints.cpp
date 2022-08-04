@@ -54,7 +54,27 @@ using namespace constraints;
 #pragma mark Type variable implementation
 
 void TypeVariableType::Implementation::print(llvm::raw_ostream &OS) {
-  getTypeVariable()->print(OS, PrintOptions());
+  PrintOptions PO;
+  PO.PrintTypesForDebugging = true;
+  getTypeVariable()->print(OS, PO);
+  
+  SmallVector<TypeVariableOptions, 4> bindingOptions;
+  if (canBindToLValue())
+    bindingOptions.push_back(TypeVariableOptions::TVO_CanBindToLValue);
+  if (canBindToInOut())
+    bindingOptions.push_back(TypeVariableOptions::TVO_CanBindToInOut);
+  if (canBindToNoEscape())
+    bindingOptions.push_back(TypeVariableOptions::TVO_CanBindToNoEscape);
+  if (canBindToHole())
+    bindingOptions.push_back(TypeVariableOptions::TVO_CanBindToHole);
+  if (!bindingOptions.empty()) {
+    OS << " [allows bindings to: ";
+    interleave(bindingOptions, OS,
+               [&](TypeVariableOptions option) {
+                  (OS << getTypeVariableOptions(option));},
+               ", ");
+               OS << "]";
+  }
 }
 
 SavedTypeVariableBinding::SavedTypeVariableBinding(TypeVariableType *typeVar)
@@ -196,7 +216,6 @@ bool constraints::computeTupleShuffle(ArrayRef<TupleTypeElt> fromTuple,
 
     // Otherwise, assign this input to the next output element.
     const auto &elt2 = toTuple[i];
-    assert(!elt2.isVararg());
 
     // Fail if the input element is named and we're trying to match it with
     // something with a different label.
@@ -299,15 +318,22 @@ void constraints::performSyntacticDiagnosticsForTarget(
     // First emit diagnostics for the main expression.
     performSyntacticExprDiagnostics(target.getAsExpr(), dc,
                                     isExprStmt, disableExprAvailabilityChecking);
-
-    // If this is a for-in statement, we also need to check the where clause if
-    // present.
-    if (target.isForEachStmt()) {
-      if (auto *whereExpr = target.getForEachStmtInfo().whereExpr)
-        performSyntacticExprDiagnostics(whereExpr, dc, /*isExprStmt*/ false);
-    }
     return;
   }
+
+  case SolutionApplicationTarget::Kind::forEachStmt: {
+    auto *stmt = target.getAsForEachStmt();
+
+    // First emit diagnostics for the main expression.
+    performSyntacticExprDiagnostics(stmt->getTypeCheckedSequence(), dc,
+                                    isExprStmt,
+                                    disableExprAvailabilityChecking);
+
+    if (auto *whereExpr = stmt->getWhere())
+      performSyntacticExprDiagnostics(whereExpr, dc, /*isExprStmt*/ false);
+    return;
+  }
+
   case SolutionApplicationTarget::Kind::function: {
     FunctionSyntacticDiagnosticWalker walker(dc);
     target.getFunctionBody()->walk(walker);
@@ -341,6 +367,9 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
   return expr->getType();
 }
 
+/// FIXME: In order to remote this function both \c FrontendStatsTracer
+/// and \c PrettyStackTrace* have to be updated to accept `ASTNode`
+// instead of each individual syntactic element types.
 Optional<SolutionApplicationTarget>
 TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
                                  TypeCheckExprOptions options) {
@@ -350,7 +379,18 @@ TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
                                   target.getAsExpr());
   PrettyStackTraceExpr stackTrace(Context, "type-checking", target.getAsExpr());
 
-  // First, pre-check the expression, validating any types that occur in the
+  return typeCheckTarget(target, options);
+}
+
+Optional<SolutionApplicationTarget>
+TypeChecker::typeCheckTarget(SolutionApplicationTarget &target,
+                             TypeCheckExprOptions options) {
+  DeclContext *dc = target.getDeclContext();
+  auto &Context = dc->getASTContext();
+  PrettyStackTraceLocation stackTrace(Context, "type-checking-target",
+                                      target.getLoc());
+
+  // First, pre-check the target, validating any types that occur in the
   // expression and folding sequence expressions.
   if (ConstraintSystem::preCheckTarget(
           target, /*replaceInvalidRefsWithErrors=*/true,
@@ -358,15 +398,13 @@ TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
     return None;
   }
 
-  auto *expr = target.getAsExpr();
-
-  // Check whether given expression has a code completion token which requires
+  // Check whether given target has a code completion token which requires
   // special handling.
   if (Context.CompletionCallback &&
-      typeCheckForCodeCompletion(target, /*needsPrecheck*/false,
+      typeCheckForCodeCompletion(target, /*needsPrecheck*/ false,
                                  [&](const constraints::Solution &S) {
-        Context.CompletionCallback->sawSolution(S);
-      }))
+                                   Context.CompletionCallback->sawSolution(S);
+                                 }))
     return None;
 
   // Construct a constraint system from this expression.
@@ -380,18 +418,18 @@ TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
 
   ConstraintSystem cs(dc, csOptions);
 
-  // Tell the constraint system what the contextual type is.  This informs
-  // diagnostics and is a hint for various performance optimizations.
-  cs.setContextualType(
-      expr,
-      target.getExprContextualTypeLoc(),
-      target.getExprContextualTypePurpose());
+  if (auto *expr = target.getAsExpr()) {
+    // Tell the constraint system what the contextual type is.  This informs
+    // diagnostics and is a hint for various performance optimizations.
+    cs.setContextualType(expr, target.getExprContextualTypeLoc(),
+                         target.getExprContextualTypePurpose());
 
-  // Try to shrink the system by reducing disjunction domains. This
-  // goes through every sub-expression and generate its own sub-system, to
-  // try to reduce the domains of those subexpressions.
-  cs.shrink(expr);
-  target.setExpr(expr);
+    // Try to shrink the system by reducing disjunction domains. This
+    // goes through every sub-expression and generate its own sub-system, to
+    // try to reduce the domains of those subexpressions.
+    cs.shrink(expr);
+    target.setExpr(expr);
+  }
 
   // If the client can handle unresolved type variables, leave them in the
   // system.
@@ -399,10 +437,8 @@ TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
 
   // Attempt to solve the constraint system.
   auto viable = cs.solve(target, allowFreeTypeVariables);
-  if (!viable) {
-    target.setExpr(expr);
+  if (!viable)
     return None;
-  }
 
   // Apply this solution to the constraint system.
   // FIXME: This shouldn't be necessary.
@@ -415,7 +451,6 @@ TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
     // Failure already diagnosed, above, as part of applying the solution.
     return None;
   }
-  Expr *result = resultTarget->getAsExpr();
 
   // Unless the client has disabled them, perform syntactic checks on the
   // expression now.
@@ -426,7 +461,6 @@ TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
         options.contains(TypeCheckExprFlags::DisableExprAvailabilityChecking));
   }
 
-  resultTarget->setExpr(result);
   return *resultTarget;
 }
 
@@ -805,6 +839,8 @@ bool TypeChecker::typeCheckPatternBinding(PatternBindingDecl *PBD,
 
 bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
   auto &Context = dc->getASTContext();
+  FrontendStatsTracer statsTracer(Context.Stats, "typecheck-for-each", stmt);
+  PrettyStackTraceStmt stackTrace(Context, "type-checking-for-each", stmt);
 
   auto failed = [&]() -> bool {
     // Invalidate the pattern and the var decl.
@@ -817,16 +853,9 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
     return true;
   };
 
-  auto sequenceProto = TypeChecker::getProtocol(
-      dc->getASTContext(), stmt->getForLoc(), 
-      stmt->getAwaitLoc().isValid() ? 
-        KnownProtocolKind::AsyncSequence : KnownProtocolKind::Sequence);
-  if (!sequenceProto)
-    return failed();
-
   auto target = SolutionApplicationTarget::forForEachStmt(
-      stmt, sequenceProto, dc, /*bindPatternVarsOneWay=*/false);
-  if (!typeCheckExpression(target))
+      stmt, dc, /*bindPatternVarsOneWay=*/false);
+  if (!typeCheckTarget(target))
     return failed();
 
   // Check to see if the sequence expr is throwing (in async context),
@@ -1250,7 +1279,7 @@ void Solution::dump(raw_ostream &out) const {
         out << choice.getBaseType()->getString(PO) << ".";
 
       out << choice.getDecl()->getBaseName() << ": "
-          << ovl.second.openedType->getString(PO) << "\n";
+          << ovl.second.adjustedOpenedType->getString(PO) << "\n";
       break;
 
     case OverloadChoiceKind::KeyPathApplication:
@@ -1376,6 +1405,7 @@ void ConstraintSystem::print(raw_ostream &out, Expr *E) const {
   };
 
   E->dump(out, getTypeOfExpr, getTypeOfTypeRepr, getTypeOfKeyPathComponent);
+  out << "\n";
 }
 
 void ConstraintSystem::print(raw_ostream &out) const {
@@ -1396,17 +1426,15 @@ void ConstraintSystem::print(raw_ostream &out) const {
   }
 
   out << "Type Variables:\n";
-  for (auto tv : getTypeVariables()) {
+  std::vector<TypeVariableType *> typeVariables(getTypeVariables().begin(),
+                                                getTypeVariables().end());
+  llvm::sort(typeVariables,
+             [](const TypeVariableType *lhs, const TypeVariableType *rhs) {
+               return lhs->getID() < rhs->getID();
+             });
+  for (auto tv : typeVariables) {
     out.indent(2);
-    Type(tv).print(out, PO);
-    if (tv->getImpl().canBindToLValue())
-      out << " [lvalue allowed]";
-    if (tv->getImpl().canBindToInOut())
-      out << " [inout allowed]";
-    if (tv->getImpl().canBindToNoEscape())
-      out << " [noescape allowed]";
-    if (tv->getImpl().canBindToHole())
-      out << " [hole allowed]";
+    tv->getImpl().print(out);
     auto rep = getRepresentative(tv);
     if (rep == tv) {
       if (auto fixed = getFixedType(tv)) {
@@ -1468,7 +1496,7 @@ void ConstraintSystem::print(raw_ostream &out) const {
           out << choice.getBaseType()->getString(PO) << ".";
         out << choice.getDecl()->getBaseName() << ": "
             << resolved.boundType->getString(PO) << " == "
-            << resolved.openedType->getString(PO);
+            << resolved.adjustedOpenedType->getString(PO);
         break;
 
       case OverloadChoiceKind::KeyPathApplication:
@@ -2170,98 +2198,6 @@ ForcedCheckedCastExpr *swift::findForcedDowncast(ASTContext &ctx, Expr *expr) {
   }
 
   return nullptr;
-}
-
-bool
-IsCallableNominalTypeRequest::evaluate(Evaluator &evaluator, CanType ty,
-                                       DeclContext *dc) const {
-  auto options = defaultMemberLookupOptions;
-  options |= NameLookupFlags::IgnoreAccessControl;
-
-  // Look for a callAsFunction method.
-  auto &ctx = ty->getASTContext();
-  auto results =
-      TypeChecker::lookupMember(dc, ty, DeclNameRef(ctx.Id_callAsFunction),
-                                options);
-  return llvm::any_of(results, [](LookupResultEntry entry) -> bool {
-    if (auto *fd = dyn_cast<FuncDecl>(entry.getValueDecl()))
-      return fd->isCallAsFunctionMethod();
-    return false;
-  });
-}
-
-template <class DynamicAttribute>
-static bool checkForDynamicAttribute(CanType ty,
-                                     llvm::function_ref<bool (Type)> hasAttribute) {
-  // If this is an archetype type, check if any types it conforms to
-  // (superclass or protocols) have the attribute.
-  if (auto archetype = dyn_cast<ArchetypeType>(ty)) {
-    for (auto proto : archetype->getConformsTo()) {
-      if (hasAttribute(proto->getDeclaredInterfaceType()))
-        return true;
-    }
-    if (auto superclass = archetype->getSuperclass()) {
-      if (hasAttribute(superclass))
-        return true;
-    }
-  }
-
-  // If this is an existential type, check if its constraint type
-  // has the attribute.
-  if (auto existential = ty->getAs<ExistentialType>()) {
-    return hasAttribute(existential->getConstraintType());
-  }
-
-  // If this is a protocol composition, check if any of its members have the
-  // attribute.
-  if (auto protocolComp = dyn_cast<ProtocolCompositionType>(ty)) {
-    for (auto member : protocolComp->getMembers()) {
-      if (hasAttribute(member))
-        return true;
-    }
-  }
-
-  // Otherwise, this must be a nominal type.
-  // Neither Dynamic member lookup nor Dynamic Callable doesn't
-  // work for tuples, etc.
-  auto nominal = ty->getAnyNominal();
-  if (!nominal)
-    return false;
-
-  // If this type has the attribute on it, then yes!
-  if (nominal->getAttrs().hasAttribute<DynamicAttribute>())
-    return true;
-
-  // Check the protocols the type conforms to.
-  for (auto proto : nominal->getAllProtocols()) {
-    if (hasAttribute(proto->getDeclaredInterfaceType()))
-      return true;
-  }
-
-  // Check the superclass if present.
-  if (auto classDecl = dyn_cast<ClassDecl>(nominal)) {
-    if (auto superclass = classDecl->getSuperclass()) {
-      if (hasAttribute(superclass))
-        return true;
-    }
-  }
-  return false;
-}
-
-bool
-HasDynamicMemberLookupAttributeRequest::evaluate(Evaluator &evaluator,
-                                                 CanType ty) const {
-  return checkForDynamicAttribute<DynamicMemberLookupAttr>(ty, [](Type type) {
-    return type->hasDynamicMemberLookupAttribute();
-  });
-}
-
-bool
-HasDynamicCallableAttributeRequest::evaluate(Evaluator &evaluator,
-                                             CanType ty) const {
-  return checkForDynamicAttribute<DynamicCallableAttr>(ty, [](Type type) {
-    return type->hasDynamicCallableAttribute();
-  });
 }
 
 void ConstraintSystem::forEachExpr(

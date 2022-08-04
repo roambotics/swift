@@ -189,9 +189,6 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   }
 
   // Add flags for C++ interop.
-  if (inputArgs.hasArg(options::OPT_enable_experimental_cxx_interop)) {
-    arguments.push_back("-enable-experimental-cxx-interop");
-  }
   if (const Arg *arg =
           inputArgs.getLastArg(options::OPT_experimental_cxx_stdlib)) {
     arguments.push_back("-Xcc");
@@ -236,6 +233,8 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
                        options::OPT_disable_actor_data_race_checks);
   inputArgs.AddLastArg(arguments, options::OPT_warn_concurrency);
   inputArgs.AddLastArg(arguments, options::OPT_strict_concurrency);
+  inputArgs.AddAllArgs(arguments, options::OPT_enable_experimental_feature);
+  inputArgs.AddAllArgs(arguments, options::OPT_enable_upcoming_feature);
   inputArgs.AddLastArg(arguments, options::OPT_warn_implicit_overrides);
   inputArgs.AddLastArg(arguments, options::OPT_typo_correction_limit);
   inputArgs.AddLastArg(arguments, options::OPT_enable_app_extension);
@@ -300,14 +299,15 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   inputArgs.AddLastArg(arguments, options::OPT_access_notes_path);
   inputArgs.AddLastArg(arguments, options::OPT_library_level);
   inputArgs.AddLastArg(arguments, options::OPT_enable_bare_slash_regex);
-  inputArgs.AddLastArg(arguments, options::OPT_async_main);
+  inputArgs.AddLastArg(arguments, options::OPT_enable_experimental_cxx_interop);
 
   // Pass on any build config options
   inputArgs.AddAllArgs(arguments, options::OPT_D);
 
   // Pass on file paths that should be remapped in debug info.
-  inputArgs.AddAllArgs(arguments, options::OPT_debug_prefix_map);
-  inputArgs.AddAllArgs(arguments, options::OPT_coverage_prefix_map);
+  inputArgs.AddAllArgs(arguments, options::OPT_debug_prefix_map,
+                                  options::OPT_coverage_prefix_map,
+                                  options::OPT_file_prefix_map);
 
   std::string globalRemapping = getGlobalDebugPathRemapping();
   if (!globalRemapping.empty()) {
@@ -573,6 +573,8 @@ ToolChain::constructInvocation(const CompileJobAction &job,
     context.Args.AddLastArg(Arguments, options::OPT_index_store_path);
     if (!context.Args.hasArg(options::OPT_index_ignore_system_modules))
       Arguments.push_back("-index-system-modules");
+    context.Args.AddLastArg(Arguments, options::OPT_index_ignore_clang_modules);
+    context.Args.AddLastArg(Arguments, options::OPT_index_include_locals);
   }
 
   if (context.Args.hasArg(options::OPT_debug_info_store_invocation) ||
@@ -694,6 +696,7 @@ const char *ToolChain::JobContext::computeFrontendModeForCompile() const {
   case file_types::TY_SwiftOverlayFile:
   case file_types::TY_IndexUnitOutputPath:
   case file_types::TY_SwiftABIDescriptor:
+  case file_types::TY_ConstValues:
     llvm_unreachable("Output type can never be primary output.");
   case file_types::TY_INVALID:
     llvm_unreachable("Invalid type ID");
@@ -954,6 +957,7 @@ ToolChain::constructInvocation(const BackendJobAction &job,
     case file_types::TY_SwiftOverlayFile:
     case file_types::TY_IndexUnitOutputPath:
     case file_types::TY_SwiftABIDescriptor:
+    case file_types::TY_ConstValues:
       llvm_unreachable("Output type can never be primary output.");
     case file_types::TY_INVALID:
       llvm_unreachable("Invalid type ID");

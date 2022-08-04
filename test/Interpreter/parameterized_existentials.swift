@@ -1,5 +1,10 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-parameterized-existential-types)
+// RUN: %target-run-simple-swift(-Xfrontend -disable-availability-checking)
 // REQUIRES: executable_test
+
+// This test requires the new existential shape metadata accessors which are 
+// not available in on-device runtimes, or in the back-deployment runtime.
+// UNSUPPORTED: use_os_stdlib
+// UNSUPPORTED: back_deployment_runtime
 
 import StdlibUnittest
 
@@ -38,4 +43,20 @@ ParameterizedProtocolsTestSuite.test("metadataEquality") {
   expectEqual(typeOne, typeTwo)
 }
 
+ParameterizedProtocolsTestSuite.test("casting") {
+  let a = GenericHolder(value: 5) as any Holder<Int>
+  let b = GenericHolder(value: 5) as! any Holder<Int>
+  expectEqual(a.value, b.value)
+}
+
+// rdar://96571508
+struct ErasingHolder<T> {
+  let box: any Holder<T>
+}
+ParameterizedProtocolsTestSuite.test("casting") {
+  let a = ErasingHolder(box: IntHolder(value: 5))
+  expectEqual(a.box.value, 5)
+}
+
 runAllTests()
+

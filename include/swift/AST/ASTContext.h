@@ -223,11 +223,13 @@ class ASTContext final {
   ASTContext(const ASTContext&) = delete;
   void operator=(const ASTContext&) = delete;
 
-  ASTContext(LangOptions &langOpts, TypeCheckerOptions &typecheckOpts,
-             SILOptions &silOpts, SearchPathOptions &SearchPathOpts,
-             ClangImporterOptions &ClangImporterOpts,
-             symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts,
-             SourceManager &SourceMgr, DiagnosticEngine &Diags);
+  ASTContext(
+      LangOptions &langOpts, TypeCheckerOptions &typecheckOpts,
+      SILOptions &silOpts, SearchPathOptions &SearchPathOpts,
+      ClangImporterOptions &ClangImporterOpts,
+      symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts,
+      SourceManager &SourceMgr, DiagnosticEngine &Diags,
+      std::function<bool(llvm::StringRef, bool)> PreModuleImportCallback = {});
 
 public:
   // Members that should only be used by ASTContext.cpp.
@@ -238,11 +240,13 @@ public:
 
   void operator delete(void *Data) throw();
 
-  static ASTContext *get(LangOptions &langOpts, TypeCheckerOptions &typecheckOpts,
-                         SILOptions &silOpts, SearchPathOptions &SearchPathOpts,
-                         ClangImporterOptions &ClangImporterOpts,
-                         symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts,
-                         SourceManager &SourceMgr, DiagnosticEngine &Diags);
+  static ASTContext *
+  get(LangOptions &langOpts, TypeCheckerOptions &typecheckOpts,
+      SILOptions &silOpts, SearchPathOptions &SearchPathOpts,
+      ClangImporterOptions &ClangImporterOpts,
+      symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts,
+      SourceManager &SourceMgr, DiagnosticEngine &Diags,
+      std::function<bool(llvm::StringRef, bool)> PreModuleImportCallback = {});
   ~ASTContext();
 
   /// Optional table of counters to report, nullptr when not collecting.
@@ -373,6 +377,10 @@ private:
   /// Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &
   getAllocator(AllocationArena arena = AllocationArena::Permanent) const;
+
+  /// An optional generic callback function invoked prior to importing a module.
+  mutable std::function<bool(llvm::StringRef ModuleName, bool IsOverlay)>
+      PreModuleImportCallback;
 
 public:
   /// Allocate - Allocate memory from the ASTContext bump pointer.
@@ -529,7 +537,7 @@ public:
   /// Retrieve the declaration of Swift.Error.
   ProtocolDecl *getErrorDecl() const;
   CanType getErrorExistentialType() const;
-  
+
 #define KNOWN_STDLIB_TYPE_DECL(NAME, DECL_CLASS, NUM_GENERIC_PARAMS) \
   /** Retrieve the declaration of Swift.NAME. */ \
   DECL_CLASS *get##NAME##Decl() const; \
@@ -553,7 +561,13 @@ public:
   /// Retrieve the declaration of the "pointee" property of a pointer type.
   VarDecl *getPointerPointeePropertyDecl(PointerTypeKind ptrKind) const;
 
-  /// Retrieve the type Swift.AnyObject.
+  /// Retrieve the type Swift.Any as an existential type.
+  CanType getAnyExistentialType() const;
+
+  /// Retrieve the type Swift.AnyObject as a constraint.
+  CanType getAnyObjectConstraint() const;
+
+  /// Retrieve the type Swift.AnyObject as an existential type.
   CanType getAnyObjectType() const;
 
 #define KNOWN_SDK_TYPE_DECL(MODULE, NAME, DECL_CLASS, NUM_GENERIC_PARAMS) \
@@ -868,6 +882,14 @@ public:
   /// swift_isUniquelyReferenced functions.
   AvailabilityContext getObjCIsUniquelyReferencedAvailability();
 
+  /// Get the runtime availability of metadata manipulation runtime functions
+  /// for extended existential types.
+  AvailabilityContext getParameterizedExistentialRuntimeAvailability();
+
+  /// Get the runtime availability of immortal ref-count symbols, which are
+  /// needed to place array buffers into constant data sections.
+  AvailabilityContext getImmortalRefCountSymbolsAvailability();
+
   /// Get the runtime availability of features introduced in the Swift 5.2
   /// compiler for the target platform.
   AvailabilityContext getSwift52Availability();
@@ -1103,6 +1125,9 @@ public:
   /// If a module by this name has already been loaded, the existing module will
   /// be returned.
   ///
+  /// \param ModulePath The module's \c ImportPath which describes
+  /// the name of the module being loaded, possibly including submodules.
+
   /// \returns The requested module, or NULL if the module cannot be found.
   ModuleDecl *getModule(ImportPath::Module ModulePath);
 
@@ -1318,6 +1343,12 @@ public:
 
   GenericSignature getOverrideGenericSignature(const ValueDecl *base,
                                                const ValueDecl *derived);
+
+  GenericSignature
+  getOverrideGenericSignature(const NominalTypeDecl *baseNominal,
+                              const NominalTypeDecl *derivedNominal,
+                              GenericSignature baseGenericSig,
+                              const GenericParamList *derivedParams);
 
   enum class OverrideGenericSignatureReqCheck {
     /// Base method's generic requirements are satisfied by derived method

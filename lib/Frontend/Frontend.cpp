@@ -105,6 +105,11 @@ std::string CompilerInvocation::getReferenceDependenciesFilePathForPrimary(
   return getPrimarySpecificPathsForPrimary(filename)
       .SupplementaryOutputs.ReferenceDependenciesFilePath;
 }
+std::string CompilerInvocation::getConstValuesFilePathForPrimary(
+    StringRef filename) const {
+  return getPrimarySpecificPathsForPrimary(filename)
+      .SupplementaryOutputs.ConstValuesOutputPath;
+}
 std::string
 CompilerInvocation::getSerializedDiagnosticsPathForAtMostOnePrimary() const {
   return getPrimarySpecificPathsForAtMostOnePrimary()
@@ -1175,7 +1180,6 @@ bool CompilerInstance::forEachFileToTypeCheck(
       }
       if (fn(*SF))
         return true;
-      ;
     }
   } else {
     for (auto *SF : getPrimarySourceFiles()) {
@@ -1186,9 +1190,29 @@ bool CompilerInstance::forEachFileToTypeCheck(
   return false;
 }
 
+bool CompilerInstance::forEachSourceFile(
+    llvm::function_ref<bool(SourceFile &)> fn) {
+  for (auto fileName : getMainModule()->getFiles()) {
+    auto *SF = dyn_cast<SourceFile>(fileName);
+    if (!SF) {
+      continue;
+    }
+    if (fn(*SF))
+      return true;
+    ;
+  }
+
+  return false;
+}
+
 void CompilerInstance::finishTypeChecking() {
   forEachFileToTypeCheck([](SourceFile &SF) {
     performWholeModuleTypeChecking(SF);
+    return false;
+  });
+
+  forEachSourceFile([](SourceFile &SF) {
+    loadDerivativeConfigurations(SF);
     return false;
   });
 }
@@ -1329,8 +1353,6 @@ bool CompilerInstance::performSILProcessing(SILModule *silModule) {
   }
 
   performSILOptimizations(Invocation, silModule);
-
-  publicCMOSymbols = silModule->getPublicCMOSymbols();
 
   if (auto *stats = getStatsReporter())
     countStatsPostSILOpt(*stats, *silModule);

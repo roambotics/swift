@@ -18,13 +18,13 @@ import Parse
 public func initializeSwiftModules() {
   registerSILClasses()
   registerSwiftPasses()
-  registerRegexParser()
+  initializeSwiftParseModules()
 }
 
 private func registerPass(
       _ pass: FunctionPass,
       _ runFn: @escaping (@convention(c) (BridgedFunctionPassCtxt) -> ())) {
-  pass.name.withBridgedStringRef { nameStr in
+  pass.name._withStringRef { nameStr in
     SILPassManager_registerFunctionPass(nameStr, runFn)
   }
 }
@@ -32,7 +32,7 @@ private func registerPass(
 private func registerPass<InstType: Instruction>(
       _ pass: InstructionPass<InstType>,
       _ runFn: @escaping (@convention(c) (BridgedInstructionPassCtxt) -> ())) {
-  pass.name.withBridgedStringRef { nameStr in
+  pass.name._withStringRef { nameStr in
     SILCombine_registerInstructionPass(nameStr, runFn)
   }
 }
@@ -43,6 +43,8 @@ private func registerSwiftPasses() {
   registerPass(escapeInfoDumper, { escapeInfoDumper.run($0) })
   registerPass(addressEscapeInfoDumper, { addressEscapeInfoDumper.run($0) })
   registerPass(computeEffects, { computeEffects.run($0) })
+  registerPass(objCBridgingOptimization, { objCBridgingOptimization.run($0) })
+  registerPass(stackPromotion, { stackPromotion.run($0) })
   registerPass(simplifyBeginCOWMutationPass, { simplifyBeginCOWMutationPass.run($0) })
   registerPass(simplifyGlobalValuePass, { simplifyGlobalValuePass.run($0) })
   registerPass(simplifyStrongRetainPass, { simplifyStrongRetainPass.run($0) })

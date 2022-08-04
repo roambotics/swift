@@ -77,12 +77,21 @@ transferNodesFromList(llvm::ilist_traits<SILInstruction> &L2,
   // If transferring instructions within the same basic block, no reason to
   // update their parent pointers.
   SILBasicBlock *ThisParent = getContainingBlock();
-  if (ThisParent == L2.getContainingBlock()) return;
+  SILBasicBlock *l2Block = L2.getContainingBlock();
+  if (ThisParent == l2Block) return;
+  
+  bool differentFunctions = (ThisParent->getFunction() != l2Block->getFunction());
 
   // Update the parent fields in the instructions.
   for (; first != last; ++first) {
     SWIFT_FUNC_STAT_NAMED("sil");
     first->ParentBB = ThisParent;
+    if (differentFunctions) {
+      for (SILValue result : first->getResults()) {
+        result->resetBitfields();
+      }
+      first->asSILNode()->resetBitfields();
+    }
   }
 }
 
@@ -1387,6 +1396,15 @@ bool SILInstruction::isMetaInstruction() const {
   llvm_unreachable("Instruction not handled in isMetaInstruction()!");
 }
 
+unsigned SILInstruction::getCachedFieldIndex(NominalTypeDecl *decl,
+                                             VarDecl *property) {
+  return getModule().getFieldIndex(decl, property);
+}
+
+unsigned SILInstruction::getCachedCaseIndex(EnumElementDecl *enumElement) {
+  return getModule().getCaseIndex(enumElement);
+}
+
 //===----------------------------------------------------------------------===//
 //                                 Utilities
 //===----------------------------------------------------------------------===//
@@ -1600,17 +1618,17 @@ MultipleValueInstructionResult::MultipleValueInstructionResult(
 
 void MultipleValueInstructionResult::setOwnershipKind(
     ValueOwnershipKind NewKind) {
-  Bits.MultipleValueInstructionResult.VOKind = unsigned(NewKind);
+  sharedUInt8().MultipleValueInstructionResult.valueOwnershipKind = uint8_t(NewKind);
 }
 
 void MultipleValueInstructionResult::setIndex(unsigned NewIndex) {
   // We currently use 32 bits to store the Index. A previous comment wrote
   // that "500k fields is probably enough".
-  Bits.MultipleValueInstructionResult.Index = NewIndex;
+  sharedUInt32().MultipleValueInstructionResult.index = NewIndex;
 }
 
 ValueOwnershipKind MultipleValueInstructionResult::getOwnershipKind() const {
-  return ValueOwnershipKind(Bits.MultipleValueInstructionResult.VOKind);
+  return ValueOwnershipKind(sharedUInt8().MultipleValueInstructionResult.valueOwnershipKind);
 }
 
 MultipleValueInstruction *MultipleValueInstructionResult::getParentImpl() const {

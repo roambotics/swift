@@ -270,10 +270,6 @@ def pch_output_dir: Separate<["-"], "pch-output-dir">,
   Flags<[FrontendOption, HelpHidden, ArgumentIsPath]>,
   HelpText<"Directory to persist automatically created precompiled bridging headers">;
 
-def async_main: Flag<["-"], "async-main">,
-    Flags<[FrontendOption]>,
-    HelpText<"Resolve main function as if it were called from an asynchronous context">;
-
 // FIXME: Unhide this once it doesn't depend on an output file map.
 def incremental : Flag<["-"], "incremental">,
   Flags<[NoInteractiveOption, HelpHidden, DoesNotAffectIncrementalBuild]>,
@@ -528,6 +524,14 @@ def emit_parseable_module_interface_path :
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden, ArgumentIsPath,
          SupplementaryOutput]>;
 
+def emit_const_values :
+  Flag<["-"], "emit-const-values">,
+  Flags<[NoInteractiveOption, SupplementaryOutput]>;
+def emit_const_values_path : Separate<["-"], "emit-const-values-path">,
+  Flags<[FrontendOption, NoInteractiveOption, ArgumentIsPath,
+         SupplementaryOutput]>,
+  MetaVarName<"<path>">, HelpText<"Emit the extracted compile-time known values to <path>">;
+
 def emit_objc_header : Flag<["-"], "emit-objc-header">,
   Flags<[FrontendOption, NoInteractiveOption, SupplementaryOutput]>,
   HelpText<"Emit an Objective-C header file">;
@@ -608,8 +612,14 @@ def enable_experimental_concise_pound_file : Flag<["-"],
   Flags<[FrontendOption, ModuleInterfaceOption]>,
   HelpText<"Enable experimental concise '#file' identifier">;
 
+def enable_experimental_cxx_interop :
+  Flag<["-"], "enable-experimental-cxx-interop">,
+  Flags<[FrontendOption, HelpHidden]>,
+  HelpText<"Enable experimental C++ interop code generation and config directives">;
+
 def experimental_cxx_stdlib :
   Separate<["-"], "experimental-cxx-stdlib">,
+  Flags<[HelpHidden]>,
   HelpText<"C++ standard library to use; forwarded to Clang's -stdlib flag">;
 
 def experimental_emit_module_separately:
@@ -621,18 +631,6 @@ def no_emit_module_separately:
   Flag<["-"], "no-emit-module-separately">,
   Flags<[NoInteractiveOption, HelpHidden]>,
   HelpText<"Force using merge-module as the incremental build mode (new Driver only)">;
-
-def requirement_machine_protocol_signatures_EQ : Joined<["-"], "requirement-machine-protocol-signatures=">,
-  Flags<[FrontendOption]>,
-  HelpText<"Control usage of experimental protocol requirement signature minimization: 'on', 'off', 'verify' or 'check'">;
-
-def requirement_machine_abstract_signatures_EQ : Joined<["-"], "requirement-machine-abstract-signatures=">,
-  Flags<[FrontendOption]>,
-  HelpText<"Control usage of experimental generic signature minimization: 'on', 'off', 'verify' or 'check'">;
-
-def requirement_machine_inferred_signatures_EQ : Joined<["-"], "requirement-machine-inferred-signatures=">,
-  Flags<[FrontendOption]>,
-  HelpText<"Control usage of experimental generic signature minimization: 'on', 'off', 'verify' or 'check'">;
 
 def experimental_hermetic_seal_at_link:
   Flag<["-"], "experimental-hermetic-seal-at-link">,
@@ -706,6 +704,16 @@ def strict_concurrency : Joined<["-"], "strict-concurrency=">,
            "'targeted' ('Sendable' checking is enabled in code that uses the "
            "concurrency model, or 'complete' ('Sendable' and other checking is "
            "enabled for all code in the module)">;
+
+def enable_experimental_feature :
+  Separate<["-"], "enable-experimental-feature">,
+  Flags<[FrontendOption]>,
+  HelpText<"Enable an experimental feature">;
+
+def enable_upcoming_feature : Separate<["-"], "enable-upcoming-feature">,
+  Flags<[FrontendOption]>,
+  HelpText<"Enable a feature that will be introduced in an upcoming language "
+           "version">;
 
 def Rpass_EQ : Joined<["-"], "Rpass=">,
   Flags<[FrontendOption]>,
@@ -816,6 +824,10 @@ def Oplayground : Flag<["-"], "Oplayground">, Group<O_Group>,
   Flags<[HelpHidden, FrontendOption, ModuleInterfaceOption]>,
   HelpText<"Compile with optimizations appropriate for a playground">;
 
+def EnbaleDefaultCMO : Flag<["-"], "enable-default-cmo">,
+  Flags<[HelpHidden, FrontendOption]>,
+  HelpText<"Perform conservative cross-module optimization">;
+
 def CrossModuleOptimization : Flag<["-"], "cross-module-optimization">,
   Flags<[HelpHidden, FrontendOption]>,
   HelpText<"Perform cross-module optimization">;
@@ -857,6 +869,9 @@ def debug_prefix_map : Separate<["-"], "debug-prefix-map">,
 def coverage_prefix_map : Separate<["-"], "coverage-prefix-map">,
   Flags<[FrontendOption]>,
   HelpText<"Remap source paths in coverage info">, MetaVarName<"<prefix=replacement>">;
+def file_prefix_map : Separate<["-"], "file-prefix-map">,
+  Flags<[FrontendOption]>,
+  HelpText<"Remap source paths in debug, coverage, and index info">, MetaVarName<"<prefix=replacement>">;
 
 def file_compilation_dir : Separate<["-"], "file-compilation-dir">,
   Flags<[FrontendOption]>, MetaVarName<"<path>">,
@@ -1262,6 +1277,14 @@ def index_unit_output_path : Separate<["-"], "index-unit-output-path">,
   Flags<[FrontendOption, ArgumentIsPath]>, MetaVarName<"<path>">,
   HelpText<"Use <path> as the output path in the produced index data.">;
 
+def index_ignore_clang_modules : Flag<["-"], "index-ignore-clang-modules">,
+  Flags<[FrontendOption]>,
+  HelpText<"Avoid indexing clang modules (pcms)">;
+
+def index_include_locals : Flag<["-"], "index-include-locals">,
+  Flags<[FrontendOption]>,
+  HelpText<"Include local definitions/references in the produced index data.">;
+
 def index_ignore_system_modules : Flag<["-"], "index-ignore-system-modules">,
   Flags<[NoInteractiveOption]>,
   HelpText<"Avoid indexing system modules">;
@@ -1399,6 +1422,10 @@ def ignored_usrs: Separate<["-", "--"], "ignored-usrs">,
   HelpText<"the file containing USRs of removed decls that the digester should ignore">,
   MetaVarName<"<path>">;
 
+def ignore_spi_groups : Separate<["-", "--"], "ignore-spi-group">,
+  Flags<[NoDriverOption, SwiftAPIDigesterOption]>,
+  HelpText<"SPI group name to not diagnose about">;
+
 def protocol_requirement_allow_list: Separate<["-", "--"], "protocol-requirement-allow-list">,
   Flags<[NoDriverOption, SwiftAPIDigesterOption, ArgumentIsPath]>,
   HelpText<"File containing a new-line separated list of protocol names">,
@@ -1441,6 +1468,10 @@ def swift_only: Flag<["-", "--"], "swift-only">,
 def disable_os_checks: Flag<["-", "--"], "disable-os-checks">,
   Flags<[NoDriverOption, SwiftAPIDigesterOption]>,
   HelpText<"Skip OS related diagnostics">;
+
+def disable_remove_deprecated_check: Flag<["-", "--"], "disable-remove-deprecated-check">,
+  Flags<[NoDriverOption, SwiftAPIDigesterOption]>,
+  HelpText<"Skip diagnosing removal of deprecated symbols">;
 
 def print_module: Flag<["-", "--"], "print-module">,
   Flags<[NoDriverOption, SwiftAPIDigesterOption]>,

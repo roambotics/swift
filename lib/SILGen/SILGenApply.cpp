@@ -29,6 +29,7 @@
 #include "swift/AST/ForeignAsyncConvention.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/DistributedDecl.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ModuleLoader.h"
@@ -627,6 +628,16 @@ public:
       return fn;
     }
     case Kind::WitnessMethod: {
+      if (auto func = constant->getFuncDecl()) {
+        if (func->isDistributed() && isa<ProtocolDecl>(func->getDeclContext())) {
+          // If we're calling cross-actor, we must always use a distributed thunk
+          if (!isSameActorIsolated(func, SGF.FunctionDC)) {
+            // We must adjust the constant to use a distributed thunk.
+            constant = constant->asDistributed();
+          }
+        }
+      }
+
       auto constantInfo =
           SGF.getConstantInfo(SGF.getTypeExpansionContext(), *constant);
 
@@ -700,6 +711,16 @@ public:
       return createCalleeTypeInfo(SGF, constant, constantInfo.getSILType());
     }
     case Kind::WitnessMethod: {
+      if (auto func = constant->getFuncDecl()) {
+        if (func->isDistributed() && isa<ProtocolDecl>(func->getDeclContext())) {
+          // If we're calling cross-actor, we must always use a distributed thunk
+          if (!isSameActorIsolated(func, SGF.FunctionDC)) {
+            /// We must adjust the constant to use a distributed thunk.
+            constant = constant->asDistributed();
+          }
+        }
+      }
+
       auto constantInfo =
           SGF.getConstantInfo(SGF.getTypeExpansionContext(), *constant);
       return createCalleeTypeInfo(SGF, constant, constantInfo.getSILType());
@@ -1142,6 +1163,8 @@ public:
     }
 
     auto captureInfo = SGF.SGM.Types.getLoweredLocalCaptures(constant);
+    SGF.SGM.Types.setCaptureTypeExpansionContext(constant, SGF.SGM.M);
+    
     if (afd->getDeclContext()->isLocalContext() &&
         !captureInfo.hasGenericParamCaptures())
       subs = SubstitutionMap();
@@ -1207,6 +1230,9 @@ public:
   }
   
   void visitAbstractClosureExpr(AbstractClosureExpr *e) {
+    SILDeclRef constant(e);
+
+    SGF.SGM.Types.setCaptureTypeExpansionContext(constant, SGF.SGM.M);
     // Emit the closure body.
     SGF.SGM.emitClosure(e);
 
@@ -1219,7 +1245,6 @@ public:
     
     // A directly-called closure can be emitted as a direct call instead of
     // really producing a closure object.
-    SILDeclRef constant(e);
 
     auto captureInfo = SGF.SGM.M.Types.getLoweredLocalCaptures(constant);
 
@@ -1278,7 +1303,10 @@ public:
     CanType superFormalType = arg->getType()->getCanonicalType();
 
     // The callee for a super call has to be either a method or constructor.
+    // There might be one level of conversion in between.
     Expr *fn = apply->getFn();
+    if (auto fnConv = dyn_cast<FunctionConversionExpr>(fn))
+      fn = fnConv->getSubExpr();
     SubstitutionMap substitutions;
     SILDeclRef constant;
     if (auto *ctorRef = dyn_cast<OtherConstructorDeclRefExpr>(fn)) {
@@ -1782,17 +1810,50 @@ static void emitRawApply(SILGenFunction &SGF,
 
   // Gather the arguments.
   for (auto i : indices(args)) {
-    auto argValue = (inputParams[i].isConsumed() ? args[i].forward(SGF)
-                                                 : args[i].getValue());
-#ifndef NDEBUG
+    SILValue argValue;
     auto inputTy =
         substFnConv.getSILType(inputParams[i], SGF.getTypeExpansionContext());
+
+    if (inputParams[i].isConsumed()) {
+      argValue = args[i].forward(SGF);
+      if (argValue->getType().isMoveOnlyWrapped() &&
+          !inputTy.isMoveOnlyWrapped()) {
+        argValue =
+            SGF.B.createOwnedMoveOnlyWrapperToCopyableValue(loc, argValue);
+      }
+    } else {
+      ManagedValue arg = args[i];
+
+      // Move only is not represented in the Swift level type system, so if we
+      // have a move only value, convert it to a non-move only value. The
+      // move/is no escape checkers will ensure that it is legal to do this or
+      // will error. At this point we just want to make sure that the emitted
+      // types line up.
+      if (arg.getType().isMoveOnlyWrapped()) {
+        if (!inputTy.isMoveOnlyWrapped()) {
+          // We need to borrow so that we can convert from $@moveOnly T -> $T.
+          // Use a formal access borrow to ensure that we have tight scopes like
+          // we do when we borrow fn.
+          if (!arg.isPlusZero())
+            arg = arg.formalAccessBorrow(SGF, loc);
+
+          arg = SGF.B.createGuaranteedMoveOnlyWrapperToCopyableValue(loc, arg);
+        }
+      }
+
+      argValue = arg.getValue();
+    }
+
+#ifndef NDEBUG
     if (argValue->getType() != inputTy) {
       auto &out = llvm::errs();
       out << "TYPE MISMATCH IN ARGUMENT " << i << " OF APPLY AT ";
       printSILLocationDescription(out, loc, SGF.getASTContext());
       out << "  argument value: ";
       argValue->print(out);
+      out << "  argument type: ";
+      argValue->getType().print(out);
+      out << "\n";
       out << "  parameter type: ";
       inputTy.print(out);
       out << "\n";
@@ -2924,7 +2985,6 @@ private:
     // substituted argument type by abstraction and/or bridging.
     auto paramSlice = claimNextParameters(1);
     SILParameterInfo param = paramSlice.front();
-
     assert(arg.hasLValueType() == param.isIndirectInOut());
 
     // Make sure we use the same value category for these so that we
@@ -3056,6 +3116,18 @@ private:
 
       // If it's not already in memory, put it there.
       if (!result.getType().isAddress()) {
+        // If we have a move only wrapped type, we need to unwrap before we
+        // materialize. We will forward as appropriate so it will show up as a
+        // consuming use or a guaranteed use as appropriate.
+        if (result.getType().isMoveOnlyWrapped()) {
+          if (result.isPlusOne(SGF)) {
+            result =
+                SGF.B.createOwnedMoveOnlyWrapperToCopyableValue(loc, result);
+          } else {
+            result = SGF.B.createGuaranteedMoveOnlyWrapperToCopyableValue(
+                loc, result);
+          }
+        }
         result = result.materialize(SGF, loc);
       }
 
@@ -3119,7 +3191,7 @@ private:
     auto emissionKind = SGFAccessKind::BorrowedObjectRead;
     for (auto param : claimedParams) {
       assert(!param.isConsumed());
-      if (param.isIndirectInGuaranteed()) {
+      if (param.isIndirectInGuaranteed() && SGF.silConv.useLoweredAddresses()) {
         emissionKind = SGFAccessKind::BorrowedAddressRead;
         break;
       }
@@ -3439,8 +3511,7 @@ void DelayedArgument::emitDefaultArgument(SILGenFunction &SGF,
   auto value = SGF.emitApplyOfDefaultArgGenerator(info.loc,
                                                   info.defaultArgsOwner,
                                                   info.destIndex,
-                                                  info.resultType,
-                                                  info.origResultType);
+                                                  info.resultType);
 
   SmallVector<ManagedValue, 4> loweredArgs;
   SmallVector<DelayedArgument, 4> delayedArgs;
@@ -3497,8 +3568,10 @@ static void emitBorrowedLValueRecursive(SILGenFunction &SGF,
 
   // Load if necessary.
   assert(!param.isConsumed() && "emitting borrow into consumed parameter?");
-  if (!param.isIndirectInGuaranteed() && value.getType().isAddress()) {
-    value = SGF.B.createFormalAccessLoadBorrow(loc, value);
+  if (value.getType().isAddress()) {
+    if (!param.isIndirectInGuaranteed() || !SGF.silConv.useLoweredAddresses()) {
+      value = SGF.B.createFormalAccessLoadBorrow(loc, value);
+    }
   }
 
   assert(param.getInterfaceType() == value.getType().getASTType());
@@ -3960,15 +4033,20 @@ SILGenFunction::emitBeginApply(SILLocation loc, ManagedValue fn,
   // Manage all the yielded values.
   auto yieldInfos = substFnType->getYields();
   assert(yieldValues.size() == yieldInfos.size());
+  bool useLoweredAddresses = silConv.useLoweredAddresses();
   for (auto i : indices(yieldValues)) {
     auto value = yieldValues[i];
     auto info = yieldInfos[i];
     if (info.isIndirectInOut()) {
       yields.push_back(ManagedValue::forLValue(value));
     } else if (info.isConsumed()) {
-      yields.push_back(emitManagedRValueWithCleanup(value));
+      !useLoweredAddresses && value->getType().isTrivial(getFunction())
+          ? yields.push_back(ManagedValue::forTrivialRValue(value))
+          : yields.push_back(emitManagedRValueWithCleanup(value));
     } else if (info.isGuaranteed()) {
-      yields.push_back(ManagedValue::forBorrowedRValue(value));
+      !useLoweredAddresses && value->getType().isTrivial(getFunction())
+          ? yields.push_back(ManagedValue::forTrivialRValue(value))
+          : yields.push_back(ManagedValue::forBorrowedRValue(value));
     } else {
       yields.push_back(ManagedValue::forTrivialRValue(value));
     }
@@ -4108,8 +4186,13 @@ RValue CallEmission::applyEnumElementConstructor(SGFContext C) {
                                 resultFnType, argVals,
                                 std::move(*callSite).forward());
 
-    auto payloadTy = AnyFunctionType::composeTuple(SGF.getASTContext(),
-                                                   resultFnType->getParams());
+    // We need to implode a tuple rvalue for enum construction. This is
+    // essentially an implosion of the internal arguments of a pseudo case
+    // constructor, so we can drop the parameter flags.
+    auto payloadTy = AnyFunctionType::composeTuple(
+        SGF.getASTContext(), resultFnType->getParams(),
+        ParameterFlagHandling::IgnoreNonEmpty);
+
     auto arg = RValue(SGF, argVals, payloadTy->getCanonicalType());
     payload = ArgumentSource(uncurriedLoc, std::move(arg));
     formalResultType = cast<FunctionType>(formalResultType).getResult();
@@ -4430,27 +4513,6 @@ public:
 #endif
   }
 };
-
-class EmitBreadcrumbCleanup : public Cleanup {
-  ExecutorBreadcrumb breadcrumb;
-
-public:
-  EmitBreadcrumbCleanup(ExecutorBreadcrumb &&breadcrumb)
-    : breadcrumb(std::move(breadcrumb)) {}
-
-  void emit(SILGenFunction &SGF, CleanupLocation l,
-            ForUnwind_t forUnwind) override {
-    breadcrumb.emit(SGF, l);
-  }
-
-  void dump(SILGenFunction &SGF) const override {
-#ifndef NDEBUG
-    llvm::errs() << "EmitBreadcrumbCleanup "
-                 << "State:" << getState()
-                 << "NeedsEmit:" << breadcrumb.needsEmit();
-#endif
-  }
-};
 } // end anonymous namespace
 
 //===----------------------------------------------------------------------===//
@@ -4601,11 +4663,6 @@ RValue SILGenFunction::emitApply(
     rawDirectResult = rawDirectResults[0];
   }
 
-  if (!calleeTypeInfo.foreign.async) {
-    // hop back to the current executor
-    breadcrumb.emit(*this, loc);
-  }
-
   // For objc async calls, lifetime extend the args until the result plan which
   // generates `await_async_continuation`.
   // Lifetime is extended by creating unmanaged copies here and by pushing the
@@ -4617,6 +4674,14 @@ RValue SILGenFunction::emitApply(
         unmanagedCopies.push_back(arg.unmanagedCopy(*this, loc));
       }
     }
+    // similarly, we defer the emission of the breadcrumb until the result
+    // plan's finish method is called, because it must happen in the
+    // successors of the `await_async_continuation` terminator.
+    resultPlan->deferExecutorBreadcrumb(std::move(breadcrumb));
+
+  } else {
+    // In the ordinary case, we hop back to the current executor
+    breadcrumb.emit(*this, loc);
   }
 
   // Pop the argument scope.
@@ -4703,8 +4768,6 @@ RValue SILGenFunction::emitApply(
     for (auto unmanagedCopy : unmanagedCopies) {
       Cleanups.pushCleanup<FixLifetimeDestroyCleanup>(unmanagedCopy);
     }
-    // save breadcrumb as a clean-up so it is emitted in result / throw cases.
-    Cleanups.pushCleanup<EmitBreadcrumbCleanup>(std::move(breadcrumb));
   } else {
     assert(unmanagedCopies.empty());
   }
@@ -5779,12 +5842,15 @@ SILDeclRef SILGenModule::getAccessorDeclRef(AccessorDecl *accessor) {
 }
 
 /// Emit a call to a getter.
-RValue SILGenFunction::emitGetAccessor(SILLocation loc, SILDeclRef get,
-                                       SubstitutionMap substitutions,
-                                       ArgumentSource &&selfValue, bool isSuper,
-                                       bool isDirectUse,
-                                       PreparedArguments &&subscriptIndices,
-                                       SGFContext c, bool isOnSelfParameter) {
+RValue SILGenFunction::emitGetAccessor(
+    SILLocation loc, SILDeclRef get,
+    SubstitutionMap substitutions,
+    ArgumentSource &&selfValue, bool isSuper,
+    bool isDirectUse,
+    PreparedArguments &&subscriptIndices,
+    SGFContext c,
+    bool isOnSelfParameter,
+    Optional<ImplicitActorHopTarget> implicitActorHopTarget) {
   // Scope any further writeback just within this operation.
   FormalEvaluationScope writebackScope(*this);
 
@@ -5795,6 +5861,9 @@ RValue SILGenFunction::emitGetAccessor(SILLocation loc, SILDeclRef get,
   CanAnyFunctionType accessType = getter.getSubstFormalType();
 
   CallEmission emission(*this, std::move(getter), std::move(writebackScope));
+  if (implicitActorHopTarget)
+    emission.setImplicitlyAsync(implicitActorHopTarget);
+
   // Self ->
   if (hasSelf) {
     emission.addSelfParam(loc, std::move(selfValue),
@@ -5858,8 +5927,8 @@ void SILGenFunction::emitSetAccessor(SILLocation loc, SILDeclRef set,
 ManagedValue SILGenFunction::emitAddressorAccessor(
     SILLocation loc, SILDeclRef addressor, SubstitutionMap substitutions,
     ArgumentSource &&selfValue, bool isSuper, bool isDirectUse,
-    PreparedArguments &&subscriptIndices, SILType addressType,
-    bool isOnSelfParameter) {
+    PreparedArguments &&subscriptIndices,
+    SILType addressType, bool isOnSelfParameter) {
   // Scope any further writeback just within this operation.
   FormalEvaluationScope writebackScope(*this);
 
@@ -5920,7 +5989,8 @@ SILGenFunction::emitCoroutineAccessor(SILLocation loc, SILDeclRef accessor,
   Callee callee =
     emitSpecializedAccessorFunctionRef(*this, loc, accessor,
                                        substitutions, selfValue,
-                                       isSuper, isDirectUse, isOnSelfParameter);
+                                       isSuper, isDirectUse,
+                                       isOnSelfParameter);
 
   // We're already in a full formal-evaluation scope.
   // Make a dead writeback scope; applyCoroutine won't try to pop this.

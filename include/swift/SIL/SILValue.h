@@ -255,6 +255,9 @@ struct ValueOwnershipKind {
   explicit ValueOwnershipKind(unsigned newValue) : value(innerty(newValue)) {}
   ValueOwnershipKind(const SILFunction &f, SILType type,
                      SILArgumentConvention convention);
+  ValueOwnershipKind(const SILFunction &f, SILType type,
+                     SILArgumentConvention convention,
+                     SILModuleConventions moduleConventions);
 
   /// Parse Value into a ValueOwnershipKind.
   ///
@@ -317,7 +320,7 @@ struct ValueOwnershipKind {
     return bool(merge(other));
   }
 
-  /// Returns isCompatibleWith(other.getOwnershipKind()).
+  /// Returns isCompatibleWith(other->getOwnershipKind()).
   ///
   /// Definition is inline after SILValue is defined to work around circular
   /// dependencies.
@@ -555,6 +558,19 @@ public:
 
   bool isLexical() const;
 
+  /// Unsafely eliminate moveonly from this value's type. Returns true if the
+  /// value's underlying type was move only and thus was changed. Returns false
+  /// otherwise.
+  ///
+  /// NOTE: Please do not use this directly! It is only meant to be used by the
+  /// optimizer pass: SILMoveOnlyWrappedTypeEliminator.
+  bool unsafelyEliminateMoveOnlyWrapper() {
+    if (!Type.isMoveOnlyWrapped())
+      return false;
+    Type = Type.removingMoveOnlyWrapper();
+    return true;
+  }
+
   static bool classof(SILNodePointer node) {
     return node->getKind() >= SILNodeKind::First_ValueBase &&
            node->getKind() <= SILNodeKind::Last_ValueBase;
@@ -652,9 +668,10 @@ public:
   /// NOTE: This is implemented in ValueOwnership.cpp not SILValue.cpp.
   ///
   /// FIXME: remove this redundant API from SILValue.
-  ValueOwnershipKind getOwnershipKind() const {
-    return Value->getOwnershipKind();
-  }
+  LLVM_ATTRIBUTE_DEPRECATED(
+      ValueOwnershipKind getOwnershipKind()
+          const { return Value->getOwnershipKind(); },
+      "Please use ValueBase::getOwnershipKind()");
 
   /// Verify that this SILValue and its uses respects ownership invariants.
   void verifyOwnership(DeadEndBlocks *DEBlocks) const;
@@ -666,7 +683,7 @@ public:
 inline SILNodePointer::SILNodePointer(SILValue value) : node(value) { }
 
 inline bool ValueOwnershipKind::isCompatibleWith(SILValue other) const {
-  return isCompatibleWith(other.getOwnershipKind());
+  return isCompatibleWith(other->getOwnershipKind());
 }
 
 /// Constraints on the ownership of an operand value.

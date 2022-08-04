@@ -1,6 +1,7 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-swift-frontend-emit-module -emit-module-path %t/FakeCodableForDistributedTests.swiftmodule -module-name FakeCodableForDistributedTests -disable-availability-checking %S/../Inputs/FakeCodableForDistributedTests.swift
 // RUN: %target-build-swift -module-name main -Xfrontend -disable-availability-checking -j2 -parse-as-library -I %t %s %S/../Inputs/FakeCodableForDistributedTests.swift -o %t/a.out
+// RUN: %target-codesign %t/a.out
 // RUN: %target-run %t/a.out | %FileCheck %s --color
 
 // REQUIRES: executable_test
@@ -12,7 +13,7 @@
 // UNSUPPORTED: back_deployment_runtime
 
 // FIXME(distributed): Distributed actors currently have some issues on windows, isRemote always returns false. rdar://82593574
-// UNSUPPORTED: windows
+// UNSUPPORTED: OS=windows-msvc
 
 import Distributed
 
@@ -492,7 +493,7 @@ func test() async throws {
     invocationDecoder: &decodeErrDecoder,
     handler: FakeResultHandler()
   )
-  // CHECK: ERROR: ExecuteDistributedTargetError(message: "Failed to decode of Int??? (for a test)")
+  // CHECK: ERROR: ExecuteDistributedTargetError(errorCode: Distributed.ExecuteDistributedTargetError.ErrorCode.other, message: "Failed to decode of Int??? (for a test)")
 
   print("done")
   // CHECK-NEXT: done

@@ -75,6 +75,9 @@ enum class SendableCheckReason {
   /// A reference to an actor from outside that actor.
   CrossActor,
 
+  /// Exiting an actor to non-isolated async code.
+  ExitingActor,
+
   /// A synchronous operation that was "promoted" to an asynchronous one
   /// because it was out of the actor's domain.
   SynchronousAsAsync,
@@ -82,6 +85,9 @@ enum class SendableCheckReason {
   /// A protocol conformance where the witness/requirement have different
   /// actor isolation.
   Conformance,
+
+  /// An override of a function.
+  Override,
 
   /// The declaration is being exposed to Objective-C.
   ObjC,
@@ -96,7 +102,8 @@ void checkOverrideActorIsolation(ValueDecl *value);
 /// code where strict checking has been enabled.
 bool contextRequiresStrictConcurrencyChecking(
     const DeclContext *dc,
-    llvm::function_ref<Type(const AbstractClosureExpr *)> getType);
+    llvm::function_ref<Type(const AbstractClosureExpr *)> getType,
+    llvm::function_ref<bool(const ClosureExpr *)> isolatedByPreconcurrency);
 
 /// Describes a referenced actor variable and whether it is isolated.
 struct ReferencedActor {
@@ -203,6 +210,9 @@ struct ActorReferenceResult {
     /// The declaration is being accessed from outside the actor and
     /// potentially from a different node, so it must be marked 'distributed'.
     Distributed = 1 << 2,
+
+    /// The declaration is being accessed from a @preconcurrency context.
+    Preconcurrency = 1 << 3,
   };
 
   using Options = OptionSet<Flags>;
@@ -268,7 +278,8 @@ public:
 /// \returns true if an problem was detected, false otherwise.
 bool diagnoseNonSendableTypesInReference(
     ConcreteDeclRef declRef, const DeclContext *fromDC, SourceLoc loc,
-    SendableCheckReason refKind);
+    SendableCheckReason refKind,
+    Optional<ActorIsolation> knownIsolation = None);
 
 /// Produce a diagnostic for a missing conformance to Sendable.
 void diagnoseMissingSendableConformance(
@@ -410,7 +421,8 @@ Type getExplicitGlobalActor(ClosureExpr *closure);
 /// Adjust the type of the variable for concurrency.
 Type adjustVarTypeForConcurrency(
     Type type, VarDecl *var, DeclContext *dc,
-    llvm::function_ref<Type(const AbstractClosureExpr *)> getType);
+    llvm::function_ref<Type(const AbstractClosureExpr *)> getType,
+    llvm::function_ref<bool(const ClosureExpr *)> isolatedByPreconcurrency);
 
 /// Adjust the given function type to account for concurrency-specific
 /// attributes whose affect on the type might differ based on context.
@@ -420,7 +432,9 @@ Type adjustVarTypeForConcurrency(
 AnyFunctionType *adjustFunctionTypeForConcurrency(
     AnyFunctionType *fnType, ValueDecl *decl, DeclContext *dc,
     unsigned numApplies, bool isMainDispatchQueue,
-    llvm::function_ref<Type(const AbstractClosureExpr *)> getType);
+    llvm::function_ref<Type(const AbstractClosureExpr *)> getType,
+    llvm::function_ref<bool(const ClosureExpr *)> isolatedByPreconcurrency,
+    llvm::function_ref<Type(Type)> openType);
 
 /// Determine whether the given name is that of a DispatchQueue operation that
 /// takes a closure to be executed on the queue.

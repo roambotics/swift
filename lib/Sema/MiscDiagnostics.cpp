@@ -1790,7 +1790,7 @@ bool TypeChecker::getDefaultGenericArgumentsString(
       }
 
       if (hasExplicitAnyObject)
-        members.push_back(typeDecl->getASTContext().getAnyObjectType());
+        members.push_back(typeDecl->getASTContext().getAnyObjectConstraint());
 
       auto type = ProtocolCompositionType::get(typeDecl->getASTContext(),
                                                members, hasExplicitAnyObject);
@@ -2809,6 +2809,8 @@ public:
   // There is no clear winner here since there are candidates within
   // limited availability contexts.
   void finalizeOpaque(const Candidate &universallyAvailable) {
+    using AvailabilityCondition = OpaqueTypeDecl::AvailabilityCondition;
+
     SmallVector<OpaqueTypeDecl::ConditionallyAvailableSubstitutions *, 4>
         conditionalSubstitutions;
 
@@ -2819,12 +2821,14 @@ public:
       if (!availabilityContext)
         continue;
 
-      SmallVector<VersionRange, 4> conditions;
+      SmallVector<AvailabilityCondition, 4> conditions;
 
       llvm::transform(availabilityContext->getCond(),
                       std::back_inserter(conditions),
                       [&](const StmtConditionElement &elt) {
-                        return elt.getAvailability()->getAvailableRange();
+                        auto condition = elt.getAvailability();
+                        return std::make_pair(condition->getAvailableRange(),
+                                              condition->isUnavailability());
                       });
 
       conditionalSubstitutions.push_back(
@@ -2836,7 +2840,7 @@ public:
     // Add universally available choice as the last one.
     conditionalSubstitutions.push_back(
         OpaqueTypeDecl::ConditionallyAvailableSubstitutions::get(
-            Ctx, {VersionRange::empty()},
+            Ctx, {{VersionRange::empty(), /*unavailable=*/false}},
             std::get<1>(universallyAvailable)
                 .mapReplacementTypesOutOfContext()));
 
@@ -2846,16 +2850,22 @@ public:
 
   std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
     if (auto underlyingToOpaque = dyn_cast<UnderlyingToOpaqueExpr>(E)) {
-      auto key =
-          underlyingToOpaque->substitutions.getCanonical().getOpaqueValue();
+      auto subMap = underlyingToOpaque->substitutions;
 
+      auto key = subMap.getCanonical().getOpaqueValue();
       auto isUnique = UniqueSignatures.insert(key).second;
 
       auto candidate =
-          std::make_tuple(underlyingToOpaque->getSubExpr(),
-                          underlyingToOpaque->substitutions, isUnique);
+          std::make_tuple(underlyingToOpaque->getSubExpr(), subMap, isUnique);
 
       if (isSelfReferencing(candidate)) {
+        HasInvalidReturn = true;
+        return {false, nullptr};
+      }
+
+      if (subMap.hasDynamicSelf()) {
+        Ctx.Diags.diagnose(E->getLoc(),
+                           diag::opaque_type_cannot_contain_dynamic_self);
         HasInvalidReturn = true;
         return {false, nullptr};
       }
@@ -2876,12 +2886,10 @@ public:
         return {true, S};
       }
 
-      // If this is `if #available` statement with no other dynamic
+      // If this is `if #(un)available` statement with no other dynamic
       // conditions, let's check if it returns opaque type directly.
       if (llvm::all_of(If->getCond(), [&](const auto &condition) {
-            return condition.getKind() ==
-                       StmtConditionElement::CK_Availability &&
-                   !condition.getAvailability()->isUnavailability();
+            return condition.getKind() == StmtConditionElement::CK_Availability;
           })) {
         // Check return statement directly with availability context set.
         if (auto *Then = dyn_cast<BraceStmt>(If->getThenStmt())) {
@@ -3572,11 +3580,12 @@ void swift::performAbstractFuncDeclDiagnostics(AbstractFunctionDecl *AFD) {
 }
 
 // Perform MiscDiagnostics on Switch Statements.
-static void checkSwitch(ASTContext &ctx, const SwitchStmt *stmt) {
+static void checkSwitch(ASTContext &ctx, const SwitchStmt *stmt,
+                        DeclContext *DC) {
   // We want to warn about "case .Foo, .Bar where 1 != 100:" since the where
   // clause only applies to the second case, and this is surprising.
   for (auto cs : stmt->getCases()) {
-    TypeChecker::checkExistentialTypes(ctx, cs);
+    TypeChecker::checkExistentialTypes(ctx, cs, DC);
 
     // The case statement can have multiple case items, each can have a where.
     // If we find a "where", and there is a preceding item without a where, and
@@ -3740,6 +3749,7 @@ static void checkStmtConditionTrailingClosure(ASTContext &ctx, const Expr *E) {
       case ExprKind::Array:
       case ExprKind::Dictionary:
       case ExprKind::InterpolatedStringLiteral:
+      case ExprKind::Closure:
         // If a trailing closure appears as a child of one of these types of
         // expression, don't diagnose it as there is no ambiguity.
         return {E->isImplicit(), E};
@@ -3782,7 +3792,7 @@ static void checkStmtConditionTrailingClosure(ASTContext &ctx, const Stmt *S) {
   } else if (auto SS = dyn_cast<SwitchStmt>(S)) {
     checkStmtConditionTrailingClosure(ctx, SS->getSubjectExpr());
   } else if (auto FES = dyn_cast<ForEachStmt>(S)) {
-    checkStmtConditionTrailingClosure(ctx, FES->getSequence());
+    checkStmtConditionTrailingClosure(ctx, FES->getParsedSequence());
     checkStmtConditionTrailingClosure(ctx, FES->getWhere());
   } else if (auto DCS = dyn_cast<DoCatchStmt>(S)) {
     for (auto CS : DCS->getCatches())
@@ -5069,10 +5079,10 @@ void swift::performSyntacticExprDiagnostics(const Expr *E,
 void swift::performStmtDiagnostics(const Stmt *S, DeclContext *DC) {
   auto &ctx = DC->getASTContext();
 
-  TypeChecker::checkExistentialTypes(ctx, const_cast<Stmt *>(S));
-    
+  TypeChecker::checkExistentialTypes(ctx, const_cast<Stmt *>(S), DC);
+
   if (auto switchStmt = dyn_cast<SwitchStmt>(S))
-    checkSwitch(ctx, switchStmt);
+    checkSwitch(ctx, switchStmt, DC);
 
   checkStmtConditionTrailingClosure(ctx, S);
   
@@ -5388,22 +5398,10 @@ bool swift::diagnoseUnhandledThrowsInAsyncContext(DeclContext *dc,
   if (!forEach->getAwaitLoc().isValid())
     return false;
 
-  auto &ctx = dc->getASTContext();
-
-  auto sequenceProto = TypeChecker::getProtocol(
-      ctx, forEach->getForLoc(), KnownProtocolKind::AsyncSequence);
-
-  if (!sequenceProto)
-    return false;
-
-  // fetch the sequence out of the statement
-  // else wise the value is potentially unresolved
-  auto Ty = forEach->getSequence()->getType();
-  auto module = dc->getParentModule();
-  auto conformanceRef = module->lookupConformance(Ty, sequenceProto);
-
+  auto conformanceRef = forEach->getSequenceConformance();
   if (conformanceRef.hasEffect(EffectKind::Throws) &&
       forEach->getTryLoc().isInvalid()) {
+    auto &ctx = dc->getASTContext();
     ctx.Diags
         .diagnose(forEach->getAwaitLoc(), diag::throwing_call_unhandled, "call")
         .fixItInsert(forEach->getAwaitLoc(), "try");

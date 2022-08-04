@@ -19,6 +19,7 @@
 #include "Callee.h"
 #include "ConstantBuilder.h"
 #include "Explosion.h"
+#include "ExtendedExistential.h"
 #include "FixedTypeInfo.h"
 #include "GenArchetype.h"
 #include "GenClass.h"
@@ -280,8 +281,16 @@ usesExtendedExistentialMetadata(CanExistentialMetatypeType type) {
 
   // The only existential types that don't currently use ExistentialType
   // are Any and AnyObject, which don't use extended metadata.
-  if (usesExtendedExistentialMetadata(cur))
+  if (usesExtendedExistentialMetadata(cur)) {
+    // HACK: The AST for an existential metatype of a (parameterized) protocol
+    // still directly wraps the existential type as its instance, which means
+    // we need to reconstitute the enclosing ExistentialType.
+    assert(cur->isExistentialType());
+    if (!cur->is<ExistentialType>()) {
+      cur = ExistentialType::get(cur)->getCanonicalType();
+    }
     return std::make_pair(cast<ExistentialType>(cur), depth);
+  }
   return None;
 }
 
@@ -373,6 +382,9 @@ llvm::Constant *IRGenModule::getAddrOfStringForTypeRef(
 
   unsigned pos = 0;
   for (auto &symbolic : mangling.SymbolicReferences) {
+    using SymbolicReferent = IRGenMangler::SymbolicReferent;
+    const SymbolicReferent &referent = symbolic.first;
+
     assert(symbolic.second >= pos
            && "references should be ordered");
     if (symbolic.second != pos) {
@@ -386,9 +398,10 @@ llvm::Constant *IRGenModule::getAddrOfStringForTypeRef(
     }
     
     ConstantReference ref;
-    unsigned char baseKind;
-    if (auto ctype = symbolic.first.dyn_cast<const NominalTypeDecl*>()) {
-      auto type = const_cast<NominalTypeDecl*>(ctype);
+    unsigned char kind;
+    switch (referent.getKind()) {
+    case SymbolicReferent::NominalType: {
+      auto type = const_cast<NominalTypeDecl*>(referent.getNominalType());
       if (auto proto = dyn_cast<ProtocolDecl>(type)) {
         // The symbolic reference is to the protocol descriptor of the
         // referenced protocol.
@@ -402,19 +415,30 @@ llvm::Constant *IRGenModule::getAddrOfStringForTypeRef(
           LinkEntity::forNominalTypeDescriptor(type));
       }
       // \1 - direct reference, \2 - indirect reference
-      baseKind = 1;
-    } else if (auto copaque = symbolic.first.dyn_cast<const OpaqueTypeDecl*>()){
-      auto opaque = const_cast<OpaqueTypeDecl*>(copaque);
+      kind = (ref.isIndirect() ? 0x02 : 0x01);
+      break;
+    }
+    case SymbolicReferent::OpaqueType: {
+      auto opaque = const_cast<OpaqueTypeDecl*>(referent.getOpaqueType());
       IRGen.noteUseOfOpaqueTypeDescriptor(opaque);
       ref = getAddrOfLLVMVariableOrGOTEquivalent(
                                    LinkEntity::forOpaqueTypeDescriptor(opaque));
-      baseKind = 1;
-    } else {
-      llvm_unreachable("unhandled symbolic referent");
+      kind = (ref.isIndirect() ? 0x02 : 0x01);
+      break;
+    }
+    case SymbolicReferent::ExtendedExistentialTypeShape: {
+      auto shapeInfo =
+        ExtendedExistentialTypeShapeInfo::get(
+          referent.getType()->getCanonicalType());
+      ref = ConstantReference(
+              emitExtendedExistentialTypeShape(*this, shapeInfo),
+              ConstantReference::Direct);
+      kind = (shapeInfo.isUnique() ? 0x0a : 0x0b);
+      break;
+    }
     }
     
-    // add kind byte. indirect kinds are the direct kind + 1
-    unsigned char kind = ref.isIndirect() ? baseKind + 1 : baseKind;
+    // add kind byte
     S.add(llvm::ConstantInt::get(Int8Ty, kind));
     // add relative reference
     S.addRelativeAddress(ref.getValue());
@@ -1082,6 +1106,9 @@ MetadataAccessStrategy irgen::getTypeMetadataAccessStrategy(CanType type) {
       assert(type->hasUnboundGenericType());
     }
 
+    if (type->isForeignReferenceType())
+      return MetadataAccessStrategy::PublicUniqueAccessor;
+
     if (requiresForeignTypeMetadata(nominal))
       return MetadataAccessStrategy::ForeignAccessor;
 
@@ -1713,10 +1740,8 @@ namespace {
 
       // Existential metatypes for extended existentials don't use
       // ExistentialMetatypeMetadata.
-      if (auto typeAndDepth = usesExtendedExistentialMetadata(type)) {
-        CanExistentialType existential = typeAndDepth->first;
-        unsigned depth = typeAndDepth->second;
-        auto metadata = emitExtendedExistentialTypeMetadata(existential, depth);
+      if (usesExtendedExistentialMetadata(type)) {
+        auto metadata = emitExtendedExistentialTypeMetadata(type);
         return setLocal(type, MetadataResponse::forComplete(metadata));
       }
 
@@ -1781,7 +1806,7 @@ namespace {
       auto layout = type.getExistentialLayout();
 
       if (layout.containsParameterized) {
-        return emitExtendedExistentialTypeMetadata(type, /*metatype depth*/ 0);
+        return emitExtendedExistentialTypeMetadata(type);
       }
 
       SmallVector<ProtocolDecl *, 4> protocols;
@@ -1834,13 +1859,12 @@ namespace {
       return call;
     }
 
-    llvm::Value *emitExtendedExistentialTypeMetadata(CanExistentialType type,
-                                                     unsigned metatypeDepth) {
-      auto shapeInfo = ExistentialTypeGeneralization::get(type);
-      auto shapeAndIsUnique =
-        emitExtendedExistentialTypeShape(IGF.IGM, shapeInfo, metatypeDepth);
-      llvm::Constant *shape = shapeAndIsUnique.first;
-      bool shapeIsUnique = shapeAndIsUnique.second;
+    llvm::Value *emitExtendedExistentialTypeMetadata(CanType type) {
+      assert(type.isAnyExistentialType());
+      auto shapeInfo = ExtendedExistentialTypeShapeInfo::get(type);
+      llvm::Constant *shape =
+        emitExtendedExistentialTypeShape(IGF.IGM, shapeInfo);
+      bool shapeIsUnique = shapeInfo.isUnique();
 
       // Emit a reference to the extended existential shape,
       // signed appropriately.
@@ -1857,10 +1881,10 @@ namespace {
       GenericArguments genericArgs;
       Address argsBuffer;
       llvm::Value *argsPointer;
-      if (shapeInfo.Generalization.empty()) {
+      if (shapeInfo.genSubs.empty()) {
         argsPointer = llvm::UndefValue::get(IGF.IGM.Int8PtrPtrTy);
       } else {
-        genericArgs.collect(IGF, shapeInfo.Generalization);
+        genericArgs.collect(IGF, shapeInfo.genSubs);
         argsBuffer = createGenericArgumentsArray(IGF, genericArgs.Values);
         argsPointer =
           IGF.Builder.CreateBitCast(argsBuffer.getAddress(),
@@ -1875,7 +1899,7 @@ namespace {
       call->setDoesNotThrow();
 
       // Destroy the generalization arguments array, if we made one.
-      if (!shapeInfo.Generalization.empty())
+      if (!shapeInfo.genSubs.empty())
         destroyGenericArgumentsArray(IGF, argsBuffer, genericArgs.Values);
 
       return call;
@@ -1883,7 +1907,16 @@ namespace {
 
     MetadataResponse visitProtocolType(CanProtocolType type,
                                        DynamicMetadataRequest request) {
-      llvm_unreachable("constraint type should be wrapped in existential type");
+      assert(false && "constraint type should be wrapped in existential type");
+
+      CanExistentialType existential(
+          ExistentialType::get(type)->castTo<ExistentialType>());
+
+      if (auto metatype = tryGetLocal(existential, request))
+        return metatype;
+
+      auto metadata = emitExistentialTypeMetadata(existential);
+      return setLocal(type, MetadataResponse::forComplete(metadata));
     }
 
     MetadataResponse
@@ -1892,7 +1925,16 @@ namespace {
       if (type->isAny() || type->isAnyObject())
         return emitSingletonExistentialTypeMetadata(type);
 
-      llvm_unreachable("constraint type should be wrapped in existential type");
+      assert(false && "constraint type should be wrapped in existential type");
+
+      CanExistentialType existential(
+          ExistentialType::get(type)->castTo<ExistentialType>());
+
+      if (auto metatype = tryGetLocal(existential, request))
+        return metatype;
+
+      auto metadata = emitExistentialTypeMetadata(existential);
+      return setLocal(type, MetadataResponse::forComplete(metadata));
     }
 
     MetadataResponse
@@ -1915,7 +1957,11 @@ namespace {
                                           DynamicMetadataRequest request) {
       llvm_unreachable("should not be asking for metadata of a SILToken type");
     }
-
+    MetadataResponse
+    visitSILMoveOnlyWrappedType(CanSILMoveOnlyWrappedType type,
+                                DynamicMetadataRequest request) {
+      llvm_unreachable("should not be asking for metadata of a move only type");
+    }
     MetadataResponse visitArchetypeType(CanArchetypeType type,
                                         DynamicMetadataRequest request) {
       return emitArchetypeTypeMetadataRef(IGF, type, request);
@@ -3052,15 +3098,6 @@ llvm::Value *IRGenFunction::emitTypeMetadataRef(CanType type) {
 MetadataResponse
 IRGenFunction::emitTypeMetadataRef(CanType type,
                                    DynamicMetadataRequest request) {
-  if (type->isForeignReferenceType()) {
-    type->getASTContext().Diags.diagnose(
-        type->lookThroughAllOptionalTypes()
-            ->getClassOrBoundGenericClass()
-            ->getLoc(),
-        diag::foreign_reference_types_unsupported.ID, {});
-    exit(1);
-  }
-
   type = IGM.getRuntimeReifiedType(type);
   // Look through any opaque types we're allowed to.
   type = IGM.substOpaqueTypesWithUnderlyingTypes(type);
@@ -3150,24 +3187,11 @@ public:
 
     for (auto i : indices(ty->getElementTypes())) {
       auto substEltType = ty.getElementType(i);
-      auto &substElt = ty->getElement(i);
-
-      // Make sure we don't have something non-materializable.
-      auto Flags = substElt.getParameterFlags();
-      assert(Flags.getValueOwnership() == ValueOwnership::Default);
-      assert(!Flags.isVariadic());
 
       CanType loweredSubstEltType = visit(substEltType);
-      changed =
-          (changed || substEltType != loweredSubstEltType || !Flags.isNone());
+      changed = (changed || substEltType != loweredSubstEltType);
 
-      // Note: we drop @escaping and @autoclosure which can still appear on
-      // materializable tuple types.
-      //
-      // FIXME: Replace this with an assertion that the original tuple element
-      // did not have any flags.
-      loweredElts.emplace_back(loweredSubstEltType, substElt.getName(),
-                               ParameterTypeFlags());
+      loweredElts.push_back(ty->getElement(i).getWithType(loweredSubstEltType));
     }
 
     if (!changed)
@@ -3461,6 +3485,7 @@ namespace {
       case ReferenceCounting::Error:
         llvm_unreachable("classes shouldn't have this kind of refcounting");
       case ReferenceCounting::None:
+      case ReferenceCounting::Custom:
         llvm_unreachable(
             "Foreign reference types don't conform to 'AnyClass'.");
       }

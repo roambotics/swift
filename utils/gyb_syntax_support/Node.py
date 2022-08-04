@@ -1,11 +1,5 @@
-import sys  # noqa: I201
-
+from .Utils import error
 from .kinds import SYNTAX_BASE_KINDS, kind_to_type, lowercase_first_word
-
-
-def error(msg):
-    print('error: ' + msg, file=sys.stderr)
-    sys.exit(-1)
 
 
 class Node(object):
@@ -21,8 +15,10 @@ class Node(object):
                  element_choices=None, omit_when_empty=False, 
                  elements_separated_by_newline=False):
         self.syntax_kind = name
+        self.element_name = element_name
         self.swift_syntax_kind = lowercase_first_word(name)
         self.name = kind_to_type(self.syntax_kind)
+        self.kind = kind
         self.description = description
 
         self.traits = traits or []
@@ -73,12 +69,19 @@ class Node(object):
         """
         return "Unknown" in self.syntax_kind
 
+    def is_missing(self):
+        """
+        Returns `True` if this node is a `Missing` syntax subclass.
+        """
+        return "Missing" in self.syntax_kind
+
     def is_buildable(self):
         """
         Returns `True` if this node should have a builder associated.
         """
         return not self.is_base() and \
             not self.is_unknown() and \
+            not self.is_missing() and \
             not self.is_syntax_collection()
 
     def shall_be_omitted_when_empty(self):

@@ -1787,6 +1787,9 @@ public:
   void diagnoseUnhandledThrowSite(DiagnosticEngine &Diags, ASTNode E,
                                   bool isTryCovered,
                                   const PotentialEffectReason &reason) {
+    if (E.isImplicit())
+      return;
+
     switch (getKind()) {
     case Kind::PotentiallyHandled:
       if (IsNonExhaustiveCatch) {
@@ -1966,6 +1969,9 @@ public:
   void diagnoseUnhandledAsyncSite(DiagnosticEngine &Diags, ASTNode node,
                                   Optional<PotentialEffectReason> maybeReason,
                                   bool forAwait = false) {
+    if (node.isImplicit())
+      return;
+
     switch (getKind()) {
     case Kind::PotentiallyHandled: {
       Diags.diagnose(node.getStartLoc(), diag::async_in_nonasync_function,
@@ -2870,7 +2876,7 @@ private:
          if (call && call->isImplicitlyAsync()) {
            // Emit a tailored note if the call is implicitly async, meaning the
            // callee is isolated to an actor.
-           auto callee = call->getCalledValue();
+           auto callee = call->getCalledValue(/*skipFunctionConversions=*/true);
            if (callee) {
              Ctx.Diags.diagnose(diag.expr.getStartLoc(), diag::actor_isolated_sync_func,
                                 callee->getDescriptiveKind(), callee->getName());

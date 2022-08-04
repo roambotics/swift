@@ -506,6 +506,9 @@ func rdar85166519() {
 
   var _: [Int: AnyObject] = [ // expected-error {{dictionary of type '[Int : AnyObject]' cannot be initialized with array literal}}
     // expected-note@-1 {{did you mean to use a dictionary literal instead?}}
-    v?.addingReportingOverflow(0) // expected-error {{cannot convert value of type '(partialValue: Int, overflow: Bool)?' to expected dictionary key type 'Int'}}
+    v?.addingReportingOverflow(0)
   ]
 }
+
+// https://github.com/apple/swift/issues/58539
+if let x = nil {} // expected-error{{'nil' requires a contextual type}}

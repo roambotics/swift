@@ -210,7 +210,7 @@ class ExplicitSelfRequiredTest {
     doStuff {method() }  // expected-error {{call to method 'method' in closure requires explicit use of 'self' to make capture semantics explicit}} expected-note{{capture 'self' explicitly to enable implicit 'self' in this closure}} {{14-14= [self] in }} expected-note{{reference 'self.' explicitly}} {{14-14=self.}}
     doVoidStuff {_ = method() }  // expected-error {{call to method 'method' in closure requires explicit use of 'self' to make capture semantics explicit}} expected-note{{capture 'self' explicitly to enable implicit 'self' in this closure}} {{18-18= [self] in }} expected-note{{reference 'self.' explicitly}} {{22-22=self.}}
     doVoidStuff {() -> () in _ = method() }  // expected-error {{call to method 'method' in closure requires explicit use of 'self' to make capture semantics explicit}} expected-note{{capture 'self' explicitly to enable implicit 'self' in this closure}} {{18-18= [self]}} expected-note{{reference 'self.' explicitly}} {{34-34=self.}}
-    // With an empty capture list, insertion should should be suggested without a comma
+    // With an empty capture list, insertion should be suggested without a comma
     doStuff { [] in method() } // expected-error {{call to method 'method' in closure requires explicit use of 'self' to make capture semantics explicit}} expected-note{{capture 'self' explicitly to enable implicit 'self' in this closure}} {{16-16=self}} expected-note{{reference 'self.' explicitly}} {{21-21=self.}}
     doStuff { [  ] in method() } // expected-error {{call to method 'method' in closure requires explicit use of 'self' to make capture semantics explicit}} expected-note{{capture 'self' explicitly to enable implicit 'self' in this closure}} {{16-16=self}} expected-note{{reference 'self.' explicitly}} {{23-23=self.}}
     doStuff { [ /* This space intentionally left blank. */ ] in method() } // expected-error {{call to method 'method' in closure requires explicit use of 'self' to make capture semantics explicit}} expected-note{{capture 'self' explicitly to enable implicit 'self' in this closure}} {{16-16=self}} expected-note{{reference 'self.' explicitly}} {{65-65=self.}}
@@ -475,9 +475,9 @@ var f = { (s: Undeclared) -> Int in 0 } // expected-error {{cannot find type 'Un
 
 // <rdar://problem/21375863> Swift compiler crashes when using closure, declared to return illegal type.
 func r21375863() {
-  var width = 0 // expected-warning {{variable 'width' was never mutated}}
-  var height = 0 // expected-warning {{variable 'height' was never mutated}}
-  var bufs: [[UInt8]] = (0..<4).map { _ -> [asdf] in  // expected-error {{cannot find type 'asdf' in scope}} expected-warning {{variable 'bufs' was never used}}
+  var width = 0
+  var height = 0
+  var bufs: [[UInt8]] = (0..<4).map { _ -> [asdf] in  // expected-error {{cannot find type 'asdf' in scope}}
     [UInt8](repeating: 0, count: width*height)
   }
 }
@@ -553,7 +553,7 @@ class SR3186 {
   }
 }
 
-// Apply the explicit 'self' rule even if it referrs to a capture, if
+// Apply the explicit 'self' rule even if it refers to a capture, if
 // we're inside a nested closure
 class SR14120 {
   func operation() {}
@@ -732,3 +732,22 @@ public class TestImplicitCaptureOfExplicitCaptureOfSelfInEscapingClosure {
         }
     }
 }
+
+// https://github.com/apple/swift/issues/59716
+// FIXME: Diagnostic should be tailored for closure result
+["foo"].map { s in
+    if s == "1" { return } // expected-error{{cannot convert return expression of type '()' to return type 'Bool'}}
+    return s.isEmpty
+}.filter { $0 }
+
+["foo"].map { s in
+    if s == "1" { return } // expected-error{{cannot convert return expression of type '()' to return type 'Bool'}}
+    if s == "2" { return }
+    if s == "3" { return }
+    return s.isEmpty
+}.filter { $0 }
+
+["foo"].map { s in
+    if s == "1" { return () } // expected-error{{cannot convert return expression of type '()' to return type 'Bool'}}
+    return s.isEmpty
+}.filter { $0 }

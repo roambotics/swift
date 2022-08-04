@@ -124,6 +124,12 @@ enum class AccessSemantics : uint8_t {
   /// This is an ordinary access to a declaration, using whatever
   /// polymorphism is expected.
   Ordinary,
+
+  /// This is an access to the underlying storage through a distributed thunk.
+  ///
+  /// The declaration must be a 'distributed' computed property used outside
+  /// of its actor isolation context.
+  DistributedThunk,
 };
 
 /// Expr - Base class for all expressions in swift.
@@ -354,6 +360,11 @@ protected:
   );
 
   SWIFT_INLINE_BITFIELD_FULL(PackExpr, Expr, 32,
+    : NumPadBits,
+    NumElements : 32
+  );
+
+  SWIFT_INLINE_BITFIELD_FULL(TypeJoinExpr, Expr, 32,
     : NumPadBits,
     NumElements : 32
   );
@@ -1682,6 +1693,14 @@ public:
   /// does not call the getter or setter.
   AccessSemantics getAccessSemantics() const {
     return (AccessSemantics) Bits.MemberRefExpr.Semantics;
+  }
+
+  /// Informs IRGen to that this member should be applied via its distributed
+  /// thunk, rather than invoking it directly.
+  ///
+  /// Only intended to be set on distributed get-only computed properties.
+  void setAccessViaDistributedThunk() {
+    Bits.MemberRefExpr.Semantics = (unsigned)AccessSemantics::DistributedThunk;
   }
 
   SourceLoc getLoc() const { return NameLoc.getBaseNameLoc(); }
@@ -4539,7 +4558,7 @@ public:
     Bits.ApplyExpr.ShouldApplyDistributedThunk = flag;
   }
 
-  ValueDecl *getCalledValue() const;
+  ValueDecl *getCalledValue(bool skipFunctionConversions = false) const;
 
   static bool classof(const Expr *E) {
     return E->getKind() >= ExprKind::First_ApplyExpr &&
@@ -5924,6 +5943,55 @@ public:
   }
 
   static bool classof(const Expr *E) { return E->getKind() == ExprKind::Pack; }
+};
+
+class TypeJoinExpr final : public Expr,
+                           private llvm::TrailingObjects<TypeJoinExpr, Expr *> {
+  friend TrailingObjects;
+
+  DeclRefExpr *Var;
+
+  size_t numTrailingObjects() const {
+    return getNumElements();
+  }
+
+  MutableArrayRef<Expr *> getMutableElements() {
+    return { getTrailingObjects<Expr *>(), getNumElements() };
+  }
+
+  TypeJoinExpr(DeclRefExpr *var, ArrayRef<Expr *> elements);
+
+public:
+  static TypeJoinExpr *create(ASTContext &ctx, DeclRefExpr *var,
+                              ArrayRef<Expr *> exprs);
+
+  SourceLoc getLoc() const { return SourceLoc(); }
+  SourceRange getSourceRange() const { return SourceRange(); }
+
+  DeclRefExpr *getVar() const { return Var; }
+
+  void setVar(DeclRefExpr *var) {
+    assert(var && "cannot set variable reference to null");
+    Var = var;
+  }
+
+  ArrayRef<Expr *> getElements() const {
+    return { getTrailingObjects<Expr *>(), getNumElements() };
+  }
+
+  Expr *getElement(unsigned i) const {
+    return getElements()[i];
+  }
+
+  void setElement(unsigned i, Expr *E) {
+    getMutableElements()[i] = E;
+  }
+
+  unsigned getNumElements() const { return Bits.TypeJoinExpr.NumElements; }
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::TypeJoin;
+  }
 };
 
 inline bool Expr::isInfixOperator() const {

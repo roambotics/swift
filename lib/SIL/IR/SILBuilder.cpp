@@ -154,6 +154,18 @@ SILBuilder::createUncheckedReinterpretCast(SILLocation Loc, SILValue Op,
   if (SILType::canRefCast(Op->getType(), Ty, getModule()))
     return createUncheckedRefCast(Loc, Op, Ty);
 
+  // If the source and destination types are functions with the same
+  // kind of representation, then do a function conversion.
+  if (Op->getType().isObject() && Ty.isObject()) {
+    if (auto OpFnTy = Op->getType().getAs<SILFunctionType>()) {
+      if (auto DestFnTy = Ty.getAs<SILFunctionType>()) {
+        if (OpFnTy->getRepresentation() == DestFnTy->getRepresentation()) {
+          return createConvertFunction(Loc, Op, Ty, /*withoutActuallyEscaping*/ false);
+        }
+      }
+    }
+  }
+  
   // The destination type is nontrivial, and may be smaller than the source
   // type, so RC identity cannot be assumed.
   return insert(UncheckedBitwiseCastInst::create(
@@ -175,6 +187,18 @@ SILBuilder::createUncheckedBitCast(SILLocation Loc, SILValue Op, SILType Ty) {
   if (SILType::canRefCast(Op->getType(), Ty, getModule()))
     return createUncheckedRefCast(Loc, Op, Ty);
 
+  // If the source and destination types are functions with the same
+  // kind of representation, then do a function conversion.
+  if (Op->getType().isObject() && Ty.isObject()) {
+    if (auto OpFnTy = Op->getType().getAs<SILFunctionType>()) {
+      if (auto DestFnTy = Ty.getAs<SILFunctionType>()) {
+        if (OpFnTy->getRepresentation() == DestFnTy->getRepresentation()) {
+          return createConvertFunction(Loc, Op, Ty, /*withoutActuallyEscaping*/ false);
+        }
+      }
+    }
+  }
+  
   // The destination type is nontrivial, and may be smaller than the source
   // type, so RC identity cannot be assumed.
   return createUncheckedValueCast(Loc, Op, Ty);
@@ -648,9 +672,9 @@ void SILBuilder::emitScopedBorrowOperation(SILLocation loc, SILValue original,
 static ValueOwnershipKind deriveForwardingOwnership(SILValue operand,
                                                     SILType targetType,
                                                     SILFunction &func) {
-  if (operand.getOwnershipKind() != OwnershipKind::None
-      || targetType.isTrivial(func)) {
-    return operand.getOwnershipKind();
+  if (operand->getOwnershipKind() != OwnershipKind::None ||
+      targetType.isTrivial(func)) {
+    return operand->getOwnershipKind();
   }
   return OwnershipKind::Owned;
 }

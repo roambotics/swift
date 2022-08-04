@@ -1,5 +1,4 @@
 // RUN: %target-typecheck-verify-swift -I %S/Inputs -enable-experimental-cxx-interop
-// XFAIL: *
 
 import MemberInline
 
@@ -41,3 +40,12 @@ let nonTrivialValueByVal = nonTrivialIntArrayByVal[1]
 var diffTypesArrayByVal = DifferentTypesArrayByVal()
 let diffTypesResultIntByVal: Int32 = diffTypesArrayByVal[0]
 let diffTypesResultDoubleByVal: Double = diffTypesArrayByVal[0.5]
+
+let postIncrement = HasPostIncrementOperator()
+postIncrement.successor() // expected-error {{value of type 'HasPostIncrementOperator' has no member 'successor'}}
+
+let anotherReturnType = HasPreIncrementOperatorWithAnotherReturnType()
+let anotherReturnTypeResult: HasPreIncrementOperatorWithAnotherReturnType = anotherReturnType.successor()
+
+let voidReturnType = HasPreIncrementOperatorWithVoidReturnType()
+let voidReturnTypeResult: HasPreIncrementOperatorWithVoidReturnType = voidReturnType.successor()

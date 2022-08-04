@@ -60,9 +60,6 @@ Expr *TypeChecker::buildDefaultInitializer(Type type) {
   if (auto tupleType = type->getAs<TupleType>()) {
     SmallVector<Expr *, 2> inits;
     for (const auto &elt : tupleType->getElements()) {
-      if (elt.isVararg())
-        return nullptr;
-
       auto eltInit = TypeChecker::buildDefaultInitializer(elt.getType());
       if (!eltInit)
         return nullptr;
@@ -250,10 +247,9 @@ StoredPropertiesAndMissingMembersRequest::evaluate(Evaluator &evaluator,
 }
 
 /// Validate the \c entryNumber'th entry in \c binding.
-const PatternBindingEntry *
-PatternBindingEntryRequest::evaluate(Evaluator &eval,
-                                     PatternBindingDecl *binding,
-                                     unsigned entryNumber) const {
+const PatternBindingEntry *PatternBindingEntryRequest::evaluate(
+    Evaluator &eval, PatternBindingDecl *binding, unsigned entryNumber,
+    bool LeaveClosureBodiesUnchecked) const {
   const auto &pbe = binding->getPatternList()[entryNumber];
   auto &Context = binding->getASTContext();
 
@@ -363,8 +359,12 @@ PatternBindingEntryRequest::evaluate(Evaluator &eval,
   if (patternType->hasUnresolvedType() ||
       patternType->hasPlaceholder() ||
       patternType->hasUnboundGenericType()) {
-    if (TypeChecker::typeCheckPatternBinding(binding, entryNumber,
-                                             patternType)) {
+    TypeCheckExprOptions options;
+    if (LeaveClosureBodiesUnchecked) {
+      options |= TypeCheckExprFlags::LeaveClosureBodyUnchecked;
+    }
+    if (TypeChecker::typeCheckPatternBinding(binding, entryNumber, patternType,
+                                             options)) {
       binding->setInvalid();
       return &pbe;
     }
@@ -2686,7 +2686,8 @@ static VarDecl *synthesizePropertyWrapperProjectionVar(
 }
 
 static void typeCheckSynthesizedWrapperInitializer(VarDecl *wrappedVar,
-                                                   Expr *&initializer) {
+                                                   Expr *&initializer,
+                                                   bool contextualize) {
   auto *dc = wrappedVar->getInnermostDeclContext();
   auto &ctx = wrappedVar->getASTContext();
   auto *initContext = new (ctx) PropertyWrapperInitializer(
@@ -2702,6 +2703,11 @@ static void typeCheckSynthesizedWrapperInitializer(VarDecl *wrappedVar,
 
   initializer = result->getAsExpr();
 
+  // Contextualize the initializer which is a local variable with defaultInit or
+  // gets an independent initializer. The rest of initializer contextualizing
+  // will be done in visitPatternBindingDecl.
+  if (!contextualize)
+    return;
   TypeChecker::contextualizeInitializer(initContext, initializer);
   checkPropertyWrapperActorIsolation(wrappedVar, initializer);
   TypeChecker::checkInitializerEffects(initContext, initializer);
@@ -2976,7 +2982,8 @@ PropertyWrapperInitializerInfoRequest::evaluate(Evaluator &evaluator,
         && !wrapperInfo.defaultInit) {
       auto ty = parentPBD->getPattern(patternNumber)->getType();
       if (auto defaultInit = TypeChecker::buildDefaultInitializer(ty)) {
-        typeCheckSynthesizedWrapperInitializer(var, defaultInit);
+        typeCheckSynthesizedWrapperInitializer(var, defaultInit,
+                                               /*contextualize=*/false);
         parentPBD->setInit(0, defaultInit);
         parentPBD->setInitializerChecked(0);
       }
@@ -2994,7 +3001,9 @@ PropertyWrapperInitializerInfoRequest::evaluate(Evaluator &evaluator,
         // FIXME: Record this expression somewhere so that DI can perform the
         // initialization itself.
         Expr *defaultInit = nullptr;
-        typeCheckSynthesizedWrapperInitializer(var, defaultInit);
+        // Only contextualize local wrapped property, the rest of wrapped
+        // property will be contextualized in visitPatternBindingDecl.
+        typeCheckSynthesizedWrapperInitializer(var, defaultInit, dc->isLocalContext());
         pbd->setInit(0, defaultInit);
         pbd->setInitializerChecked(0);
 
@@ -3064,7 +3073,8 @@ PropertyWrapperInitializerInfoRequest::evaluate(Evaluator &evaluator,
              !var->getName().hasDollarPrefix()) {
     wrappedValueInit = PropertyWrapperValuePlaceholderExpr::create(
         ctx, var->getSourceRange(), var->getType(), /*wrappedValue=*/nullptr);
-    typeCheckSynthesizedWrapperInitializer(var, wrappedValueInit);
+    typeCheckSynthesizedWrapperInitializer(var, wrappedValueInit,
+                                           /*contextualize=*/true);
   }
 
   return PropertyWrapperInitializerInfo(wrappedValueInit, projectedValueInit);

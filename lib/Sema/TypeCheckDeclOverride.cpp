@@ -490,7 +490,8 @@ static bool noteFixableMismatchedTypes(ValueDecl *decl, const ValueDecl *base) {
     auto *fnType = baseTy->getAs<AnyFunctionType>();
     baseTy = fnType->getResult();
     Type argTy = FunctionType::composeTuple(
-        ctx, baseTy->getAs<AnyFunctionType>()->getParams());
+        ctx, baseTy->getAs<AnyFunctionType>()->getParams(),
+        ParameterFlagHandling::IgnoreNonEmpty);
     auto diagKind = diag::override_type_mismatch_with_fixits_init;
     unsigned numArgs = baseInit->getParameters()->size();
     return computeFixitsForOverriddenDeclaration(
@@ -620,8 +621,7 @@ static bool parameterTypesMatch(const ValueDecl *derivedDecl,
   if (baseParams->size() != derivedParams->size())
     return false;
 
-  auto subs = SubstitutionMap::getOverrideSubstitutions(baseDecl, derivedDecl,
-                                                        /*derivedSubs=*/None);
+  auto subs = SubstitutionMap::getOverrideSubstitutions(baseDecl, derivedDecl);
 
   for (auto i : indices(baseParams->getArray())) {
     auto *baseParam = baseParams->get(i);
@@ -1514,6 +1514,7 @@ namespace  {
     UNINTERESTING_ATTR(Inlinable)
     UNINTERESTING_ATTR(Effects)
     UNINTERESTING_ATTR(Final)
+    UNINTERESTING_ATTR(MoveOnly)
     UNINTERESTING_ATTR(FixedLayout)
     UNINTERESTING_ATTR(Lazy)
     UNINTERESTING_ATTR(LLDBDebuggerFunction)
@@ -1612,7 +1613,6 @@ namespace  {
 
     UNINTERESTING_ATTR(UnsafeInheritExecutor)
     UNINTERESTING_ATTR(CompilerInitialized)
-
 #undef UNINTERESTING_ATTR
 
     void visitAvailableAttr(AvailableAttr *attr) {
@@ -1715,7 +1715,15 @@ static bool isAvailabilitySafeForOverride(ValueDecl *override,
   AvailabilityContext baseInfo =
     AvailabilityInference::availableRange(base, ctx);
 
-  return baseInfo.isContainedIn(overrideInfo);
+  if (baseInfo.isContainedIn(overrideInfo))
+    return true;
+
+  // Allow overrides that are not as available as the base decl as long as the
+  // override is as available as its context.
+  auto overrideTypeAvailability = AvailabilityInference::inferForType(
+      override->getDeclContext()->getSelfTypeInContext());
+  
+  return overrideTypeAvailability.isContainedIn(overrideInfo);
 }
 
 /// Returns true if a diagnostic about an accessor being less available
@@ -2331,7 +2339,7 @@ void swift::checkImplementationOnlyOverride(const ValueDecl *VD) {
   assert(SF && "checking a non-source declaration?");
 
   ModuleDecl *M = overridden->getModuleContext();
-  if (SF->isImportedImplementationOnly(M)) {
+  if (SF->getRestrictedImportKind(M) == RestrictedImportKind::ImplementationOnly) {
     VD->diagnose(diag::implementation_only_override_import_without_attr,
                  overridden->getDescriptiveKind())
         .fixItInsert(VD->getAttributeInsertionLoc(false),

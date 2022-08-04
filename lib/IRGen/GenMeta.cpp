@@ -50,6 +50,7 @@
 #include "ClassTypeInfo.h"
 #include "ConstantBuilder.h"
 #include "EnumMetadataVisitor.h"
+#include "ExtendedExistential.h"
 #include "Field.h"
 #include "FixedTypeInfo.h"
 #include "ForeignClassMetadataVisitor.h"
@@ -912,6 +913,10 @@ namespace {
         if (entry.getFunction().isAutoDiffDerivativeFunction())
           declRef = declRef.asAutoDiffDerivativeFunction(
               entry.getFunction().getAutoDiffDerivativeFunctionIdentifier());
+        if (entry.getFunction().isDistributedThunk()) {
+          flags = flags.withIsAsync(true);
+          declRef = declRef.asDistributed();
+        }
         addDiscriminator(flags, schema, declRef);
       }
 
@@ -1688,7 +1693,7 @@ namespace {
         VTable(IGM.getSILModule().lookUpVTable(getType())),
         Resilient(IGM.hasResilientMetadata(Type, ResilienceExpansion::Minimal)) {
 
-      if (getType()->isForeign() || Type->isForeignReferenceType())
+      if (getType()->isForeign())
         return;
 
       MetadataLayout = &IGM.getClassMetadataLayout(Type);
@@ -1719,7 +1724,6 @@ namespace {
     }
 
     void layout() {
-      assert(!getType()->isForeignReferenceType());
       super::layout();
       addVTable();
       addOverrideTable();
@@ -2333,9 +2337,10 @@ namespace {
             for (unsigned condIndex : indices(conditions)) {
               const auto &condition = conditions[condIndex];
 
-              assert(condition.hasLowerEndpoint());
+              assert(condition.first.hasLowerEndpoint());
 
-              auto version = condition.getLowerEndpoint();
+              bool isUnavailability = condition.second;
+              auto version = condition.first.getLowerEndpoint();
               auto *major = getInt32Constant(version.getMajor());
               auto *minor = getInt32Constant(version.getMinor());
               auto *patch = getInt32Constant(version.getSubminor());
@@ -2347,6 +2352,13 @@ namespace {
 
               auto success = IGF.Builder.CreateICmpNE(
                   isAtLeast, llvm::Constant::getNullValue(IGM.Int32Ty));
+
+              if (isUnavailability) {
+                // Invert the result of "at least" check by xor'ing resulting
+                // boolean with `-1`.
+                success =
+                    IGF.Builder.CreateXor(success, IGF.Builder.getIntN(1, -1));
+              }
 
               auto nextCondOrRet = condIndex == conditions.size() - 1
                                        ? returnTypeBB
@@ -2367,7 +2379,7 @@ namespace {
           auto universal = substitutionSet.back();
 
           assert(universal->getAvailability().size() == 1 &&
-                 universal->getAvailability()[0].isEmpty());
+                 universal->getAvailability()[0].first.isEmpty());
 
           IGF.Builder.CreateRet(
               getResultValue(IGF, genericEnv, universal->getSubstitutions()));
@@ -2555,15 +2567,6 @@ void irgen::emitLazyTypeContextDescriptor(IRGenModule &IGM,
 
 void irgen::emitLazyTypeMetadata(IRGenModule &IGM, NominalTypeDecl *type) {
   eraseExistingTypeContextDescriptor(IGM, type);
-
-  // Special case, UFOs are opaque pointers for now.
-  if (auto cd = dyn_cast<ClassDecl>(type)) {
-    if (cd->isForeignReferenceType()) {
-      auto sd = cast<StructDecl>(type->getASTContext().getOpaquePointerDecl());
-      emitStructMetadata(IGM, sd);
-      return;
-    }
-  }
 
   if (requiresForeignTypeMetadata(type)) {
     emitForeignTypeMetadata(IGM, type);
@@ -3245,12 +3248,7 @@ static void createNonGenericMetadataAccessFunction(IRGenModule &IGM,
 /// Emit the base-offset variable for the class.
 static void emitClassMetadataBaseOffset(IRGenModule &IGM,
                                         ClassDecl *classDecl) {
-  if (classDecl->isForeignReferenceType()) {
-    classDecl->getASTContext().Diags.diagnose(
-        classDecl->getLoc(), diag::foreign_reference_types_unsupported.ID,
-        {});
-    exit(1);
-  }
+  assert(!classDecl->isForeignReferenceType());
 
   // Otherwise, we know the offset at compile time, even if our
   // clients do not, so just emit a constant.
@@ -4045,6 +4043,8 @@ namespace {
       // Any bytes before this will be zeroed.  Currently we don't take
       // advantage of this.
       Size patternOffset = Size(0);
+      Size classROData = Size(0);
+      Size metaclassROData = Size(0);
 
       if (IGM.ObjCInterop) {
         // Add the metaclass object.
@@ -4059,13 +4059,27 @@ namespace {
           IGM.getOffsetInWords(patternOffset + roDataPoints.first));
         B.fillPlaceholderWithInt(*MetaclassRODataOffset, IGM.Int16Ty,
           IGM.getOffsetInWords(patternOffset + roDataPoints.second));
+        classROData = patternOffset + roDataPoints.first;
+        metaclassROData = patternOffset + roDataPoints.second;
       }
 
       auto patternSize = subB.getNextOffsetFromGlobal();
 
       auto global = subB.finishAndCreateGlobal("", IGM.getPointerAlignment(),
                                                /*constant*/ true);
+      if (IGM.ObjCInterop) {
+        auto getRODataAtOffset = [&] (Size offset) -> llvm::Constant * {
+          auto t0 = llvm::ConstantExpr::getBitCast(global, IGM.Int8PtrTy);
+          llvm::Constant *indices[] = {llvm::ConstantInt::get(IGM.Int32Ty, offset.getValue())};
+          return llvm::ConstantExpr::getBitCast(
+            llvm::ConstantExpr::getInBoundsGetElementPtr(IGM.Int8Ty,
+                                                         t0, indices),
+            IGM.Int8PtrTy);
 
+        };
+        IGM.addGenericROData(getRODataAtOffset(classROData));
+        IGM.addGenericROData(getRODataAtOffset(metaclassROData));
+      }
       return { global, patternOffset, patternSize };
     }
 
@@ -5444,6 +5458,9 @@ namespace {
     ForeignClassMetadataBuilder(IRGenModule &IGM, ClassDecl *target,
                                 ConstantStructBuilder &B)
         : ForeignMetadataBuilderBase(IGM, target, B) {
+      assert(!getTargetType()->isForeignReferenceType() &&
+             "foreign reference type metadata must be built with the ForeignReferenceTypeMetadataBuilder");
+
       if (IGM.getOptions().LazyInitializeClassMetadata)
         CanBeConstant = false;
     }
@@ -5532,6 +5549,61 @@ namespace {
       B.addNullPointer(IGM.Int8PtrTy);
     }
   };
+
+  class ForeignReferenceTypeMetadataBuilder;
+  class ForeignReferenceTypeMetadataBuilderBase :
+      public ForeignReferenceTypeMetadataVisitor<ForeignReferenceTypeMetadataBuilder> {
+  protected:
+    ConstantStructBuilder &B;
+
+    ForeignReferenceTypeMetadataBuilderBase(IRGenModule &IGM, ClassDecl *target,
+                                            ConstantStructBuilder &B)
+        : ForeignReferenceTypeMetadataVisitor(IGM, target), B(B) {}
+  };
+
+  /// A builder for ForeignReferenceTypeMetadata.
+  class ForeignReferenceTypeMetadataBuilder :
+      public ForeignMetadataBuilderBase<ForeignReferenceTypeMetadataBuilder,
+                                        ForeignReferenceTypeMetadataBuilderBase> {
+  public:
+    ForeignReferenceTypeMetadataBuilder(IRGenModule &IGM, ClassDecl *target,
+                                        ConstantStructBuilder &B)
+        : ForeignMetadataBuilderBase(IGM, target, B) {
+      assert(getTargetType()->isForeignReferenceType() &&
+             "foreign reference type metadata build must be used on foreign reference types.");
+
+      if (IGM.getOptions().LazyInitializeClassMetadata)
+        CanBeConstant = false;
+    }
+
+    void emitInitializeMetadata(IRGenFunction &IGF, llvm::Value *metadata,
+                                MetadataDependencyCollector *collector) {
+      llvm_unreachable("Not implemented for foreign reference types.");
+    }
+
+    // Visitor methods.
+
+    void addValueWitnessTable() {
+      auto type = getTargetType()->getCanonicalType();
+      B.add(irgen::emitValueWitnessTable(IGM, type, false, false).getValue());
+    }
+
+    void addMetadataFlags() {
+      B.addInt(IGM.MetadataKindTy, (unsigned) MetadataKind::ForeignReferenceType);
+    }
+
+    void addNominalTypeDescriptor() {
+      auto descriptor =
+          ClassContextDescriptorBuilder(this->IGM, Target, RequireMetadata).emit();
+      B.addSignedPointer(descriptor,
+                         IGM.getOptions().PointerAuth.TypeDescriptors,
+                         PointerAuthEntity::Special::TypeDescriptor);
+    }
+
+    void addReservedWord() {
+      B.addNullPointer(IGM.Int8PtrTy);
+    }
+  };
   
   /// A builder for ForeignStructMetadata.
   class ForeignStructMetadataBuilder :
@@ -5598,8 +5670,9 @@ bool irgen::requiresForeignTypeMetadata(CanType type) {
 
 bool irgen::requiresForeignTypeMetadata(NominalTypeDecl *decl) {
   if (auto *clazz = dyn_cast<ClassDecl>(decl)) {
-    assert(!clazz->isForeignReferenceType());
-    
+    if (clazz->isForeignReferenceType())
+      return true;
+
     switch (clazz->getForeignClassKind()) {
     case ClassDecl::ForeignKind::Normal:
     case ClassDecl::ForeignKind::RuntimeOnly:
@@ -5623,16 +5696,25 @@ void irgen::emitForeignTypeMetadata(IRGenModule &IGM, NominalTypeDecl *decl) {
   init.setPacked(true);
 
   if (auto classDecl = dyn_cast<ClassDecl>(decl)) {
-    assert(classDecl->getForeignClassKind() == ClassDecl::ForeignKind::CFType ||
-           classDecl->isForeignReferenceType());
+    if (classDecl->isForeignReferenceType()) {
+      ForeignReferenceTypeMetadataBuilder builder(IGM, classDecl, init);
+      builder.layout();
 
-    ForeignClassMetadataBuilder builder(IGM, classDecl, init);
-    builder.layout();
+      IGM.defineTypeMetadata(type, /*isPattern=*/false,
+                             builder.canBeConstant(),
+                             init.finishAndCreateFuture());
+      builder.createMetadataAccessFunction();
+    } else {
+      assert(classDecl->getForeignClassKind() == ClassDecl::ForeignKind::CFType);
 
-    IGM.defineTypeMetadata(type, /*isPattern=*/false,
-                           builder.canBeConstant(),
-                           init.finishAndCreateFuture());
-    builder.createMetadataAccessFunction();
+      ForeignClassMetadataBuilder builder(IGM, classDecl, init);
+      builder.layout();
+
+      IGM.defineTypeMetadata(type, /*isPattern=*/false,
+                             builder.canBeConstant(),
+                             init.finishAndCreateFuture());
+      builder.createMetadataAccessFunction();
+    }
   } else if (auto structDecl = dyn_cast<StructDecl>(decl)) {
     assert(isa<ClangModuleUnit>(structDecl->getModuleScopeContext()));
 
@@ -5717,12 +5799,14 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   case KnownProtocolKind::Differentiable:
   case KnownProtocolKind::FloatingPoint:
   case KnownProtocolKind::Identifiable:
+  case KnownProtocolKind::AnyActor:
   case KnownProtocolKind::Actor:
   case KnownProtocolKind::DistributedActor:
   case KnownProtocolKind::DistributedActorSystem:
   case KnownProtocolKind::DistributedTargetInvocationEncoder:
   case KnownProtocolKind::DistributedTargetInvocationDecoder:
   case KnownProtocolKind::DistributedTargetInvocationResultHandler:
+  case KnownProtocolKind::UnsafeCxxInputIterator:
   case KnownProtocolKind::SerialExecutor:
   case KnownProtocolKind::Sendable:
   case KnownProtocolKind::UnsafeSendable:
@@ -5994,8 +6078,8 @@ llvm::GlobalValue *irgen::emitAsyncFunctionPointer(IRGenModule &IGM,
 }
 
 static FormalLinkage getExistentialShapeLinkage(CanGenericSignature genSig,
-                                                CanExistentialType type) {
-  auto typeLinkage = getTypeLinkage_correct(type);
+                                                CanType shapeType) {
+  auto typeLinkage = getTypeLinkage_correct(shapeType);
   if (typeLinkage == FormalLinkage::Private)
     return FormalLinkage::Private;
 
@@ -6010,25 +6094,50 @@ static FormalLinkage getExistentialShapeLinkage(CanGenericSignature genSig,
   return FormalLinkage::PublicNonUnique;
 }
 
-std::pair<llvm::Constant *, /*unique*/ bool>
-irgen::emitExtendedExistentialTypeShape(IRGenModule &IGM,
-                                 const ExistentialTypeGeneralization &info,
-                                        unsigned metatypeDepth) {
-  CanGenericSignature genSig;
-  if (info.Generalization)
-    genSig = info.Generalization.getGenericSignature()
-                                .getCanonicalSignature();
-  CanExistentialType existentialType =
-    cast<ExistentialType>(info.Shape->getCanonicalType());
+ExtendedExistentialTypeShapeInfo
+ExtendedExistentialTypeShapeInfo::get(CanType existentialType) {
+  assert(isa<ExistentialType>(existentialType) ||
+         isa<ExistentialMetatypeType>(existentialType));
 
-  CanType shapeType = existentialType;
+  unsigned metatypeDepth = 0;
+  while (auto metatype = dyn_cast<ExistentialMetatypeType>(existentialType)) {
+    metatypeDepth++;
+    existentialType = metatype.getInstanceType();
+  }
+
+  auto genInfo = ExistentialTypeGeneralization::get(existentialType);
+
+  auto result = get(genInfo, metatypeDepth);
+  result.genSubs = genInfo.Generalization;
+  return result;
+}
+
+ExtendedExistentialTypeShapeInfo
+ExtendedExistentialTypeShapeInfo::get(
+                                const ExistentialTypeGeneralization &genInfo,
+                                      unsigned metatypeDepth) {
+  auto shapeType = genInfo.Shape->getCanonicalType();
   for (unsigned i = 0; i != metatypeDepth; ++i)
     shapeType = CanExistentialMetatypeType::get(shapeType);
 
-  auto linkage = getExistentialShapeLinkage(genSig, existentialType);
+  CanGenericSignature genSig;
+  if (genInfo.Generalization)
+    genSig = genInfo.Generalization.getGenericSignature()
+                                   .getCanonicalSignature();
+
+  auto linkage = getExistentialShapeLinkage(genSig, shapeType);
   assert(linkage != FormalLinkage::PublicUnique);
-  bool isUnique = (linkage != FormalLinkage::PublicNonUnique);
-  bool isShared = (linkage != FormalLinkage::Private);
+
+  return { genSig, shapeType, SubstitutionMap(), linkage };
+}
+
+llvm::Constant *
+irgen::emitExtendedExistentialTypeShape(IRGenModule &IGM,
+                              const ExtendedExistentialTypeShapeInfo &info) {
+  CanGenericSignature genSig = info.genSig;
+  CanType shapeType = info.shapeType;
+  bool isUnique = info.isUnique();
+  bool isShared = info.isShared();
 
   auto entity =
     LinkEntity::forExtendedExistentialTypeShape(genSig, shapeType,
@@ -6051,6 +6160,13 @@ irgen::emitExtendedExistentialTypeShape(IRGenModule &IGM,
       b.addRelativeAddress(cache);
     }
 
+    CanType existentialType = shapeType;
+    unsigned metatypeDepth = 0;
+    while (auto emt = dyn_cast<ExistentialMetatypeType>(existentialType)) {
+      existentialType = emt.getInstanceType();
+      metatypeDepth++;
+    }
+
     CanGenericSignature reqSig =
       IGM.Context.getOpenedArchetypeSignature(existentialType, genSig);
 
@@ -6065,7 +6181,7 @@ irgen::emitExtendedExistentialTypeShape(IRGenModule &IGM,
     SpecialKind specialKind = [&] {
       if (metatypeDepth > 0)
         return SpecialKind::Metatype;
-      if (existentialType->requiresClass())
+      if (existentialType->isClassExistentialType())
         return SpecialKind::Class;
       return SpecialKind::None;
     }();
@@ -6157,8 +6273,5 @@ irgen::emitExtendedExistentialTypeShape(IRGenModule &IGM,
     IGM.setTrueConstGlobal(var);
   });
 
-  return {
-    llvm::ConstantExpr::getBitCast(shape, IGM.Int8PtrTy),
-    isUnique
-  };
+  return llvm::ConstantExpr::getBitCast(shape, IGM.Int8PtrTy);
 }

@@ -59,7 +59,7 @@ public:
   SILValue getValue() const { return op.get(); }
 
   ValueOwnershipKind getOwnershipKind() const {
-    return op.get().getOwnershipKind();
+    return op.get()->getOwnershipKind();
   }
 
   unsigned getOperandIndex() const { return op.getOperandNumber(); }
@@ -328,6 +328,8 @@ FORWARDING_OWNERSHIP(InitExistentialRef)
 FORWARDING_OWNERSHIP(DifferentiableFunction)
 FORWARDING_OWNERSHIP(LinearFunction)
 FORWARDING_OWNERSHIP(MarkMustCheck)
+FORWARDING_OWNERSHIP(MoveOnlyWrapperToCopyableValue)
+FORWARDING_OWNERSHIP(CopyableToMoveOnlyWrapperValue)
 #undef FORWARDING_OWNERSHIP
 
 // Arbitrary value casts are forwarding instructions that are also allowed to
@@ -862,6 +864,8 @@ visitResumeThrowingContinuationThrowing(BuiltinInst *bi, StringRef attr) {
 
   return OperandOwnership::TrivialUse;
 }
+
+BUILTIN_OPERAND_OWNERSHIP(TrivialUse, TaskRunInline)
 
 BUILTIN_OPERAND_OWNERSHIP(InteriorPointer, CancelAsyncTask)
 BUILTIN_OPERAND_OWNERSHIP(InteriorPointer, InitializeDefaultActor)

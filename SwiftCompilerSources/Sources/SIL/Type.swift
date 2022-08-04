@@ -42,8 +42,17 @@ public struct Type : CustomStringConvertible, CustomReflectable {
   public func getNominalFields(in function: Function) -> NominalFieldsArray {
     NominalFieldsArray(type: self, function: function)
   }
-  
-  public var description: String { SILType_debugDescription(bridged).takeString() }
+
+  public func getIndexOfEnumCase(withName name: String) -> Int? {
+    let idx = name._withStringRef {
+      SILType_getCaseIdxOfEnumType(bridged, $0)
+    }
+    return idx >= 0 ? idx : nil
+  }
+
+  public var description: String {
+    String(_cxxString: SILType_debugDescription(bridged))
+  }
 
   public var customMirror: Mirror { Mirror(self, children: []) }
 }
@@ -66,7 +75,7 @@ public struct NominalFieldsArray : RandomAccessCollection, FormattedLikeArray {
   }
 
   public func getIndexOfField(withName name: String) -> Int? {
-    let idx = name.withBridgedStringRef {
+    let idx = name._withStringRef {
       SILType_getFieldIdxOfNominalType(type.bridged, $0)
     }
     return idx >= 0 ? idx : nil

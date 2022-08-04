@@ -1600,6 +1600,7 @@ IRGenModule::getReferenceObjectTypeInfo(ReferenceCounting refcounting) {
   case ReferenceCounting::Block:
   case ReferenceCounting::Error:
   case ReferenceCounting::ObjC:
+  case ReferenceCounting::Custom:
   case ReferenceCounting::None:
     llvm_unreachable("not implemented");
   }
@@ -2169,6 +2170,8 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
   case TypeKind::BoundGenericEnum:
   case TypeKind::BoundGenericStruct:
     return convertAnyNominalType(ty, cast<BoundGenericType>(ty)->getDecl());
+  case TypeKind::SILMoveOnlyWrapped:
+    llvm_unreachable("implement this");
   case TypeKind::InOut:
     return convertInOutType(cast<InOutType>(ty));
   case TypeKind::Tuple:

@@ -55,6 +55,7 @@ template <typename Runtime> struct TargetStructMetadata;
 template <typename Runtime> struct TargetOpaqueMetadata;
 template <typename Runtime> struct TargetValueMetadata;
 template <typename Runtime> struct TargetForeignClassMetadata;
+template <typename Runtime> struct TargetForeignReferenceTypeMetadata;
 template <typename Runtime> struct TargetContextDescriptor;
 template <typename Runtime> class TargetTypeContextDescriptor;
 template <typename Runtime> class TargetClassDescriptor;
@@ -258,6 +259,7 @@ public:
     case MetadataKind::Class:
     case MetadataKind::ObjCClassWrapper:
     case MetadataKind::ForeignClass:
+    case MetadataKind::ForeignReferenceType:
       return true;
 
     default:
@@ -374,6 +376,9 @@ public:
           ->Description;
     case MetadataKind::ForeignClass:
       return static_cast<const TargetForeignClassMetadata<Runtime> *>(this)
+          ->Description;
+    case MetadataKind::ForeignReferenceType:
+      return static_cast<const TargetForeignReferenceTypeMetadata<Runtime> *>(this)
           ->Description;
     default:
       return nullptr;
@@ -877,7 +882,7 @@ public:
   //
   // Using Objective-C runtime, KVO can modify object behavior without needing
   // to modify the object's code. This is done by dynamically creating an
-  // artificial subclass of the the object's type.
+  // artificial subclass of the object's type.
   //
   // The isa pointer of the observed object is swapped out to point to
   // the artificial subclass, which has the following properties:
@@ -1158,6 +1163,44 @@ struct TargetForeignClassMetadata : public TargetForeignTypeMetadata<Runtime> {
   }
 };
 using ForeignClassMetadata = TargetForeignClassMetadata<InProcess>;
+
+/// The structure of metadata objects for foreign reference types.
+/// A foreign reference type is a non-Swift, non-Objective-C foreign type with
+/// reference semantics. Foreign reference types are pointers/reference to
+/// value types marked with the "import_as_ref" attribute.
+///
+/// Foreign reference types may have *custom* reference counting operations, or
+/// they may be immortal (and therefore trivial).
+///
+/// We assume for now that foreign reference types are entirely opaque
+/// to Swift introspection.
+template <typename Runtime>
+struct TargetForeignReferenceTypeMetadata : public TargetForeignTypeMetadata<Runtime> {
+  using StoredPointer = typename Runtime::StoredPointer;
+
+  /// An out-of-line description of the type.
+  TargetSignedPointer<Runtime, const TargetClassDescriptor<Runtime> * __ptrauth_swift_type_descriptor> Description;
+
+  /// Reserved space.  For now, this should be zero-initialized.
+  /// If this is used for anything in the future, at least some of these
+  /// first bits should be flags.
+  StoredPointer Reserved[1];
+
+  ConstTargetMetadataPointer<Runtime, TargetClassDescriptor>
+  getDescription() const {
+    return Description;
+  }
+
+  typename Runtime::StoredSignedPointer
+  getDescriptionAsSignedPointer() const {
+    return Description;
+  }
+
+  static bool classof(const TargetMetadata<Runtime> *metadata) {
+    return metadata->getKind() == MetadataKind::ForeignReferenceType;
+  }
+};
+using ForeignReferenceTypeMetadata = TargetForeignReferenceTypeMetadata<InProcess>;
 
 /// The common structure of metadata for structs and enums.
 template <typename Runtime>
@@ -1735,6 +1778,12 @@ public:
 using ExistentialTypeMetadata
   = TargetExistentialTypeMetadata<InProcess>;
 
+template<typename Runtime>
+struct TargetExistentialTypeExpression {
+  /// The type expression.
+  TargetRelativeDirectPointer<Runtime, const char, /*nullable*/ false> name;
+};
+
 /// A description of the shape of an existential type.
 ///
 /// An existential type has the general form:
@@ -1791,7 +1840,7 @@ struct TargetExtendedExistentialTypeShape
       // Optional generalization signature header
       TargetGenericContextDescriptorHeader<Runtime>,
       // Optional type subexpression
-      TargetRelativeDirectPointer<Runtime, const char, /*nullable*/ false>,
+      TargetExistentialTypeExpression<Runtime>,
       // Optional suggested value witnesses
       TargetRelativeIndirectablePointer<Runtime, const TargetValueWitnessTable<Runtime>,
                                         /*nullable*/ false>,
@@ -1802,8 +1851,6 @@ struct TargetExtendedExistentialTypeShape
       // for generalization signature
       TargetGenericRequirementDescriptor<Runtime>> {
 private:
-  using RelativeStringPointer =
-    TargetRelativeDirectPointer<Runtime, const char, /*nullable*/ false>;
   using RelativeValueWitnessTablePointer =
     TargetRelativeIndirectablePointer<Runtime,
                                       const TargetValueWitnessTable<Runtime>,
@@ -1812,7 +1859,7 @@ private:
     swift::ABI::TrailingObjects<
       TargetExtendedExistentialTypeShape<Runtime>,
       TargetGenericContextDescriptorHeader<Runtime>,
-      RelativeStringPointer,
+      TargetExistentialTypeExpression<Runtime>,
       RelativeValueWitnessTablePointer,
       GenericParamDescriptor,
       TargetGenericRequirementDescriptor<Runtime>>;
@@ -1825,7 +1872,7 @@ private:
     return Flags.hasGeneralizationSignature();
   }
 
-  size_t numTrailingObjects(OverloadToken<RelativeStringPointer>) const {
+  size_t numTrailingObjects(OverloadToken<TargetExistentialTypeExpression<Runtime>>) const {
     return Flags.hasTypeExpression();
   }
 
@@ -1879,12 +1926,13 @@ public:
   /// we nonetheless distinguish at compile time.  Storing this also
   /// allows us to far more easily produce a formal type from this
   /// shape reflectively.
-  RelativeStringPointer ExistentialType;
+  TargetRelativeDirectPointer<Runtime, const char, /*nullable*/ false>
+      ExistentialType;
 
   /// The header describing the requirement signature of the existential.
   TargetGenericContextDescriptorHeader<Runtime> ReqSigHeader;
 
-  RuntimeGenericSignature getRequirementSignature() const {
+  RuntimeGenericSignature<Runtime> getRequirementSignature() const {
     return {ReqSigHeader, getReqSigParams(), getReqSigRequirements()};
   }
 
@@ -1894,8 +1942,8 @@ public:
 
   const GenericParamDescriptor *getReqSigParams() const {
     return Flags.hasImplicitReqSigParams()
-             ? ImplicitGenericParamDescriptors
-             : this->template getTrailingObjects<GenericParamDescriptor>();
+               ? swift::targetImplicitGenericParamDescriptors<Runtime>()
+               : this->template getTrailingObjects<GenericParamDescriptor>();
   }
 
   unsigned getNumReqSigRequirements() const {
@@ -1911,10 +1959,11 @@ public:
   /// The type expression of the existential, as a symbolic mangled type
   /// string.  Must be null if the header is just the (single)
   /// requirement type parameter.
-  TargetPointer<Runtime, const char> getTypeExpression() const {
+  const TargetExistentialTypeExpression<Runtime> *getTypeExpression() const {
     return Flags.hasTypeExpression()
-      ? this->template getTrailingObjects<RelativeStringPointer>()->get()
-      : nullptr;
+               ? this->template getTrailingObjects<
+                     TargetExistentialTypeExpression<Runtime>>()
+               : nullptr;
   }
 
   bool isTypeExpressionOpaque() const {
@@ -1961,8 +2010,8 @@ public:
     return Flags.hasGeneralizationSignature();
   }
 
-  RuntimeGenericSignature getGeneralizationSignature() const {
-    if (!hasGeneralizationSignature()) return RuntimeGenericSignature();
+  RuntimeGenericSignature<Runtime> getGeneralizationSignature() const {
+    if (!hasGeneralizationSignature()) return RuntimeGenericSignature<Runtime>();
     return {*getGenSigHeader(), getGenSigParams(), getGenSigRequirements()};
   }
 
@@ -1974,7 +2023,7 @@ public:
   const GenericParamDescriptor *getGenSigParams() const {
     assert(hasGeneralizationSignature());
     if (Flags.hasImplicitGenSigParams())
-      return ImplicitGenericParamDescriptors;
+      return swift::targetImplicitGenericParamDescriptors<Runtime>();
     auto base = this->template getTrailingObjects<GenericParamDescriptor>();
     if (!Flags.hasImplicitReqSigParams())
       base += getNumReqSigParams();
@@ -2086,6 +2135,8 @@ struct TargetExtendedExistentialTypeMetadata
     swift::ABI::TrailingObjects<
       TargetExtendedExistentialTypeMetadata<Runtime>,
       ConstTargetPointer<Runtime, void>> {
+  using StoredSize = typename Runtime::StoredSize;
+
 private:
   using TrailingObjects =
     swift::ABI::TrailingObjects<
@@ -2097,8 +2148,11 @@ private:
   using OverloadToken = typename TrailingObjects::template OverloadToken<T>;
 
   size_t numTrailingObjects(OverloadToken<ConstTargetPointer<Runtime, void>>) const {
-    return Shape->getGenSigLayoutSizeInWords();
+    return Shape->getGenSigArgumentLayoutSizeInWords();
   }
+
+public:
+  static constexpr StoredSize OffsetToArguments = sizeof(TargetMetadata<Runtime>);
 
 public:
   explicit constexpr
@@ -2112,6 +2166,11 @@ public:
 
   ConstTargetPointer<Runtime, void> const *getGeneralizationArguments() const {
     return this->template getTrailingObjects<ConstTargetPointer<Runtime, void>>();
+  }
+
+public:
+  static bool classof(const TargetMetadata<Runtime> *metadata) {
+    return metadata->getKind() == MetadataKind::ExtendedExistential;
   }
 };
 using ExtendedExistentialTypeMetadata
@@ -2823,6 +2882,9 @@ public:
 };
 using AnonymousContextDescriptor = TargetAnonymousContextDescriptor<InProcess>;
 
+template<template <typename Runtime> class ObjCInteropKind, unsigned PointerSize>
+using ExternalAnonymousContextDescriptor = TargetAnonymousContextDescriptor<External<ObjCInteropKind<RuntimeTarget<PointerSize>>>>;
+
 /// A protocol descriptor.
 ///
 /// Protocol descriptors contain information about the contents of a protocol:
@@ -2977,7 +3039,11 @@ public:
     return cd->getKind() == ContextDescriptorKind::OpaqueType;
   }
 };
-  
+
+template <template <typename Runtime> class ObjCInteropKind,
+          unsigned PointerSize>
+using ExternalOpaqueTypeDescriptor = TargetOpaqueTypeDescriptor<
+    External<ObjCInteropKind<RuntimeTarget<PointerSize>>>>;
 using OpaqueTypeDescriptor = TargetOpaqueTypeDescriptor<InProcess>;
 
 /// The instantiation cache for generic metadata.  This must be guaranteed

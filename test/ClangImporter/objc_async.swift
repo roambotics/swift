@@ -1,7 +1,9 @@
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -typecheck -I %S/Inputs/custom-modules %s -verify -verify-additional-file %swift_src_root/test/Inputs/clang-importer-sdk/usr/include/ObjCConcurrency.h -strict-concurrency=targeted -parse-as-library
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -typecheck -I %S/Inputs/custom-modules %s -verify -verify-additional-file %swift_src_root/test/Inputs/clang-importer-sdk/usr/include/ObjCConcurrency.h -strict-concurrency=targeted -parse-as-library -enable-experimental-feature SendableCompletionHandlers
 
 // REQUIRES: objc_interop
 // REQUIRES: concurrency
+// REQUIRES: asserts
+
 import Foundation
 import ObjCConcurrency
 // expected-remark@-1{{add '@preconcurrency' to suppress 'Sendable'-related warnings from module 'ObjCConcurrency'}}
@@ -114,7 +116,7 @@ func testSendable(fn: () -> Void) {
 func testSendableInAsync() async {
   var x = 17
   doSomethingConcurrentlyButUnsafe {
-    x = 42 // expected-error{{mutation of captured var 'x' in concurrently-executing code}}
+    x = 42 // expected-warning{{mutation of captured var 'x' in concurrently-executing code}}
   }
   print(x)
 }
@@ -373,4 +375,25 @@ func testSender(
 
   sender.sendPtr(ptr)
   sender.sendStringArray(stringArray)
+}
+
+// Sendable checking
+public struct SomeWrapper<T: AuditedNonSendable> {
+  public let unit: T
+}
+
+extension SomeWrapper: Sendable where T: Sendable {}
+
+
+// rdar://96830159
+@MainActor class SendableCompletionHandler {
+  var isolatedThing: [String] = []
+  // expected-note@-1 {{property declared here}}
+
+  func makeCall(slowServer: SlowServer) {
+    slowServer.doSomethingSlow("churn butter") { (_ : Int) in
+      let _ = self.isolatedThing
+      // expected-warning@-1 {{main actor-isolated property 'isolatedThing' can not be referenced from a Sendable closure; this is an error in Swift 6}}
+    }
+  }
 }

@@ -1,8 +1,16 @@
-// RUN: %target-typecheck-verify-swift -requirement-machine-protocol-signatures=on -requirement-machine-inferred-signatures=on -disable-availability-checking -enable-parameterized-existential-types
+// RUN: %target-typecheck-verify-swift -disable-availability-checking
 
-protocol Sequence<Element> {
+protocol Sequence<Element> { // expected-note {{'Sequence' declared here}}
   associatedtype Element
 }
+
+// 'any' is required here
+
+func takesSequenceOfInt1(_: Sequence<Int>) {}
+// expected-error@-1 {{use of protocol 'Sequence' as a type must be written 'any Sequence'}}
+
+func returnsSequenceOfInt1() -> Sequence<Int> {}
+// expected-error@-1 {{use of protocol 'Sequence' as a type must be written 'any Sequence'}}
 
 struct ConcreteSequence<Element> : Sequence {}
 
@@ -37,6 +45,8 @@ struct Collapse<T: DoubleWide>: DoubleWide {
 }
 
 func test() -> any DoubleWide<some DoubleWide<Int, Int>, some DoubleWide<Int, Int>> { return Collapse<Int>(x: 42) }
+// expected-error@-1 {{'some' types cannot be used in constraints on existential types}}
+// expected-error@-2 {{'some' types cannot be used in constraints on existential types}}
 
 func diagonalizeAny(_ x: any Sequence<Int>) -> any Sequence<(Int, Int)> {
   return x.map { ($0, $0) }
@@ -63,10 +73,22 @@ func saturation(_ dry: any Sponge, _ wet: any Sponge<Int, Int>) {
   // expected-note@-1 {{did you mean to use 'as!' to force downcast?}}
 }
 
-protocol Pair<X, Y> where Self.X == Self.Y {
-  associatedtype X
-  associatedtype Y
+func typeExpr() {
+  _ = Sequence<Int>.self
+  // expected-error@-1 {{use of protocol 'Sequence' as a type must be written 'any Sequence'}}
+
+  _ = any Sequence<Int>.self
+  // expected-error@-1 {{'self' is not a member type of protocol 'parameterized_existential.Sequence<Swift.Int>'}}
+
+  _ = (any Sequence<Int>).self
 }
 
-func splay(_ x: some Pair<Int, String>) -> (Int, String) { fatalError() }
-// expected-error@-1 {{no type for 'some Pair<Int, String>.X' can satisfy both 'some Pair<Int, String>.X == String' and 'some Pair<Int, String>.X == Int'}}
+/// Not supported as a protocol composition term for now
+
+protocol SomeProto {}
+
+func protocolCompositionNotSupported1(_: SomeProto & Sequence<Int>) {}
+// expected-error@-1 {{non-protocol, non-class type 'Sequence<Int>' cannot be used within a protocol-constrained type}}
+
+func protocolCompositionNotSupported2(_: any SomeProto & Sequence<Int>) {}
+// expected-error@-1 {{non-protocol, non-class type 'Sequence<Int>' cannot be used within a protocol-constrained type}}

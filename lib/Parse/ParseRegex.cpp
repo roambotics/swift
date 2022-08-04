@@ -14,8 +14,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/AST/BridgingUtils.h"
-#include "swift/AST/DiagnosticsParse.h"
 #include "swift/Basic/BridgingUtils.h"
 #include "swift/Parse/ParsedSyntaxRecorder.h"
 #include "swift/Parse/Parser.h"
@@ -43,7 +41,7 @@ ParserResult<Expr> Parser::parseExprRegexLiteral() {
 
   // Let the Swift library parse the contents, returning an error, or null if
   // successful.
-  unsigned version;
+  unsigned version = 0;
   auto capturesBuf = Context.AllocateUninitialized<uint8_t>(
       RegexLiteralExpr::getCaptureStructureSerializationAllocationSize(
           regexText.size()));
@@ -51,12 +49,14 @@ ParserResult<Expr> Parser::parseExprRegexLiteral() {
       regexLiteralParsingFn(regexText.str().c_str(), &version,
                             /*captureStructureOut*/ capturesBuf.data(),
                             /*captureStructureSize*/ capturesBuf.size(),
-                            /*diagBaseLoc*/ getBridgedSourceLoc(Tok.getLoc()),
-                            getBridgedDiagnosticEngine(&Diags));
+                            /*diagBaseLoc*/ Tok.getLoc(), Diags);
   auto loc = consumeToken();
+  SourceMgr.recordRegexLiteralStartLoc(loc);
+
   if (hadError) {
     return makeParserResult(new (Context) ErrorExpr(loc));
   }
+  assert(version >= 1);
   return makeParserResult(RegexLiteralExpr::createParsed(
       Context, loc, regexText, version, capturesBuf));
 }

@@ -156,6 +156,12 @@ void PropertyMap::concretizeNestedTypesFromConcreteParent(
     auto conformance = module->lookupConformance(concreteType,
                                                  const_cast<ProtocolDecl *>(proto),
                                                  allowMissing);
+    if (!allowMissing &&
+        proto->isSpecificProtocol(KnownProtocolKind::Sendable) &&
+        conformance.hasUnavailableConformance()) {
+      conformance = ProtocolConformanceRef::forInvalid();
+    }
+
     if (conformance.isInvalid()) {
       // For superclass rules, it is totally fine to have a signature like:
       //

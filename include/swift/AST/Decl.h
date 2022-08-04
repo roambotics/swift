@@ -35,7 +35,6 @@
 #include "swift/AST/TypeAlignments.h"
 #include "swift/AST/TypeWalker.h"
 #include "swift/AST/Types.h"
-#include "swift/AST/Witness.h"
 #include "swift/Basic/ArrayRefView.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Basic/Debug.h"
@@ -105,6 +104,7 @@ namespace swift {
   class ValueDecl;
   class VarDecl;
   class OpaqueReturnTypeRepr;
+  class Witness;
 
   namespace ast_scope {
   class AbstractPatternEntryScope;
@@ -412,7 +412,7 @@ protected:
   SWIFT_INLINE_BITFIELD(SubscriptDecl, VarDecl, 2,
     StaticSpelling : 2
   );
-  SWIFT_INLINE_BITFIELD(AbstractFunctionDecl, ValueDecl, 3+2+8+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(AbstractFunctionDecl, ValueDecl, 3+2+8+1+1+1+1+1+1+1,
     /// \see AbstractFunctionDecl::BodyKind
     BodyKind : 3,
 
@@ -439,7 +439,11 @@ protected:
 
     /// Whether peeking into this function detected nested type declarations.
     /// This is set when skipping over the decl at parsing.
-    HasNestedTypeDeclarations : 1
+    HasNestedTypeDeclarations : 1,
+
+    /// Whether this function is a distributed thunk for a distributed
+    /// function or computed property.
+    DistributedThunk: 1
   );
 
   SWIFT_INLINE_BITFIELD(FuncDecl, AbstractFunctionDecl, 1+1+2+1+1+2+1,
@@ -2258,12 +2262,19 @@ class ValueDecl : public Decl {
     /// Whether this declaration produces an implicitly unwrapped
     /// optional result.
     unsigned isIUO : 1;
+
+    /// Whether the "isMoveOnly" bit has been computed yet.
+    unsigned isMoveOnlyComputed : 1;
+
+    /// Whether this declaration can not be copied and thus is move only.
+    unsigned isMoveOnly : 1;
   } LazySemanticInfo = { };
 
   friend class DynamicallyReplacedDeclRequest;
   friend class OverriddenDeclsRequest;
   friend class IsObjCRequest;
   friend class IsFinalRequest;
+  friend class IsMoveOnlyRequest;
   friend class IsDynamicRequest;
   friend class IsImplicitlyUnwrappedOptionalRequest;
   friend class InterfaceTypeRequest;
@@ -2537,6 +2548,9 @@ public:
 
   /// Is this declaration 'final'?
   bool isFinal() const;
+
+  /// Is this declaration 'moveOnly'?
+  bool isMoveOnly() const;
 
   /// Is this declaration marked with 'dynamic'?
   bool isDynamic() const;
@@ -2948,9 +2962,12 @@ public:
     return false;
   }
 
+  using AvailabilityCondition = std::pair<VersionRange, bool>;
+
   class ConditionallyAvailableSubstitutions final
-      : private llvm::TrailingObjects<ConditionallyAvailableSubstitutions,
-                                      VersionRange> {
+      : private llvm::TrailingObjects<
+            ConditionallyAvailableSubstitutions,
+            AvailabilityCondition> {
     friend TrailingObjects;
 
     unsigned NumAvailabilityConditions;
@@ -2960,25 +2977,25 @@ public:
     /// A type with limited availability described by the provided set
     /// of availability conditions (with `and` relationship).
     ConditionallyAvailableSubstitutions(
-        ArrayRef<VersionRange> availabilityContext,
+        ArrayRef<AvailabilityCondition> availabilityContext,
         SubstitutionMap substitutions)
         : NumAvailabilityConditions(availabilityContext.size()),
           Substitutions(substitutions) {
       assert(!availabilityContext.empty());
       std::uninitialized_copy(availabilityContext.begin(),
                               availabilityContext.end(),
-                              getTrailingObjects<VersionRange>());
+                              getTrailingObjects<AvailabilityCondition>());
     }
 
   public:
-    ArrayRef<VersionRange> getAvailability() const {
-      return {getTrailingObjects<VersionRange>(), NumAvailabilityConditions};
+    ArrayRef<AvailabilityCondition> getAvailability() const {
+      return {getTrailingObjects<AvailabilityCondition>(), NumAvailabilityConditions};
     }
 
     SubstitutionMap getSubstitutions() const { return Substitutions; }
 
     static ConditionallyAvailableSubstitutions *
-    get(ASTContext &ctx, ArrayRef<VersionRange> availabilityContext,
+    get(ASTContext &ctx, ArrayRef<AvailabilityCondition> availabilityContext,
         SubstitutionMap substitutions);
   };
 };
@@ -3644,7 +3661,7 @@ public:
   bool isActor() const;
 
   /// Whether this nominal type qualifies as a distributed actor, meaning that
-  /// it is either a distributed actor.
+  /// it is either a distributed actor or a DistributedActor constrained protocol.
   bool isDistributedActor() const;
 
   /// Whether this nominal type qualifies as any actor (plain or distributed).
@@ -4224,15 +4241,7 @@ public:
 
   /// Whether the class uses the ObjC object model (reference counting,
   /// allocation, etc.), the Swift model, or has no reference counting at all.
-  ReferenceCounting getObjectModel() const {
-    if (isForeignReferenceType())
-      return ReferenceCounting::None;
-
-    if (checkAncestry(AncestryFlags::ObjCObjectModel))
-      return ReferenceCounting::ObjC;
-
-    return ReferenceCounting::Native;
-  }
+  ReferenceCounting getObjectModel() const;
 
   LayoutConstraintKind getLayoutConstraintKind() const {
     if (getObjectModel() == ReferenceCounting::ObjC)
@@ -4346,6 +4355,8 @@ public:
   /// non-reference-counted swift reference type that was imported from a C++
   /// record.
   bool isForeignReferenceType() const;
+
+  bool hasRefCountingAnnotations() const;
 };
 
 /// The set of known protocols for which derived conformances are supported.
@@ -5119,6 +5130,13 @@ public:
 
   bool hasAnyNativeDynamicAccessors() const;
 
+  /// Does this have a 'distributed' modifier?
+  bool isDistributed() const;
+
+  /// Return a distributed thunk if this computed property is marked as
+  /// 'distributed' and and nullptr otherwise.
+  FuncDecl *getDistributedThunk() const;
+
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) {
     return D->getKind() >= DeclKind::First_AbstractStorageDecl &&
@@ -5351,9 +5369,6 @@ public:
 
   /// Is this an "async let" property?
   bool isAsyncLet() const;
-
-  /// Does this have a 'distributed' modifier?
-  bool isDistributed() const;
 
   /// Is this var known to be a "local" distributed actor,
   /// if so the implicit throwing ans some isolation checks can be skipped.
@@ -5742,6 +5757,10 @@ public:
   }
   void setDefaultArgumentKind(DefaultArgumentKind K) {
     Bits.ParamDecl.defaultArgumentKind = static_cast<unsigned>(K);
+  }
+
+  void setDefaultArgumentKind(ArgumentAttrs K) {
+    setDefaultArgumentKind(K.argumentKind);
   }
 
   bool isNoImplicitCopy() const {
@@ -6266,7 +6285,8 @@ private:
 
 public:
   /// Get all derivative function configurations.
-  ArrayRef<AutoDiffConfig> getDerivativeFunctionConfigurations();
+  ArrayRef<AutoDiffConfig>
+  getDerivativeFunctionConfigurations();
 
   /// Add the given derivative function configuration.
   void addDerivativeFunctionConfiguration(const AutoDiffConfig &config);
@@ -6324,6 +6344,7 @@ protected:
     Bits.AbstractFunctionDecl.Throws = Throws;
     Bits.AbstractFunctionDecl.HasSingleExpressionBody = false;
     Bits.AbstractFunctionDecl.HasNestedTypeDeclarations = false;
+    Bits.AbstractFunctionDecl.DistributedThunk = false;
   }
 
   void setBodyKind(BodyKind K) {
@@ -6421,6 +6442,16 @@ public:
 
   /// Returns 'true' if the function is distributed.
   bool isDistributed() const;
+
+  /// Is this a thunk function used to access a distributed method
+  /// or computed property outside of its actor isolation context?
+  bool isDistributedThunk() const {
+    return Bits.AbstractFunctionDecl.DistributedThunk;
+  }
+
+  void setDistributedThunk(bool isThunk) {
+    Bits.AbstractFunctionDecl.DistributedThunk = isThunk;
+  }
 
   /// For a 'distributed' target (func or computed property),
   /// get the 'thunk' responsible for performing the 'remoteCall'.
@@ -6750,7 +6781,7 @@ public:
   bool hasDynamicSelfResult() const;
 
   /// The async function marked as the alternative to this function, if any.
-  AbstractFunctionDecl *getAsyncAlternative() const;
+  AbstractFunctionDecl *getAsyncAlternative(bool isKnownObjC = false) const;
 
   /// If \p asyncAlternative is set, then compare its parameters to this
   /// (presumed synchronous) function's parameters to find the index of the

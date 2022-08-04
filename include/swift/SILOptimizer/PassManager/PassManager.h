@@ -13,12 +13,14 @@
 #include "swift/SIL/Notifications.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/BasicBlockBits.h"
+#include "swift/SIL/NodeBits.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
 #include "swift/SILOptimizer/PassManager/PassPipeline.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/Chrono.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <vector>
 
@@ -65,8 +67,12 @@ class SwiftPassInvocation {
   static constexpr int BlockSetCapacity = 8;
   char blockSetStorage[sizeof(BasicBlockSet) * BlockSetCapacity];
   bool aliveBlockSets[BlockSetCapacity];
-
   int numBlockSetsAllocated = 0;
+
+  static constexpr int NodeSetCapacity = 8;
+  char nodeSetStorage[sizeof(NodeSet) * NodeSetCapacity];
+  bool aliveNodeSets[NodeSetCapacity];
+  int numNodeSetsAllocated = 0;
 
   void endPassRunChecks();
 
@@ -91,6 +97,10 @@ public:
   BasicBlockSet *allocBlockSet();
 
   void freeBlockSet(BasicBlockSet *set);
+
+  NodeSet *allocNodeSet();
+
+  void freeNodeSet(NodeSet *set);
 
   /// The top-level API to erase an instruction, called from the Swift pass.
   void eraseInstruction(SILInstruction *inst);
@@ -193,6 +203,8 @@ class SILPassManager {
   /// bare pointer to ensure that we can deregister the notification after this
   /// pass manager is destroyed.
   DeserializationNotificationHandler *deserializationNotificationHandler;
+
+  std::chrono::nanoseconds totalPassRuntime = std::chrono::nanoseconds(0);
 
   /// C'tor. It creates and registers all analysis passes, which are defined
   /// in Analysis.def. This is private as it should only be used by

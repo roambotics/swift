@@ -24,6 +24,7 @@
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILDebugScope.h"
+#include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILVisitor.h"
 
 namespace swift {
@@ -1770,6 +1771,38 @@ void SILCloner<ImplClass>::visitMarkMustCheckInst(MarkMustCheckInst *Inst) {
 }
 
 template <typename ImplClass>
+void SILCloner<ImplClass>::visitMoveOnlyWrapperToCopyableValueInst(
+    MoveOnlyWrapperToCopyableValueInst *inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(inst->getDebugScope()));
+  MoveOnlyWrapperToCopyableValueInst *cvt;
+  if (inst->getOwnershipKind() == OwnershipKind::Owned) {
+    cvt = getBuilder().createOwnedMoveOnlyWrapperToCopyableValue(
+        getOpLocation(inst->getLoc()), getOpValue(inst->getOperand()));
+  } else {
+    assert(inst->getOwnershipKind() == OwnershipKind::Guaranteed);
+    cvt = getBuilder().createGuaranteedMoveOnlyWrapperToCopyableValue(
+        getOpLocation(inst->getLoc()), getOpValue(inst->getOperand()));
+  }
+  recordClonedInstruction(inst, cvt);
+}
+
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitCopyableToMoveOnlyWrapperValueInst(
+    CopyableToMoveOnlyWrapperValueInst *inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(inst->getDebugScope()));
+  CopyableToMoveOnlyWrapperValueInst *cvt;
+  if (inst->getOwnershipKind() == OwnershipKind::Owned) {
+    cvt = getBuilder().createOwnedCopyableToMoveOnlyWrapperValue(
+        getOpLocation(inst->getLoc()), getOpValue(inst->getOperand()));
+  } else {
+    assert(inst->getOwnershipKind() == OwnershipKind::Guaranteed);
+    cvt = getBuilder().createGuaranteedCopyableToMoveOnlyWrapperValue(
+        getOpLocation(inst->getLoc()), getOpValue(inst->getOperand()));
+  }
+  recordClonedInstruction(inst, cvt);
+}
+
+template <typename ImplClass>
 void SILCloner<ImplClass>::visitReleaseValueInst(ReleaseValueInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(
@@ -2423,8 +2456,8 @@ void SILCloner<ImplClass>::visitUncheckedOwnershipConversionInst(
     return recordFoldedValue(Inst, getOpValue(Inst->getOperand()));
   }
 
-  ValueOwnershipKind Kind = SILValue(Inst).getOwnershipKind();
-  if (getOpValue(Inst->getOperand()).getOwnershipKind() ==
+  ValueOwnershipKind Kind = SILValue(Inst)->getOwnershipKind();
+  if (getOpValue(Inst->getOperand())->getOwnershipKind() ==
       OwnershipKind::None) {
     Kind = OwnershipKind::None;
   }

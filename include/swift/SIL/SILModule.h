@@ -38,7 +38,6 @@
 #include "swift/SIL/SILVTable.h"
 #include "swift/SIL/SILWitnessTable.h"
 #include "swift/SIL/TypeLowering.h"
-#include "swift/TBDGen/TBDGen.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/MapVector.h"
@@ -104,6 +103,7 @@ class AnyFunctionType;
 class ASTContext;
 class FileUnit;
 class FuncDecl;
+class IRGenOptions;
 class KeyPathPattern;
 class ModuleDecl;
 class SILUndef;
@@ -304,6 +304,9 @@ private:
   /// This is the set of undef values we've created, for uniquing purposes.
   llvm::DenseMap<SILType, SILUndef *> UndefValues;
 
+  llvm::DenseMap<std::pair<Decl *, VarDecl *>, unsigned> fieldIndices;
+  llvm::DenseMap<EnumElementDecl *, unsigned> enumCaseIndices;
+
   /// The stage of processing this module is at.
   SILStage Stage;
 
@@ -351,6 +354,12 @@ private:
   /// The options passed into this SILModule.
   const SILOptions &Options;
 
+  /// IRGen options to be used by target specific SIL optimization passes.
+  ///
+  /// Not null, if the module is created by the compiler itself (and not
+  /// e.g. by lldb).
+  const IRGenOptions *irgenOptions;
+
   /// The number of functions created in this module, which will be the index of
   /// the next function.
   unsigned nextFunctionIndex = 0;
@@ -380,17 +389,14 @@ private:
 #endif
 
   SILModule(llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
-            Lowering::TypeConverter &TC, const SILOptions &Options);
+            Lowering::TypeConverter &TC, const SILOptions &Options,
+            const IRGenOptions *irgenOptions = nullptr);
 
   SILModule(const SILModule&) = delete;
   void operator=(const SILModule&) = delete;
 
   /// Folding set for key path patterns.
   llvm::FoldingSet<KeyPathPattern> KeyPathPatterns;
-  
-  /// Symbols (e.g. function names) which are made public by the
-  /// CrossModuleOptimization pass and therefore must be included in the TBD file.
-  TBDSymbolSetPtr publicCMOSymbols;
 
 public:
   ~SILModule();
@@ -452,6 +458,19 @@ public:
   ///
   /// This should only be the case during parsing or deserialization.
   bool hasUnresolvedOpenedArchetypeDefinitions();
+
+  /// Get a unique index for a struct or class field in layout order.
+  ///
+  /// Precondition: \p decl must be a non-resilient struct or class.
+  ///
+  /// Precondition: \p field must be a stored property declared in \p decl,
+  ///               not in a superclass.
+  ///
+  /// Postcondition: The returned index is unique across all properties in the
+  ///                object, including properties declared in a superclass.
+  unsigned getFieldIndex(NominalTypeDecl *decl, VarDecl *property);
+
+  unsigned getCaseIndex(EnumElementDecl *enumElement);
 
   /// Called by SILBuilder whenever a new instruction is created and inserted.
   void notifyAddedInstruction(SILInstruction *inst);
@@ -526,7 +545,8 @@ public:
   /// single-file mode, and a ModuleDecl in whole-module mode.
   static std::unique_ptr<SILModule>
   createEmptyModule(llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
-                    Lowering::TypeConverter &TC, const SILOptions &Options);
+                    Lowering::TypeConverter &TC, const SILOptions &Options,
+                    const IRGenOptions *irgenOptions = nullptr);
 
   /// Get the Swift module associated with this SIL module.
   ModuleDecl *getSwiftModule() const { return TheSwiftModule; }
@@ -559,12 +579,12 @@ public:
   bool isOptimizedOnoneSupportModule() const;
 
   const SILOptions &getOptions() const { return Options; }
-
-  /// Return the symbols (e.g. function names) which are made public by the
-  /// CrossModuleOptimization pass and therefore must be included in the TBD file.
-  TBDSymbolSetPtr getPublicCMOSymbols() { return publicCMOSymbols; }
-
-  void addPublicCMOSymbol(StringRef symbol);
+  const IRGenOptions *getIRGenOptionsOrNull() const {
+    // We don't want to serialize target specific SIL.
+    assert(isSerialized() &&
+           "Target specific options must not be used before serialization");
+    return irgenOptions;
+  }
 
   using iterator = FunctionListType::iterator;
   using const_iterator = FunctionListType::const_iterator;

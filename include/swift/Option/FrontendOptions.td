@@ -192,6 +192,10 @@ def explicit_swift_module_map
   : Separate<["-"], "explicit-swift-module-map-file">, MetaVarName<"<path>">,
     HelpText<"Specify a JSON file containing information of explicit Swift modules">;
 
+def const_gather_protocols_file
+  : Separate<["-"], "const-gather-protocols-file">, MetaVarName<"<path>">,
+    HelpText<"Specify a list of protocols for extraction of conformances' const values'">;
+
 def placeholder_dependency_module_map
   : Separate<["-"], "placeholder-dependency-module-map-file">, MetaVarName<"<path>">,
     HelpText<"Specify a JSON file containing information of external Swift module dependencies">;
@@ -313,10 +317,6 @@ def enable_resilience : Flag<["-"], "enable-resilience">,
 def enable_experimental_async_top_level :
   Flag<["-"], "enable-experimental-async-top-level">,
   HelpText<"Enable experimental concurrency in top-level code">;
-
-def enable_experimental_bound_generic_extensions :
-  Flag<["-"], "enable-experimental-bound-generic-extensions">,
-  HelpText<"Enable experimental support for extensions of bound generic types">;
 }
 
 // HIDDEN FLAGS
@@ -378,8 +378,17 @@ def disable_requirement_machine_reuse : Flag<["-"], "disable-requirement-machine
 def enable_requirement_machine_opaque_archetypes : Flag<["-"], "enable-requirement-machine-opaque-archetypes">,
   HelpText<"Enable more correct opaque archetype support, which is off by default because it might fail to produce a convergent rewrite system">;
 
+def warn_redundant_requirements : Flag<["-"], "warn-redundant-requirements">,
+  HelpText<"Emit warnings for redundant requirements in generic signatures">;
+
 def dump_type_witness_systems : Flag<["-"], "dump-type-witness-systems">,
   HelpText<"Enables dumping type witness systems from associated type inference">;
+
+def enable_round_trip_debug_types : Flag<["-"], "enable-round-trip-debug-types">,
+  HelpText<"Enables verification of debug info mangling">;
+
+def disable_round_trip_debug_types : Flag<["-"], "disable-round-trip-debug-types">,
+  HelpText<"Disables verification of debug info mangling">;
 
 def debug_generic_signatures : Flag<["-"], "debug-generic-signatures">,
   HelpText<"Debug generic signatures">;
@@ -492,6 +501,10 @@ def function_sections: Flag<["-"], "function-sections">,
   Flags<[FrontendOption, NoInteractiveOption]>,
   HelpText<"Emit functions to separate sections.">;
 
+def enable_single_module_llvm_emission: Flag<["-"], "enable-single-module-llvm-emission">,
+  Flags<[FrontendOption, NoInteractiveOption]>,
+  HelpText<"Emit LLVM IR into a single LLVM module in multithreaded mode.">;
+
 def stack_promotion_checks : Flag<["-"], "emit-stack-promotion-checks">,
   HelpText<"Emit runtime checks for correct stack promotion of objects.">;
 
@@ -535,10 +548,6 @@ def enable_experimental_named_opaque_types :
 def enable_explicit_existential_types :
   Flag<["-"], "enable-explicit-existential-types">,
   HelpText<"Enable experimental support for explicit existential types">;
-
-def enable_parameterized_existential_types :
-  Flag<["-"], "enable-parameterized-existential-types">,
-  HelpText<"Enable experimental support for parameterized existential types">;
 
 def enable_experimental_opened_existential_types :
   Flag<["-"], "enable-experimental-opened-existential-types">,
@@ -605,6 +614,10 @@ def disable_swift3_objc_inference :
 def enable_implicit_dynamic : Flag<["-"], "enable-implicit-dynamic">,
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
   HelpText<"Add 'dynamic' to all declarations">;
+  
+def enable_experimental_opaque_type_erasure : Flag<["-"], "enable-experimental-opaque-type-erasure">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Type-erases opaque types that conform to @_typeEraser protocols">;
 
 def enable_llvm_vfe : Flag<["-"], "enable-llvm-vfe">,
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
@@ -627,6 +640,10 @@ def conditional_runtime_records : Flag<["-"], "conditional-runtime-records">,
 def disable_preallocated_instantiation_caches : Flag<["-"], "disable-preallocated-instantiation-caches">,
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
   HelpText<"Avoid preallocating metadata instantiation caches in globals">;
+
+def disable_readonly_static_objects : Flag<["-"], "disable-readonly-static-objects">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Avoid allocating static objects in a read-only data section">;
 
 def trap_function
   : Separate<["-"], "trap-function">, MetaVarName<"<name>">,
@@ -822,16 +839,6 @@ def emit_sorted_sil : Flag<["-"], "emit-sorted-sil">,
 def emit_syntax : Flag<["-"], "emit-syntax">,
   HelpText<"Parse input file(s) and emit the Syntax tree(s) as JSON">, ModeOpt;
 
-def enable_experimental_cxx_interop :
-  Flag<["-"], "enable-experimental-cxx-interop">,
-  HelpText<"Enable C++ interop code generation and config directives">,
-  Flags<[FrontendOption, HelpHidden]>;
-
-def enable_cxx_interop :
-  Flag<["-"], "enable-cxx-interop">,
-  HelpText<"Alias for -enable-experimental-cxx-interop">,
-  Flags<[FrontendOption, HelpHidden]>;
-
 def cxx_interop_getters_setters_as_properties :
   Flag<["-"], "cxx-interop-getters-setters-as-properties">,
   HelpText<"Import getters and setters as computed properties in Swift">,
@@ -869,6 +876,10 @@ def compile_module_from_interface :
   Flag<["-"], "compile-module-from-interface">,
   HelpText<"Treat the (single) input as a swiftinterface and produce a module">,
   ModeOpt;
+
+def ignore_interface_provided_options :
+  Flag<["-"], "ignore-interface-provided-options">,
+  HelpText<"Ignore all module flags specified in the swiftinterface being built">;
 
 def build_module_from_parseable_interface :
   Flag<["-"], "build-module-from-parseable-interface">,
@@ -1057,5 +1068,41 @@ def clang_header_expose_public_decls:
   Flag<["-"], "clang-header-expose-public-decls">,
   HelpText<"Expose all public declarations in the generated clang header">,
   Flags<[FrontendOption, HelpHidden]>;
+  
+def weak_link_at_target :
+  Flag<["-"], "weak-link-at-target">,
+  HelpText<"Weakly link symbols for declarations that were introduced at the "
+           "deployment target. Symbols introduced before the deployment "
+           "target are still strongly linked.">;
 
+def concurrency_model :
+    Separate<["-"], "concurrency-model">,
+    HelpText<"Which concurrency model is used.  Defaults to standard.">,
+    MetaVarName<"standard|task-to-thread">;
+def concurrency_model_EQ :
+    Joined<["-"], "concurrency-model=">,
+    Alias<concurrency_model>;
+
+def enable_stack_protector :
+  Flag<["-"], "enable-stack-protector">,
+  HelpText<"Enable the stack protector">;
+def disable_stack_protector :
+  Flag<["-"], "disable-stack-protector">,
+  HelpText<"Disable the stack-protector">;
+
+def enable_new_llvm_pass_manager :
+  Flag<["-"], "enable-new-llvm-pass-manager">,
+  HelpText<"Enable the new llvm pass manager">;
+def disable_new_llvm_pass_manager :
+  Flag<["-"], "disable-new-llvm-pass-manager">,
+  HelpText<"Disable the new llvm pass manager">;
+
+def disable_emit_generic_class_ro_t_list :
+  Flag<["-"], "disable-emit-generic-class-ro_t-list">,
+  HelpText<"Disable emission of a section with references to class_ro_t of "
+           "generic class patterns">;
+def enable_emit_generic_class_ro_t_list :
+  Flag<["-"], "enable-emit-generic-class-ro_t-list">,
+  HelpText<"Enable emission of a section with references to class_ro_t of "
+           "generic class patterns">;
 } // end let Flags = [FrontendOption, NoDriverOption, HelpHidden]

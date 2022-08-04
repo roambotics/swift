@@ -1178,7 +1178,7 @@ static void lookupVisibleDeclsImpl(VisibleDeclConsumer &Consumer,
                                    const DeclContext *DC,
                                    bool IncludeTopLevel, SourceLoc Loc) {
   const SourceManager &SM = DC->getASTContext().SourceMgr;
-  auto Reason = DeclVisibilityKind::MemberOfCurrentNominal;
+  auto MemberReason = DeclVisibilityKind::MemberOfCurrentNominal;
 
   // If we are inside of a method, check to see if there are any ivars in scope,
   // and if so, whether this is a reference to one of them.
@@ -1194,7 +1194,7 @@ static void lookupVisibleDeclsImpl(VisibleDeclConsumer &Consumer,
       if (!isa<PatternBindingInitializer>(DC) ||
           !cast<PatternBindingInitializer>(DC)->getInitializedLazyVar())
         LS = LS.withOnMetatype();
-      DC = DC->getParent();
+      DC = DC->getParentForLookup();
     }
 
     // We don't look for generic parameters if we are in the context of a
@@ -1210,7 +1210,7 @@ static void lookupVisibleDeclsImpl(VisibleDeclConsumer &Consumer,
 
     if (auto *SE = dyn_cast<SubscriptDecl>(DC)) {
       ExtendedType = SE->getDeclContext()->getSelfTypeInContext();
-      DC = DC->getParent();
+      DC = DC->getParentForLookup();
       if (SE->isStatic())
         LS = LS.withOnMetatype();
     } else if (auto *AFD = dyn_cast<AbstractFunctionDecl>(DC)) {
@@ -1238,7 +1238,7 @@ static void lookupVisibleDeclsImpl(VisibleDeclConsumer &Consumer,
 
       if (AFD->getDeclContext()->isTypeContext()) {
         ExtendedType = AFD->getDeclContext()->getSelfTypeInContext();
-        DC = DC->getParent();
+        DC = DC->getParentForLookup();
 
         if (auto *FD = dyn_cast<FuncDecl>(AFD))
           if (FD->isStatic())
@@ -1280,12 +1280,15 @@ static void lookupVisibleDeclsImpl(VisibleDeclConsumer &Consumer,
       dcGenericParams = dcGenericParams->getOuterParameters();
     }
 
-    if (ExtendedType)
-      ::lookupVisibleMemberDecls(ExtendedType, Consumer, DC, LS, Reason,
+    if (ExtendedType) {
+      ::lookupVisibleMemberDecls(ExtendedType, Consumer, DC, LS, MemberReason,
                                  nullptr);
 
-    DC = DC->getParent();
-    Reason = DeclVisibilityKind::MemberOfOutsideNominal;
+      // Going outside the current type context.
+      MemberReason = DeclVisibilityKind::MemberOfOutsideNominal;
+    }
+
+    DC = DC->getParentForLookup();
   }
 
   if (auto SF = dyn_cast<SourceFile>(DC)) {

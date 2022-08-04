@@ -17,10 +17,6 @@
 
 SWIFT_BEGIN_NULLABILITY_ANNOTATIONS
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 typedef struct {
   BridgedFunction function;
   BridgedPassContext passContext;
@@ -62,6 +58,10 @@ typedef struct {
 } BridgedBasicBlockSet;
 
 typedef struct {
+  void * _Nullable nds;
+} BridgedNodeSet;
+
+typedef struct {
   void * _Nullable data;
 } BridgedSlab;
 
@@ -80,10 +80,10 @@ typedef struct {
 typedef void (* _Nonnull BridgedFunctionPassRunFn)(BridgedFunctionPassCtxt);
 typedef void (* _Nonnull BridgedInstructionPassRunFn)(BridgedInstructionPassCtxt);
 
-void SILPassManager_registerFunctionPass(BridgedStringRef name,
+void SILPassManager_registerFunctionPass(llvm::StringRef name,
                                          BridgedFunctionPassRunFn runFn);
 
-void SILCombine_registerInstructionPass(BridgedStringRef name,
+void SILCombine_registerInstructionPass(llvm::StringRef name,
                                         BridgedInstructionPassRunFn runFn);
 
 BridgedAliasAnalysis PassContext_getAliasAnalysis(BridgedPassContext context);
@@ -139,15 +139,25 @@ void BasicBlockSet_insert(BridgedBasicBlockSet set, BridgedBasicBlock block);
 void BasicBlockSet_erase(BridgedBasicBlockSet set, BridgedBasicBlock block);
 BridgedFunction BasicBlockSet_getFunction(BridgedBasicBlockSet set);
 
+BridgedNodeSet PassContext_allocNodeSet(BridgedPassContext context);
+void PassContext_freeNodeSet(BridgedPassContext context,
+                             BridgedNodeSet set);
+SwiftInt NodeSet_containsValue(BridgedNodeSet set, BridgedValue value);
+void NodeSet_insertValue(BridgedNodeSet set, BridgedValue value);
+void NodeSet_eraseValue(BridgedNodeSet set, BridgedValue value);
+SwiftInt NodeSet_containsInstruction(BridgedNodeSet set, BridgedInstruction inst);
+void NodeSet_insertInstruction(BridgedNodeSet set, BridgedInstruction inst);
+void NodeSet_eraseInstruction(BridgedNodeSet set, BridgedInstruction inst);
+BridgedFunction NodeSet_getFunction(BridgedNodeSet set);
+
 void AllocRefInstBase_setIsStackAllocatable(BridgedInstruction arb);
 
 BridgedSubstitutionMap
 PassContext_getContextSubstitutionMap(BridgedPassContext context,
                                       BridgedType bridgedType);
 
-#ifdef __cplusplus
-} // extern "C"
-#endif
+OptionalBridgedFunction
+PassContext_loadFunction(BridgedPassContext context, llvm::StringRef name);
 
 SWIFT_END_NULLABILITY_ANNOTATIONS
 

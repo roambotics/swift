@@ -460,6 +460,7 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
   PASS_THROUGH_REFERENCE(OneWay, getSubExpr);
   NO_REFERENCE(Tap);
   NO_REFERENCE(Pack);
+  NO_REFERENCE(TypeJoin);
 
 #undef SIMPLE_REFERENCE
 #undef NO_REFERENCE
@@ -788,6 +789,7 @@ bool Expr::canAppendPostfixExpression(bool appendingPostfixOperator) const {
   case ExprKind::EditorPlaceholder:
   case ExprKind::KeyPathDot:
   case ExprKind::Pack:
+  case ExprKind::TypeJoin:
     return false;
 
   case ExprKind::Tap:
@@ -956,6 +958,7 @@ bool Expr::isValidParentOfTypeExpr(Expr *typeExpr) const {
   case ExprKind::Tap:
   case ExprKind::ReifyPack:
   case ExprKind::Pack:
+  case ExprKind::TypeJoin:
     return false;
   }
 
@@ -1413,7 +1416,7 @@ DictionaryExpr *DictionaryExpr::create(ASTContext &C, SourceLoc LBracketLoc,
                                   Ty);
 }
 
-static ValueDecl *getCalledValue(Expr *E) {
+static ValueDecl *getCalledValue(Expr *E, bool skipFunctionConversions) {
   if (auto *DRE = dyn_cast<DeclRefExpr>(E))
     return DRE->getDecl();
 
@@ -1422,11 +1425,16 @@ static ValueDecl *getCalledValue(Expr *E) {
 
   // Look through SelfApplyExpr.
   if (auto *SAE = dyn_cast<SelfApplyExpr>(E))
-    return SAE->getCalledValue();
+    return SAE->getCalledValue(skipFunctionConversions);
+
+  if (skipFunctionConversions) {
+    if (auto fnConv = dyn_cast<FunctionConversionExpr>(E))
+      return getCalledValue(fnConv->getSubExpr(), skipFunctionConversions);
+  }
 
   Expr *E2 = E->getValueProvidingExpr();
   if (E != E2)
-    return getCalledValue(E2);
+    return getCalledValue(E2, skipFunctionConversions);
 
   return nullptr;
 }
@@ -1468,8 +1476,8 @@ Expr *DefaultArgumentExpr::getCallerSideDefaultExpr() const {
                            new (ctx) ErrorExpr(getSourceRange(), getType()));
 }
 
-ValueDecl *ApplyExpr::getCalledValue() const {
-  return ::getCalledValue(Fn);
+ValueDecl *ApplyExpr::getCalledValue(bool skipFunctionConversions) const {
+  return ::getCalledValue(Fn, skipFunctionConversions);
 }
 
 SubscriptExpr::SubscriptExpr(Expr *base, ArgumentList *argList,
@@ -1906,6 +1914,14 @@ Expr *AutoClosureExpr::getUnwrappedCurryThunkExpr() const {
     return expr;
   };
 
+  auto maybeUnwrapConversions = [](Expr *expr) {
+    if (auto *covariantReturn = dyn_cast<CovariantReturnConversionExpr>(expr))
+      expr = covariantReturn->getSubExpr();
+    if (auto *functionConversion = dyn_cast<FunctionConversionExpr>(expr))
+      expr = functionConversion->getSubExpr();
+    return expr;
+  };
+
   switch (getThunkKind()) {
   case AutoClosureExpr::Kind::None:
   case AutoClosureExpr::Kind::AsyncLet:
@@ -1916,6 +1932,7 @@ Expr *AutoClosureExpr::getUnwrappedCurryThunkExpr() const {
     body = body->getSemanticsProvidingExpr();
     body = maybeUnwrapOpenExistential(body);
     body = maybeUnwrapOptionalEval(body);
+    body = maybeUnwrapConversions(body);
 
     if (auto *outerCall = dyn_cast<ApplyExpr>(body)) {
       return outerCall->getFn();
@@ -1934,9 +1951,11 @@ Expr *AutoClosureExpr::getUnwrappedCurryThunkExpr() const {
       innerBody = innerBody->getSemanticsProvidingExpr();
       innerBody = maybeUnwrapOpenExistential(innerBody);
       innerBody = maybeUnwrapOptionalEval(innerBody);
+      innerBody = maybeUnwrapConversions(innerBody);
 
       if (auto *outerCall = dyn_cast<ApplyExpr>(innerBody)) {
-        if (auto *innerCall = dyn_cast<ApplyExpr>(outerCall->getFn())) {
+        auto outerFn = maybeUnwrapConversions(outerCall->getFn());
+        if (auto *innerCall = dyn_cast<ApplyExpr>(outerFn)) {
           return innerCall->getFn();
         }
       }
@@ -2336,6 +2355,23 @@ PackExpr *PackExpr::create(ASTContext &ctx,
 
 PackExpr *PackExpr::createEmpty(ASTContext &ctx) {
   return create(ctx, {}, PackType::getEmpty(ctx));
+}
+
+TypeJoinExpr::TypeJoinExpr(DeclRefExpr *varRef, ArrayRef<Expr *> elements)
+  : Expr(ExprKind::TypeJoin, /*implicit=*/true, Type()), Var(varRef) {
+  assert(Var);
+
+  Bits.TypeJoinExpr.NumElements = elements.size();
+  // Copy elements.
+  std::uninitialized_copy(elements.begin(), elements.end(),
+                          getTrailingObjects<Expr *>());
+}
+
+TypeJoinExpr *TypeJoinExpr::create(ASTContext &ctx, DeclRefExpr *var,
+                                   ArrayRef<Expr *> elements) {
+  size_t size = totalSizeToAlloc<Expr *>(elements.size());
+  void *mem = ctx.Allocate(size, alignof(TypeJoinExpr));
+  return new (mem) TypeJoinExpr(var, elements);
 }
 
 void swift::simple_display(llvm::raw_ostream &out, const ClosureExpr *CE) {

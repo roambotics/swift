@@ -615,16 +615,20 @@ public:
 
   /// Keep track of cxx function names, params etc in order to
   /// allow for de-duping functions that differ strictly on "constness".
-  llvm::DenseMap<llvm::StringRef,
+  llvm::DenseMap<const clang::DeclContext *, llvm::DenseMap<llvm::StringRef,
                  std::pair<
                      llvm::DenseSet<clang::FunctionDecl *>,
-                     llvm::DenseSet<clang::FunctionDecl *>>>
+                     llvm::DenseSet<clang::FunctionDecl *>>>>
       cxxMethods;
 
   // Cache for already-specialized function templates and any thunks they may
   // have.
   llvm::DenseMap<clang::FunctionDecl *, ValueDecl *>
       specializedFunctionTemplates;
+
+  /// Stores qualified names of C++ template specializations that were too deep
+  /// to import into Swift.
+  llvm::StringSet<> tooDeepTemplateSpecializations;
 
   /// Keeps track of the Clang functions that have been turned into
   /// properties.
@@ -935,7 +939,7 @@ public:
 
   void addImportDiagnostic(
       ImportDiagnosticTarget target, Diagnostic &&diag,
-      const clang::SourceLocation &loc = clang::SourceLocation());
+      clang::SourceLocation loc);
 
   /// Import the given Clang identifier into Swift.
   ///
@@ -1101,48 +1105,6 @@ public:
   DeclContext *importDeclContextOf(const clang::Decl *D,
                                    EffectiveClangContext context);
 
-  /// Create a new named constant with the given value.
-  ///
-  /// \param name The name of the constant.
-  /// \param dc The declaration context into which the name will be introduced.
-  /// \param type The type of the named constant.
-  /// \param value The value of the named constant.
-  /// \param convertKind How to convert the constant to the given type.
-  /// \param isStatic Whether the constant should be a static member of \p dc.
-  ValueDecl *createConstant(Identifier name, DeclContext *dc,
-                            Type type, const clang::APValue &value,
-                            ConstantConvertKind convertKind,
-                            bool isStatic,
-                            ClangNode ClangN);
-
-  /// Create a new named constant with the given value.
-  ///
-  /// \param name The name of the constant.
-  /// \param dc The declaration context into which the name will be introduced.
-  /// \param type The type of the named constant.
-  /// \param value The value of the named constant.
-  /// \param convertKind How to convert the constant to the given type.
-  /// \param isStatic Whether the constant should be a static member of \p dc.
-  ValueDecl *createConstant(Identifier name, DeclContext *dc,
-                            Type type, StringRef value,
-                            ConstantConvertKind convertKind,
-                            bool isStatic,
-                            ClangNode ClangN);
-
-  /// Create a new named constant using the given expression.
-  ///
-  /// \param name The name of the constant.
-  /// \param dc The declaration context into which the name will be introduced.
-  /// \param type The type of the named constant.
-  /// \param valueExpr An expression to use as the value of the constant.
-  /// \param convertKind How to convert the constant to the given type.
-  /// \param isStatic Whether the constant should be a static member of \p dc.
-  ValueDecl *createConstant(Identifier name, DeclContext *dc,
-                            Type type, Expr *valueExpr,
-                            ConstantConvertKind convertKind,
-                            bool isStatic,
-                            ClangNode ClangN);
-
   /// Determine whether the given declaration is considered
   /// 'unavailable' in Swift.
   bool isUnavailableInSwift(const clang::Decl *decl) {
@@ -1158,6 +1120,18 @@ public:
   ValueDecl *createUnavailableDecl(Identifier name, DeclContext *dc,
                                    Type type, StringRef UnavailableMessage,
                                    bool isStatic, ClangNode ClangN);
+
+  /// Add a synthesized typealias to the given nominal type.
+  void addSynthesizedTypealias(NominalTypeDecl *nominal, Identifier name,
+                               Type underlyingType);
+
+  void addSynthesizedProtocolAttrs(
+      NominalTypeDecl *nominal,
+      ArrayRef<KnownProtocolKind> synthesizedProtocolAttrs,
+      bool isUnchecked = false);
+
+  void makeComputed(AbstractStorageDecl *storage, AccessorDecl *getter,
+                    AccessorDecl *setter);
 
   /// Retrieve the standard library module.
   ModuleDecl *getStdlibModule();
@@ -1397,7 +1371,7 @@ public:
 
   /// Attempt to infer a default argument for a parameter with the
   /// given Clang \c type, \c baseName, and optionality.
-  static DefaultArgumentKind
+  static ArgumentAttrs
   inferDefaultArgument(clang::QualType type, OptionalTypeKind clangOptionality,
                        DeclBaseName baseName, StringRef argumentLabel,
                        bool isFirstParameter, bool isLastParameter,
@@ -1750,7 +1724,7 @@ class ImportDiagnosticAdder {
 public:
   ImportDiagnosticAdder(
       ClangImporter::Implementation &impl, ImportDiagnosticTarget target,
-      const clang::SourceLocation &loc = clang::SourceLocation())
+      clang::SourceLocation loc)
       : impl(impl), target(target), loc(loc) {}
 
   void operator () (Diagnostic &&diag) {
@@ -1770,10 +1744,6 @@ bool shouldSuppressDeclImport(const clang::Decl *decl);
 /// Identifies certain UIKit constants that used to have overlay equivalents,
 /// but are now renamed using the swift_name attribute.
 bool isSpecialUIKitStructZeroProperty(const clang::NamedDecl *decl);
-
-/// \returns true if this operator should be made a static function
-/// even if imported as a non-static member function.
-bool isImportedAsStatic(clang::OverloadedOperatorKind op);
 
 /// \returns true if \p a has the same underlying type as \p b after removing
 /// any pointer/reference specifiers. Note that this does not currently look through
@@ -1849,6 +1819,9 @@ public:
 /// actor.
 bool isMainActorAttr(const clang::SwiftAttrAttr *swiftAttr);
 
+/// Determines whether the given swift_attr controls mutability
+bool isMutabilityAttr(const clang::SwiftAttrAttr *swiftAttr);
+
 /// Apply an attribute to a function type.
 static inline Type applyToFunctionType(
     Type type, llvm::function_ref<ASTExtInfo(ASTExtInfo)> transform) {
@@ -1886,6 +1859,22 @@ inline Optional<const clang::EnumDecl *> findAnonymousEnumForTypedef(
     return cast<clang::EnumDecl>(found->get<clang::NamedDecl *>());
 
   return None;
+}
+
+inline bool requiresCPlusPlus(const clang::Module *module) {
+  // The libc++ modulemap doesn't currently declare the requirement.
+  if (module->getTopLevelModuleName() == "std")
+    return true;
+
+  // Modulemaps often declare the requirement for the top-level module only.
+  if (auto parent = module->Parent) {
+    if (requiresCPlusPlus(parent))
+      return true;
+  }
+
+  return llvm::any_of(module->Requirements, [](clang::Module::Requirement req) {
+    return req.first == "cplusplus";
+  });
 }
 
 }

@@ -136,20 +136,22 @@ struct MultipleArgsSetter {
   void setX(int a, int b);
 };
 
-struct NonTrivial {
+struct __attribute__((swift_attr("import_unsafe"))) NonTrivial {
   int value = 42;
   ~NonTrivial() {}
 };
 
 struct PtrGetterSetter {
   int value = 42;
-  int *getX() { return &value; }
+  int *getX() __attribute__((swift_attr("import_unsafe"))) { return &value; }
   void setX(int *v) { value = *v; }
 };
 
 struct RefGetterSetter {
   int value = 42;
-  const int &getX() { return value; }
+  const int &getX() __attribute__((swift_attr("import_unsafe"))) {
+    return value;
+  }
   void setX(const int &v) { value = v; }
 };
 
@@ -189,6 +191,24 @@ class PrivatePropertyWithSameName {
 public:
   int getValue() const;
   void setValue(int i);
+};
+
+struct SnakeCaseGetterSetter {
+  int value = 42;
+  int get_foo() const { return value; };
+  void set_foo(int v) { value = v; };
+};
+
+struct SnakeCaseUTF8Str {
+  int value = 42;
+  int get_utf8_string() const { return value; };
+  void set_utf8_string(int v) { value = v; };
+};
+
+struct SnakeCaseTrailing {
+  int value = 42;
+  int get_x_() const { return value; };
+  void set_x_(int v) { value = v; } ;
 };
 
 #endif // SWIFT_IMPLICIT_COMPUTED_PROPERTIES_H

@@ -22,6 +22,7 @@
 #include "SwiftTargetInfo.h"
 #include "TypeLayout.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/IRGenOptions.h"
 #include "swift/AST/LinkLibrary.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ReferenceCounting.h"
@@ -32,8 +33,8 @@
 #include "swift/Basic/OptimizationMode.h"
 #include "swift/Basic/SuccessorMap.h"
 #include "swift/IRGen/ValueWitness.h"
-#include "swift/SIL/SILFunction.h"
 #include "swift/SIL/RuntimeEffect.h"
+#include "swift/SIL/SILFunction.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
@@ -93,6 +94,7 @@ namespace swift {
   class BraceStmt;
   class CanType;
   class GeneratedModule;
+  struct GenericRequirement;
   class LinkLibrary;
   class SILFunction;
   class IRGenOptions;
@@ -152,7 +154,6 @@ namespace irgen {
   class Signature;
   class StructMetadataLayout;
   struct SymbolicMangling;
-  struct GenericRequirement;
   class TypeConverter;
   class TypeInfo;
   enum class TypeMetadataAddress;
@@ -628,8 +629,8 @@ public:
   /// Should we add value names to local IR values?
   bool EnableValueNames = false;
 
-  // Is swifterror returned in a register by the target ABI.
-  bool IsSwiftErrorInRegister;
+  // Should `swifterror` attribute be explicitly added for the target ABI.
+  bool ShouldUseSwiftError;
 
   llvm::Type *VoidTy;                  /// void (usually {})
   llvm::IntegerType *Int1Ty;           /// i1
@@ -763,6 +764,9 @@ public:
 
   llvm::GlobalVariable *TheTrivialPropertyDescriptor = nullptr;
 
+  llvm::GlobalVariable *swiftImmortalRefCount = nullptr;
+  llvm::GlobalVariable *swiftStaticArrayMetadata = nullptr;
+
   /// Used to create unique names for class layout types with tail allocated
   /// elements.
   unsigned TailElemTypeID = 0;
@@ -834,6 +838,7 @@ public:
     case ReferenceCounting::ObjC:
     case ReferenceCounting::Block:
     case ReferenceCounting::None:
+    case ReferenceCounting::Custom:
       return true;
 
     case ReferenceCounting::Bridge:
@@ -874,6 +879,9 @@ public:
   llvm::PointerType *getValueWitnessTablePtrTy();
   llvm::PointerType *getEnumValueWitnessTablePtrTy();
 
+  llvm::IntegerType *getTypeMetadataRequestParamTy();
+  llvm::StructType *getTypeMetadataResponseTy();
+
   void unimplemented(SourceLoc, StringRef Message);
   [[noreturn]]
   void fatal_unimplemented(SourceLoc, StringRef Message);
@@ -882,6 +890,8 @@ public:
   bool useDllStorage();
 
   bool shouldPrespecializeGenericMetadata();
+  
+  bool canMakeStaticObjectsReadOnly();
   
   Size getAtomicBoolSize() const { return AtomicBoolSize; }
   Alignment getAtomicBoolAlignment() const { return AtomicBoolAlign; }
@@ -1071,6 +1081,7 @@ public:
 
   void addUsedGlobal(llvm::GlobalValue *global);
   void addCompilerUsedGlobal(llvm::GlobalValue *global);
+  void addGenericROData(llvm::Constant *addr);
   void addObjCClass(llvm::Constant *addr, bool nonlazy);
   void addObjCClassStub(llvm::Constant *addr);
   void addProtocolConformance(ConformanceDescription &&conformance);
@@ -1189,6 +1200,8 @@ private:
   /// Metadata nodes for autolinking info.
   SmallVector<LinkLibrary, 32> AutolinkEntries;
 
+  // List of ro_data_t referenced from generic class patterns.
+  SmallVector<llvm::WeakTrackingVH, 4> GenericRODatas;
   /// List of Objective-C classes, bitcast to i8*.
   SmallVector<llvm::WeakTrackingVH, 4> ObjCClasses;
   /// List of Objective-C classes that require nonlazy realization, bitcast to
@@ -1429,12 +1442,14 @@ public:
   /// invalid.
   bool finalize();
 
-  void constructInitialFnAttributes(llvm::AttrBuilder &Attrs,
-                                    OptimizationMode FuncOptMode =
-                                      OptimizationMode::NotSet);
+  void constructInitialFnAttributes(
+      llvm::AttrBuilder &Attrs,
+      OptimizationMode FuncOptMode = OptimizationMode::NotSet,
+      StackProtectorMode stackProtect = StackProtectorMode::NoStackProtector);
   void setHasNoFramePointer(llvm::AttrBuilder &Attrs);
   void setHasNoFramePointer(llvm::Function *F);
   llvm::AttributeList constructInitialAttributes();
+  StackProtectorMode shouldEmitStackProtector(SILFunction *f);
 
   void emitProtocolDecl(ProtocolDecl *D);
   void emitEnumDecl(EnumDecl *D);
@@ -1442,6 +1457,10 @@ public:
   void emitClassDecl(ClassDecl *D);
   void emitExtension(ExtensionDecl *D);
   void emitOpaqueTypeDecl(OpaqueTypeDecl *D);
+  /// This method does additional checking vs. \c emitOpaqueTypeDecl
+  /// based on the state and flags associated with the module.
+  void maybeEmitOpaqueTypeDecl(OpaqueTypeDecl *D);
+
   void emitSILGlobalVariable(SILGlobalVariable *gv);
   void emitCoverageMapping();
   void emitSILFunction(SILFunction *f);
@@ -1764,7 +1783,6 @@ private:
 
   void emitLazyPrivateDefinitions();
   void addRuntimeResolvableType(GenericTypeDecl *nominal);
-  void maybeEmitOpaqueTypeDecl(OpaqueTypeDecl *opaque);
 
   /// Add all conformances of the given \c IterableDeclContext
   /// LazyWitnessTables.

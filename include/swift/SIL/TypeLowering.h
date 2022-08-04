@@ -174,6 +174,8 @@ class TypeLowering {
 public:
   class RecursiveProperties {
     // These are chosen so that bitwise-or merges the flags properly.
+    //
+    // clang-format off
     enum : unsigned {
       NonTrivialFlag             = 1 << 0,
       NonFixedABIFlag            = 1 << 1,
@@ -183,6 +185,7 @@ public:
       InfiniteFlag               = 1 << 5,
       HasRawPointerFlag          = 1 << 6,
     };
+    // clang-format on
 
     uint8_t Flags;
   public:
@@ -227,7 +230,6 @@ public:
     static constexpr RecursiveProperties forResilient() {
       return {IsTrivial, IsFixedABI, IsNotAddressOnly, IsResilient};
     }
-
 
     void addSubobject(RecursiveProperties other) {
       Flags |= other.Flags;
@@ -776,6 +778,8 @@ class TypeConverter {
   
   llvm::DenseMap<AbstractClosureExpr *, Optional<AbstractionPattern>>
     ClosureAbstractionPatterns;
+  llvm::DenseMap<SILDeclRef, TypeExpansionContext>
+    CaptureTypeExpansionContexts;
 
   CanAnyFunctionType makeConstantInterfaceType(SILDeclRef constant);
   
@@ -957,12 +961,12 @@ public:
   }
 
   CanType getLoweredRValueType(TypeExpansionContext context, Type t) {
-    return getLoweredType(t, context).getASTType();
+    return getLoweredType(t, context).getRawASTType();
   }
 
   CanType getLoweredRValueType(TypeExpansionContext context,
                                AbstractionPattern origType, Type substType) {
-    return getLoweredType(origType, substType, context).getASTType();
+    return getLoweredType(origType, substType, context).getRawASTType();
   }
 
   AbstractionPattern getAbstractionPattern(AbstractStorageDecl *storage,
@@ -1180,6 +1184,7 @@ public:
   /// the abstraction pattern is queried using this function. Once the
   /// abstraction pattern has been asked for, it may not be changed.
   Optional<AbstractionPattern> getConstantAbstractionPattern(SILDeclRef constant);
+  TypeExpansionContext getCaptureTypeExpansionContext(SILDeclRef constant);
   
   /// Set the preferred abstraction pattern for a closure.
   ///
@@ -1189,6 +1194,8 @@ public:
   void setAbstractionPattern(AbstractClosureExpr *closure,
                              AbstractionPattern pattern);
   
+  void setCaptureTypeExpansionContext(SILDeclRef constant,
+                                      SILModule &M);
 private:
   CanType computeLoweredRValueType(TypeExpansionContext context,
                                    AbstractionPattern origType,

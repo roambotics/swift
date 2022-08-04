@@ -702,22 +702,16 @@ public:
     extractAllElements(origResult, builder, origResults);
 
     // Get and partially apply the differential.
-    auto jvpGenericEnv = jvp->getGenericEnvironment();
-    auto jvpSubstMap = jvpGenericEnv
-                           ? jvpGenericEnv->getForwardingSubstitutionMap()
-                           : jvp->getForwardingSubstitutionMap();
+    auto jvpSubstMap = jvp->getForwardingSubstitutionMap();
     auto *differentialRef = builder.createFunctionRef(loc, &getDifferential());
     auto *differentialPartialApply = builder.createPartialApply(
         loc, differentialRef, jvpSubstMap, {diffStructVal},
         ParameterConvention::Direct_Guaranteed);
 
-    auto differentialType = jvp->getLoweredFunctionType()
-                                ->getResults()
-                                .back()
-                                .getSILStorageInterfaceType();
-    differentialType = differentialType.substGenericArgs(
-        getModule(), jvpSubstMap, TypeExpansionContext::minimal());
-    differentialType = differentialType.subst(getModule(), jvpSubstMap);
+    auto differentialType = jvp->mapTypeIntoContext(
+        jvp->getConventions().getSILType(
+            jvp->getLoweredFunctionType()->getResults().back(),
+            jvp->getTypeExpansionContext()));
     auto differentialFnType = differentialType.castTo<SILFunctionType>();
     auto differentialSubstType =
         differentialPartialApply->getType().castTo<SILFunctionType>();
@@ -1445,7 +1439,7 @@ void JVPCloner::Implementation::initializeDifferentialStructElements(
          "The number of differential struct fields must equal the number of "
          "differential struct element values");
   for (auto pair : llvm::zip(diffStructDecl->getStoredProperties(), values)) {
-    assert(std::get<1>(pair).getOwnershipKind() != OwnershipKind::Guaranteed &&
+    assert(std::get<1>(pair)->getOwnershipKind() != OwnershipKind::Guaranteed &&
            "Differential struct elements must be @owned");
     auto insertion = differentialStructElements.insert(
         {std::get<0>(pair), std::get<1>(pair)});

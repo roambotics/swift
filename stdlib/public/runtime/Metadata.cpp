@@ -14,22 +14,28 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Runtime/Metadata.h"
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+// Avoid defining macro max(), min() which conflict with std::max(), std::min()
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include "MetadataCache.h"
+#include "swift/ABI/TypeIdentity.h"
 #include "swift/Basic/Lazy.h"
 #include "swift/Basic/Range.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Demangling/Demangler.h"
-#include "swift/ABI/TypeIdentity.h"
 #include "swift/Runtime/Casting.h"
 #include "swift/Runtime/EnvironmentVariables.h"
 #include "swift/Runtime/ExistentialContainer.h"
-#include "swift/Runtime/Heap.h"
 #include "swift/Runtime/HeapObject.h"
-#include "swift/Runtime/Mutex.h"
+#include "swift/Runtime/Metadata.h"
 #include "swift/Runtime/Once.h"
 #include "swift/Runtime/Portability.h"
 #include "swift/Strings.h"
+#include "swift/Threading/Mutex.h"
 #include "llvm/ADT/StringExtras.h"
 #include <algorithm>
 #include <cctype>
@@ -38,12 +44,6 @@
 #include <new>
 #include <unordered_set>
 #include <vector>
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-// Avoid defining macro max(), min() which conflict with std::max(), std::min()
-#define NOMINMAX
-#include <windows.h>
-#endif
 #if SWIFT_PTRAUTH
 #include <ptrauth.h>
 #endif
@@ -77,7 +77,7 @@ using namespace metadataimpl;
 // GenericParamDescriptor is a single byte, so while it's difficult to
 // imagine needing even a quarter this many generic params, there's very
 // little harm in doing it.
-constexpr GenericParamDescriptor
+const GenericParamDescriptor
 swift::ImplicitGenericParamDescriptors[MaxNumImplicitGenericParamDescriptors] = {
 #define D GenericParamDescriptor::implicit()
   D,D,D,D, D,D,D,D, D,D,D,D, D,D,D,D, D,D,D,D, D,D,D,D, D,D,D,D, D,D,D,D,
@@ -378,7 +378,7 @@ namespace {
   class GenericMetadataCache :
     public MetadataCache<GenericCacheEntry, GenericMetadataCacheTag> {
   public:
-    GenericSignatureLayout SigLayout;
+    GenericSignatureLayout<InProcess> SigLayout;
 
     GenericMetadataCache(const TargetGenericContext<InProcess> &genericContext)
       : SigLayout(genericContext.getGenericSignature()) {
@@ -471,7 +471,8 @@ static void swift_objc_classCopyFixupHandler(Class oldClass, Class newClass) {
             reinterpret_cast<void *const *>(&src[i]),
             descriptors[i].Flags.getExtraDiscriminator(),
             !descriptors[i].Flags.isAsync(),
-            /*allowNull*/ false); // Don't allow NULL for Obj-C classes
+            /*allowNull*/ true); // NULL allowed for VFE (methods in the vtable
+                                 // might be proven unused and null'ed)
       }
     }
 
@@ -787,8 +788,8 @@ _cacheCanonicalSpecializedMetadata(const TypeContextDescriptor *description) {
 static void
 cacheCanonicalSpecializedMetadata(const TypeContextDescriptor *description,
                                   swift_once_t *token) {
-  swift_once(
-      token,
+  swift::once(
+      *token,
       [](void *uncastDescription) {
         auto *description = (const TypeContextDescriptor *)uncastDescription;
         _cacheCanonicalSpecializedMetadata(description);
@@ -3149,11 +3150,14 @@ _swift_initClassMetadataImpl(ClassMetadata *self,
     self->Superclass = getRootSuperclass();
 
   // Register our custom implementation of class_getImageName.
-  static swift_once_t onceToken;
-  swift_once(&onceToken, [](void *unused) {
-    (void)unused;
-    setUpObjCRuntimeGetImageNameFromClass();
-  }, nullptr);
+  static swift::once_t onceToken;
+  swift::once(
+      onceToken,
+      [](void *unused) {
+        (void)unused;
+        setUpObjCRuntimeGetImageNameFromClass();
+      },
+      nullptr);
 #endif
 
   // Copy field offsets, generic arguments and (if necessary) vtable entries
@@ -4364,7 +4368,8 @@ ExtendedExistentialTypeCacheEntry::getOrCreateVWT(Key key) {
   auto sigSizeInWords = shape->ReqSigHeader.getArgumentLayoutSizeInWords();
 
 #ifndef NDEBUG
-  auto layout = GenericSignatureLayout(shape->getRequirementSignature());
+  auto layout =
+      GenericSignatureLayout<InProcess>(shape->getRequirementSignature());
   assert(layout.NumKeyParameters == shape->ReqSigHeader.NumParams &&
          "requirement signature for existential includes a "
          "redundant parameter?");
@@ -4460,6 +4465,8 @@ namespace {
 static const TypeContextDescriptor *
 getForeignTypeDescription(Metadata *metadata) {
   if (auto foreignClass = dyn_cast<ForeignClassMetadata>(metadata))
+    return foreignClass->getDescription();
+  else if (auto foreignClass = dyn_cast<ForeignReferenceTypeMetadata>(metadata))
     return foreignClass->getDescription();
   return cast<ValueMetadata>(metadata)->getDescription();
 }
@@ -6157,15 +6164,9 @@ void swift::blockOnMetadataDependency(MetadataDependency root,
 #if !SWIFT_STDLIB_PASSTHROUGH_METADATA_ALLOCATOR
 
 namespace {
-  struct alignas(2 * sizeof(uintptr_t)) PoolRange
-      : swift::aligned_alloc<2 * sizeof(uintptr_t)> {
+  struct alignas(sizeof(uintptr_t) * 2) PoolRange {
     static constexpr uintptr_t PageSize = 16 * 1024;
     static constexpr uintptr_t MaxPoolAllocationSize = PageSize / 2;
-
-    constexpr PoolRange(char *Begin, size_t Remaining)
-        : Begin(Begin), Remaining(Remaining) {}
-
-    PoolRange() : Begin(nullptr), Remaining(0) {}
 
     /// The start of the allocation.
     char *Begin;
@@ -6288,8 +6289,8 @@ void *MetadataAllocator::Allocate(size_t size, size_t alignment) {
   assert(alignment <= alignof(void*));
   assert(size % alignof(void*) == 0);
 
-  static OnceToken_t getenvToken;
-  SWIFT_ONCE_F(getenvToken, checkAllocatorDebugEnvironmentVariables, nullptr);
+  static swift::once_t getenvToken;
+  swift::once(getenvToken, checkAllocatorDebugEnvironmentVariables);
 
   // If the size is larger than the maximum, just do a normal heap allocation.
   if (size > PoolRange::MaxPoolAllocationSize) {
@@ -6319,7 +6320,8 @@ void *MetadataAllocator::Allocate(size_t size, size_t alignment) {
       if (SWIFT_UNLIKELY(_swift_debug_metadataAllocationIterationEnabled))
         poolSize -= sizeof(PoolTrailer);
       allocatedNewPage = true;
-      allocation = new char[PoolRange::PageSize];
+      allocation = reinterpret_cast<char *>(swift_slowAlloc(PoolRange::PageSize,
+                                                            alignof(char) - 1));
       memsetScribble(allocation, PoolRange::PageSize);
 
       if (SWIFT_UNLIKELY(_swift_debug_metadataAllocationIterationEnabled)) {
@@ -6377,7 +6379,7 @@ void *MetadataAllocator::Allocate(size_t size, size_t alignment) {
 
     // If it failed, go back to a neutral state and try again.
     if (allocatedNewPage) {
-      delete[] allocation;
+      swift_slowDealloc(allocation, PoolRange::PageSize, alignof(char) - 1);
     }
   }
 }

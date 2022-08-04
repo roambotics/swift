@@ -349,7 +349,7 @@ void IRGenModule::addSwiftErrorAttributes(llvm::AttributeList &attrs,
   // We create a shadow stack location of the swifterror parameter for the
   // debugger on such platforms and so we can't mark the parameter with a
   // swifterror attribute.
-  if (IsSwiftErrorInRegister)
+  if (ShouldUseSwiftError)
     b.addAttribute(llvm::Attribute::SwiftError);
   
   // The error result should not be aliased, captured, or pointed at invalid
@@ -396,11 +396,14 @@ namespace {
     unsigned AsyncContextIdx;
     unsigned AsyncResumeFunctionSwiftSelfIdx = 0;
     FunctionPointerKind FnKind;
+    bool ShouldComputeABIDetails;
+    SmallVector<GenericRequirement, 4> GenericRequirements;
 
     SignatureExpansion(IRGenModule &IGM, CanSILFunctionType fnType,
-                       FunctionPointerKind fnKind)
-        : IGM(IGM), FnType(fnType), FnKind(fnKind) {
-    }
+                       FunctionPointerKind fnKind,
+                       bool ShouldComputeABIDetails = false)
+        : IGM(IGM), FnType(fnType), FnKind(fnKind),
+          ShouldComputeABIDetails(ShouldComputeABIDetails) {}
 
     /// Expand the components of the primary entrypoint of the function type.
     void expandFunctionType();
@@ -1628,7 +1631,9 @@ void SignatureExpansion::expandParameters() {
   // Next, the generic signature.
   if (hasPolymorphicParameters(FnType) &&
       !FnKind.shouldSuppressPolymorphicArguments())
-    expandPolymorphicSignature(IGM, FnType, ParamIRTypes);
+    expandPolymorphicSignature(IGM, FnType, ParamIRTypes,
+                               ShouldComputeABIDetails ? &GenericRequirements
+                                                       : nullptr);
 
   // Certain special functions are passed the continuation directly.
   if (FnKind.shouldPassContinuationDirectly()) {
@@ -1925,14 +1930,19 @@ Signature SignatureExpansion::getSignature() {
   } else {
     result.ExtraDataKind = ExtraData::kindForMember<void>();
   }
+  if (ShouldComputeABIDetails)
+    result.ABIDetails =
+        SignatureExpansionABIDetails{std::move(GenericRequirements)};
   return result;
 }
 
 Signature Signature::getUncached(IRGenModule &IGM,
                                  CanSILFunctionType formalType,
-                                 FunctionPointerKind fpKind) {
+                                 FunctionPointerKind fpKind,
+                                 bool shouldComputeABIDetails) {
   GenericContextScope scope(IGM, formalType->getInvocationGenericSignature());
-  SignatureExpansion expansion(IGM, formalType, fpKind);
+  SignatureExpansion expansion(IGM, formalType, fpKind,
+                               shouldComputeABIDetails);
   expansion.expandFunctionType();
   return expansion.getSignature();
 }
@@ -2916,8 +2926,20 @@ llvm::CallInst *IRBuilder::CreateCall(const FunctionPointer &fn,
       fn.getRawPointer()->getType()->getPointerElementType());
   llvm::CallInst *call =
       IRBuilderBase::CreateCall(fnTy, fn.getRawPointer(), args, bundles);
-  call->setAttributes(
-      fixUpTypesInByValAndStructRetAttributes(fnTy, fn.getAttributes()));
+
+  llvm::AttributeList attrs = fn.getAttributes();
+  // If a parameter of a function is SRet, the corresponding argument should be
+  // wrapped in SRet(...).
+  if (auto func = dyn_cast<llvm::Function>(fn.getRawPointer())) {
+    for (unsigned argIndex = 0; argIndex < func->arg_size(); ++argIndex) {
+      if (func->hasParamAttribute(argIndex, llvm::Attribute::StructRet)) {
+        llvm::AttrBuilder builder;
+        builder.addStructRetAttr(nullptr);
+        attrs = attrs.addParamAttributes(func->getContext(), argIndex, builder);
+      }
+    }
+  }
+  call->setAttributes(fixUpTypesInByValAndStructRetAttributes(fnTy, attrs));
   call->setCallingConv(fn.getCallingConv());
   return call;
 }
@@ -4245,7 +4267,7 @@ Address IRGenFunction::createErrorResultSlot(SILType errorType, bool isAsync) {
   // The slot for async callees cannot be annotated swifterror because those
   // errors are never passed in registers but rather are always passed
   // indirectly in the async context.
-  if (IGM.IsSwiftErrorInRegister && !isAsync)
+  if (IGM.ShouldUseSwiftError && !isAsync)
     cast<llvm::AllocaInst>(addr.getAddress())->setSwiftError(true);
 
   // Initialize at the alloca point.

@@ -465,7 +465,6 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
 
   // First, look for a local binding in scope.
   if (Loc.isValid() && !Name.isOperator()) {
-    SmallVector<ValueDecl *, 2> localDecls;
     ASTScope::lookupLocalDecls(DC->getParentSourceFile(),
                                LookupName.getFullName(), Loc,
                                /*stopAfterInnermostBraceStmt=*/false,
@@ -586,10 +585,19 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
     }
 
     auto emitBasicError = [&] {
-      Context.Diags
-          .diagnose(Loc, diag::cannot_find_in_scope, Name,
-                    Name.isOperator())
-          .highlight(UDRE->getSourceRange());
+      
+      if (Name.isSimpleName(Context.Id_self)) {
+        // `self` gets diagnosed with a different error when it can't be found.
+        Context.Diags
+            .diagnose(Loc, diag::cannot_find_self_in_scope)
+            .highlight(UDRE->getSourceRange());
+      } else {
+        Context.Diags
+            .diagnose(Loc, diag::cannot_find_in_scope, Name,
+                      Name.isOperator())
+            .highlight(UDRE->getSourceRange());
+      }
+
       if (!Context.LangOpts.DisableExperimentalClangImporterDiagnostics) {
         Context.getClangModuleLoader()->diagnoseTopLevelValue(
             Name.getFullName());
@@ -952,6 +960,9 @@ namespace {
 
     /// Simplify constructs like `UInt32(1)` into `1 as UInt32` if
     /// the type conforms to the expected literal protocol.
+    ///
+    /// \returns Either a transformed expression, or `ErrorExpr` upon type
+    /// resolution failure, or `nullptr` if transformation is not applicable.
     Expr *simplifyTypeConstructionWithLiteralArg(Expr *E);
 
     /// Whether the current expression \p E is in a context that might turn out
@@ -1422,8 +1433,9 @@ namespace {
         return KPE;
       }
 
-      if (auto *simplified = simplifyTypeConstructionWithLiteralArg(expr))
-        return simplified;
+      if (auto *result = simplifyTypeConstructionWithLiteralArg(expr)) {
+        return isa<ErrorExpr>(result) ? nullptr : result;
+      }
 
       // If we find an unresolved member chain, wrap it in an
       // UnresolvedMemberChainResultExpr (unless this has already been done).
@@ -2072,12 +2084,8 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
   if (auto precheckedTy = typeExpr->getInstanceType()) {
     castTy = precheckedTy;
   } else {
-    const auto options =
-        TypeResolutionOptions(TypeResolverContext::InExpression) |
-        TypeResolutionFlags::SilenceErrors;
-
     const auto result = TypeResolution::resolveContextualType(
-        typeExpr->getTypeRepr(), DC, options,
+        typeExpr->getTypeRepr(), DC, TypeResolverContext::InExpression,
         [](auto unboundTy) {
           // FIXME: Don't let unbound generic types escape type resolution.
           // For now, just return the unbound generic type.
@@ -2088,7 +2096,9 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
         PlaceholderType::get);
 
     if (result->hasError())
-      return nullptr;
+      return new (getASTContext())
+          ErrorExpr(typeExpr->getSourceRange(), result, typeExpr);
+
     castTy = result;
   }
 
@@ -2124,19 +2134,27 @@ bool ConstraintSystem::preCheckTarget(SolutionApplicationTarget &target,
   }
 
   if (target.isForEachStmt()) {
-    auto &info = target.getForEachStmtInfo();
+    auto *stmt = target.getAsForEachStmt();
 
-    if (info.whereExpr)
-      hadErrors |= preCheckExpression(info.whereExpr, DC,
+    auto *sequenceExpr = stmt->getParsedSequence();
+    auto *whereExpr = stmt->getWhere();
+
+    hadErrors |= preCheckExpression(sequenceExpr, DC,
+                                    /*replaceInvalidRefsWithErrors=*/true,
+                                    /*leaveClosureBodiesUnchecked=*/false);
+
+    if (whereExpr) {
+      hadErrors |= preCheckExpression(whereExpr, DC,
                                       /*replaceInvalidRefsWithErrors=*/true,
                                       /*leaveClosureBodiesUnchecked=*/false);
+    }
 
     // Update sequence and where expressions to pre-checked versions.
     if (!hadErrors) {
-      info.stmt->setSequence(target.getAsExpr());
+      stmt->setParsedSequence(sequenceExpr);
 
-      if (info.whereExpr)
-        info.stmt->setWhere(info.whereExpr);
+      if (whereExpr)
+        stmt->setWhere(whereExpr);
     }
   }
 

@@ -339,7 +339,7 @@ static bool isStoreCopy(SILValue value) {
     return false;
 
   auto *user = value->getSingleUse()->getUser();
-  return isa<StoreInst>(user) || isa<AssignInst>(user);
+  return isa<StoreInst>(user);
 }
 
 void ValueStorageMap::insertValue(SILValue value, SILValue storageAddress) {
@@ -418,6 +418,11 @@ struct AddressLoweringState {
   // with only indirect arguments are rewritten in a post-pass, only after all
   // parameters are rewritten.
   SmallBlotSetVector<FullApplySite, 16> indirectApplies;
+
+  // checked_cast_br instructions with loadable source type and opaque target
+  // type need to be rewritten in a post-pass, once all the uses of the opaque
+  // target value are rewritten to their address forms.
+  SmallVector<CheckedCastBranchInst *, 8> opaqueResultCCBs;
 
   // All function-exiting terminators (return or throw instructions).
   SmallVector<TermInst *, 8> exitingInsts;
@@ -606,6 +611,15 @@ void OpaqueValueVisitor::mapValueStorage() {
       if (auto apply = FullApplySite::isa(&inst))
         checkForIndirectApply(apply);
 
+      // Collect all checked_cast_br instructions that have a loadable source
+      // type and opaque target type
+      if (auto *ccb = dyn_cast<CheckedCastBranchInst>(&inst)) {
+        if (!ccb->getSourceLoweredType().isAddressOnly(*ccb->getFunction()) &&
+            ccb->getTargetLoweredType().isAddressOnly(*ccb->getFunction())) {
+          pass.opaqueResultCCBs.push_back(ccb);
+        }
+      }
+
       for (auto result : inst.getResults()) {
         if (isPseudoCallResult(result) || isPseudoReturnValue(result))
           continue;
@@ -631,8 +645,10 @@ void OpaqueValueVisitor::checkForIndirectApply(FullApplySite applySite) {
     }
     ++calleeArgIdx;
   }
-  if (applySite.getSubstCalleeType()->hasIndirectFormalResults())
+
+  if (applySite.getSubstCalleeType()->hasIndirectFormalResults()) {
     pass.indirectApplies.insert(applySite);
+  }
 }
 
 /// If `value` is address-only, add it to the `valueStorageMap`.
@@ -679,7 +695,7 @@ void OpaqueValueVisitor::canonicalizeReturnValues() {
       continue;
     }
     SILValue oldResult = returnInst->getOperand();
-    if (oldResult.getOwnershipKind() != OwnershipKind::Owned)
+    if (oldResult->getOwnershipKind() != OwnershipKind::Owned)
       continue;
 
     assert(oldResult->getType().is<TupleType>());
@@ -787,7 +803,7 @@ static Operand *getProjectedDefOperand(SILValue value) {
   case ValueKind::StructExtractInst:
   case ValueKind::OpenExistentialValueInst:
   case ValueKind::OpenExistentialBoxValueInst:
-    assert(value.getOwnershipKind() == OwnershipKind::Guaranteed);
+    assert(value->getOwnershipKind() == OwnershipKind::Guaranteed);
     return &cast<SingleValueInstruction>(value)->getAllOperands()[0];
   }
 }
@@ -869,6 +885,16 @@ static SILValue getProjectedUseValue(Operand *operand) {
   return SILValue();
 }
 
+static bool doesNotNeedStackAllocation(SILValue value) {
+  auto *defInst = value->getDefiningInstruction();
+  if (!defInst)
+    return false;
+
+  if (isa<LoadBorrowInst>(defInst) || isa<BeginApplyInst>(defInst))
+    return true;
+
+  return false;
+}
 //===----------------------------------------------------------------------===//
 //                          OpaqueStorageAllocation
 //
@@ -1028,11 +1054,15 @@ void OpaqueStorageAllocation::allocateValue(SILValue value) {
   if (getReusedStorageOperand(value))
     return;
 
+  if (doesNotNeedStackAllocation(value))
+    return;
+
   // Check for values that inherently project storage from their operand.
   if (auto *storageOper = getProjectedDefOperand(value)) {
     pass.valueStorageMap.recordDefProjection(storageOper, value);
     return;
   }
+
   if (value->getOwnershipKind() == OwnershipKind::Guaranteed) {
     value->dump();
     llvm::report_fatal_error("^^^ guaranteed values must reuse storage");
@@ -1167,9 +1197,8 @@ void OpaqueStorageAllocation::removeAllocation(SILValue value) {
 // immediately before the return. This allows the return to be rewritten by
 // loading from storage.
 AllocStackInst *OpaqueStorageAllocation::createStackAllocation(SILValue value) {
-  assert(value.getOwnershipKind() != OwnershipKind::Guaranteed &&
+  assert(value->getOwnershipKind() != OwnershipKind::Guaranteed &&
          "creating storage for a guaranteed value implies a copy");
-
   // Instructions that produce an opened type never reach here because they
   // have guaranteed ownership--they project their storage. We reach this
   // point after the opened value has been copied.
@@ -1215,12 +1244,13 @@ AllocStackInst *OpaqueStorageAllocation::createStackAllocation(SILValue value) {
     deallocBuilder.createDeallocStack(pass.genLoc(), alloc);
   };
   if (latestOpeningInst) {
-    // Deallocate at the dominance frontier to ensure that allocation encloses
-    // not only the uses of the current value, but also of any values reusing
-    // this storage as a use projection.
-    SmallVector<SILBasicBlock *, 4> frontier;
-    computeDominanceFrontier(alloc->getParent(), pass.domInfo, frontier);
-    for (SILBasicBlock *deallocBlock : frontier) {
+    // Deallocate at the predecessors of dominance frontier blocks that are
+    // dominated by the alloc to ensure that allocation encloses not only the
+    // uses of the current value, but also of any values reusing this storage as
+    // a use projection.
+    SmallVector<SILBasicBlock *, 4> boundary;
+    computeDominatedBoundaryBlocks(alloc->getParent(), pass.domInfo, boundary);
+    for (SILBasicBlock *deallocBlock : boundary) {
       dealloc(deallocBlock->getTerminator()->getIterator());
     }
   } else {
@@ -1755,14 +1785,12 @@ void CallArgRewriter::rewriteIndirectArgument(Operand *operand) {
     });
   } else {
     auto borrow = argBuilder.emitBeginBorrowOperation(callLoc, argValue);
-    auto *storeInst =
-        argBuilder.emitStoreBorrowOperation(callLoc, borrow, allocInst);
+    argBuilder.emitStoreBorrowOperation(callLoc, borrow, allocInst);
 
     apply.insertAfterFullEvaluation([&](SILBuilder &callBuilder) {
-      if (auto *storeBorrow = dyn_cast<StoreBorrowInst>(storeInst)) {
-        callBuilder.emitEndBorrowOperation(callLoc, storeBorrow);
+      if (borrow != argValue) {
+        callBuilder.emitEndBorrowOperation(callLoc, borrow);
       }
-      callBuilder.emitEndBorrowOperation(callLoc, borrow);
       callBuilder.createDeallocStack(callLoc, allocInst);
     });
   }
@@ -1808,10 +1836,11 @@ public:
         loweredCalleeConv(getLoweredCallConv(oldCall)) {}
 
   void convertApplyWithIndirectResults();
+  void convertBeginApplyWithOpaqueYield();
 
 protected:
   SILBasicBlock::iterator getCallResultInsertionPoint() {
-    if (isa<ApplyInst>(apply))
+    if (isa<ApplyInst>(apply) || isa<BeginApplyInst>(apply))
       return std::next(SILBasicBlock::iterator(apply.getInstruction()));
 
     auto *bb = cast<TryApplyInst>(apply)->getNormalBB();
@@ -2066,6 +2095,35 @@ void ApplyRewriter::rewriteApply(ArrayRef<SILValue> newCallArgs) {
   // will be deleted with its destructure_tuple.
 }
 
+void ApplyRewriter::convertBeginApplyWithOpaqueYield() {
+  auto *origCall = cast<BeginApplyInst>(apply.getInstruction());
+  SmallVector<SILValue, 4> opValues;
+
+  for (auto &oper : origCall->getArgumentOperands()) {
+    opValues.push_back(oper.get());
+  }
+
+  // Recreate the begin_apply so that the instruction results have the right
+  // ownership kind as per the lowered addresses convention.
+  auto *newCall = argBuilder.createBeginApply(
+      callLoc, apply.getCallee(), apply.getSubstitutionMap(), opValues,
+      origCall->getApplyOptions(), origCall->getSpecializationInfo());
+  this->apply = FullApplySite(newCall);
+
+  // Replace uses of orig begin_apply with the new begin_apply
+  auto oldResults = origCall->getAllResultsBuffer();
+  auto newResults = newCall->getAllResultsBuffer();
+  assert(oldResults.size() == newResults.size());
+  for (auto i : indices(oldResults)) {
+    if (oldResults[i].getType().isAddressOnly(*pass.function)) {
+      pass.valueStorageMap.setStorageAddress(&oldResults[i], &newResults[i]);
+      pass.valueStorageMap.getStorage(&oldResults[i]).markRewritten();
+    } else {
+      oldResults[i].replaceAllUsesWith(&newResults[i]);
+    }
+  }
+}
+
 // Replace \p tryApply with a new try_apply using \p newCallArgs.
 //
 // If the old result was a single opaque value, then create and return a
@@ -2253,6 +2311,102 @@ void ApplyRewriter::replaceDirectResults(DestructureTupleInst *oldDestructure) {
 }
 
 //===----------------------------------------------------------------------===//
+//                               CheckedCastBrRewriter
+//
+//    Utilities for rewriting checked_cast_br with opaque source/target type
+// ===---------------------------------------------------------------------===//
+class CheckedCastBrRewriter {
+  CheckedCastBranchInst *ccb;
+  AddressLoweringState &pass;
+  SILLocation castLoc;
+  SILFunction *func;
+  SILBasicBlock *successBB;
+  SILBasicBlock *failureBB;
+  SILArgument *origSuccessVal;
+  SILArgument *origFailureVal;
+  SILBuilder termBuilder;
+  SILBuilder successBuilder;
+  SILBuilder failureBuilder;
+
+public:
+  CheckedCastBrRewriter(CheckedCastBranchInst *ccb, AddressLoweringState &pass)
+      : ccb(ccb), pass(pass), castLoc(ccb->getLoc()), func(ccb->getFunction()),
+        successBB(ccb->getSuccessBB()), failureBB(ccb->getFailureBB()),
+        origSuccessVal(successBB->getArgument(0)),
+        origFailureVal(failureBB->getArgument(0)),
+        termBuilder(pass.getTermBuilder(ccb)),
+        successBuilder(pass.getBuilder(successBB->begin())),
+        failureBuilder(pass.getBuilder(failureBB->begin())) {}
+
+  /// Rewrite checked_cast_br with opaque source/target operands to
+  /// checked_cast_addr_br
+  void rewrite() {
+    auto srcAddr =
+        getAddressForCastEntity(ccb->getOperand(), /* needsInit */ true);
+    auto destAddr =
+        getAddressForCastEntity(origSuccessVal, /* needsInit */ false);
+
+    // getReusedStorageOperand() ensured we do not allocate a separate address
+    // for failure block arg. Set the storage address of the failure block arg
+    // to be source address here.
+    if (origFailureVal->getType().isAddressOnly(*func)) {
+      pass.valueStorageMap.setStorageAddress(origFailureVal, srcAddr);
+    }
+
+    termBuilder.createCheckedCastAddrBranch(
+        castLoc, CastConsumptionKind::TakeOnSuccess, srcAddr,
+        ccb->getSourceFormalType(), destAddr, ccb->getTargetFormalType(),
+        successBB, failureBB, ccb->getTrueBBCount(), ccb->getFalseBBCount());
+
+    replaceBlockArg(origSuccessVal, destAddr);
+    replaceBlockArg(origFailureVal, srcAddr);
+
+    pass.deleter.forceDelete(ccb);
+  }
+
+private:
+  /// Return the storageAddress if \p value is opaque, otherwise create and
+  /// return a stack temporary.
+  SILValue getAddressForCastEntity(SILValue value, bool needsInit) {
+    if (value->getType().isAddressOnly(*func)) {
+      auto builder = pass.getBuilder(ccb->getIterator());
+      AddressMaterialization addrMat(pass, builder);
+      return addrMat.materializeAddress(value);
+    }
+
+    // Create a stack temporary for a loadable value
+    auto *addr = termBuilder.createAllocStack(castLoc, value->getType());
+    if (needsInit) {
+      termBuilder.createStore(castLoc, value, addr,
+                              value->getType().isTrivial(*func)
+                                  ? StoreOwnershipQualifier::Trivial
+                                  : StoreOwnershipQualifier::Init);
+    }
+    successBuilder.createDeallocStack(castLoc, addr);
+    failureBuilder.createDeallocStack(castLoc, addr);
+    return addr;
+  }
+
+  void replaceBlockArg(SILArgument *blockArg, SILValue addr) {
+    // Replace all uses of the opaque block arg with a load from its
+    // storage address.
+    auto load =
+        pass.getBuilder(blockArg->getParent()->begin())
+            .createTrivialLoadOr(castLoc, addr, LoadOwnershipQualifier::Take);
+    blockArg->replaceAllUsesWith(load);
+
+    blockArg->getParent()->eraseArgument(blockArg->getIndex());
+
+    if (blockArg->getType().isAddressOnly(*func)) {
+      // In case of opaque block arg, replace the block arg with the dummy load
+      // in the valueStorageMap. DefRewriter::visitLoadInst will then rewrite
+      // the dummy load to copy_addr.
+      pass.valueStorageMap.replaceValue(blockArg, load);
+    }
+  }
+};
+
+//===----------------------------------------------------------------------===//
 //                               ReturnRewriter
 //
 //             Rewrite return instructions for indirect results.
@@ -2438,7 +2592,19 @@ protected:
     CallArgRewriter(applyInst, pass).rewriteIndirectArgument(use);
   }
 
-  void visitAssignInst(AssignInst *assignInst);
+  void visitBeginApplyInst(BeginApplyInst *bai) {
+    CallArgRewriter(bai, pass).rewriteIndirectArgument(use);
+  }
+
+  void visitYieldInst(YieldInst *yield) {
+    SILValue addr = addrMat.materializeAddress(use->get());
+    yield->setOperand(0, addr);
+  }
+
+  void visitValueMetatypeInst(ValueMetatypeInst *vmi) {
+    SILValue opAddr = addrMat.materializeAddress(use->get());
+    vmi->setOperand(opAddr);
+  }
 
   void visitBeginBorrowInst(BeginBorrowInst *borrow);
 
@@ -2670,11 +2836,6 @@ void UseRewriter::visitStoreInst(StoreInst *storeInst) {
   rewriteStore(storeInst->getSrc(), storeInst->getDest(), isInit);
 }
 
-void UseRewriter::visitAssignInst(AssignInst *assignInst) {
-  rewriteStore(assignInst->getSrc(), assignInst->getDest(),
-               IsNotInitialization);
-}
-
 /// Emit end_borrows for a an incomplete BorrowedValue with only nonlifetime
 /// ending uses. This function inserts end_borrows on the lifetime boundary.
 void UseRewriter::emitEndBorrows(SILValue value) {
@@ -2811,87 +2972,8 @@ void UseRewriter::visitSwitchEnumInst(SwitchEnumInst * switchEnum) {
                                defaultCounter);
 }
 
-void UseRewriter::visitCheckedCastBranchInst(
-    CheckedCastBranchInst *checkedCastBranch) {
-  auto loc = checkedCastBranch->getLoc();
-  auto *func = checkedCastBranch->getFunction();
-  auto *successBB = checkedCastBranch->getSuccessBB();
-  auto *failureBB = checkedCastBranch->getFailureBB();
-  auto *oldSuccessVal = successBB->getArgument(0);
-  auto *oldFailureVal = failureBB->getArgument(0);
-  auto termBuilder = pass.getTermBuilder(checkedCastBranch);
-  auto successBuilder = pass.getBuilder(successBB->begin());
-  auto failureBuilder = pass.getBuilder(failureBB->begin());
-  bool isAddressOnlyTarget = oldSuccessVal->getType().isAddressOnly(*func);
-
-  auto srcAddr = pass.valueStorageMap.getStorage(use->get()).storageAddress;
-
-  if (isAddressOnlyTarget) {
-    // If target is opaque, use the storage address mapped to success
-    // block's argument as the destination for checked_cast_addr_br.
-    SILValue destAddr =
-        pass.valueStorageMap.getStorage(oldSuccessVal).storageAddress;
-
-    termBuilder.createCheckedCastAddrBranch(
-        loc, CastConsumptionKind::TakeOnSuccess, srcAddr,
-        checkedCastBranch->getSourceFormalType(), destAddr,
-        checkedCastBranch->getTargetFormalType(), successBB, failureBB,
-        checkedCastBranch->getTrueBBCount(),
-        checkedCastBranch->getFalseBBCount());
-
-    // In this case, since both success and failure block's args are opaque,
-    // create dummy loads from their storage addresses that will later be
-    // rewritten to copy_addr in DefRewriter::visitLoadInst
-    auto newSuccessVal = successBuilder.createTrivialLoadOr(
-        loc, destAddr, LoadOwnershipQualifier::Take);
-    oldSuccessVal->replaceAllUsesWith(newSuccessVal);
-    successBB->eraseArgument(0);
-
-    pass.valueStorageMap.replaceValue(oldSuccessVal, newSuccessVal);
-
-    auto newFailureVal = failureBuilder.createTrivialLoadOr(
-        loc, srcAddr, LoadOwnershipQualifier::Take);
-    oldFailureVal->replaceAllUsesWith(newFailureVal);
-    failureBB->eraseArgument(0);
-
-    pass.valueStorageMap.replaceValue(oldFailureVal, newFailureVal);
-    markRewritten(newFailureVal, srcAddr);
-  } else {
-    // If the target is loadable, create a stack temporary to be used as the
-    // destination for checked_cast_addr_br.
-    SILValue destAddr = termBuilder.createAllocStack(
-        loc, checkedCastBranch->getTargetLoweredType());
-
-    termBuilder.createCheckedCastAddrBranch(
-        loc, CastConsumptionKind::TakeOnSuccess, srcAddr,
-        checkedCastBranch->getSourceFormalType(), destAddr,
-        checkedCastBranch->getTargetFormalType(), successBB, failureBB,
-        checkedCastBranch->getTrueBBCount(),
-        checkedCastBranch->getFalseBBCount());
-
-    // Replace the success block arg with loaded value from destAddr, and delete
-    // the success block arg.
-    auto newSuccessVal = successBuilder.createTrivialLoadOr(
-        loc, destAddr, LoadOwnershipQualifier::Take);
-    oldSuccessVal->replaceAllUsesWith(newSuccessVal);
-    successBB->eraseArgument(0);
-
-    successBuilder.createDeallocStack(loc, destAddr);
-    failureBuilder.createDeallocStack(loc, destAddr);
-
-    // Since failure block arg is opaque, create dummy load from its storage
-    // address. This will be replaced later with copy_addr in
-    // DefRewriter::visitLoadInst.
-    auto newFailureVal = failureBuilder.createTrivialLoadOr(
-        loc, srcAddr, LoadOwnershipQualifier::Take);
-    oldFailureVal->replaceAllUsesWith(newFailureVal);
-    failureBB->eraseArgument(0);
-
-    pass.valueStorageMap.replaceValue(oldFailureVal, newFailureVal);
-    markRewritten(newFailureVal, srcAddr);
-  }
-
-  pass.deleter.forceDelete(checkedCastBranch);
+void UseRewriter::visitCheckedCastBranchInst(CheckedCastBranchInst *ccb) {
+  CheckedCastBrRewriter(ccb, pass).rewrite();
 }
 
 void UseRewriter::visitUncheckedEnumDataInst(
@@ -2989,16 +3071,7 @@ protected:
     LLVM_DEBUG(llvm::dbgs() << "REWRITE ARG "; arg->dump());
     if (storage.storageAddress)
       LLVM_DEBUG(llvm::dbgs() << "  STORAGE "; storage.storageAddress->dump());
-
     storage.storageAddress = addrMat.materializeAddress(arg);
-  }
-
-  void setStorageAddress(SILValue oldValue, SILValue addr) {
-    auto &storage = pass.valueStorageMap.getStorage(oldValue);
-    // getReusedStorageOperand() ensures that oldValue does not already have
-    // separate storage. So there's no need to delete its alloc_stack.
-    assert(!storage.storageAddress || storage.storageAddress == addr);
-    storage.storageAddress = addr;
   }
 
   void beforeVisit(SILInstruction *inst) {
@@ -3018,6 +3091,11 @@ protected:
     // results, and generating a new apply instruction.
     CallArgRewriter(applyInst, pass).rewriteArguments();
     ApplyRewriter(applyInst, pass).convertApplyWithIndirectResults();
+  }
+
+  void visitBeginApplyInst(BeginApplyInst *bai) {
+    CallArgRewriter(bai, pass).rewriteArguments();
+    ApplyRewriter(bai, pass).convertBeginApplyWithOpaqueYield();
   }
 
   // Rewrite the apply for an indirect result.
@@ -3068,7 +3146,7 @@ protected:
         openExistentialBoxValue->getType().getAddressType());
 
     openExistentialBoxValue->replaceAllTypeDependentUsesWith(openAddr);
-    setStorageAddress(openExistentialBoxValue, openAddr);
+    pass.valueStorageMap.setStorageAddress(openExistentialBoxValue, openAddr);
   }
 
   // Load an opaque value.
@@ -3086,6 +3164,10 @@ protected:
       builder.createCopyAddr(loadInst->getLoc(), loadInst->getOperand(), addr,
                              isTake, IsInitialization);
     }
+  }
+
+  void visitLoadBorrowInst(LoadBorrowInst *lbi) {
+    pass.valueStorageMap.setStorageAddress(lbi, lbi->getOperand());
   }
 
   // Define an opaque struct.
@@ -3133,15 +3215,16 @@ protected:
 //                           Rewrite Opaque Values
 //===----------------------------------------------------------------------===//
 
-// Rewrite applies with indirect paramters or results of loadable types which
+// Rewrite applies with indirect parameters or results of loadable types which
 // were not visited during opaque value rewritting.
 static void rewriteIndirectApply(FullApplySite apply,
                                  AddressLoweringState &pass) {
   // If all indirect args were loadable, then they still need to be rewritten.
   CallArgRewriter(apply, pass).rewriteArguments();
 
-  if (!apply.getSubstCalleeType()->hasIndirectFormalResults())
+  if (!apply.getSubstCalleeType()->hasIndirectFormalResults()) {
     return;
+  }
 
   // If the call has indirect results and wasn't already rewritten, rewrite it
   // now. This handles try_apply, which is not rewritten when DefRewriter visits
@@ -3186,6 +3269,13 @@ static void rewriteFunction(AddressLoweringState &pass) {
       rewriteIndirectApply(optionalApply.getValue(), pass);
     }
   }
+
+  // Rewrite all checked_cast_br instructions with loadable source type and
+  // opaque target type now
+  for (auto *ccb : pass.opaqueResultCCBs) {
+    CheckedCastBrRewriter(ccb, pass).rewrite();
+  }
+
   // Rewrite this function's return value now that all opaque values within the
   // function are rewritten. This still depends on a valid ValueStorage
   // projection operands.

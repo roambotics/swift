@@ -418,6 +418,13 @@ class RefCountBitsT {
   }
 
   SWIFT_ALWAYS_INLINE
+  static constexpr BitsType immortalBits() {
+    return (BitsType(2) << Offsets::StrongExtraRefCountShift) |
+           (BitsType(Offsets::IsImmortalMask)) |
+           (BitsType(1) << Offsets::UseSlowRCShift);
+  }
+
+  SWIFT_ALWAYS_INLINE
   RefCountBitsT() = default;
 
   SWIFT_ALWAYS_INLINE
@@ -431,9 +438,7 @@ class RefCountBitsT {
   SWIFT_ALWAYS_INLINE
   constexpr
   RefCountBitsT(Immortal_t immortal)
-  : bits((BitsType(2) << Offsets::StrongExtraRefCountShift) |
-         (BitsType(Offsets::IsImmortalMask)) |
-         (BitsType(1) << Offsets::UseSlowRCShift))
+  : bits(immortalBits())
   { }
 
   SWIFT_ALWAYS_INLINE
@@ -626,9 +631,8 @@ class RefCountBitsT {
 
 typedef RefCountBitsT<RefCountIsInline> InlineRefCountBits;
 
-class alignas(2 * sizeof(void*)) SideTableRefCountBits
-    : public swift::aligned_alloc<2 * sizeof(void *)>,
-      public RefCountBitsT<RefCountNotInline> {
+class alignas(sizeof(void*) * 2) SideTableRefCountBits : public RefCountBitsT<RefCountNotInline>
+{
   uint32_t weakBits;
 
   public:
@@ -1329,6 +1333,9 @@ class HeapObjectSideTableEntry {
 #endif
   { }
 
+  void *operator new(size_t) = delete;
+  void operator delete(void *) = delete;
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Winvalid-offsetof"
   static ptrdiff_t refCountsOffset() {
@@ -1455,7 +1462,7 @@ class HeapObjectSideTableEntry {
     // Weak ref count is now zero. Delete the side table entry.
     // FREED -> DEAD
     assert(refCounts.getUnownedCount() == 0);
-    delete this;
+    swift_cxx_deleteObject(this);
   }
 
   void decrementWeakNonAtomic() {
@@ -1468,7 +1475,7 @@ class HeapObjectSideTableEntry {
     // Weak ref count is now zero. Delete the side table entry.
     // FREED -> DEAD
     assert(refCounts.getUnownedCount() == 0);
-    delete this;
+    swift_cxx_deleteObject(this);
   }
 
   uint32_t getWeakCount() const {
