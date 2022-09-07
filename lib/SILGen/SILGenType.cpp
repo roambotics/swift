@@ -707,10 +707,6 @@ SILFunction *SILGenModule::emitProtocolWitness(
        !requirement.getFuncDecl()->isDistributed() &&
        witnessRef.hasDecl() && witnessRef.getFuncDecl() &&
        witnessRef.getFuncDecl()->isDistributed());
-  // We only need to use thunks when we go cross-actor:
-  shouldUseDistributedThunkWitness = shouldUseDistributedThunkWitness &&
-                                     getActorIsolation(requirement.getDecl()) !=
-                                         getActorIsolation(witness.getDecl());
   if (shouldUseDistributedThunkWitness) {
     auto thunkDeclRef = SILDeclRef(
         witnessRef.getFuncDecl()->getDistributedThunk(),
@@ -732,7 +728,7 @@ SILFunction *SILGenModule::emitProtocolWitness(
   // The type of the witness thunk.
   auto reqtSubstTy = cast<AnyFunctionType>(
     reqtOrigTy->substGenericArgs(reqtSubMap)
-      ->getCanonicalType(genericSig));
+      ->getReducedType(genericSig));
 
   // Generic signatures where all parameters are concrete are lowered away
   // at the SILFunctionType level.

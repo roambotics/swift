@@ -6,9 +6,10 @@ include(SwiftAndroidSupport)
 include(SwiftCXXUtils)
 
 function(_swift_gyb_target_sources target scope)
+  set(SWIFT_SYNTAX_GYB_SUPPORT_DIR "${SWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE}/Sources/generate-swift-syntax-builder")
   file(GLOB GYB_UNICODE_DATA ${SWIFT_SOURCE_DIR}/utils/UnicodeData/*)
   file(GLOB GYB_STDLIB_SUPPORT ${SWIFT_SOURCE_DIR}/utils/gyb_stdlib_support.py)
-  file(GLOB GYB_SYNTAX_SUPPORT ${SWIFT_SOURCE_DIR}/utils/gyb_syntax_support/*.py)
+  file(GLOB GYB_SYNTAX_SUPPORT ${SWIFT_SYNTAX_GYB_SUPPORT_DIR}/gyb_syntax_support/*.py)
   file(GLOB GYB_SOURCEKIT_SUPPORT ${SWIFT_SOURCE_DIR}/utils/gyb_sourcekit_support/*.py)
   set(GYB_SOURCES
     ${SWIFT_SOURCE_DIR}/utils/gyb
@@ -26,7 +27,7 @@ function(_swift_gyb_target_sources target scope)
 
     add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${generated}
       COMMAND
-        $<TARGET_FILE:Python3::Interpreter> ${SWIFT_SOURCE_DIR}/utils/gyb -D CMAKE_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P} ${SWIFT_GYB_FLAGS} -o ${CMAKE_CURRENT_BINARY_DIR}/${generated}.tmp ${absolute}
+        ${CMAKE_COMMAND} -E env PYTHONPATH=${SWIFT_SYNTAX_GYB_SUPPORT_DIR} $<TARGET_FILE:Python3::Interpreter> ${SWIFT_SOURCE_DIR}/utils/gyb -D CMAKE_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P} ${SWIFT_GYB_FLAGS} -o ${CMAKE_CURRENT_BINARY_DIR}/${generated}.tmp ${absolute}
       COMMAND
         ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/${generated}.tmp ${CMAKE_CURRENT_BINARY_DIR}/${generated}
       COMMAND
@@ -465,12 +466,14 @@ function(_add_swift_runtime_link_flags target relpath_to_lib_dir bootstrapping)
       # the stdlib is not picked up from there, but from the SDK.
       # This requires to explicitly add all the needed compatibility libraries. We
       # can take them from the current build.
-      set(vsuffix "-${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}-${SWIFT_HOST_VARIANT_ARCH}")
-      set(conctarget "swiftCompatibilityConcurrency${vsuffix}")
-      target_link_libraries(${target} PUBLIC ${conctarget})
+      target_link_libraries(${target} PUBLIC HostCompatibilityLibs)
 
       # Add the SDK directory for the host platform.
       target_link_directories(${target} PRIVATE "${sdk_dir}")
+
+      # A backup in case the toolchain doesn't have one of the compatibility libraries.
+      target_link_directories(${target} PRIVATE
+        "${SWIFTLIB_DIR}/${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}")
 
       # Include the abi stable system stdlib in our rpath.
       set(swift_runtime_rpath "/usr/lib/swift")
@@ -505,7 +508,7 @@ function(_add_swift_runtime_link_flags target relpath_to_lib_dir bootstrapping)
 
     # Workaround to make lldb happy: we have to explicitly add all swift compiler modules
     # to the linker command line.
-    set(swift_ast_path_flags "-Wl")
+    set(swift_ast_path_flags " -Wl")
     get_property(modules GLOBAL PROPERTY swift_compiler_modules)
     foreach(module ${modules})
       get_target_property(module_file "SwiftModule${module}" "module_file")
@@ -608,6 +611,11 @@ function(add_swift_host_library name)
   set(ASHL_SOURCES ${ASHL_UNPARSED_ARGUMENTS})
 
   translate_flags(ASHL "${options}")
+
+  # Once the new Swift parser is linked, everything has Swift modules.
+  if (SWIFT_SWIFT_PARSER AND ASHL_SHARED)
+    set(ASHL_HAS_SWIFT_MODULES ON)
+  endif()
 
   if(NOT ASHL_SHARED AND NOT ASHL_STATIC AND NOT ASHL_OBJECT)
     message(FATAL_ERROR "One of SHARED/STATIC/OBJECT must be specified")
@@ -833,6 +841,11 @@ function(add_swift_host_tool executable)
   if(SWIFT_PARALLEL_LINK_JOBS)
     set_target_properties(${executable} PROPERTIES
       JOB_POOL_LINK swift_link_job_pool)
+  endif()
+
+  # Once the new Swift parser is linked in, every host tool has Swift modules.
+  if (SWIFT_SWIFT_PARSER)
+    set(ASHT_HAS_SWIFT_MODULES ON)
   endif()
 
   if (ASHT_HAS_SWIFT_MODULES)

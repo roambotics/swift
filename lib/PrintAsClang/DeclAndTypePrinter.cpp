@@ -114,8 +114,6 @@ class DeclAndTypePrinter::Implementation
 
   SmallVector<const FunctionType *, 4> openFunctionTypes;
 
-  std::string outOfLineDefinitions;
-
   ASTContext &getASTContext() const {
     return owningPrinter.M.getASTContext();
   }
@@ -218,7 +216,6 @@ private:
   template <bool AllowDelayed = false, typename R>
   void printMembers(R &&members) {
     bool protocolMembersOptional = false;
-    assert(outOfLineDefinitions.empty());
     for (const Decl *member : members) {
       auto VD = dyn_cast<ValueDecl>(member);
       if (!VD || !shouldInclude(VD) || isa<TypeDecl>(VD))
@@ -300,9 +297,8 @@ private:
     if (outputLang == OutputLanguageMode::Cxx) {
       // FIXME: Non objc class.
       // FIXME: Print availability.
-      ClangClassTypePrinter(os).printClassTypeDecl(CD, []() {
-        // FIXME: print class body.
-      });
+      ClangClassTypePrinter(os).printClassTypeDecl(
+          CD, [&]() { printMembers(CD->getMembers()); });
       return;
     }
 
@@ -355,8 +351,6 @@ private:
                                   owningPrinter.interopContext);
     printer.printValueTypeDecl(
         SD, /*bodyPrinter=*/[&]() { printMembers(SD->getMembers()); });
-    os << outOfLineDefinitions;
-    outOfLineDefinitions.clear();
   }
 
   void visitExtensionDecl(ExtensionDecl *ED) {
@@ -404,118 +398,331 @@ private:
     ClangValueTypePrinter valueTypePrinter(os, owningPrinter.prologueOS,
                                            owningPrinter.typeMapping,
                                            owningPrinter.interopContext);
-    valueTypePrinter.printValueTypeDecl(ED, /*bodyPrinter=*/[&]() {
-      ClangSyntaxPrinter syntaxPrinter(os);
-      auto elementTagMapping =
-          owningPrinter.interopContext.getIrABIDetails().getEnumTagMapping(ED);
-      // Sort cases based on their assigned tag indices
-      llvm::stable_sort(elementTagMapping, [](const auto &p1, const auto &p2) {
-        return p1.second < p2.second;
-      });
+    ClangSyntaxPrinter syntaxPrinter(os);
+    DeclAndTypeClangFunctionPrinter clangFuncPrinter(
+        os, owningPrinter.prologueOS, owningPrinter.typeMapping,
+        owningPrinter.interopContext, owningPrinter);
 
-      if (elementTagMapping.empty()) {
-        os << "\n";
+    auto &outOfLineOS = owningPrinter.outOfLineDefinitionsOS;
+    ClangSyntaxPrinter outOfLineSyntaxPrinter(outOfLineOS);
+    DeclAndTypeClangFunctionPrinter outOfLineFuncPrinter(
+        owningPrinter.outOfLineDefinitionsOS, owningPrinter.prologueOS,
+        owningPrinter.typeMapping, owningPrinter.interopContext, owningPrinter);
+    ClangValueTypePrinter outOfLineValTyPrinter(
+        owningPrinter.outOfLineDefinitionsOS, owningPrinter.prologueOS,
+        owningPrinter.typeMapping, owningPrinter.interopContext);
+
+    auto elementTagMapping =
+        owningPrinter.interopContext.getIrABIDetails().getEnumTagMapping(ED);
+    // Sort cases based on their assigned tag indices
+    llvm::stable_sort(elementTagMapping, [](const auto &p1, const auto &p2) {
+      return p1.second.tag < p2.second.tag;
+    });
+
+    auto printIsFunction = [&](StringRef caseName, EnumDecl *ED) {
+      std::string declName, defName, name;
+      llvm::raw_string_ostream declOS(declName), defOS(defName), nameOS(name);
+      ClangSyntaxPrinter(nameOS).printIdentifier(caseName);
+      name[0] = std::toupper(name[0]);
+
+      os << "  inline bool is" << name << "() const;\n";
+
+      outOfLineOS << "  inline bool ";
+      outOfLineSyntaxPrinter.printBaseName(ED);
+      outOfLineOS << "::is" << name << "() const {\n";
+      outOfLineOS << "    return *this == ";
+      outOfLineSyntaxPrinter.printBaseName(ED);
+      outOfLineOS << "::";
+      outOfLineSyntaxPrinter.printIdentifier(caseName);
+      outOfLineOS << ";\n";
+      outOfLineOS << "  }\n";
+    };
+
+    auto printGetFunction = [&](EnumElementDecl *elementDecl) {
+      auto associatedValueList = elementDecl->getParameterList();
+      // TODO: add tuple type support
+      if (!elementDecl->hasAssociatedValues() ||
+          associatedValueList->size() > 1) {
         return;
       }
+      auto paramType = associatedValueList->front()->getType();
+      Type objectType;
+      OptionalTypeKind optKind;
+      std::tie(objectType, optKind) = getObjectTypeAndOptionality(
+          paramType->getNominalOrBoundGenericNominal(), paramType);
+      auto objectTypeDecl = objectType->getNominalOrBoundGenericNominal();
 
-      os << "  enum class cases {\n";
-      for (const auto &pair : elementTagMapping) {
-        os << "    ";
-        syntaxPrinter.printIdentifier(pair.first->getNameStr());
-        os << ",\n";
+      std::string declName, defName, name;
+      llvm::raw_string_ostream declOS(declName), defOS(defName), nameOS(name);
+      ClangSyntaxPrinter(nameOS).printIdentifier(elementDecl->getNameStr());
+      name[0] = std::toupper(name[0]);
+
+      clangFuncPrinter.printCustomCxxFunction(
+          {paramType},
+          [&](auto &types) {
+            // Printing function name and return type
+            os << "  inline " << types[paramType] << " get" << name;
+            outOfLineOS << "  inline " << types[paramType] << ' ';
+            outOfLineSyntaxPrinter.printBaseName(ED);
+            outOfLineOS << "::get" << name;
+          },
+          [&](auto &types) {}, true,
+          [&](auto &types) {
+            // Printing function body
+            outOfLineOS << "    if (!is" << name << "()) abort();\n";
+            outOfLineOS << "    alignas(";
+            outOfLineSyntaxPrinter.printBaseName(elementDecl->getParentEnum());
+            outOfLineOS << ") unsigned char buffer[sizeof(";
+            outOfLineSyntaxPrinter.printBaseName(elementDecl->getParentEnum());
+            outOfLineOS << ")];\n";
+            outOfLineOS << "    auto *thisCopy = new(buffer) ";
+            outOfLineSyntaxPrinter.printBaseName(elementDecl->getParentEnum());
+            outOfLineOS << "(*this);\n";
+            outOfLineOS << "    char * _Nonnull payloadFromDestruction = "
+                           "thisCopy->_destructiveProjectEnumData();\n";
+            if (auto knownCxxType =
+                    owningPrinter.typeMapping.getKnownCxxTypeInfo(
+                        objectTypeDecl)) {
+              outOfLineOS << "    " << types[paramType] << " result;\n";
+              outOfLineOS << "    "
+                             "memcpy(&result, payloadFromDestruction, "
+                             "sizeof(result));\n";
+              outOfLineOS << "    return result;\n  ";
+            } else {
+              outOfLineOS << "    return swift::";
+              outOfLineOS << cxx_synthesis::getCxxImplNamespaceName();
+              outOfLineOS << "::implClassFor<";
+              outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
+                  objectTypeDecl->getModuleContext(),
+                  elementDecl->getParentEnum()->getModuleContext());
+              outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+              outOfLineOS << ">::type";
+              outOfLineOS << "::returnNewValue([&](char * _Nonnull result) {\n";
+              outOfLineOS << "      swift::"
+                          << cxx_synthesis::getCxxImplNamespaceName();
+              outOfLineOS << "::implClassFor<";
+              outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
+                  objectTypeDecl->getModuleContext(),
+                  elementDecl->getParentEnum()->getModuleContext());
+              outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+              outOfLineOS << ">::type";
+              outOfLineOS
+                  << "::initializeWithTake(result, payloadFromDestruction);\n";
+              outOfLineOS << "    });\n  ";
+            }
+          },
+          ED->getModuleContext(), outOfLineOS);
+    };
+
+    auto printStruct = [&](StringRef caseName, EnumElementDecl *elementDecl,
+                           Optional<IRABIDetailsProvider::EnumElementInfo>
+                               elementInfo) {
+      os << "  inline const static struct {  "
+         << "// impl struct for case " << caseName << '\n';
+      os << "    inline constexpr operator cases() const {\n";
+      os << "      return cases::";
+      syntaxPrinter.printIdentifier(caseName);
+      os << ";\n";
+      os << "    }\n";
+
+      if (elementDecl != nullptr) {
+        assert(elementInfo.hasValue());
+
+        Type paramType, objectType;
+        NominalTypeDecl *objectTypeDecl = nullptr;
+        OptionalTypeKind optKind;
+
+        // TODO: support tuple type
+        if (elementDecl->hasAssociatedValues() &&
+            elementDecl->getParameterList()->size() == 1) {
+          paramType = elementDecl->getParameterList()->front()->getType();
+          std::tie(objectType, optKind) = getObjectTypeAndOptionality(
+              paramType->getNominalOrBoundGenericNominal(), paramType);
+          objectTypeDecl = objectType->getNominalOrBoundGenericNominal();
+        }
+
+        SmallVector<Type> neededTypes;
+        if (paramType) {
+          neededTypes.push_back(paramType);
+        }
+
+        clangFuncPrinter.printCustomCxxFunction(
+            neededTypes,
+            [&](auto &types) {
+              // Printing function name and return type
+              os << "    inline ";
+              syntaxPrinter.printBaseName(elementDecl->getParentEnum());
+              os << " operator()";
+
+              outOfLineOS << "  inline ";
+              outOfLineSyntaxPrinter.printBaseName(
+                  elementDecl->getParentEnum());
+              outOfLineOS << ' ';
+              outOfLineSyntaxPrinter.printBaseName(
+                  elementDecl->getParentEnum());
+              outOfLineOS << "::_impl_" << elementDecl->getNameStr()
+                          << "::operator()";
+            },
+            [&](auto &types) {
+              // Printing parameters
+              if (!paramType) {
+                return;
+              }
+              assert(objectTypeDecl != nullptr);
+              if (owningPrinter.typeMapping.getKnownCxxTypeInfo(
+                      objectTypeDecl)) {
+                os << types[paramType] << " val";
+                outOfLineOS << types[paramType] << " val";
+              } else {
+                os << "const " << types[paramType] << " &val";
+                outOfLineOS << "const " << types[paramType] << " &val";
+              }
+            },
+            true,
+            [&](auto &types) {
+              // Printing function body
+              outOfLineOS << "    auto result = ";
+              outOfLineSyntaxPrinter.printBaseName(
+                  elementDecl->getParentEnum());
+              outOfLineOS << "::_make();\n";
+
+              if (paramType) {
+                assert(objectTypeDecl != nullptr);
+
+                if (owningPrinter.typeMapping.getKnownCxxTypeInfo(
+                        objectTypeDecl)) {
+                  outOfLineOS << "    memcpy(result._getOpaquePointer(), &val, "
+                                 "sizeof(val));\n";
+                } else {
+                  outOfLineOS << "    alignas(";
+                  outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
+                      objectTypeDecl->getModuleContext(),
+                      ED->getModuleContext());
+                  outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                  outOfLineOS << ") unsigned char buffer[sizeof(";
+                  outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
+                      objectTypeDecl->getModuleContext(),
+                      ED->getModuleContext());
+                  outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                  outOfLineOS << ")];\n";
+                  outOfLineOS << "    auto *valCopy = new(buffer) ";
+                  outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
+                      objectTypeDecl->getModuleContext(),
+                      ED->getModuleContext());
+                  outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                  outOfLineOS << "(val);\n";
+                  outOfLineOS << "    ";
+                  outOfLineOS << cxx_synthesis::getCxxSwiftNamespaceName()
+                              << "::";
+                  outOfLineOS << cxx_synthesis::getCxxImplNamespaceName();
+                  outOfLineOS << "::implClassFor<";
+                  outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
+                      objectTypeDecl->getModuleContext(),
+                      ED->getModuleContext());
+                  outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                  outOfLineOS << ">::type::initializeWithTake(result._"
+                                 "getOpaquePointer(), ";
+                  outOfLineOS << cxx_synthesis::getCxxSwiftNamespaceName()
+                              << "::";
+                  outOfLineOS << cxx_synthesis::getCxxImplNamespaceName();
+                  outOfLineOS << "::implClassFor<";
+                  outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
+                      objectTypeDecl->getModuleContext(),
+                      ED->getModuleContext());
+                  outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                  outOfLineOS << ">::type::getOpaquePointer(*valCopy)";
+                  outOfLineOS << ");\n";
+                }
+              }
+
+              outOfLineOS << "    result._destructiveInjectEnumTag(";
+              if (ED->isResilient()) {
+                outOfLineOS << cxx_synthesis::getCxxImplNamespaceName()
+                            << "::" << elementInfo->globalVariableName;
+              } else {
+                outOfLineOS << elementInfo->tag;
+              }
+              outOfLineOS << ");\n";
+              outOfLineOS << "    return result;\n";
+              outOfLineOS << "  ";
+            },
+            ED->getModuleContext(), outOfLineOS);
       }
-      os << "  };\n"; // enum class cases' closing bracket
+      os << "  } ";
+      syntaxPrinter.printIdentifier(caseName);
+      os << ";\n";
+    };
+
+    valueTypePrinter.printValueTypeDecl(ED, /*bodyPrinter=*/[&]() {
+      os << '\n';
+      os << "  enum class cases {";
+      llvm::interleave(
+          elementTagMapping, os,
+          [&](const auto &pair) {
+            os << "\n    ";
+            syntaxPrinter.printIdentifier(pair.first->getNameStr());
+          },
+          ",");
+      // TODO: allow custom name for this special case
+      auto resilientUnknownDefaultCaseName = "unknownDefault";
+      if (ED->isResilient()) {
+        os << (ED->getNumElements() > 0 ? ",\n    " : "\n    ")
+           << resilientUnknownDefaultCaseName;
+      }
+      os << "\n  };\n\n"; // enum class cases' closing bracket
+
+      os << "#pragma clang diagnostic push\n";
+      os << "#pragma clang diagnostic ignored \"-Wc++17-extensions\"  "
+         << "// allow use of inline static data member\n";
+      for (const auto &pair : elementTagMapping) {
+        // Printing struct
+        printStruct(pair.first->getNameStr(), pair.first, pair.second);
+        // Printing `is` function
+        printIsFunction(pair.first->getNameStr(), ED);
+        if (pair.first->hasAssociatedValues()) {
+          // Printing `get` function
+          printGetFunction(pair.first);
+        }
+        os << '\n';
+      }
+
+      if (ED->isResilient()) {
+        // Printing struct for unknownDefault
+        printStruct(resilientUnknownDefaultCaseName, /* elementDecl */ nullptr,
+                    /* elementInfo */ None);
+        // Printing isUnknownDefault
+        printIsFunction(resilientUnknownDefaultCaseName, ED);
+        os << '\n';
+      }
+      os << "#pragma clang diagnostic pop\n";
 
       // Printing operator cases()
       os << "  inline operator cases() const {\n";
-      os << "    switch (_getEnumTag()) {\n";
-      for (const auto &pair : elementTagMapping) {
-        // TODO: have to use global variable for resilient enum
-        os << "      case " << pair.second << ": return cases::";
-        syntaxPrinter.printIdentifier(pair.first->getNameStr());
-        os << ";\n";
+      if (ED->isResilient()) {
+        if (!elementTagMapping.empty()) {
+          os << "    auto tag = _getEnumTag();\n";
+        }
+        for (const auto &pair : elementTagMapping) {
+          os << "    if (tag == " << cxx_synthesis::getCxxImplNamespaceName();
+          os << "::" << pair.second.globalVariableName << ") return cases::";
+          syntaxPrinter.printIdentifier(pair.first->getNameStr());
+          os << ";\n";
+        }
+        os << "    return cases::" << resilientUnknownDefaultCaseName << ";\n";
+      } else { // non-resilient enum
+        os << "    switch (_getEnumTag()) {\n";
+        for (const auto &pair : elementTagMapping) {
+          os << "      case " << pair.second.tag << ": return cases::";
+          syntaxPrinter.printIdentifier(pair.first->getNameStr());
+          os << ";\n";
+        }
+        // TODO: change to Swift's fatalError when it's available in C++
+        os << "      default: abort();\n";
+        os << "    }\n"; // switch's closing bracket
       }
-      // TODO: change to Swift's fatalError when it's available in C++
-      os << "      default: abort();\n";
-      os << "    }\n"; // switch's closing bracket
-      os << "  }\n";   // operator cases()'s closing bracket
-
-      // Printing case-related functions
-      DeclAndTypeClangFunctionPrinter clangFuncPrinter(
-          os, owningPrinter.prologueOS, owningPrinter.typeMapping,
-          owningPrinter.interopContext);
-
-      for (const auto &pair : elementTagMapping) {
-        os << "  inline bool is";
-        auto name = pair.first->getNameStr().str();
-        name[0] = std::toupper(name[0]);
-        os << name << "() const {\n";
-        os << "    return *this == cases::";
-        syntaxPrinter.printIdentifier(pair.first->getNameStr());
-        os << ";\n  }\n";
-
-        if (!pair.first->hasAssociatedValues()) {
-          continue;
-        }
-
-        auto associatedValueList = pair.first->getParameterList();
-        // TODO: add tuple type support
-        if (associatedValueList->size() > 1) {
-          continue;
-        }
-        auto firstType = associatedValueList->front()->getType();
-        auto firstTypeDecl = firstType->getNominalOrBoundGenericNominal();
-        OptionalTypeKind optKind;
-        std::tie(firstType, optKind) =
-            getObjectTypeAndOptionality(firstTypeDecl, firstType);
-
-        // FIXME: (tongjie) may have to forward declare return type
-        os << "  inline ";
-        clangFuncPrinter.printClangFunctionReturnType(
-            firstType, optKind, firstTypeDecl->getModuleContext(),
-            owningPrinter.outputLang);
-        os << " get" << name << "() const {\n";
-        os << "    if (!is" << name << "()) abort();\n";
-        os << "    alignas(";
-        syntaxPrinter.printBaseName(ED);
-        os << ") unsigned char buffer[sizeof(";
-        syntaxPrinter.printBaseName(ED);
-        os << ")];\n";
-        os << "    auto *thisCopy = new(buffer) ";
-        syntaxPrinter.printBaseName(ED);
-        os << "(*this);\n";
-        os << "    char * _Nonnull payloadFromDestruction = "
-              "thisCopy->_destructiveProjectEnumData();\n";
-        if (auto knownCxxType =
-                owningPrinter.typeMapping.getKnownCxxTypeInfo(firstTypeDecl)) {
-          os << "    ";
-          clangFuncPrinter.printClangFunctionReturnType(
-              firstType, optKind, firstTypeDecl->getModuleContext(),
-              owningPrinter.outputLang);
-          os << " result;\n";
-          os << "    "
-                "memcpy(&result, payloadFromDestruction, sizeof(result));\n";
-          os << "    return result;\n";
-        } else {
-          os << "    return ";
-          syntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
-              firstTypeDecl->getModuleContext(), ED->getModuleContext());
-          os << cxx_synthesis::getCxxImplNamespaceName();
-          os << "::";
-          ClangValueTypePrinter::printCxxImplClassName(os, firstTypeDecl);
-          os << "::returnNewValue([&](char * _Nonnull result) {\n";
-          os << "      " << cxx_synthesis::getCxxImplNamespaceName();
-          os << "::";
-          ClangValueTypePrinter::printCxxImplClassName(os, firstTypeDecl);
-          os << "::initializeWithTake(result, payloadFromDestruction);\n";
-          os << "    });\n";
-        }
-        os << "  }\n";
-      }
+      os << "  }\n"; // operator cases()'s closing bracket
       os << "\n";
     });
-    os << outOfLineDefinitions;
-    outOfLineDefinitions.clear();
   }
 
   void visitEnumDecl(EnumDecl *ED) {
@@ -684,34 +891,37 @@ private:
                          .printSwiftABIFunctionSignatureAsCxxFunction(
                              AFD, methodTy,
                              /*selfTypeDeclContext=*/typeDeclContext);
+      if (!funcABI)
+        return;
       owningPrinter.prologueOS << cFuncPrologueOS.str();
 
-      DeclAndTypeClangFunctionPrinter declPrinter(os, owningPrinter.prologueOS,
-                                                  owningPrinter.typeMapping,
-                                                  owningPrinter.interopContext);
+      DeclAndTypeClangFunctionPrinter declPrinter(
+          os, owningPrinter.prologueOS, owningPrinter.typeMapping,
+          owningPrinter.interopContext, owningPrinter);
       if (auto *accessor = dyn_cast<AccessorDecl>(AFD)) {
         declPrinter.printCxxPropertyAccessorMethod(
-            typeDeclContext, accessor, funcABI.getSymbolName(), resultTy,
-            /*isDefinition=*/false);
+            typeDeclContext, accessor, funcABI->getSymbolName(), resultTy,
+            /*isDefinition=*/false, funcABI->additionalParams);
       } else {
-        declPrinter.printCxxMethod(typeDeclContext, AFD,
-                                   funcABI.getSymbolName(), resultTy,
-                                   /*isDefinition=*/false);
+        declPrinter.printCxxMethod(
+            typeDeclContext, AFD, funcABI->getSymbolName(), resultTy,
+            /*isDefinition=*/false, funcABI->additionalParams);
       }
 
-      llvm::raw_string_ostream defOS(outOfLineDefinitions);
       DeclAndTypeClangFunctionPrinter defPrinter(
-          defOS, owningPrinter.prologueOS, owningPrinter.typeMapping,
-          owningPrinter.interopContext);
+          owningPrinter.outOfLineDefinitionsOS, owningPrinter.prologueOS,
+          owningPrinter.typeMapping, owningPrinter.interopContext,
+          owningPrinter);
 
       if (auto *accessor = dyn_cast<AccessorDecl>(AFD)) {
 
         defPrinter.printCxxPropertyAccessorMethod(
-            typeDeclContext, accessor, funcABI.getSymbolName(), resultTy,
-            /*isDefinition=*/true);
+            typeDeclContext, accessor, funcABI->getSymbolName(), resultTy,
+            /*isDefinition=*/true, funcABI->additionalParams);
       } else {
-        defPrinter.printCxxMethod(typeDeclContext, AFD, funcABI.getSymbolName(),
-                                  resultTy, /*isDefinition=*/true);
+        defPrinter.printCxxMethod(
+            typeDeclContext, AFD, funcABI->getSymbolName(), resultTy,
+            /*isDefinition=*/true, funcABI->additionalParams);
       }
 
       // FIXME: SWIFT_WARN_UNUSED_RESULT
@@ -1008,6 +1218,9 @@ private:
 
     bool useMangledSymbolName() const { return !isCDecl; }
 
+    SmallVector<DeclAndTypeClangFunctionPrinter::AdditionalParam, 2>
+        additionalParams;
+
   private:
     bool isCDecl;
     StringRef symbolName;
@@ -1015,34 +1228,47 @@ private:
 
   // Converts the array of ABIAdditionalParam into an array of AdditionalParam
   void convertABIAdditionalParams(
-      AbstractFunctionDecl *FD, Type resultTy,
+      AbstractFunctionDecl *FD,
       llvm::SmallVector<IRABIDetailsProvider::ABIAdditionalParam, 1> ABIparams,
       llvm::SmallVector<DeclAndTypeClangFunctionPrinter::AdditionalParam, 2>
-          &params) {
+          &params,
+      Optional<NominalTypeDecl *> selfTypeDeclContext = None) {
     for (auto param : ABIparams) {
-      if (param.role == IRABIDetailsProvider::ABIAdditionalParam::
-                            ABIParameterRole::GenericRequirementRole)
+      using Role = IRABIDetailsProvider::ABIAdditionalParam::ABIParameterRole;
+      switch (param.getRole()) {
+      case Role::GenericRequirement:
         params.push_back({DeclAndTypeClangFunctionPrinter::AdditionalParam::
                               Role::GenericRequirement,
-                          resultTy->getASTContext().getOpaquePointerType(),
-                          /*isIndirect=*/false, param.genericRequirement});
-      else if (param.role ==
-               IRABIDetailsProvider::ABIAdditionalParam::ABIParameterRole::Self)
+                          FD->getASTContext().getOpaquePointerType(),
+                          /*isIndirect=*/false, param.getGenericRequirement()});
+        break;
+      case Role::GenericTypeMetadataSource:
+        params.push_back({DeclAndTypeClangFunctionPrinter::AdditionalParam::
+                              Role::GenericTypeMetadata,
+                          param.getMetadataSourceType(), /*isIndirect=*/false,
+                          None});
+        break;
+      case Role::Self:
         params.push_back(
             {DeclAndTypeClangFunctionPrinter::AdditionalParam::Role::Self,
-             resultTy->getASTContext().getOpaquePointerType(),
+             selfTypeDeclContext
+                 ? (*selfTypeDeclContext)->getDeclaredInterfaceType()
+                 : FD->getASTContext().getOpaquePointerType(),
              /*isIndirect=*/
              isa<FuncDecl>(FD) ? cast<FuncDecl>(FD)->isMutating() : false});
-      else if (param.role == IRABIDetailsProvider::ABIAdditionalParam::
-                                 ABIParameterRole::Error)
+        break;
+      case Role::Error:
         params.push_back(
             {DeclAndTypeClangFunctionPrinter::AdditionalParam::Role::Error,
-             resultTy->getASTContext().getOpaquePointerType()});
+             FD->getASTContext().getOpaquePointerType()});
+        break;
+      }
     }
   }
 
   // Print out the extern C Swift ABI function signature.
-  FuncionSwiftABIInformation printSwiftABIFunctionSignatureAsCxxFunction(
+  Optional<FuncionSwiftABIInformation>
+  printSwiftABIFunctionSignatureAsCxxFunction(
       AbstractFunctionDecl *FD, Optional<FunctionType *> givenFuncType = None,
       Optional<NominalTypeDecl *> selfTypeDeclContext = None) {
     assert(outputLang == OutputLanguageMode::Cxx);
@@ -1062,32 +1288,48 @@ private:
     auto resultTy =
         getForeignResultType(FD, funcTy, asyncConvention, errorConvention);
 
+    std::string cRepresentationString;
+    llvm::raw_string_ostream cRepresentationOS(cRepresentationString);
+
     FuncionSwiftABIInformation funcABI(FD);
 
-    os << "SWIFT_EXTERN ";
+    cRepresentationOS << "SWIFT_EXTERN ";
 
-    DeclAndTypeClangFunctionPrinter funcPrinter(os, owningPrinter.prologueOS,
-                                                owningPrinter.typeMapping,
-                                                owningPrinter.interopContext);
+    DeclAndTypeClangFunctionPrinter funcPrinter(
+        cRepresentationOS, owningPrinter.prologueOS, owningPrinter.typeMapping,
+        owningPrinter.interopContext, owningPrinter);
     auto ABIparams = owningPrinter.interopContext.getIrABIDetails()
                          .getFunctionABIAdditionalParams(FD);
-    llvm::SmallVector<DeclAndTypeClangFunctionPrinter::AdditionalParam, 2>
-        additionalParams;
-    if (selfTypeDeclContext && !isa<ConstructorDecl>(FD)) {
-      additionalParams.push_back(
+    // FIXME: Ideally direct 'self' would come from IR provider too.
+    if (selfTypeDeclContext && !isa<ConstructorDecl>(FD) &&
+        llvm::find_if(
+            ABIparams,
+            [](const IRABIDetailsProvider::ABIAdditionalParam &Param) {
+              return Param.getRole() ==
+                     IRABIDetailsProvider::ABIAdditionalParam::
+                         ABIParameterRole::Self;
+            }) == ABIparams.end()) {
+      (*selfTypeDeclContext)->getDeclaredInterfaceType();
+      funcABI.additionalParams.push_back(
           {DeclAndTypeClangFunctionPrinter::AdditionalParam::Role::Self,
-           (*selfTypeDeclContext)->getDeclaredType(),
+           (*selfTypeDeclContext)->getDeclaredInterfaceType(),
            /*isIndirect=*/
            isa<FuncDecl>(FD) ? cast<FuncDecl>(FD)->isMutating() : false});
     }
-    // FIXME: Fix the method 'self' parameter.
-    if (!selfTypeDeclContext && !ABIparams.empty())
-      convertABIAdditionalParams(FD, resultTy, ABIparams, additionalParams);
+    if (!ABIparams.empty())
+      convertABIAdditionalParams(FD, ABIparams, funcABI.additionalParams,
+                                 /*selfContext=*/selfTypeDeclContext);
 
-    funcPrinter.printFunctionSignature(
+    auto representation = funcPrinter.printFunctionSignature(
         FD, funcABI.getSymbolName(), resultTy,
         DeclAndTypeClangFunctionPrinter::FunctionSignatureKind::CFunctionProto,
-        additionalParams);
+        funcABI.additionalParams);
+    if (representation.isUnsupported()) {
+      // FIXME: Emit remark about unemitted declaration.
+      return None;
+    }
+
+    os << cRepresentationOS.str();
     // Swift functions can't throw exceptions, we can only
     // throw them from C++ when emitting C++ inline thunks for the Swift
     // functions.
@@ -1122,30 +1364,27 @@ private:
     auto resultTy =
         getForeignResultType(FD, funcTy, asyncConvention, errorConvention);
 
-    DeclAndTypeClangFunctionPrinter funcPrinter(os, owningPrinter.prologueOS,
-                                                owningPrinter.typeMapping,
-                                                owningPrinter.interopContext);
-    llvm::SmallVector<DeclAndTypeClangFunctionPrinter::AdditionalParam, 2>
-        additionalParams;
-    auto ABIparams = owningPrinter.interopContext.getIrABIDetails()
-                         .getFunctionABIAdditionalParams(FD);
-    if (!ABIparams.empty())
-      convertABIAdditionalParams(FD, resultTy, ABIparams, additionalParams);
+    DeclAndTypeClangFunctionPrinter funcPrinter(
+        os, owningPrinter.prologueOS, owningPrinter.typeMapping,
+        owningPrinter.interopContext, owningPrinter);
     DeclAndTypeClangFunctionPrinter::FunctionSignatureModifiers modifiers;
     modifiers.isInline = true;
-    funcPrinter.printFunctionSignature(
-        FD, FD->getName().getBaseIdentifier().get(), resultTy,
+    auto result = funcPrinter.printFunctionSignature(
+        FD, cxx_translation::getNameForCxx(FD), resultTy,
         DeclAndTypeClangFunctionPrinter::FunctionSignatureKind::CxxInlineThunk,
         {}, modifiers);
+    assert(
+        !result.isUnsupported()); // The C signature should be unsupported too.
     // FIXME: Support throwing exceptions for Swift errors.
     if (!funcTy->isThrowing())
       os << " noexcept";
     printFunctionClangAttributes(FD, funcTy);
     printAvailability(FD);
     os << " {\n";
-    funcPrinter.printCxxThunkBody(
-        funcABI.getSymbolName(), FD->getModuleContext(), resultTy,
-        FD->getParameters(), additionalParams, funcTy->isThrowing(), funcTy);
+    funcPrinter.printCxxThunkBody(funcABI.getSymbolName(),
+                                  FD->getModuleContext(), resultTy,
+                                  FD->getParameters(), funcABI.additionalParams,
+                                  funcTy->isThrowing(), funcTy);
     os << "}\n";
   }
 
@@ -1370,8 +1609,10 @@ private:
       llvm::raw_string_ostream cFuncPrologueOS(cFuncDecl);
       auto funcABI = Implementation(cFuncPrologueOS, owningPrinter, outputLang)
                          .printSwiftABIFunctionSignatureAsCxxFunction(FD);
+      if (!funcABI)
+        return;
       owningPrinter.prologueOS << cFuncPrologueOS.str();
-      printAbstractFunctionAsCxxFunctionThunk(FD, funcABI);
+      printAbstractFunctionAsCxxFunctionThunk(FD, *funcABI);
       return;
     }
     if (FD->getDeclContext()->isTypeContext())
@@ -1669,6 +1910,9 @@ public:
 
     // Print imported bridgeable decls as their unbridged type.
     if (nominal->hasClangNode())
+      return nullptr;
+
+    if (isa<ProtocolDecl>(nominal))
       return nullptr;
 
     auto &ctx = nominal->getASTContext();
@@ -2319,8 +2563,21 @@ static bool isAsyncAlternativeOfOtherDecl(const ValueDecl *VD) {
   return false;
 }
 
+static bool hasExposeAttr(const ValueDecl *VD) {
+  if (isa<NominalTypeDecl>(VD) && VD->getModuleContext()->isStdlibModule()) {
+    if (VD == VD->getASTContext().getStringDecl())
+      return true;
+    return false;
+  }
+  if (VD->getAttrs().hasAttribute<ExposeAttr>())
+    return true;
+  if (const auto *NMT = dyn_cast<NominalTypeDecl>(VD->getDeclContext()))
+    return hasExposeAttr(NMT);
+  return false;
+}
+
 bool DeclAndTypePrinter::shouldInclude(const ValueDecl *VD) {
-  return !VD->isInvalid() &&
+  return !VD->isInvalid() && (!requiresExposedAttribute || hasExposeAttr(VD)) &&
          (outputLang == OutputLanguageMode::Cxx
               ? cxx_translation::isVisibleToCxx(VD, minRequiredAccess)
               : isVisibleToObjC(VD, minRequiredAccess)) &&

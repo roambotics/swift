@@ -299,9 +299,9 @@ Type SubstitutionMap::lookupSubstitution(CanSubstitutableType type) const {
     return replacementType;
   }
 
-  // The generic parameter may not be canonical. Retrieve the canonical
+  // The generic parameter may not be reduced. Retrieve the reduced
   // type, which will be dependent.
-  CanType canonicalType = genericSig.getCanonicalTypeInContext(genericParam);
+  CanType canonicalType = genericSig.getReducedType(genericParam);
 
   // If nothing changed, we don't have a replacement.
   if (canonicalType == type) return Type();
@@ -367,11 +367,10 @@ SubstitutionMap::lookupConformance(CanType type, ProtocolDecl *proto) const {
     return ProtocolConformanceRef::forMissingOrInvalid(substType, proto);
   }
 
-  auto accessPath =
-    genericSig->getConformanceAccessPath(type, proto);
+  auto path = genericSig->getConformancePath(type, proto);
 
   ProtocolConformanceRef conformance;
-  for (const auto &step : accessPath) {
+  for (const auto &step : path) {
     // For the first step, grab the initial conformance.
     if (conformance.isInvalid()) {
       if (auto initialConformance = getSignatureConformance(
@@ -535,10 +534,25 @@ OverrideSubsInfo::OverrideSubsInfo(const NominalTypeDecl *baseNominal,
   if (auto baseNominalSig = baseNominal->getGenericSignature()) {
     BaseDepth = baseNominalSig.getGenericParams().back()->getDepth() + 1;
 
+    auto *genericEnv = derivedNominal->getGenericEnvironment();
     auto derivedNominalTy = derivedNominal->getDeclaredInterfaceType();
+
+    // FIXME: Map in and out of context to get more accurate
+    // conformance information. If the base generic signature
+    // is <T: P> and the derived generic signature is <T: C>
+    // where C is a class that conforms to P, then we want the
+    // substitution map to store the concrete conformance C: P
+    // and not the abstract conformance T: P.
+    if (genericEnv) {
+      derivedNominalTy = genericEnv->mapTypeIntoContext(
+          derivedNominalTy);
+    }
+
     BaseSubMap = derivedNominalTy->getContextSubstitutionMap(
-        baseNominal->getParentModule(), baseNominal);
-    assert(!BaseSubMap.hasArchetypes());
+        baseNominal->getParentModule(), baseNominal,
+        genericEnv);
+
+    BaseSubMap = BaseSubMap.mapReplacementTypesOutOfContext();
   }
 
   if (auto derivedNominalSig = derivedNominal->getGenericSignature())

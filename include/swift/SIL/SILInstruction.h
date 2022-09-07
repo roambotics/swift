@@ -5000,13 +5000,62 @@ public:
   MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
 };
 
+/// ExplicitCopyAddrInst - A copy_addr that should not be optimized and should
+/// be viewed
+class ExplicitCopyAddrInst
+    : public InstructionBase<SILInstructionKind::ExplicitCopyAddrInst,
+                             NonValueInstruction>,
+      public CopyLikeInstruction {
+  friend SILBuilder;
+
+private:
+  FixedOperandList<2> Operands;
+  USE_SHARED_UINT8;
+
+  ExplicitCopyAddrInst(SILDebugLocation DebugLoc, SILValue Src, SILValue Dest,
+                       IsTake_t isTakeOfSrc,
+                       IsInitialization_t isInitializationOfDest);
+
+public:
+  SILValue getSrc() const { return Operands[Src].get(); }
+  SILValue getDest() const { return Operands[Dest].get(); }
+
+  void setSrc(SILValue V) { Operands[Src].set(V); }
+  void setDest(SILValue V) { Operands[Dest].set(V); }
+
+  IsTake_t isTakeOfSrc() const {
+    return IsTake_t(sharedUInt8().ExplicitCopyAddrInst.isTakeOfSrc);
+  }
+  IsInitialization_t isInitializationOfDest() const {
+    return IsInitialization_t(
+        sharedUInt8().ExplicitCopyAddrInst.isInitializationOfDest);
+  }
+
+  void setIsTakeOfSrc(IsTake_t T) {
+    sharedUInt8().ExplicitCopyAddrInst.isTakeOfSrc = (bool)T;
+  }
+  void setIsInitializationOfDest(IsInitialization_t I) {
+    sharedUInt8().ExplicitCopyAddrInst.isInitializationOfDest = (bool)I;
+  }
+
+  ArrayRef<Operand> getAllOperands() const { return Operands.asArray(); }
+  MutableArrayRef<Operand> getAllOperands() { return Operands.asArray(); }
+};
+
 /// "%token = bind_memory %0 : $Builtin.RawPointer, %1 : $Builtin.Word to $T"
 ///
 /// Binds memory at the raw pointer %0 to type $T with enough capacity
 /// to hold %1 values.
 ///
 /// %token is an opaque word representing the previously bound types of this
-/// memory region, before binding it to a contiguous region of type $T.
+/// memory region, before binding it to a contiguous region of type $T. This
+/// token has no purpose unless it is consumed be a rebind_memory instruction.
+///
+/// Semantics: changes the type information assocated with a memory region. This
+/// affects all memory operations that alias with the given region of memory,
+/// regardless of their type or address provenance. For optimizations that query
+/// side effects, this is equivalent to writing and immediately reading an
+/// unknown value to memory at `%0` of `%1` bytes.
 class BindMemoryInst final : public InstructionBaseWithTrailingOperands<
                                  SILInstructionKind::BindMemoryInst,
                                  BindMemoryInst, SingleValueInstruction> {
@@ -5054,6 +5103,9 @@ public:
 ///
 /// %out_token represents the previously bound types of this memory region,
 /// before binding it to %in_token.
+///
+/// This has the same semantics as bind_memory except that the size of memory
+/// affected must be derived from `%in_token`.
 class RebindMemoryInst final : public SingleValueInstruction {
   FixedOperandList<2> Operands;
 

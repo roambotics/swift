@@ -29,6 +29,7 @@
 #include "swift/AST/GenericParamKey.h"
 #include "swift/AST/IfConfigClause.h"
 #include "swift/AST/LayoutConstraint.h"
+#include "swift/AST/LifetimeAnnotation.h"
 #include "swift/AST/ReferenceCounting.h"
 #include "swift/AST/RequirementSignature.h"
 #include "swift/AST/StorageImpl.h"
@@ -985,6 +986,19 @@ public:
   /// Check if this is a declaration defined at the top level of the Swift module
   bool isStdlibDecl() const;
 
+  LifetimeAnnotation getLifetimeAnnotation() const {
+    auto &attrs = getAttrs();
+    if (attrs.hasAttribute<EagerMoveAttr>())
+      return LifetimeAnnotation::EagerMove;
+    if (attrs.hasAttribute<LexicalAttr>())
+      return LifetimeAnnotation::Lexical;
+    return LifetimeAnnotation::None;
+  }
+
+  bool isNoImplicitCopy() const {
+    return getAttrs().hasAttribute<NoImplicitCopyAttr>();
+  }
+
   AvailabilityContext getAvailabilityForLinkage() const;
 
   /// Whether this declaration or one of its outer contexts has the
@@ -1415,10 +1429,6 @@ public:
   bool canNeverBeBound() const;
 
   bool hasValidParent() const;
-
-  /// Determine whether this extension has already been bound to a nominal
-  /// type declaration.
-  bool alreadyBoundToNominal() const { return NextExtension.getInt(); }
 
   /// Retrieve the extended type definition as written in the source, if it exists.
   ///
@@ -3748,6 +3758,21 @@ public:
     return getGlobalActorInstance() != nullptr;
   }
 
+  /// Returns true if this type has a type wrapper custom attribute.
+  bool hasTypeWrapper() const { return bool(getTypeWrapper()); }
+
+  /// Return a type wrapper (if any) associated with this type.
+  NominalTypeDecl *getTypeWrapper() const;
+
+  /// If this declaration has a type wrapper return a property that
+  /// is used for all type wrapper related operations (mainly for
+  /// applicable property access routing).
+  VarDecl *getTypeWrapperProperty() const;
+
+  /// Get an initializer that could be used to instantiate a
+  /// type wrapped type.
+  ConstructorDecl *getTypeWrapperInitializer() const;
+
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) {
     return D->getKind() >= DeclKind::First_NominalTypeDecl &&
@@ -5447,6 +5472,20 @@ public:
   /// is provided first.
   llvm::TinyPtrVector<CustomAttr *> getAttachedPropertyWrappers() const;
 
+  /// Retrieve the outermost property wrapper attribute associated with
+  /// this declaration. For example:
+  ///
+  /// \code
+  /// @A @B @C var <name>: Bool = ...
+  /// \endcode
+  ///
+  /// The outermost attribute in this case is `@A` and it has
+  /// complete wrapper type `A<B<C<Bool>>>`.
+  CustomAttr *getOutermostAttachedPropertyWrapper() const {
+    auto wrappers = getAttachedPropertyWrappers();
+    return wrappers.empty() ? nullptr : wrappers.front();
+  }
+
   /// Whether this property has any attached property wrappers.
   bool hasAttachedPropertyWrapper() const;
 
@@ -5529,7 +5568,18 @@ public:
   /// Return true if this property either has storage or has an attached property
   /// wrapper that has storage.
   bool hasStorageOrWrapsStorage() const;
-  
+
+  /// Whether this property belongs to a type wrapped type and has
+  /// all access to it routed through a type wrapper.
+  bool isAccessedViaTypeWrapper() const;
+
+  /// For type wrapped properties (see \c isAccessedViaTypeWrapper)
+  /// all access is routed through a type wrapper.
+  ///
+  /// \returns an underlying type wrapper property which is a
+  /// storage endpoint for all access to this property.
+  VarDecl *getUnderlyingTypeWrapperStorage() const;
+
   /// Visit all auxiliary declarations to this VarDecl.
   ///
   /// An auxiliary declaration is a declaration synthesized by the compiler to support
@@ -5761,10 +5811,6 @@ public:
 
   void setDefaultArgumentKind(ArgumentAttrs K) {
     setDefaultArgumentKind(K.argumentKind);
-  }
-
-  bool isNoImplicitCopy() const {
-    return getAttrs().hasAttribute<NoImplicitCopyAttr>();
   }
 
   /// Whether this parameter has a default argument expression available.

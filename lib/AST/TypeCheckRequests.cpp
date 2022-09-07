@@ -1474,6 +1474,12 @@ void swift::simple_display(llvm::raw_ostream &out,
     out << ")";
   }
 
+  if (import.options.contains(ImportFlags::Preconcurrency))
+    out << " preconcurrency";
+
+  if (import.options.contains(ImportFlags::WeakLinked))
+    out << " weak-linked";
+
   out << " ]";
 }
 
@@ -1523,6 +1529,10 @@ void swift::simple_display(llvm::raw_ostream &out, CustomAttrTypeKind value) {
 
   case CustomAttrTypeKind::PropertyWrapper:
     out << "property-wrapper";
+    return;
+
+  case CustomAttrTypeKind::TypeWrapper:
+    out << "type-wrapper";
     return;
 
   case CustomAttrTypeKind::GlobalActor:

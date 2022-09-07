@@ -51,9 +51,11 @@
 // CHECK-NEXT:  size_t stride;
 // CHECK-NEXT:  unsigned flags;
 // CHECK-NEXT:  unsigned extraInhabitantCount;
+// CHECK-EMPTY:
+// CHECK-NEXT:  constexpr size_t getAlignment() const { return (flags & 255) + 1; }
 // CHECK-NEXT: };
 // CHECK-EMPTY:
-// CHECK-NEXT: using EnumValueWitnessGetEnumTagTy = int(* __ptrauth_swift_value_witness_function_pointer(41909))(const void * _Nonnull, void * _Nonnull) SWIFT_NOEXCEPT_FUNCTION_PTR;
+// CHECK-NEXT: using EnumValueWitnessGetEnumTagTy = unsigned(* __ptrauth_swift_value_witness_function_pointer(41909))(const void * _Nonnull, void * _Nonnull) SWIFT_NOEXCEPT_FUNCTION_PTR;
 // CHECK-NEXT: using EnumValueWitnessDestructiveProjectEnumDataTy = void(* __ptrauth_swift_value_witness_function_pointer(1053))(void * _Nonnull, void * _Nonnull) SWIFT_NOEXCEPT_FUNCTION_PTR;
 // CHECK-NEXT: using EnumValueWitnessDestructiveInjectEnumTagTy = void(* __ptrauth_swift_value_witness_function_pointer(45796))(void * _Nonnull, unsigned, void * _Nonnull) SWIFT_NOEXCEPT_FUNCTION_PTR;
 // CHECK-EMPTY:
@@ -96,24 +98,8 @@
 // CHECK-NEXT: }
 // CHECK-NEXT: #endif
 // CHECK-EMPTY:
-// CHECK-NEXT: /// Container for an opaque Swift value, like resilient struct.
-// CHECK-NEXT: class OpaqueStorage {
-// CHECK-NEXT: public:
-// CHECK-NEXT:   inline OpaqueStorage() noexcept : storage(nullptr) { }
-// CHECK-NEXT:   inline OpaqueStorage(ValueWitnessTable * _Nonnull vwTable) noexcept : storage(reinterpret_cast<char *>(opaqueAlloc(vwTable->size, (vwTable->flags &255) + 1))) { }
-// CHECK-NEXT:   inline OpaqueStorage(OpaqueStorage&& other) noexcept : storage(other.storage) { other.storage = nullptr; }
-// CHECK-NEXT:   inline OpaqueStorage(const OpaqueStorage&) noexcept = delete;
-// CHECK-NEXT:   inline ~OpaqueStorage() noexcept { if (storage) { opaqueFree(static_cast<char * _Nonnull>(storage)); } }
-// CHECK-NEXT:   void operator =(OpaqueStorage&& other) noexcept { auto temp = storage; storage = other.storage; other.storage = temp; }
-// CHECK-NEXT:   void operator =(const OpaqueStorage&) noexcept = delete;
-// CHECK-NEXT:   inline char * _Nonnull getOpaquePointer() noexcept { return static_cast<char * _Nonnull>(storage); }
-// CHECK-NEXT:   inline const char * _Nonnull getOpaquePointer() const noexcept { return static_cast<char * _Nonnull>(storage); }
-// CHECK-NEXT: private:
-// CHECK-NEXT:   char * _Nullable storage;
-// CHECK-NEXT: };
-// CHECK-EMPTY:
 // CHECK-NEXT: /// Naive exception class that should be thrown
-// CHECK-NEXT: class NaiveException {
+// CHECK-NEXT: class NaiveException : public swift::Error {
 // CHECK-NEXT: public:
 // CHECK-NEXT: inline NaiveException(const char * _Nonnull msg) noexcept : msg_(msg) { }
 // CHECK-NEXT: inline NaiveException(NaiveException&& other) noexcept : msg_(other.msg_) { other.msg_ = nullptr; }
@@ -133,97 +119,121 @@
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<bool> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<bool>() {
-// CHECK-NEXT:   return &_impl::$sSbN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<bool> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$sSbN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<int8_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<int8_t>() {
-// CHECK-NEXT:   return &_impl::$ss4Int8VN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<int8_t> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$ss4Int8VN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<uint8_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<uint8_t>() {
-// CHECK-NEXT:   return &_impl::$ss5UInt8VN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<uint8_t> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$ss5UInt8VN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<int16_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<int16_t>() {
-// CHECK-NEXT:   return &_impl::$ss5Int16VN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<int16_t> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$ss5Int16VN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<uint16_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<uint16_t>() {
-// CHECK-NEXT:   return &_impl::$ss6UInt16VN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<uint16_t> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$ss6UInt16VN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<int32_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<int32_t>() {
-// CHECK-NEXT:   return &_impl::$ss5Int32VN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<int32_t> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$ss5Int32VN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<uint32_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<uint32_t>() {
-// CHECK-NEXT:   return &_impl::$ss6UInt32VN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<uint32_t> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$ss6UInt32VN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<int64_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<int64_t>() {
-// CHECK-NEXT:   return &_impl::$ss5Int64VN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<int64_t> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$ss5Int64VN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<uint64_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<uint64_t>() {
-// CHECK-NEXT:   return &_impl::$ss6UInt64VN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<uint64_t> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$ss6UInt64VN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<float> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<float>() {
-// CHECK-NEXT:   return &_impl::$sSfN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<float> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$sSfN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<double> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<double>() {
-// CHECK-NEXT:   return &_impl::$sSdN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<double> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$sSdN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<void *> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: inline void * _Nonnull getTypeMetadata<void *>() {
-// CHECK-NEXT:   return &_impl::$ss13OpaquePointerVN;
-// CHECK-NEXT: }
+// CHECK-NEXT: struct TypeMetadataTrait<void *> {
+// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return &_impl::$ss13OpaquePointerVN;
+// CHECK-NEXT:   }
+// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: #endif
 // CHECK-EMPTY:

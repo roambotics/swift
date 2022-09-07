@@ -18,6 +18,7 @@
 #include "swift/AST/USRGeneration.h"
 #include "swift/Basic/Version.h"
 #include "swift/Sema/IDETypeChecking.h"
+#include "swift/SymbolGraphGen/DocumentationCategory.h"
 
 #include "DeclarationFragmentPrinter.h"
 #include "FormatVersion.h"
@@ -448,11 +449,24 @@ void
 SymbolGraph::recordConformanceRelationships(Symbol S) {
   const auto VD = S.getSymbolDecl();
   if (const auto *NTD = dyn_cast<NominalTypeDecl>(VD)) {
-    for (const auto *Conformance : NTD->getAllConformances()) {
-      recordEdge(Symbol(this, VD, nullptr),
-        Symbol(this, Conformance->getProtocol(), nullptr),
-        RelationshipKind::ConformsTo(),
-        dyn_cast_or_null<ExtensionDecl>(Conformance->getDeclContext()));
+    if (auto *PD = dyn_cast<ProtocolDecl>(NTD)) {
+      PD->walkInheritedProtocols([&](ProtocolDecl *inherited) {
+        if (inherited != PD) {
+          recordEdge(Symbol(this, VD, nullptr),
+            Symbol(this, inherited, nullptr),
+            RelationshipKind::ConformsTo(),
+            nullptr);
+        }
+
+        return TypeWalker::Action::Continue;
+      });
+    } else {
+      for (const auto *Conformance : NTD->getAllConformances()) {
+        recordEdge(Symbol(this, VD, nullptr),
+          Symbol(this, Conformance->getProtocol(), nullptr),
+          RelationshipKind::ConformsTo(),
+          dyn_cast_or_null<ExtensionDecl>(Conformance->getDeclContext()));
+      }
     }
   }
 }
@@ -581,6 +595,12 @@ bool SymbolGraph::isImplicitlyPrivate(const Decl *D,
     return true;
   }
 
+  // If the decl has a `@_documentation(visibility: <access>)` attribute, override any other heuristic
+  auto DocVisibility = documentationVisibilityForDecl(D);
+  if (DocVisibility) {
+    return Walker.Options.MinimumAccessLevel > (*DocVisibility);
+  }
+
   // Don't record effectively internal declarations if specified
   if (D->hasUnderscoredNaming()) {
     // Some implicit decls from Clang with underscored names sneak in, so throw those out
@@ -626,6 +646,13 @@ bool SymbolGraph::isImplicitlyPrivate(const Decl *D,
     }
 
     // Special cases below.
+
+    // Symbols from exported-imported modules should only be included if they
+    // were originally public.
+    if (Walker.isFromExportedImportedModule(D) &&
+        VD->getFormalAccess() < AccessLevel::Public) {
+      return true;
+    }
 
     auto BaseName = VD->getBaseName().userFacingName();
 

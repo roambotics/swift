@@ -1002,6 +1002,9 @@ bool Decl::isWeakImported(ModuleDecl *fromModule) const {
   if (isAlwaysWeakImported())
     return true;
 
+  if (fromModule->isImportedAsWeakLinked(this->getModuleContext()))
+    return true;
+
   auto availability = getAvailabilityForLinkage();
   if (availability.isAlwaysAvailable())
     return false;
@@ -4041,6 +4044,9 @@ findGenericParameterReferences(CanGenericSignature genericSig,
     auto opaqueSig = opaque->getDecl()->getOpaqueInterfaceGenericSignature();
     for (const auto &req : opaqueSig.getRequirements()) {
       switch (req.getKind()) {
+      case RequirementKind::SameCount:
+        llvm_unreachable("Same-count requirement not supported here");
+
       case RequirementKind::Conformance:
       case RequirementKind::Layout:
         continue;
@@ -4106,7 +4112,7 @@ findGenericParameterReferences(CanGenericSignature genericSig,
 
   // If the type parameter is beyond the domain of the existential generic
   // signature, ignore it.
-  if (!genericSig->isValidTypeInContext(type)) {
+  if (!genericSig->isValidTypeParameter(type)) {
     return GenericParameterReferenceInfo();
   }
 
@@ -4168,7 +4174,7 @@ GenericParameterReferenceInfo ValueDecl::findExistentialSelfReferences(
   // Note: a non-null GenericSignature would violate the invariant that
   // the protocol 'Self' type referenced from the requirement's interface
   // type is the same as the existential 'Self' type.
-  auto sig = getASTContext().getOpenedArchetypeSignature(baseTy,
+  auto sig = getASTContext().getOpenedExistentialSignature(baseTy,
       GenericSignature());
 
   auto genericParam = sig.getGenericParams().front();
@@ -4384,7 +4390,7 @@ ExtensionRange NominalTypeDecl::getExtensions() {
 }
 
 void NominalTypeDecl::addExtension(ExtensionDecl *extension) {
-  assert(!extension->alreadyBoundToNominal() && "Already added extension");
+  assert(!extension->NextExtension.getInt() && "Already added extension");
   extension->NextExtension.setInt(true);
   
   // First extension; set both first and last.
@@ -6600,7 +6606,7 @@ bool VarDecl::hasExternalPropertyWrapper() const {
     return true;
 
   // Wrappers with attribute arguments are always implementation-detail.
-  if (getAttachedPropertyWrappers().front()->hasArgs())
+  if (getOutermostAttachedPropertyWrapper()->hasArgs())
     return false;
 
   auto wrapperInfo = getAttachedPropertyWrapperTypeInfo(0);
@@ -6727,7 +6733,8 @@ bool VarDecl::hasStorageOrWrapsStorage() const {
 }
 
 void VarDecl::visitAuxiliaryDecls(llvm::function_ref<void(VarDecl *)> visit) const {
-  if (getDeclContext()->isTypeContext() || isImplicit())
+  if (getDeclContext()->isTypeContext() ||
+      (isImplicit() && !isa<ParamDecl>(this)))
     return;
 
   if (getAttrs().hasAttribute<LazyAttr>()) {
@@ -9205,14 +9212,20 @@ ActorIsolation swift::getActorIsolation(ValueDecl *value) {
 }
 
 ActorIsolation swift::getActorIsolationOfContext(DeclContext *dc) {
-  if (auto *vd = dyn_cast_or_null<ValueDecl>(dc->getAsDecl()))
+  auto dcToUse = dc;
+  // Defer bodies share actor isolation of their enclosing context.
+  if (auto FD = dyn_cast<FuncDecl>(dcToUse)) {
+    if (FD->isDeferBody()) {
+      dcToUse = FD->getDeclContext();
+    }
+  }
+  if (auto *vd = dyn_cast_or_null<ValueDecl>(dcToUse->getAsDecl()))
     return getActorIsolation(vd);
 
-  if (auto *var = dc->getNonLocalVarDecl())
-     return getActorIsolation(var);
+  if (auto *var = dcToUse->getNonLocalVarDecl())
+    return getActorIsolation(var);
 
-
-  if (auto *closure = dyn_cast<AbstractClosureExpr>(dc)) {
+  if (auto *closure = dyn_cast<AbstractClosureExpr>(dcToUse)) {
     switch (auto isolation = closure->getActorIsolation()) {
     case ClosureActorIsolation::Independent:
       return ActorIsolation::forIndependent()
@@ -9229,20 +9242,21 @@ ActorIsolation swift::getActorIsolationOfContext(DeclContext *dc) {
       auto actor = selfDecl->getType()->getReferenceStorageReferent()
           ->getAnyActor();
       assert(actor && "Bad closure actor isolation?");
-      return ActorIsolation::forActorInstance(actor)
+      // FIXME: This could be a parameter... or a capture... hmmm.
+      return ActorIsolation::forActorInstanceSelf(actor)
         .withPreconcurrency(isolation.preconcurrency());
     }
     }
   }
 
-  if (auto *tld = dyn_cast<TopLevelCodeDecl>(dc)) {
-    if (dc->isAsyncContext() ||
-        dc->getASTContext().LangOpts.StrictConcurrencyLevel
-            >= StrictConcurrency::Complete) {
-      if (Type mainActor = dc->getASTContext().getMainActorType())
+  if (auto *tld = dyn_cast<TopLevelCodeDecl>(dcToUse)) {
+    if (dcToUse->isAsyncContext() ||
+        dcToUse->getASTContext().LangOpts.StrictConcurrencyLevel >=
+            StrictConcurrency::Complete) {
+      if (Type mainActor = dcToUse->getASTContext().getMainActorType())
         return ActorIsolation::forGlobalActor(
             mainActor,
-            /*unsafe=*/!dc->getASTContext().isSwiftVersionAtLeast(6));
+            /*unsafe=*/!dcToUse->getASTContext().isSwiftVersionAtLeast(6));
     }
   }
 

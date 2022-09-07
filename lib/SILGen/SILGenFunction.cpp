@@ -981,6 +981,7 @@ void SILGenFunction::emitAsyncMainThreadStart(SILDeclRef entryPoint) {
 
 void SILGenFunction::emitGeneratorFunction(SILDeclRef function, Expr *value,
                                            bool EmitProfilerIncrement) {
+  auto *const topLevelValue = value;
   auto *dc = function.getDecl()->getInnermostDeclContext();
   MagicFunctionName = SILGenModule::getMagicFunctionName(function);
 
@@ -1034,8 +1035,12 @@ void SILGenFunction::emitGeneratorFunction(SILDeclRef function, Expr *value,
   auto interfaceType = value->getType()->mapTypeOutOfContext();
   emitProlog(captureInfo, params, /*selfParam=*/nullptr,
              dc, interfaceType, /*throws=*/false, SourceLoc());
-  if (EmitProfilerIncrement)
-    emitProfilerIncrement(value);
+  if (EmitProfilerIncrement) {
+    // Emit a profiler increment for the top-level value, not looking through
+    // any function conversions. This is necessary as the counter would have
+    // been recorded for this expression, not the sub-expression.
+    emitProfilerIncrement(topLevelValue);
+  }
   prepareEpilog(interfaceType, false, CleanupLocation(Loc));
 
   {
@@ -1163,9 +1168,8 @@ void SILGenFunction::emitProfilerIncrement(ASTNode N) {
   const auto &RegionCounterMap = SP->getRegionCounterMap();
   auto CounterIt = RegionCounterMap.find(N);
 
-  // TODO: Assert that this cannot happen (rdar://42792053).
-  if (CounterIt == RegionCounterMap.end())
-    return;
+  assert(CounterIt != RegionCounterMap.end() &&
+         "cannot increment non-existent counter");
 
   auto Int32Ty = getLoweredType(BuiltinIntegerType::get(32, C));
   auto Int64Ty = getLoweredType(BuiltinIntegerType::get(64, C));
