@@ -735,6 +735,7 @@ get_filename_component(SWIFT_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR} REALPATH)
 set(SWIFT_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 set(SWIFT_CMAKE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 set(SWIFT_MAIN_INCLUDE_DIR "${SWIFT_SOURCE_DIR}/include")
+set(SWIFT_SHIMS_INCLUDE_DIR "${SWIFT_SOURCE_DIR}/stdlib/public/SwiftShims")
 set(SWIFT_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/include")
 
 set(SWIFT_RUNTIME_OUTPUT_INTDIR "${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR}/bin")
@@ -755,7 +756,7 @@ elseif(BOOTSTRAPPING_MODE MATCHES "BOOTSTRAPPING.*")
   else()
     set(BOOTSTRAPPING_MODE "HOSTTOOLS")
   endif()
-elseif(BOOTSTRAPPING_MODE STREQUAL "HOSTTOOLS")
+elseif(BOOTSTRAPPING_MODE STREQUAL "HOSTTOOLS" OR SWIFT_SWIFT_PARSER)
   # We are building using a pre-installed host toolchain but not bootstrapping
   # the Swift modules. This happens when building using 'build-tooling-libs'
   # where we haven't built a new Swift compiler. Use the Swift compiler from the
@@ -785,6 +786,7 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 include_directories(BEFORE
   ${SWIFT_MAIN_INCLUDE_DIR}
   ${SWIFT_INCLUDE_DIR}
+  ${SWIFT_SHIMS_INCLUDE_DIR}
   )
 
 # Configuration flags passed to all of our invocations of gyb.  Try to
@@ -870,18 +872,8 @@ endif()
 
 # When we have the early SwiftSyntax build, we can include its parser.
 if(SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR)
-  # An option that specifies how the SwiftSyntax-based Swift parser is
-  # integrated.
-  option(SWIFT_SWIFT_PARSER_MODE [=[
-How to use the SwiftSyntax-based Swift parser. Possible values are
-    OFF:           do not use this parser at all
-    ROUNDTRIP:     ensure that the SwiftSyntax-based Swift parser round-trips
-]=] OFF)
-
-  if(SWIFT_SWIFT_PARSER_MODE)
-    set(SWIFT_SWIFT_PARSER TRUE)
-    include(${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/cmake/SwiftSyntaxTargets.cmake)
-  endif()
+  set(SWIFT_SWIFT_PARSER TRUE)
+  include(${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/cmake/SwiftSyntaxTargets.cmake)
 endif()
 
 
@@ -1091,6 +1083,7 @@ if(SWIFT_INCLUDE_TOOLS)
   message(STATUS "  Assertions:     ${LLVM_ENABLE_ASSERTIONS}")
   message(STATUS "  LTO:            ${SWIFT_TOOLS_ENABLE_LTO}")
   message(STATUS "  Bootstrapping:  ${BOOTSTRAPPING_MODE}")
+  message(STATUS "  Swift parser:   ${SWIFT_SWIFT_PARSER}")
   message(STATUS "")
 else()
   message(STATUS "Not building host Swift tools")
@@ -1185,6 +1178,7 @@ endif()
 if(SWIFT_BUILD_STDLIB)
   add_subdirectory(stdlib)
 else()
+  set(SWIFT_STDLIB_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/stdlib")
   # Some of the things below depend on the threading library
   add_subdirectory(stdlib/public/Threading)
 

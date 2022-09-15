@@ -22,6 +22,7 @@ add_swift_host_library(swiftParse STATIC
   ParseRequests.cpp
   ParseStmt.cpp
   ParseType.cpp
+  ParseVersion.cpp
   PersistentParserState.cpp
   SyntaxParsingCache.cpp
   SyntaxParsingContext.cpp)
@@ -59,7 +60,7 @@ if (SWIFT_SWIFT_PARSER)
 
   target_compile_definitions(swiftParse
     PRIVATE
-    SWIFT_SWIFT_PARSER_ROUNDTRIP
+    SWIFT_SWIFT_PARSER
   )
 endif()
 

@@ -3945,15 +3945,6 @@ ParserStatus Parser::parseTypeAttribute(TypeAttributes &Attributes,
     Attributes.setOpaqueReturnTypeOf(mangling, index);
     break;
   }
-
-  case TAK_tuple: {
-    if (!isInSILMode()) {
-      diagnose(AtLoc, diag::only_allowed_in_sil, "tuple");
-      return makeParserSuccess();
-    }
-
-    Attributes.IsTuple = true;
-  }
   }
 
   Attributes.setAttr(attr, AtLoc);
@@ -6255,7 +6246,6 @@ static AccessorDecl *createAccessorFunc(SourceLoc DeclLoc,
                                      storageParam->getNameLoc(),
                                      storageParam->getName(),
                                      P->CurDeclContext);
-        accessorParam->setVariadic(storageParam->isVariadic());
         accessorParam->setAutoClosure(storageParam->isAutoClosure());
 
         // The cloned parameter is implicit.

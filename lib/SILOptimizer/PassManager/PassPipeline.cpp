@@ -129,17 +129,23 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   P.addNoReturnFolding();
   addDefiniteInitialization(P);
 
-
   //===---
-  // Ownership Optimizations
+  // Begin Ownership Optimizations
   //
 
-  P.addMoveKillsCopyableAddressesChecker();
-  P.addMoveOnlyObjectChecker(); // Check noImplicitCopy and move only
-                                // types.
+  P.addMoveOnlyAddressChecker(); // Check noImplicitCopy and move only types for
+                                 // addresses.
+  P.addMoveKillsCopyableAddressesChecker(); // Check _move for addresses.
+  P.addMoveOnlyObjectChecker();          // Check noImplicitCopy and move only
+                                         // types for objects
   P.addMoveKillsCopyableValuesChecker(); // No uses after _move of copyable
-                                         //   value.
-  P.addTrivialMoveOnlyTypeEliminator();
+                                         // value.
+  P.addTrivialMoveOnlyTypeEliminator();  // Lower move only wrapped trivial
+                                         // types.
+
+  //
+  // End Ownership Optimizations
+  //===---
 
   P.addAddressLowering();
 
@@ -811,6 +817,9 @@ static void addLastChanceOptPassPipeline(SILPassPipelinePlan &P) {
   // Emits remarks on all functions with @_assemblyVision attribute.
   P.addAssemblyVisionRemarkGenerator();
 
+  // In optimized builds, do the inter-procedural analysis in a module pass.
+  P.addStackProtection();
+
   // FIXME: rdar://72935649 (Miscompile on combining PruneVTables with WMO)
   // P.addPruneVTables();
 }
@@ -982,6 +991,9 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
   if (P.getOptions().AssumeSingleThreaded) {
     P.addAssumeSingleThreaded();
   }
+
+  // In Onone builds, do a function-local analysis in a function pass.
+  P.addFunctionStackProtection();
 
   // Has only an effect if the -sil-based-debuginfo option is specified.
   P.addSILDebugInfoGenerator();

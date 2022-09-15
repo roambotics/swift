@@ -530,7 +530,8 @@ static bool matchCallArgumentsImpl(
     }
 
     // Handle variadic parameters.
-    if (param.isVariadic()) {
+    if (param.isVariadic() ||
+        param.getPlainType()->is<PackExpansionType>()) {
       // Claim the next argument with the name of this parameter.
       auto claimed =
           claimNextNamed(nextArgIdx, paramLabel, ignoreNameMismatch);
@@ -546,7 +547,8 @@ static bool matchCallArgumentsImpl(
 
       // If the argument is itself variadic, we're forwarding varargs
       // with a VarargExpansionExpr; don't collect any more arguments.
-      if (args[*claimed].isVariadic()) {
+      if (args[*claimed].isVariadic() ||
+          args[*claimed].getPlainType()->is<PackExpansionType>()) {
         return;
       }
 
@@ -796,7 +798,8 @@ static bool matchCallArgumentsImpl(
       const auto &param = params[paramIdx];
 
       // Variadic parameters can be unfulfilled.
-      if (param.isVariadic())
+      if (param.isVariadic() ||
+          param.getPlainType()->is<PackExpansionType>())
         continue;
 
       // Parameters with defaults can be unfulfilled.
@@ -885,7 +888,9 @@ static bool matchCallArgumentsImpl(
           continue;
 
         // Does nothing for variadic tail.
-        if (params[paramIdx].isVariadic() && paramBindIdx > 0) {
+        if ((params[paramIdx].isVariadic() ||
+             params[paramIdx].getPlainType()->is<PackExpansionType>()) &&
+            paramBindIdx > 0) {
           assert(args[fromArgIdx].getLabel().empty());
           continue;
         }
@@ -1576,7 +1581,7 @@ shouldOpenExistentialCallArgument(
     return None;
 
   // If the parameter is non-generic variadic, don't open.
-  if (param->isVariadic() && !param->getVarargBaseTy()->hasTypeSequence())
+  if (param->isVariadic())
     return None;
 
   // Look through an inout type on the formal type of the parameter.
@@ -2432,8 +2437,9 @@ static bool isSingleTupleParam(ASTContext &ctx,
     return false;
 
   const auto &param = params.front();
-  if (param.isVariadic() || param.isInOut() || param.hasLabel() ||
-      param.isIsolated())
+  if ((param.isVariadic() ||
+       param.getPlainType()->is<PackExpansionType>()) ||
+      param.isInOut() || param.hasLabel() || param.isIsolated())
     return false;
 
   auto paramType = param.getPlainType();
@@ -6132,6 +6138,11 @@ ConstraintSystem::matchTypes(Type type1, Type type2, ConstraintKind kind,
 #include "swift/AST/TypeNodes.def"
       llvm_unreachable("artificial type in constraint");
 
+    case TypeKind::BuiltinTuple:
+      llvm_unreachable("BuiltinTupleType in constraint");
+
+    // Note: Mismatched builtin types fall through to the TypeKind::Error
+    // case below.
 #define BUILTIN_TYPE(id, parent) case TypeKind::id:
 #define TYPE(id, parent)
 #include "swift/AST/TypeNodes.def"
@@ -6985,6 +6996,9 @@ ConstraintSystem::simplifyConstructionConstraint(
 #define TYPE(id, parent)
 #include "swift/AST/TypeNodes.def"
       llvm_unreachable("artificial type in constraint");
+
+  case TypeKind::BuiltinTuple:
+    llvm_unreachable("BuiltinTupleType in constraint");
     
   case TypeKind::Unresolved:
   case TypeKind::Error:
@@ -8215,27 +8229,24 @@ performMemberLookup(ConstraintKind constraintKind, DeclNameRef memberName,
   // of the tuple.
   auto &ctx = getASTContext();
   if (auto baseTuple = baseObjTy->getAs<TupleType>()) {
-    // Tuples don't have compound-name members.
-    if (!memberName.isSimpleName() || memberName.isSpecial())
-      return result;  // No result.
+    if (!memberName.isSpecial()) {
+      StringRef nameStr = memberName.getBaseIdentifier().str();
+      int fieldIdx = -1;
+      // Resolve a number reference into the tuple type.
+      unsigned Value = 0;
+      if (!nameStr.getAsInteger(10, Value) &&
+          Value < baseTuple->getNumElements()) {
+        fieldIdx = Value;
+      } else {
+        fieldIdx = baseTuple->getNamedElementId(memberName.getBaseIdentifier());
+      }
 
-    StringRef nameStr = memberName.getBaseIdentifier().str();
-    int fieldIdx = -1;
-    // Resolve a number reference into the tuple type.
-    unsigned Value = 0;
-    if (!nameStr.getAsInteger(10, Value) &&
-        Value < baseTuple->getNumElements()) {
-      fieldIdx = Value;
-    } else {
-      fieldIdx = baseTuple->getNamedElementId(memberName.getBaseIdentifier());
+      if (fieldIdx != -1) {
+        // Add an overload set that selects this field.
+        result.ViableCandidates.push_back(OverloadChoice(baseTy, fieldIdx));
+        return result;
+      }
     }
-    
-    if (fieldIdx == -1)
-      return result;    // No result.
-    
-    // Add an overload set that selects this field.
-    result.ViableCandidates.push_back(OverloadChoice(baseTy, fieldIdx));
-    return result;
   }
 
   if (auto *selfTy = instanceTy->getAs<DynamicSelfType>())

@@ -1316,6 +1316,10 @@ public:
     CustomAttribute,
   };
 
+  ParserResult<TypeRepr> parseTypeScalar(
+      Diag<> MessageID,
+      ParseTypeReason reason);
+
   ParserResult<TypeRepr> parseType();
   ParserResult<TypeRepr> parseType(
       Diag<> MessageID,
@@ -1432,9 +1436,6 @@ public:
     ///
     /// \p SecondName is the name.
     SourceLoc SecondNameLoc;
-
-    /// The location of the '...', if present.
-    SourceLoc EllipsisLoc;
 
     /// The first name.
     Identifier FirstName;
@@ -1838,6 +1839,7 @@ public:
   ParserStatus parseStmtCondition(StmtCondition &Result, Diag<> ID,
                                   StmtKind ParentKind);
   ParserResult<PoundAvailableInfo> parseStmtConditionPoundAvailable();
+  ParserResult<PoundHasSymbolInfo> parseStmtConditionPoundHasSymbol();
   ParserResult<Stmt> parseStmtIf(LabeledStmtInfo LabelInfo,
                                  bool IfWasImplicitlyInserted = false);
   ParserResult<Stmt> parseStmtGuard();

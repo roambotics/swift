@@ -1190,15 +1190,6 @@ static ValueDecl *getCOWBufferForReading(ASTContext &C, Identifier Id) {
   return builder.build(Id);
 }
 
-static ValueDecl *getIntInstrprofIncrement(ASTContext &C, Identifier Id) {
-  // (Builtin.RawPointer, Builtin.Int64, Builtin.Int32, Builtin.Int32) -> ()
-  Type Int64Ty = BuiltinIntegerType::get(64, C);
-  Type Int32Ty = BuiltinIntegerType::get(32, C);
-  return getBuiltinFunction(Id,
-                            {C.TheRawPointerType, Int64Ty, Int32Ty, Int32Ty},
-                            TupleType::getEmpty(C));
-}
-
 static ValueDecl *getTypePtrAuthDiscriminator(ASTContext &C, Identifier Id) {
   // <T : AnyObject> (T.Type) -> Int64
   BuiltinFunctionBuilder builder(C);
@@ -2286,6 +2277,10 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
     return nullptr; // not needed for the parser library.
   #endif
 
+  // Builtin.TheTupleType resolves to the singleton instance of BuiltinTupleDecl.
+  if (Id == Context.Id_TheTupleType)
+    return Context.getBuiltinTupleDecl();
+
   SmallVector<Type, 4> Types;
   StringRef OperationName = getBuiltinBaseName(Context, Id.str(), Types);
 
@@ -2700,6 +2695,7 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
     return getReinterpretCastOperation(Context, Id);
       
   case BuiltinValueKind::AddressOf:
+  case BuiltinValueKind::UnprotectedAddressOf:
     if (!Types.empty()) return nullptr;
     return getAddressOfOperation(Context, Id);
 
@@ -2707,6 +2703,7 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
     return getLegacyCondFailOperation(Context, Id);
 
   case BuiltinValueKind::AddressOfBorrow:
+  case BuiltinValueKind::UnprotectedAddressOfBorrow:
     if (!Types.empty()) return nullptr;
     return getAddressOfBorrowOperation(Context, Id);
 
@@ -2843,9 +2840,6 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
     return getBuiltinFunction(Id,
                               {},
                               TupleType::getEmpty(Context));
-
-  case BuiltinValueKind::IntInstrprofIncrement:
-    return getIntInstrprofIncrement(Context, Id);
 
   case BuiltinValueKind::TypePtrAuthDiscriminator:
     return getTypePtrAuthDiscriminator(Context, Id);

@@ -26,7 +26,7 @@
 #include "swift/Syntax/SyntaxNodes.h"
 #include "swift/SyntaxParse/SyntaxTreeCreator.h"
 
-#ifdef SWIFT_SWIFT_PARSER_ROUNDTRIP
+#ifdef SWIFT_SWIFT_PARSER
 #include "SwiftParserCompilerSupport.h"
 #endif
 
@@ -193,10 +193,20 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
   if (auto tokens = parser.takeTokenReceiver()->finalize())
     tokensRef = ctx.AllocateCopy(*tokens);
 
-#ifdef SWIFT_SWIFT_PARSER_ROUNDTRIP
-  if (ctx.SourceMgr.getCodeCompletionBufferID() != bufferID) {
+#ifdef SWIFT_SWIFT_PARSER
+  if ((ctx.LangOpts.hasFeature(Feature::ParserRoundTrip) ||
+       ctx.LangOpts.hasFeature(Feature::ParserValidation)) &&
+      ctx.SourceMgr.getCodeCompletionBufferID() != bufferID &&
+      SF->Kind != SourceFileKind::SIL) {
     auto bufferRange = ctx.SourceMgr.getRangeForBuffer(*bufferID);
-    unsigned int flags = SPCC_RoundTrip;
+    unsigned int flags = 0;
+
+    if (ctx.LangOpts.hasFeature(Feature::ParserRoundTrip))
+      flags |= SPCC_RoundTrip;
+
+    if (!ctx.Diags.hadAnyError() &&
+        ctx.LangOpts.hasFeature(Feature::ParserValidation))
+      flags |= SPCC_ParseDiagnostics;
 
     int roundTripResult =
       swift_parser_consistencyCheck(

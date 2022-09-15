@@ -1883,6 +1883,7 @@ private:
   NEVER_VISIT(UnresolvedType)
   NEVER_VISIT(PlaceholderType)
   NEVER_VISIT(BuiltinType)
+  NEVER_VISIT(BuiltinTupleType)
 
   VISIT(TupleType, recurse)
 
@@ -2486,9 +2487,8 @@ ParameterList *ClangImporter::Implementation::importFunctionParameterList(
 
   // Append an additional argument to represent varargs.
   if (isVariadic) {
-    auto paramTy =
-        BoundGenericType::get(SwiftContext.getArrayDecl(), Type(),
-                              {SwiftContext.getAnyExistentialType()});
+    auto paramTy = VariadicSequenceType::get(
+        SwiftContext.getAnyExistentialType());
     auto name = SwiftContext.getIdentifier("varargs");
     auto param = new (SwiftContext) ParamDecl(SourceLoc(), SourceLoc(),
                                               Identifier(), SourceLoc(),
