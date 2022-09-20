@@ -241,6 +241,9 @@ def tools_directory : Separate<["-"], "tools-directory">,
 
 def D : JoinedOrSeparate<["-"], "D">, Flags<[FrontendOption]>,
   HelpText<"Marks a conditional compilation flag as true">;
+  
+def e : JoinedOrSeparate<["-"], "e">, Flags<[NewDriverOnlyOption]>,
+  HelpText<"Executes a line of code provided on the command line">;
 
 def F : JoinedOrSeparate<["-"], "F">,
   Flags<[FrontendOption, ArgumentIsPath, SwiftAPIExtractOption, SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
@@ -1356,6 +1359,11 @@ def symbol_graph_minimum_access_level: Separate<["-"], "symbol-graph-minimum-acc
 def pretty_print: Flag<["-"], "pretty-print">,
   Flags<[SwiftAPIExtractOption, SwiftSymbolGraphExtractOption]>,
   HelpText<"Pretty-print the output JSON">;
+
+def emit_extension_block_symbols: Flag<["-"], "emit-extension-block-symbols">,
+  Flags<[SwiftSymbolGraphExtractOption, FrontendOption,
+        NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
+  HelpText<"Emit 'swift.extension' symbols for extensions to external types instead of directly associating members and conformances with the extended nominal when generating symbol graphs">;
 
 // swift-symbolgraph-extract-only options
 def output_dir : Separate<["-"], "output-dir">,

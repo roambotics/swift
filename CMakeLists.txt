@@ -872,8 +872,14 @@ endif()
 
 # When we have the early SwiftSyntax build, we can include its parser.
 if(SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR)
-  set(SWIFT_SWIFT_PARSER TRUE)
-  include(${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/cmake/SwiftSyntaxTargets.cmake)
+  set(SWIFT_PATH_TO_EARLYSWIFTSYNTAX_TARGETS
+    ${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/cmake/SwiftSyntaxTargets.cmake)
+  if(NOT EXISTS "${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_TARGETS}")
+    message(STATUS "Skipping Swift Swift parser integration due to missing early SwiftSyntax")
+  else()
+    set(SWIFT_SWIFT_PARSER TRUE)
+    include(${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_TARGETS})
+  endif()
 endif()
 
 
@@ -1194,7 +1200,7 @@ else()
   # Some tools (e.g. swift-reflection-dump) rely on a host swiftReflection, so
   # ensure we build that when building tools.
   if(SWIFT_INCLUDE_TOOLS)
-    add_subdirectory(stdlib/public/SwiftShims)
+    add_subdirectory(stdlib/public/SwiftShims/swift/shims)
   endif()
 endif()
 

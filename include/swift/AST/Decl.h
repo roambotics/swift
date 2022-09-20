@@ -837,7 +837,7 @@ public:
   /// Returns the OS version in which the decl became ABI as specified by the
   /// @_backDeploy attribute.
   Optional<llvm::VersionTuple>
-  getBackDeployBeforeOSVersion(PlatformKind Kind) const;
+  getBackDeployBeforeOSVersion(ASTContext &Ctx) const;
 
   /// Returns the starting location of the entire declaration.
   SourceLoc getStartLoc() const { return getSourceRange().Start; }
@@ -1048,6 +1048,12 @@ public:
   bool isSPI() const;
 
   bool isAvailableAsSPI() const;
+
+  /// Whether the declaration is considered unavailable through either being
+  /// explicitly marked as such, or has a parent decl that is semantically
+  /// unavailable. This is a broader notion of unavailability than is checked by
+  /// \c AvailableAttr::isUnavailable.
+  bool isSemanticallyUnavailable() const;
 
   // List the SPI groups declared with @_spi or inherited by this decl.
   //
