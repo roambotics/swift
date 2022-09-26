@@ -2221,7 +2221,10 @@ namespace {
               MD->overwriteAccess(AccessLevel::Private);
             } else if (cxxOperatorKind ==
                        clang::OverloadedOperatorKind::OO_PlusPlus) {
-              if (cxxMethod->param_empty()) {
+              // Make sure the type is not a foreign reference type.
+              // We cannot handle `operator++` for those types, since the
+              // current implementation creates a new instance of the type.
+              if (cxxMethod->param_empty() && !isa<ClassDecl>(result)) {
                 // This is a pre-increment operator. We synthesize a
                 // non-mutating function called `successor() -> Self`.
                 FuncDecl *successorFunc = synthesizer.makeSuccessorFunc(MD);

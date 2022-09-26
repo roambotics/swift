@@ -82,6 +82,7 @@ public:
 
   static SILSpecializeAttr *create(SILModule &M,
                                    GenericSignature specializedSignature,
+                                   ArrayRef<Type> typeErasedParams,
                                    bool exported, SpecializationKind kind,
                                    SILFunction *target, Identifier spiGroup,
                                    const ModuleDecl *spiModule,
@@ -105,6 +106,14 @@ public:
 
   GenericSignature getSpecializedSignature() const {
     return specializedSignature;
+  }
+
+  GenericSignature getUnerasedSpecializedSignature() const {
+    return unerasedSpecializedSignature;
+  }
+
+  ArrayRef<Type> getTypeErasedParams() const {
+    return typeErasedParams;
   }
 
   SILFunction *getFunction() const {
@@ -133,6 +142,8 @@ private:
   SpecializationKind kind;
   bool exported;
   GenericSignature specializedSignature;
+  GenericSignature unerasedSpecializedSignature;
+  llvm::SmallVector<Type, 2> typeErasedParams;
   Identifier spiGroup;
   AvailabilityContext availability;
   const ModuleDecl *spiModule = nullptr;
@@ -140,8 +151,11 @@ private:
   SILFunction *targetFunction = nullptr;
 
   SILSpecializeAttr(bool exported, SpecializationKind kind,
-                    GenericSignature specializedSignature, SILFunction *target,
-                    Identifier spiGroup, const ModuleDecl *spiModule,
+                    GenericSignature specializedSignature,
+                    GenericSignature unerasedSpecializedSignature,
+                    ArrayRef<Type> typeErasedParams,
+                    SILFunction *target, Identifier spiGroup,
+                    const ModuleDecl *spiModule,
                     AvailabilityContext availability);
 };
 
@@ -1446,5 +1460,21 @@ private:
 };
 
 } // end llvm namespace
+
+//===----------------------------------------------------------------------===//
+// Inline SIL implementations
+//===----------------------------------------------------------------------===//
+
+namespace swift {
+
+inline bool SILBasicBlock::isEntry() const {
+  return this == &*getParent()->begin();
+}
+
+inline SILModule &SILInstruction::getModule() const {
+  return getFunction()->getModule();
+}
+
+} // end swift namespace
 
 #endif
