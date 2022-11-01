@@ -12,6 +12,7 @@
 
 #include "swift/PrintAsClang/PrintAsClang.h"
 
+#include "ClangSyntaxPrinter.h"
 #include "ModuleContentsWriter.h"
 #include "SwiftToClangInteropContext.h"
 
@@ -20,6 +21,7 @@
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/Basic/Version.h"
 #include "swift/ClangImporter/ClangImporter.h"
+#include "swift/Frontend/FrontendOptions.h"
 
 #include "clang/Basic/Module.h"
 
@@ -106,15 +108,6 @@ static void writePrologue(raw_ostream &out, ASTContext &ctx,
         out << "#include <stdlib.h>\n";
         out << "#include <new>\n";
         out << "#include <type_traits>\n";
-        // FIXME: Look for the header in the SDK.
-        out << "// Look for the C++ interop support header relative to clang's resource dir:\n";
-        out << "//  '<toolchain>/usr/lib/clang/<version>/include/../../../swift/shims'.\n";
-        out << "#if __has_include(<../../../swift/shims/_SwiftCxxInteroperability.h>)\n";
-        out << "#include <../../../swift/shims/_SwiftCxxInteroperability.h>\n";
-        out << "// Alternatively, allow user to find the header using additional include path into 'swift'.\n";
-        out << "#elif __has_include(<shims/_SwiftCxxInteroperability.h>)\n";
-        out << "#include <shims/_SwiftCxxInteroperability.h>\n";
-        out << "#endif\n";
       },
       [&] {
         out << "#include <stdint.h>\n"
@@ -494,19 +487,9 @@ static std::string computeMacroGuard(const ModuleDecl *M) {
   return (llvm::Twine(M->getNameStr().upper()) + "_SWIFT_H").str();
 }
 
-static std::string getModuleContentsCxxString(
-    ModuleDecl &M, SmallPtrSet<ImportModuleTy, 8> &imports,
-    SwiftToClangInteropContext &interopContext, bool requiresExposedAttribute) {
-  std::string moduleContentsBuf;
-  llvm::raw_string_ostream moduleContents{moduleContentsBuf};
-  printModuleContentsAsCxx(moduleContents, imports, M, interopContext,
-                           requiresExposedAttribute);
-  return std::move(moduleContents.str());
-}
-
 bool swift::printAsClangHeader(raw_ostream &os, ModuleDecl *M,
                                StringRef bridgingHeader,
-                               bool ExposePublicDeclsInClangHeader,
+                               const FrontendOptions &frontendOpts,
                                const IRGenOptions &irGenOpts) {
   llvm::PrettyStackTraceString trace("While generating Clang header");
 
@@ -523,16 +506,47 @@ bool swift::printAsClangHeader(raw_ostream &os, ModuleDecl *M,
   emitObjCConditional(os, [&] { os << objcModuleContents.str(); });
   emitCxxConditional(os, [&] {
     // FIXME: Expose Swift with @expose by default.
-    if (ExposePublicDeclsInClangHeader ||
-        M->DeclContext::getASTContext().LangOpts.EnableCXXInterop) {
-      SmallPtrSet<ImportModuleTy, 8> imports;
-      auto contents = getModuleContentsCxxString(
-          *M, imports, interopContext,
-          /*requiresExposedAttribute=*/!ExposePublicDeclsInClangHeader);
-      // FIXME: In ObjC++ mode, we do not need to reimport duplicate modules.
-      writeImports(os, imports, *M, bridgingHeader, /*useCxxImport=*/true);
-      os << contents;
-    }
+    bool enableCxx = frontendOpts.ClangHeaderExposedDecls.hasValue() ||
+                     frontendOpts.EnableExperimentalCxxInteropInClangHeader ||
+                     M->DeclContext::getASTContext().LangOpts.EnableCXXInterop;
+    if (!enableCxx)
+      return;
+    // Include the shim header only in the C++ mode.
+    ClangSyntaxPrinter(os).printIncludeForShimHeader(
+        "_SwiftCxxInteroperability.h");
+
+    bool requiresExplicitExpose =
+        !frontendOpts.ClangHeaderExposedDecls.hasValue() ||
+        *frontendOpts.ClangHeaderExposedDecls ==
+            FrontendOptions::ClangHeaderExposeBehavior::HasExposeAttr;
+    // Default dependency behavior is used when the -clang-header-expose-decls
+    // flag is not specified.
+    bool defaultDependencyBehavior =
+        !frontendOpts.ClangHeaderExposedDecls.hasValue();
+
+    std::string moduleContentsBuf;
+    llvm::raw_string_ostream moduleContents{moduleContentsBuf};
+    auto deps = printModuleContentsAsCxx(
+        moduleContents, *M, interopContext,
+        /*requiresExposedAttribute=*/requiresExplicitExpose);
+    // FIXME: In ObjC++ mode, we do not need to reimport duplicate modules.
+    writeImports(os, deps.imports, *M, bridgingHeader, /*useCxxImport=*/true);
+
+    // Embed the standard library directly.
+    if (defaultDependencyBehavior && deps.dependsOnStandardLibrary) {
+      assert(!M->isStdlibModule());
+      SwiftToClangInteropContext interopContext(
+          *M->getASTContext().getStdlibModule(), irGenOpts);
+      auto macroGuard = computeMacroGuard(M->getASTContext().getStdlibModule());
+      os << "#ifndef " << macroGuard << "\n";
+      os << "#define " << macroGuard << "\n";
+      printModuleContentsAsCxx(os, *M->getASTContext().getStdlibModule(),
+                               interopContext,
+                               /*requiresExposedAttribute=*/true);
+      os << "#endif // " << macroGuard << "\n";
+      }
+
+      os << moduleContents.str();
   });
   writeEpilogue(os);
 

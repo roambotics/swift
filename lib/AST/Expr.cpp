@@ -389,6 +389,7 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
   PASS_THROUGH_REFERENCE(InOut, getSubExpr);
 
   NO_REFERENCE(VarargExpansion);
+  NO_REFERENCE(PackExpansion);
   NO_REFERENCE(DynamicType);
 
   PASS_THROUGH_REFERENCE(RebindSelfInConstructor, getSubExpr);
@@ -443,14 +444,13 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
   PASS_THROUGH_REFERENCE(BridgeFromObjC, getSubExpr);
   PASS_THROUGH_REFERENCE(ConditionalBridgeFromObjC, getSubExpr);
   PASS_THROUGH_REFERENCE(UnderlyingToOpaque, getSubExpr);
-  PASS_THROUGH_REFERENCE(ReifyPack, getSubExpr);
   NO_REFERENCE(Coerce);
   NO_REFERENCE(ForcedCheckedCast);
   NO_REFERENCE(ConditionalCheckedCast);
   NO_REFERENCE(Is);
 
   NO_REFERENCE(Arrow);
-  NO_REFERENCE(If);
+  NO_REFERENCE(Ternary);
   NO_REFERENCE(EnumIsCase);
   NO_REFERENCE(Assign);
   NO_REFERENCE(CodeCompletion);
@@ -461,8 +461,8 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
   NO_REFERENCE(KeyPathDot);
   PASS_THROUGH_REFERENCE(OneWay, getSubExpr);
   NO_REFERENCE(Tap);
-  NO_REFERENCE(Pack);
   NO_REFERENCE(TypeJoin);
+  NO_REFERENCE(MacroExpansion);
 
 #undef SIMPLE_REFERENCE
 #undef NO_REFERENCE
@@ -745,6 +745,7 @@ bool Expr::canAppendPostfixExpression(bool appendingPostfixOperator) const {
   case ExprKind::OpenExistential:
   case ExprKind::MakeTemporarilyEscapable:
   case ExprKind::VarargExpansion:
+  case ExprKind::PackExpansion:
     return false;
 
   case ExprKind::Call:
@@ -792,7 +793,6 @@ bool Expr::canAppendPostfixExpression(bool appendingPostfixOperator) const {
   case ExprKind::BridgeFromObjC:
   case ExprKind::BridgeToObjC:
   case ExprKind::UnderlyingToOpaque:
-  case ExprKind::ReifyPack:
     // Implicit conversion nodes have no syntax of their own; defer to the
     // subexpression.
     return cast<ImplicitConversionExpr>(this)->getSubExpr()
@@ -805,16 +805,18 @@ bool Expr::canAppendPostfixExpression(bool appendingPostfixOperator) const {
     return false;
 
   case ExprKind::Arrow:
-  case ExprKind::If:
+  case ExprKind::Ternary:
   case ExprKind::Assign:
   case ExprKind::UnresolvedPattern:
   case ExprKind::EditorPlaceholder:
   case ExprKind::KeyPathDot:
-  case ExprKind::Pack:
   case ExprKind::TypeJoin:
     return false;
 
   case ExprKind::Tap:
+    return true;
+
+  case ExprKind::MacroExpansion:
     return true;
   }
 
@@ -918,6 +920,7 @@ bool Expr::isValidParentOfTypeExpr(Expr *typeExpr) const {
   case ExprKind::AutoClosure:
   case ExprKind::InOut:
   case ExprKind::VarargExpansion:
+  case ExprKind::PackExpansion:
   case ExprKind::DynamicType:
   case ExprKind::RebindSelfInConstructor:
   case ExprKind::OpaqueValue:
@@ -968,7 +971,7 @@ bool Expr::isValidParentOfTypeExpr(Expr *typeExpr) const {
   case ExprKind::Is:
   case ExprKind::Coerce:
   case ExprKind::Arrow:
-  case ExprKind::If:
+  case ExprKind::Ternary:
   case ExprKind::EnumIsCase:
   case ExprKind::Assign:
   case ExprKind::CodeCompletion:
@@ -980,9 +983,8 @@ bool Expr::isValidParentOfTypeExpr(Expr *typeExpr) const {
   case ExprKind::KeyPathDot:
   case ExprKind::OneWay:
   case ExprKind::Tap:
-  case ExprKind::ReifyPack:
-  case ExprKind::Pack:
   case ExprKind::TypeJoin:
+  case ExprKind::MacroExpansion:
     return false;
   }
 
@@ -1235,6 +1237,21 @@ VarargExpansionExpr *VarargExpansionExpr::createArrayExpansion(ASTContext &ctx, 
   return new (ctx) VarargExpansionExpr(AE, /*implicit*/ true, AE->getType());
 }
 
+PackExpansionExpr *
+PackExpansionExpr::create(ASTContext &ctx, Expr *patternExpr,
+                          ArrayRef<OpaqueValueExpr *> opaqueValues,
+                          ArrayRef<Expr *> bindings, SourceLoc dotsLoc,
+                          GenericEnvironment *environment,
+                          bool implicit, Type type) {
+  size_t size =
+      totalSizeToAlloc<OpaqueValueExpr *, Expr *>(opaqueValues.size(),
+                                                  bindings.size());
+  void *mem = ctx.Allocate(size, alignof(PackExpansionExpr));
+  return ::new (mem) PackExpansionExpr(patternExpr, opaqueValues,
+                                       bindings, dotsLoc, environment,
+                                       implicit, type);
+}
+
 SequenceExpr *SequenceExpr::create(ASTContext &ctx, ArrayRef<Expr*> elements) {
   assert(elements.size() & 1 && "even number of elements in sequence");
   size_t bytes = totalSizeToAlloc<Expr *>(elements.size());
@@ -1302,7 +1319,7 @@ bool CaptureListEntry::isSimpleSelfCapture() const {
 
 CaptureListExpr *CaptureListExpr::create(ASTContext &ctx,
                                          ArrayRef<CaptureListEntry> captureList,
-                                         ClosureExpr *closureBody) {
+                                         AbstractClosureExpr *closureBody) {
   auto size = totalSizeToAlloc<CaptureListEntry>(captureList.size());
   auto mem = ctx.Allocate(size, alignof(CaptureListExpr));
   auto *expr = ::new(mem) CaptureListExpr(captureList, closureBody);
@@ -1776,6 +1793,13 @@ RebindSelfInConstructorExpr::getCalledConstructor(bool &isChainToSuper) const {
     if (auto injectIntoOptionalExpr
         = dyn_cast<InjectIntoOptionalExpr>(candidate)) {
       candidate = injectIntoOptionalExpr->getSubExpr();
+      continue;
+    }
+
+    // Look through open existential expressions
+    if (auto openExistentialExpr
+        = dyn_cast<OpenExistentialExpr>(candidate)) {
+      candidate = openExistentialExpr->getSubExpr();
       continue;
     }
     break;
@@ -2252,24 +2276,21 @@ OpenedArchetypeType *OpenExistentialExpr::getOpenedArchetype() const {
 
 KeyPathExpr::KeyPathExpr(SourceLoc startLoc, Expr *parsedRoot,
                          Expr *parsedPath, SourceLoc endLoc, bool hasLeadingDot,
-                         bool isObjC, bool isImplicit,
-                         unsigned closureDiscriminator)
+                         bool isObjC, bool isImplicit)
     : Expr(ExprKind::KeyPath, isImplicit), StartLoc(startLoc), EndLoc(endLoc),
       ParsedRoot(parsedRoot), ParsedPath(parsedPath),
-      HasLeadingDot(hasLeadingDot), ClosureDiscriminator(closureDiscriminator) {
+      HasLeadingDot(hasLeadingDot) {
   assert(!(isObjC && (parsedRoot || parsedPath)) &&
          "Obj-C key paths should only have components");
   Bits.KeyPathExpr.IsObjC = isObjC;
 }
 
 KeyPathExpr::KeyPathExpr(SourceLoc backslashLoc, Expr *parsedRoot,
-                         Expr *parsedPath, bool hasLeadingDot, bool isImplicit,
-                         unsigned closureDiscriminator)
+                         Expr *parsedPath, bool hasLeadingDot, bool isImplicit)
     : KeyPathExpr(backslashLoc, parsedRoot, parsedPath,
                   parsedPath ? parsedPath->getEndLoc()
                              : parsedRoot->getEndLoc(),
-                  hasLeadingDot, /*isObjC*/ false, isImplicit,
-                  closureDiscriminator) {
+                  hasLeadingDot, /*isObjC*/ false, isImplicit) {
   assert((parsedRoot || parsedPath) &&
          "Key path must have either root or path");
 }
@@ -2278,8 +2299,7 @@ KeyPathExpr::KeyPathExpr(ASTContext &ctx, SourceLoc startLoc,
                          ArrayRef<Component> components, SourceLoc endLoc,
                          bool isObjC, bool isImplicit)
     : KeyPathExpr(startLoc, /*parsedRoot*/ nullptr, /*parsedPath*/ nullptr,
-                  endLoc, /*hasLeadingDot*/ false, isObjC, isImplicit,
-                  /*closure discriminator*/ AbstractClosureExpr::InvalidDiscriminator) {
+                  endLoc, /*hasLeadingDot*/ false, isObjC, isImplicit) {
   assert(!components.empty());
   Components = ctx.AllocateCopy(components);
 }
@@ -2293,11 +2313,9 @@ KeyPathExpr *KeyPathExpr::createParsedPoundKeyPath(
 
 KeyPathExpr *KeyPathExpr::createParsed(ASTContext &ctx, SourceLoc backslashLoc,
                                        Expr *parsedRoot, Expr *parsedPath,
-                                       bool hasLeadingDot,
-                                       unsigned closureDiscriminator) {
+                                       bool hasLeadingDot) {
   return new (ctx) KeyPathExpr(backslashLoc, parsedRoot, parsedPath,
-                               hasLeadingDot, /*isImplicit*/ false,
-                               closureDiscriminator);
+                               hasLeadingDot, /*isImplicit*/ false);
 }
 
 KeyPathExpr *KeyPathExpr::createImplicit(ASTContext &ctx,
@@ -2313,8 +2331,7 @@ KeyPathExpr *KeyPathExpr::createImplicit(ASTContext &ctx,
                                          Expr *parsedRoot, Expr *parsedPath,
                                          bool hasLeadingDot) {
   return new (ctx) KeyPathExpr(backslashLoc, parsedRoot, parsedPath,
-           hasLeadingDot, /*isImplicit*/ true,
-           /*closureDiscriminator*/ AbstractClosureExpr::InvalidDiscriminator);
+           hasLeadingDot, /*isImplicit*/ true);
 }
 
 void
@@ -2428,30 +2445,6 @@ RegexLiteralExpr::createParsed(ASTContext &ctx, SourceLoc loc,
                                ArrayRef<uint8_t> serializedCaps) {
   return new (ctx) RegexLiteralExpr(loc, regexText, version, serializedCaps,
                                     /*implicit*/ false);
-}
-
-PackExpr::PackExpr(ArrayRef<Expr *> SubExprs, Type Ty)
-  : Expr(ExprKind::Pack, /*implicit*/ true, Ty) {
-  Bits.PackExpr.NumElements = SubExprs.size();
-
-  // Copy elements.
-  std::uninitialized_copy(SubExprs.begin(), SubExprs.end(),
-                          getTrailingObjects<Expr *>());
-}
-
-PackExpr *PackExpr::create(ASTContext &ctx,
-                           ArrayRef<Expr *> SubExprs,
-                           Type Ty) {
-  assert(Ty->castTo<PackType>());
-
-  size_t size =
-      totalSizeToAlloc<Expr *>(SubExprs.size());
-  void *mem = ctx.Allocate(size, alignof(PackExpr));
-  return new (mem) PackExpr(SubExprs, Ty);
-}
-
-PackExpr *PackExpr::createEmpty(ASTContext &ctx) {
-  return create(ctx, {}, PackType::getEmpty(ctx));
 }
 
 TypeJoinExpr::TypeJoinExpr(DeclRefExpr *varRef, ArrayRef<Expr *> elements)

@@ -820,6 +820,36 @@ public:
       OpenedExistentialArchetypes.erase(expr->getOpenedArchetype());
     }
 
+    bool shouldVerify(PackExpansionExpr *expr) {
+      if (!shouldVerify(cast<Expr>(expr)))
+        return false;
+
+      Generics.push_back(expr->getGenericEnvironment()->getGenericSignature());
+
+      for (auto *placeholder : expr->getOpaqueValues()) {
+        assert(!OpaqueValues.count(placeholder));
+        OpaqueValues[placeholder] = 0;
+      }
+
+      return true;
+    }
+
+    void verifyCheckedAlways(PackExpansionExpr *E) {
+      // Remove the element generic environment before verifying
+      // the pack expansion type, which contains pack archetypes.
+      assert(Generics.back().get<GenericSignature>().getPointer() ==
+             E->getGenericEnvironment()->getGenericSignature().getPointer());
+      Generics.pop_back();
+      verifyCheckedAlwaysBase(E);
+    }
+
+    void cleanup(PackExpansionExpr *expr) {
+      for (auto *placeholder : expr->getOpaqueValues()) {
+        assert(OpaqueValues.count(placeholder));
+        OpaqueValues.erase(placeholder);
+      }
+    }
+
     bool shouldVerify(MakeTemporarilyEscapableExpr *expr) {
       if (!shouldVerify(cast<Expr>(expr)))
         return false;
@@ -2089,18 +2119,18 @@ public:
       verifyCheckedBase(E);
     }
 
-    void verifyChecked(IfExpr *E) {
-      PrettyStackTraceExpr debugStack(Ctx, "verifying IfExpr", E);
+    void verifyChecked(TernaryExpr *E) {
+      PrettyStackTraceExpr debugStack(Ctx, "verifying TernaryExpr", E);
 
       auto condTy = E->getCondExpr()->getType();
       if (!condTy->isBool()) {
-        Out << "IfExpr condition is not Bool\n";
+        Out << "TernaryExpr condition is not Bool\n";
         abort();
       }
 
       checkSameType(E->getThenExpr()->getType(),
                     E->getElseExpr()->getType(),
-                    "then and else branches of an if-expr");
+                    "then and else branches of a TernaryExpr");
       verifyCheckedBase(E);
     }
     

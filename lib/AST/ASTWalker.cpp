@@ -401,6 +401,14 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     return false;
   }
 
+  bool visitMacroExpansionDecl(MacroExpansionDecl *MED) {
+    if (MED->getArgs() && doIt(MED->getArgs()))
+      return true;
+    if (MED->getRewritten() && doIt(MED->getRewritten()))
+      return true;
+    return false;
+  }
+
   bool visitAbstractFunctionDecl(AbstractFunctionDecl *AFD) {
 #ifndef NDEBUG
     PrettyStackTraceDecl debugStack("walking into body of", AFD);
@@ -625,16 +633,6 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
       }
     return E;
   }
-  Expr *visitPackExpr(PackExpr *E) {
-    for (unsigned i = 0, e = E->getNumElements(); i != e; ++i)
-      if (E->getElement(i)) {
-        if (Expr *Elt = doIt(E->getElement(i)))
-          E->setElement(i, Elt);
-        else
-          return nullptr;
-      }
-    return E;
-  }
   Expr *visitSubscriptExpr(SubscriptExpr *E) {
     if (Expr *Base = doIt(E->getBase()))
       E->setBase(Base);
@@ -829,6 +827,14 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     return nullptr;
   }
 
+  Expr *visitPackExpansionExpr(PackExpansionExpr *E) {
+    if (Expr *pattern = doIt(E->getPatternExpr())) {
+      E->setPatternExpr(pattern);
+      return E;
+    }
+    return nullptr;
+  }
+
   Expr *visitSequenceExpr(SequenceExpr *E) {
     for (unsigned i = 0, e = E->getNumElements(); i != e; ++i)
       if (Expr *Elt = doIt(E->getElement(i)))
@@ -863,8 +869,8 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
       }
     }
 
-    ClosureExpr *body = expr->getClosureBody();
-    if ((body = cast_or_null<ClosureExpr>(doIt(body))))
+    AbstractClosureExpr *body = expr->getClosureBody();
+    if ((body = cast_or_null<AbstractClosureExpr>(doIt(body))))
       expr->setClosureBody(body);
     else
       return nullptr;
@@ -1010,9 +1016,8 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
 
     return E;
   }
-  
-  
-  Expr *visitIfExpr(IfExpr *E) {
+
+  Expr *visitTernaryExpr(TernaryExpr *E) {
     if (Expr *Cond = E->getCondExpr()) {
       Cond = doIt(Cond);
       if (!Cond) return nullptr;
@@ -1241,6 +1246,22 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     return E;
   }
 
+  Expr *visitMacroExpansionExpr(MacroExpansionExpr *E) {
+    Expr *rewritten = nullptr;
+    if (E->getRewritten()) {
+      rewritten = doIt(E->getRewritten());
+      if (!rewritten) return nullptr;
+    }
+    ArgumentList *args = nullptr;
+    if (E->getArgs()) {
+      args = doIt(E->getArgs());
+      if (!args) return nullptr;
+    }
+    E->setRewritten(rewritten);
+    E->setArgs(args);
+    return E;
+  }
+
   //===--------------------------------------------------------------------===//
   //                           Everything Else
   //===--------------------------------------------------------------------===//
@@ -1395,8 +1416,17 @@ public:
     for (auto &elt : C) {
       switch (elt.getKind()) {
       case StmtConditionElement::CK_Availability:
-      case StmtConditionElement::CK_HasSymbol:
         break;
+      case StmtConditionElement::CK_HasSymbol: {
+        auto E = elt.getHasSymbolInfo()->getSymbolExpr();
+        if (!E)
+          return true;
+        E = doIt(E);
+        if (!E)
+          return true;
+        elt.getHasSymbolInfo()->setSymbolExpr(E);
+        break;
+      }
       case StmtConditionElement::CK_Boolean: {
         auto E = elt.getBoolean();
         // Walk an expression condition normally.

@@ -104,7 +104,6 @@ function(_add_target_variant_c_compile_link_flags)
     # of options by target_compile_options -- this way no undesired
     # side effects are introduced should a new search path be added.
     list(APPEND result
-      "-arch" "${CFLAGS_ARCH}"
       "-F${SWIFT_SDK_${CFLAGS_SDK}_PATH}/../../../Developer/Library/Frameworks")
   endif()
 
@@ -1917,10 +1916,11 @@ function(add_swift_target_library name)
       list(APPEND swiftlib_swift_compile_flags_all
            ${SWIFTLIB_SWIFT_COMPILE_FLAGS_LINUX})
     elseif(${sdk} STREQUAL WINDOWS)
-      # FIXME(SR2005) static and shared are not mutually exclusive; however
-      # since we do a single build of the sources, this doesn't work for
-      # building both simultaneously.  Effectively, only shared builds are
-      # supported on windows currently.
+      # FIXME: https://github.com/apple/swift/issues/44614
+      # static and shared are not mutually exclusive; however since we do a
+      # single build of the sources, this doesn't work for building both
+      # simultaneously.  Effectively, only shared builds are supported on
+      # windows currently.
       if(SWIFTLIB_SHARED)
         list(APPEND swiftlib_swift_compile_flags_all -D_WINDLL)
         if(SWIFTLIB_IS_STDLIB_CORE)
@@ -2668,17 +2668,9 @@ function(add_swift_target_executable name)
         # https://gitlab.kitware.com/cmake/cmake/-/merge_requests/5291)
         set_property(TARGET ${VARIANT_NAME} PROPERTY OSX_ARCHITECTURES "${arch}")
 
-        add_custom_command_target(unused_var2
-         COMMAND "codesign" "-f" "-s" "-" "${SWIFT_RUNTIME_OUTPUT_INTDIR}/${VARIANT_NAME}"
-         CUSTOM_TARGET_NAME "${VARIANT_NAME}_signed"
-         OUTPUT "${SWIFT_RUNTIME_OUTPUT_INTDIR}/${VARIANT_NAME}_signed"
-         DEPENDS ${VARIANT_NAME})
-      else()
-        # No code signing on other platforms.
-        add_custom_command_target(unused_var2
-         CUSTOM_TARGET_NAME "${VARIANT_NAME}_signed"
-         OUTPUT "${SWIFT_RUNTIME_OUTPUT_INTDIR}/${VARIANT_NAME}_signed"
-         DEPENDS ${VARIANT_NAME})
+        add_custom_command(TARGET ${VARIANT_NAME}
+          POST_BUILD
+         COMMAND "codesign" "-f" "-s" "-" "${SWIFT_RUNTIME_OUTPUT_INTDIR}/${VARIANT_NAME}")
        endif()
     endforeach()
   endforeach()

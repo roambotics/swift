@@ -197,8 +197,12 @@ void CapturePropagationCloner::cloneClosure(
 
     SILArgument *Arg = OrigEntryBB->getArgument(ArgIdx);
 
-    SILValue MappedValue = ClonedEntryBB->createFunctionArgument(
+    auto *MappedValue = ClonedEntryBB->createFunctionArgument(
         remapType(Arg->getType()), Arg->getDecl());
+    MappedValue->setNoImplicitCopy(
+        cast<SILFunctionArgument>(Arg)->isNoImplicitCopy());
+    MappedValue->setLifetimeAnnotation(
+        cast<SILFunctionArgument>(Arg)->getLifetimeAnnotation());
     entryArgs.push_back(MappedValue);
   }
   assert(OrigEntryBB->args_size() - ArgIdx == PartialApplyArgs.size()
@@ -612,7 +616,7 @@ void CapturePropagation::run() {
     }
   }
   if (HasChanged) {
-    invalidateAnalysis(SILAnalysis::InvalidationKind::Everything);
+    invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
   }
 }
 

@@ -684,8 +684,6 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     Opts.Features.insert(Feature::ForwardModeDifferentiation);
   if (Args.hasArg(OPT_enable_experimental_additive_arithmetic_derivation))
     Opts.Features.insert(Feature::AdditiveArithmeticDerivedConformances);
-  if (Args.hasArg(OPT_enable_experimental_layout_prespecialization))
-    Opts.Features.insert(Feature::LayoutPrespecialization);
   
   if (Args.hasArg(OPT_enable_experimental_opaque_type_erasure))
     Opts.Features.insert(Feature::OpaqueTypeErasure);
@@ -735,7 +733,8 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
                      diagLevel);
     }
   } else if (Args.getLastArg(OPT_require_explicit_availability,
-                             OPT_require_explicit_availability_target)) {
+                             OPT_require_explicit_availability_target) ||
+             Opts.LibraryLevel == LibraryLevel::API) {
     Opts.RequireExplicitAvailability = DiagnosticBehavior::Warning;
   }
 
@@ -822,6 +821,8 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableCrossImportRemarks = Args.hasArg(OPT_emit_cross_import_remarks);
 
   Opts.EnableModuleLoadingRemarks = Args.hasArg(OPT_remark_loading_module);
+
+  Opts.EnableIndexingSystemModuleRemarks = Args.hasArg(OPT_remark_indexing_system_module);
 
   Opts.EnableSkipExplicitInterfaceModuleBuildRemarks = Args.hasArg(OPT_remark_skip_explicit_interface_build);
   
@@ -1273,6 +1274,7 @@ static bool ParseClangImporterArgs(ClangImporterOptions &Opts,
   }
 
   Opts.ExtraArgsOnly |= Args.hasArg(OPT_extra_clang_options_only);
+  Opts.DirectClangCC1ModuleBuild |= Args.hasArg(OPT_direct_clang_cc1_module_build);
 
   if (const Arg *A = Args.getLastArg(OPT_pch_output_dir)) {
     Opts.PrecompiledHeaderOutputDir = A->getValue();
@@ -1404,6 +1406,13 @@ static bool ParseSearchPathArgs(SearchPathOptions &Opts,
   // is called before setTargetTriple() and parseArgs().
   // TODO: improve the handling of RuntimeIncludePath.
 
+  std::vector<std::string> CompilerPluginLibraryPaths(
+      Opts.getCompilerPluginLibraryPaths());
+  for (const Arg *A : Args.filtered(OPT_load_plugin_library)) {
+    CompilerPluginLibraryPaths.push_back(resolveSearchPath(A->getValue()));
+  }
+  Opts.setCompilerPluginLibraryPaths(CompilerPluginLibraryPaths);
+
   return false;
 }
 
@@ -1444,6 +1453,7 @@ static bool ParseDiagnosticArgs(DiagnosticOptions &Opts, ArgList &Args,
 
   Opts.FixitCodeForAllDiagnostics |= Args.hasArg(OPT_fixit_all);
   Opts.SuppressWarnings |= Args.hasArg(OPT_suppress_warnings);
+  Opts.SuppressRemarks |= Args.hasArg(OPT_suppress_remarks);
   Opts.WarningsAsErrors = Args.hasFlag(options::OPT_warnings_as_errors,
                                        options::OPT_no_warnings_as_errors,
                                        false);
@@ -2634,7 +2644,8 @@ serialization::Status
 CompilerInvocation::loadFromSerializedAST(StringRef data) {
   serialization::ExtendedValidationInfo extendedInfo;
   serialization::ValidationInfo info = serialization::validateSerializedAST(
-      data, getSILOptions().EnableOSSAModules, LangOpts.SDKName, &extendedInfo);
+      data, getSILOptions().EnableOSSAModules, LangOpts.SDKName,
+      !LangOpts.DebuggerSupport, &extendedInfo);
 
   if (info.status != serialization::Status::Valid)
     return info.status;
@@ -2670,7 +2681,7 @@ CompilerInvocation::setUpInputForSILTool(
 
   auto result = serialization::validateSerializedAST(
       fileBufOrErr.get()->getBuffer(), getSILOptions().EnableOSSAModules,
-      LangOpts.SDKName, &extendedInfo);
+      LangOpts.SDKName, !LangOpts.DebuggerSupport, &extendedInfo);
   bool hasSerializedAST = result.status == serialization::Status::Valid;
 
   if (hasSerializedAST) {

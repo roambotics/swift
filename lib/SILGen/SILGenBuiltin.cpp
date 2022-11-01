@@ -1152,7 +1152,7 @@ static ManagedValue emitBuiltinAutoDiffApplyDerivativeFunction(
     AutoDiffDerivativeFunctionKind kind, unsigned arity,
     bool throws, SILGenFunction &SGF, SILLocation loc,
     SubstitutionMap substitutions, ArrayRef<ManagedValue> args, SGFContext C) {
-  // FIXME(SR-11853): Support throwing functions.
+  // FIXME(https://github.com/apple/swift/issues/54259): Support throwing functions.
   assert(!throws && "Throwing functions are not yet supported");
 
   auto origFnVal = args[0].getValue();
@@ -1221,7 +1221,7 @@ static ManagedValue emitBuiltinAutoDiffApplyDerivativeFunction(
 static ManagedValue emitBuiltinAutoDiffApplyTransposeFunction(
     unsigned arity, bool throws, SILGenFunction &SGF, SILLocation loc,
     SubstitutionMap substitutions, ArrayRef<ManagedValue> args, SGFContext C) {
-  // FIXME(SR-11853): Support throwing functions.
+  // FIXME(https://github.com/apple/swift/issues/54259): Support throwing functions.
   assert(!throws && "Throwing functions are not yet supported");
 
   auto origFnVal = args.front().getValue();
@@ -1519,7 +1519,7 @@ ManagedValue emitBuiltinCreateAsyncTask(SILGenFunction &SGF, SILLocation loc,
 
   // Form the metatype of the result type.
   CanType futureResultType =
-      Type(MetatypeType::get(GenericTypeParamType::get(/*type sequence*/ false,
+      Type(MetatypeType::get(GenericTypeParamType::get(/*isParameterPack*/ false,
                                                        /*depth*/ 0, /*index*/ 0,
                                                        SGF.getASTContext()),
                              MetatypeRepresentation::Thick))
@@ -1545,7 +1545,7 @@ ManagedValue emitBuiltinCreateAsyncTask(SILGenFunction &SGF, SILLocation loc,
           .build();
   auto genericSig = subs.getGenericSignature().getCanonicalSignature();
   auto genericResult =
-      GenericTypeParamType::get(/*type sequence*/ false,
+      GenericTypeParamType::get(/*isParameterPack*/ false,
                                 /*depth*/ 0, /*index*/ 0, SGF.getASTContext());
   // <T> () async throws -> T
   CanType functionTy =
@@ -1577,7 +1577,7 @@ static ManagedValue emitBuiltinCreateAsyncTaskInGroup(
 
   // Form the metatype of the result type.
   CanType futureResultType =
-      Type(MetatypeType::get(GenericTypeParamType::get(/*type sequence*/ false,
+      Type(MetatypeType::get(GenericTypeParamType::get(/*isParameterPack*/ false,
                                                        /*depth*/ 0, /*index*/ 0,
                                                        SGF.getASTContext()),
                              MetatypeRepresentation::Thick))

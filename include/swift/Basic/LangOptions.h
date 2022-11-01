@@ -216,6 +216,9 @@ namespace swift {
 
     /// Emit a remark after loading a module.
     bool EnableModuleLoadingRemarks = false;
+
+    /// Emit a remark when indexing a system module.
+    bool EnableIndexingSystemModuleRemarks = false;
     
     /// Emit a remark on early exit in explicit interface build
     bool EnableSkipExplicitInterfaceModuleBuildRemarks = false;
@@ -807,6 +810,11 @@ namespace swift {
     /// When set, use ExtraArgs alone to configure clang instance because ExtraArgs
     /// contains the full option set.
     bool ExtraArgsOnly = false;
+
+    /// When building a PCM, rely on the Swift frontend's command-line -Xcc flags
+    /// to build the Clang module via Clang frontend directly,
+    /// and completly bypass the Clang driver.
+    bool DirectClangCC1ModuleBuild = false;
 
     /// Return a hash code of any components from these options that should
     /// contribute to a Swift Bridging PCH hash.

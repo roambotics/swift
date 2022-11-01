@@ -1,8 +1,6 @@
 // RUN: %empty-directory(%t)
 // RUN: split-file %s %t
 
-// RUN: %target-swift-frontend -parse-as-library %platform-module-dir/Swift.swiftmodule/%module-target-triple.swiftinterface -enable-library-evolution -disable-objc-attr-requires-foundation-module -typecheck -module-name Swift -parse-stdlib -enable-experimental-cxx-interop -emit-clang-header-path %t/Swift.h  -experimental-skip-all-function-bodies
-
 // RUN: %target-swift-frontend -typecheck %t/use-optional.swift -typecheck -module-name UseOptional -enable-experimental-cxx-interop -emit-clang-header-path %t/UseOptional.h
 
 // RUN: %target-interop-build-clangxx -fno-exceptions -std=gnu++20 -c %t/optional-execution.cpp -I %t -o %t/swift-stdlib-execution.o
@@ -17,6 +15,12 @@
 @_expose(Cxx)
 public struct SmallStruct {
     public let x: Int16
+}
+
+@_expose(Cxx)
+public enum RawEnum: Int16 {
+    case first = 1
+    case second = 3
 }
 
 @_expose(Cxx)
@@ -71,7 +75,6 @@ public func resetOpt<T>(_ val: inout Optional<T>) {
 //--- optional-execution.cpp
 
 #include <cassert>
-#include "Swift.h"
 #include "UseOptional.h"
 
 int main() {
@@ -81,9 +84,12 @@ int main() {
   {
     auto val = createCIntOpt(2);
     takeCIntOpt(val);
+    assert((bool)val);
     assert(val.isSome());
     assert(val.getUnsafelyUnwrapped() == 2);
+    assert(val.get() == 2);
     resetOpt(val);
+    assert(!(bool)val);
     assert(val.isNone());
     takeCIntOpt(val);
   }
@@ -92,9 +98,12 @@ int main() {
   {
     auto val = createSmallStructOpt(0xFA);
     takeSmallStructOpt(val);
+    assert((bool)val);
     assert(val.isSome());
     assert(val.getUnsafelyUnwrapped().getX() == 0xFA);
+    assert(val.get().getX() == 0xFA);
     resetOpt(val);
+    assert(!(bool)val);
     assert(val.isNone());
     takeSmallStructOpt(val);
   }
@@ -114,5 +123,14 @@ int main() {
 // CHECK-NEXT: Optional(UseOptional.Klass)
 // CHECK-NEXT: nil
 // CHECK-NEXT: deinit-Klass
+
+  {
+    auto val = RawEnum::init(1);
+    assert(val.isSome());
+    assert(val.getUnsafelyUnwrapped() == RawEnum::first);
+    assert(val.getUnsafelyUnwrapped().getRawValue() == 1);
+    auto val2 = RawEnum::init(2);
+    assert(val2.isNone());
+  }
   return 0;
 }

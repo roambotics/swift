@@ -380,7 +380,10 @@ struct SILDeclRef {
   bool isAlwaysInline() const;
   /// True if the function has the @_backDeploy attribute.
   bool isBackDeployed() const;
-  
+
+  /// Return the expected linkage for a definition of this declaration.
+  SILLinkage getDefinitionLinkage() const;
+
   /// Return the expected linkage of this declaration.
   SILLinkage getLinkage(ForDefinition_t forDefinition) const;
 
@@ -480,9 +483,6 @@ struct SILDeclRef {
     return result;
   }
 
-  /// True is the decl ref references any kind of thunk.
-  bool isAnyThunk() const;
-
   /// True if the decl ref references a thunk from a natively foreign
   /// declaration to Swift calling convention.
   bool isForeignToNativeThunk() const;
@@ -509,9 +509,6 @@ struct SILDeclRef {
   /// True if the decl ref references a method which introduces a new witness
   /// table entry.
   bool requiresNewWitnessTableEntry() const;
-
-  /// True if the decl is a method which introduces a new witness table entry.
-  static bool requiresNewWitnessTableEntry(AbstractFunctionDecl *func);
 
   /// Return a SILDeclRef to the declaration overridden by this one, or
   /// a null SILDeclRef if there is no override.
@@ -553,11 +550,22 @@ struct SILDeclRef {
 
   bool isImplicit() const;
 
+  /// Whether the referenced function contains user code. This is generally true
+  /// for a non-implicit decls, but may also be true for implicit decls if
+  /// explicitly written code has been spliced into the body. This is the case
+  /// for e.g a lazy variable getter.
+  bool hasUserWrittenCode() const;
+
   /// Return the scope in which the parent class of a method (i.e. class
   /// containing this declaration) can be subclassed, returning NotApplicable if
   /// this is not a method, there is no such class, or the class cannot be
   /// subclassed.
   SubclassScope getSubclassScope() const;
+
+  /// For a SILDeclRef that describes a variable initializer or backing
+  /// initializer, retrieves the expression that will be emitted for that
+  /// initialization. Otherwise, returns \c nullptr.
+  Expr *getInitializationExpr() const;
 
   bool isDynamicallyReplaceable() const;
 

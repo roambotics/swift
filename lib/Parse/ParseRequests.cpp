@@ -26,7 +26,7 @@
 #include "swift/Syntax/SyntaxNodes.h"
 #include "swift/SyntaxParse/SyntaxTreeCreator.h"
 
-#ifdef SWIFT_SWIFT_PARSER
+#if SWIFT_SWIFT_PARSER
 #include "SwiftCompilerSupport.h"
 #endif
 
@@ -193,7 +193,7 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
   if (auto tokens = parser.takeTokenReceiver()->finalize())
     tokensRef = ctx.AllocateCopy(*tokens);
 
-#ifdef SWIFT_SWIFT_PARSER
+#if SWIFT_SWIFT_PARSER
   if ((ctx.LangOpts.hasFeature(Feature::ParserRoundTrip) ||
        ctx.LangOpts.hasFeature(Feature::ParserValidation)) &&
       ctx.SourceMgr.getCodeCompletionBufferID() != bufferID &&
@@ -215,13 +215,24 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
       flags |= SCC_FoldSequences;
 
     if (flags) {
+      SourceLoc startLoc =
+          parser.SourceMgr.getLocForBufferStart(parser.L->getBufferID());
+      struct ParserContext {
+        SourceLoc startLoc;
+        DiagnosticEngine *engine;
+      } context{startLoc, &parser.Diags};
       int roundTripResult = swift_parser_consistencyCheck(
           bufferRange.str().data(), bufferRange.getByteLength(),
-          SF->getFilename().str().c_str(), flags);
+          SF->getFilename().str().c_str(), flags, static_cast<void *>(&context),
+          [](ptrdiff_t off, const char *text, void *ctx) {
+            auto *context = static_cast<ParserContext *>(ctx);
+            SourceLoc loc = context->startLoc.getAdvancedLoc(off);
+            context->engine->diagnose(loc, diag::foreign_diagnostic,
+                                      StringRef(text));
+          });
 
-      // FIXME: Produce an error on round-trip failure.
       if (roundTripResult)
-        abort();
+        ctx.Diags.diagnose(SourceLoc(), diag::new_parser_failure);
     }
   }
 #endif
