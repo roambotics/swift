@@ -44,7 +44,6 @@
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/DataTypes.h"
-#include "llvm/Support/DynamicLibrary.h"
 #include <functional>
 #include <memory>
 #include <utility>
@@ -133,7 +132,6 @@ namespace swift {
   class IndexSubset;
   struct SILAutoDiffDerivativeFunctionKey;
   struct InterfaceSubContextDelegate;
-  class CompilerPlugin;
 
   enum class KnownProtocolKind : uint8_t;
 
@@ -143,10 +141,6 @@ namespace namelookup {
 
 namespace rewriting {
   class RewriteContext;
-}
-
-namespace syntax {
-  class SyntaxArena;
 }
 
 namespace ide {
@@ -294,6 +288,11 @@ public:
 
   ide::TypeCheckCompletionCallback *CompletionCallback = nullptr;
 
+  /// A callback that will be called when the constraint system found a
+  /// solution. Called multiple times if the constraint system has ambiguous
+  /// solutions.
+  ide::TypeCheckCompletionCallback *SolutionCallback = nullptr;
+
   /// The request-evaluator that is used to process various requests.
   Evaluator evaluator;
 
@@ -352,12 +351,6 @@ public:
       std::tuple<Decl *, IndexSubset *, AutoDiffDerivativeFunctionKind>,
       llvm::SmallPtrSet<DerivativeAttr *, 1>>
       DerivativeAttrs;
-
-  /// Cache of compiler plugins keyed by their name.
-  llvm::StringMap<CompilerPlugin> LoadedPlugins;
-
-  /// Cache of loaded symbols.
-  llvm::StringMap<void *> LoadedSymbols;
 
 private:
   /// The current generation number, which reflects the number of
@@ -504,9 +497,6 @@ public:
                                               arena),
                               setVector.size());
   }
-
-  /// Retrieve the syntax node memory manager for this context.
-  llvm::IntrusiveRefCntPtr<syntax::SyntaxArena> getSyntaxArena() const;
 
   /// Set a new stats reporter.
   void setStatsReporter(UnifiedStatsReporter *stats);
@@ -1453,13 +1443,9 @@ public:
   /// The declared interface type of Builtin.TheTupleType.
   BuiltinTupleType *getBuiltinTupleType();
 
-  /// Finds the loaded compiler plugin given its name.
-  CompilerPlugin *getLoadedPlugin(StringRef name);
-
-  /// Finds the address of the given symbol. If `libraryHint` is non-null,
+  /// Finds the address of the given symbol. If `libraryHandleHint` is non-null,
   /// search within the library.
-  void *getAddressOfSymbol(StringRef name,
-                           llvm::sys::DynamicLibrary *libraryHint = nullptr);
+  void *getAddressOfSymbol(const char *name, void *libraryHandleHint = nullptr);
 
 private:
   friend Decl;

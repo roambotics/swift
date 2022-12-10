@@ -17,6 +17,7 @@
 #include "swift/AST/ProtocolAssociations.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/SIL/SILDeclRef.h"
+#include "swift/SIL/SILModule.h"
 
 namespace swift {
 
@@ -76,7 +77,8 @@ public:
                     const SILSymbolVisitorContext &ctx);
 
   /// Override to prepare for enumeration of the symbols for a specific decl.
-  virtual void willVisitDecl(Decl *D) {}
+  /// Return \c true to proceed with visiting the decl or \c false to skip it.
+  virtual bool willVisitDecl(Decl *D) { return true; }
 
   /// Override to clean up after enumeration of the symbols for a specific decl.
   virtual void didVisitDecl(Decl *D) {}
@@ -106,9 +108,7 @@ public:
   virtual void addMethodDescriptor(SILDeclRef declRef) {}
   virtual void addMethodLookupFunction(ClassDecl *CD) {}
   virtual void addNominalTypeDescriptor(NominalTypeDecl *NTD) {}
-  virtual void addObjCClass(ClassDecl *CD) {}
   virtual void addObjCInterface(ClassDecl *CD) {}
-  virtual void addObjCMetaclass(ClassDecl *CD) {}
   virtual void addObjCMethod(AbstractFunctionDecl *AFD) {}
   virtual void addObjCResilientClassStub(ClassDecl *CD) {}
   virtual void addOpaqueTypeDescriptor(OpaqueTypeDecl *OTD) {}
@@ -125,6 +125,33 @@ public:
   virtual void addTypeMetadataAccessFunction(CanType T) {}
   virtual void addTypeMetadataAddress(CanType T) {}
 };
+
+template <typename F>
+void enumerateFunctionsForHasSymbol(SILModule &M, ValueDecl *D, F Handler) {
+  class SymbolVisitor : public SILSymbolVisitor {
+    F Handler;
+
+  public:
+    SymbolVisitor(F Handler) : Handler{Handler} {};
+
+    void addFunction(SILDeclRef declRef) override { Handler(declRef); }
+
+    virtual void addFunction(StringRef name, SILDeclRef declRef) override {
+      // The kinds of functions which go through this callback (e.g.
+      // differentiability witnesses) have custom manglings and are incompatible
+      // with #_hasSymbol currently.
+      //
+      // Ideally, this callback will be removed entirely in favor of SILDeclRef
+      // being able to represent all function variants with no special cases
+      // required.
+    }
+  };
+
+  SILSymbolVisitorOptions opts;
+  opts.VisitMembers = false;
+  auto visitorCtx = SILSymbolVisitorContext(M.getSwiftModule(), opts);
+  SymbolVisitor(Handler).visitDecl(D, visitorCtx);
+}
 
 } // end namespace swift
 

@@ -22,9 +22,6 @@
 #include "swift/Basic/Defer.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Subsystems.h"
-#include "swift/Syntax/SyntaxArena.h"
-#include "swift/Syntax/SyntaxNodes.h"
-#include "swift/SyntaxParse/SyntaxTreeCreator.h"
 
 #if SWIFT_SWIFT_PARSER
 #include "SwiftCompilerSupport.h"
@@ -81,8 +78,6 @@ ParseMembersRequest::evaluate(Evaluator &evaluator,
   // Lexer diagnostics have been emitted during skipping, so we disable lexer's
   // diagnostic engine here.
   Parser parser(bufferID, *sf, /*No Lexer Diags*/nullptr, nullptr, nullptr);
-  // Disable libSyntax creation in the delayed parsing.
-  parser.SyntaxContext->disable();
   auto declsAndHash = parser.parseDeclListDelayed(idc);
   FingerprintAndMembers fingerprintAndMembers = {declsAndHash.second,
                                                  declsAndHash.first};
@@ -125,7 +120,6 @@ ParseAbstractFunctionBodyRequest::evaluate(Evaluator &evaluator,
     unsigned bufferID =
         sourceMgr.findBufferContainingLoc(afd->getBodySourceRange().Start);
     Parser parser(bufferID, sf, /*SIL*/ nullptr);
-    parser.SyntaxContext->disable();
     auto result = parser.parseAbstractFunctionBodyDelayed(afd);
     afd->setBodyKind(BodyKind::Parsed);
     return result;
@@ -154,12 +148,6 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
   if (!bufferID)
     return {};
 
-  std::shared_ptr<SyntaxTreeCreator> sTreeCreator;
-  if (SF->shouldBuildSyntaxTree()) {
-    sTreeCreator = std::make_shared<SyntaxTreeCreator>(
-        ctx.SourceMgr, *bufferID, SF->SyntaxParsingCache, ctx.getSyntaxArena());
-  }
-
   // If we've been asked to silence warnings, do so now. This is needed for
   // secondary files, which can be parsed multiple times.
   auto &diags = ctx.Diags;
@@ -177,17 +165,11 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
     SF->setDelayedParserState({state, &deletePersistentParserState});
   }
 
-  Parser parser(*bufferID, *SF, /*SIL*/ nullptr, state, sTreeCreator);
+  Parser parser(*bufferID, *SF, /*SIL*/ nullptr, state);
   PrettyStackTraceParser StackTrace(parser);
 
-  SmallVector<Decl *, 128> decls;
-  parser.parseTopLevel(decls);
-
-  Optional<SourceFileSyntax> syntaxRoot;
-  if (sTreeCreator) {
-    auto rawNode = parser.finalizeSyntaxTree();
-    syntaxRoot.emplace(*sTreeCreator->realizeSyntaxRoot(rawNode, *SF));
-  }
+  SmallVector<ASTNode, 128> items;
+  parser.parseTopLevelItems(items);
 
   Optional<ArrayRef<Token>> tokensRef;
   if (auto tokens = parser.takeTokenReceiver()->finalize())
@@ -237,8 +219,8 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
   }
 #endif
 
-  return SourceFileParsingResult{ctx.AllocateCopy(decls), tokensRef,
-                                 parser.CurrentTokenHash, syntaxRoot};
+  return SourceFileParsingResult{ctx.AllocateCopy(items), tokensRef,
+                                 parser.CurrentTokenHash};
 }
 
 evaluator::DependencySource ParseSourceFileRequest::readDependencySource(
@@ -249,30 +231,37 @@ evaluator::DependencySource ParseSourceFileRequest::readDependencySource(
 Optional<SourceFileParsingResult>
 ParseSourceFileRequest::getCachedResult() const {
   auto *SF = std::get<0>(getStorage());
-  auto decls = SF->getCachedTopLevelDecls();
-  if (!decls)
+  auto items = SF->getCachedTopLevelItems();
+  if (!items)
     return None;
 
-  Optional<SourceFileSyntax> syntaxRoot;
-  if (auto &rootPtr = SF->SyntaxRoot)
-    syntaxRoot.emplace(*rootPtr);
-
-  return SourceFileParsingResult{*decls, SF->AllCollectedTokens,
-                                 SF->InterfaceHasher, syntaxRoot};
+  return SourceFileParsingResult{*items, SF->AllCollectedTokens,
+                                 SF->InterfaceHasher};
 }
 
 void ParseSourceFileRequest::cacheResult(SourceFileParsingResult result) const {
   auto *SF = std::get<0>(getStorage());
-  assert(!SF->Decls);
-  SF->Decls = result.TopLevelDecls;
+  assert(!SF->Items);
+  SF->Items = result.TopLevelItems;
   SF->AllCollectedTokens = result.CollectedTokens;
   SF->InterfaceHasher = result.InterfaceHasher;
 
-  if (auto &root = result.SyntaxRoot)
-    SF->SyntaxRoot = std::make_unique<SourceFileSyntax>(std::move(*root));
-
   // Verify the parsed source file.
   verify(*SF);
+}
+
+ArrayRef<Decl *> ParseTopLevelDeclsRequest::evaluate(
+    Evaluator &evaluator, SourceFile *SF) const {
+  auto items = evaluateOrDefault(evaluator, ParseSourceFileRequest{SF}, {})
+    .TopLevelItems;
+
+  std::vector<Decl *> decls;
+  for (auto item : items) {
+    if (auto decl = item.dyn_cast<Decl *>())
+      decls.push_back(decl);
+  }
+
+  return SF->getASTContext().AllocateCopy(decls);
 }
 
 //----------------------------------------------------------------------------//

@@ -167,6 +167,16 @@ def verify_incremental_dependencies :
   Flag<["-"], "verify-incremental-dependencies">,
   Flags<[FrontendOption, HelpHidden]>,
   HelpText<"Enable the dependency verifier for each frontend job">;
+  
+def strict_implicit_module_context :
+  Flag<["-"], "strict-implicit-module-context">,
+  Flags<[FrontendOption, HelpHidden]>,
+  HelpText<"Enable the strict forwarding of compilation context to downstream implicit module dependencies">;
+  
+def no_strict_implicit_module_context :
+  Flag<["-"], "no-strict-implicit-module-context">,
+  Flags<[FrontendOption, HelpHidden]>,
+  HelpText<"Disable the strict forwarding of compilation context to downstream implicit module dependencies">;
 
 def disallow_forwarding_driver :
   Flag<["-"], "disallow-use-new-driver">, Flags<[]>,
@@ -556,6 +566,9 @@ def emit_objc_header_path : Separate<["-"], "emit-objc-header-path">,
   Flags<[FrontendOption, NoInteractiveOption, ArgumentIsPath,
          SupplementaryOutput]>,
   MetaVarName<"<path>">, HelpText<"Emit an Objective-C header file to <path>">;
+def emit_clang_header_nonmodular_includes : Flag<["-"], "emit-clang-header-nonmodular-includes">,
+  Flags<[FrontendOption, NoInteractiveOption, SupplementaryOutput]>,
+  HelpText<"Augment emitted Objective-C header with textual imports for every included modular import">;
 
 def emit_clang_header_path : Separate<["-"], "emit-clang-header-path">,
   Flags<[FrontendOption, NoDriverOption, NoInteractiveOption, ArgumentIsPath,
@@ -633,6 +646,11 @@ def enable_experimental_cxx_interop :
   Flag<["-"], "enable-experimental-cxx-interop">,
   Flags<[FrontendOption, HelpHidden, ModuleInterfaceOption]>,
   HelpText<"Enable experimental C++ interop code generation and config directives">;
+
+def experimental_c_foreign_reference_types :
+  Flag<["-"], "experimental-c-foreign-reference-types">,
+  Flags<[FrontendOption, HelpHidden, ModuleInterfaceOption]>,
+  HelpText<"Enable experimental C foreign references types (with reference coutning).">;
 
 def enable_experimental_cxx_interop_in_clang_header :
   Flag<["-"], "enable-experimental-cxx-interop-in-clang-header">,
@@ -1325,6 +1343,10 @@ def user_module_version : Separate<["-"], "user-module-version">,
   HelpText<"Module version specified from Swift module authors">,
   MetaVarName<"<vers>">;
 
+def allowable_client : Separate<["-"], "allowable-client">,
+  Flags<[FrontendOption, ModuleInterfaceOptionIgnorable, NewDriverOnlyOption]>,
+  HelpText<"Module names that are allowed to import this module">,
+  MetaVarName<"<vers>">;
 // VFS
 
 def vfsoverlay : JoinedOrSeparate<["-"], "vfsoverlay">,
@@ -1354,6 +1376,12 @@ def disable_autolinking_runtime_compatibility_concurrency
       HelpText<"Do not use autolinking for the concurrency runtime "
                "compatibility library">;
 
+def enable_autolinking_runtime_compatibility_bytecode_layouts
+    : Flag<[ "-" ], "enable-autolinking-runtime-compatibility-bytecode-layouts">,
+      Flags<[ FrontendOption ]>,
+      HelpText<"Enable autolinking for the bytecode layouts runtime "
+               "compatibility library">;
+
 def emit_symbol_graph: Flag<["-"], "emit-symbol-graph">,
   Flags<[FrontendOption, NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
   HelpText<"Emit a symbol graph">;
@@ -1377,6 +1405,11 @@ def emit_extension_block_symbols: Flag<["-"], "emit-extension-block-symbols">,
   Flags<[SwiftSymbolGraphExtractOption, FrontendOption,
         NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
   HelpText<"Emit 'swift.extension' symbols for extensions to external types instead of directly associating members and conformances with the extended nominal when generating symbol graphs">;
+
+def omit_extension_block_symbols: Flag<["-"], "omit-extension-block-symbols">,
+  Flags<[SwiftSymbolGraphExtractOption, FrontendOption,
+        NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
+  HelpText<"Directly associate members and conformances with the extended nominal when generating symbol graphs instead of emitting 'swift.extension' symbols for extensions to external types">;
 
 // swift-symbolgraph-extract-only options
 def output_dir : Separate<["-"], "output-dir">,

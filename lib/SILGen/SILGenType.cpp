@@ -477,9 +477,9 @@ private:
     // substitute the witness's derivative generic signature in its derivative
     // function identifier.
     if (requirementRef.isAutoDiffDerivativeFunction()) {
-      auto *reqrRerivativeId = requirementRef.getDerivativeFunctionIdentifier();
+      auto *reqrDerivativeId = requirementRef.getDerivativeFunctionIdentifier();
       auto *witnessDerivativeId = AutoDiffDerivativeFunctionIdentifier::get(
-          reqrRerivativeId->getKind(), reqrRerivativeId->getParameterIndices(),
+          reqrDerivativeId->getKind(), reqrDerivativeId->getParameterIndices(),
           witness.getDerivativeGenericSignature(), witnessRef.getASTContext());
       witnessRef = witnessRef.asAutoDiffDerivativeFunction(witnessDerivativeId);
     }
@@ -866,7 +866,8 @@ static SILFunction *emitSelfConformanceWitness(SILGenModule &SGM,
 
   // Open the protocol type.
   auto openedType = OpenedArchetypeType::get(
-      protocol->getExistentialType()->getCanonicalType(), GenericSignature());
+      protocol->getDeclaredExistentialType()->getCanonicalType(),
+      GenericSignature());
 
   // Form the substitutions for calling the witness.
   auto witnessSubs = SubstitutionMap::getProtocolSubstitutions(protocol,
@@ -1121,7 +1122,8 @@ public:
   //===--------------------------------------------------------------------===//
   void visitTypeAliasDecl(TypeAliasDecl *tad) {}
   void visitOpaqueTypeDecl(OpaqueTypeDecl *otd) {}
-  void visitAbstractTypeParamDecl(AbstractTypeParamDecl *tpd) {}
+  void visitGenericTypeParamDecl(GenericTypeParamDecl *d) {}
+  void visitAssociatedTypeDecl(AssociatedTypeDecl *d) {}
   void visitModuleDecl(ModuleDecl *md) {}
   void visitMissingMemberDecl(MissingMemberDecl *) {}
   void visitNominalTypeDecl(NominalTypeDecl *ntd) {
@@ -1220,6 +1222,10 @@ public:
     });
   }
 
+  void visitMacroDecl(MacroDecl *md) {
+    llvm_unreachable("macros aren't allowed in types");
+  }
+
   void visitMacroExpansionDecl(MacroExpansionDecl *med) {
     auto *rewritten = med->getRewritten();
     assert(rewritten && "Macro must have been rewritten in SILGen");
@@ -1276,7 +1282,8 @@ public:
   //===--------------------------------------------------------------------===//
   void visitTypeAliasDecl(TypeAliasDecl *tad) {}
   void visitOpaqueTypeDecl(OpaqueTypeDecl *tad) {}
-  void visitAbstractTypeParamDecl(AbstractTypeParamDecl *tpd) {}
+  void visitGenericTypeParamDecl(GenericTypeParamDecl *d) {}
+  void visitAssociatedTypeDecl(AssociatedTypeDecl *d) {}
   void visitModuleDecl(ModuleDecl *md) {}
   void visitMissingMemberDecl(MissingMemberDecl *) {}
   void visitNominalTypeDecl(NominalTypeDecl *ntd) {
@@ -1388,6 +1395,10 @@ public:
     asd->visitEmittedAccessors([&](AccessorDecl *accessor) {
       visitFuncDecl(accessor);
     });
+  }
+
+  void visitMacroDecl(MacroDecl *md) {
+    llvm_unreachable("macros aren't allowed in extensions");
   }
 
   void visitMacroExpansionDecl(MacroExpansionDecl *med) {

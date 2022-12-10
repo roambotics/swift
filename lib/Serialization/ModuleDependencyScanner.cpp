@@ -118,12 +118,15 @@ ErrorOr<ModuleDependencies> ModuleDependencyScanner::scanInterfaceFile(
     std::string InPath = moduleInterfacePath.str();
     auto compiledCandidates = getCompiledCandidates(Ctx, realModuleName.str(),
                                                     InPath);
-    Result = ModuleDependencies::forSwiftInterfaceModule(InPath,
-                                                   compiledCandidates,
-                                                   Args,
-                                                   PCMArgs,
-                                                   Hash,
-                                                   isFramework);
+
+    SmallString<128> outputPathBase(moduleCachePath);
+    llvm::sys::path::append(
+        outputPathBase,
+        moduleName.str() + "-" + Hash + "." +
+            file_types::getExtension(file_types::TY_SwiftModuleFile));
+    Result = ModuleDependencies::forSwiftInterfaceModule(
+        outputPathBase.str().str(), InPath, compiledCandidates, Args, PCMArgs,
+        Hash, isFramework);
     // Open the interface file.
     auto &fs = *Ctx.SourceMgr.getFileSystem();
     auto interfaceBuf = fs.getBufferForFile(moduleInterfacePath);
@@ -136,6 +139,7 @@ ErrorOr<ModuleDependencies> ModuleDependencyScanner::scanInterfaceFile(
     auto moduleDecl = ModuleDecl::create(realModuleName, Ctx);
     auto sourceFile = new (Ctx) SourceFile(
         *moduleDecl, SourceFileKind::Interface, bufferID);
+    moduleDecl->addAuxiliaryFile(*sourceFile);
 
     // Walk the source file to find the import declarations.
     llvm::StringSet<> alreadyAddedModules;
@@ -163,20 +167,16 @@ Optional<ModuleDependencies> SerializedModuleLoaderBase::getModuleDependencies(
 
   // Check whether we've cached this result.
   if (auto found = cache.findDependencies(
-           moduleName,
-           {ModuleDependenciesKind::SwiftInterface, currentSearchPathSet}))
+           moduleName, ModuleDependenciesKind::SwiftInterface))
     return found;
   if (auto found = cache.findDependencies(
-           moduleName,
-           {ModuleDependenciesKind::SwiftSource, currentSearchPathSet}))
+           moduleName, ModuleDependenciesKind::SwiftSource))
     return found;
   if (auto found = cache.findDependencies(
-            moduleName,
-            {ModuleDependenciesKind::SwiftBinary, currentSearchPathSet}))
+            moduleName, ModuleDependenciesKind::SwiftBinary))
     return found;
   if (auto found = cache.findDependencies(
-            moduleName,
-            {ModuleDependenciesKind::SwiftPlaceholder, currentSearchPathSet}))
+            moduleName, ModuleDependenciesKind::SwiftPlaceholder))
     return found;
 
   ImportPath::Module::Builder builder(Ctx, moduleName, /*separator=*/'.');

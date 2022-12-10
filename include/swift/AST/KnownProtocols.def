@@ -105,6 +105,8 @@ PROTOCOL(DistributedTargetInvocationDecoder)
 PROTOCOL(DistributedTargetInvocationResultHandler)
 
 // C++ Standard Library Overlay:
+PROTOCOL(CxxConvertibleToCollection)
+PROTOCOL(CxxRandomAccessCollection)
 PROTOCOL(CxxSequence)
 PROTOCOL(UnsafeCxxInputIterator)
 PROTOCOL(UnsafeCxxRandomAccessIterator)
@@ -113,9 +115,6 @@ PROTOCOL(AsyncSequence)
 PROTOCOL(AsyncIteratorProtocol)
 
 PROTOCOL(FloatingPoint)
-
-// Compiler Plugins
-PROTOCOL_(CompilerPlugin)
 
 EXPRESSIBLE_BY_LITERAL_PROTOCOL(ExpressibleByArrayLiteral, "Array", false)
 EXPRESSIBLE_BY_LITERAL_PROTOCOL(ExpressibleByBooleanLiteral, "BooleanLiteralType", true)

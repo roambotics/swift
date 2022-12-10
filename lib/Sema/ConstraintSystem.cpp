@@ -1606,6 +1606,25 @@ ConstraintSystem::getTypeOfReference(ValueDecl *value,
     return { type, type, type, type };
   }
 
+  // Unqualified reference to a macro.
+  if (auto macro = dyn_cast<MacroDecl>(value)) {
+    Type macroType = macro->getInterfaceType();
+
+    // Open any the generic types.
+    OpenedTypeMap replacements;
+    openGeneric(macro->getParentModule(), macro->getGenericSignature(),
+                locator, replacements);
+
+    // If we opened up any type variables, record the replacements.
+    recordOpenedTypes(locator, replacements);
+
+    Type openedType = openType(macroType, replacements);
+
+    // FIXME: Should we use replaceParamErrorTypeByPlaceholder() here?
+
+    return { openedType, openedType, openedType, openedType };
+  }
+
   // Only remaining case: unqualified reference to a property.
   auto *varDecl = cast<VarDecl>(value);
 
@@ -2470,29 +2489,6 @@ ConstraintSystem::getTypeOfMemberReference(
 
   return { origOpenedType, openedType, origType, type };
 }
-
-#if SWIFT_SWIFT_PARSER
-Type ConstraintSystem::getTypeOfMacroReference(StringRef macroName,
-                                               Expr *anchor) {
-  auto req = MacroContextRequest{macroName.str(), DC->getParentModule()};
-  auto *macroCtx = evaluateOrDefault(getASTContext().evaluator, req, nullptr);
-  if (!macroCtx)
-    return Type();
-
-  auto *locator = getConstraintLocator(anchor);
-  // Dig through to __MacroEvaluationContext.SignatureType
-  auto sig = getASTContext().getIdentifier("SignatureType");
-  auto *signature = cast<TypeAliasDecl>(macroCtx->lookupDirect(sig).front());
-  auto type = signature->getUnderlyingType();
-
-  // Open any the generic types.
-  OpenedTypeMap replacements;
-  openGeneric(signature->getParent(), signature->getGenericSignature(),
-              locator, replacements);
-
-  return openType(type, replacements);
-}
-#endif
 
 Type ConstraintSystem::getEffectiveOverloadType(ConstraintLocator *locator,
                                                 const OverloadChoice &overload,
@@ -3958,7 +3954,7 @@ SolutionResult ConstraintSystem::salvage() {
         int i = 0;
         for (auto &solution : viable) {
           log << "---Ambiguous solution #" << i++ << "---\n";
-          solution.dump(log);
+          solution.dump(log, solverState->getCurrentIndent());
           log << "\n";
         }
       }
@@ -4479,7 +4475,7 @@ static bool diagnoseAmbiguity(
       } else if (llvm::all_of(solution.Fixes, [&](ConstraintFix *fix) {
                    return fix->getLocator()
                        ->findLast<LocatorPathElt::ApplyArgument>()
-                       .hasValue();
+                       .has_value();
                  })) {
         // All fixes have to do with arguments, so let's show the parameter
         // lists.
@@ -4692,13 +4688,15 @@ bool ConstraintSystem::diagnoseAmbiguityWithFixes(
     return true;
 
   if (isDebugMode()) {
-    auto &log = llvm::errs();
+    auto indent = solverState->getCurrentIndent();
+    auto &log = llvm::errs().indent(indent);
     log << "--- Ambiguity: Considering #" << solutions.size()
         << " solutions with fixes ---\n";
     int i = 0;
     for (auto &solution : solutions) {
-      log << "\n--- Solution #" << i++ << "---\n";
-      solution.dump(log);
+      log << "\n";
+      log.indent(indent) << "--- Solution #" << i++ << "---\n";
+      solution.dump(log, indent);
       log << "\n";
     }
   }
@@ -5331,7 +5329,16 @@ void constraints::simplifyLocator(ASTNode &anchor,
       break;
 
     case ConstraintLocator::PackElement:
+    case ConstraintLocator::PackShape:
       break;
+
+    case ConstraintLocator::PackExpansionPattern: {
+      if (auto *expansion = getAsExpr<PackExpansionExpr>(anchor))
+        anchor = expansion->getPatternExpr();
+
+      path = path.slice(1);
+      break;
+    }
 
     case ConstraintLocator::PatternBindingElement: {
       auto pattern = path[0].castTo<LocatorPathElt::PatternBindingElement>();
@@ -6540,7 +6547,7 @@ void ConstraintSystem::diagnoseFailureFor(SolutionApplicationTarget target) {
 bool ConstraintSystem::isDeclUnavailable(const Decl *D,
                                          ConstraintLocator *locator) const {
   // First check whether this declaration is universally unavailable.
-  if (AvailableAttr::isUnavailable(D))
+  if (D->getAttrs().isUnavailable(getASTContext()))
     return true;
 
   return TypeChecker::isDeclarationUnavailable(D, DC, [&] {
@@ -6869,7 +6876,7 @@ bool ConstraintSystem::isReadOnlyKeyPathComponent(
     ExportContext where = ExportContext::forFunctionBody(DC, referenceLoc);
     auto maybeUnavail =
         TypeChecker::checkDeclarationAvailability(setter, where);
-    if (maybeUnavail.hasValue()) {
+    if (maybeUnavail.has_value()) {
       return true;
     }
   }

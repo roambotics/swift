@@ -85,6 +85,10 @@ namespace swift {
     /// all decls in the module are considered to be SPI including public ones.
     SPI,
 
+    /// Internal Programming Interface that is not distributed and only usable
+    /// from within a project.
+    IPI,
+
     /// The library has some other undefined distribution.
     Other
   };
@@ -278,6 +282,8 @@ namespace swift {
     /// disabled because it is not complete.
     bool EnableCXXInterop = false;
 
+    bool CForeignReferenceTypes = false;
+
     /// Imports getters and setters as computed properties.
     bool CxxInteropGettersSettersAsProperties = false;
 
@@ -418,19 +424,6 @@ namespace swift {
     /// Whether collect tokens during parsing for syntax coloring.
     bool CollectParsedToken = false;
 
-    /// Whether to parse syntax tree. If the syntax tree is built, the generated
-    /// AST may not be correct when syntax nodes are reused as part of
-    /// incrementals parsing.
-    bool BuildSyntaxTree = false;
-
-    /// Whether parsing is occurring for creation of syntax tree only, and no typechecking will occur after
-    /// parsing e.g. when parsing for SwiftSyntax. This is intended to affect parsing, e.g. disable
-    /// unnecessary name lookups that are not useful for pure syntactic parsing.
-    bool ParseForSyntaxTreeOnly = false;
-
-    /// Whether to verify the parsed syntax tree and emit related diagnostics.
-    bool VerifySyntaxTree = false;
-
     /// Whether to disable the evaluation of '#if' decls, such that the bodies
     /// of active clauses aren't hoisted into the enclosing scope.
     bool DisablePoundIfEvaluation = false;
@@ -525,6 +518,9 @@ namespace swift {
 
     /// Enables dumping type witness systems from associated type inference.
     bool DumpTypeWitnessSystems = false;
+
+    /// Enables dumping macro expansions.
+    bool DumpMacroExpansions = false;
 
     /// The model of concurrency to be used.
     ConcurrencyModel ActiveConcurrencyModel = ConcurrencyModel::Standard;
@@ -630,6 +626,12 @@ namespace swift {
       llvm::raw_svector_ostream OS(Scratch);
       OS << EffectiveLanguageVersion;
       return llvm::hash_combine(Target.str(), OS.str());
+    }
+
+    /// Return a hash code of any components from these options that should
+    /// contribute to a Swift Dependency Scanning hash.
+    llvm::hash_code getModuleScanningHashComponents() const {
+      return getPCHHashComponents();
     }
 
   private:
@@ -834,6 +836,12 @@ namespace swift {
                           DisableSwiftBridgeAttr,
                           DisableOverlayModules,
                           EnableClangSPI);
+    }
+
+    /// Return a hash code of any components from these options that should
+    /// contribute to a Swift Dependency Scanning hash.
+    llvm::hash_code getModuleScanningHashComponents() const {
+      return getPCHHashComponents();
     }
 
     std::vector<std::string> getRemappedExtraArgs(

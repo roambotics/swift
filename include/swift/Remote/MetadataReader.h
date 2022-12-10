@@ -515,11 +515,9 @@ public:
                                  const std::string &mangledName,
                                  MangledNameKind kind,
                                  Demangler &dem) {
-    size_t stringSize = mangledName.size() + 1; // + 1 for terminating NUL.
-
-    char *copiedString = dem.Allocate<char>(stringSize);
-    memcpy(copiedString, mangledName.data(), stringSize);
-    return demangle(RemoteRef<char>(remoteAddress, copiedString), kind, dem);
+    StringRef mangledNameCopy = dem.copyString(mangledName);
+    return demangle(RemoteRef<char>(remoteAddress, mangledNameCopy.data()),
+                    kind, dem);
   }
 
   /// Given a demangle tree, attempt to turn it into a type.
@@ -1495,7 +1493,12 @@ public:
   
     return demangledSymbol;
   }
-  
+
+  Demangle::NodePointer buildContextManglingForSymbol(const std::string &symbol,
+                                                      Demangler &dem) {
+    return buildContextManglingForSymbol(dem.copyString(symbol), dem);
+  }
+
   /// Given a read context descriptor, attempt to build a demangling tree
   /// for it.
   Demangle::NodePointer
@@ -2906,9 +2909,11 @@ private:
   template <
       typename T = BuilderType,
       typename std::enable_if_t<
-          !std::is_same<
-              bool,
-              decltype(T::needsToPrecomputeParentGenericContextShapes)>::value,
+          !(std::is_same<
+                const bool,
+                decltype(T::needsToPrecomputeParentGenericContextShapes)>::
+                value &&
+            T::needsToPrecomputeParentGenericContextShapes),
           bool> = true>
   BuiltTypeDecl buildNominalTypeDecl(ContextDescriptorRef descriptor) {
     // Build the demangling tree from the context tree.
@@ -2921,13 +2926,14 @@ private:
     return decl;
   }
 
-  template <
-      typename T = BuilderType,
-      typename std::enable_if_t<
-          std::is_same<
-              bool,
-              decltype(T::needsToPrecomputeParentGenericContextShapes)>::value,
-          bool> = true>
+  template <typename T = BuilderType,
+            typename std::enable_if_t<
+                std::is_same<
+                    const bool,
+                    decltype(T::needsToPrecomputeParentGenericContextShapes)>::
+                        value &&
+                    T::needsToPrecomputeParentGenericContextShapes,
+                bool> = true>
   BuiltTypeDecl buildNominalTypeDecl(ContextDescriptorRef descriptor) {
     // Build the demangling tree from the context tree.
     Demangler dem;
@@ -2944,12 +2950,17 @@ private:
                 countLevels(parentContext, runningCount);
 
           auto genericContext = current->getGenericContext();
-          if (!genericContext)
-            return;
-          auto contextHeader = genericContext->getGenericContextHeader();
-
-          paramsPerLevel.emplace_back(contextHeader.NumParams - runningCount);
-          runningCount += paramsPerLevel.back();
+          // Only consider generic contexts of type class, enum or struct.
+          // There are other context types that can be generic, but they should
+          // not affect the generic shape.
+          if (genericContext &&
+              (current->getKind() == ContextDescriptorKind::Class ||
+               current->getKind() == ContextDescriptorKind::Enum ||
+               current->getKind() == ContextDescriptorKind::Struct)) {
+            auto contextHeader = genericContext->getGenericContextHeader();
+            paramsPerLevel.emplace_back(contextHeader.NumParams - runningCount);
+            runningCount += paramsPerLevel.back();
+          }
         };
     countLevels(descriptor, runningCount);
     BuiltTypeDecl decl = Builder.createTypeDecl(node, paramsPerLevel);

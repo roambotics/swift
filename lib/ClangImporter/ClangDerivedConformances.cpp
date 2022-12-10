@@ -27,7 +27,7 @@ lookupDirectWithoutExtensions(NominalTypeDecl *decl, Identifier id) {
       decl->getASTContext().evaluator, ClangRecordMemberLookup({decl, id}), {});
 
   // Check if there are any synthesized Swift members that match the name.
-  for (auto member : decl->getMembers()) {
+  for (auto member : decl->getCurrentMembersWithoutLoading()) {
     if (auto namedMember = dyn_cast<ValueDecl>(member)) {
       if (namedMember->hasName() && !namedMember->getName().isSpecial() &&
           namedMember->getName().getBaseIdentifier().is(id.str()) &&
@@ -39,6 +39,22 @@ lookupDirectWithoutExtensions(NominalTypeDecl *decl, Identifier id) {
     }
   }
   return result;
+}
+
+/// Similar to ModuleDecl::conformsToProtocol, but doesn't introduce a
+/// dependency on Sema.
+static bool isConcreteAndValid(ProtocolConformanceRef conformanceRef,
+                               ModuleDecl *module) {
+  if (conformanceRef.isInvalid())
+    return false;
+  if (!conformanceRef.isConcrete())
+    return false;
+  auto conformance = conformanceRef.getConcrete();
+  auto subMap = conformance->getSubstitutions(module);
+  return llvm::all_of(subMap.getConformances(),
+                      [&](ProtocolConformanceRef each) -> bool {
+                        return isConcreteAndValid(each, module);
+                      });
 }
 
 static clang::TypeDecl *
@@ -126,7 +142,9 @@ static ValueDecl *getMinusOperator(NominalTypeDecl *decl) {
     if (lhsNominal != rhsNominal || lhsNominal != decl)
       return false;
     auto returnTy = minus->getResultInterfaceType();
-    if (!module->conformsToProtocol(returnTy, binaryIntegerProto))
+    auto conformanceRef =
+        module->lookupConformance(returnTy, binaryIntegerProto);
+    if (!isConcreteAndValid(conformanceRef, module))
       return false;
     return true;
   };
@@ -273,13 +291,13 @@ void swift::conformToCxxIteratorIfNeeded(
 
   // Try to conform to UnsafeCxxRandomAccessIterator if possible.
 
-  auto minus = dyn_cast<FuncDecl>(getMinusOperator(decl));
+  auto minus = dyn_cast_or_null<FuncDecl>(getMinusOperator(decl));
   if (!minus)
     return;
   auto distanceTy = minus->getResultInterfaceType();
   // distanceTy conforms to BinaryInteger, this is ensured by getMinusOperator.
 
-  auto plusEqual = dyn_cast<FuncDecl>(getPlusEqualOperator(decl, distanceTy));
+  auto plusEqual = dyn_cast_or_null<FuncDecl>(getPlusEqualOperator(decl, distanceTy));
   if (!plusEqual)
     return;
 
@@ -301,6 +319,8 @@ void swift::conformToCxxSequenceIfNeeded(
       ctx.getProtocol(KnownProtocolKind::UnsafeCxxInputIterator);
   ProtocolDecl *cxxSequenceProto =
       ctx.getProtocol(KnownProtocolKind::CxxSequence);
+  ProtocolDecl *cxxConvertibleProto =
+      ctx.getProtocol(KnownProtocolKind::CxxConvertibleToCollection);
   // If the Cxx module is missing, or does not include one of the necessary
   // protocols, bail.
   if (!cxxIteratorProto || !cxxSequenceProto)
@@ -331,9 +351,10 @@ void swift::conformToCxxSequenceIfNeeded(
     return;
 
   // Check if RawIterator conforms to UnsafeCxxInputIterator.
-  auto rawIteratorConformanceRef = decl->getModuleContext()->conformsToProtocol(
-      rawIteratorTy, cxxIteratorProto);
-  if (!rawIteratorConformanceRef || !rawIteratorConformanceRef.isConcrete())
+  ModuleDecl *module = decl->getModuleContext();
+  auto rawIteratorConformanceRef =
+      module->lookupConformance(rawIteratorTy, cxxIteratorProto);
+  if (!isConcreteAndValid(rawIteratorConformanceRef, module))
     return;
   auto rawIteratorConformance = rawIteratorConformanceRef.getConcrete();
   auto pointeeDecl =
@@ -356,11 +377,76 @@ void swift::conformToCxxSequenceIfNeeded(
           return declSelfTy;
         return Type(dependentType);
       },
-      LookUpConformanceInModule(decl->getModuleContext()));
+      LookUpConformanceInModule(module));
 
   impl.addSynthesizedTypealias(decl, ctx.Id_Element, pointeeTy);
   impl.addSynthesizedTypealias(decl, ctx.Id_Iterator, iteratorTy);
   impl.addSynthesizedTypealias(decl, ctx.getIdentifier("RawIterator"),
                                rawIteratorTy);
-  impl.addSynthesizedProtocolAttrs(decl, {KnownProtocolKind::CxxSequence});
+  // Not conforming the type to CxxSequence protocol here:
+  // The current implementation of CxxSequence triggers extra copies of the C++
+  // collection when creating a CxxIterator instance. It needs a more efficient
+  // implementation, which is not possible with the existing Swift features.
+  // impl.addSynthesizedProtocolAttrs(decl, {KnownProtocolKind::CxxSequence});
+
+  // Try to conform to CxxRandomAccessCollection if possible.
+
+  auto tryToConformToRandomAccessCollection = [&]() -> bool {
+    auto cxxRAIteratorProto =
+        ctx.getProtocol(KnownProtocolKind::UnsafeCxxRandomAccessIterator);
+    if (!cxxRAIteratorProto ||
+        !ctx.getProtocol(KnownProtocolKind::CxxRandomAccessCollection))
+      return false;
+
+    // Check if `begin()` and `end()` are non-mutating.
+    if (begin->isMutating() || end->isMutating())
+      return false;
+
+    // Check if RawIterator conforms to UnsafeCxxRandomAccessIterator.
+    auto rawIteratorRAConformanceRef =
+        decl->getModuleContext()->lookupConformance(rawIteratorTy,
+                                                    cxxRAIteratorProto);
+    if (!isConcreteAndValid(rawIteratorRAConformanceRef, module))
+      return false;
+
+    // CxxRandomAccessCollection always uses Int as an Index.
+    auto indexTy = ctx.getIntType();
+
+    auto sliceTy = ctx.getSliceType();
+    sliceTy = sliceTy.subst(
+        [&](SubstitutableType *dependentType) {
+          if (dependentType->isEqual(cxxSequenceSelfTy))
+            return declSelfTy;
+          return Type(dependentType);
+        },
+        LookUpConformanceInModule(module));
+
+    auto indicesTy = ctx.getRangeType();
+    indicesTy = indicesTy.subst(
+        [&](SubstitutableType *dependentType) {
+          if (dependentType->isEqual(cxxSequenceSelfTy))
+            return indexTy;
+          return Type(dependentType);
+        },
+        LookUpConformanceInModule(module));
+
+    impl.addSynthesizedTypealias(decl, ctx.getIdentifier("Index"), indexTy);
+    impl.addSynthesizedTypealias(decl, ctx.getIdentifier("Indices"), indicesTy);
+    impl.addSynthesizedTypealias(decl, ctx.getIdentifier("SubSequence"),
+                                 sliceTy);
+    impl.addSynthesizedProtocolAttrs(
+        decl, {KnownProtocolKind::CxxRandomAccessCollection});
+    return true;
+  };
+
+  bool conformedToRAC = tryToConformToRandomAccessCollection();
+
+  // If the collection does not support random access, let's still allow the
+  // developer to explicitly convert a C++ sequence to a Swift Array (making a
+  // copy of the sequence's elements) by conforming the type to
+  // CxxCollectionConvertible. This enables an overload of Array.init declared
+  // in the Cxx module.
+  if (!conformedToRAC && cxxConvertibleProto)
+    impl.addSynthesizedProtocolAttrs(
+        decl, {KnownProtocolKind::CxxConvertibleToCollection});
 }

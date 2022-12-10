@@ -66,6 +66,20 @@ std::string CompilerInvocation::getPCHHash() const {
   return llvm::toString(llvm::APInt(64, Code), 36, /*Signed=*/false);
 }
 
+std::string CompilerInvocation::getModuleScanningHash() const {
+  using llvm::hash_combine;
+
+  auto Code = hash_combine(LangOpts.getModuleScanningHashComponents(),
+                           FrontendOpts.getModuleScanningHashComponents(),
+                           ClangImporterOpts.getModuleScanningHashComponents(),
+                           SearchPathOpts.getModuleScanningHashComponents(),
+                           DiagnosticOpts.getModuleScanningHashComponents(),
+                           SILOpts.getModuleScanningHashComponents(),
+                           IRGenOpts.getModuleScanningHashComponents());
+
+  return llvm::toString(llvm::APInt(64, Code), 36, /*Signed=*/false);
+}
+
 const PrimarySpecificPaths &
 CompilerInvocation::getPrimarySpecificPathsForAtMostOnePrimary() const {
   return getFrontendOptions().getPrimarySpecificPathsForAtMostOnePrimary();
@@ -154,6 +168,7 @@ SerializationOptions CompilerInvocation::computeSerializationOptions(
     serializationOpts.ImportedHeader = opts.ImplicitObjCHeaderPath;
   serializationOpts.ModuleLinkName = opts.ModuleLinkName;
   serializationOpts.UserModuleVersion = opts.UserModuleVersion;
+  serializationOpts.AllowableClients = opts.AllowableClients;
 
   serializationOpts.PublicDependentLibraries =
       getIRGenOptions().PublicLinkLibraries;
@@ -168,7 +183,7 @@ SerializationOptions CompilerInvocation::computeSerializationOptions(
   // so only serialize them if the module isn't going to be shipped to
   // the public.
   serializationOpts.SerializeOptionsForDebugging =
-      opts.SerializeOptionsForDebugging.getValueOr(
+      opts.SerializeOptionsForDebugging.value_or(
           !module->isExternallyConsumed());
 
   serializationOpts.PathObfuscator = opts.serializedPathObfuscator;
@@ -201,8 +216,10 @@ SerializationOptions CompilerInvocation::computeSerializationOptions(
 Lowering::TypeConverter &CompilerInstance::getSILTypes() {
   if (auto *tc = TheSILTypes.get())
     return *tc;
-  
-  auto *tc = new Lowering::TypeConverter(*getMainModule());
+
+  auto *tc = new Lowering::TypeConverter(
+      *getMainModule(),
+      /*loweredAddresses=*/!Context->SILOpts.EnableSILOpaqueValues);
   TheSILTypes.reset(tc);
   return *tc;
 }
@@ -651,7 +668,7 @@ bool CompilerInstance::setUpInputs() {
         getRecordedBufferID(input, shouldRecover, failed);
     hasFailed |= failed;
 
-    if (!bufferID.hasValue() || !input.isPrimary())
+    if (!bufferID.has_value() || !input.isPrimary())
       continue;
 
     recordPrimaryInputBuffer(*bufferID);
@@ -660,7 +677,7 @@ bool CompilerInstance::setUpInputs() {
     return true;
 
   // Set the primary file to the code-completion point if one exists.
-  if (codeCompletionBufferID.hasValue() &&
+  if (codeCompletionBufferID.has_value() &&
       !isPrimaryInput(*codeCompletionBufferID)) {
     assert(PrimaryBufferIDs.empty() && "re-setting PrimaryBufferID");
     recordPrimaryInputBuffer(*codeCompletionBufferID);
@@ -681,13 +698,13 @@ CompilerInstance::getRecordedBufferID(const InputFile &input,
   auto buffers = getInputBuffersIfPresent(input);
 
   // Recover by dummy buffer if requested.
-  if (!buffers.hasValue() && shouldRecover &&
+  if (!buffers.has_value() && shouldRecover &&
       input.getType() == file_types::TY_Swift) {
     buffers = ModuleBuffers(llvm::MemoryBuffer::getMemBuffer(
         "// missing file\n", input.getFileName()));
   }
 
-  if (!buffers.hasValue()) {
+  if (!buffers.has_value()) {
     failed = true;
     return None;
   }
@@ -735,8 +752,8 @@ Optional<ModuleBuffers> CompilerInstance::getInputBuffersIfPresent(
   auto swiftdoc = openModuleDoc(input);
   auto sourceinfo = openModuleSourceInfo(input);
   return ModuleBuffers(std::move(*inputFileOrErr),
-                       swiftdoc.hasValue() ? std::move(swiftdoc.getValue()) : nullptr,
-                       sourceinfo.hasValue() ? std::move(sourceinfo.getValue()) : nullptr);
+                       swiftdoc.has_value() ? std::move(swiftdoc.value()) : nullptr,
+                       sourceinfo.has_value() ? std::move(sourceinfo.value()) : nullptr);
 }
 
 Optional<std::unique_ptr<llvm::MemoryBuffer>>
@@ -981,12 +998,12 @@ CompilerInstance::computeMainSourceFileForModule(ModuleDecl *mod) const {
     MainBufferID.emplace(InputSourceCodeBufferIDs.front());
   }
 
-  if (!MainBufferID.hasValue()) {
+  if (!MainBufferID.has_value()) {
     return nullptr;
   }
 
   auto SFK = tryMatchInputModeToSourceFileKind(FOpts.InputMode);
-  if (!SFK.hasValue()) {
+  if (!SFK.has_value()) {
     return nullptr;
   }
 
@@ -1287,9 +1304,6 @@ SourceFile *CompilerInstance::createSourceFileForMainModule(
 
   auto *inputFile = new (*Context)
       SourceFile(*mod, fileKind, bufferID, opts, isPrimary);
-
-  if (isMainBuffer)
-    inputFile->SyntaxParsingCache = Invocation.getMainFileSyntaxParsingCache();
 
   return inputFile;
 }

@@ -527,7 +527,7 @@ function(_add_swift_runtime_link_flags target relpath_to_lib_dir bootstrapping)
     set_property(TARGET ${target} APPEND_STRING PROPERTY
                  LINK_FLAGS " -lobjc ")
 
-  elseif(SWIFT_HOST_VARIANT_SDK MATCHES "LINUX|ANDROID|OPENBSD")
+  elseif(SWIFT_HOST_VARIANT_SDK MATCHES "LINUX|ANDROID|OPENBSD|FREEBSD")
     set(swiftrt "swiftImageRegistrationObject${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_OBJECT_FORMAT}-${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}-${SWIFT_HOST_VARIANT_ARCH}")
     if(${ASRLF_BOOTSTRAPPING_MODE} MATCHES "HOSTTOOLS|CROSSCOMPILE")
       # At build time and run time, link against the swift libraries in the
@@ -569,7 +569,7 @@ function(_add_swift_runtime_link_flags target relpath_to_lib_dir bootstrapping)
 
   if(SWIFT_SWIFT_PARSER)
     # Make sure we can find the early SwiftSyntax libraries.
-    target_link_directories(${target} PRIVATE "${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/lib")
+    target_link_directories(${target} PRIVATE "${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/lib/swift/host")
 
     # For the "end step" of bootstrapping configurations on Darwin, need to be
     # able to fall back to the SDK directory for libswiftCore et al.
@@ -909,6 +909,20 @@ function(add_swift_host_tool executable)
         $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:"SHELL:-Xclang --dependent-lib=msvcrt$<$<CONFIG:Debug>:d>">
         )
     endif()
+  endif()
+
+  if(SWIFT_SWIFT_PARSER)
+    set(extra_relative_rpath "")
+    if(NOT ${ASHT_BOOTSTRAPPING} STREQUAL "")
+      if (${executable} MATCHES "-bootstrapping")
+        set(extra_relative_rpath "../")
+      endif()
+    endif()
+
+    set_property(
+      TARGET ${executable}
+      APPEND PROPERTY INSTALL_RPATH
+        "@executable_path/../${extra_relative_rpath}lib/swift/host")
   endif()
 
   if(ASHT_THINLTO_LD64_ADD_FLTO_CODEGEN_ONLY)

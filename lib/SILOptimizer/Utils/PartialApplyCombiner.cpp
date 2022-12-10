@@ -179,7 +179,7 @@ void PartialApplyCombiner::processSingleApply(FullApplySite paiAI) {
         auto *ASI = builder.createAllocStack(pai->getLoc(), arg->getType());
         builder.createCopyAddr(pai->getLoc(), arg, ASI, IsTake_t::IsNotTake,
                                IsInitialization_t::IsInitialization);
-        paiAI.insertAfterFullEvaluation([&](SILBuilder &builder) {
+        paiAI.insertAfterApplication([&](SILBuilder &builder) {
           builder.createDeallocStack(destroyloc, ASI);
         });
         arg = ASI;
@@ -207,7 +207,7 @@ void PartialApplyCombiner::processSingleApply(FullApplySite paiAI) {
   // We also need to destroy the partial_apply instruction itself because it is
   // consumed by the apply_instruction.
   if (!pai->hasCalleeGuaranteedContext()) {
-    paiAI.insertAfterFullEvaluation([&](SILBuilder &builder) {
+    paiAI.insertAfterApplication([&](SILBuilder &builder) {
       builder.emitDestroyValueOperation(destroyloc, pai);
     });
   }
@@ -240,8 +240,8 @@ bool PartialApplyCombiner::combine() {
     auto *user = use->getUser();
 
     // Recurse through copy_value
-    if (auto *cvi = dyn_cast<CopyValueInst>(user)) {
-      for (auto *copyUse : cvi->getUses())
+    if (isa<CopyValueInst>(user) || isa<BeginBorrowInst>(user)) {
+      for (auto *copyUse : cast<SingleValueInstruction>(user)->getUses())
         worklist.push_back(copyUse);
       continue;
     }

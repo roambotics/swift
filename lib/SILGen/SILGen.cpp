@@ -55,7 +55,11 @@ SILGenModule::SILGenModule(SILModule &M, ModuleDecl *SM)
       FileIDsByFilePath(SM->computeFileIDMap(/*shouldDiagnose=*/true)) {
   const SILOptions &Opts = M.getOptions();
   if (!Opts.UseProfile.empty()) {
-    auto ReaderOrErr = llvm::IndexedInstrProfReader::create(Opts.UseProfile);
+    // FIXME: Create file system to read the profile. In the future, the vfs
+    // needs to come from CompilerInstance.
+    auto FS = llvm::vfs::getRealFileSystem();
+    auto ReaderOrErr =
+        llvm::IndexedInstrProfReader::create(Opts.UseProfile, *FS);
     if (auto E = ReaderOrErr.takeError()) {
       diagnose(SourceLoc(), diag::profile_read_error, Opts.UseProfile,
                llvm::toString(std::move(E)));
@@ -728,15 +732,16 @@ SILFunction *SILGenModule::getFunction(SILDeclRef constant,
 
   emittedFunctions[constant] = F;
 
-  if (!delayedFunctions.count(constant)) {
+  auto foundDelayed = delayedFunctions.find(constant);
+  if (foundDelayed == delayedFunctions.end()) {
     if (isEmittedOnDemand(M, constant)) {
-      forcedFunctions.push_back(constant);
+      if (forcedFunctions.insert(constant).second)
+        pendingForcedFunctions.push_back(constant);
       return F;
     }
   }
 
   // If we delayed emitting this function previously, we need it now.
-  auto foundDelayed = delayedFunctions.find(constant);
   if (foundDelayed != delayedFunctions.end()) {
     // Move the function to its proper place within the module.
     M.functions.remove(F);
@@ -748,7 +753,8 @@ SILFunction *SILGenModule::getFunction(SILDeclRef constant,
       M.functions.insertAfter(insertAfter->getIterator(), F);
     }
 
-    forcedFunctions.push_back(constant);
+    if (forcedFunctions.insert(constant).second)
+      pendingForcedFunctions.push_back(constant);
     delayedFunctions.erase(foundDelayed);
   } else {
     // We would have registered a delayed function as "last emitted" when we
@@ -766,7 +772,6 @@ bool SILGenModule::hasFunction(SILDeclRef constant) {
 void SILGenModule::visitFuncDecl(FuncDecl *fd) { emitFunction(fd); }
 
 void SILGenModule::emitFunctionDefinition(SILDeclRef constant, SILFunction *f) {
-
   if (!f->empty()) {
     diagnose(constant.getAsRegularLocation(), diag::sil_function_redefinition,
              f->getName());
@@ -907,6 +912,8 @@ void SILGenModule::emitFunctionDefinition(SILDeclRef constant, SILFunction *f) {
   case SILDeclRef::Kind::DefaultArgGenerator: {
     auto *decl = constant.getDecl();
     auto *param = getParameterAt(decl, constant.defaultArgIndex);
+    assert(param);
+
     auto *initDC = param->getDefaultArgumentInitContext();
 
     switch (param->getDefaultArgumentKind()) {
@@ -1144,24 +1151,28 @@ static void emitOrDelayFunction(SILGenModule &SGM, SILDeclRef constant) {
                   !constant.isDynamicallyReplaceable() &&
                   !isPossiblyUsedExternally(linkage, SGM.M.isWholeModule());
 
-  // Avoid emitting a delayable definition if it hasn't already been referenced.
-  SILFunction *f = nullptr;
-  if (mayDelay)
-    f = SGM.getEmittedFunction(constant, ForDefinition);
-  else
-    f = SGM.getFunction(constant, ForDefinition);
-
-  // If we don't want to emit now, remember how for later.
-  if (!f) {
-    SGM.delayedFunctions.insert({constant, emitAfter});
-    // Even though we didn't emit the function now, update the
-    // lastEmittedFunction so that we preserve the original ordering that
-    // the symbols would have been emitted in.
-    SGM.lastEmittedFunction = constant;
+  if (!mayDelay) {
+    SGM.emitFunctionDefinition(constant, SGM.getFunction(constant, ForDefinition));
     return;
   }
 
-  SGM.emitFunctionDefinition(constant, f);
+  // If the function is already forced then it was previously delayed and then
+  // referenced. We don't need to emit or delay it again.
+  if (SGM.forcedFunctions.contains(constant))
+    return;
+
+  if (auto *f = SGM.getEmittedFunction(constant, ForDefinition)) {
+    SGM.emitFunctionDefinition(constant, f);
+    return;
+  }
+
+  // This is a delayable function so remember how to emit it in case it gets
+  // referenced later.
+  SGM.delayedFunctions.insert({constant, emitAfter});
+  // Even though we didn't emit the function now, update the
+  // lastEmittedFunction so that we preserve the original ordering that
+  // the symbols would have been emitted in.
+  SGM.lastEmittedFunction = constant;
 }
 
 void SILGenModule::preEmitFunction(SILDeclRef constant, SILFunction *F,
@@ -1274,7 +1285,7 @@ void SILGenModule::emitDifferentiabilityWitness(
   // NOTE(TF-893): Extending capacity is necessary when `origSilFnType` has
   // parameters corresponding to captured variables. These parameters do not
   // appear in the type of `origFnType`.
-  // TODO: If posssible, change `autodiff::getLoweredParameterIndices` to
+  // TODO: If possible, change `autodiff::getLoweredParameterIndices` to
   // take `CaptureInfo` into account.
   if (origSilFnType->getNumParameters() > silParamIndices->getCapacity())
     silParamIndices = silParamIndices->extendingCapacity(
@@ -1440,7 +1451,7 @@ void SILGenModule::emitConstructor(ConstructorDecl *decl) {
 
   if (declCtx->getSelfClassDecl()) {
     // Designated initializers for classes, as well as @objc convenience
-    // initializers, have have separate entry points for allocation and
+    // initializers, have separate entry points for allocation and
     // initialization.
     if (decl->isDesignatedInit() || decl->isObjC()) {
       emitOrDelayFunction(*this, constant);
@@ -1590,9 +1601,12 @@ void SILGenModule::emitMoveOnlyDestructor(NominalTypeDecl *cd,
 
   emitAbstractFuncDecl(dd);
 
-  // Emit the deallocating destructor.
-  SILDeclRef deallocator(dd, SILDeclRef::Kind::Deallocator);
-  emitFunctionDefinition(deallocator, getFunction(deallocator, ForDefinition));
+  // Emit the deallocating destructor if we have a body.
+  if (dd->hasBody()) {
+    SILDeclRef deallocator(dd, SILDeclRef::Kind::Deallocator);
+    emitFunctionDefinition(deallocator,
+                           getFunction(deallocator, ForDefinition));
+  }
 }
 
 void SILGenModule::emitDefaultArgGenerator(SILDeclRef constant,
@@ -1767,6 +1781,10 @@ void SILGenModule::visitVarDecl(VarDecl *vd) {
 
 void SILGenModule::visitSubscriptDecl(SubscriptDecl *sd) {
   llvm_unreachable("top-level subscript?");
+}
+
+void SILGenModule::visitMacroDecl(MacroDecl *d) {
+  // nothing to emit for macros
 }
 
 void SILGenModule::visitMacroExpansionDecl(MacroExpansionDecl *d) {
@@ -2209,13 +2227,13 @@ public:
     // Emit any delayed definitions that were forced.
     // Emitting these may in turn force more definitions, so we have to take
     // care to keep pumping the queues.
-    while (!SGM.forcedFunctions.empty()
+    while (!SGM.pendingForcedFunctions.empty()
            || !SGM.pendingConformances.empty()) {
-      while (!SGM.forcedFunctions.empty()) {
-        auto &front = SGM.forcedFunctions.front();
+      while (!SGM.pendingForcedFunctions.empty()) {
+        auto &front = SGM.pendingForcedFunctions.front();
         SGM.emitFunctionDefinition(
             front, SGM.getEmittedFunction(front, ForDefinition));
-        SGM.forcedFunctions.pop_front();
+        SGM.pendingForcedFunctions.pop_front();
       }
       while (!SGM.pendingConformances.empty()) {
         SGM.getWitnessTable(SGM.pendingConformances.front());

@@ -126,7 +126,7 @@ class ModuleWriter {
   ModuleDecl &M;
 
   llvm::DenseMap<const TypeDecl *, std::pair<EmissionState, bool>> seenTypes;
-  llvm::DenseSet<const NominalTypeDecl *> seenClangTypes;
+  llvm::DenseSet<const clang::Type *> seenClangTypes;
   std::vector<const Decl *> declsToWrite;
   DelayedMemberSet delayedMembers;
   PrimitiveTypeMapping typeMapping;
@@ -276,8 +276,13 @@ public:
     });
   }
 
-  void emitReferencedClangTypeMetadata(const NominalTypeDecl *typeDecl) {
-    auto it = seenClangTypes.insert(typeDecl);
+  void emitReferencedClangTypeMetadata(const TypeDecl *typeDecl) {
+    if (!isa<clang::TypeDecl>(typeDecl->getClangDecl()))
+      return;
+    // Get the underlying clang type from a type alias decl or record decl.
+    clang::QualType clangType(
+        cast<clang::TypeDecl>(typeDecl->getClangDecl())->getTypeForDecl(), 0);
+    auto it = seenClangTypes.insert(clangType.getCanonicalType().getTypePtr());
     if (it.second)
       ClangValueTypePrinter::printClangTypeSwiftGenericTraits(os, typeDecl, &M);
   }
@@ -295,6 +300,9 @@ public:
           forwardDeclareCxxValueTypeIfNeeded(NTD);
         else if (isa<StructDecl>(TD) && NTD->hasClangNode())
           emitReferencedClangTypeMetadata(NTD);
+      } else if (auto TAD = dyn_cast<TypeAliasDecl>(TD)) {
+        if (TAD->hasClangNode())
+          emitReferencedClangTypeMetadata(TAD);
       }
       return;
     }
@@ -314,8 +322,10 @@ public:
       return;
     } else if (auto ED = dyn_cast<EnumDecl>(TD)) {
       forwardDeclare(ED);
-    } else if (isa<AbstractTypeParamDecl>(TD)) {
-      llvm_unreachable("should not see type params here");
+    } else if (isa<GenericTypeParamDecl>(TD)) {
+      llvm_unreachable("should not see generic parameters here");
+    } else if (isa<AssociatedTypeDecl>(TD)) {
+      llvm_unreachable("should not see associated types here");
     } else if (isa<StructDecl>(TD) &&
                TD->getModuleContext()->isStdlibModule()) {
       // stdlib has some @_cdecl functions with structs.
@@ -781,6 +791,7 @@ EmittedClangHeaderDependencyInfo swift::printModuleContentsAsCxx(
     os << "#ifdef __cplusplus\n";
     os << "namespace ";
     M.ValueDecl::getName().print(os);
+    os << " __attribute__((swift_private))";
     os << " {\n";
     os << "namespace " << cxx_synthesis::getCxxImplNamespaceName() << " {\n";
     os << "extern \"C\" {\n";
@@ -798,6 +809,7 @@ EmittedClangHeaderDependencyInfo swift::printModuleContentsAsCxx(
   // Construct a C++ namespace for the module.
   ClangSyntaxPrinter(os).printNamespace(
       [&](raw_ostream &os) { M.ValueDecl::getName().print(os); },
-      [&](raw_ostream &os) { os << moduleOS.str(); });
+      [&](raw_ostream &os) { os << moduleOS.str(); },
+      ClangSyntaxPrinter::NamespaceTrivia::AttributeSwiftPrivate);
   return info;
 }

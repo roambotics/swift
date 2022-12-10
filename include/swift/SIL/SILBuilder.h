@@ -2625,7 +2625,7 @@ public:
       IndexSubset *ResultIndices, SILValue OriginalFunction,
       Optional<std::pair<SILValue, SILValue>> JVPAndVJPFunctions = None) {
     SILValue jvpAndVJPArray[2];
-    if (JVPAndVJPFunctions.hasValue()) {
+    if (JVPAndVJPFunctions.has_value()) {
       jvpAndVJPArray[0] = JVPAndVJPFunctions->first;
       jvpAndVJPArray[1] = JVPAndVJPFunctions->second;
     }
@@ -2635,7 +2635,7 @@ public:
         JVPAndVJPFunctions,
         hasOwnership()
             ? DifferentiableFunctionInst::getMergedOwnershipKind(
-                  OriginalFunction, JVPAndVJPFunctions.hasValue()
+                  OriginalFunction, JVPAndVJPFunctions.has_value()
                                         ? ArrayRef<SILValue>(jvpAndVJPArray, 2)
                                         : ArrayRef<SILValue>())
             : ValueOwnershipKind(OwnershipKind::None));
@@ -2726,6 +2726,14 @@ public:
   }
 
   //===--------------------------------------------------------------------===//
+  // Weak linking support
+  //===--------------------------------------------------------------------===//
+  HasSymbolInst *createHasSymbol(SILLocation Loc, ValueDecl *Decl) {
+    return insert(new (getModule()) HasSymbolInst(
+        getModule(), getSILDebugLocation(Loc), Decl));
+  }
+
+  //===--------------------------------------------------------------------===//
   // Private Helper Methods
   //===--------------------------------------------------------------------===//
 
@@ -2797,7 +2805,7 @@ private:
   }
 };
 
-/// An wrapper on top of SILBuilder's constructor that automatically sets the
+/// A wrapper on top of SILBuilder's constructor that automatically sets the
 /// current SILDebugScope based on the specified insertion point. This is useful
 /// for situations where a single SIL instruction is lowered into a sequence of
 /// SIL instructions.

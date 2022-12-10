@@ -33,6 +33,7 @@
 #include "swift/AST/AccessScope.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DeclContext.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/ForeignErrorConvention.h"
@@ -180,7 +181,8 @@ static void checkInheritanceClause(
     // For generic parameters and associated types, the GSB checks constraints;
     // however, we still want to fire off the requests to produce diagnostics
     // in some circular validation cases.
-    if (isa<AbstractTypeParamDecl>(decl))
+    if (isa<GenericTypeParamDecl>(decl) ||
+        isa<AssociatedTypeDecl>(decl))
       continue;
 
     // Check whether we inherited from 'AnyObject' twice.
@@ -192,7 +194,7 @@ static void checkInheritanceClause(
       // for Swift >= 5.
       auto sourceRange = inherited.getSourceRange();
       bool isWrittenAsClass =
-          (isa<ProtocolDecl>(decl) || isa<AbstractTypeParamDecl>(decl)) &&
+          isa<ProtocolDecl>(decl) &&
           Lexer::getTokenAtLocation(ctx.SourceMgr, sourceRange.Start)
               .is(tok::kw_class);
       if (ctx.LangOpts.isSwiftVersionAtLeast(5) && isWrittenAsClass) {
@@ -210,7 +212,7 @@ static void checkInheritanceClause(
         auto knownRange = inheritedAnyObject->second;
         SourceRange removeRange = getRemovalRange(knownIndex);
         if (!ctx.LangOpts.isSwiftVersionAtLeast(5) &&
-            (isa<ProtocolDecl>(decl) || isa<AbstractTypeParamDecl>(decl)) &&
+            isa<ProtocolDecl>(decl) &&
             Lexer::getTokenAtLocation(ctx.SourceMgr, knownRange.Start)
               .is(tok::kw_class)) {
           SourceLoc classLoc = knownRange.Start;
@@ -695,12 +697,16 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
                 
                 if (currParams[i].getPlainType()->getOptionalObjectType()) {
                   optionalRedecl = true;
-                  if (swift::getParameterAt(current, i)->isImplicitlyUnwrappedOptional())
+                  auto *param = swift::getParameterAt(current, i);
+                  assert(param);
+                  if (param->isImplicitlyUnwrappedOptional())
                     currIsIUO = true;
                 }
                 
                 if (otherParams[i].getPlainType()->getOptionalObjectType()) {
-                  if (swift::getParameterAt(other, i)->isImplicitlyUnwrappedOptional())
+                  auto *param = swift::getParameterAt(other, i);
+                  assert(param);
+                  if (param->isImplicitlyUnwrappedOptional())
                     otherIsIUO = true;
                 }
                 else {
@@ -786,9 +792,9 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
           }
 
           bool fullyPrecedes(const AvailabilityRange &other) const {
-            if (!obsoleted.hasValue())
+            if (!obsoleted.has_value())
               return false;
-            if (!other.introduced.hasValue())
+            if (!other.introduced.has_value())
               return false;
             return *obsoleted <= *other.introduced;
           }
@@ -1539,6 +1545,7 @@ static void maybeDiagnoseClassWithoutInitializers(ClassDecl *classDecl) {
       return;
     case SourceFileKind::Library:
     case SourceFileKind::Main:
+    case SourceFileKind::MacroExpansion:
       break;
     }
   }
@@ -1975,6 +1982,14 @@ public:
     llvm_unreachable("should always be type-checked already");
   }
 
+  void visitMacroDecl(MacroDecl *MD) {
+    TypeChecker::checkDeclAttributes(MD);
+    checkAccessControl(MD);
+
+    if (!MD->getDeclContext()->isModuleScopeContext())
+      MD->diagnose(diag::macro_in_nested, MD->getName());
+  }
+
   void visitMacroExpansionDecl(MacroExpansionDecl *MED) {
     llvm_unreachable("FIXME: macro expansion decl not handled in DeclChecker");
   }
@@ -2185,6 +2200,7 @@ public:
             return;
           case SourceFileKind::Main:
           case SourceFileKind::Library:
+          case SourceFileKind::MacroExpansion:
             break;
           }
 
@@ -2205,6 +2221,7 @@ public:
           case SourceFileKind::SIL:
             return;
           case SourceFileKind::Library:
+          case SourceFileKind::MacroExpansion:
             break;
           }
 
@@ -2487,6 +2504,9 @@ public:
       }
     }
 
+    diagnoseCopyableTypeContainingMoveOnlyType(ED);
+    diagnoseMoveOnlyNominalDeclDoesntConformToProtocols(ED);
+
     checkExplicitAvailability(ED);
 
     TypeChecker::checkDeclCircularity(ED);
@@ -2509,8 +2529,9 @@ public:
 
     TypeChecker::checkDeclAttributes(SD);
 
-    for (Decl *Member : SD->getMembers())
+    for (Decl *Member : SD->getMembers()) {
       visit(Member);
+    }
 
     TypeChecker::checkPatternBindingCaptures(SD);
 
@@ -2524,6 +2545,12 @@ public:
     TypeChecker::checkDeclCircularity(SD);
 
     TypeChecker::checkConformancesInContext(SD);
+
+    // If this struct is not move only, check that all vardecls of nominal type
+    // are not move only.
+    diagnoseCopyableTypeContainingMoveOnlyType(SD);
+
+    diagnoseMoveOnlyNominalDeclDoesntConformToProtocols(SD);
   }
 
   /// Check whether the given properties can be @NSManaged in this class.
@@ -2625,6 +2652,17 @@ public:
     }
   }
 
+  void diagnoseMoveOnlyNominalDeclDoesntConformToProtocols(
+      NominalTypeDecl *nomDecl) {
+    if (!nomDecl->isMoveOnly())
+      return;
+
+    for (auto *prot : nomDecl->getLocalProtocols()) {
+      nomDecl->diagnose(diag::moveonly_cannot_conform_to_protocol_with_name,
+                        nomDecl->getDescriptiveKind(),
+                        nomDecl->getBaseName(), prot->getBaseName());
+    }
+  }
 
   void visitClassDecl(ClassDecl *CD) {
     checkUnsupportedNestedType(CD);
@@ -2788,6 +2826,8 @@ public:
     TypeChecker::checkConformancesInContext(CD);
 
     maybeDiagnoseClassWithoutInitializers(CD);
+
+    diagnoseMoveOnlyNominalDeclDoesntConformToProtocols(CD);
   }
 
   void visitProtocolDecl(ProtocolDecl *PD) {
@@ -2894,6 +2934,7 @@ public:
         return false;
       case SourceFileKind::Library:
       case SourceFileKind::Main:
+      case SourceFileKind::MacroExpansion:
         break;
       }
     }
@@ -3241,6 +3282,12 @@ public:
 
     if (nominal->isDistributedActor())
       TypeChecker::checkDistributedActor(SF, nominal);
+
+    // If we have a move only type and allow it to extend any protocol, error.
+    if (nominal->isMoveOnly() && ED->getInherited().size()) {
+      ED->diagnose(diag::moveonly_cannot_conform_to_protocol,
+                   nominal->getDescriptiveKind(), nominal->getBaseName());
+    }
   }
 
   void visitTopLevelCodeDecl(TopLevelCodeDecl *TLCD) {
@@ -3445,6 +3492,8 @@ void TypeChecker::typeCheckDecl(Decl *D, bool LeaveClosureBodiesUnchecked) {
 
 void TypeChecker::checkParameterList(ParameterList *params,
                                      DeclContext *owner) {
+  Optional<ParamDecl*> firstIsolatedParam;
+  bool diagnosedDuplicateIsolatedParam = false;
   for (auto param: *params) {
     checkDeclAttributes(param);
 
@@ -3457,6 +3506,32 @@ void TypeChecker::checkParameterList(ParameterList *params,
           param->diagnose(diag::async_autoclosure_nonasync_function);
           if (auto func = dyn_cast<FuncDecl>(owner))
             addAsyncNotes(func);
+        }
+      }
+    }
+
+    // check for well-formed isolated parameters.
+    if (!diagnosedDuplicateIsolatedParam) {
+      if (param->isIsolated()) {
+        if (firstIsolatedParam) {
+          // cannot have more than one isolated parameter (SE-0313)
+          param->diagnose(diag::isolated_parameter_duplicate)
+              .highlight(param->getSourceRange())
+              .warnUntilSwiftVersion(6);
+          // I'd love to describe the context in which there is an isolated parameter,
+          // we had a DescriptiveDeclContextKind, but that only
+          // exists for Decls.
+
+          auto prevIso = firstIsolatedParam.value();
+          prevIso
+              ->diagnose(diag::isolated_parameter_previous_note,
+                         prevIso->getName())
+              .highlight(prevIso->getSourceRange());
+
+          // no need to complain about any further `isolated` params
+          diagnosedDuplicateIsolatedParam = true;
+        } else {
+          firstIsolatedParam = param; // save first one we've seen.
         }
       }
     }

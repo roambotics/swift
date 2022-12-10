@@ -68,8 +68,8 @@
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/Subsystems.h"
 #include "swift/SymbolGraphGen/SymbolGraphOptions.h"
-#include "swift/Syntax/Serialization/SyntaxSerialization.h"
-#include "swift/Syntax/SyntaxNodes.h"
+
+#include "clang/Lex/Preprocessor.h"
 
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringMap.h"
@@ -139,18 +139,6 @@ getFileOutputStream(StringRef OutputFilename, ASTContext &Ctx) {
   return os;
 }
 
-/// Writes the Syntax tree to the given file
-static bool emitSyntax(const SourceFile &SF, StringRef OutputFilename) {
-  auto os = getFileOutputStream(OutputFilename, SF.getASTContext());
-  if (!os) return true;
-
-  json::Output jsonOut(*os, /*UserInfo=*/{}, /*PrettyPrint=*/false);
-  auto Root = SF.getSyntaxRoot().getRaw();
-  jsonOut << *Root;
-  *os << "\n";
-  return false;
-}
-
 /// Writes SIL out to the given file.
 static bool writeSIL(SILModule &SM, ModuleDecl *M, const SILOptions &Opts,
                      StringRef OutputFilename) {
@@ -178,17 +166,17 @@ static bool writeSIL(SILModule &SM, const PrimarySpecificPaths &PSPs,
 /// \returns true if there were any errors
 ///
 /// \see swift::printAsClangHeader
-static bool printAsClangHeaderIfNeeded(StringRef outputPath, ModuleDecl *M,
-                                       StringRef bridgingHeader,
-                                       const FrontendOptions &frontendOpts,
-                                       const IRGenOptions &irGenOpts) {
+static bool printAsClangHeaderIfNeeded(
+    StringRef outputPath, ModuleDecl *M, StringRef bridgingHeader,
+    const FrontendOptions &frontendOpts, const IRGenOptions &irGenOpts,
+    clang::HeaderSearch &clangHeaderSearchInfo) {
   if (outputPath.empty())
     return false;
-  return withOutputFile(M->getDiags(), outputPath,
-                        [&](raw_ostream &out) -> bool {
-                          return printAsClangHeader(out, M, bridgingHeader,
-                                                    frontendOpts, irGenOpts);
-                        });
+  return withOutputFile(
+      M->getDiags(), outputPath, [&](raw_ostream &out) -> bool {
+        return printAsClangHeader(out, M, bridgingHeader, frontendOpts,
+                                  irGenOpts, clangHeaderSearchInfo);
+      });
 }
 
 /// Prints the stable module interface for \p M to \p outputPath.
@@ -310,9 +298,9 @@ static void countStatsOfSourceFile(UnifiedStatsReporter &Stats,
   C.NumPrecedenceGroups += groups.size();
 
   auto bufID = SF->getBufferID();
-  if (bufID.hasValue()) {
+  if (bufID.has_value()) {
     C.NumSourceLines +=
-      SM.getEntireTextForBuffer(bufID.getValue()).count('\n');
+      SM.getEntireTextForBuffer(bufID.value()).count('\n');
   }
 }
 
@@ -388,7 +376,7 @@ static bool precompileBridgingHeader(const CompilerInstance &Instance) {
     // Create or validate a persistent PCH.
     auto SwiftPCHHash = Invocation.getPCHHash();
     auto PCH = clangImporter->getOrCreatePCH(ImporterOpts, SwiftPCHHash);
-    return !PCH.hasValue();
+    return !PCH.has_value();
   }
   return clangImporter->emitBridgingPCH(
       opts.InputsAndOutputs.getFilenameOfFirstInput(),
@@ -925,7 +913,7 @@ static bool emitAnyWholeModulePostTypeCheckSupplementaryOutputs(
       opts.InputsAndOutputs.hasClangHeaderOutputPath()) {
     std::string BridgingHeaderPathForPrint;
     if (!opts.ImplicitObjCHeaderPath.empty()) {
-      if (opts.BridgingHeaderDirForPrint.hasValue()) {
+      if (opts.BridgingHeaderDirForPrint.has_value()) {
         // User specified preferred directory for including, use that dir.
         llvm::SmallString<32> Buffer(*opts.BridgingHeaderDirForPrint);
         llvm::sys::path::append(Buffer,
@@ -939,7 +927,10 @@ static bool emitAnyWholeModulePostTypeCheckSupplementaryOutputs(
     hadAnyError |= printAsClangHeaderIfNeeded(
         Invocation.getClangHeaderOutputPathForAtMostOnePrimary(),
         Instance.getMainModule(), BridgingHeaderPathForPrint, opts,
-        Invocation.getIRGenOptions());
+        Invocation.getIRGenOptions(),
+        Context.getClangModuleLoader()
+            ->getClangPreprocessor()
+            .getHeaderSearchInfo());
   }
 
   // Only want the header if there's been any errors, ie. there's not much
@@ -1344,9 +1335,6 @@ static bool performAction(CompilerInstance &Instance,
   case FrontendOptions::ActionType::DumpInterfaceHash:
     getPrimaryOrMainSourceFile(Instance).dumpInterfaceHash(llvm::errs());
     return Context.hadError();
-  case FrontendOptions::ActionType::EmitSyntax:
-    return emitSyntax(getPrimaryOrMainSourceFile(Instance),
-                      opts.InputsAndOutputs.getSingleOutputFilename());
   case FrontendOptions::ActionType::EmitImportedModules:
     return emitImportedModules(Instance.getMainModule(), opts);
 

@@ -16,83 +16,120 @@
 
 #include "TypeCheckMacros.h"
 #include "TypeChecker.h"
+#include "swift/ABI/MetadataValues.h"
 #include "swift/AST/ASTContext.h"
-#include "swift/AST/CompilerPlugin.h"
 #include "swift/AST/Expr.h"
+#include "swift/AST/NameLookupRequests.h"
+#include "swift/AST/MacroDefinition.h"
+#include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/StringExtras.h"
+#include "swift/Demangling/Demangler.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/Parser.h"
+#include "swift/Subsystems.h"
 
 using namespace swift;
 
-extern "C" void *swift_ASTGen_lookupMacro(const char *macroName);
+extern "C" void *swift_ASTGen_resolveMacroType(const void *macroType);
 
 extern "C" void swift_ASTGen_destroyMacro(void *macro);
 
-extern "C" void
-swift_ASTGen_getMacroEvaluationContext(const void *sourceFile,
-                                       void *declContext, void *astContext,
-                                       void *macro, void **evaluationContext);
-
 extern "C" ptrdiff_t swift_ASTGen_evaluateMacro(
-    void *sourceFile, const void *sourceLocation,
+    void *diagEngine, void *macro, void *sourceFile,
+    const void *sourceLocation,
     const char **evaluatedSource, ptrdiff_t *evaluatedSourceLength);
 
-extern "C" void
-swift_ASTGen_getMacroTypeSignature(void *macro, const char **genericSignature,
-                                   ptrdiff_t *genericSignatureLength);
+/// Produce the mangled name for the nominal type descriptor of a type
+/// referenced by its module and type name.
+static std::string mangledNameForTypeMetadataAccessor(
+    StringRef moduleName, StringRef typeName) {
+  using namespace Demangle;
 
-StructDecl *MacroContextRequest::evaluate(Evaluator &evaluator,
-                                          std::string macroName,
-                                          ModuleDecl *mod) const {
-#if SWIFT_SWIFT_PARSER
-  auto &ctx = mod->getASTContext();
-  auto *macro = swift_ASTGen_lookupMacro(macroName.c_str());
-  if (!macro)
+  //  kind=Global
+  //    kind=NominalTypeDescriptor
+  //      kind=Type
+  //        kind=Structure
+  //          kind=Module, text=moduleName
+  //          kind=Identifier, text=typeName
+  Demangle::Demangler D;
+  auto *global = D.createNode(Node::Kind::Global);
+  {
+    auto *nominalDescriptor =
+        D.createNode(Node::Kind::TypeMetadataAccessFunction);
+    {
+      auto *type = D.createNode(Node::Kind::Type);
+      {
+        auto *module = D.createNode(Node::Kind::Module, moduleName);
+        auto *identifier = D.createNode(Node::Kind::Identifier, typeName);
+        auto *structNode = D.createNode(Node::Kind::Structure);
+        structNode->addChild(module, D);
+        structNode->addChild(identifier, D);
+        type->addChild(structNode, D);
+      }
+      nominalDescriptor->addChild(type, D);
+    }
+    global->addChild(nominalDescriptor, D);
+  }
+
+  auto mangleResult = mangleNode(global);
+  assert(mangleResult.isSuccess());
+  return mangleResult.result();
+}
+
+/// Look for macro's type metadata given its external module and type name.
+static void const *lookupMacroTypeMetadataByExternalName(
+    ASTContext &ctx, StringRef moduleName, StringRef typeName) {
+  // Look up the type metadata accessor.
+  auto symbolName = mangledNameForTypeMetadataAccessor(moduleName, typeName);
+  auto accessorAddr = ctx.getAddressOfSymbol(symbolName.c_str());
+  if (!accessorAddr)
     return nullptr;
 
-  const char *evaluatedSource;
-  ptrdiff_t evaluatedSourceLength;
-  swift_ASTGen_getMacroTypeSignature(macro, &evaluatedSource,
-                                     &evaluatedSourceLength);
+  // Call the accessor to form type metadata.
+  using MetadataAccessFunc = const void *(MetadataRequest);
+  auto accessor = reinterpret_cast<MetadataAccessFunc*>(accessorAddr);
+  return accessor(MetadataRequest(MetadataState::Complete));
+}
 
-  // Create a new source buffer with the contents of the macro's
-  // signature.
-  SourceManager &sourceMgr = ctx.SourceMgr;
-  std::string bufferName;
-  {
-    llvm::raw_string_ostream out(bufferName);
-    out << "Macro signature of #" << macroName;
+MacroDefinition MacroDefinitionRequest::evaluate(
+    Evaluator &evaluator, MacroDecl *macro
+) const {
+  ASTContext &ctx = macro->getASTContext();
+
+#if SWIFT_SWIFT_PARSER
+  /// Look for the type metadata given the external module and type names.
+  auto macroMetatype = lookupMacroTypeMetadataByExternalName(
+      ctx, macro->externalModuleName.str(),
+      macro->externalMacroTypeName.str());
+  if (macroMetatype) {
+    // Check whether the macro metatype is in-process.
+    if (auto inProcess = swift_ASTGen_resolveMacroType(macroMetatype)) {
+      // Make sure we clean up after the macro.
+      ctx.addCleanup([inProcess]() {
+        swift_ASTGen_destroyMacro(inProcess);
+      });
+
+      return MacroDefinition::forInProcess(
+          MacroDefinition::Expression, inProcess);
+    }
   }
-  auto macroBuffer = llvm::MemoryBuffer::getMemBuffer(
-      StringRef(evaluatedSource, evaluatedSourceLength), bufferName);
-  unsigned macroBufferID =
-      sourceMgr.addNewSourceBuffer(std::move(macroBuffer));
-  auto macroSourceFile = new (ctx) SourceFile(
-      *mod, SourceFileKind::Library, macroBufferID);
-  // Make sure implicit imports are resolved in this file.
-  performImportResolution(*macroSourceFile);
+#endif
 
-  auto *start = sourceMgr.getLocForBufferStart(macroBufferID)
-                    .getOpaquePointerValue();
-  void *context = nullptr;
-  swift_ASTGen_getMacroEvaluationContext(
-      (const void *)start, (void *)(DeclContext *)macroSourceFile,
-      (void *)&ctx, macro, &context);
+  ctx.Diags.diagnose(
+      macro, diag::external_macro_not_found, macro->externalModuleName.str(),
+      macro->externalMacroTypeName.str(), macro->getName());
+  // FIXME: Can we give more actionable advice?
 
-  ctx.addCleanup([macro]() { swift_ASTGen_destroyMacro(macro); });
-  return dyn_cast<StructDecl>((Decl *)context);
-#else
-  return nullptr;
-#endif // SWIFT_SWIFT_PARSER
+  return MacroDefinition::forInvalid();
 }
 
 #if SWIFT_SWIFT_PARSER
 Expr *swift::expandMacroExpr(
-    DeclContext *dc, Expr *expr, StringRef macroName, Type expandedType
+    DeclContext *dc, Expr *expr, ConcreteDeclRef macroRef, Type expandedType
 ) {
   ASTContext &ctx = dc->getASTContext();
   SourceManager &sourceMgr = ctx.SourceMgr;
@@ -109,46 +146,39 @@ Expr *swift::expandMacroExpr(
   // Evaluate the macro.
   NullTerminatedStringRef evaluatedSource;
 
-  // Built-in macros go through `MacroSystem` in Swift Syntax linked to this
-  // compiler.
-  if (swift_ASTGen_lookupMacro(macroName.str().c_str())) {
-    auto astGenSourceFile = sourceFile->exportedSourceFile;
-    if (!astGenSourceFile)
-      return nullptr;
-  
-    const char *evaluatedSourceAddress;
-    ptrdiff_t evaluatedSourceLength;
-    swift_ASTGen_evaluateMacro(
-        astGenSourceFile, expr->getStartLoc().getOpaquePointerValue(),
-        &evaluatedSourceAddress, &evaluatedSourceLength);
-    if (!evaluatedSourceAddress)
-      return nullptr;
-    evaluatedSource = NullTerminatedStringRef(evaluatedSourceAddress,
-                                              (size_t)evaluatedSourceLength);
+  MacroDecl *macro = cast<MacroDecl>(macroRef.getDecl());
+
+  auto macroDef = evaluateOrDefault(
+      ctx.evaluator, MacroDefinitionRequest{macro},
+      MacroDefinition::forInvalid());
+  if (!macroDef) {
+    return nullptr;
   }
-  // Other macros go through a compiler plugin.
-  else {
-    auto mee = cast<MacroExpansionExpr>(expr);
-    auto *plugin = ctx.getLoadedPlugin(macroName);
-    if (!plugin) {
-      ctx.Diags.diagnose(
-          mee->getLoc(), diag::macro_undefined, macroName)
-      .highlight(mee->getMacroNameLoc().getSourceRange());
-      return nullptr;
+
+  {
+    PrettyStackTraceExpr debugStack(ctx, "expanding macro", expr);
+
+    switch (macroDef.implKind) {
+    case MacroDefinition::ImplementationKind::InProcess: {
+      // Builtin macros are handled via ASTGen.
+      auto astGenSourceFile = sourceFile->exportedSourceFile;
+      if (!astGenSourceFile)
+        return nullptr;
+
+      const char *evaluatedSourceAddress;
+      ptrdiff_t evaluatedSourceLength;
+      swift_ASTGen_evaluateMacro(
+          &ctx.Diags,
+          macroDef.getAsInProcess(),
+          astGenSourceFile, expr->getStartLoc().getOpaquePointerValue(),
+          &evaluatedSourceAddress, &evaluatedSourceLength);
+      if (!evaluatedSourceAddress)
+        return nullptr;
+      evaluatedSource = NullTerminatedStringRef(evaluatedSourceAddress,
+                                                (size_t)evaluatedSourceLength);
+      break;
     }
-    auto bufferID = sourceFile->getBufferID();
-    auto sourceFileText = sourceMgr.getEntireTextForBuffer(*bufferID);
-    auto evaluated = plugin->invokeRewrite(
-        /*targetModuleName*/ dc->getParentModule()->getName().str(),
-        /*filePath*/ sourceFile->getFilename(),
-        /*sourceFileText*/ sourceFileText,
-        /*range*/ Lexer::getCharSourceRangeFromSourceRange(
-            sourceMgr, mee->getSourceRange()),
-        ctx);
-    if (evaluated)
-      evaluatedSource = *evaluated;
-    else
-      return nullptr;
+    }
   }
 
   // Figure out a reasonable name for the macro expansion buffer.
@@ -156,7 +186,7 @@ Expr *swift::expandMacroExpr(
   {
     llvm::raw_string_ostream out(bufferName);
 
-    out << "Macro expansion of #" << macroName;
+    out << "Macro expansion of #" << macro->getName();
     if (auto bufferID = sourceFile->getBufferID()) {
       unsigned startLine, startColumn;
       std::tie(startLine, startColumn) =
@@ -174,19 +204,49 @@ Expr *swift::expandMacroExpr(
     }
   }
 
+  // Dump macro expansions to standard output, if requested.
+  if (ctx.LangOpts.DumpMacroExpansions) {
+    llvm::errs() << bufferName << " as " << expandedType.getString()
+      << "\n------------------------------\n"
+      << evaluatedSource
+      << "\n------------------------------\n";
+  }
+
   // Create a new source buffer with the contents of the expanded macro.
   auto macroBuffer =
-      llvm::MemoryBuffer::getMemBuffer(evaluatedSource, bufferName);
+      llvm::MemoryBuffer::getMemBufferCopy(evaluatedSource, bufferName);
   unsigned macroBufferID = sourceMgr.addNewSourceBuffer(std::move(macroBuffer));
+  free((void*)evaluatedSource.data());
 
-  // Create a source file to hold the macro buffer.
-  // FIXME: Seems like we should record this somewhere?
+  // Create a source file to hold the macro buffer. This is automatically
+  // registered with the enclosing module.
   auto macroSourceFile = new (ctx) SourceFile(
-      *dc->getParentModule(), SourceFileKind::Library, macroBufferID);
+      *dc->getParentModule(), SourceFileKind::MacroExpansion, macroBufferID,
+      /*parsingOpts=*/{}, /*isPrimary=*/false, expr);
 
   // Parse the expression.
   Parser parser(macroBufferID, *macroSourceFile, &ctx.Diags, nullptr, nullptr);
   parser.consumeTokenWithoutFeedingReceiver();
+
+  // Set up a "local context" for parsing, so that we have a source of
+  // closure and local-variable discriminators.
+  LocalContext tempContext{};
+  parser.CurDeclContext = dc;
+  parser.CurLocalContext = &tempContext;
+  {
+    DiscriminatorFinder finder;
+    expr->walk(finder);
+
+    unsigned closureDiscriminator;
+    if (finder.getFirstDiscriminator() ==
+          AbstractClosureExpr::InvalidDiscriminator)
+      closureDiscriminator = 0;
+    else
+      closureDiscriminator = finder.getFirstDiscriminator() + 1;
+
+    tempContext.overrideNextClosureDiscriminator(closureDiscriminator);
+  }
+
   auto parsedResult = parser.parseExpr(diag::expected_macro_expansion_expr);
   if (parsedResult.isParseError() || parsedResult.isNull()) {
     // Tack on a note to say where we expanded the macro from?
@@ -203,6 +263,8 @@ Expr *swift::expandMacroExpr(
     ContextualTypePurpose::CTP_CoerceOperand
   };
 
+  PrettyStackTraceExpr debugStack(
+      ctx, "type checking expanded macro", expandedExpr);
   Type realExpandedType = TypeChecker::typeCheckExpression(
       expandedExpr, dc, contextualType);
   if (!realExpandedType)

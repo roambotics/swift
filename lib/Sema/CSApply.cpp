@@ -76,7 +76,8 @@ static bool isOpenedAnyObject(Type type) {
   if (!archetype || !archetype->isRoot())
     return false;
 
-  return archetype->getExistentialType()->isAnyObject();
+  return (archetype->requiresClass() &&
+          !archetype->hasRequirements());
 }
 
 SubstitutionMap
@@ -2974,16 +2975,20 @@ namespace {
 #if SWIFT_SWIFT_PARSER
       auto &ctx = cs.getASTContext();
       if (ctx.LangOpts.hasFeature(Feature::BuiltinMacros)) {
-        auto kind = MagicIdentifierLiteralExpr::getKindString(expr->getKind())
-            .drop_front();
         auto expandedType = solution.simplifyType(solution.getType(expr));
         cs.setType(expr, expandedType);
 
-        if (auto newExpr = expandMacroExpr(dc, expr, kind, expandedType)) {
+        auto locator = cs.getConstraintLocator(expr);
+        auto overload = solution.getOverloadChoice(locator);
+
+        auto macro = cast<MacroDecl>(overload.choice.getDecl());
+        ConcreteDeclRef macroRef = resolveConcreteDeclRef(macro, locator);
+        if (auto newExpr = expandMacroExpr(dc, expr, macroRef, expandedType)) {
           auto expansion = new (ctx) MacroExpansionExpr(
-              expr->getStartLoc(), DeclNameRef(ctx.getIdentifier(kind)),
-              DeclNameLoc(expr->getLoc()), nullptr, /*isImplicit=*/true,
-              expandedType);
+              expr->getStartLoc(), DeclNameRef(macro->getName()),
+              DeclNameLoc(expr->getLoc()), SourceLoc(), { }, SourceLoc(),
+              nullptr, /*isImplicit=*/true, expandedType);
+          expansion->setMacroRef(macroRef);
           expansion->setRewritten(newExpr);
           cs.cacheExprTypes(expansion);
           return expansion;
@@ -5391,11 +5396,17 @@ namespace {
 #if SWIFT_SWIFT_PARSER
       auto &ctx = cs.getASTContext();
       if (ctx.LangOpts.hasFeature(Feature::Macros)) {
-        auto macroIdent = E->getMacroName().getBaseIdentifier();
         auto expandedType = solution.simplifyType(solution.getType(E));
         cs.setType(E, expandedType);
-        if (auto newExpr = expandMacroExpr(
-                dc, E, macroIdent.str(), expandedType)) {
+
+        auto locator = cs.getConstraintLocator(E);
+        auto overload = solution.getOverloadChoice(locator);
+
+        auto macro = cast<MacroDecl>(overload.choice.getDecl());
+        ConcreteDeclRef macroRef = resolveConcreteDeclRef(macro, locator);
+        E->setMacroRef(macroRef);
+
+        if (auto newExpr = expandMacroExpr(dc, E, macroRef, expandedType)) {
           E->setRewritten(newExpr);
           cs.cacheExprTypes(E);
           return E;
@@ -5488,6 +5499,7 @@ Solution::resolveLocatorToDecl(ConstraintLocator *locator) const {
 static ConcreteDeclRef getDefaultArgOwner(ConcreteDeclRef owner,
                                           unsigned index) {
   auto *param = getParameterAt(owner.getDecl(), index);
+  assert(param);
   if (param->getDefaultArgumentKind() == DefaultArgumentKind::Inherited) {
     return getDefaultArgOwner(owner.getOverriddenDecl(), index);
   }
@@ -6025,6 +6037,8 @@ ArgumentList *ExprRewriter::coerceCallArguments(
 
     if (paramInfo.hasExternalPropertyWrapper(paramIdx)) {
       auto *paramDecl = getParameterAt(callee.getDecl(), paramIdx);
+      assert(paramDecl);
+
       auto appliedWrapper = appliedPropertyWrappers[appliedWrapperIndex++];
       auto wrapperType = solution.simplifyType(appliedWrapper.wrapperType);
       auto initKind = appliedWrapper.initKind;
@@ -8188,6 +8202,7 @@ bool ExprRewriter::isDistributedThunk(ConcreteDeclRef ref, Expr *context) {
       case DeclContextKind::FileUnit:
       case DeclContextKind::Module:
       case DeclContextKind::TopLevelCodeDecl:
+      case DeclContextKind::MacroDecl:
         break;
     }
 
@@ -8929,21 +8944,46 @@ static Optional<SolutionApplicationTarget> applySolutionToForEachStmt(
 
     Expr *nextCall = rewrittenTarget->getAsExpr();
     // Wrap a call to `next()` into `try await` since `AsyncIteratorProtocol`
-    // requirement is `async throws`
+    // witness could be `async throws`.
     if (isAsync) {
-      auto &ctx = cs.getASTContext();
-      auto nextRefType =
-          solution
-              .getResolvedType(
-                  cast<ApplyExpr>(cast<AwaitExpr>(nextCall)->getSubExpr())
-                      ->getFn())
-              ->castTo<FunctionType>();
+      // Cannot use `forEachChildExpr` here because we need to
+      // to wrap a call in `try` and then stop immediately after.
+      struct TryInjector : ASTWalker {
+        ASTContext &C;
+        const Solution &S;
 
-      // If the inferred witness is throwing, we need to wrap the call
-      // into `try` expression.
-      if (nextRefType->isThrowing())
-        nextCall = TryExpr::createImplicit(ctx, /*tryLoc=*/SourceLoc(),
-                                           nextCall, nextCall->getType());
+        bool ShouldStop = false;
+
+        TryInjector(ASTContext &ctx, const Solution &solution)
+            : C(ctx), S(solution) {}
+
+        PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
+          if (ShouldStop)
+            return Action::Stop();
+
+          if (auto *call = dyn_cast<CallExpr>(E)) {
+            // There is a single call expression in `nextCall`.
+            ShouldStop = true;
+
+            auto nextRefType =
+              S.getResolvedType(call->getFn())->castTo<FunctionType>();
+
+            // If the inferred witness is throwing, we need to wrap the call
+            // into `try` expression.
+            if (nextRefType->isThrowing()) {
+              auto *tryExpr = TryExpr::createImplicit(
+                  C, /*tryLoc=*/call->getStartLoc(), call, call->getType());
+              // Cannot stop here because we need to make sure that
+              // the new expression gets injected into AST.
+              return Action::SkipChildren(tryExpr);
+            }
+          }
+
+          return Action::Continue(E);
+        }
+      };
+
+      nextCall->walk(TryInjector(cs.getASTContext(), solution));
     }
 
     stmt->setNextCall(nextCall);

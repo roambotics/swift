@@ -498,7 +498,7 @@ void BindingSet::finalize(
       if (!hasViableBindings()) {
         inferTransitiveProtocolRequirements(inferredBindings);
 
-        if (TransitiveProtocols.hasValue()) {
+        if (TransitiveProtocols.has_value()) {
           for (auto *constraint : *TransitiveProtocols) {
             auto protocolTy = constraint->getSecondType();
             addBinding({protocolTy, AllowedBindingKind::Exact, constraint});
@@ -1065,6 +1065,14 @@ bool BindingSet::favoredOverDisjunction(Constraint *disjunction) const {
   return !involvesTypeVariables();
 }
 
+bool BindingSet::favoredOverConjunction(Constraint *conjunction) const {
+  if (CS.shouldAttemptFixes() && isHole()) {
+    if (forClosureResult() || forGenericParameter())
+      return false;
+  }
+  return true;
+}
+
 BindingSet ConstraintSystem::getBindingsFor(TypeVariableType *typeVar,
                                             bool finalize) {
   assert(typeVar->getImpl().getRepresentative(nullptr) == typeVar &&
@@ -1398,6 +1406,7 @@ void PotentialBindings::infer(Constraint *constraint) {
   case ConstraintKind::BindTupleOfFunctionParams:
   case ConstraintKind::PackElementOf:
   case ConstraintKind::ShapeOf:
+  case ConstraintKind::ExplicitGenericArguments:
     // Constraints from which we can't do anything.
     break;
 
@@ -2208,8 +2217,9 @@ bool TypeVariableBinding::attempt(ConstraintSystem &cs) const {
   if (Binding.isDefaultableBinding()) {
     cs.DefaultedConstraints.insert(srcLocator);
 
+    // Fail if hole reporting fails.
     if (type->isPlaceholder() && reportHole())
-      return true;
+      return false;
   }
 
   if (cs.simplify())

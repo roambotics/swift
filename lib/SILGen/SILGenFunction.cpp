@@ -254,6 +254,7 @@ void SILGenFunction::emitCaptures(SILLocation loc,
       if (closure.kind == SILDeclRef::Kind::DefaultArgGenerator) {
         auto *param = getParameterAt(closure.getDecl(),
                                      closure.defaultArgIndex);
+        assert(param);
         loc = param->getLoc();
       } else {
         auto f = *closure.getAnyFunctionRef();
@@ -631,16 +632,22 @@ void SILGenFunction::emitArtificialTopLevel(Decl *mainDecl) {
       ->loadModule(SourceLoc(),
                    ImportPath::Module(llvm::makeArrayRef(UIKitName)));
     assert(UIKit && "couldn't find UIKit objc module?!");
-    SmallVector<ValueDecl *, 1> results;
+    SmallVector<ValueDecl *, 2> results;
     UIKit->lookupQualified(UIKit,
                            DeclNameRef(ctx.getIdentifier("UIApplicationMain")),
                            NL_QualifiedDefault,
                            results);
-    assert(results.size() == 1
-           && "couldn't find a unique UIApplicationMain in the UIKit ObjC "
-              "module?!");
 
-    ValueDecl *UIApplicationMainDecl = results.front();
+    // As the comment above alludes, using a qualified lookup into UIKit is
+    // *not* sound. In particular, it's possible for the lookup to find the
+    // (deprecated) Swift copy of UIApplicationMain in UIKit and try to call
+    // that instead of the C entrypoint. Let's try to force this to happen.
+    auto FoundUIApplicationMain = llvm::find_if(results, [](const ValueDecl *VD) {
+      return !VD->getClangNode().isNull();
+    });
+    assert(FoundUIApplicationMain != results.end() &&
+           "Could not find a UIApplicationMain to call!");
+    ValueDecl *UIApplicationMainDecl = *FoundUIApplicationMain;
 
     auto mainRef = SILDeclRef(UIApplicationMainDecl).asForeign();
     SILGenFunctionBuilder builder(SGM);

@@ -15,6 +15,7 @@
 // CHECK-NEXT:        "type": "Swift.String",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "RawLiteral",
 // CHECK-NEXT:        "value": "\"Hello, World\""
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
@@ -22,6 +23,7 @@
 // CHECK-NEXT:        "type": "[Swift.Int]",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "RawLiteral",
 // CHECK-NEXT:        "value": "[1, 2, 3, 4, 5, 6, 7, 8, 9]"
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
@@ -29,6 +31,7 @@
 // CHECK-NEXT:        "type": "Swift.Bool",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "RawLiteral",
 // CHECK-NEXT:        "value": "false"
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
@@ -36,6 +39,7 @@
 // CHECK-NEXT:        "type": "Swift.Bool?",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "RawLiteral",
 // CHECK-NEXT:        "value": "nil"
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
@@ -43,6 +47,7 @@
 // CHECK-NEXT:        "type": "(Swift.Int, Swift.Float)",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "RawLiteral",
 // CHECK-NEXT:        "value": "(42, 6.6)"
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
@@ -50,13 +55,80 @@
 // CHECK-NEXT:        "type": "[Swift.String : Swift.Int]",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "RawLiteral",
 // CHECK-NEXT:        "value": "[(\"One\", 1), (\"Two\", 2), (\"Three\", 3)]"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "p10",
+// CHECK-NEXT:        "type": "fields.Bar",
+// CHECK-NEXT:        "isStatic": "false",
+// CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "InitCall",
+// CHECK-NEXT:        "value": {
+// CHECK-NEXT:          "type": "fields.Bar",
+// CHECK-NEXT:          "arguments": []
+// CHECK-NEXT:        }
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "p11",
+// CHECK-NEXT:        "type": "fields.Bat",
+// CHECK-NEXT:        "isStatic": "false",
+// CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "InitCall",
+// CHECK-NEXT:        "value": {
+// CHECK-NEXT:          "type": "fields.Bat",
+// CHECK-NEXT:          "arguments": [
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "buz",
+// CHECK-NEXT:              "type": "Swift.String",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "\"\""
+// CHECK-NEXT:            },
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "fuz",
+// CHECK-NEXT:              "type": "Swift.Int",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "0"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          ]
+// CHECK-NEXT:        }
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "p12",
+// CHECK-NEXT:        "type": "fields.Bat",
+// CHECK-NEXT:        "isStatic": "false",
+// CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "InitCall",
+// CHECK-NEXT:        "value": {
+// CHECK-NEXT:          "type": "fields.Bat",
+// CHECK-NEXT:          "arguments": [
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "buz",
+// CHECK-NEXT:              "type": "Swift.String",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "\"hello\""
+// CHECK-NEXT:            },
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "fuz",
+// CHECK-NEXT:              "type": "Swift.Int",
+// CHECK-NEXT:              "valueKind": "Runtime"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          ]
+// CHECK-NEXT:        }
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "p13",
+// CHECK-NEXT:        "type": "Swift.Int",
+// CHECK-NEXT:        "isStatic": "false",
+// CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "Runtime"
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "p0",
 // CHECK-NEXT:        "type": "Swift.Int",
 // CHECK-NEXT:        "isStatic": "true",
 // CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "RawLiteral",
 // CHECK-NEXT:        "value": "11"
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
@@ -64,6 +136,7 @@
 // CHECK-NEXT:        "type": "Swift.Float",
 // CHECK-NEXT:        "isStatic": "true",
 // CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "valueKind": "RawLiteral",
 // CHECK-NEXT:        "value": "42.2"
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
@@ -71,14 +144,27 @@
 // CHECK-NEXT:        "type": "Swift.Int",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "true",
-// CHECK-NEXT:        "value": "Unknown"
+// CHECK-NEXT:        "valueKind": "RawLiteral",
+// CHECK-NEXT:        "value": "3"
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "p4",
 // CHECK-NEXT:        "type": "Swift.Int",
 // CHECK-NEXT:        "isStatic": "true",
 // CHECK-NEXT:        "isComputed": "true",
-// CHECK-NEXT:        "value": "Unknown"
+// CHECK-NEXT:        "valueKind": "RawLiteral",
+// CHECK-NEXT:        "value": "3"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "e1",
+// CHECK-NEXT:        "type": "fields.Foo.Boo",
+// CHECK-NEXT:        "isStatic": "false",
+// CHECK-NEXT:        "isComputed": "true",
+// CHECK-NEXT:        "valueKind": "InitCall",
+// CHECK-NEXT:        "value": {
+// CHECK-NEXT:          "type": "fields.Foo.Boo",
+// CHECK-NEXT:          "arguments": []
+// CHECK-NEXT:        }
 // CHECK-NEXT:      }
 // CHECK-NEXT:    ]
 // CHECK-NEXT:  }
@@ -91,12 +177,37 @@ public struct Foo {
     let p1: String = "Hello, World"
     static let p2: Float = 42.2
     var p3: Int {3}
-    static var p4: Int {3}
+    static var p4: Int { return 3 }
     let p5: [Int] = [1,2,3,4,5,6,7,8,9]
     let p6: Bool = false
     let p7: Bool? = nil
     let p8: (Int, Float) = (42, 6.6)
     let p9: [String: Int] = ["One": 1, "Two": 2, "Three": 3]
+    let p10 = Bar()
+    let p11: Bat = .init()
+    let p12 = Bat(buz: "hello", fuz: adder(2, 3))
+    let p13: Int = adder(2, 3)
+}
+
+extension Foo {
+    struct Boo {}
+
+    var e1: Boo { Boo() }
+}
+
+func adder(_ x: Int, _ y: Int) -> Int {
+    x + y
+}
+
+public struct Bar {}
+public struct Bat {
+    let buz: String
+    let fuz: Int
+
+    init(buz: String = "", fuz: Int = 0) {
+        self.buz = buz
+        self.fuz = fuz
+    }
 }
 
 extension Foo : MyProto {}

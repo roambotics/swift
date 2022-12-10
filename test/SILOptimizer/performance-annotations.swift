@@ -213,3 +213,18 @@ func goodClosure2() {
     })
 }
 
+@_noAllocation
+func closueWhichModifiesLocalVar() -> Int {
+  var x = 42
+  let localNonEscapingClosure = {
+    x += 1
+  }
+  localNonEscapingClosure()
+  return x
+}
+
+@_noAllocation
+func createEmptyArray() {
+  _ = [Int]() // expected-error {{ending the lifetime of a value of type}}
+}
+

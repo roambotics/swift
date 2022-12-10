@@ -887,6 +887,15 @@ emitKeyPathComponent(IRGenModule &IGM,
             componentCanSig, [&](GenericRequirement reqt) {
               auto substType =
                   reqt.TypeParameter.subst(subs)->getCanonicalType();
+
+              // FIXME: This seems wrong. We used to just mangle opened archetypes as
+              // their interface type. Let's make that explicit now.
+              substType = substType.transformRec([](Type t) -> Optional<Type> {
+                if (auto *openedExistential = t->getAs<OpenedArchetypeType>())
+                  return openedExistential->getInterfaceType();
+                return None;
+              })->getCanonicalType();
+
               if (!reqt.Protocol) {
                 // Type requirement.
                 externalSubArgs.push_back(emitMetadataTypeRefForKeyPath(
@@ -1047,7 +1056,7 @@ emitKeyPathComponent(IRGenModule &IGM,
           ++i;
         }
         assert(structIdx && "not a stored property of the struct?!");
-        idValue = llvm::ConstantInt::get(IGM.SizeTy, structIdx.getValue());
+        idValue = llvm::ConstantInt::get(IGM.SizeTy, structIdx.value());
       } else if (classDecl) {
         // TODO: This field index would require runtime resolution with Swift
         // native class resilience. We never directly access ObjC-imported

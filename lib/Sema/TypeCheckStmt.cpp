@@ -43,7 +43,6 @@
 #include "swift/Parse/LocalContext.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Sema/IDETypeChecking.h"
-#include "swift/Syntax/TokenKinds.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SmallString.h"
@@ -98,9 +97,13 @@ namespace {
         return Action::SkipChildren(E);
       } 
 
-      // Capture lists need to be reparented to enclosing autoclosures.
       if (auto CapE = dyn_cast<CaptureListExpr>(E)) {
-        if (isa<AutoClosureExpr>(ParentDC)) {
+        // Capture lists need to be reparented to enclosing autoclosures
+        // and/or initializers of property wrapper backing properties
+        // (because they subsume initializers associated with wrapped
+        // properties).
+        if (isa<AutoClosureExpr>(ParentDC) ||
+            isPropertyWrapperBackingPropertyInitContext(ParentDC)) {
           for (auto &Cap : CapE->getCaptureList()) {
             Cap.PBD->setDeclContext(ParentDC);
             Cap.getVar()->setDeclContext(ParentDC);
@@ -135,6 +138,21 @@ namespace {
       // But we do want to walk into the initializers of local
       // variables.
       return Action::VisitChildrenIf(isa<PatternBindingDecl>(D));
+    }
+
+  private:
+    static bool isPropertyWrapperBackingPropertyInitContext(DeclContext *DC) {
+      auto *init = dyn_cast<PatternBindingInitializer>(DC);
+      if (!init)
+        return false;
+
+      if (auto *PB = init->getBinding()) {
+        auto *var = PB->getSingleVar();
+        return var && var->getOriginalWrappedProperty(
+                          PropertyWrapperSynthesizedPropertyKind::Backing);
+      }
+
+      return false;
     }
   };
 
@@ -417,6 +435,23 @@ LabeledStmt *swift::findBreakOrContinueStmtTarget(
   emitUnresolvedLabelDiagnostics(
       ctx.Diags, targetLoc, targetName, labelCorrections);
   return nullptr;
+}
+
+LabeledStmt *
+BreakTargetRequest::evaluate(Evaluator &evaluator, const BreakStmt *BS) const {
+  auto *DC = BS->getDeclContext();
+  return findBreakOrContinueStmtTarget(
+      DC->getASTContext(), DC->getParentSourceFile(), BS->getLoc(),
+      BS->getTargetName(), BS->getTargetLoc(), /*isContinue*/ false, DC);
+}
+
+LabeledStmt *
+ContinueTargetRequest::evaluate(Evaluator &evaluator,
+                                const ContinueStmt *CS) const {
+  auto *DC = CS->getDeclContext();
+  return findBreakOrContinueStmtTarget(
+      DC->getASTContext(), DC->getParentSourceFile(), CS->getLoc(),
+      CS->getTargetName(), CS->getTargetLoc(), /*isContinue*/ true, DC);
 }
 
 static Expr *getDeclRefProvidingExpressionForHasSymbol(Expr *E) {
@@ -724,7 +759,7 @@ public:
   Stmt *visitReturnStmt(ReturnStmt *RS) {
     auto TheFunc = AnyFunctionRef::fromDeclContext(DC);
 
-    if (!TheFunc.hasValue()) {
+    if (!TheFunc.has_value()) {
       getASTContext().Diags.diagnose(RS->getReturnLoc(),
                                      diag::return_invalid_outside_func);
       return nullptr;
@@ -1012,24 +1047,14 @@ public:
   }
 
   Stmt *visitBreakStmt(BreakStmt *S) {
-    if (auto target = findBreakOrContinueStmtTarget(
-            getASTContext(), DC->getParentSourceFile(), S->getLoc(),
-            S->getTargetName(), S->getTargetLoc(), /*isContinue=*/false,
-            DC)) {
-      S->setTarget(target);
-    }
-
+    // Force the target to be computed in case it produces diagnostics.
+    (void)S->getTarget();
     return S;
   }
 
   Stmt *visitContinueStmt(ContinueStmt *S) {
-    if (auto target = findBreakOrContinueStmtTarget(
-            getASTContext(), DC->getParentSourceFile(), S->getLoc(),
-            S->getTargetName(), S->getTargetLoc(), /*isContinue=*/true,
-            DC)) {
-      S->setTarget(target);
-    }
-
+    // Force the target to be computed in case it produces diagnostics.
+    (void)S->getTarget();
     return S;
   }
 
@@ -1908,9 +1933,19 @@ bool TypeCheckASTNodeAtLocRequest::evaluate(
         if (!braceCharRange.contains(Loc))
           return Action::SkipChildren(S);
 
-        // Reset the node found in a parent context.
-        if (!brace->isImplicit())
-          FoundNode = nullptr;
+        // Reset the node found in a parent context if it's not part of this
+        // brace statement.
+        // We must not reset FoundNode if it's inside thei BraceStmt's source
+        // range because the found node could be inside a capture list, which is
+        // syntactically part of the brace stmt's range but won't be walked as
+        // a child of the brace stmt.
+        if (!brace->isImplicit() && FoundNode) {
+          auto foundNodeCharRange = Lexer::getCharSourceRangeFromSourceRange(
+              SM, FoundNode->getSourceRange());
+          if (!braceCharRange.contains(foundNodeCharRange)) {
+            FoundNode = nullptr;
+          }
+        }
 
         for (ASTNode &node : brace->getElements()) {
           if (SM.isBeforeInBuffer(Loc, node.getStartLoc()))
@@ -1967,6 +2002,18 @@ bool TypeCheckASTNodeAtLocRequest::evaluate(
     PreWalkAction walkToDeclPre(Decl *D) override {
       if (auto *newDC = dyn_cast<DeclContext>(D))
         DC = newDC;
+
+      if (!SM.isBeforeInBuffer(Loc, D->getStartLoc())) {
+        // NOTE: We need to check the character loc here because the target
+        // loc can be inside the last token of the node. i.e. interpolated
+        // string.
+        SourceLoc endLoc = Lexer::getLocForEndOfToken(SM, D->getEndLoc());
+        if (!(SM.isBeforeInBuffer(endLoc, Loc) || endLoc == Loc)) {
+          if (!isa<TopLevelCodeDecl>(D)) {
+            FoundNode = new ASTNode(D);
+          }
+        }
+      }
       return Action::Continue();
     }
 
@@ -1980,7 +2027,7 @@ bool TypeCheckASTNodeAtLocRequest::evaluate(
   }
 
   // Nothing found at the location, or the decl context does not own the 'Loc'.
-  if (finder.isNull())
+  if (finder.isNull() || !finder.getDeclContext())
     return true;
 
   DeclContext *DC = finder.getDeclContext();

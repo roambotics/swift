@@ -3,6 +3,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTNode.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/DiagnosticsCommon.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericParamList.h"
 #include "swift/AST/Identifier.h"
@@ -21,6 +22,95 @@ inline llvm::ArrayRef<T> getArrayRef(BridgedArrayRef bridged) {
 static SourceLoc getSourceLocFromPointer(void *loc) {
   auto smLoc = llvm::SMLoc::getFromPointer((const char *)loc);
   return SourceLoc(smLoc);
+}
+
+namespace {
+  struct BridgedDiagnosticImpl {
+    InFlightDiagnostic inFlight;
+    std::vector<StringRef> textBlobs;
+
+    BridgedDiagnosticImpl(const BridgedDiagnosticImpl&) = delete;
+    BridgedDiagnosticImpl(BridgedDiagnosticImpl &&) = delete;
+    BridgedDiagnosticImpl &operator=(const BridgedDiagnosticImpl&) = delete;
+    BridgedDiagnosticImpl &operator=(BridgedDiagnosticImpl &&) = delete;
+
+    ~BridgedDiagnosticImpl() {
+      inFlight.flush();
+      for (auto text: textBlobs) {
+        free((void*)text.data());
+      }
+    }
+  };
+}
+
+BridgedDiagnostic SwiftDiagnostic_create(
+    void *diagnosticEngine, BridgedDiagnosticSeverity severity,
+    void *sourceLocPtr,
+    const uint8_t *textPtr, long textLen
+) {
+  StringRef origText{
+    reinterpret_cast<const char *>(textPtr), size_t(textLen)};
+  llvm::MallocAllocator mallocAlloc;
+  StringRef text = origText.copy(mallocAlloc);
+
+  SourceLoc loc = getSourceLocFromPointer(sourceLocPtr);
+
+  Diag<StringRef> diagID;
+  switch (severity) {
+  case BridgedDiagnosticSeverity::BridgedError:
+    diagID = diag::bridged_error;
+    break;
+  case BridgedDiagnosticSeverity::BridgedFatalError:
+    diagID = diag::bridged_fatal_error;
+    break;
+  case BridgedDiagnosticSeverity::BridgedNote:
+    diagID = diag::bridged_note;
+    break;
+  case BridgedDiagnosticSeverity::BridgedRemark:
+    diagID = diag::bridged_remark;
+    break;
+  case BridgedDiagnosticSeverity::BridgedWarning:
+    diagID = diag::bridged_warning;
+    break;
+  }
+
+  DiagnosticEngine &diags = *static_cast<DiagnosticEngine *>(diagnosticEngine);
+  return new BridgedDiagnosticImpl{diags.diagnose(loc, diagID, text), {text}};
+}
+
+/// Highlight a source range as part of the diagnostic.
+void SwiftDiagnostic_highlight(
+    BridgedDiagnostic diagPtr, void *startLocPtr, void *endLocPtr
+) {
+  SourceLoc startLoc = getSourceLocFromPointer(startLocPtr);
+  SourceLoc endLoc = getSourceLocFromPointer(endLocPtr);
+
+  BridgedDiagnosticImpl *impl = static_cast<BridgedDiagnosticImpl *>(diagPtr);
+  impl->inFlight.highlightChars(startLoc, endLoc);
+}
+
+/// Add a Fix-It to replace a source range as part of the diagnostic.
+void SwiftDiagnostic_fixItReplace(
+    BridgedDiagnostic diagPtr, void *replaceStartLocPtr, void *replaceEndLocPtr,
+    const uint8_t *newTextPtr, long newTextLen) {
+
+  SourceLoc startLoc = getSourceLocFromPointer(replaceStartLocPtr);
+  SourceLoc endLoc = getSourceLocFromPointer(replaceEndLocPtr);
+
+  StringRef origReplaceText{
+    reinterpret_cast<const char *>(newTextPtr), size_t(newTextLen)};
+  llvm::MallocAllocator mallocAlloc;
+  StringRef replaceText = origReplaceText.copy(mallocAlloc);
+
+  BridgedDiagnosticImpl *impl = static_cast<BridgedDiagnosticImpl *>(diagPtr);
+  impl->textBlobs.push_back(replaceText);
+  impl->inFlight.fixItReplaceChars(startLoc, endLoc, replaceText);
+}
+
+/// Finish the given diagnostic and emit it.
+void SwiftDiagnostic_finish(BridgedDiagnostic diagPtr) {
+  BridgedDiagnosticImpl *impl = static_cast<BridgedDiagnosticImpl *>(diagPtr);
+  delete impl;
 }
 
 BridgedIdentifier SwiftASTContext_getIdentifier(void *ctx,
@@ -87,10 +177,14 @@ void *SwiftSequenceExpr_create(void *ctx, BridgedArrayRef exprs) {
 }
 
 void *SwiftTupleExpr_create(void *ctx, void *lparen, BridgedArrayRef subs,
+                            BridgedArrayRef names,
+                            BridgedArrayRef nameLocs,
                             void *rparen) {
+  auto &Context = *static_cast<ASTContext *>(ctx);
   return TupleExpr::create(
-      *static_cast<ASTContext *>(ctx), getSourceLocFromPointer(lparen),
-      getArrayRef<Expr *>(subs), {}, {}, getSourceLocFromPointer(rparen),
+      Context, getSourceLocFromPointer(lparen),
+      getArrayRef<Expr *>(subs), getArrayRef<Identifier>(names),
+      getArrayRef<SourceLoc>(nameLocs), getSourceLocFromPointer(rparen),
       /*Implicit*/ false);
 }
 
@@ -220,13 +314,13 @@ void *ParamDecl_create(void *ctx, void *loc, void *_Nullable argLoc,
   return paramDecl;
 }
 
-void *FuncDecl_create(void *ctx, void *staticLoc, bool isStatic, void *funcLoc,
-                      BridgedIdentifier name, void *nameLoc, bool isAsync,
-                      void *_Nullable asyncLoc, bool throws,
-                      void *_Nullable throwsLoc, void *paramLLoc,
-                      BridgedArrayRef params, void *paramRLoc,
-                      void *_Nullable body, void *_Nullable returnType,
-                      void *declContext) {
+struct FuncDeclBridged
+FuncDecl_create(void *ctx, void *staticLoc, bool isStatic, void *funcLoc,
+                BridgedIdentifier name, void *nameLoc, bool isAsync,
+                void *_Nullable asyncLoc, bool throws,
+                void *_Nullable throwsLoc, void *paramLLoc,
+                BridgedArrayRef params, void *paramRLoc,
+                void *_Nullable returnType, void *declContext) {
   auto *paramList = ParameterList::create(
       *static_cast<ASTContext *>(ctx), getSourceLocFromPointer(paramLLoc),
       getArrayRef<ParamDecl *>(params), getSourceLocFromPointer(paramRLoc));
@@ -240,9 +334,13 @@ void *FuncDecl_create(void *ctx, void *staticLoc, bool isStatic, void *funcLoc,
       getSourceLocFromPointer(asyncLoc), throws,
       getSourceLocFromPointer(throwsLoc), nullptr, paramList,
       (TypeRepr *)returnType, (DeclContext *)declContext);
-  out->setBody((BraceStmt *)body, FuncDecl::BodyKind::Parsed);
 
-  return static_cast<Decl *>(out);
+  return {static_cast<DeclContext *>(out), static_cast<FuncDecl *>(out),
+          static_cast<Decl *>(out)};
+}
+
+void FuncDecl_setBody(void *fn, void *body) {
+  ((FuncDecl *)fn)->setBody((BraceStmt *)body, FuncDecl::BodyKind::Parsed);
 }
 
 void *SimpleIdentTypeRepr_create(void *ctx, void *loc, BridgedIdentifier id) {
@@ -283,10 +381,13 @@ void *ClosureExpr_create(void *ctx, void *body, void *dc) {
   SourceLoc inLoc;
 
   ASTContext &Context = *static_cast<ASTContext *>(ctx);
+  auto params = ParameterList::create(Context, inLoc, {}, inLoc);
+
   auto *out = new (Context)
       ClosureExpr(attributes, bracketRange, nullptr, nullptr, asyncLoc,
                   throwsLoc, arrowLoc, inLoc, nullptr, 0, (DeclContext *)dc);
   out->setBody((BraceStmt *)body, true);
+  out->setParameterList(params);
   return (Expr *)out;
 }
 
@@ -498,6 +599,9 @@ void TypeAliasDecl_setUnderlyingTypeRepr(void *decl, void *underlyingType) {
   ((TypeAliasDecl *)decl)->setUnderlyingTypeRepr((TypeRepr *)underlyingType);
 }
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 void TopLevelCodeDecl_dump(void *decl) {
   ((TopLevelCodeDecl *)decl)->dump(llvm::errs());
 }
@@ -505,3 +609,6 @@ void TopLevelCodeDecl_dump(void *decl) {
 void Expr_dump(void *expr) { ((Expr *)expr)->dump(llvm::errs()); }
 void Decl_dump(void *expr) { ((Decl *)expr)->dump(llvm::errs()); }
 void Stmt_dump(void *expr) { ((Stmt *)expr)->dump(llvm::errs()); }
+void Type_dump(void *expr) { ((TypeRepr *)expr)->dump(); }
+
+#pragma clang diagnostic pop

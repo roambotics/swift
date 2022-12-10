@@ -28,8 +28,8 @@ add_swift_host_library(swiftIDE STATIC
   KeyPathCompletion.cpp
   ModuleInterfacePrinting.cpp
   PostfixCompletion.cpp
-  Refactoring.cpp
   REPLCodeCompletion.cpp
+  SelectedOverloadInfo.cpp
   SourceEntityWalker.cpp
   SwiftSourceDocInfo.cpp
   SyntaxModel.cpp
@@ -42,7 +42,6 @@ target_link_libraries(swiftIDE PRIVATE
   swiftAST
   swiftClangImporter
   swiftDriver
-  swiftIndex
   swiftParse
   swiftSema)
 

@@ -113,8 +113,8 @@ llvm::InlineAsm *IRGenModule::getObjCRetainAutoreleasedReturnValueMarker() {
   // Check to see if we've already computed the market.  Note that we
   // might have cached a null marker, and that's fine.
   auto &cache = ObjCRetainAutoreleasedReturnValueMarker;
-  if (cache.hasValue())
-    return cache.getValue();
+  if (cache.has_value())
+    return cache.value();
 
   // Ask the target for the string.
   StringRef asmString = TargetInfo.ObjCRetainAutoreleasedReturnValueMarker;
@@ -144,7 +144,7 @@ llvm::InlineAsm *IRGenModule::getObjCRetainAutoreleasedReturnValueMarker() {
     cache = llvm::InlineAsm::get(type, asmString, "", /*sideeffects*/ true);
   }
 
-  return cache.getValue();
+  return cache.value();
 }
 
 /// Reclaim an autoreleased return value.
@@ -193,7 +193,8 @@ namespace {
   public:
     UnknownTypeInfo(llvm::PointerType *storageType, Size size,
                  SpareBitVector spareBits, Alignment align)
-      : HeapTypeInfo(storageType, size, spareBits, align) {
+      : HeapTypeInfo(ReferenceCounting::Unknown, storageType, size, spareBits,
+                     align) {
     }
 
     /// AnyObject requires ObjC reference-counting.
@@ -222,8 +223,8 @@ namespace {
   public:
     BridgeObjectTypeInfo(llvm::PointerType *storageType, Size size,
                  SpareBitVector spareBits, Alignment align)
-      : HeapTypeInfo(storageType, size, spareBits, align) {
-    }
+      : HeapTypeInfo(ReferenceCounting::Bridge, storageType, size, spareBits,
+                     align) {}
 
     /// Builtin.BridgeObject uses its own specialized refcounting implementation.
     ReferenceCounting getReferenceCounting() const {
@@ -433,6 +434,65 @@ getProtocolRefsList(llvm::Constant *protocol) {
   return std::make_pair(size, protocolRefsList);
 }
 
+static void appendNonRuntimeImpliedProtocols(
+  clang::ObjCProtocolDecl *proto,
+  llvm::SetVector<clang::ObjCProtocolDecl *> &nonRuntimeImpliedProtos) {
+
+  if (!proto->isNonRuntimeProtocol()) {
+    nonRuntimeImpliedProtos.insert(proto->getCanonicalDecl());
+    return;
+  }
+
+  for (auto *parent : proto->protocols())
+    appendNonRuntimeImpliedProtocols(parent, nonRuntimeImpliedProtos);
+}
+
+// Get runtime protocol list used during emission of objective-c protocol
+// metadata taking non-runtime protocols into account.
+static std::vector<clang::ObjCProtocolDecl *>
+getRuntimeProtocolList(clang::ObjCProtocolDecl::protocol_range protocols) {
+
+  llvm::DenseSet<clang::ObjCProtocolDecl *> nonRuntimeProtocols;
+  std::vector<clang::ObjCProtocolDecl*> runtimeProtocols;
+  for (auto p: protocols) {
+    auto *proto = p->getCanonicalDecl();
+    if (proto->isNonRuntimeProtocol())
+      nonRuntimeProtocols.insert(proto);
+    else
+      runtimeProtocols.push_back(proto);
+  }
+
+  if (nonRuntimeProtocols.empty())
+    return runtimeProtocols;
+
+  // Find the non-runtime implied protocols: protocols that occur in the closest
+  // ancestry of a non-runtime protocol.
+  llvm::SetVector<clang::ObjCProtocolDecl *> nonRuntimeImpliedProtos;
+  for (auto *nonRuntimeProto : nonRuntimeProtocols) {
+    appendNonRuntimeImpliedProtocols(nonRuntimeProto, nonRuntimeImpliedProtos);
+  }
+
+  // Subtract the implied protocols of the runtime protocols and non runtime
+  // protoocls implied protocols form the non runtime implied protocols.
+  llvm::DenseSet<const clang::ObjCProtocolDecl *> impliedProtocols;
+  for (auto *p : runtimeProtocols) {
+    impliedProtocols.insert(p);
+    p->getImpliedProtocols(impliedProtocols);
+  }
+
+  for (auto *p : nonRuntimeImpliedProtos) {
+    p->getImpliedProtocols(impliedProtocols);
+  }
+
+  for (auto *p : nonRuntimeImpliedProtos) {
+    if (!impliedProtocols.contains(p)) {
+      runtimeProtocols.push_back(p);
+    }
+  }
+
+  return runtimeProtocols;
+}
+
 static void updateProtocolRefs(IRGenModule &IGM,
                                const clang::ObjCProtocolDecl *objcProtocol,
                                llvm::Constant *protocol) {
@@ -444,22 +504,35 @@ static void updateProtocolRefs(IRGenModule &IGM,
   assert(clangImporter && "Must have a clang importer");
 
   // Get the array containining the protocol refs.
-  unsigned protocolRefsSize;
-  llvm::ConstantArray *protocolRefs;
-  std::tie(protocolRefsSize, protocolRefs) = getProtocolRefsList(protocol);
+  unsigned protocolRefsSize = getProtocolRefsList(protocol).first;
   unsigned currentIdx = 0;
-  for (auto inheritedObjCProtocol : objcProtocol->protocols()) {
+  auto inheritedObjCProtocols = getRuntimeProtocolList(objcProtocol->protocols());
+  for (auto inheritedObjCProtocol : inheritedObjCProtocols) {
     assert(currentIdx < protocolRefsSize);
+
+    // Getting the `protocolRefs` constant must not be hoisted out of the loop
+    // because this constant might be deleted by
+    // `oldVar->replaceAllUsesWith(newOpd)` below.
+    llvm::ConstantArray *protocolRefs = getProtocolRefsList(protocol).second;
     auto oldVar = protocolRefs->getOperand(currentIdx);
     // Map the objc protocol to swift protocol.
     auto optionalDecl = clangImporter->importDeclCached(inheritedObjCProtocol);
+    // This should not happen but the compiler currently silently accepts
+    // protocol forward declarations without definitions (102058759).
+    if (!optionalDecl || *optionalDecl == nullptr) {
+      ++currentIdx;
+      continue;
+    }
     auto inheritedSwiftProtocol = cast<ProtocolDecl>(*optionalDecl);
     // Get the objc protocol record we use in Swift.
     auto record = IGM.getAddrOfObjCProtocolRecord(inheritedSwiftProtocol,
                                                   NotForDefinition);
     auto newOpd = llvm::ConstantExpr::getBitCast(record, oldVar->getType());
-    if (newOpd != oldVar)
-      oldVar->replaceAllUsesWith(newOpd);
+    if (newOpd != oldVar) {
+      oldVar->replaceUsesWithIf(newOpd, [protocol](llvm::Use &U) -> bool {
+                                return U.getUser() == getProtocolRefsList(protocol).second;
+                                });
+    }
     ++currentIdx;
   }
   assert(currentIdx == protocolRefsSize);

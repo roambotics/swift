@@ -1,5 +1,6 @@
+import SwiftParser
 import SwiftSyntax
-@_spi(Testing) import _SwiftSyntaxMacros
+import _SwiftSyntaxMacros
 
 extension SyntaxProtocol {
   func token(at position: AbsolutePosition) -> TokenSyntax? {
@@ -26,20 +27,20 @@ struct ExportedMacro {
   var macro: Macro.Type
 }
 
-/// Look up a macro with the given name.
+/// Resolve a reference to type metadata into a macro, if posible.
 ///
 /// Returns an unmanaged pointer to an ExportedMacro instance that describes
 /// the specified macro. If there is no macro with the given name, produces
 /// nil.
-@_cdecl("swift_ASTGen_lookupMacro")
-public func lookupMacro(
-  macroNamePtr: UnsafePointer<UInt8>
+@_cdecl("swift_ASTGen_resolveMacroType")
+public func resolveMacroType(
+  macroTypePtr: UnsafePointer<UInt8>
 ) -> UnsafeRawPointer? {
-  let macroSystem = MacroSystem.exampleSystem
+  let macroType = unsafeBitCast(macroTypePtr, to: Any.Type.self)
 
-  // Look for a macro with this name.
-  let macroName = String(cString: macroNamePtr)
-  guard let macro = macroSystem.lookup(macroName) else { return nil }
+  guard let macro = macroType as? Macro.Type else {
+    return nil
+  }
 
   // Allocate and initialize the exported macro.
   let exportedPtr = UnsafeMutablePointer<ExportedMacro>.allocate(capacity: 1)
@@ -81,48 +82,23 @@ private func allocateUTF8String(
   }
 }
 
-/// Query the type signature of the given macro.
-@_cdecl("swift_ASTGen_getMacroTypeSignature")
-public func getMacroTypeSignature(
-  macroPtr: UnsafeMutablePointer<UInt8>,
-  evaluationContextPtr: UnsafeMutablePointer<UnsafePointer<UInt8>?>,
-  evaluationContextLengthPtr: UnsafeMutablePointer<Int>
-) {
-  macroPtr.withMemoryRebound(to: ExportedMacro.self, capacity: 1) { macro in
-    (evaluationContextPtr.pointee, evaluationContextLengthPtr.pointee) =
-      allocateUTF8String(macro.pointee.evaluationContext, nullTerminated: true)
-  }
-}
-
-extension ExportedMacro {
-  var evaluationContext: String {
-    """
-    struct __MacroEvaluationContext\(self.macro.genericSignature?.description ?? "") {
-      typealias SignatureType = \(self.macro.signature)
+extension String {
+  /// Drop everything up to and including the last '/' from the string.
+  fileprivate func withoutPath() -> String {
+    // Only keep everything after the last slash.
+    if let lastSlash = lastIndex(of: "/") {
+      return String(self[index(after: lastSlash)...])
     }
-    """
-  }
-}
 
-/// Query the macro evaluation context of the given macro.
-@_cdecl("swift_ASTGen_getMacroEvaluationContext")
-public func getMacroEvaluationContext(
-  sourceFilePtr: UnsafePointer<UInt8>,
-  declContext: UnsafeMutableRawPointer,
-  context: UnsafeMutableRawPointer,
-  macroPtr: UnsafeMutablePointer<UInt8>,
-  contextPtr: UnsafeMutablePointer<UnsafeMutableRawPointer?>
-) {
-  contextPtr.pointee = macroPtr.withMemoryRebound(to: ExportedMacro.self, capacity: 1) { macro in
-    return ASTGenVisitor(ctx: context, base: sourceFilePtr, declContext: declContext)
-      .visit(StructDeclSyntax(stringLiteral: macro.pointee.evaluationContext))
-      .rawValue
+    return self
   }
 }
 
 @_cdecl("swift_ASTGen_evaluateMacro")
 @usableFromInline
 func evaluateMacro(
+  diagEnginePtr: UnsafeMutablePointer<UInt8>,
+  macroPtr: UnsafeMutablePointer<UInt8>,
   sourceFilePtr: UnsafePointer<UInt8>,
   sourceLocationPtr: UnsafePointer<UInt8>?,
   expandedSourcePointer: UnsafeMutablePointer<UnsafePointer<UInt8>?>,
@@ -155,25 +131,36 @@ func evaluateMacro(
     }
 
     guard let parentSyntax = token.parent,
-      parentSyntax.is(MacroExpansionExprSyntax.self)
+          let parentExpansion = parentSyntax.as(MacroExpansionExprSyntax.self)
     else {
       print("not on a macro expansion node: \(token.recursiveDescription)")
       return -1
     }
 
-    let macroSystem = MacroSystem.exampleSystem
-    let converter = SourceLocationConverter(
-      file: sourceFile.pointee.fileName, tree: sf
-    )
-    let context = MacroEvaluationContext(
+    var context = MacroExpansionContext(
       moduleName: sourceFile.pointee.moduleName,
-      sourceLocationConverter: converter
+      fileName: sourceFile.pointee.fileName.withoutPath()
     )
 
-    let evaluatedSyntax = parentSyntax.evaluateMacro(
-      with: macroSystem, context: context
-    ) { error in
-      /* TODO: Report errors */
+    let evaluatedSyntax: ExprSyntax = macroPtr.withMemoryRebound(to: ExportedMacro.self, capacity: 1) { macro in
+      guard let exprMacro = macro.pointee.macro as? ExpressionMacro.Type else {
+        print("not an expression macro")
+        return ExprSyntax(parentExpansion)
+      }
+
+      return exprMacro.expansion(of: parentExpansion, in: &context)
+    }
+
+    // Emit diagnostics accumulated in the context.
+    for diag in context.diagnostics {
+      // FIXME: Consider tacking on a note that says that this diagnostic
+      // came from a macro expansion.
+      emitDiagnostic(
+        diagEnginePtr: diagEnginePtr,
+        sourceFileBuffer: .init(mutating: sourceFile.pointee.buffer),
+        nodeStartOffset: parentSyntax.position.utf8Offset,
+        diagnostic: diag
+      )
     }
 
     var evaluatedSyntaxStr = evaluatedSyntax.withoutTrivia().description
@@ -190,26 +177,4 @@ func evaluateMacro(
 
     return 0
   }
-}
-
-/// Calls the given `allMacros: [Any.Type]` function pointer and produces a
-/// newly allocated buffer containing metadata pointers.
-@_cdecl("swift_ASTGen_getMacroTypes")
-@usableFromInline
-func getMacroTypes(
-  getterAddress: UnsafeRawPointer,
-  resultAddress: UnsafeMutablePointer<UnsafePointer<UnsafeRawPointer>?>,
-  count: UnsafeMutablePointer<Int>
-) {
-  let getter = unsafeBitCast(
-    getterAddress, to: (@convention(thin) () -> [Any.Type]).self)
-  let metatypes = getter()
-  let address = UnsafeMutableBufferPointer<Any.Type>.allocate(
-    capacity: metatypes.count
-  )
-  _ = address.initialize(from: metatypes)
-  address.withMemoryRebound(to: UnsafeRawPointer.self) {
-    resultAddress.initialize(to: UnsafePointer($0.baseAddress))
-  }
-  count.initialize(to: address.count)
 }

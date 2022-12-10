@@ -300,25 +300,6 @@ static void convertMemoryReinitToInitForm(SILInstruction *memInst) {
   }
 }
 
-static bool memInstMustReinitialize(Operand *memOper) {
-  SILValue address = memOper->get();
-  auto *memInst = memOper->getUser();
-  switch (memInst->getKind()) {
-  default:
-    return false;
-
-  case SILInstructionKind::CopyAddrInst: {
-    auto *CAI = cast<CopyAddrInst>(memInst);
-    return CAI->getDest() == address && !CAI->isInitializationOfDest();
-  }
-  case SILInstructionKind::StoreInst: {
-    auto *si = cast<StoreInst>(memInst);
-    return si->getDest() == address &&
-           si->getOwnershipQualifier() == StoreOwnershipQualifier::Assign;
-  }
-  }
-}
-
 //===----------------------------------------------------------------------===//
 //                               Use State
 //===----------------------------------------------------------------------===//
@@ -2426,6 +2407,10 @@ class MoveKillsCopyableAddressesCheckerPass : public SILFunctionTransform {
   void run() override {
     auto *fn = getFunction();
     auto &astContext = fn->getASTContext();
+
+    // Only run this pass if the move only language feature is enabled.
+    if (!astContext.LangOpts.Features.contains(Feature::MoveOnly))
+      return;
 
     // Don't rerun diagnostics on deserialized functions.
     if (getFunction()->wasDeserializedCanonical())

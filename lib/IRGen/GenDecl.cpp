@@ -481,15 +481,25 @@ void IRGenModule::emitSourceFile(SourceFile &SF) {
     this->addLinkLibrary(LinkLibrary("objc", LibraryKind::Library));
 
   // If C++ interop is enabled, add -lc++ on Darwin and -lstdc++ on linux.
+  // Also link with C++ bridging utility module (Cxx) and C++ stdlib overlay
+  // (std) if available.
   if (Context.LangOpts.EnableCXXInterop) {
-    if (Context.LangOpts.Target.isOSDarwin())
+    const llvm::Triple &target = Context.LangOpts.Target;
+    if (target.isOSDarwin())
       this->addLinkLibrary(LinkLibrary("c++", LibraryKind::Library));
-    else if (Context.LangOpts.Target.isOSLinux())
+    else if (target.isOSLinux())
       this->addLinkLibrary(LinkLibrary("stdc++", LibraryKind::Library));
 
     // Do not try to link Cxx with itself.
     if (!getSwiftModule()->getName().is("Cxx"))
       this->addLinkLibrary(LinkLibrary("swiftCxx", LibraryKind::Library));
+
+    // Only link with std on platforms where the overlay is available.
+    // Do not try to link std with itself.
+    if ((target.isOSDarwin() || target.isOSLinux()) &&
+        !getSwiftModule()->getName().is("Cxx") &&
+        !getSwiftModule()->getName().is("std"))
+      this->addLinkLibrary(LinkLibrary("swiftstd", LibraryKind::Library));
   }
 
   // FIXME: It'd be better to have the driver invocation or build system that
@@ -530,6 +540,11 @@ void IRGenModule::emitSourceFile(SourceFile &SF) {
     #define BACK_DEPLOYMENT_LIB(Version, Filter, LibraryName)         \
       addBackDeployLib(llvm::VersionTuple Version, LibraryName);
     #include "swift/Frontend/BackDeploymentLibs.def"
+
+    if (IRGen.Opts.AutolinkRuntimeCompatibilityBytecodeLayoutsLibrary)
+      this->addLinkLibrary(LinkLibrary("swiftCompatibilityBytecodeLayouts",
+                                       LibraryKind::Library,
+                                       /*forceLoad*/ true));
   }
 }
 
@@ -884,6 +899,7 @@ IRGenModule::getAddrOfContextDescriptorForParent(DeclContext *parent,
   }
       
   case DeclContextKind::FileUnit:
+  case DeclContextKind::MacroDecl:
     parent = parent->getParentModule();
     LLVM_FALLTHROUGH;
       
@@ -1973,6 +1989,7 @@ void IRGenerator::emitEagerClassInitialization() {
     IGM->DebugInfo->emitArtificialFunction(RegisterIGF, RegisterIGF.CurFn);
   RegisterFn->setAttributes(IGM->constructInitialAttributes());
   RegisterFn->setCallingConv(IGM->DefaultCC);
+  IGM->setColocateMetadataSection(RegisterFn);
 
   for (ClassDecl *CD : ClassesForEagerInitialization) {
     auto Ty = CD->getDeclaredType()->getCanonicalType();
@@ -2016,6 +2033,7 @@ void IRGenerator::emitObjCActorsNeedingSuperclassSwizzle() {
     IGM->DebugInfo->emitArtificialFunction(RegisterIGF, RegisterIGF.CurFn);
   RegisterFn->setAttributes(IGM->constructInitialAttributes());
   RegisterFn->setCallingConv(IGM->DefaultCC);
+  IGM->setColocateMetadataSection(RegisterFn);
 
   // Look up the SwiftNativeNSObject class.
   auto swiftNativeNSObjectName =
@@ -2479,6 +2497,7 @@ void IRGenModule::emitGlobalDecl(Decl *D) {
   case DeclKind::AssociatedType:
   case DeclKind::IfConfig: 
   case DeclKind::PoundDiagnostic:
+  case DeclKind::Macro:
     return;
 
   case DeclKind::Enum:
@@ -5340,6 +5359,7 @@ void IRGenModule::emitNestedTypeDecls(DeclRange members) {
 
     case DeclKind::IfConfig:
     case DeclKind::PoundDiagnostic:
+    case DeclKind::Macro:
       continue;
 
     case DeclKind::Func:
@@ -5849,4 +5869,24 @@ IRGenModule::getOrCreateHelperFunction(StringRef fnName, llvm::Type *resultTy,
   }
 
   return fn;
+}
+
+void IRGenModule::setColocateMetadataSection(llvm::Function *f) {
+  if (!IRGen.Opts.CollocatedMetadataFunctions)
+    return;
+
+  switch (TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::MachO:
+    f->setSection("__TEXT, __textg_swiftm, regular, pure_instructions");
+    break;
+  case llvm::Triple::DXContainer:
+  case llvm::Triple::GOFF:
+  case llvm::Triple::SPIRV:
+  case llvm::Triple::UnknownObjectFormat:
+  case llvm::Triple::Wasm:
+  case llvm::Triple::ELF:
+  case llvm::Triple::XCOFF:
+  case llvm::Triple::COFF:
+    break;
+  }
 }

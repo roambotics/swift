@@ -18,6 +18,11 @@ module ConstructorsObjC {
   requires cplusplus
 }
 
+module CustomNewOperator {
+  header "custom-new-operator.h"
+  requires cplusplus
+}
+
 module Destructors {
   header "destructors.h"
   requires cplusplus
@@ -70,6 +75,11 @@ module NoDiscard {
 
 module ProtocolConformance {
   header "protocol-conformance.h"
+  requires cplusplus
+}
+
+module StructuredBindingsGetMethod {
+  header "structured-bindings-get-method.h"
   requires cplusplus
 }
 

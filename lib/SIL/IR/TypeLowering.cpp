@@ -43,6 +43,15 @@
 using namespace swift;
 using namespace Lowering;
 
+// Necessary to straightforwardly write SIL tests that exercise
+// OpaqueValueTypeLowering (and MoveOnlyOpaqueValueTypeLowering): the tests can
+// be written as though opaque values were enabled to begin but have since been
+// lowered out of.
+llvm::cl::opt<bool> TypeLoweringForceOpaqueValueLowering(
+    "type-lowering-force-opaque-value-lowering", llvm::cl::init(false),
+    llvm::cl::desc("Force TypeLowering to behave as if building with opaque "
+                   "values enabled"));
+
 namespace {
   /// A CRTP type visitor for deciding whether the metatype for a type
   /// is a singleton type, i.e. whether there can only ever be one
@@ -286,6 +295,26 @@ namespace {
     IMPL(Module, Trivial)
 
 #undef IMPL
+
+    RetTy visitPackType(CanPackType type,
+                        AbstractionPattern origType,
+                        IsTypeExpansionSensitive_t isSensitive) {
+      return asImpl().handleAddressOnly(type, {IsNotTrivial, IsFixedABI,
+                                               IsAddressOnly, IsNotResilient,
+                                               isSensitive,
+                                               DoesNotHaveRawPointer,
+                                               IsLexical});
+    }
+
+    RetTy visitPackExpansionType(CanPackExpansionType type,
+                                 AbstractionPattern origType,
+                                 IsTypeExpansionSensitive_t isSensitive) {
+      return asImpl().handleAddressOnly(type, {IsNotTrivial, IsFixedABI,
+                                               IsAddressOnly, IsNotResilient,
+                                               isSensitive,
+                                               DoesNotHaveRawPointer,
+                                               IsLexical});
+    }
 
     RetTy visitBuiltinRawPointerType(CanBuiltinRawPointerType type,
                                      AbstractionPattern orig,
@@ -669,16 +698,6 @@ namespace {
                                       IsTypeExpansionSensitive_t isSensitive) {
       return asImpl().visitAnyStructType(type, origType, type->getDecl(),
                                          isSensitive);
-    }
-
-    RetTy visitPackType(CanPackType type, AbstractionPattern origType,
-                        IsTypeExpansionSensitive_t isSensitive) {
-      llvm_unreachable("");
-    }
-
-    RetTy visitPackExpansionType(CanPackExpansionType type, AbstractionPattern origType,
-                                 IsTypeExpansionSensitive_t isSensitive) {
-      llvm_unreachable("");
     }
 
     RetTy visitBuiltinTupleType(CanBuiltinTupleType type, AbstractionPattern origType,
@@ -1923,6 +1942,10 @@ namespace {
   /// Lower address only types as opaque values.
   class OpaqueValueTypeLowering : public LeafLoadableTypeLowering {
   public:
+    void setLoweredAddresses() const override {
+      LoweredType = LoweredType.getAddressType();
+    }
+
     OpaqueValueTypeLowering(SILType type, RecursiveProperties properties,
                             TypeExpansionContext forExpansion)
       : LeafLoadableTypeLowering(type, properties, IsNotReferenceCounted,
@@ -1931,7 +1954,12 @@ namespace {
     void emitCopyInto(SILBuilder &B, SILLocation loc,
                       SILValue src, SILValue dest, IsTake_t isTake,
                       IsInitialization_t isInit) const override {
-      llvm_unreachable("copy into");
+      if (LoweredType.isAddress()) {
+        B.createCopyAddr(loc, src, dest, isTake, isInit);
+      } else {
+        SILValue value = emitLoadOfCopy(B, loc, src, isTake);
+        emitStoreOfCopy(B, loc, value, dest, isInit);
+      }
     }
 
     // OpaqueValue store cannot be decoupled from a destroy because it is not
@@ -1985,6 +2013,10 @@ namespace {
         : LeafLoadableTypeLowering(type, properties, IsNotReferenceCounted,
                                    forExpansion) {}
 
+    void setLoweredAddresses() const override {
+      LoweredType = LoweredType.getAddressType();
+    }
+
     void emitCopyInto(SILBuilder &B, SILLocation loc, SILValue src,
                       SILValue dest, IsTake_t isTake,
                       IsInitialization_t isInit) const override {
@@ -2022,9 +2054,13 @@ namespace {
   class LowerType
     : public TypeClassifierBase<LowerType, TypeLowering *>
   {
+    bool loweredAddresses;
+
   public:
-    LowerType(TypeConverter &TC, TypeExpansionContext Expansion)
-      : TypeClassifierBase(TC, Expansion) {}
+    LowerType(TypeConverter &TC, TypeExpansionContext Expansion,
+              bool loweredAddresses)
+        : TypeClassifierBase(TC, Expansion),
+          loweredAddresses(loweredAddresses) {}
 
     TypeLowering *handleTrivial(CanType type) {
       return handleTrivial(type, RecursiveProperties::forTrivial());
@@ -2056,7 +2092,8 @@ namespace {
 
     TypeLowering *handleMoveOnlyAddressOnly(CanType type,
                                             RecursiveProperties properties) {
-      if (!TC.Context.SILOpts.EnableSILOpaqueValues) {
+      if (!TC.Context.SILOpts.EnableSILOpaqueValues &&
+          !TypeLoweringForceOpaqueValueLowering) {
         auto silType = SILType::getPrimitiveAddressType(type);
         return new (TC)
             MoveOnlyAddressOnlyTypeLowering(silType, properties, Expansion);
@@ -2074,12 +2111,15 @@ namespace {
 
     TypeLowering *handleAddressOnly(CanType type,
                                     RecursiveProperties properties) {
-      if (!TC.Context.SILOpts.EnableSILOpaqueValues) {
+      if (!TC.Context.SILOpts.EnableSILOpaqueValues &&
+          !TypeLoweringForceOpaqueValueLowering) {
         auto silType = SILType::getPrimitiveAddressType(type);
         return new (TC) AddressOnlyTypeLowering(silType, properties,
                                                            Expansion);
       }
-      auto silType = SILType::getPrimitiveObjectType(type);
+      auto silType = SILType::getPrimitiveType(
+          type, loweredAddresses ? SILValueCategory::Address
+                                 : SILValueCategory::Object);
       return new (TC) OpaqueValueTypeLowering(silType, properties, Expansion);
     }
     
@@ -2126,13 +2166,21 @@ namespace {
     TypeLowering *visitPackType(CanPackType packType,
                                 AbstractionPattern origType,
                                 IsTypeExpansionSensitive_t isSensitive) {
-      llvm_unreachable("");
+      RecursiveProperties properties;
+      properties.setAddressOnly();
+      properties = mergeIsTypeExpansionSensitive(isSensitive, properties);
+
+      return handleAddressOnly(packType, properties);
     }
 
-    TypeLowering *visitPackExpansionType(CanPackExpansionType packType,
+    TypeLowering *visitPackExpansionType(CanPackExpansionType packExpansionType,
                                          AbstractionPattern origType,
                                          IsTypeExpansionSensitive_t isSensitive) {
-      llvm_unreachable("");
+      RecursiveProperties properties;
+      properties.setAddressOnly();
+      properties = mergeIsTypeExpansionSensitive(isSensitive, properties);
+
+      return handleAddressOnly(packExpansionType, properties);
     }
 
     TypeLowering *visitBuiltinTupleType(CanBuiltinTupleType type,
@@ -2365,9 +2413,8 @@ namespace {
   };
 } // end anonymous namespace
 
-TypeConverter::TypeConverter(ModuleDecl &m)
-  : M(m), Context(m.getASTContext()) {
-}
+TypeConverter::TypeConverter(ModuleDecl &m, bool loweredAddresses)
+    : LoweredAddresses(loweredAddresses), M(m), Context(m.getASTContext()) {}
 
 TypeConverter::~TypeConverter() {
   // The bump pointer allocator destructor will deallocate but not destroy all
@@ -2447,9 +2494,37 @@ static CanTupleType computeLoweredTupleType(TypeConverter &tc,
 
   if (!changed) return substType;
 
-  // The cast should succeed, because if we end up with a one-element
-  // tuple type here, it must have a label.
-  return cast<TupleType>(CanType(TupleType::get(loweredElts, tc.Context)));
+  return CanTupleType(TupleType::get(loweredElts, tc.Context));
+}
+
+/// Lower each of the elements of the substituted type according to
+/// the abstraction pattern of the given original type.
+static CanPackType computeLoweredPackType(TypeConverter &tc,
+                                          TypeExpansionContext context,
+                                          AbstractionPattern origType,
+                                          CanPackType substType) {
+  assert(origType.matchesPack(substType));
+
+  // Does the lowered tuple type differ from the substituted type in
+  // any interesting way?
+  bool changed = false;
+  SmallVector<Type, 4> loweredElts;
+  loweredElts.reserve(substType->getNumElements());
+
+  for (auto i : indices(substType->getElementTypes())) {
+    auto origEltType = origType.getPackElementType(i);
+    auto substEltType = substType.getElementType(i);
+
+    CanType loweredTy =
+        tc.getLoweredRValueType(context, origEltType, substEltType);
+    changed = (changed || substEltType != loweredTy);
+
+    loweredElts.push_back(loweredTy);
+  }
+
+  if (!changed) return substType;
+
+  return CanPackType(PackType::get(tc.Context, loweredElts));
 }
 
 static CanType computeLoweredOptionalType(TypeConverter &tc,
@@ -2540,7 +2615,7 @@ TypeConverter::getTypeLowering(AbstractionPattern origType,
   // and cache it.
   if (loweredSubstType == substType && key.isCacheable()) {
     lowering =
-        LowerType(*this, forExpansion)
+        LowerType(*this, forExpansion, LoweredAddresses)
             .visit(key.SubstType, key.OrigType, isTypeExpansionSensitive);
 
     // Otherwise, check the table at a key that would be used by the
@@ -2585,7 +2660,7 @@ bool TypeConverter::visitAggregateLeaves(
                              &worklist](Type substTy, AbstractionPattern origTy,
                                         ValueDecl *field,
                                         Optional<unsigned> maybeIndex) -> bool {
-    unsigned index = maybeIndex.getValueOr(UINT_MAX);
+    unsigned index = maybeIndex.value_or(UINT_MAX);
     if (!visited.insert({substTy.getPointer(), field, index}).second)
       return false;
     worklist.push_back({substTy.getPointer(), origTy, field, index});
@@ -2866,54 +2941,34 @@ TypeConverter::computeLoweredRValueType(TypeExpansionContext forExpansion,
                                              MetatypeRepresentation::Thick);
     }
 
-    CanType visitExistentialType(CanExistentialType substExistType) {
-      // Try to avoid walking into the constraint type if we can help it
-      if (!substExistType->hasTypeParameter() &&
-          !substExistType->hasArchetype() &&
-          !substExistType->hasOpaqueArchetype()) {
-        return substExistType;
-      }
-
-      return CanExistentialType::get(visit(substExistType.getConstraintType()));
+    // Lower pack element types.
+    CanType visitPackType(CanPackType substPackType) {
+      return computeLoweredPackType(TC, forExpansion, origType,
+                                    substPackType);
     }
 
-    CanType
-    visitParameterizedProtocolType(CanParameterizedProtocolType substPPT) {
+    CanType visitPackExpansionType(CanPackExpansionType substPackExpansionType) {
       bool changed = false;
-      SmallVector<Type, 4> loweredSubstArgs;
-      loweredSubstArgs.reserve(substPPT.getArgs().size());
 
-      auto origConstraint = origType.getExistentialConstraintType();
-      auto origPPT = origConstraint.getAs<ParameterizedProtocolType>();
-      if (!origPPT)
-        return substPPT;
-      
-      for (auto i : indices(substPPT.getArgs())) {
-        auto origArgTy = AbstractionPattern(
-            origConstraint.getGenericSignatureOrNull(), origPPT.getArgs()[i]);
-        auto substArgType = substPPT.getArgs()[i];
+      CanType substPatternType = substPackExpansionType.getPatternType();
+      CanType loweredSubstPatternType = TC.getLoweredRValueType(
+          forExpansion,
+          origType.getPackExpansionPatternType(),
+          substPatternType);
+      changed |= (loweredSubstPatternType != substPatternType);
 
-        CanType loweredSubstEltType =
-            TC.getLoweredRValueType(forExpansion, origArgTy, substArgType);
-        changed = changed || substArgType != loweredSubstEltType;
-
-        loweredSubstArgs.push_back(loweredSubstEltType);
-      }
+      CanType substCountType = substPackExpansionType.getCountType();
+      CanType loweredSubstCountType = TC.getLoweredRValueType(
+          forExpansion,
+          origType.getPackExpansionCountType(),
+          substCountType);
+      changed |= (loweredSubstCountType != substCountType);
 
       if (!changed)
-        return substPPT;
+        return substPackExpansionType;
 
-      return CanParameterizedProtocolType::get(
-          TC.Context, substPPT->getBaseType(), loweredSubstArgs);
-    }
-
-    CanType visitPackType(CanPackType substPackType) {
-      llvm_unreachable("");
-    }
-
-
-    CanType visitPackExpansionType(CanPackExpansionType substPackType) {
-      llvm_unreachable("");
+      return CanType(PackExpansionType::get(loweredSubstPatternType,
+                                            loweredSubstCountType));
     }
 
     CanType visitBuiltinTupleType(CanBuiltinTupleType type) {
@@ -3022,9 +3077,8 @@ const TypeLowering &TypeConverter::getTypeLoweringForLoweredType(
         forExpansion, origType, loweredType);
   }
 
-  lowering =
-      LowerType(*this, forExpansion)
-        .visit(loweredType, origType, isTypeExpansionSensitive);
+  lowering = LowerType(*this, forExpansion, LoweredAddresses)
+                 .visit(loweredType, origType, isTypeExpansionSensitive);
 
   if (!lowering->isResilient() && !lowering->isTypeExpansionSensitive())
     insert(key.getKeyForMinimalExpansion(), lowering);
@@ -3821,7 +3875,7 @@ TypeConverter::getLoweredLocalCaptures(SILDeclRef fn) {
   // If we captured the dynamic 'Self' type and we have a 'self' value also,
   // add it as the final capture. Otherwise, add a fake hidden capture for
   // the dynamic 'Self' metatype.
-  if (selfCapture.hasValue()) {
+  if (selfCapture.has_value()) {
     resultingCaptures.push_back(*selfCapture);
   } else if (capturesDynamicSelf) {
     selfCapture = CapturedValue::getDynamicSelfMetadata();
@@ -4319,6 +4373,14 @@ void TypeConverter::setCaptureTypeExpansionContext(SILDeclRef constant,
     // some place we need to keep opaque types opaque.
     CaptureTypeExpansionContexts.insert({constant, context});
   }
+}
+
+void TypeConverter::setLoweredAddresses() {
+  assert(!LoweredAddresses);
+  for (auto &pair : this->LoweredTypes) {
+    pair.getSecond()->setLoweredAddresses();
+  }
+  LoweredAddresses = true;
 }
 
 static void countNumberOfInnerFields(unsigned &fieldsCount, TypeConverter &TC,

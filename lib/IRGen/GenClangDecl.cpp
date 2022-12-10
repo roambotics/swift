@@ -82,6 +82,19 @@ public:
     return true;
   }
 
+  bool VisitCXXNewExpr(clang::CXXNewExpr *NE) {
+    callback(NE->getOperatorNew());
+    return true;
+  }
+
+  bool VisitBindingDecl(clang::BindingDecl *BD) {
+    if (auto *holdingVar = BD->getHoldingVar()) {
+      if (holdingVar->hasInit())
+        TraverseStmt(holdingVar->getInit());
+    }
+    return true;
+  }
+
   // Do not traverse unevaluated expressions. Doing to might result in compile
   // errors if we try to instantiate an un-instantiatable template.
 
@@ -198,6 +211,17 @@ void IRGenModule::emitClangDecl(const clang::Decl *decl) {
         if (auto baseCxxRecord = base.getType()->getAsCXXRecordDecl())
           if (auto *baseDtor = baseCxxRecord->getDestructor())
             callback(baseDtor);
+      }
+    }
+
+    // If something from a C++ class is used, emit all virtual methods of this
+    // class because they might be emitted in the vtable even if not used
+    // directly from Swift.
+    if (auto *record = dyn_cast<clang::CXXRecordDecl>(next->getDeclContext())) {
+      for (auto *method : record->methods()) {
+        if (method->isVirtual()) {
+          callback(method);
+        }
       }
     }
 

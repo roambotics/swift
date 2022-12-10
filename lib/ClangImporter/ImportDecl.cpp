@@ -681,7 +681,7 @@ shouldSuppressGenericParamsImport(const LangOptions &langOpts,
   // the SwiftImportAsNonGeneric API note. Once we can guarantee that that
   // attribute is present in all contexts, we can remove this check.
   auto isFromFoundationModule = [](const clang::Decl *decl) -> bool {
-    clang::Module *module = getClangSubmoduleForDecl(decl).getValue();
+    clang::Module *module = getClangSubmoduleForDecl(decl).value();
     if (!module)
       return false;
     return module->getTopLevelModuleName() == "Foundation";
@@ -1089,6 +1089,9 @@ namespace {
 
     Decl *VisitNamespaceDecl(const clang::NamespaceDecl *decl) {
       DeclContext *dc = nullptr;
+      // Do not import namespace declarations marked as 'swift_private'.
+      if (decl->hasAttr<clang::SwiftPrivateAttr>())
+        return nullptr;
       // If this is a top-level namespace, don't put it in the module we're
       // importing, put it in the "__ObjC" module that is implicitly imported.
       if (!decl->getParent()->isNamespace())
@@ -1945,6 +1948,10 @@ namespace {
     }
 
     bool recordHasReferenceSemantics(const clang::RecordDecl *decl) {
+      if (!isa<clang::CXXRecordDecl>(decl) &&
+          !Impl.SwiftContext.LangOpts.CForeignReferenceTypes)
+        return false;
+
       auto semanticsKind = evaluateOrDefault(
           Impl.SwiftContext.evaluator,
           CxxRecordSemantics({decl, Impl.SwiftContext}), {});
@@ -3191,7 +3198,7 @@ namespace {
           else
             func->setSelfAccessKind(SelfAccessKind::NonMutating);
           if (selfIdx) {
-            func->setSelfIndex(selfIdx.getValue());
+            func->setSelfIndex(selfIdx.value());
           } else {
             func->setStatic();
             func->setImportAsStaticMember();
@@ -3593,8 +3600,8 @@ namespace {
       // While importing the DeclContext, we might have imported the decl
       // itself.
       auto Known = Impl.importDeclCached(decl, getVersion());
-      if (Known.hasValue())
-        return Known.getValue();
+      if (Known.has_value())
+        return Known.value();
 
       ImportedName importedName;
       std::tie(importedName, std::ignore) = importFullName(decl);
@@ -3951,7 +3958,7 @@ namespace {
       }
 
       // Determine whether the function is throwing and/or async.
-      bool throws = importedName.getErrorInfo().hasValue();
+      bool throws = importedName.getErrorInfo().has_value();
       bool async = false;
       auto asyncInfo = importedName.getAsyncInfo();
       if (asyncInfo) {
@@ -3977,7 +3984,7 @@ namespace {
           // If the return type has nullability, use it.
           nullability = translateNullability(*typeNullability);
         }
-        if (nullability != OTK_None && !errorConvention.hasValue()) {
+        if (nullability != OTK_None && !errorConvention.has_value()) {
           resultTy = OptionalType::get(resultTy);
           isIUO = nullability == OTK_ImplicitlyUnwrappedOptional;
         }
@@ -4633,8 +4640,8 @@ namespace {
       // While importing the DeclContext, we might have imported the decl
       // itself.
       auto Known = Impl.importDeclCached(decl, getVersion());
-      if (Known.hasValue())
-        return Known.getValue();
+      if (Known.has_value())
+        return Known.value();
 
       return importObjCPropertyDecl(decl, dc);
     }
@@ -5652,6 +5659,8 @@ SwiftDeclConverter::getImplicitProperty(ImportedName importedName,
       getAccessorPropertyType(getter, false, getterName.getSelfIndex());
   if (propertyType.isNull())
     return nullptr;
+  if (auto elaborated = dyn_cast<clang::ElaboratedType>(propertyType))
+    propertyType = elaborated->desugar();
 
   // If there is a setter, check that the property it implies
   // matches that of the getter.
@@ -5686,7 +5695,7 @@ SwiftDeclConverter::getImplicitProperty(ImportedName importedName,
       if (auto clangEnum = findAnonymousEnumForTypedef(Impl.SwiftContext, typedefType)) {
         // If this fails, it means that we need a stronger predicate for
         // determining the relationship between an enum and typedef.
-        assert(clangEnum.getValue()->getIntegerType()->getCanonicalTypeInternal() ==
+        assert(clangEnum.value()->getIntegerType()->getCanonicalTypeInternal() ==
                typedefType->getCanonicalTypeInternal());
         if (auto swiftEnum = Impl.importDecl(*clangEnum, Impl.CurrentVersion)) {
           importedType = {cast<NominalTypeDecl>(swiftEnum)->getDeclaredType(), false};
@@ -5815,7 +5824,7 @@ ConstructorDecl *SwiftDeclConverter::importConstructor(
 
   ConstructorDecl *existing;
   auto result = importConstructor(objcMethod, dc, implicit,
-                                  kind.getValueOr(importedName.getInitKind()),
+                                  kind.value_or(importedName.getInitKind()),
                                   required, selector, importedName, params,
                                   variadic, existing);
 
@@ -6049,7 +6058,7 @@ ConstructorDecl *SwiftDeclConverter::importConstructor(
       objcMethod, AccessLevel::Public, importedName.getDeclName(),
       /*NameLoc=*/SourceLoc(), failability, /*FailabilityLoc=*/SourceLoc(),
       /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-      /*Throws=*/importedName.getErrorInfo().hasValue(),
+      /*Throws=*/importedName.getErrorInfo().has_value(),
       /*ThrowsLoc=*/SourceLoc(), bodyParams,
       /*GenericParams=*/nullptr, const_cast<DeclContext *>(dc));
 
@@ -7126,6 +7135,8 @@ canSkipOverTypedef(ClangImporter::Implementation &Impl,
     return nullptr;
 
   clang::QualType UnderlyingType = ClangTypedef->getUnderlyingType();
+  if (auto elaborated = dyn_cast<clang::ElaboratedType>(UnderlyingType))
+    UnderlyingType = elaborated->desugar();
 
   // A typedef to a typedef should get imported as a typealias.
   auto *TypedefT = UnderlyingType->getAs<clang::TypedefType>();
@@ -7227,6 +7238,7 @@ SourceFile &ClangImporter::Implementation::getClangSwiftAttrSourceFile(
   auto sourceFile = new (SwiftContext) SourceFile(
       module, SourceFileKind::Library, None);
   ClangSwiftAttrSourceFiles.insert({&module, sourceFile});
+  module.addAuxiliaryFile(*sourceFile);
   return *sourceFile;
 }
 
@@ -7253,8 +7265,8 @@ ClangImporter::Implementation::importSwiftAttrAttributes(Decl *MappedDecl) {
     return;
 
   if (auto maybeDefinition = getDefinitionForClangTypeDecl(ClangDecl))
-    if (maybeDefinition.getValue())
-      ClangDecl = cast<clang::NamedDecl>(maybeDefinition.getValue());
+    if (maybeDefinition.value())
+      ClangDecl = cast<clang::NamedDecl>(maybeDefinition.value());
 
   Optional<const clang::SwiftAttrAttr *> seenMainActorAttr;
   const clang::SwiftAttrAttr *seenMutabilityAttr = nullptr;
@@ -7274,7 +7286,7 @@ ClangImporter::Implementation::importSwiftAttrAttributes(Decl *MappedDecl) {
           HeaderLoc attrLoc(swiftAttr->getLocation());
           diagnose(attrLoc, diag::import_multiple_mainactor_attr,
                    swiftAttr->getAttribute(),
-                   seenMainActorAttr.getValue()->getAttribute());
+                   seenMainActorAttr.value()->getAttribute());
           continue;
         }
 
@@ -7454,8 +7466,8 @@ void ClangImporter::Implementation::importAttributes(
   ASTContext &C = SwiftContext;
 
   if (auto maybeDefinition = getDefinitionForClangTypeDecl(ClangDecl))
-    if (maybeDefinition.getValue())
-      ClangDecl = cast<clang::NamedDecl>(maybeDefinition.getValue());
+    if (maybeDefinition.value())
+      ClangDecl = cast<clang::NamedDecl>(maybeDefinition.value());
 
   // Determine whether this is an async import.
   bool isAsync = false;
@@ -7599,7 +7611,7 @@ void ClangImporter::Implementation::importAttributes(
         swiftReplacement = getSwiftNameFromClangName(replacement);
 
       auto AvAttr = new (C) AvailableAttr(SourceLoc(), SourceRange(),
-                                          platformK.getValue(),
+                                          platformK.value(),
                                           message, swiftReplacement,
                                           /*RenameDecl=*/nullptr,
                                           introduced,
@@ -7622,22 +7634,10 @@ void ClangImporter::Implementation::importAttributes(
     if (method->isDirectMethod() && !AnyUnavailable) {
       assert(isa<AbstractFunctionDecl>(MappedDecl) &&
              "objc_direct declarations are expected to be an AbstractFunctionDecl");
-      if (isa<ConstructorDecl>(MappedDecl)) {
-        // TODO: Teach Swift how to directly call these functions.
-        auto attr = AvailableAttr::createPlatformAgnostic(
-            C,
-            "Swift cannot call Objective-C initializers marked with "
-            "'objc_direct'",
-            /*Rename*/ "",
-            PlatformAgnosticAvailabilityKind::UnavailableInSwift);
-        MappedDecl->getAttrs().add(attr);
-        AnyUnavailable = true;
-      } else {
-        MappedDecl->getAttrs().add(new (C) FinalAttr(/*IsImplicit=*/true));
-        if (auto accessorDecl = dyn_cast<AccessorDecl>(MappedDecl)) {
-          auto attr = new (C) FinalAttr(/*isImplicit=*/true);
-          accessorDecl->getStorage()->getAttrs().add(attr);
-        }
+      MappedDecl->getAttrs().add(new (C) FinalAttr(/*IsImplicit=*/true));
+      if (auto accessorDecl = dyn_cast<AccessorDecl>(MappedDecl)) {
+        auto attr = new (C) FinalAttr(/*isImplicit=*/true);
+        accessorDecl->getStorage()->getAttrs().add(attr);
       }
     }
   }
@@ -8003,11 +8003,11 @@ Decl *ClangImporter::Implementation::importDeclAndCacheImpl(
   auto Canon = cast<clang::NamedDecl>(UseCanonicalDecl? ClangDecl->getCanonicalDecl(): ClangDecl);
 
   auto Known = importDeclCached(Canon, version, UseCanonicalDecl);
-  if (Known.hasValue()) {
+  if (Known.has_value()) {
     if (!SuperfluousTypedefsAreTransparent &&
         SuperfluousTypedefs.count(Canon))
       return nullptr;
-    return Known.getValue();
+    return Known.value();
   }
 
   bool TypedefIsSuperfluous = false;
@@ -8188,8 +8188,8 @@ ClangImporter::Implementation::importDeclForDeclContext(
   // There's a cycle. Is the declaration imported enough to break the cycle
   // gracefully? If so, we'll have it in the decl cache.
   auto cached = importDeclCached(contextDecl, version, useCanonicalDecl);
-  if (cached.hasValue())
-    return cached.getValue();
+  if (cached.has_value())
+    return cached.value();
 
   // Can't break it? Warn and return nullptr, which is at least better than
   // stack overflow by recursion.
@@ -8448,6 +8448,8 @@ void ClangImporter::Implementation::loadAllMembersOfRecordDecl(
       clang::QualType baseType = base.getType();
       if (auto spectType = dyn_cast<clang::TemplateSpecializationType>(baseType))
         baseType = spectType->desugar();
+      if (auto elaborated = dyn_cast<clang::ElaboratedType>(baseType))
+        baseType = elaborated->desugar();
       if (!isa<clang::RecordType>(baseType))
         continue;
 

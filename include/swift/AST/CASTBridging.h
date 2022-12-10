@@ -86,12 +86,48 @@ typedef struct {
   // FIXME: Handle Layout Requirements
 } BridgedRequirementRepr;
 
+/// Diagnostic severity when reporting diagnostics.
+typedef enum ENUM_EXTENSIBILITY_ATTR(open) BridgedDiagnosticSeverity : long {
+  BridgedFatalError,
+  BridgedError,
+  BridgedWarning,
+  BridgedRemark,
+  BridgedNote,
+} BridgedDiagnosticSeverity;
+
+typedef void* BridgedDiagnostic;
+
 #ifdef __cplusplus
 extern "C" {
 
 #define _Bool bool
 
 #endif
+
+// Diagnostics
+
+/// Create a new diagnostic with the given severity, location, and diagnostic
+/// text.
+///
+/// \returns a diagnostic instance that can be extended with additional
+/// information and then must be finished via \c SwiftDiagnostic_finish.
+BridgedDiagnostic SwiftDiagnostic_create(
+    void *diagnosticEngine, BridgedDiagnosticSeverity severity,
+    void *_Nullable sourceLoc,
+    const uint8_t *_Nullable text, long textLen);
+
+/// Highlight a source range as part of the diagnostic.
+void SwiftDiagnostic_highlight(
+    BridgedDiagnostic diag, void *_Nullable startLoc, void *_Nullable endLoc);
+
+/// Add a Fix-It to replace a source range as part of the diagnostic.
+void SwiftDiagnostic_fixItReplace(
+    BridgedDiagnostic diag,
+    void *_Nullable replaceStartLoc, void *_Nullable replaceEndLoc,
+    const uint8_t *_Nullable newText, long newTextLen);
+
+/// Finish the given diagnostic and emit it.
+void SwiftDiagnostic_finish(BridgedDiagnostic diag);
 
 BridgedIdentifier SwiftASTContext_getIdentifier(void *ctx,
                                                 const uint8_t *_Nullable str,
@@ -110,6 +146,8 @@ void *ReturnStmt_create(void *ctx, void *loc, void *_Nullable expr);
 void *SwiftSequenceExpr_create(void *ctx, BridgedArrayRef exprs);
 
 void *SwiftTupleExpr_create(void *ctx, void *lparen, BridgedArrayRef subs,
+                            BridgedArrayRef names,
+                            BridgedArrayRef nameLocs,
                             void *rparen);
 
 void *SwiftFunctionCallExpr_create(void *ctx, void *fn, void *args);
@@ -154,14 +192,20 @@ void *ParamDecl_create(void *ctx, void *loc, void *_Nullable argLoc,
                        void *_Nullable argName, void *_Nullable paramLoc,
                        void *_Nullable paramName, void *_Nullable type,
                        void *declContext);
+struct FuncDeclBridged {
+  void *declContext;
+  void *funcDecl;
+  void *decl;
+};
 
-void *FuncDecl_create(void *ctx, void *staticLoc, _Bool isStatic, void *funcLoc,
-                      BridgedIdentifier name, void *nameLoc, _Bool isAsync,
-                      void *_Nullable asyncLoc, _Bool throws,
-                      void *_Nullable throwsLoc, void *paramLLoc,
-                      BridgedArrayRef params, void *paramRLoc,
-                      void *_Nullable body, void *_Nullable returnType,
-                      void *declContext);
+struct FuncDeclBridged
+FuncDecl_create(void *ctx, void *staticLoc, _Bool isStatic, void *funcLoc,
+                BridgedIdentifier name, void *nameLoc, _Bool isAsync,
+                void *_Nullable asyncLoc, _Bool throws,
+                void *_Nullable throwsLoc, void *paramLLoc,
+                BridgedArrayRef params, void *paramRLoc,
+                void *_Nullable returnType, void *declContext);
+void FuncDecl_setBody(void *fn, void *body);
 
 void *SimpleIdentTypeRepr_create(void *ctx, void *loc, BridgedIdentifier id);
 
@@ -230,6 +274,7 @@ void TopLevelCodeDecl_dump(void *);
 void Expr_dump(void *);
 void Decl_dump(void *);
 void Stmt_dump(void *);
+void Type_dump(void *);
 
 #ifdef __cplusplus
 }

@@ -112,6 +112,7 @@
 #include "swift/Frontend/ModuleInterfaceSupport.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "llvm/Support/StringSaver.h"
+#include "llvm/Support/YAMLTraits.h"
 
 namespace clang {
 class CompilerInstance;
@@ -300,6 +301,7 @@ struct ModuleInterfaceLoaderOptions {
   bool disableImplicitSwiftModule = false;
   bool disableBuildingInterface = false;
   bool downgradeInterfaceVerificationError = false;
+  bool strictImplicitModuleContext = false;
   std::string mainExecutablePath;
   ModuleInterfaceLoaderOptions(const FrontendOptions &Opts):
     remarkOnRebuildFromInterface(Opts.RemarkOnRebuildFromModuleInterface),
@@ -307,6 +309,7 @@ struct ModuleInterfaceLoaderOptions {
     disableImplicitSwiftModule(Opts.DisableImplicitModules),
     disableBuildingInterface(Opts.DisableBuildingInterface),
     downgradeInterfaceVerificationError(Opts.DowngradeInterfaceVerificationError),
+    strictImplicitModuleContext(Opts.StrictImplicitModuleContext),
     mainExecutablePath(Opts.MainExecutablePath)
   {
     switch (Opts.RequestedAction) {
@@ -479,7 +482,8 @@ private:
   }
   void
   inheritOptionsForBuildingInterface(const SearchPathOptions &SearchPathOpts,
-                                     const LangOptions &LangOpts, bool suppressRemarks,
+                                     const LangOptions &LangOpts,
+                                     bool suppressRemarks,
                                      RequireOSSAModules_t requireOSSAModules);
   bool extractSwiftInterfaceVersionAndArgs(CompilerInvocation &subInvocation,
                                            SmallVectorImpl<const char *> &SubArgs,
@@ -523,6 +527,7 @@ public:
                                            StringRef interfacePath,
                                            StringRef outputPath,
                                            SourceLoc diagLoc,
+                                           bool silenceErrors,
     llvm::function_ref<std::error_code(SubCompilerInstanceInfo&)> action) override;
 
   ~InterfaceSubContextDelegateImpl() = default;

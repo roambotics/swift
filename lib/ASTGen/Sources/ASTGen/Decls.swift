@@ -91,7 +91,9 @@ extension ASTGenVisitor {
     let secondName: UnsafeMutableRawPointer?
     let type: UnsafeMutableRawPointer?
 
-    if let nodeFirstName = node.firstName {
+    if let nodeFirstName = node.firstName,
+       // Swift AST represnts "_" as nil.
+       nodeFirstName.text != "_" {
       var text = nodeFirstName.text
       firstName = text.withUTF8 { buf in
         SwiftASTContext_getIdentifier(ctx, buf.baseAddress, buf.count)
@@ -119,18 +121,15 @@ extension ASTGenVisitor {
   }
 
   public func visit(_ node: FunctionDeclSyntax) -> ASTNode {
-    let loc = self.base.advanced(by: node.position.utf8Offset).raw
+    let staticLoc = self.base.advanced(by: node.position.utf8Offset).raw
+    let funcLoc = self.base.advanced(by: node.funcKeyword.position.utf8Offset).raw
+    let nameLoc = self.base.advanced(by: node.identifier.position.utf8Offset).raw
+    let rParamLoc = self.base.advanced(by: node.signature.input.leftParen.position.utf8Offset).raw
+    let lParamLoc = self.base.advanced(by: node.signature.input.rightParen.position.utf8Offset).raw
 
     var nameText = node.identifier.text
     let name = nameText.withUTF8 { buf in
       return SwiftASTContext_getIdentifier(ctx, buf.baseAddress, buf.count)
-    }
-
-    let body: ASTNode?
-    if let nodeBody = node.body {
-      body = visit(nodeBody)
-    } else {
-      body = nil
     }
 
     let returnType: ASTNode?
@@ -140,12 +139,29 @@ extension ASTGenVisitor {
       returnType = nil
     }
 
-    let params = node.signature.input.parameterList.map { visit($0) }
-    return .decl(
-      params.withBridgedArrayRef { ref in
-        FuncDecl_create(
-          ctx, loc, false, loc, name, loc, false, nil, false, nil, loc, ref, loc, body?.rawValue,
-          returnType?.rawValue, declContext)
-      })
+    let params = node.signature.input.parameterList.map { visit($0).rawValue }
+    let out = params.withBridgedArrayRef { ref in
+      FuncDecl_create(
+        ctx, staticLoc, false, funcLoc, name, nameLoc, false, nil, false, nil, rParamLoc, ref,
+        lParamLoc,
+        returnType?.rawValue, declContext)
+    }
+
+    let oldDeclContext = declContext
+    declContext = out.declContext
+    defer { declContext = oldDeclContext }
+
+    let body: ASTNode?
+    if let nodeBody = node.body {
+      body = visit(nodeBody)
+    } else {
+      body = nil
+    }
+
+    if let body = body {
+      FuncDecl_setBody(out.funcDecl, body.rawValue)
+    }
+
+    return .decl(out.decl)
   }
 }

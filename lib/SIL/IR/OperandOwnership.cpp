@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2022 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -109,6 +109,7 @@ SHOULD_NEVER_VISIT_INST(PreviousDynamicFunctionRef)
 SHOULD_NEVER_VISIT_INST(GlobalAddr)
 SHOULD_NEVER_VISIT_INST(GlobalValue)
 SHOULD_NEVER_VISIT_INST(BaseAddrForOffset)
+SHOULD_NEVER_VISIT_INST(HasSymbol)
 SHOULD_NEVER_VISIT_INST(IntegerLiteral)
 SHOULD_NEVER_VISIT_INST(Metatype)
 SHOULD_NEVER_VISIT_INST(ObjCProtocol)
@@ -180,6 +181,8 @@ OPERAND_OWNERSHIP(TrivialUse, PointerToAddress)
 OPERAND_OWNERSHIP(TrivialUse, ProjectBlockStorage)
 OPERAND_OWNERSHIP(TrivialUse, RawPointerToRef)
 OPERAND_OWNERSHIP(TrivialUse, SelectEnumAddr)
+// select_value is only supported for integer types currently.
+OPERAND_OWNERSHIP(TrivialUse, SelectValue)
 OPERAND_OWNERSHIP(TrivialUse, StructElementAddr)
 OPERAND_OWNERSHIP(TrivialUse, SwitchEnumAddr)
 OPERAND_OWNERSHIP(TrivialUse, SwitchValue)
@@ -422,23 +425,6 @@ OperandOwnershipClassifier::visitSelectEnumInst(SelectEnumInst *i) {
     /*allowUnowned*/true);
 }
 
-OperandOwnership
-OperandOwnershipClassifier::visitSelectValueInst(SelectValueInst *i) {
-  if (getValue() == i->getDefaultResult())
-    return OperandOwnership::GuaranteedForwarding;
-
-  for (unsigned idx = 0, endIdx = i->getNumCases(); idx < endIdx; ++idx) {
-    SILValue casevalue;
-    SILValue result;
-    std::tie(casevalue, result) = i->getCase(idx);
-
-    if (getValue() == casevalue) {
-      return OperandOwnership::GuaranteedForwarding;
-    }
-  }
-  return OperandOwnership::TrivialUse;
-}
-
 OperandOwnership OperandOwnershipClassifier::visitBranchInst(BranchInst *bi) {
   ValueOwnershipKind destBlockArgOwnershipKind =
       bi->getDestBB()->getArgument(getOperandIndex())->getOwnershipKind();
@@ -468,6 +454,7 @@ static OperandOwnership getFunctionArgOwnership(SILArgumentConvention argConv,
 
   switch (argConv) {
   case SILArgumentConvention::Indirect_In:
+  case SILArgumentConvention::Indirect_In_Constant:
   case SILArgumentConvention::Direct_Owned:
     return OperandOwnership::ForwardingConsume;
 
@@ -478,7 +465,6 @@ static OperandOwnership getFunctionArgOwnership(SILArgumentConvention argConv,
   // borrow scope in the caller. In contrast, a begin_apply /does/ have an
   // explicit borrow scope in the caller so we must treat arguments passed to it
   // as being borrowed for the entire region of coroutine execution.
-  case SILArgumentConvention::Indirect_In_Constant:
   case SILArgumentConvention::Indirect_In_Guaranteed:
   case SILArgumentConvention::Direct_Guaranteed:
     // For an apply that begins a borrow scope, its arguments are borrowed
@@ -678,6 +664,8 @@ struct OperandOwnershipBuiltinClassifier
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, ErrorInMain)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, UnexpectedError)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, WillThrow)
+BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, AddressOfBorrowOpaque)
+BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, UnprotectedAddressOfBorrowOpaque)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, AShr)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, GenericAShr)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, Add)
@@ -754,6 +742,9 @@ BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, ICMP_ULE)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, ICMP_ULT)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, InsertElement)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, IntToFPWithOverflow)
+BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, BitWidth)
+BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, IsNegative)
+BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, WordAtIndex)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, IntToPtr)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, IsOptionalType)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, IsPOD)
@@ -821,7 +812,14 @@ BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, PoundAssert)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, GlobalStringTablePointer)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, TypePtrAuthDiscriminator)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, TargetOSVersionAtLeast)
-BUILTIN_OPERAND_OWNERSHIP(UnownedInstantaneousUse, Copy)
+OperandOwnership OperandOwnershipBuiltinClassifier::visitCopy(BuiltinInst *bi,
+                                                              StringRef) {
+  if (bi->getFunction()->getConventions().useLoweredAddresses()) {
+    return OperandOwnership::UnownedInstantaneousUse;
+  } else {
+    return OperandOwnership::DestroyingConsume;
+  }
+}
 BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, StartAsyncLet)
 BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, EndAsyncLet)
 BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, StartAsyncLetWithLocalBuffer)

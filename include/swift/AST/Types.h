@@ -71,6 +71,7 @@ class Identifier;
 class InOutType;
 class OpaqueTypeDecl;
 class OpenedArchetypeType;
+class PackType;
 class PlaceholderTypeRepr;
 enum class ReferenceCounting : uint8_t;
 enum class ResilienceExpansion : unsigned;
@@ -577,6 +578,10 @@ public:
 
   bool isPlaceholder();
 
+  /// Returns true if this is a move only type. Returns false if this is a
+  /// non-move only type or a move only wrapped type.
+  bool isPureMoveOnly() const;
+
   /// Does the type have outer parenthesis?
   bool hasParenSugar() const { return getKind() == TypeKind::Paren; }
 
@@ -657,7 +662,7 @@ public:
 
   /// Retrieve the set of type parameter packs that occur within this type.
   void getTypeParameterPacks(
-      SmallVectorImpl<Type> &rootParameterPacks) const;
+      SmallVectorImpl<Type> &rootParameterPacks);
 
   /// Replace opened archetypes with the given root with their most
   /// specific non-dependent upper bounds throughout this type.
@@ -1285,6 +1290,18 @@ public:
   /// Whether this is an existential composition containing
   /// Error.
   bool isExistentialWithError();
+
+  /// Returns the reduced shape of the type, which represents an equivalence
+  /// class for the same-shape generic requirement:
+  ///
+  /// - The shape of a scalar type is always the empty tuple type ().
+  /// - The shape of a pack archetype is computed from the generic signature
+  ///   using same-shape requirements.
+  /// - The shape of a pack type is computed recursively from its elements.
+  ///
+  /// Two types satisfy a same-shape requirement if their reduced shapes are
+  /// equal as canonical types.
+  CanType getReducedShape();
 
   SWIFT_DEBUG_DUMP;
   void dump(raw_ostream &os, unsigned indent = 0) const;
@@ -1986,6 +2003,8 @@ public:
   /// this type references.
   ArrayRef<Type> getDirectGenericArgs() const;
 
+  PackType *getExpandedGenericArgsPack();
+
   // Support for FoldingSet.
   void Profile(llvm::FoldingSetNodeID &id) const;
 
@@ -2403,6 +2422,8 @@ public:
   ArrayRef<Type> getGenericArgs() const {
     return {getTrailingObjectsPointer(), Bits.BoundGenericType.GenericArgCount};
   }
+
+  PackType *getExpandedGenericArgsPack();
 
   void Profile(llvm::FoldingSetNodeID &ID) {
     Profile(ID, getDecl(), getParent(), getGenericArgs());
@@ -3091,15 +3112,15 @@ protected:
                   RecursiveTypeProperties properties, unsigned NumParams,
                   Optional<ExtInfo> Info)
       : TypeBase(Kind, CanTypeContext, properties), Output(Output) {
-    if (Info.hasValue()) {
+    if (Info.has_value()) {
       Bits.AnyFunctionType.HasExtInfo = true;
-      Bits.AnyFunctionType.ExtInfoBits = Info.getValue().getBits();
+      Bits.AnyFunctionType.ExtInfoBits = Info.value().getBits();
       Bits.AnyFunctionType.HasClangTypeInfo =
-          !Info.getValue().getClangTypeInfo().empty();
+          !Info.value().getClangTypeInfo().empty();
       Bits.AnyFunctionType.HasGlobalActor =
-          !Info.getValue().getGlobalActor().isNull();
+          !Info.value().getGlobalActor().isNull();
       // The use of both assert() and static_assert() is intentional.
-      assert(Bits.AnyFunctionType.ExtInfoBits == Info.getValue().getBits() &&
+      assert(Bits.AnyFunctionType.ExtInfoBits == Info.value().getBits() &&
              "Bits were dropped!");
       static_assert(
           ASTExtInfoBuilder::NumMaskBits == NumAFTExtInfoBits,
@@ -4683,6 +4704,17 @@ public:
   /// differentiability from all parameters.
   CanSILFunctionType getWithoutDifferentiability();
 
+  /// Given that `this` is a `@differentiable` function type, returns the type
+  /// of the given `@differentiable` function type component.
+  CanSILFunctionType getDifferentiableComponentType(
+      NormalDifferentiableFunctionTypeComponent component, SILModule &module);
+
+  /// Given that `this` is a `@differentiable(linear)` function type, returns
+  /// the type of the given `@differentiable(linear)` function type component.
+  CanSILFunctionType
+  getLinearComponentType(LinearDifferentiableFunctionTypeComponent component,
+                         SILModule &module);
+
   /// Returns the type of the derivative function for the given parameter
   /// indices, result indices, derivative function kind, derivative function
   /// generic signature (optional), and other auxiliary parameters.
@@ -4902,8 +4934,8 @@ public:
              kind == innerty::ABIEscapeToNoEscapeConversion;
     }
 
-    bool hasPayload() const { return payload.hasValue(); }
-    uintptr_t getPayload() const { return payload.getValue(); }
+    bool hasPayload() const { return payload.has_value(); }
+    uintptr_t getPayload() const { return payload.value(); }
     StringRef getMessage() const;
   };
 
@@ -6024,7 +6056,7 @@ public:
       LayoutConstraint Layout);
 
   // Returns the reduced shape type for this pack archetype.
-  Type getShape() const;
+  CanType getReducedShape() const;
 
   static bool classof(const TypeBase *T) {
     return T->getKind() == TypeKind::PackArchetype;
@@ -6160,14 +6192,6 @@ public:
   /// struct Foo<T...> { }
   /// \endcode
   bool isParameterPack() const;
-
-  /// Returns a new GenericTypeParamType with the same depth and index
-  /// as this one, with the type parameter pack bit set.
-  GenericTypeParamType *asParameterPack(ASTContext &ctx) const;
-
-  /// Returns a new GenericTypeParamType with the same depth and index
-  /// as this one, removing the type parameter pack bit.
-  GenericTypeParamType *asScalar(ASTContext &ctx) const;
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const TypeBase *T) {
@@ -6459,6 +6483,10 @@ public:
   /// Creates a pack from the types in \p elements.
   static PackType *get(const ASTContext &C, ArrayRef<Type> elements);
 
+  static PackType *get(const ASTContext &C,
+                       TypeArrayView<GenericTypeParamType> params,
+                       ArrayRef<Type> args);
+
 public:
   /// Retrieves the number of elements in this pack.
   unsigned getNumElements() const { return Bits.PackType.Count; }
@@ -6476,6 +6504,8 @@ public:
   bool containsPackExpansionType() const;
 
   PackType *flattenPackTypes();
+
+  CanTypeWrapper<PackType> getReducedShape();
 
 public:
   void Profile(llvm::FoldingSetNodeID &ID) const {
@@ -6548,6 +6578,8 @@ public:
   Type getCountType() const { return countType; }
 
   PackExpansionType *expand();
+
+  CanType getReducedShape();
 
 public:
   void Profile(llvm::FoldingSetNodeID &ID) {
@@ -6683,17 +6715,6 @@ inline bool TypeBase::isOpenedExistential() const {
 
   CanType T = getCanonicalType();
   return isa<OpenedArchetypeType>(T);
-}
-
-inline bool TypeBase::isOpenedExistentialWithError() {
-  if (!hasOpenedExistential())
-    return false;
-
-  CanType T = getCanonicalType();
-  if (auto archetype = dyn_cast<OpenedArchetypeType>(T)) {
-    return archetype->getExistentialType()->isExistentialWithError();
-  }
-  return false;
 }
 
 inline bool TypeBase::canDynamicallyBeOptionalType(bool includeExistential) {

@@ -30,6 +30,7 @@
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILDebuggerClient.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/SILSymbolVisitor.h"
 #include "swift/SIL/SILType.h"
 #include "swift/SIL/TypeLowering.h"
 #include "llvm/ADT/SmallString.h"
@@ -365,7 +366,7 @@ public:
 
     // Mark the memory as uninitialized, so DI will track it for us.
     if (kind)
-      Box = SGF.B.createMarkUninitialized(decl, Box, kind.getValue());
+      Box = SGF.B.createMarkUninitialized(decl, Box, kind.value());
 
     if (SGF.getASTContext().SILOpts.supportsLexicalLifetimes(SGF.getModule())) {
       auto loweredType = SGF.getTypeLowering(decl->getType()).getLoweredType();
@@ -995,7 +996,7 @@ void EnumElementPatternInitialization::emitEnumMatch(
           // We must treat the boxed value as +0 since it may be shared. Copy it
           // if nontrivial.
           //
-          // NOTE: The APIs that we are usinng here will ensure that if we have
+          // NOTE: The APIs that we are using here will ensure that if we have
           // a trivial value, the load_borrow will become a load [trivial] and
           // the copies will be "automagically" elided.
           if (boxedTL.isLoadable() || !SGF.silConv.useLoweredAddresses()) {
@@ -1484,9 +1485,9 @@ emitVersionLiterals(SILLocation loc, SILGenBuilder &B, ASTContext &ctx,
                     llvm::VersionTuple Vers) {
   unsigned major = Vers.getMajor();
   unsigned minor =
-      (Vers.getMinor().hasValue() ? Vers.getMinor().getValue() : 0);
+      (Vers.getMinor().has_value() ? Vers.getMinor().value() : 0);
   unsigned subminor =
-      (Vers.getSubminor().hasValue() ? Vers.getSubminor().getValue() : 0);
+      (Vers.getSubminor().has_value() ? Vers.getSubminor().value() : 0);
 
   SILType wordType = SILType::getBuiltinWordType(ctx);
 
@@ -1601,21 +1602,31 @@ void SILGenFunction::emitStmtCondition(StmtCondition Cond, JumpDest FalseDest,
 
     case StmtConditionElement::CK_HasSymbol: {
       auto info = elt.getHasSymbolInfo();
-      assert(!info->isInvalid());
+      if (info->isInvalid()) {
+        // This condition may have referenced a decl that isn't valid in some
+        // way but for developer convenience wasn't treated as an error. Just
+        // emit a 'true' condition value.
+        SILType i1 = SILType::getBuiltinIntegerType(1, getASTContext());
+        booleanTestValue = B.createIntegerLiteral(loc, i1, 1);
+        break;
+      }
+
       auto expr = info->getSymbolExpr();
       auto declRef = info->getReferencedDecl();
       assert(declRef);
 
-      auto queryFunc = declRef.getDecl()->getHasSymbolQueryDecl();
-      SILFunction *silFn = SGM.getFunction(
-          SILDeclRef(queryFunc, SILDeclRef::Kind::Func), NotForDefinition);
-      SILValue fnRef = B.createFunctionRefFor(loc, silFn);
-      booleanTestValue = B.createApply(loc, fnRef, {}, {});
+      auto decl = declRef.getDecl();
+      booleanTestValue = B.createHasSymbol(expr, decl);
       booleanTestValue = emitUnwrapIntegerResult(expr, booleanTestValue);
       booleanTestLoc = expr;
 
-      // FIXME: Add decl to list of decls that need a has symbol query
-      //        function to be emitted during IRGen.
+      // Ensure that function declarations for each function associated with
+      // the decl are emitted so that they can be referenced during IRGen.
+      enumerateFunctionsForHasSymbol(
+          getModule(), decl, [this](SILDeclRef declRef) {
+            (void)SGM.getFunction(declRef, NotForDefinition);
+          });
+
       break;
     }
     }
@@ -2043,4 +2054,22 @@ void SILGenFunction::destroyLocalVariable(SILLocation silLoc, VarDecl *vd) {
   }
 
   llvm_unreachable("unhandled case");
+}
+
+void BlackHoleInitialization::copyOrInitValueInto(SILGenFunction &SGF, SILLocation loc,
+                                                  ManagedValue value, bool isInit) {
+  // Normally we do not do anything if we have a black hole
+  // initialization... but if we have a move only object, insert a move value.
+  if (!value.getType().isMoveOnly())
+    return;
+
+  // If we have an address, then this will create a new temporary allocation
+  // which will trigger the move checker. If we have an object though, we need
+  // to insert an extra move_value to make sure the object checker behaves
+  // correctly.
+  value = value.ensurePlusOne(SGF, loc);
+  if (value.getType().isAddress())
+    return;
+
+  value = SGF.B.createMoveValue(loc, value);
 }

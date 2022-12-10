@@ -695,6 +695,7 @@ public:
     JobPriority currentPriority =
         JobPriority((Flags & concurrency::ActorFlagConstants::PriorityMask) >>
                     concurrency::ActorFlagConstants::PriorityShift);
+    (void)currentPriority;
     assert(priority > currentPriority);
 
     uint32_t flags =
@@ -845,7 +846,7 @@ class DefaultActorImpl : public HeapObject {
   // the future
   alignas(sizeof(ActiveActorStatus)) char StatusStorage[sizeof(ActiveActorStatus)];
 #endif
-  // TODO(rokhinip): Make this a flagset
+  // TODO (rokhinip): Make this a flagset
   bool isDistributedRemoteActor;
 
 public:
@@ -1252,6 +1253,7 @@ static void defaultActorDrain(DefaultActorImpl *actor) {
   bool actorLockAcquired = actor->tryLock(true);
   // We always must succeed in taking the actor lock that we are draining
   // because we don't have to compete with OOL jobs. See ownership rule (3)
+  (void)actorLockAcquired;
   assert(actorLockAcquired);
 
   // Setup a TSD for tracking current execution info

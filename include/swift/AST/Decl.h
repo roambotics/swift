@@ -159,10 +159,12 @@ enum class DescriptiveDeclKind : uint8_t {
   Enum,
   Struct,
   Class,
+  Actor,
   Protocol,
   GenericEnum,
   GenericStruct,
   GenericClass,
+  GenericActor,
   GenericType,
   Subscript,
   StaticSubscript,
@@ -190,6 +192,7 @@ enum class DescriptiveDeclKind : uint8_t {
   Requirement,
   OpaqueResultType,
   OpaqueVarType,
+  Macro,
   MacroExpansion
 };
 
@@ -499,9 +502,8 @@ protected:
   );
 
   SWIFT_INLINE_BITFIELD_EMPTY(TypeDecl, ValueDecl);
-  SWIFT_INLINE_BITFIELD_EMPTY(AbstractTypeParamDecl, TypeDecl);
 
-  SWIFT_INLINE_BITFIELD_FULL(GenericTypeParamDecl, AbstractTypeParamDecl, 16+16+1+1,
+  SWIFT_INLINE_BITFIELD_FULL(GenericTypeParamDecl, TypeDecl, 16+16+1+1,
     : NumPadBits,
 
     Depth : 16,
@@ -533,7 +535,7 @@ protected:
     IsComputingSemanticMembers : 1
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(ProtocolDecl, NominalTypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+8,
+  SWIFT_INLINE_BITFIELD_FULL(ProtocolDecl, NominalTypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+1+8,
     /// Whether the \c RequiresClass bit is valid.
     RequiresClassValid : 1,
 
@@ -570,6 +572,9 @@ protected:
 
     /// Whether we have a lazy-loaded list of primary associated types.
     HasLazyPrimaryAssociatedTypes : 1,
+
+    /// Whether we've computed the protocol requirements list yet.
+    ProtocolRequirementsValid : 1,
 
     : NumPadBits,
 
@@ -2762,6 +2767,9 @@ public:
   /// some Q), or we might have a `NamedOpaqueReturnTypeRepr`.
   TypeRepr *getOpaqueResultTypeRepr() const;
 
+  /// Get the representative for this value's result type, if it has one.
+  TypeRepr *getResultTypeRepr() const;
+
   /// Retrieve the attribute associating this declaration with a
   /// result builder, if there is one.
   CustomAttr *getAttachedResultBuilder() const;
@@ -2785,11 +2793,6 @@ public:
   /// 'func foo(Int) -> () -> Self?'.
   GenericParameterReferenceInfo findExistentialSelfReferences(
       Type baseTy, bool treatNonResultCovariantSelfAsInvariant) const;
-
-  /// Returns a synthesized declaration for a query function that provides
-  /// the boolean value for a `if #_hasSymbol(...)` condition. The interface
-  /// type of the function is `() -> Builtin.Int1`.
-  FuncDecl *getHasSymbolQueryDecl() const;
 };
 
 /// This is a common base class for declarations which declare a type.
@@ -2999,18 +3002,18 @@ public:
   }
   
   void setUniqueUnderlyingTypeSubstitutions(SubstitutionMap subs) {
-    assert(!UniqueUnderlyingType.hasValue() && "resetting underlying type?!");
+    assert(!UniqueUnderlyingType.has_value() && "resetting underlying type?!");
     UniqueUnderlyingType = subs;
   }
 
   bool hasConditionallyAvailableSubstitutions() const {
-    return ConditionallyAvailableTypes.hasValue();
+    return ConditionallyAvailableTypes.has_value();
   }
 
   ArrayRef<ConditionallyAvailableSubstitutions *>
   getConditionallyAvailableSubstitutions() const {
     assert(ConditionallyAvailableTypes);
-    return ConditionallyAvailableTypes.getValue();
+    return ConditionallyAvailableTypes.value();
   }
 
   void setConditionallyAvailableSubstitutions(
@@ -3182,29 +3185,6 @@ public:
   }
 };
 
-/// Abstract class describing generic type parameters and associated types,
-/// whose common purpose is to anchor the abstract type parameter and specify
-/// requirements for any corresponding type argument.
-class AbstractTypeParamDecl : public TypeDecl {
-protected:
-  AbstractTypeParamDecl(DeclKind kind, DeclContext *dc, Identifier name,
-                        SourceLoc NameLoc)
-    : TypeDecl(kind, dc, name, NameLoc, { }) { }
-
-public:
-  /// Return the superclass of the generic parameter.
-  Type getSuperclass() const;
-
-  /// Retrieve the set of protocols to which this abstract type
-  /// parameter conforms.
-  ArrayRef<ProtocolDecl *> getConformingProtocols() const;
-
-  static bool classof(const Decl *D) {
-    return D->getKind() >= DeclKind::First_AbstractTypeParamDecl &&
-           D->getKind() <= DeclKind::Last_AbstractTypeParamDecl;
-  }
-};
-
 /// A declaration of a generic type parameter.
 ///
 /// A generic type parameter introduces a new, named type parameter along
@@ -3219,7 +3199,7 @@ public:
 /// func min<T : Comparable>(x : T, y : T) -> T { ... }
 /// \endcode
 class GenericTypeParamDecl final
-    : public AbstractTypeParamDecl,
+    : public TypeDecl,
       private llvm::TrailingObjects<GenericTypeParamDecl, TypeRepr *,
                                     SourceLoc> {
   friend TrailingObjects;
@@ -3446,7 +3426,7 @@ public:
 ///   func getNext() -> Element?
 /// }
 /// \endcode
-class AssociatedTypeDecl : public AbstractTypeParamDecl {
+class AssociatedTypeDecl : public TypeDecl {
   /// The location of the initial keyword.
   SourceLoc KeywordLoc;
 
@@ -3510,7 +3490,7 @@ public:
   /// Retrieve the (first) overridden associated type declaration, if any.
   AssociatedTypeDecl *getOverriddenDecl() const {
     return cast_or_null<AssociatedTypeDecl>(
-                                   AbstractTypeParamDecl::getOverriddenDecl());
+        TypeDecl::getOverriddenDecl());
   }
 
   /// Retrieve the set of associated types overridden by this associated
@@ -3585,10 +3565,6 @@ class NominalTypeDecl : public GenericTypeDecl, public IterableDeclContext {
   /// Prepare to traverse the list of extensions.
   void prepareExtensions();
 
-  /// Add loaded members from all extensions. Eagerly load any members that we
-  /// can't lazily load.
-  void addLoadedExtensions();
-
   /// Retrieve the conformance loader (if any), and removing it in the
   /// same operation. The caller is responsible for loading the
   /// conformances.
@@ -3603,13 +3579,19 @@ class NominalTypeDecl : public GenericTypeDecl, public IterableDeclContext {
   std::pair<LazyMemberLoader *, uint64_t> takeConformanceLoaderSlow();
 
   /// A lookup table containing all of the members of this type and
-  /// its extensions.
+  /// its extensions, together with a bit indicating if the table
+  /// has been prepared.
   ///
   /// The table itself is lazily constructed and updated when
   /// lookupDirect() is called.
-  MemberLookupTable *LookupTable = nullptr;
+  llvm::PointerIntPair<MemberLookupTable *, 1, bool> LookupTable;
+
+  /// Get the lookup table, lazily constructing an empty table if
+  /// necessary.
+  MemberLookupTable *getLookupTable();
 
   /// Prepare the lookup table to make it ready for lookups.
+  /// Does nothing when called more than once.
   void prepareLookupTable();
 
   /// Note that we have added a member into the iterable declaration context,
@@ -3930,8 +3912,9 @@ public:
 
   /// If this declaration has a type wrapper, return `$Storage`
   /// declaration that contains all the stored properties managed
-  /// by the wrapper.
-  NominalTypeDecl *getTypeWrapperStorageDecl() const;
+  /// by the wrapper. Note that if this type is a protocol them
+  /// this method returns an associated type for $Storage.
+  TypeDecl *getTypeWrapperStorageDecl() const;
 
   /// If this declaration is a type wrapper, retrieve
   /// its required initializer - `init(storageWrapper:)`.
@@ -4603,6 +4586,7 @@ class ProtocolDecl final : public NominalTypeDecl {
   ArrayRef<PrimaryAssociatedTypeName> PrimaryAssociatedTypeNames;
   ArrayRef<ProtocolDecl *> InheritedProtocols;
   ArrayRef<AssociatedTypeDecl *> AssociatedTypes;
+  ArrayRef<ValueDecl *> ProtocolRequirements;
 
   struct {
     /// The superclass decl and a bit to indicate whether the
@@ -4684,6 +4668,7 @@ class ProtocolDecl final : public NominalTypeDecl {
   friend class ExistentialRequiresAnyRequest;
   friend class InheritedProtocolsRequest;
   friend class PrimaryAssociatedTypesRequest;
+  friend class ProtocolRequirementsRequest;
   
 public:
   ProtocolDecl(DeclContext *DC, SourceLoc ProtocolLoc, SourceLoc NameLoc,
@@ -4727,6 +4712,10 @@ public:
   /// parametrized protocol type of the form SomeProtocol<Arg1, Arg2...>.
   ArrayRef<AssociatedTypeDecl *> getPrimaryAssociatedTypes() const;
 
+  /// Returns the list of all requirements (associated type and value)
+  /// associated with this protocol.
+  ArrayRef<ValueDecl *> getProtocolRequirements() const;
+
   /// Returns a protocol requirement with the given name, or nullptr if the
   /// name has multiple overloads, or no overloads at all.
   ValueDecl *getSingleRequirement(DeclName name) const;
@@ -4736,7 +4725,7 @@ public:
   AssociatedTypeDecl *getAssociatedType(Identifier name) const;
 
   /// Returns the existential type for this protocol.
-  Type getExistentialType() const {
+  Type getDeclaredExistentialType() const {
     return ExistentialType::get(getDeclaredInterfaceType());
   }
 
@@ -4798,6 +4787,13 @@ private:
   }
   void setInheritedProtocolsValid() {
     Bits.ProtocolDecl.InheritedProtocolsValid = true;
+  }
+
+  bool areProtocolRequirementsValid() const {
+    return Bits.ProtocolDecl.ProtocolRequirementsValid;
+  }
+  void setProtocolRequirementsValid() {
+    Bits.ProtocolDecl.ProtocolRequirementsValid = true;
   }
 
 public:
@@ -4897,7 +4893,7 @@ public:
 
   /// Has the requirement signature been computed yet?
   bool isRequirementSignatureComputed() const {
-    return RequirementSig.hasValue();
+    return RequirementSig.has_value();
   }
 
   void setRequirementSignature(RequirementSignature requirementSig);
@@ -6457,8 +6453,8 @@ class BodyAndFingerprint {
 
 public:
   BodyAndFingerprint(BraceStmt *body, Optional<Fingerprint> fp)
-      : BodyAndHasFp(body, fp.hasValue()),
-        Fp(fp.hasValue() ? *fp : Fingerprint::ZERO()) {}
+      : BodyAndHasFp(body, fp.has_value()),
+        Fp(fp.has_value() ? *fp : Fingerprint::ZERO()) {}
   BodyAndFingerprint() : BodyAndFingerprint(nullptr, None) {}
 
   BraceStmt *getBody() const { return BodyAndHasFp.getPointer(); }
@@ -6471,7 +6467,7 @@ public:
   }
 
   void setFingerprint(Optional<Fingerprint> fp) {
-    if (fp.hasValue()) {
+    if (fp.has_value()) {
       Fp = *fp;
       BodyAndHasFp.setInt(true);
     } else {
@@ -6773,8 +6769,7 @@ public:
     // FIXME: Remove 'Parsed' from this list once we can always delay
     //        parsing bodies. The -experimental-skip-*-function-bodies options
     //        do currently skip parsing, unless disabled through other means in
-    //        SourceFile::hasDelayedBodyParsing (eg. needing to build the full
-    //        syntax tree due to -verify-syntax-tree).
+    //        SourceFile::hasDelayedBodyParsing.
     assert(getBodyKind() == BodyKind::None ||
            getBodyKind() == BodyKind::Unparsed ||
            getBodyKind() == BodyKind::Parsed);
@@ -7484,7 +7479,16 @@ public:
             Bits.EnumCaseDecl.NumElements};
   }
   SourceRange getSourceRange() const;
-  
+
+  /// Returns the first of the member elements or null if there are no elements.
+  /// The attributes written with an EnumCaseDecl will be attached to each of
+  /// the elements instead so inspecting the attributes of the first element is
+  /// often useful.
+  EnumElementDecl *getFirstElement() const {
+    auto elements = getElements();
+    return elements.empty() ? nullptr : elements.front();
+  }
+
   static bool classof(const Decl *D) {
     return D->getKind() == DeclKind::EnumCase;
   }
@@ -8276,18 +8280,98 @@ public:
   }
 };
 
+/// Provides a declaration of a macro.
+///
+/// Macros are declared within the source code with the `macro` introducer.
+///
+/// Macros are defined externally via conformances to the 'Macro' type
+/// that is part of swift-syntax, and are introduced into the compiler via
+/// various mechanisms (e.g., in-process macros provided as builtins or
+/// loaded via shared library, and so on).
+class MacroDecl : public GenericContext, public ValueDecl {
+public:
+  /// The location of the 'macro' keyword.
+  SourceLoc macroLoc;
+
+  /// The parameter list for a function-like macro.
+  ParameterList *parameterList;
+
+  /// Where the '->' or ':' is located, for a function- or value-like macro,
+  /// respectively.
+  SourceLoc arrowOrColonLoc;
+
+  /// The result type.
+  TypeLoc resultType;
+
+  /// The module name for the external macro definition.
+  Identifier externalModuleName;
+
+  /// The location of the module name for the external macro definition.
+  SourceLoc externalModuleNameLoc;
+
+  /// The type name for the external macro definition.
+  Identifier externalMacroTypeName;
+
+  /// The location of the type name for the external macro definition.
+  SourceLoc externalMacroTypeNameLoc;
+
+  MacroDecl(SourceLoc macroLoc, DeclName name, SourceLoc nameLoc,
+            GenericParamList *genericParams,
+            ParameterList *parameterList,
+            SourceLoc arrowOrColonLoc,
+            TypeRepr *resultType,
+            Identifier externalModuleName,
+            SourceLoc externalModuleNameLoc,
+            Identifier externalMacroTypeName,
+            SourceLoc externalMacroTypeNameLoc,
+            DeclContext *parent);
+
+  SourceRange getSourceRange() const;
+
+  /// Retrieve the interface type produced when expanding this macro.
+  Type getResultInterfaceType() const;
+
+  static bool classof(const DeclContext *C) {
+    if (auto D = C->getAsDecl())
+      return classof(D);
+    return false;
+  }
+
+  static bool classof(const Decl *D) {
+    return D->getKind() == DeclKind::Macro;
+  }
+
+  using DeclContext::operator new;
+  using DeclContext::operator delete;
+  using Decl::getASTContext;
+};
+
 class MacroExpansionDecl : public Decl {
   SourceLoc PoundLoc;
   DeclNameRef Macro;
   DeclNameLoc MacroLoc;
+  SourceLoc LeftAngleLoc, RightAngleLoc;
+  ArrayRef<TypeRepr *> GenericArgs;
   ArgumentList *ArgList;
   Decl *Rewritten;
 
 public:
   MacroExpansionDecl(DeclContext *dc, SourceLoc poundLoc, DeclNameRef macro,
-                     DeclNameLoc macroLoc, ArgumentList *args)
+                     DeclNameLoc macroLoc,
+                     SourceLoc leftAngleLoc,
+                     ArrayRef<TypeRepr *> genericArgs,
+                     SourceLoc rightAngleLoc,
+                     ArgumentList *args)
       : Decl(DeclKind::MacroExpansion, dc), PoundLoc(poundLoc),
-        Macro(macro), MacroLoc(macroLoc), ArgList(args), Rewritten(nullptr) {}
+        Macro(macro), MacroLoc(macroLoc),
+        LeftAngleLoc(leftAngleLoc), RightAngleLoc(rightAngleLoc),
+        GenericArgs(genericArgs), ArgList(args), Rewritten(nullptr) {}
+
+  ArrayRef<TypeRepr *> getGenericArgs() const { return GenericArgs; }
+
+  SourceRange getGenericArgsRange() const {
+    return SourceRange(LeftAngleLoc, RightAngleLoc);
+  }
 
   SourceRange getSourceRange() const;
   SourceLoc getLocFromSource() const { return PoundLoc; }
@@ -8410,6 +8494,8 @@ inline bool ValueDecl::hasCurriedSelf() const {
 inline bool ValueDecl::hasParameterList() const {
   if (auto *eed = dyn_cast<EnumElementDecl>(this))
     return eed->hasAssociatedValues();
+  if (auto *macro = dyn_cast<MacroDecl>(this))
+    return macro->parameterList != nullptr;
   return isa<AbstractFunctionDecl>(this) || isa<SubscriptDecl>(this);
 }
 
