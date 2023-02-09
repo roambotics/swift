@@ -28,7 +28,7 @@
 #include "swift/IDE/CodeCompletionCache.h"
 #include "swift/IDE/SyntaxModel.h"
 #include "swift/IDE/Utils.h"
-#include "swift/IDETool/CompletionInstance.h"
+#include "swift/IDETool/IDEInspectionInstance.h"
 
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Preprocessor.h"
@@ -74,11 +74,13 @@ static UIdent Attr_ObjcNamed("source.decl.attribute.objc.name");
 static UIdent Attr_Private("source.decl.attribute.private");
 static UIdent Attr_FilePrivate("source.decl.attribute.fileprivate");
 static UIdent Attr_Internal("source.decl.attribute.internal");
+static UIdent Attr_Package("source.decl.attribute.package");
 static UIdent Attr_Public("source.decl.attribute.public");
 static UIdent Attr_Open("source.decl.attribute.open");
 static UIdent Attr_Setter_Private("source.decl.attribute.setter_access.private");
 static UIdent Attr_Setter_FilePrivate("source.decl.attribute.setter_access.fileprivate");
 static UIdent Attr_Setter_Internal("source.decl.attribute.setter_access.internal");
+static UIdent Attr_Setter_Package("source.decl.attribute.setter_access.package");
 static UIdent Attr_Setter_Public("source.decl.attribute.setter_access.public");
 static UIdent Attr_Setter_Open("source.decl.attribute.setter_access.open");
 static UIdent EffectiveAccess_Public("source.decl.effective_access.public");
@@ -261,11 +263,11 @@ class InMemoryFileSystemProvider: public SourceKit::FileSystemProvider {
 };
 }
 
-static void
-configureCompletionInstance(std::shared_ptr<CompletionInstance> CompletionInst,
-                            std::shared_ptr<GlobalConfig> GlobalConfig) {
-  auto Opts = GlobalConfig->getCompletionOpts();
-  CompletionInst->setOptions({
+static void configureIDEInspectionInstance(
+    std::shared_ptr<IDEInspectionInstance> IDEInspectionInst,
+    std::shared_ptr<GlobalConfig> GlobalConfig) {
+  auto Opts = GlobalConfig->getIDEInspectionOpts();
+  IDEInspectionInst->setOptions({
     Opts.MaxASTContextReuseCount,
     Opts.CheckDependencyInterval
   });
@@ -287,9 +289,10 @@ SwiftLangSupport::SwiftLangSupport(SourceKit::Context &SKCtx)
       EditorDocuments, SKCtx.getGlobalConfiguration(), Stats, ReqTracker,
       SwiftExecutablePath, RuntimeResourcePath, DiagnosticDocumentationPath);
 
-  CompletionInst = std::make_shared<CompletionInstance>();
+  IDEInspectionInst = std::make_shared<IDEInspectionInstance>();
 
-  configureCompletionInstance(CompletionInst, SKCtx.getGlobalConfiguration());
+  configureIDEInspectionInstance(IDEInspectionInst,
+                                 SKCtx.getGlobalConfiguration());
 
   // By default, just use the in-memory cache.
   CCCache->inMemory = std::make_unique<ide::CodeCompletionCache>();
@@ -303,11 +306,11 @@ SwiftLangSupport::~SwiftLangSupport() {
 
 void SwiftLangSupport::globalConfigurationUpdated(
     std::shared_ptr<GlobalConfig> Config) {
-  configureCompletionInstance(CompletionInst, Config);
+  configureIDEInspectionInstance(IDEInspectionInst, Config);
 }
 
 void SwiftLangSupport::dependencyUpdated() {
-  CompletionInst->markCachedCompilerInstanceShouldBeInvalidated();
+  IDEInspectionInst->markCachedCompilerInstanceShouldBeInvalidated();
 }
 
 UIdent SwiftLangSupport::getUIDForDeclLanguage(const swift::Decl *D) {
@@ -671,6 +674,7 @@ UIdent SwiftLangSupport::getUIDForSymbol(SymbolInfo sym, bool isRef) {
   SIMPLE_CASE(Protocol)
   SIMPLE_CASE(Constructor)
   SIMPLE_CASE(Destructor)
+  SIMPLE_CASE(Macro)
 
   case SymbolKind::EnumConstant:
     return UID_FOR(EnumElement);
@@ -792,6 +796,8 @@ Optional<UIdent> SwiftLangSupport::getUIDForDeclAttribute(const swift::DeclAttri
           return Attr_FilePrivate;
         case AccessLevel::Internal:
           return Attr_Internal;
+        case AccessLevel::Package:
+          return Attr_Package;
         case AccessLevel::Public:
           return Attr_Public;
         case AccessLevel::Open:
@@ -806,6 +812,8 @@ Optional<UIdent> SwiftLangSupport::getUIDForDeclAttribute(const swift::DeclAttri
           return Attr_Setter_FilePrivate;
         case AccessLevel::Internal:
           return Attr_Setter_Internal;
+        case AccessLevel::Package:
+          return Attr_Setter_Package;
         case AccessLevel::Public:
           return Attr_Setter_Public;
         case AccessLevel::Open:
@@ -1079,7 +1087,7 @@ void SwiftLangSupport::performWithParamsToCompletionLikeOperation(
   }
 
   // Pin completion instance.
-  auto CompletionInst = getCompletionInstance();
+  auto CompletionInst = getIDEInspectionInstance();
 
   auto CancellationFlag = std::make_shared<std::atomic<bool>>(false);
   ReqTracker->setCancellationHandler(CancellationToken, [CancellationFlag] {

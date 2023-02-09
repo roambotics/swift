@@ -275,6 +275,8 @@ public:
   ConcreteDeclRef getCXXFunctionTemplateSpecialization(
           SubstitutionMap subst, ValueDecl *decl) override;
 
+  FuncDecl *getCXXSynthesizedOperatorFunc(FuncDecl *decl);
+
   /// Just like Decl::getClangNode() except we look through to the 'Code'
   /// enum of an error wrapper struct.
   ClangNode getEffectiveClangNode(const Decl *decl) const;
@@ -421,7 +423,7 @@ public:
       ModuleDependenciesCache &cache,
       const clang::tooling::dependencies::FullDependenciesResult &clangDependencies);
 
-  Optional<ModuleDependencies> getModuleDependencies(
+  Optional<const ModuleDependencyInfo*> getModuleDependencies(
       StringRef moduleName, ModuleDependenciesCache &cache,
       InterfaceSubContextDelegate &delegate) override;
 
@@ -437,7 +439,7 @@ public:
   /// \returns \c true if an error occurred, \c false otherwise
   bool addBridgingHeaderDependencies(
       StringRef moduleName,
-      ModuleDependenciesKind moduleKind,
+      ModuleDependencyKind moduleKind,
       ModuleDependenciesCache &cache);
 
   clang::TargetInfo &getTargetInfo() const override;
@@ -553,6 +555,9 @@ public:
   /// Emit diagnostics for declarations named name that are members
   /// of the provided baseType.
   void diagnoseMemberValue(const DeclName &name, const Type &baseType) override;
+
+  /// Enable the symbolic import experimental feature for the given callback.
+  void withSymbolicFeatureEnabled(llvm::function_ref<void(void)> callback);
 };
 
 ImportDecl *createImportDecl(ASTContext &Ctx, DeclContext *DC, ClangNode ClangN,
@@ -566,6 +571,13 @@ getModuleCachePathFromClang(const clang::CompilerInstance &Instance);
 
 /// Whether the given parameter name identifies a completion handler.
 bool isCompletionHandlerParamName(StringRef paramName);
+
+namespace importer {
+
+/// Returns true if the given module has a 'cplusplus' requirement.
+bool requiresCPlusPlus(const clang::Module *module);
+
+} // namespace importer
 
 } // end namespace swift
 

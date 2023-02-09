@@ -124,16 +124,19 @@ bool swift::requiresForeignEntryPoint(ValueDecl *vd) {
 
 SILDeclRef::SILDeclRef(ValueDecl *vd, SILDeclRef::Kind kind, bool isForeign,
                        bool isDistributed, bool isKnownToBeLocal,
+                       bool isRuntimeAccessible,
                        SILDeclRef::BackDeploymentKind backDeploymentKind,
                        AutoDiffDerivativeFunctionIdentifier *derivativeId)
     : loc(vd), kind(kind), isForeign(isForeign), 
       isDistributed(isDistributed), isKnownToBeLocal(isKnownToBeLocal),
+      isRuntimeAccessible(isRuntimeAccessible),
       backDeploymentKind(backDeploymentKind), defaultArgIndex(0),
       pointer(derivativeId) {}
 
 SILDeclRef::SILDeclRef(SILDeclRef::Loc baseLoc, bool asForeign,
                        bool asDistributed, bool asDistributedKnownToBeLocal)
-    : backDeploymentKind(SILDeclRef::BackDeploymentKind::None),
+    : isRuntimeAccessible(false),
+      backDeploymentKind(SILDeclRef::BackDeploymentKind::None),
       defaultArgIndex(0),
       pointer((AutoDiffDerivativeFunctionIdentifier *)nullptr) {
   if (auto *vd = baseLoc.dyn_cast<ValueDecl*>()) {
@@ -366,6 +369,7 @@ bool SILDeclRef::hasUserWrittenCode() const {
   case Kind::PropertyWrapperInitFromProjectedValue:
   case Kind::EntryPoint:
   case Kind::AsyncEntryPoint:
+  case Kind::RuntimeAttributeGenerator:
     // Implicit decls for these don't splice in user-written code.
     return false;
   }
@@ -507,6 +511,9 @@ static LinkageLimit getLinkageLimit(SILDeclRef constant) {
     // class from which they come, and never get seen externally.
     return Limit::NeverPublic;
 
+  case Kind::RuntimeAttributeGenerator:
+    return Limit::NeverPublic;
+
   case Kind::EntryPoint:
   case Kind::AsyncEntryPoint:
     llvm_unreachable("Already handled");
@@ -600,6 +607,7 @@ SILLinkage SILDeclRef::getDefinitionLinkage() const {
       return SILLinkage::Shared;
     return SILLinkage::Hidden;
 
+  case AccessLevel::Package:
   case AccessLevel::Public:
   case AccessLevel::Open:
     switch (limit) {
@@ -665,6 +673,16 @@ SILDeclRef SILDeclRef::getMainFileEntryPoint(FileUnit *file) {
   SILDeclRef result;
   result.loc = file;
   result.kind = Kind::EntryPoint;
+  return result;
+}
+
+SILDeclRef SILDeclRef::getRuntimeAttributeGenerator(CustomAttr *attr,
+                                                    ValueDecl *decl) {
+  SILDeclRef result;
+  result.loc = decl;
+  result.kind = Kind::RuntimeAttributeGenerator;
+  result.isRuntimeAccessible = true;
+  result.pointer = attr;
   return result;
 }
 
@@ -996,13 +1014,20 @@ bool SILDeclRef::isDistributedThunk() const {
 bool SILDeclRef::isBackDeploymentFallback() const {
   if (backDeploymentKind != BackDeploymentKind::Fallback)
     return false;
-  return kind == Kind::Func;
+  return kind == Kind::Func || kind == Kind::Initializer ||
+         kind == Kind::Allocator;
 }
 
 bool SILDeclRef::isBackDeploymentThunk() const {
   if (backDeploymentKind != BackDeploymentKind::Thunk)
     return false;
-  return kind == Kind::Func;
+  return kind == Kind::Func || kind == Kind::Initializer ||
+         kind == Kind::Allocator;
+}
+
+bool SILDeclRef::isRuntimeAccessibleFunction() const {
+  return isRuntimeAccessible &&
+         (kind == Kind::Func || kind == Kind::RuntimeAttributeGenerator);
 }
 
 /// Use the Clang importer to mangle a Clang declaration.
@@ -1181,6 +1206,10 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
   case SILDeclRef::Kind::EntryPoint: {
     return getASTContext().getEntryPointFunctionName();
   }
+
+  case SILDeclRef::Kind::RuntimeAttributeGenerator:
+    return mangler.mangleRuntimeAttributeGeneratorEntity(
+        loc.get<ValueDecl *>(), pointer.get<CustomAttr *>(), SKind);
   }
 
   llvm_unreachable("bad entity kind!");
@@ -1490,6 +1519,7 @@ SubclassScope SILDeclRef::getSubclassScope() const {
     // SILModule, so we don't need to do anything.
     return SubclassScope::NotApplicable;
   case AccessLevel::Internal:
+  case AccessLevel::Package:
   case AccessLevel::Public:
     // If the class is internal or public, it can only be subclassed from
     // the same AST Module, but possibly a different SILModule.
@@ -1549,7 +1579,7 @@ unsigned SILDeclRef::getParameterListCount() const {
 
   // Always uncurried even if the underlying function is curried.
   if (kind == Kind::DefaultArgGenerator || kind == Kind::EntryPoint ||
-      kind == Kind::AsyncEntryPoint)
+      kind == Kind::AsyncEntryPoint || kind == Kind::RuntimeAttributeGenerator)
     return 1;
 
   auto *vd = getDecl();

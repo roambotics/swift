@@ -31,6 +31,7 @@ SILValue swift::lookThroughOwnershipInsts(SILValue v) {
     switch (v->getKind()) {
     default:
       return v;
+    case ValueKind::MoveValueInst:
     case ValueKind::CopyValueInst:
     case ValueKind::BeginBorrowInst:
       v = cast<SingleValueInstruction>(v)->getOperand(0);
@@ -255,6 +256,7 @@ SingleValueInstruction *swift::getSingleValueCopyOrCast(SILInstruction *I) {
   case SILInstructionKind::BeginBorrowInst:
   case SILInstructionKind::BeginAccessInst:
   case SILInstructionKind::MarkDependenceInst:
+  case SILInstructionKind::MoveValueInst:
     return cast<SingleValueInstruction>(I);
   }
 }
@@ -279,8 +281,9 @@ bool swift::onlyAffectsRefCount(SILInstruction *user) {
   switch (user->getKind()) {
   default:
     return false;
-  case SILInstructionKind::AutoreleaseValueInst:
+  case SILInstructionKind::CopyValueInst:
   case SILInstructionKind::DestroyValueInst:
+  case SILInstructionKind::AutoreleaseValueInst:
   case SILInstructionKind::ReleaseValueInst:
   case SILInstructionKind::RetainValueInst:
   case SILInstructionKind::StrongReleaseInst:
@@ -461,6 +464,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::SwitchEnumInst:
   case SILInstructionKind::DeallocStackInst:
   case SILInstructionKind::DeallocStackRefInst:
+  case SILInstructionKind::DeallocPackInst:
   case SILInstructionKind::AutoreleaseValueInst:
   case SILInstructionKind::BindMemoryInst:
   case SILInstructionKind::RebindMemoryInst:
@@ -483,6 +487,12 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::IncrementProfilerCounterInst:
   case SILInstructionKind::EndCOWMutationInst:
   case SILInstructionKind::HasSymbolInst:
+  case SILInstructionKind::DynamicPackIndexInst:
+  case SILInstructionKind::PackPackIndexInst:
+  case SILInstructionKind::ScalarPackIndexInst:
+  case SILInstructionKind::PackElementGetInst:
+  case SILInstructionKind::PackElementSetInst:
+  case SILInstructionKind::DebugStepInst:
     return RuntimeEffect::NoEffect;
 
   case SILInstructionKind::DebugValueInst:
@@ -502,6 +512,9 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::KeyPathInst:
     return RuntimeEffect::Allocating | RuntimeEffect::Releasing |
            RuntimeEffect::MetaData;
+
+  case SILInstructionKind::TuplePackElementAddrInst:
+    return RuntimeEffect::MetaData;
 
   case SILInstructionKind::SwitchEnumAddrInst:
   case SILInstructionKind::InjectEnumAddrInst:
@@ -555,6 +568,14 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     impactType = inst->getOperand(0)->getType();
     return RuntimeEffect::MetaData;
 
+  case SILInstructionKind::OpenPackElementInst:
+    // We do potentially have to build type metadata as part of this
+    // instruction (if we have to materialize a concrete pack).
+    // The interface doesn't let us be specific about what metadata,
+    // though.
+    impactType = SILType();
+    return RuntimeEffect::MetaData;
+
   case SILInstructionKind::OpenExistentialAddrInst:
     if (cast<OpenExistentialAddrInst>(inst)->getAccessKind() ==
         OpenedExistentialAccess::Mutable)
@@ -586,6 +607,10 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     impactType = inst->getOperand(0)->getType();
     return RuntimeEffect::Casting | metadataEffect(impactType) |
       metadataEffect(cast<CheckedCastBranchInst>(inst)->getTargetLoweredType());
+
+  case SILInstructionKind::AllocPackInst:
+    // Just conservatively assume this has metadata impact.
+    return RuntimeEffect::MetaData;
 
   case SILInstructionKind::AllocStackInst:
   case SILInstructionKind::ProjectBoxInst:

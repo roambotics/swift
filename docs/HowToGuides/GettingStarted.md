@@ -187,7 +187,7 @@ toolchain as a one-off, there are a couple of differences:
 
 ### Spot check dependencies
 
-* Run `cmake --version`; this should be 3.19.6 or higher.
+* Run `cmake --version`; this should be at least 3.19.6 (3.24.2 if you want to use Xcode for editing on macOS).
 * Run `python3 --version`; check that this succeeds.
 * Run `ninja --version`; check that this succeeds.
 * If you installed and want to use Sccache: Run `sccache --version`; check
@@ -243,10 +243,6 @@ Phew, that's a lot to digest! Now let's proceed to the actual build itself!
        --skip-ios --skip-watchos --skip-tvos --swift-darwin-supported-archs "$(uname -m)" \
        --sccache --release-debuginfo --swift-disable-dead-stripping
      ```
-     > **Warning**  
-     > On Macs with Apple silicon (arm64), pass `--bootstrapping=off`.
-     > (https://github.com/apple/swift/issues/62017)
-
    - Linux:
      ```sh
      utils/build-script --release-debuginfo --skip-early-swift-driver \
@@ -254,10 +250,16 @@ Phew, that's a lot to digest! Now let's proceed to the actual build itself!
      ```
      If you installed and want to use Sccache, include the `--sccache` option in
      the invocation as well.
+   <!-- FIXME: Without this "hard" line break, the note doesn’t get properly spaced from the bullet -->
+   <br />
 
    > **Note**  
-   > If you aren't planning to edit the parts of the compiler that are written
-   > in Swift, pass `--bootstrapping=off` to speed up local development.
+   > If you are planning to work on the compiler, but not the parts that are
+   > written in Swift, pass `--bootstrapping=hosttools` to speed up local
+   > development. Note that on Linux — unlike macOS, where the toolchain already
+   > comes with Xcode — this option additionally requires
+   > [a recent Swift toolchain](https://www.swift.org/download/) to be
+   > installed.
 
    This will create a directory `swift-project/build/Ninja-RelWithDebInfoAssert`
    containing the Swift compiler and standard library and clang/LLVM build artifacts.
@@ -274,9 +276,8 @@ Phew, that's a lot to digest! Now let's proceed to the actual build itself!
    on Linux, add the `--xctest` flag to `build-script`.
 
 In the following sections, for simplicity, we will assume that you are using a
-`Ninja-RelWithDebInfoAssert` build on macOS running on an Intel-based Mac,
-unless explicitly mentioned otherwise. You will need to slightly tweak the paths
-for other build configurations.
+`Ninja-RelWithDebInfoAssert` build on macOS, unless explicitly mentioned otherwise.
+You will need to slightly tweak the paths for other build configurations.
 
 ### Troubleshooting build issues
 
@@ -357,19 +358,19 @@ while retaining the option of building with Ninja on the command line.
 
 Assuming that you have already [built the toolchain via Ninja](#the-actual-build),
 several more steps are necessary to set up this environment:
-* Generate Xcode projects with `utils/build-script --release --swift-darwin-supported-archs "$(uname -m)" --xcode`.
+* Generate Xcode projects with `utils/build-script --swift-darwin-supported-archs "$(uname -m)" --xcode --clean`.
   This will first build a few LLVM files that are needed to configure the
   projects.
 * Create a new Xcode workspace.
 * Add the generated Xcode projects or Swift packages that are relevant to your
   tasks to your workspace. All the Xcode projects can be found among the
-  build artifacts under `build/Xcode-DebugAssert`. For example:
-  * If you are aiming for the compiler, add `build/Xcode-DebugAssert/swift-macosx-*/Swift.xcodeproj`.
+  build artifacts under `build/Xcode-*/`. For example:
+  * If you are aiming for the compiler, add `build/Xcode-*/swift-macosx-*/Swift.xcodeproj`.
     This project also includes the standard library and runtime sources. If you
     need the parts of the compiler that are implemented in Swift itself, add the
     `swift/SwiftCompilerSources/Package.swift` package as well.
   * If you are aiming for just the standard library or runtime, add
-    `build/Xcode-DebugAssert/swift-macosx-*/stdlib/Swift-stdlib.xcodeproj`.
+    `build/Xcode-*/swift-macosx-*/stdlib/Swift-stdlib.xcodeproj`.
   <!-- FIXME: Without this "hard" line break, the note doesn’t get properly spaced from the bullet -->
   <br />
 
@@ -463,7 +464,7 @@ Now that you have made some changes, you will need to rebuild...
 
 To rebuild the compiler:
 ```sh
-ninja -C ../build/Ninja-RelWithDebInfoAssert/swift-macosx-$(uname -m) swift-frontend
+ninja -C ../build/Ninja-RelWithDebInfoAssert/swift-macosx-$(uname -m) bin/swift-frontend
 ```
 
 To rebuild everything, including the standard library:
@@ -486,12 +487,11 @@ This should print your updated version string.
 
 ## Reproducing an issue
 
-Starter bugs typically have small code examples that fit within a single file.
-You can reproduce such an issue in various ways, such as compiling it from the
-command line using `/path/to/swiftc MyFile.swift`, pasting the code into
-[Compiler Explorer][] (aka godbolt) or using an Xcode Playground.
-
-[Compiler Explorer]: https://godbolt.org
+[Good first issues](https://github.com/apple/swift/contribute) typically have
+small code examples that fit within a single file. You can reproduce such an
+issue in various ways, such as compiling it from the command line using
+`/path/to/swiftc MyFile.swift`, pasting the code into [Compiler Explorer](https://godbolt.org)
+(aka godbolt) or using an Xcode Playground.
 
 For files using frameworks from an SDK bundled with Xcode, you need the pass
 the SDK explicitly. Here are a couple of examples:

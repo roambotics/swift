@@ -893,9 +893,11 @@ void ReabstractionInfo::createSubstitutedAndSpecializedTypes() {
         hasConvertedResilientParams = true;
       }
       break;
-    case ParameterConvention::Indirect_In_Constant:
     case ParameterConvention::Indirect_Inout:
     case ParameterConvention::Indirect_InoutAliasable:
+    case ParameterConvention::Pack_Inout:
+    case ParameterConvention::Pack_Owned:
+    case ParameterConvention::Pack_Guaranteed:
       break;
       
     case ParameterConvention::Direct_Owned:
@@ -2520,7 +2522,7 @@ SILFunction *ReabstractionThunkGenerator::createThunk() {
   SILFunction *Thunk = FunctionBuilder.getOrCreateSharedFunction(
       Loc, ThunkName, ReInfo.getSubstitutedType(), IsBare, IsTransparent,
       ReInfo.isSerialized(), ProfileCounter(), IsThunk, IsNotDynamic,
-      IsNotDistributed);
+      IsNotDistributed, IsNotRuntimeAccessible);
   // Re-use an existing thunk.
   if (!Thunk->empty())
     return Thunk;
@@ -2546,10 +2548,7 @@ SILFunction *ReabstractionThunkGenerator::createThunk() {
     for (auto SpecArg : SpecializedFunc->getArguments()) {
       auto *NewArg = EntryBB->createFunctionArgument(SpecArg->getType(),
                                                      SpecArg->getDecl());
-      NewArg->setNoImplicitCopy(
-          cast<SILFunctionArgument>(SpecArg)->isNoImplicitCopy());
-      NewArg->setLifetimeAnnotation(
-          cast<SILFunctionArgument>(SpecArg)->getLifetimeAnnotation());
+      NewArg->copyFlags(cast<SILFunctionArgument>(SpecArg));
       Arguments.push_back(NewArg);
     }
     FullApplySite ApplySite = createReabstractionThunkApply(Builder);
@@ -2652,6 +2651,8 @@ SILArgument *ReabstractionThunkGenerator::convertReabstractionThunkArguments(
         cast<SILFunctionArgument>(SpecArg)->isNoImplicitCopy());
     NewArg->setLifetimeAnnotation(
         cast<SILFunctionArgument>(SpecArg)->getLifetimeAnnotation());
+    NewArg->setClosureCapture(
+        cast<SILFunctionArgument>(SpecArg)->isClosureCapture());
     Arguments.push_back(NewArg);
   };
   // ReInfo.NumIndirectResults corresponds to SubstTy's formal indirect
@@ -2697,6 +2698,8 @@ SILArgument *ReabstractionThunkGenerator::convertReabstractionThunkArguments(
           cast<SILFunctionArgument>(SpecArg)->isNoImplicitCopy());
       NewArg->setLifetimeAnnotation(
           cast<SILFunctionArgument>(SpecArg)->getLifetimeAnnotation());
+      NewArg->setClosureCapture(
+          cast<SILFunctionArgument>(SpecArg)->isClosureCapture());
       if (!NewArg->getArgumentConvention().isGuaranteedConvention()) {
         SILValue argVal = Builder.emitLoadValueOperation(
             Loc, NewArg, LoadOwnershipQualifier::Take);
@@ -2881,8 +2884,9 @@ bool usePrespecialized(
 
         if (!erased || !layout || !layout->isClass()) {
           newSubs.push_back(entry.value());
-        } else if (!entry.value()->isAnyClassReferenceType()) {
-          // non-reference type can't be applied
+        } else if (!entry.value()->isAnyClassReferenceType() ||
+                   entry.value()->isAnyExistentialType()) {
+          // non-reference or existential type can't be applied
           break;
         } else if (!specializedSig->getRequiredProtocols(genericParam)
                         .empty()) {

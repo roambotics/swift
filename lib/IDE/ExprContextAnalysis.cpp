@@ -254,8 +254,7 @@ void swift::ide::collectPossibleReturnTypesFromContext(
         } else {
           const auto type = swift::performTypeResolution(
               CE->getExplicitResultTypeRepr(), DC->getASTContext(),
-              /*isSILMode=*/false, /*isSILType=*/false,
-              DC->getGenericSignatureOfContext(), /*GenericParams=*/nullptr,
+              DC->getGenericSignatureOfContext(), /*SILContext=*/nullptr,
               const_cast<DeclContext *>(DC), /*diagnostics=*/false);
 
           if (!type->hasError()) {
@@ -1214,6 +1213,11 @@ class ExprContextAnalyzer {
         return;
       auto *var = initDC->getWrappedVar();
       recordPossibleType(AFD->mapTypeIntoContext(var->getInterfaceType()));
+      break;
+    }
+
+    case InitializerKind::RuntimeAttribute: {
+      // This never appears in AST.
       break;
     }
     }

@@ -73,8 +73,9 @@ class SolutionApplicationTarget;
 // so they could be made friends of ConstraintSystem.
 namespace TypeChecker {
 
-Optional<BraceStmt *> applyResultBuilderBodyTransform(FuncDecl *func,
-                                                        Type builderType);
+Optional<BraceStmt *> applyResultBuilderBodyTransform(
+    FuncDecl *func, Type builderType,
+    bool ClosuresInResultBuilderDontParticipateInInference);
 
 Optional<constraints::SolutionApplicationTarget>
 typeCheckExpression(constraints::SolutionApplicationTarget &target,
@@ -677,6 +678,13 @@ template <typename T> bool isExpr(ASTNode node) {
 template <typename T = Decl> T *getAsDecl(ASTNode node) {
   if (auto *E = node.dyn_cast<Decl *>())
     return dyn_cast_or_null<T>(E);
+  return nullptr;
+}
+
+template <typename T = TypeRepr>
+T *getAsTypeRepr(ASTNode node) {
+  if (auto *type = node.dyn_cast<TypeRepr *>())
+    return dyn_cast_or_null<T>(type);
   return nullptr;
 }
 
@@ -1487,6 +1495,10 @@ public:
   llvm::DenseMap<ConstraintLocator *, OpenedArchetypeType *>
     OpenedExistentialTypes;
 
+  /// The pack expansion environment that can open pack elements for
+  /// a given locator.
+  llvm::DenseMap<ConstraintLocator *, UUID> PackExpansionEnvironments;
+
   /// The locators of \c Defaultable constraints whose defaults were used.
   llvm::SmallPtrSet<ConstraintLocator *, 2> DefaultedConstraints;
 
@@ -1669,7 +1681,11 @@ public:
   Type getContextualType(ASTNode anchor) const {
     for (const auto &entry : contextualTypes) {
       if (entry.first == anchor) {
-        return simplifyType(entry.second.getType());
+        // The contextual information record could contain the purpose
+        // without a type i.e. when the context is an optional-some or
+        // an invalid pattern binding.
+        if (auto contextualTy = entry.second.getType())
+          return simplifyType(contextualTy);
       }
     }
     return Type();
@@ -1783,6 +1799,15 @@ enum class ConstraintSystemFlags {
 
   /// When set, ignore async/sync mismatches
   IgnoreAsyncSyncMismatch = 0x80,
+
+  /// Disable macro expansions.
+  DisableMacroExpansions = 0x100,
+
+  /// Non solver-based code completion expects that closures inside result
+  /// builders don't participate in inference.
+  /// Once all code completion kinds are migrated to solver-based we should be
+  /// able to remove this flag.
+  ClosuresInResultBuildersDontParticipateInInference = 0x200,
 };
 
 /// Options that affect the constraint system as a whole.
@@ -1943,11 +1968,18 @@ private:
       /// type-checked.
       DeclContext *dc;
 
+      // TODO: Fold the 3 below fields into ContextualTypeInfo
+
       /// The purpose of the contextual type.
       ContextualTypePurpose contextualPurpose;
 
       /// The type to which the expression should be converted.
       TypeLoc convertType;
+
+      /// The locator for the contextual type conversion constraint, or
+      /// \c nullptr to use the default locator which is anchored directly on
+      /// the expression.
+      ConstraintLocator *convertTypeLocator;
 
       /// When initializing a pattern from the expression, this is the
       /// pattern.
@@ -2036,14 +2068,25 @@ private:
 public:
   SolutionApplicationTarget(Expr *expr, DeclContext *dc,
                             ContextualTypePurpose contextualPurpose,
-                            Type convertType, bool isDiscarded)
+                            Type convertType,
+                            ConstraintLocator *convertTypeLocator,
+                            bool isDiscarded)
       : SolutionApplicationTarget(expr, dc, contextualPurpose,
                                   TypeLoc::withoutLoc(convertType),
-                                  isDiscarded) { }
+                                  convertTypeLocator, isDiscarded) {}
 
   SolutionApplicationTarget(Expr *expr, DeclContext *dc,
                             ContextualTypePurpose contextualPurpose,
-                            TypeLoc convertType, bool isDiscarded);
+                            Type convertType, bool isDiscarded)
+      : SolutionApplicationTarget(expr, dc, contextualPurpose, convertType,
+                                  /*convertTypeLocator*/ nullptr, isDiscarded) {
+  }
+
+  SolutionApplicationTarget(Expr *expr, DeclContext *dc,
+                            ContextualTypePurpose contextualPurpose,
+                            TypeLoc convertType,
+                            ConstraintLocator *convertTypeLocator,
+                            bool isDiscarded);
 
   SolutionApplicationTarget(Expr *expr, DeclContext *dc, ExprPattern *pattern,
                             Type patternType)
@@ -2268,6 +2311,13 @@ public:
     if (contextualTypeIsOnlyAHint())
       return Type();
     return getExprContextualType();
+  }
+
+  /// Retrieve the conversion type locator for the expression, or \c nullptr
+  /// if it has not been set.
+  ConstraintLocator *getExprConvertTypeLocator() const {
+    assert(kind == Kind::expression);
+    return expression.convertTypeLocator;
   }
 
   /// Returns the autoclosure parameter type, or \c nullptr if the
@@ -2739,7 +2789,7 @@ struct GetClosureType {
   Type operator()(const AbstractClosureExpr *expr) const;
 };
 
-/// Retrieve the closure type from the constraint system.
+/// Retrieve the closure's preconcurrency status from the constraint system.
 struct ClosureIsolatedByPreconcurrency {
   ConstraintSystem &cs;
 
@@ -3009,6 +3059,8 @@ private:
   /// used for the 'self' of an existential type.
   llvm::SmallMapVector<ConstraintLocator *, OpenedArchetypeType *, 4>
       OpenedExistentialTypes;
+
+  llvm::SmallMapVector<ConstraintLocator *, UUID, 4> PackExpansionEnvironments;
 
   /// The set of functions that have been transformed by a result builder.
   llvm::MapVector<AnyFunctionRef, AppliedBuilderTransform>
@@ -3485,6 +3537,9 @@ public:
     /// The length of \c OpenedExistentialTypes.
     unsigned numOpenedExistentialTypes;
 
+    /// The length of \c PackExpansionEnvironments.
+    unsigned numPackExpansionEnvironments;
+
     /// The length of \c DefaultedConstraints.
     unsigned numDefaultedConstraints;
 
@@ -3586,8 +3641,9 @@ private:
 
   // FIXME: Perhaps these belong on ConstraintSystem itself.
   friend Optional<BraceStmt *>
-  swift::TypeChecker::applyResultBuilderBodyTransform(FuncDecl *func,
-                                                        Type builderType);
+  swift::TypeChecker::applyResultBuilderBodyTransform(
+      FuncDecl *func, Type builderType,
+      bool ClosuresInResultBuilderDontParticipateInInference);
 
   friend Optional<SolutionApplicationTarget>
   swift::TypeChecker::typeCheckExpression(
@@ -3681,10 +3737,8 @@ public:
     return TypeVariables.count(typeVar) > 0;
   }
 
-  /// Whether the given ASTNode's source range contains the code
-  /// completion location.
-  bool containsCodeCompletionLoc(ASTNode node) const;
-  bool containsCodeCompletionLoc(const ArgumentList *args) const;
+  bool containsIDEInspectionTarget(ASTNode node) const;
+  bool containsIDEInspectionTarget(const ArgumentList *args) const;
 
   /// Marks the argument \p Arg as being ignored because it occurs after the
   /// code completion token. This assumes that the argument is not type checked
@@ -3965,6 +4019,13 @@ public:
   std::pair<Type, OpenedArchetypeType *> openExistentialType(
       Type type, ConstraintLocator *locator);
 
+  /// Add the given pack expansion as an opened pack element environment.
+  void addPackElementEnvironment(PackExpansionExpr *expr);
+
+  /// Get the opened element generic environment for the given locator.
+  GenericEnvironment *getPackElementEnvironment(ConstraintLocator *locator,
+                                                CanType shapeClass);
+
   /// Retrieve the constraint locator for the given anchor and
   /// path, uniqued and automatically infer the summary flags
   ConstraintLocator *
@@ -4196,7 +4257,8 @@ public:
 
   /// Add the appropriate constraint for a contextual conversion.
   void addContextualConversionConstraint(Expr *expr, Type conversionType,
-                                         ContextualTypePurpose purpose);
+                                         ContextualTypePurpose purpose,
+                                         ConstraintLocator *locator);
 
   /// Convenience function to pass an \c ArrayRef to \c addJoinConstraint
   Type addJoinConstraint(ConstraintLocator *locator,
@@ -5051,6 +5113,11 @@ public:
   /// \returns \c true if constraint generation failed, \c false otherwise
   LLVM_NODISCARD
   bool generateConstraints(AnyFunctionRef fn, BraceStmt *body);
+
+  /// Generate constraints for a given SingleValueStmtExpr.
+  ///
+  /// \returns \c true if constraint generation failed, \c false otherwise
+  bool generateConstraints(SingleValueStmtExpr *E);
 
   /// Generate constraints for the given (unchecked) expression.
   ///
@@ -5950,6 +6017,22 @@ public:
                                SolutionApplicationTarget)>
                                rewriteTarget);
 
+  /// Apply the given solution to the given SingleValueStmtExpr.
+  ///
+  /// \param solution The solution to apply.
+  /// \param SVE The SingleValueStmtExpr to rewrite.
+  /// \param DC The declaration context in which transformations will be
+  /// applied.
+  /// \param rewriteTarget Function that performs a rewrite of any
+  /// solution application target within the context.
+  ///
+  /// \returns true if solution cannot be applied.
+  bool applySolutionToSingleValueStmt(
+      Solution &solution, SingleValueStmtExpr *SVE, DeclContext *DC,
+      std::function<
+          Optional<SolutionApplicationTarget>(SolutionApplicationTarget)>
+          rewriteTarget);
+
   /// Reorder the disjunctive clauses for a given expression to
   /// increase the likelihood that a favored constraint will be successfully
   /// resolved before any others.
@@ -6107,6 +6190,46 @@ public:
             locator, LocatorPathElt::PlaceholderType(placeholderRepr)),
         TVO_CanBindToNoEscape | TVO_PrefersSubtypeBinding |
             TVO_CanBindToHole);
+  }
+};
+
+/// A function object that opens a given pack type by generating a
+/// \c PackElementOf constraint.
+class OpenPackElementType {
+  ConstraintSystem &cs;
+  ConstraintLocator *locator;
+  PackExpansionExpr *elementEnv;
+
+public:
+  explicit OpenPackElementType(ConstraintSystem &cs,
+                               const ConstraintLocatorBuilder &locator,
+                               PackExpansionExpr *elementEnv)
+      : cs(cs), elementEnv(elementEnv) {
+    this->locator = cs.getConstraintLocator(locator);
+  }
+
+  Type operator()(Type packType, PackReferenceTypeRepr *packRepr) const {
+    // Only assert we have an element environment when invoking the function
+    // object. In cases where pack elements are referenced outside of a
+    // pack expansion, type resolution will error before opening the pack
+    // element.
+    assert(elementEnv);
+
+    auto *elementType = cs.createTypeVariable(locator,
+                                              TVO_CanBindToHole |
+                                              TVO_CanBindToNoEscape);
+
+    // If we're opening a pack element from an explicit type repr,
+    // set the type repr types in the constraint system for generating
+    // ShapeOf constraints when visiting the PackExpansionExpr.
+    if (packRepr) {
+      cs.setType(packRepr->getPackType(), packType);
+      cs.setType(packRepr, elementType);
+    }
+
+    cs.addConstraint(ConstraintKind::PackElementOf, elementType,
+                     packType, cs.getConstraintLocator(elementEnv));
+    return elementType;
   }
 };
 
@@ -6462,6 +6585,10 @@ public:
     Element->print(Out, SM, indent);
   }
 
+  /// Returns \c false if this conjunction element is known not to contain the
+  /// code compleiton token.
+  bool mightContainCodeCompletionToken(const ConstraintSystem &cs) const;
+
 private:
   /// Find type variables referenced by this conjunction element.
   /// If this is a closure body element, it would look inside \c ASTNode.
@@ -6781,6 +6908,9 @@ ASTNode findAsyncNode(ClosureExpr *closure);
 /// \returns The currently assigned type if it's a placeholder,
 /// empty type otherwise.
 Type isPlaceholderVar(PatternBindingDecl *PB);
+
+/// Dump an anchor node for a constraint locator or contextual type.
+void dumpAnchor(ASTNode anchor, SourceManager *SM, raw_ostream &out);
 
 } // end namespace constraints
 

@@ -143,12 +143,15 @@ static void getAssignByWrapperArgsRecursively(SmallVectorImpl<SILValue> &args,
       break;
     case SILArgumentConvention::Direct_Unowned:
     case SILArgumentConvention::Indirect_In:
-    case SILArgumentConvention::Indirect_In_Constant:
     case SILArgumentConvention::Direct_Owned:
       break;
     case SILArgumentConvention::Indirect_Inout:
     case SILArgumentConvention::Indirect_InoutAliasable:
     case SILArgumentConvention::Indirect_Out:
+    case SILArgumentConvention::Pack_Inout:
+    case SILArgumentConvention::Pack_Guaranteed:
+    case SILArgumentConvention::Pack_Owned:
+    case SILArgumentConvention::Pack_Out:
       llvm_unreachable("wrong convention for setter/initializer src argument");
   }
   args.push_back(src);
@@ -187,51 +190,28 @@ lowerAssignByWrapperInstruction(SILBuilderWithScope &b,
       LLVM_FALLTHROUGH;
     case AssignByWrapperInst::Initialization:
     case AssignByWrapperInst::Assign: {
-      switch (inst->getOriginator()) {
-      case AssignByWrapperInst::Originator::TypeWrapper: {
-        bool initialization =
-            inst->getMode() == AssignByWrapperInst::Initialization;
+      SILValue initFn = inst->getInitializer();
+      CanSILFunctionType fTy = initFn->getType().castTo<SILFunctionType>();
+      SILFunctionConventions convention(fTy, inst->getModule());
+      SmallVector<SILValue, 4> args;
+      if (convention.hasIndirectSILResults()) {
+        if (inst->getMode() == AssignByWrapperInst::Assign)
+          b.createDestroyAddr(loc, dest);
 
-        if (inst->getDest()->getType().isAddressOnly(*inst->getFunction())) {
-          b.createCopyAddr(loc, src, dest, IsTake,
-                           initialization ? IsInitialization
-                                          : IsNotInitialization);
+        args.push_back(dest);
+        getAssignByWrapperArgs(args, src, convention, b, forCleanup);
+        b.createApply(loc, initFn, SubstitutionMap(), args);
+      } else {
+        getAssignByWrapperArgs(args, src, convention, b, forCleanup);
+        SILValue wrappedSrc =
+            b.createApply(loc, initFn, SubstitutionMap(), args);
+        if (inst->getMode() == AssignByWrapperInst::Initialization ||
+            inst->getDest()->getType().isTrivial(*inst->getFunction())) {
+          b.createTrivialStoreOr(loc, wrappedSrc, dest,
+                                 StoreOwnershipQualifier::Init);
         } else {
-          b.createTrivialStoreOr(loc, src, dest,
-                                 initialization
-                                     ? StoreOwnershipQualifier::Init
-                                     : StoreOwnershipQualifier::Assign);
+          b.createStore(loc, wrappedSrc, dest, StoreOwnershipQualifier::Assign);
         }
-        break;
-      }
-
-      case AssignByWrapperInst::Originator::PropertyWrapper: {
-        SILValue initFn = inst->getInitializer();
-        CanSILFunctionType fTy = initFn->getType().castTo<SILFunctionType>();
-        SILFunctionConventions convention(fTy, inst->getModule());
-        SmallVector<SILValue, 4> args;
-        if (convention.hasIndirectSILResults()) {
-          if (inst->getMode() == AssignByWrapperInst::Assign)
-            b.createDestroyAddr(loc, dest);
-
-          args.push_back(dest);
-          getAssignByWrapperArgs(args, src, convention, b, forCleanup);
-          b.createApply(loc, initFn, SubstitutionMap(), args);
-        } else {
-          getAssignByWrapperArgs(args, src, convention, b, forCleanup);
-          SILValue wrappedSrc =
-              b.createApply(loc, initFn, SubstitutionMap(), args);
-          if (inst->getMode() == AssignByWrapperInst::Initialization ||
-              inst->getDest()->getType().isTrivial(*inst->getFunction())) {
-            b.createTrivialStoreOr(loc, wrappedSrc, dest,
-                                   StoreOwnershipQualifier::Init);
-          } else {
-            b.createStore(loc, wrappedSrc, dest,
-                          StoreOwnershipQualifier::Assign);
-          }
-        }
-        break;
-      }
       }
 
       // The unused partial_apply violates memory lifetime rules in case "self"

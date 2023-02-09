@@ -384,7 +384,7 @@ static void ParseModuleInterfaceArgs(ModuleInterfaceOptions &Opts,
   if (const Arg *A = Args.getLastArg(OPT_library_level)) {
     StringRef contents = A->getValue();
     if (contents == "spi") {
-      Opts.PrintSPIs = true;
+      Opts.PrintPrivateInterfaceContent = true;
     }
   }
   for (auto val: Args.getAllArgValues(OPT_skip_import_in_public_interface)) {
@@ -498,6 +498,12 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
                                OPT_disable_deserialization_recovery)) {
     Opts.EnableDeserializationRecovery
       = A->getOption().matches(OPT_enable_deserialization_recovery);
+  }
+
+  if (auto A = Args.getLastArg(OPT_enable_deserialization_safety,
+                               OPT_disable_deserialization_safety)) {
+    Opts.EnableDeserializationSafety
+      = A->getOption().matches(OPT_enable_deserialization_safety);
   }
 
   // Whether '/.../' regex literals are enabled. This implies experimental
@@ -1241,6 +1247,16 @@ static bool ParseClangImporterArgs(ClangImporterOptions &Opts,
     Opts.IndexStorePath = A->getValue();
 
   for (const Arg *A : Args.filtered(OPT_Xcc)) {
+    StringRef clangArg = A->getValue();
+    if (clangArg.consume_front("-working-directory")) {
+      if (!clangArg.empty() && clangArg.front() != '=') {
+        // Have an old -working-directory<path> argument. Convert it into
+        // two separate arguments as Clang no longer supports that format.
+        Opts.ExtraArgs.push_back("-working-directory");
+        Opts.ExtraArgs.push_back(clangArg.str());
+        continue;
+      }
+    }
     Opts.ExtraArgs.push_back(A->getValue());
   }
 
@@ -1331,6 +1347,7 @@ static void ParseSymbolGraphArgs(symbolgraphgen::SymbolGraphOptions &Opts,
         llvm::StringSwitch<AccessLevel>(A->getValue())
             .Case("open", AccessLevel::Open)
             .Case("public", AccessLevel::Public)
+            .Case("package", AccessLevel::Package)
             .Case("internal", AccessLevel::Internal)
             .Case("fileprivate", AccessLevel::FilePrivate)
             .Case("private", AccessLevel::Private)
@@ -1344,6 +1361,25 @@ static void ParseSymbolGraphArgs(symbolgraphgen::SymbolGraphOptions &Opts,
   Opts.EmitSynthesizedMembers = true;
   Opts.PrintMessages = false;
   Opts.IncludeClangDocs = false;
+}
+
+static bool validateSwiftModuleFileArgumentAndAdd(const std::string &swiftModuleArgument,
+                                                  DiagnosticEngine &Diags,
+                                                  std::vector<std::pair<std::string, std::string>> &ExplicitSwiftModuleInputs) {
+  std::size_t foundDelimeterPos = swiftModuleArgument.find_first_of("=");
+  if (foundDelimeterPos == std::string::npos) {
+    Diags.diagnose(SourceLoc(), diag::error_swift_module_file_requires_delimeter,
+                   swiftModuleArgument);
+    return true;
+  }
+  std::string moduleName = swiftModuleArgument.substr(0, foundDelimeterPos),
+              modulePath = swiftModuleArgument.substr(foundDelimeterPos+1);
+  if (!Lexer::isIdentifier(moduleName)) {
+    Diags.diagnose(SourceLoc(), diag::error_bad_module_name, moduleName, false);
+    return true;
+  }
+  ExplicitSwiftModuleInputs.emplace_back(std::make_pair(moduleName, modulePath));
+  return false;
 }
 
 static bool ParseSearchPathArgs(SearchPathOptions &Opts,
@@ -1398,6 +1434,11 @@ static bool ParseSearchPathArgs(SearchPathOptions &Opts,
 
   if (const Arg *A = Args.getLastArg(OPT_explicit_swift_module_map))
     Opts.ExplicitSwiftModuleMap = A->getValue();
+  for (auto A : Args.getAllArgValues(options::OPT_swift_module_file)) {
+    if (validateSwiftModuleFileArgumentAndAdd(A, Diags,
+                                              Opts.ExplicitSwiftModuleInputs))
+      return true;
+  }
   for (auto A: Args.filtered(OPT_candidate_module_file)) {
     Opts.CandidateCompiledModules.push_back(resolveSearchPath(A->getValue()));
   }
@@ -1460,11 +1501,23 @@ static bool ParseDiagnosticArgs(DiagnosticOptions &Opts, ArgList &Args,
       Opts.PrintedFormattingStyle = DiagnosticOptions::FormattingStyle::LLVM;
     } else if (contents == "swift") {
       Opts.PrintedFormattingStyle = DiagnosticOptions::FormattingStyle::Swift;
+    } else if (contents == "swift-syntax") {
+      Opts.PrintedFormattingStyle =
+          DiagnosticOptions::FormattingStyle::SwiftSyntax;
     } else {
       Diags.diagnose(SourceLoc(), diag::error_unsupported_option_argument,
                      arg->getOption().getPrefixedName(), arg->getValue());
       return true;
     }
+  }
+
+  for (const Arg *arg: Args.filtered(OPT_emit_macro_expansion_files)) {
+    StringRef contents = arg->getValue();
+    bool negated = contents.startswith("no-");
+    if (negated)
+      contents = contents.drop_front(3);
+    if (contents == "diagnostics")
+      Opts.EmitMacroExpansionFiles = !negated;
   }
 
   Opts.FixitCodeForAllDiagnostics |= Args.hasArg(OPT_fixit_all);
@@ -1817,9 +1870,13 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
   Opts.EnableStackProtection =
       Args.hasFlag(OPT_enable_stack_protector, OPT_disable_stack_protector,
                    Opts.EnableStackProtection);
-  Opts.EnableMoveInoutStackProtection =
-      Args.hasFlag(OPT_enable_move_inout_stack_protector, OPT_disable_stack_protector,
-                   Opts.EnableMoveInoutStackProtection);
+  Opts.EnableMoveInoutStackProtection = Args.hasArg(
+      OPT_enable_move_inout_stack_protector, OPT_disable_stack_protector,
+      Opts.EnableMoveInoutStackProtection);
+  Opts.EnableImportPtrauthFieldFunctionPointers =
+      Args.hasArg(OPT_enable_import_ptrauth_field_function_pointers,
+                  OPT_disable_import_ptrauth_field_function_pointers,
+                  Opts.EnableImportPtrauthFieldFunctionPointers);
   Opts.VerifyAll |= Args.hasArg(OPT_sil_verify_all);
   Opts.VerifyNone |= Args.hasArg(OPT_sil_verify_none);
   Opts.DebugSerialization |= Args.hasArg(OPT_sil_debug_serialization);
@@ -2476,6 +2533,10 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
       Args.hasFlag(OPT_enable_collocate_metadata_functions,
                    OPT_disable_collocate_metadata_functions,
                    Opts.CollocatedMetadataFunctions);
+  Opts.UseRelativeProtocolWitnessTables =
+    Args.hasFlag(OPT_enable_relative_protocol_witness_tables,
+                 OPT_disable_relative_protocol_witness_tables,
+                 Opts.UseRelativeProtocolWitnessTables);
   return false;
 }
 

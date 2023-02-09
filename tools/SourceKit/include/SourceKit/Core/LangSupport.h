@@ -363,6 +363,7 @@ public:
     return RequestResult();
   }
 
+  bool isValue() const { return type == Value; }
   const T &value() const {
     assert(type == Value);
     return *data;
@@ -556,8 +557,15 @@ struct CursorSymbolInfo {
     for (auto ParentContext : ParentContexts) {
       ParentContext.print(OS, Indentation + "    ");
     }
+
+    llvm::SmallVector<ReferencedDeclInfo> SortedReferencedSymbols(
+        ReferencedSymbols.begin(), ReferencedSymbols.end());
+    std::sort(SortedReferencedSymbols.begin(), SortedReferencedSymbols.end(),
+              [](const ReferencedDeclInfo &LHS, const ReferencedDeclInfo &RHS) {
+                return LHS.USR < RHS.USR;
+              });
     OS << Indentation << "ReferencedSymbols:" << '\n';
-    for (auto ReferencedSymbol : ReferencedSymbols) {
+    for (auto ReferencedSymbol : SortedReferencedSymbols) {
       ReferencedSymbol.print(OS, Indentation + "    ");
     }
     OS << Indentation << "ReceiverUSRs:" << '\n';
@@ -581,8 +589,14 @@ struct CursorInfoData {
   llvm::ArrayRef<CursorSymbolInfo> Symbols;
   /// All available actions on the code under cursor.
   llvm::ArrayRef<RefactoringInfo> AvailableActions;
+  /// Whether the ASTContext was reused for this cursor info.
+  bool DidReuseAST = false;
 
-  void print(llvm::raw_ostream &OS, std::string Indentation) const {
+  /// If \p ForSolverBasedCursorInfoVerification is \c true, fields that are
+  /// acceptable to differ between the AST-based and the solver-based result,
+  /// will be excluded.
+  void print(llvm::raw_ostream &OS, std::string Indentation,
+             bool ForSolverBasedCursorInfoVerification = false) const {
     OS << Indentation << "CursorInfoData" << '\n';
     OS << Indentation << "  Symbols:" << '\n';
     for (auto Symbol : Symbols) {
@@ -591,6 +605,9 @@ struct CursorInfoData {
     OS << Indentation << "  AvailableActions:" << '\n';
     for (auto AvailableAction : AvailableActions) {
       AvailableAction.print(OS, Indentation + "    ");
+    }
+    if (!ForSolverBasedCursorInfoVerification) {
+      OS << Indentation << "DidReuseAST: " << DidReuseAST << '\n';
     }
   }
 
@@ -845,6 +862,16 @@ public:
 
   virtual void dependencyUpdated() {}
 
+  virtual void demangleNames(
+      ArrayRef<const char *> MangledNames, bool Simplified,
+      std::function<void(const RequestResult<ArrayRef<std::string>> &)>
+          Receiver) = 0;
+
+  virtual void mangleSimpleClassNames(
+      ArrayRef<std::pair<StringRef, StringRef>> ModuleClassPairs,
+      std::function<void(const RequestResult<ArrayRef<std::string>> &)>
+          Receiver) = 0;
+
   virtual void indexSource(StringRef Filename,
                            IndexingConsumer &Consumer,
                            ArrayRef<const char *> Args) = 0;
@@ -938,6 +965,7 @@ public:
       bool SymbolGraph, bool CancelOnSubsequentRequest,
       ArrayRef<const char *> Args, Optional<VFSOptions> vfsOptions,
       SourceKitCancellationToken CancellationToken,
+      bool VerifySolverBasedCursorInfo,
       std::function<void(const RequestResult<CursorInfoData> &)> Receiver) = 0;
 
   virtual void

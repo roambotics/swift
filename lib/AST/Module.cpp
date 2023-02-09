@@ -573,7 +573,8 @@ void ModuleDecl::updateSourceFileLocationMap() {
   }
 
   // If we are up-to-date, there's nothing to do.
-  if (sourceFileLocationMap->numFiles == getFiles().size() &&
+  ArrayRef<FileUnit *> files = Files;
+  if (sourceFileLocationMap->numFiles == files.size() &&
       sourceFileLocationMap->numAuxiliaryFiles ==
           AuxiliaryFiles.size())
     return;
@@ -582,7 +583,7 @@ void ModuleDecl::updateSourceFileLocationMap() {
   sourceFileLocationMap->allSourceFiles.clear();
 
   // First, add all of the source files with a backing buffer.
-  for (auto *fileUnit : getFiles()) {
+  for (auto *fileUnit : files) {
     if (auto sourceFile = dyn_cast<SourceFile>(fileUnit)) {
       if (sourceFile->getBufferID())
         sourceFileLocationMap->allSourceFiles.push_back(sourceFile);
@@ -597,6 +598,9 @@ void ModuleDecl::updateSourceFileLocationMap() {
   std::sort(sourceFileLocationMap->allSourceFiles.begin(),
             sourceFileLocationMap->allSourceFiles.end(),
             SourceFileRangeComparison{&getASTContext().SourceMgr});
+
+  sourceFileLocationMap->numFiles = files.size();
+  sourceFileLocationMap->numAuxiliaryFiles = AuxiliaryFiles.size();
 }
 
 SourceFile *ModuleDecl::getSourceFileContainingLocation(SourceLoc loc) {
@@ -665,15 +669,15 @@ ArrayRef<SourceFile *> ModuleDecl::getPrimarySourceFiles() const {
   return evaluateOrDefault(eval, PrimarySourceFilesRequest{mutableThis}, {});
 }
 
-SourceFile *CodeCompletionFileRequest::evaluate(Evaluator &evaluator,
-                                                ModuleDecl *mod) const {
+SourceFile *IDEInspectionFileRequest::evaluate(Evaluator &evaluator,
+                                               ModuleDecl *mod) const {
   const auto &SM = mod->getASTContext().SourceMgr;
   assert(mod->isMainModule() && "Can only do completion in the main module");
-  assert(SM.hasCodeCompletionBuffer() && "Not performing code completion?");
+  assert(SM.hasIDEInspectionTargetBuffer() && "Not in IDE inspection mode?");
 
   for (auto *file : mod->getFiles()) {
     auto *SF = dyn_cast<SourceFile>(file);
-    if (SF && SF->getBufferID() == SM.getCodeCompletionBufferID())
+    if (SF && SF->getBufferID() == SM.getIDEInspectionTargetBufferID())
       return SF;
   }
   llvm_unreachable("Couldn't find the completion file?");
@@ -877,8 +881,55 @@ void SourceFile::lookupClassMembers(ImportPath::Access accessPath,
   cache.lookupClassMembers(accessPath, consumer);
 }
 
-SourceFile *SourceFile::getEnclosingSourceFile() const {
+ASTNode SourceFile::getMacroExpansion() const {
   if (Kind != SourceFileKind::MacroExpansion)
+    return nullptr;
+
+  auto genInfo =
+      *getASTContext().SourceMgr.getGeneratedSourceInfo(*getBufferID());
+  return ASTNode::getFromOpaqueValue(genInfo.astNode);
+}
+
+CustomAttr *SourceFile::getAttachedMacroAttribute() const {
+  if (Kind != SourceFileKind::MacroExpansion)
+    return nullptr;
+
+  auto genInfo =
+      *getASTContext().SourceMgr.getGeneratedSourceInfo(*getBufferID());
+  return genInfo.attachedMacroCustomAttr;
+}
+
+Optional<MacroRole> SourceFile::getFulfilledMacroRole() const {
+  if (Kind != SourceFileKind::MacroExpansion)
+    return None;
+
+  auto genInfo =
+      *getASTContext().SourceMgr.getGeneratedSourceInfo(*getBufferID());
+  switch (genInfo.kind) {
+  case GeneratedSourceInfo::ExpressionMacroExpansion:
+    return MacroRole::Expression;
+
+  case GeneratedSourceInfo::FreestandingDeclMacroExpansion:
+    return MacroRole::Declaration;
+
+  case GeneratedSourceInfo::AccessorMacroExpansion:
+    return MacroRole::Accessor;
+
+  case GeneratedSourceInfo::MemberAttributeMacroExpansion:
+    return MacroRole::MemberAttribute;
+
+  case GeneratedSourceInfo::MemberMacroExpansion:
+    return MacroRole::Member;
+
+  case GeneratedSourceInfo::ReplacedFunctionBody:
+  case GeneratedSourceInfo::PrettyPrinted:
+    return None;
+  }
+}
+
+SourceFile *SourceFile::getEnclosingSourceFile() const {
+  auto macroExpansion = getMacroExpansion();
+  if (!macroExpansion)
     return nullptr;
 
   auto sourceLoc = macroExpansion.getStartLoc();
@@ -1158,6 +1209,13 @@ ModuleDecl::lookupExistentialConformance(Type type, ProtocolDecl *protocol) {
   if (!protocol->existentialConformsToSelf())
     return ProtocolConformanceRef::forInvalid();
 
+  // All existentials are Copyable.
+  if (protocol->isSpecificProtocol(KnownProtocolKind::Copyable)) {
+    return ProtocolConformanceRef(
+        ctx.getBuiltinConformance(type, protocol, GenericSignature(), {},
+                                  BuiltinConformanceKind::Synthesized));
+  }
+
   auto layout = type->getExistentialLayout();
 
   // Due to an IRGen limitation, witness tables cannot be passed from an
@@ -1314,8 +1372,10 @@ static ProtocolConformanceRef getBuiltinTupleTypeConformance(
     return ProtocolConformanceRef(specialized);
   }
 
-  // Tuple type are Sendable when all of their element types are Sendable.
-  if (protocol->isSpecificProtocol(KnownProtocolKind::Sendable)) {
+  /// For some known protocols (KPs) like Sendable and Copyable, a tuple type
+  /// conforms to the protocol KP when all of their element types conform to KP.
+  if (protocol->isSpecificProtocol(KnownProtocolKind::Sendable) ||
+      protocol->isSpecificProtocol(KnownProtocolKind::Copyable)) {
 
     // Create the pieces for a generic tuple type (T1, T2, ... TN) and a
     // generic signature <T1, T2, ..., TN>.
@@ -1341,9 +1401,9 @@ static ProtocolConformanceRef getBuiltinTupleTypeConformance(
                                     BuiltinConformanceKind::Synthesized));
     }
 
-    // Form a generic conformance of (T1, T2, ..., TN): Sendable with signature
-    // <T1, T2, ..., TN> and conditional requirements T1: Sendable,
-    // T2: Sendable, ..., TN: Sendable.
+    // Form a generic conformance of (T1, T2, ..., TN): KP with signature
+    // <T1, T2, ..., TN> and conditional requirements T1: KP,
+    // T2: P, ..., TN: KP.
     auto genericTupleType = TupleType::get(genericElements, ctx);
     auto genericSig = GenericSignature::get(
         genericParams, conditionalRequirements);
@@ -1392,12 +1452,20 @@ static bool isSendableFunctionType(const FunctionType *functionType) {
 /// appropriate.
 static ProtocolConformanceRef getBuiltinFunctionTypeConformance(
     Type type, const FunctionType *functionType, ProtocolDecl *protocol) {
+  ASTContext &ctx = protocol->getASTContext();
   // @Sendable function types are Sendable.
   if (protocol->isSpecificProtocol(KnownProtocolKind::Sendable) &&
       isSendableFunctionType(functionType)) {
-    ASTContext &ctx = protocol->getASTContext();
     return ProtocolConformanceRef(
         ctx.getBuiltinConformance(type, protocol, GenericSignature(), { },
+                                  BuiltinConformanceKind::Synthesized));
+  }
+
+  // Functions cannot permanently destroy a move-only var/let
+  // that they capture, so it's safe to copy functions, like classes.
+  if (protocol->isSpecificProtocol(KnownProtocolKind::Copyable)) {
+    return ProtocolConformanceRef(
+        ctx.getBuiltinConformance(type, protocol, GenericSignature(), {},
                                   BuiltinConformanceKind::Synthesized));
   }
 
@@ -1408,8 +1476,9 @@ static ProtocolConformanceRef getBuiltinFunctionTypeConformance(
 /// appropriate.
 static ProtocolConformanceRef getBuiltinMetaTypeTypeConformance(
     Type type, const AnyMetatypeType *metatypeType, ProtocolDecl *protocol) {
-  // All metatypes are Sendable.
-  if (protocol->isSpecificProtocol(KnownProtocolKind::Sendable)) {
+  // All metatypes are Sendable and Copyable
+  if (protocol->isSpecificProtocol(KnownProtocolKind::Sendable) ||
+      protocol->isSpecificProtocol(KnownProtocolKind::Copyable)) {
     ASTContext &ctx = protocol->getASTContext();
     return ProtocolConformanceRef(
         ctx.getBuiltinConformance(type, protocol, GenericSignature(), { },
@@ -1423,8 +1492,9 @@ static ProtocolConformanceRef getBuiltinMetaTypeTypeConformance(
 /// appropriate.
 static ProtocolConformanceRef getBuiltinBuiltinTypeConformance(
     Type type, const BuiltinType *builtinType, ProtocolDecl *protocol) {
-  // All builtin are Sendable.
-  if (protocol->isSpecificProtocol(KnownProtocolKind::Sendable)) {
+  // All builtin are Sendable and Copyable
+  if (protocol->isSpecificProtocol(KnownProtocolKind::Sendable) ||
+      protocol->isSpecificProtocol(KnownProtocolKind::Copyable)) {
     ASTContext &ctx = protocol->getASTContext();
     return ProtocolConformanceRef(
         ctx.getBuiltinConformance(type, protocol, GenericSignature(), { },
@@ -1478,6 +1548,10 @@ LookupConformanceInModuleRequest::evaluate(
   // archetype's list of conformances, or if the archetype has a superclass
   // constraint and the superclass conforms to the protocol.
   if (auto archetype = type->getAs<ArchetypeType>()) {
+
+    // All archetypes conform to Copyable since they represent a generic.
+    if (protocol->isSpecificProtocol(KnownProtocolKind::Copyable))
+      return ProtocolConformanceRef(protocol);
 
     // The generic signature builder drops conformance requirements that are made
     // redundant by a superclass requirement, so check for a concrete
@@ -1587,6 +1661,15 @@ LookupConformanceInModuleRequest::evaluate(
         }
       } else {
         return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
+      }
+    } else if (protocol->isSpecificProtocol(KnownProtocolKind::Copyable)) {
+      // Only move-only nominals are not Copyable
+      if (nominal->isMoveOnly()) {
+        return ProtocolConformanceRef::forInvalid();
+      } else {
+        // FIXME: this should probably follow the Sendable case in that
+        // we should synthesize and append a ProtocolConformance to the `conformances` list.
+       return ProtocolConformanceRef(protocol);
       }
     } else {
       // Was unable to infer the missing conformance.
@@ -1860,6 +1943,8 @@ StringRef ModuleDecl::ReverseFullNameIterator::operator*() const {
 
   auto *clangModule =
       static_cast<const clang::Module *>(current.get<const void *>());
+  if (!clangModule->isSubModule() && clangModule->Name == "std")
+    return "CxxStdlib";
   return clangModule->Name;
 }
 
@@ -1994,6 +2079,23 @@ StringRef ModuleDecl::getModuleLoadedFilename() const {
     }
   }
   return StringRef();
+}
+
+bool ModuleDecl::isSDKModule() const {
+  auto sdkPath = getASTContext().SearchPathOpts.getSDKPath();
+  if (sdkPath.empty())
+    return false;
+
+  auto modulePath = getModuleSourceFilename();
+  auto si = llvm::sys::path::begin(sdkPath),
+       se = llvm::sys::path::end(sdkPath);
+  for (auto mi = llvm::sys::path::begin(modulePath),
+       me = llvm::sys::path::end(modulePath);
+       si != se && mi != me; ++si, ++mi) {
+    if (*si != *mi)
+      return false;
+  }
+  return si == se;
 }
 
 bool ModuleDecl::isStdlibModule() const {
@@ -2725,6 +2827,7 @@ bool SourceFile::hasTestableOrPrivateImport(
   auto *module = ofDecl->getModuleContext();
   switch (accessLevel) {
   case AccessLevel::Internal:
+  case AccessLevel::Package:
   case AccessLevel::Public:
     // internal/public access only needs an import marked as @_private. The
     // filename does not need to match (and we don't serialize it for such
@@ -3246,17 +3349,13 @@ ModuleDecl::computeFileIDMap(bool shouldDiagnose) const {
 
 SourceFile::SourceFile(ModuleDecl &M, SourceFileKind K,
                        Optional<unsigned> bufferID,
-                       ParsingOptions parsingOpts, bool isPrimary,
-                       ASTNode macroExpansion)
+                       ParsingOptions parsingOpts, bool isPrimary)
     : FileUnit(FileUnitKind::Source, M), BufferID(bufferID ? *bufferID : -1),
-      ParsingOpts(parsingOpts), IsPrimary(isPrimary),
-      macroExpansion(macroExpansion), Kind(K) {
+      ParsingOpts(parsingOpts), IsPrimary(isPrimary), Kind(K) {
   M.getASTContext().addDestructorCleanup(*this);
 
   assert(!IsPrimary || M.isMainModule() &&
          "A primary cannot appear outside the main module");
-  assert(macroExpansion.isNull() == (K != SourceFileKind::MacroExpansion) &&
-         "Macro expansions always need an expansion node");
 
   if (isScriptMode()) {
     bool problem = M.registerEntryPointFile(this, SourceLoc(), None);
@@ -3350,6 +3449,15 @@ ArrayRef<Decl *> SourceFile::getHoistedDecls() const {
   return Hoisted;
 }
 
+void SourceFile::addDeclWithRuntimeDiscoverableAttrs(ValueDecl *decl) {
+  assert(!decl->getRuntimeDiscoverableAttrs().empty());
+  DeclsWithRuntimeDiscoverableAttrs.insert(decl);
+}
+
+ArrayRef<ValueDecl *> SourceFile::getDeclsWithRuntimeDiscoverableAttrs() const {
+  return DeclsWithRuntimeDiscoverableAttrs.getArrayRef();
+}
+
 bool FileUnit::walk(ASTWalker &walker) {
   SmallVector<Decl *, 64> Decls;
   getTopLevelDecls(Decls);
@@ -3362,14 +3470,14 @@ bool FileUnit::walk(ASTWalker &walker) {
     if (SkipInternal) {
       // Ignore if the decl isn't visible
       if (auto *VD = dyn_cast<ValueDecl>(D)) {
-        if (!VD->isAccessibleFrom(nullptr))
+        if (VD->getFormalAccess() < AccessLevel::Public)
           continue;
       }
 
       // Also ignore if the extended nominal isn't visible
       if (auto *ED = dyn_cast<ExtensionDecl>(D)) {
         auto *ND = ED->getExtendedNominal();
-        if (ND && !ND->isAccessibleFrom(nullptr))
+        if (ND && ND->getFormalAccess() < AccessLevel::Public)
           continue;
       }
     }

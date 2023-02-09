@@ -17,7 +17,7 @@ import SILBridging
 //                       Instruction base classes
 //===----------------------------------------------------------------------===//
 
-public class Instruction : ListNode, CustomStringConvertible, Hashable {
+public class Instruction : CustomStringConvertible, Hashable {
   final public var next: Instruction? {
     SILInstruction_next(bridged).instruction
   }
@@ -26,20 +26,19 @@ public class Instruction : ListNode, CustomStringConvertible, Hashable {
     SILInstruction_previous(bridged).instruction
   }
 
-  // Needed for ReverseList<Instruction>.reversed(). Never use directly.
-  public var _firstInList: Instruction { SILBasicBlock_firstInst(block.bridged).instruction! }
-  // Needed for List<Instruction>.reversed(). Never use directly.
-  public var _lastInList: Instruction { SILBasicBlock_lastInst(block.bridged).instruction! }
-
-  final public var block: BasicBlock {
+  final public var parentBlock: BasicBlock {
     SILInstruction_getParent(bridged).block
   }
 
-  final public var function: Function { block.function }
+  final public var parentFunction: Function { parentBlock.parentFunction }
 
   final public var description: String {
     let stdString = SILNode_debugDescription(bridgedNode)
     return String(_cxxString: stdString)
+  }
+
+  final public var isDeleted: Bool {
+    return SILInstruction_isDeleted(bridged)
   }
 
   final public var operands: OperandArray {
@@ -158,7 +157,6 @@ extension OptionalBridgedInstruction {
 
 public class SingleValueInstruction : Instruction, Value {
   final public var definingInstruction: Instruction? { self }
-  final public var definingBlock: BasicBlock { block }
 
   fileprivate final override var resultCount: Int { 1 }
   fileprivate final override func getResult(index: Int) -> Value { self }
@@ -174,12 +172,13 @@ public final class MultipleValueInstructionResult : Value {
     return String(_cxxString: stdString)
   }
 
-  public var instruction: Instruction {
-    MultiValueInstResult_getParent(bridged).instruction
+  public var parentInstruction: MultipleValueInstruction {
+    MultiValueInstResult_getParent(bridged).getAs(MultipleValueInstruction.self)
   }
 
-  public var definingInstruction: Instruction? { instruction }
-  public var definingBlock: BasicBlock { instruction.block }
+  public var definingInstruction: Instruction? { parentInstruction }
+
+  public var parentBlock: BasicBlock { parentInstruction.parentBlock }
 
   public var index: Int { MultiValueInstResult_getIndex(bridged) }
 
@@ -279,6 +278,9 @@ final public class DeallocStackRefInst : Instruction, UnaryInstruction {
   public var allocRef: AllocRefInstBase { operand as! AllocRefInstBase }
 }
 
+final public class MarkUninitializedInst : SingleValueInstruction, UnaryInstruction {
+}
+
 final public class CondFailInst : Instruction, UnaryInstruction {
   public override var mayTrap: Bool { true }
 
@@ -288,6 +290,8 @@ final public class CondFailInst : Instruction, UnaryInstruction {
 final public class FixLifetimeInst : Instruction, UnaryInstruction {}
 
 final public class DebugValueInst : Instruction, UnaryInstruction {}
+
+final public class DebugStepInst : Instruction {}
 
 final public class UnconditionalCheckedCastAddrInst : Instruction {
   public override var mayTrap: Bool { true }
@@ -415,6 +419,8 @@ class InitExistentialMetatypeInst : SingleValueInstruction, UnaryInstruction {}
 final public
 class OpenExistentialMetatypeInst : SingleValueInstruction, UnaryInstruction {}
 
+final public class MetatypeInst : SingleValueInstruction {}
+
 final public
 class ValueMetatypeInst : SingleValueInstruction, UnaryInstruction {}
 
@@ -450,7 +456,9 @@ final public class GlobalAddrInst : GlobalAccessInst {}
 
 final public class GlobalValueInst : GlobalAccessInst {}
 
-final public class IntegerLiteralInst : SingleValueInstruction {}
+final public class IntegerLiteralInst : SingleValueInstruction {
+  public var value: llvm.APInt { IntegerLiteralInst_getValue(bridged) }
+}
 
 final public class StringLiteralInst : SingleValueInstruction {
   public var string: String { StringLiteralInst_getValue(bridged).string }
@@ -603,6 +611,8 @@ final public class ProjectBoxInst : SingleValueInstruction, UnaryInstruction {
 
 final public class CopyValueInst : SingleValueInstruction, UnaryInstruction {}
 
+final public class MoveValueInst : SingleValueInstruction, UnaryInstruction {}
+
 final public class StrongCopyUnownedValueInst : SingleValueInstruction, UnaryInstruction {}
 
 final public class StrongCopyUnmanagedValueInst : SingleValueInstruction, UnaryInstruction  {}
@@ -636,6 +646,13 @@ final public class ApplyInst : SingleValueInstruction, FullApplySite {
   public var numArguments: Int { ApplyInst_numArguments(bridged) }
 
   public var singleDirectResult: Value? { self }
+
+  public var isNonThrowing: Bool { ApplyInst_getNonThrowing(bridged) }
+  public var isNonAsync: Bool { ApplyInst_getNonAsync(bridged) }
+
+  public typealias SpecializationInfo = UnsafePointer<swift.GenericSpecializationInformation>?
+
+  public var specializationInfo: SpecializationInfo { ApplyInst_getSpecializationInfo(bridged) }
 }
 
 final public class ClassMethodInst : SingleValueInstruction, UnaryInstruction {}
@@ -755,13 +772,13 @@ final public class BranchInst : TermInst {
 }
 
 final public class CondBranchInst : TermInst {
-  var trueBlock: BasicBlock { successors[0] }
-  var falseBlock: BasicBlock { successors[1] }
+  public var trueBlock: BasicBlock { successors[0] }
+  public var falseBlock: BasicBlock { successors[1] }
 
-  var condition: Value { operands[0].value }
+  public var condition: Value { operands[0].value }
 
-  var trueOperands: OperandArray { operands[1...CondBranchInst_getNumTrueArgs(bridged)] }
-  var falseOperands: OperandArray {
+  public var trueOperands: OperandArray { operands[1..<(CondBranchInst_getNumTrueArgs(bridged) &+ 1)] }
+  public var falseOperands: OperandArray {
     let ops = operands
     return ops[(CondBranchInst_getNumTrueArgs(bridged) &+ 1)..<ops.count]
   }

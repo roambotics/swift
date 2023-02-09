@@ -32,18 +32,28 @@ public struct Type : CustomStringConvertible, NoReflectionChildren {
     return SILType_isReferenceCounted(bridged, function.bridged) != 0
   }
 
+  public var hasArchetype: Bool { SILType_hasArchetype(bridged) }
+
   public var isNominal: Bool { SILType_isNominal(bridged) != 0 }
   public var isClass: Bool { SILType_isClass(bridged) != 0 }
   public var isStruct: Bool { SILType_isStruct(bridged) != 0 }
   public var isTuple: Bool { SILType_isTuple(bridged) != 0 }
   public var isEnum: Bool { SILType_isEnum(bridged) != 0 }
   public var isFunction: Bool { SILType_isFunction(bridged) }
+  public var isMetatype: Bool { SILType_isMetatype(bridged) }
+
+  /// Can only be used if the type is in fact a nominal type (`isNominal` is true).
+  public var nominal: Decl { Decl(bridged: SILType_getNominal(bridged)) }
+
+  public var isOrContainsObjectiveCClass: Bool { SILType_isOrContainsObjectiveCClass(bridged) }
 
   public var tupleElements: TupleElementArray { TupleElementArray(type: self) }
 
   public func getNominalFields(in function: Function) -> NominalFieldsArray {
     NominalFieldsArray(type: self, function: function)
   }
+
+  public var instanceTypeOfMetatype: Type { SILType_instanceTypeOfMetatype(bridged).type }
 
   public var isCalleeConsumedFunction: Bool { SILType_isCalleeConsumedFunction(bridged) }
   
@@ -101,4 +111,13 @@ public struct TupleElementArray : RandomAccessCollection, FormattedLikeArray {
 
 extension BridgedType {
   var type: Type { Type(bridged: self) }
+}
+
+// TODO: use an AST type for this once we have it
+public struct Decl : Equatable {
+  let bridged: BridgedDecl
+
+  public static func ==(lhs: Decl, rhs: Decl) -> Bool {
+    lhs.bridged == rhs.bridged
+  }
 }

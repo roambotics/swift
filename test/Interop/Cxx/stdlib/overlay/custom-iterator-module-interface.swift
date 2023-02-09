@@ -85,3 +85,23 @@
 // CHECK-NOT: struct HasNoIncrementOperator : UnsafeCxxInputIterator
 // CHECK-NOT: struct HasNoPreIncrementOperator : UnsafeCxxInputIterator
 // CHECK-NOT: struct HasNoDereferenceOperator : UnsafeCxxInputIterator
+
+// CHECK: struct __CxxTemplateInst17TemplatedIteratorIiE : UnsafeCxxInputIterator {
+// CHECK:   var pointee: Int32 { get }
+// CHECK:   func successor() -> __CxxTemplateInst17TemplatedIteratorIiE
+// CHECK:   typealias Pointee = Int32
+// CHECK:   static func == (lhs: __CxxTemplateInst17TemplatedIteratorIiE, other: __CxxTemplateInst17TemplatedIteratorIiE) -> Bool
+// CHECK: }
+
+// CHECK: struct __CxxTemplateInst28TemplatedIteratorOutOfLineEqIiE : UnsafeCxxInputIterator {
+// CHECK:   var pointee: Int32 { get }
+// CHECK:   func successor() -> __CxxTemplateInst28TemplatedIteratorOutOfLineEqIiE
+// CHECK:   typealias Pointee = Int32
+// CHECK: }
+
+// CHECK: struct __CxxTemplateInst31TemplatedRACIteratorOutOfLineEqIiE : UnsafeCxxRandomAccessIterator, UnsafeCxxInputIterator {
+// CHECK:   var pointee: Int32 { get }
+// CHECK:   func successor() -> __CxxTemplateInst31TemplatedRACIteratorOutOfLineEqIiE
+// CHECK:   typealias Pointee = Int32
+// CHECK:   typealias Distance = __CxxTemplateInst31TemplatedRACIteratorOutOfLineEqIiE.difference_type
+// CHECK: }

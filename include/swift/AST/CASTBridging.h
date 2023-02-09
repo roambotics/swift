@@ -169,6 +169,9 @@ void *SwiftVarDecl_create(void *ctx, BridgedIdentifier _Nullable name,
                           void *initExpr, void *loc, _Bool isStatic,
                           _Bool isLet, void *dc);
 
+void *SingleValueStmtExpr_createWithWrappedBranches(void *ctx, void *S,
+                                                    void *DC, _Bool mustBeExpr);
+
 void *IfStmt_create(void *ctx, void *ifLoc, void *cond, void *_Nullable then,
                     void *_Nullable elseLoc, void *_Nullable elseStmt);
 
@@ -239,10 +242,11 @@ void *ImplicitlyUnwrappedOptionalTypeRepr_create(void *ctx, void *base,
                                                  void *exclamationLoc);
 void *MetatypeTypeRepr_create(void *ctx, void *baseType, void *typeLoc);
 void *ProtocolTypeRepr_create(void *ctx, void *baseType, void *protoLoc);
-void *PackExpansionTypeRepr_create(void *ctx, void *base, void *ellipsisLoc);
+void *PackExpansionTypeRepr_create(void *ctx, void *base, void *repeatLoc);
 void *TupleTypeRepr_create(void *ctx, BridgedArrayRef elements, void *lParenLoc,
                            void *rParenLoc);
-void *IdentTypeRepr_create(void *ctx, BridgedArrayRef components);
+void *MemberTypeRepr_create(void *ctx, void *baseComponent,
+                            BridgedArrayRef bridgedMemberComponents);
 void *GenericIdentTypeRepr_create(void *ctx, BridgedIdentifier name,
                                   void *nameLoc, BridgedArrayRef genericArgs,
                                   void *lAngle, void *rAngle);

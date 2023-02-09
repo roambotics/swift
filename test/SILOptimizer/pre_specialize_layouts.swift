@@ -16,8 +16,6 @@
 // RUN: %target-swift-frontend -enable-experimental-feature LayoutPrespecialization -O -swift-version 5 -enable-library-evolution -emit-module -o /dev/null -emit-module-interface-path %t/pre_specialized_module_layouts.swiftinterface %S/Inputs/pre_specialized_module_layouts.swift -module-name pre_specialized_module_layouts
 // RUN: %target-swift-frontend -enable-experimental-feature LayoutPrespecialization -I %t -O -Xllvm -sil-disable-pass=function-signature-opts -emit-sil %s | %FileCheck %s --check-prefix=OPT
 
-// REQUIRES: asserts
-
 import pre_specialized_module_layouts
 
 // Helper to prevent return values from getting optimized away
@@ -106,28 +104,23 @@ internal func testEmitIntoClient<T>(t: T) {
 // OPT:   [[R1:%.*]] = init_existential_addr {{%.*}} : $*Any, $SomeClass
 // OPT:   [[F1:%.*]] = function_ref @$s30pre_specialized_module_layouts14InternalThing2V7computexyFyXl_Ts5 : $@convention(method) (@guaranteed InternalThing2<AnyObject>) -> @owned AnyObject
 // OPT:   [[R2:%.*]] = unchecked_addr_cast [[R1]] : $*SomeClass to $*AnyObject
-// OPT:   [[A1:%.*]] = unchecked_bitwise_cast {{%.*}} : $InternalThing2<SomeClass> to $InternalThing2<AnyObject>
-// OPT:   [[R3:%.*]] = apply [[F1]]([[A1]]) : $@convention(method) (@guaranteed InternalThing2<AnyObject>) -> @owned AnyObject
+// OPT:   [[R3:%.*]] = apply [[F1]]({{.*}}) : $@convention(method) (@guaranteed InternalThing2<AnyObject>) -> @owned AnyObject
 // OPT:   store [[R3]] to [[R2]] : $*AnyObject
 // OPT:   [[R4:%.*]] = init_existential_addr {{%.*}} : $*Any, $SomeClass
 // OPT:   [[F2:%.*]] = function_ref @$s30pre_specialized_module_layouts14InternalThing2V9computedXxvgyXl_Ts5 : $@convention(method) (@guaranteed InternalThing2<AnyObject>) -> @owned AnyObject
 // OPT:   [[R5:%.*]] = unchecked_addr_cast [[R4]] : $*SomeClass to $*AnyObject
-// OPT:   [[A2:%.*]] = unchecked_bitwise_cast {{%.*}} : $InternalThing2<SomeClass> to $InternalThing2<AnyObject>
-// OPT:   [[R6:%.*]] = apply [[F2]]([[A2]]) : $@convention(method) (@guaranteed InternalThing2<AnyObject>) -> @owned AnyObject
+// OPT:   [[R6:%.*]] = apply [[F2]]({{.*}}) : $@convention(method) (@guaranteed InternalThing2<AnyObject>) -> @owned AnyObject
 // OPT:   store [[R6]] to [[R5]] : $*AnyObject
 // OPT:   [[F3:%.*]] = function_ref @$s30pre_specialized_module_layouts14InternalThing2V9computedYxvsyXl_Ts5 : $@convention(method) (@owned AnyObject, @inout InternalThing2<AnyObject>) -> ()
 // OPT:   [[A3:%.*]] = unchecked_ref_cast {{%.*}} : $SomeClass to $AnyObject
-// OPT:   [[A4:%.*]] = unchecked_addr_cast {{%.*}} : $*InternalThing2<SomeClass> to $*InternalThing2<AnyObject>
-// OPT:   apply [[F3]]([[A3]], [[A4]]) : $@convention(method) (@owned AnyObject, @inout InternalThing2<AnyObject>) -> ()
+// OPT:   apply [[F3]]([[A3]], {{.*}}) : $@convention(method) (@owned AnyObject, @inout InternalThing2<AnyObject>) -> ()
 // OPT:   [[F4:%.*]] = function_ref @$s30pre_specialized_module_layouts14InternalThing2V9computedYxvgyXl_Ts5 : $@convention(method) (@guaranteed InternalThing2<AnyObject>) -> @owned AnyObject
-// OPT:   [[A5:%.*]] = unchecked_bitwise_cast {{%.*}} : $InternalThing2<SomeClass> to $InternalThing2<AnyObject>
-// OPT:   [[R5:%.*]] = apply [[F4]]([[A5]]) : $@convention(method) (@guaranteed InternalThing2<AnyObject>) -> @owned AnyObject
+// OPT:   [[R5:%.*]] = apply [[F4]]({{.*}}) : $@convention(method) (@guaranteed InternalThing2<AnyObject>) -> @owned AnyObject
 // OPT:   [[F5:%.*]] = function_ref @$s30pre_specialized_module_layouts14InternalThing2V9computedZxvMyXl_Ts5 : $@yield_once @convention(method) (@inout InternalThing2<AnyObject>) -> @yields @inout AnyObject
-// OPT:   ([[R7:%.*]], {{%.*}}) = begin_apply [[F5]]([[A4]]) : $@yield_once @convention(method) (@inout InternalThing2<AnyObject>) -> @yields @inout AnyObject
+// OPT:   ([[R7:%.*]], {{%.*}}) = begin_apply [[F5]]({{.*}}) : $@yield_once @convention(method) (@inout InternalThing2<AnyObject>) -> @yields @inout AnyObject
 // OPT:   [[R8:%.*]] = unchecked_addr_cast [[R7]] : $*AnyObject to $*SomeClass
 // OPT:   [[F6:%.*]] = function_ref @$s30pre_specialized_module_layouts14InternalThing2V9computedZxvryXl_Ts5 : $@yield_once @convention(method) (@guaranteed InternalThing2<AnyObject>) -> @yields @in_guaranteed AnyObject
-// OPT:   [[A6:%.*]] = unchecked_bitwise_cast {{%.*}} : $InternalThing2<SomeClass> to $InternalThing2<AnyObject>
-// OPT:   ([[R9:%.*]], {{%.*}}) = begin_apply [[F6]]([[A6]]) : $@yield_once @convention(method) (@guaranteed InternalThing2<AnyObject>) -> @yields @in_guaranteed AnyObject
+// OPT:   ([[R9:%.*]], {{%.*}}) = begin_apply [[F6]]({{.*}}) : $@yield_once @convention(method) (@guaranteed InternalThing2<AnyObject>) -> @yields @in_guaranteed AnyObject
 // OPT:   [[R10:%.*]] = unchecked_addr_cast [[R9]] : $*AnyObject to $*SomeClass
 // OPT: } // end sil function '$s30pre_specialized_module_layouts16useInternalThingyyxlFAA9SomeClassC_Tg5'
 
@@ -190,6 +183,17 @@ public func usePartialApply(y: SomeClass) -> (SomeClass) -> SomeClass {
   }
 
   return usePartialApplyInner
+}
+
+// NOTE: AnyObject specializations MUST not be applied to existential references.
+
+// OPT: sil @$s22pre_specialize_layouts48useLayoutPrespecializedEntryPointWithExistentialyyAA21SomeReferenceProtocol_pF : $@convention(thin) (@guaranteed any SomeReferenceProtocol) -> () {
+// OPT:   {{bb.*}}([[A1:%.*]] : $any SomeReferenceProtocol):
+// OPT-NOT: {{%.*}} = function_ref @$s30pre_specialized_module_layouts20publicPrespecializedyyxlFyXl_Ts5 : $@convention(thin) (@guaranteed AnyObject) -> ()
+// OPT: } // end sil function '$s22pre_specialize_layouts48useLayoutPrespecializedEntryPointWithExistentialyyAA21SomeReferenceProtocol_pF'
+public protocol SomeReferenceProtocol: AnyObject {}
+public func useLayoutPrespecializedEntryPointWithExistential(_ p: any SomeReferenceProtocol) {
+  publicPrespecialized(p)
 }
 
 // OPT-macosx: sil [available 10.50] @$s22pre_specialize_layouts40usePrespecializedEntryPointsAvailabilityyyF : $@convention(thin) () -> () {

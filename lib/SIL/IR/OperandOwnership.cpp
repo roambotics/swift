@@ -27,9 +27,6 @@ bool swift::checkOperandOwnershipInvariants(const Operand *operand,
     // Must be a valid BorrowingOperand.
     return bool(BorrowingOperand(const_cast<Operand *>(operand)));
   }
-  if (opOwnership == OperandOwnership::GuaranteedForwarding) {
-    return canOpcodeForwardGuaranteedValues(const_cast<Operand *>(operand));
-  }
   return true;
 }
 
@@ -101,9 +98,11 @@ SHOULD_NEVER_VISIT_INST(AllocBox)
 SHOULD_NEVER_VISIT_INST(AllocExistentialBox)
 SHOULD_NEVER_VISIT_INST(AllocGlobal)
 SHOULD_NEVER_VISIT_INST(AllocStack)
+SHOULD_NEVER_VISIT_INST(AllocPack)
 SHOULD_NEVER_VISIT_INST(DifferentiabilityWitnessFunction)
 SHOULD_NEVER_VISIT_INST(FloatLiteral)
 SHOULD_NEVER_VISIT_INST(FunctionRef)
+SHOULD_NEVER_VISIT_INST(DebugStep)
 SHOULD_NEVER_VISIT_INST(DynamicFunctionRef)
 SHOULD_NEVER_VISIT_INST(PreviousDynamicFunctionRef)
 SHOULD_NEVER_VISIT_INST(GlobalAddr)
@@ -125,6 +124,7 @@ SHOULD_NEVER_VISIT_INST(StrongRelease)
 SHOULD_NEVER_VISIT_INST(GetAsyncContinuation)
 SHOULD_NEVER_VISIT_INST(IncrementProfilerCounter)
 SHOULD_NEVER_VISIT_INST(TestSpecification)
+SHOULD_NEVER_VISIT_INST(ScalarPackIndex)
 
 #define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)            \
   SHOULD_NEVER_VISIT_INST(StrongRetain##Name)                                  \
@@ -156,6 +156,7 @@ OPERAND_OWNERSHIP(TrivialUse, CopyAddr)
 OPERAND_OWNERSHIP(TrivialUse, ExplicitCopyAddr)
 OPERAND_OWNERSHIP(TrivialUse, MarkUnresolvedMoveAddr)
 OPERAND_OWNERSHIP(TrivialUse, DeallocStack)
+OPERAND_OWNERSHIP(TrivialUse, DeallocPack)
 OPERAND_OWNERSHIP(TrivialUse, DeinitExistentialAddr)
 OPERAND_OWNERSHIP(TrivialUse, DestroyAddr)
 OPERAND_OWNERSHIP(TrivialUse, EndAccess)
@@ -177,6 +178,7 @@ OPERAND_OWNERSHIP(TrivialUse, ObjCMetatypeToObject)
 OPERAND_OWNERSHIP(TrivialUse, ObjCToThickMetatype)
 OPERAND_OWNERSHIP(TrivialUse, OpenExistentialAddr)
 OPERAND_OWNERSHIP(TrivialUse, OpenExistentialMetatype)
+OPERAND_OWNERSHIP(TrivialUse, OpenPackElement)
 OPERAND_OWNERSHIP(TrivialUse, PointerToAddress)
 OPERAND_OWNERSHIP(TrivialUse, ProjectBlockStorage)
 OPERAND_OWNERSHIP(TrivialUse, RawPointerToRef)
@@ -194,6 +196,11 @@ OPERAND_OWNERSHIP(TrivialUse, UncheckedAddrCast)
 OPERAND_OWNERSHIP(TrivialUse, UncheckedRefCastAddr)
 OPERAND_OWNERSHIP(TrivialUse, UncheckedTakeEnumDataAddr)
 OPERAND_OWNERSHIP(TrivialUse, UnconditionalCheckedCastAddr)
+OPERAND_OWNERSHIP(TrivialUse, DynamicPackIndex)
+OPERAND_OWNERSHIP(TrivialUse, PackPackIndex)
+OPERAND_OWNERSHIP(TrivialUse, PackElementGet)
+OPERAND_OWNERSHIP(TrivialUse, PackElementSet)
+OPERAND_OWNERSHIP(TrivialUse, TuplePackElementAddr)
 
 // The dealloc_stack_ref operand needs to have NonUse ownership because
 // this use comes after the last consuming use (which is usually a dealloc_ref).
@@ -430,8 +437,8 @@ OperandOwnership OperandOwnershipClassifier::visitBranchInst(BranchInst *bi) {
       bi->getDestBB()->getArgument(getOperandIndex())->getOwnershipKind();
 
   if (destBlockArgOwnershipKind == OwnershipKind::Guaranteed) {
-    return isGuaranteedForwardingPhi(getValue())
-               ? OperandOwnership::GuaranteedForwardingPhi
+    return isGuaranteedForwarding(getValue())
+               ? OperandOwnership::GuaranteedForwarding
                : OperandOwnership::Reborrow;
   }
   return destBlockArgOwnershipKind.getForwardingOperandOwnership(
@@ -454,8 +461,8 @@ static OperandOwnership getFunctionArgOwnership(SILArgumentConvention argConv,
 
   switch (argConv) {
   case SILArgumentConvention::Indirect_In:
-  case SILArgumentConvention::Indirect_In_Constant:
   case SILArgumentConvention::Direct_Owned:
+  case SILArgumentConvention::Pack_Owned:
     return OperandOwnership::ForwardingConsume;
 
   // A guaranteed argument is forwarded into the callee. If the call itself has
@@ -467,6 +474,9 @@ static OperandOwnership getFunctionArgOwnership(SILArgumentConvention argConv,
   // as being borrowed for the entire region of coroutine execution.
   case SILArgumentConvention::Indirect_In_Guaranteed:
   case SILArgumentConvention::Direct_Guaranteed:
+  case SILArgumentConvention::Pack_Guaranteed:
+  case SILArgumentConvention::Pack_Inout:
+  case SILArgumentConvention::Pack_Out:
     // For an apply that begins a borrow scope, its arguments are borrowed
     // throughout the caller's borrow scope.
     return hasScopeInCaller ? OperandOwnership::Borrow
@@ -825,6 +835,7 @@ BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, EndAsyncLet)
 BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, StartAsyncLetWithLocalBuffer)
 BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, EndAsyncLetLifetime)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, CreateTaskGroup)
+BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, CreateTaskGroupWithFlags)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, DestroyTaskGroup)
 
 BUILTIN_OPERAND_OWNERSHIP(ForwardingConsume, COWBufferForReading)

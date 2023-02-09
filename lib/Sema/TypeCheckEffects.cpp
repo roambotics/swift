@@ -1391,7 +1391,10 @@ public:
     CatchGuard,
 
     /// A defer body
-    DeferBody
+    DeferBody,
+
+    // A runtime discoverable attribute initialization expression.
+    RuntimeAttribute,
   };
 
 private:
@@ -1533,6 +1536,10 @@ public:
 
     if (isa<PropertyWrapperInitializer>(init)) {
       return Context(Kind::PropertyWrapper);
+    }
+
+    if (isa<RuntimeAttributeInitializer>(init)) {
+      return Context(Kind::RuntimeAttribute);
     }
 
     auto *binding = cast<PatternBindingInitializer>(init)->getBinding();
@@ -1811,6 +1818,7 @@ public:
     case Kind::CatchPattern:
     case Kind::CatchGuard:
     case Kind::DeferBody:
+    case Kind::RuntimeAttribute:
       Diags.diagnose(E.getStartLoc(), diag::throwing_op_in_illegal_context,
                  static_cast<unsigned>(getKind()), getEffectSourceName(reason));
       return;
@@ -1847,6 +1855,7 @@ public:
     case Kind::CatchPattern:
     case Kind::CatchGuard:
     case Kind::DeferBody:
+    case Kind::RuntimeAttribute:
       Diags.diagnose(S->getStartLoc(), diag::throw_in_illegal_context,
                      static_cast<unsigned>(getKind()));
       return;
@@ -1873,6 +1882,7 @@ public:
     case Kind::CatchPattern:
     case Kind::CatchGuard:
     case Kind::DeferBody:
+    case Kind::RuntimeAttribute:
       assert(!DiagnoseErrorOnTry);
       // Diagnosed at the call sites.
       return;
@@ -1973,6 +1983,7 @@ public:
     case Kind::CatchPattern:
     case Kind::CatchGuard:
     case Kind::DeferBody:
+    case Kind::RuntimeAttribute:
       diagnoseAsyncInIllegalContext(Diags, node);
       return;
     }
@@ -2709,11 +2720,12 @@ private:
     // course we're in a context that could never handle an 'async'. Then, we
     // produce an error.
     if (!Flags.has(ContextFlags::HasAnyAsyncSite)) {
-      if (CurContext.handlesAsync(ConditionalEffectKind::Conditional))
-        Ctx.Diags.diagnose(E->getAwaitLoc(), diag::no_async_in_await);
-      else
+      if (CurContext.handlesAsync(ConditionalEffectKind::Conditional)) {
+        diagnoseRedundantAwait(E);
+      } else {
         CurContext.diagnoseUnhandledAsyncSite(Ctx.Diags, E, None,
                                               /*forAwait=*/ true);
+      }
     }
 
     // Inform the parent of the walk that an 'await' exists here.
@@ -2731,7 +2743,7 @@ private:
     // Warn about 'try' expressions that weren't actually needed.
     if (!Flags.has(ContextFlags::HasTryThrowSite)) {
       if (!E->isImplicit())
-        Ctx.Diags.diagnose(E->getTryLoc(), diag::no_throw_in_try);
+        diagnoseRedundantTry(E);
 
     // Diagnose all the call sites within a single unhandled 'try'
     // at the same time.
@@ -2751,9 +2763,8 @@ private:
     E->getSubExpr()->walk(*this);
 
     // Warn about 'try' expressions that weren't actually needed.
-    if (!Flags.has(ContextFlags::HasTryThrowSite)) {
-      Ctx.Diags.diagnose(E->getLoc(), diag::no_throw_in_try);
-    }
+    if (!Flags.has(ContextFlags::HasTryThrowSite))
+      diagnoseRedundantTry(E);
 
     scope.preserveCoverageFromOptionalOrForcedTryOperand();
     return ShouldNotRecurse;
@@ -2767,9 +2778,8 @@ private:
     E->getSubExpr()->walk(*this);
 
     // Warn about 'try' expressions that weren't actually needed.
-    if (!Flags.has(ContextFlags::HasTryThrowSite)) {
-      Ctx.Diags.diagnose(E->getLoc(), diag::no_throw_in_try);
-    }
+    if (!Flags.has(ContextFlags::HasTryThrowSite))
+      diagnoseRedundantTry(E);
 
     scope.preserveCoverageFromOptionalOrForcedTryOperand();
     return ShouldNotRecurse;
@@ -2805,6 +2815,30 @@ private:
     }
 
     return ShouldRecurse;
+  }
+
+  void diagnoseRedundantTry(AnyTryExpr *E) const {
+    if (auto *SVE = SingleValueStmtExpr::tryDigOutSingleValueStmtExpr(E)) {
+      // For an if/switch expression, produce an error instead of a warning.
+      Ctx.Diags.diagnose(E->getTryLoc(),
+                         diag::effect_marker_on_single_value_stmt,
+                         "try", SVE->getStmt()->getKind())
+        .highlight(E->getTryLoc());
+      return;
+    }
+    Ctx.Diags.diagnose(E->getTryLoc(), diag::no_throw_in_try);
+  }
+
+  void diagnoseRedundantAwait(AwaitExpr *E) const {
+    if (auto *SVE = SingleValueStmtExpr::tryDigOutSingleValueStmtExpr(E)) {
+      // For an if/switch expression, produce an error instead of a warning.
+      Ctx.Diags.diagnose(E->getAwaitLoc(),
+                         diag::effect_marker_on_single_value_stmt,
+                         "await", SVE->getStmt()->getKind())
+        .highlight(E->getAwaitLoc());
+      return;
+    }
+    Ctx.Diags.diagnose(E->getAwaitLoc(), diag::no_async_in_await);
   }
 
   void diagnoseUncoveredAsyncSite(const Expr *anchor) const {

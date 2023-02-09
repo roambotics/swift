@@ -269,6 +269,24 @@ bool ArgsToFrontendOptionsConverter::convert(
   if (const Arg *A = Args.getLastArg(OPT_module_link_name))
     Opts.ModuleLinkName = A->getValue();
 
+  if (const Arg *A = Args.getLastArg(OPT_package_name)) {
+    auto pkgName = A->getValue();
+    if (!Lexer::isIdentifier(pkgName))
+      Diags.diagnose(SourceLoc(), diag::error_bad_package_name, pkgName);
+    else if (pkgName == STDLIB_NAME)
+      Diags.diagnose(SourceLoc(), diag::error_stdlib_package_name, pkgName);
+    else
+      Opts.PackageName = pkgName;
+  }
+
+  if (const Arg *A = Args.getLastArg(OPT_export_as)) {
+    auto exportAs = A->getValue();
+    if (!Lexer::isIdentifier(exportAs))
+      Diags.diagnose(SourceLoc(), diag::error_bad_export_as_name, exportAs);
+    else
+      Opts.ExportAsName = exportAs;
+  }
+
   // This must be called after computing module name, module abi name,
   // and module link name. If computing module aliases is unsuccessful,
   // return early.

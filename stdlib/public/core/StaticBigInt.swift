@@ -43,14 +43,6 @@ public struct StaticBigInt:
   public init(_builtinIntegerLiteral value: Builtin.IntLiteral) {
     _value = value
   }
-
-  /// Returns the given value unchanged.
-  @_alwaysEmitIntoClient
-  @available(SwiftStdlib 5.8, *)
-  @inline(__always)
-  public static prefix func + (_ rhs: Self) -> Self {
-    rhs
-  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -73,7 +65,11 @@ extension StaticBigInt {
   @available(SwiftStdlib 5.8, *)
   @inlinable
   internal var _isNegative: Bool {
+#if compiler(>=5.8) && $BuiltinIntLiteralAccessors
     Bool(Builtin.isNegative_IntLiteral(_value))
+#else
+    fatalError("Swift compiler is incompatible with this SDK version")
+#endif
   }
 
   /// Returns the minimal number of bits in this value's binary representation,
@@ -94,7 +90,11 @@ extension StaticBigInt {
   @available(SwiftStdlib 5.8, *)
   @inlinable
   public var bitWidth: Int {
+#if compiler(>=5.8) && $BuiltinIntLiteralAccessors
     Int(Builtin.bitWidth_IntLiteral(_value))
+#else
+    fatalError("Swift compiler is incompatible with this SDK version")
+#endif
   }
 
   /// Returns a 32-bit or 64-bit word of this value's binary representation.
@@ -109,7 +109,7 @@ extension StaticBigInt {
   ///     negative[1]        //-> 0xFFEEDDCCBBAA9988
   ///     negative[2]        //-> 0xFFFFFFFFFFFFFFFF
   ///
-  ///     let positive: StaticBigInt = +0x0011223344556677_8899AABBCCDDEEFF
+  ///     let positive: StaticBigInt =  0x0011223344556677_8899AABBCCDDEEFF
   ///     positive.signum()  //-> +1
   ///     positive.bitWidth  //-> 118
   ///     positive[0]        //-> 0x8899AABBCCDDEEFF
@@ -125,9 +125,13 @@ extension StaticBigInt {
     guard !bitIndex.overflow, bitIndex.partialValue < bitWidth else {
       return _isNegative ? ~0 : 0
     }
+#if compiler(>=5.8) && $BuiltinIntLiteralAccessors
     return UInt(
       Builtin.wordAtIndex_IntLiteral(_value, wordIndex._builtinWordValue)
     )
+#else
+    fatalError("Swift compiler is incompatible with this SDK version")
+#endif
   }
 }
 

@@ -55,7 +55,7 @@ public struct AtInliningTarget {
 }
 
 @available(macOS 10.14.5, *)
-public struct BetweenTargets {
+public struct BetweenTargets { // expected-note {{enclosing scope requires availability of macOS 10.14.5 or newer}}
   @usableFromInline internal init() {}
 }
 
@@ -615,12 +615,12 @@ public func spiDeployedUseNoAvailable( // expected-note 3 {{add @available attri
 }
 
 
-// MARK: - @_backDeploy functions
+// MARK: - @backDeployed functions
 
-// @_backDeploy acts like @inlinable.
+// @backDeployed acts like @inlinable.
 
 @available(macOS 10.10, *)
-@_backDeploy(before: macOS 999.0)
+@backDeployed(before: macOS 999.0)
 public func backDeployedToInliningTarget(
   _: NoAvailable,
   _: BeforeInliningTarget,
@@ -1102,7 +1102,7 @@ extension BetweenTargets {
 }
 
 extension BetweenTargets {
-  @available(macOS 10.10, *)
+  @available(macOS 10.10, *) // expected-warning {{instance method cannot be more available than enclosing scope}}
   func excessivelyAvailableInternalFuncInExtension() {}
 }
 

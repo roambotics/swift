@@ -267,6 +267,11 @@ void ConstraintSystem::applySolution(const Solution &solution) {
     OpenedExistentialTypes.insert(openedExistential);
   }
 
+  // Register the solutions's pack expansion environments.
+  for (const auto &expansion : solution.PackExpansionEnvironments) {
+    PackExpansionEnvironments.insert(expansion);
+  }
+
   // Register the defaulted type variables.
   DefaultedConstraints.insert(solution.DefaultedConstraints.begin(),
                               solution.DefaultedConstraints.end());
@@ -585,6 +590,7 @@ ConstraintSystem::SolverScope::SolverScope(ConstraintSystem &cs)
   numArgumentMatchingChoices = cs.argumentMatchingChoices.size();
   numOpenedTypes = cs.OpenedTypes.size();
   numOpenedExistentialTypes = cs.OpenedExistentialTypes.size();
+  numPackExpansionEnvironments = cs.PackExpansionEnvironments.size();
   numDefaultedConstraints = cs.DefaultedConstraints.size();
   numAddedNodeTypes = cs.addedNodeTypes.size();
   numAddedKeyPathComponentTypes = cs.addedKeyPathComponentTypes.size();
@@ -661,6 +667,9 @@ ConstraintSystem::SolverScope::~SolverScope() {
 
   // Remove any opened existential types.
   truncate(cs.OpenedExistentialTypes, numOpenedExistentialTypes);
+
+  // Remove any pack expansion environments.
+  truncate(cs.PackExpansionEnvironments, numPackExpansionEnvironments);
 
   // Remove any defaulted type variables.
   truncate(cs.DefaultedConstraints, numDefaultedConstraints);
@@ -991,6 +1000,11 @@ void ConstraintSystem::shrink(Expr *expr) {
         return Action::SkipChildren(expr);
       }
 
+      // Same as TapExpr and ClosureExpr, we'll handle SingleValueStmtExprs
+      // separately.
+      if (isa<SingleValueStmtExpr>(expr))
+        return Action::SkipChildren(expr);
+
       if (auto coerceExpr = dyn_cast<CoerceExpr>(expr)) {
         if (coerceExpr->isLiteralInit())
           ApplyExprs.push_back({coerceExpr, 1});
@@ -1190,7 +1204,8 @@ void ConstraintSystem::shrink(Expr *expr) {
                 // example:
                 // let foo: [Array<Float>] = [[0], [1], [2]] as [Array]
                 // let foo: [Array<Float>] = [[0], [1], [2]] as [Array<_>]
-                /*unboundTyOpener*/ nullptr, /*placeholderHandler*/ nullptr);
+                /*unboundTyOpener*/ nullptr, /*placeholderHandler*/ nullptr,
+                /*packElementOpener*/ nullptr);
 
             // Looks like coercion type is invalid, let's skip this sub-tree.
             if (coercionType->hasError())
@@ -2350,15 +2365,39 @@ Constraint *ConstraintSystem::selectDisjunction() {
 }
 
 Constraint *ConstraintSystem::selectConjunction() {
+  SmallVector<Constraint *, 4> conjunctions;
   for (auto &constraint : InactiveConstraints) {
     if (constraint.isDisabled())
       continue;
 
     if (constraint.getKind() == ConstraintKind::Conjunction)
-      return &constraint;
+      conjunctions.push_back(&constraint);
   }
 
-  return nullptr;
+  if (conjunctions.empty())
+    return nullptr;
+
+  auto &SM = getASTContext().SourceMgr;
+
+  // All of the multi-statement closures should be solved in order of their
+  // apperance in the source.
+  llvm::sort(
+      conjunctions, [&](Constraint *conjunctionA, Constraint *conjunctionB) {
+        auto *locA = conjunctionA->getLocator();
+        auto *locB = conjunctionB->getLocator();
+
+        if (!(locA && locB))
+          return false;
+
+        auto *closureA = getAsExpr<ClosureExpr>(locA->getAnchor());
+        auto *closureB = getAsExpr<ClosureExpr>(locB->getAnchor());
+
+        return closureA && closureB
+                   ? SM.isBeforeInBuffer(closureA->getLoc(), closureB->getLoc())
+                   : false;
+      });
+
+  return conjunctions.front();
 }
 
 bool DisjunctionChoice::attempt(ConstraintSystem &cs) const {

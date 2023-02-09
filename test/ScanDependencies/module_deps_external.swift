@@ -44,24 +44,14 @@ import SomeExternalModule
 
 // CHECK: directDependencies
 // CHECK-NEXT: {
-// CHECK-NEXT: "swift": "F"
-// CHECK-NEXT: }
-// CHECK-NEXT: {
-// CHECK-NEXT: "swiftPlaceholder": "SomeExternalModule"
-// CHECK-NEXT: }
-// CHECK-NEXT: {
-// CHECK-NEXT: "swift": "Swift"
-// CHECK-NEXT: }
-// CHECK-NEXT: {
-// CHECK-NEXT: "swift": "SwiftOnoneSupport"
-// CHECK-NEXT: },
-// CHECK-NEXT: {
-// CHECK-NEXT: "swift": "_Concurrency"
-// CHECK-NEXT: },
-// CHECK-NEXT: {
-// CHECK-NEXT: "swift": "_StringProcessing"
-// CHECK-NEXT: }
-// CHECK-NEXT: ],
+// CHECK-DAG: "swift": "F"
+// CHECK-DAG: "swiftPlaceholder": "SomeExternalModule"
+// CHECK-DAG: "swift": "Swift"
+// CHECK-DAG: "swift": "SwiftOnoneSupport"
+// CHECK-DAG: "swift": "_Concurrency"
+// CHECK-DAG: "swift": "_StringProcessing"
+// CHECK-DAG: "clang": "_SwiftConcurrencyShims"
+// CHECK: ],
 
 // CHECK:      "extraPcmArgs": [
 // CHECK-NEXT:    "-Xcc",
@@ -81,13 +71,6 @@ import SomeExternalModule
 // CHECK-NEXT: "F"
 // CHECK-NEXT: ]
 
-/// --------Swift external module SomeExternalModule
-// CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}SomeExternalModule.swiftmodule",
-// CHECK-NEXT: "details": {
-// CHECK-NEXT: "swiftPlaceholder": {
-// CHECK-NEXT: "moduleDocPath": "BUILD_DIR/{{.*}}/ScanDependencies/Output/module_deps_external.swift.tmp/inputs/SomeExternalModule.swiftdoc",
-// CHECK-NEXT: "moduleSourceInfoPath": "BUILD_DIR/{{.*}}/ScanDependencies/Output/module_deps_external.swift.tmp/inputs/SomeExternalModule.swiftsourceinfo"
-
 /// --------Swift module Swift
 // CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}Swift-{{.*}}.swiftmodule",
 
@@ -103,3 +86,10 @@ import SomeExternalModule
 // CHECK-MAKE-DEPS-SAME: Bridging.h
 // CHECK-MAKE-DEPS-SAME: BridgingOther.h
 // CHECK-MAKE-DEPS-SAME: module.modulemap
+
+/// --------Swift external module SomeExternalModule
+// CHECK-LABEL: "modulePath": "{{.*}}{{/|\\}}SomeExternalModule.swiftmodule",
+// CHECK-NEXT: "details": {
+// CHECK-NEXT: "swiftPlaceholder": {
+// CHECK-NEXT: "moduleDocPath": "BUILD_DIR/{{.*}}/ScanDependencies/Output/module_deps_external.swift.tmp/inputs/SomeExternalModule.swiftdoc",
+// CHECK-NEXT: "moduleSourceInfoPath": "BUILD_DIR/{{.*}}/ScanDependencies/Output/module_deps_external.swift.tmp/inputs/SomeExternalModule.swiftsourceinfo"

@@ -23,6 +23,7 @@
 #include "swift/AST/IndexSubset.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeRepr.h"
@@ -74,6 +75,7 @@ StringRef swift::getAccessLevelSpelling(AccessLevel value) {
   case AccessLevel::Private: return "private";
   case AccessLevel::FilePrivate: return "fileprivate";
   case AccessLevel::Internal: return "internal";
+  case AccessLevel::Package: return "package";
   case AccessLevel::Public: return "public";
   case AccessLevel::Open: return "open";
   }
@@ -398,6 +400,30 @@ const AvailableAttr *DeclAttributes::getNoAsync(const ASTContext &ctx) const {
   return bestAttr;
 }
 
+const BackDeployedAttr *
+DeclAttributes::getBackDeployed(const ASTContext &ctx) const {
+  const BackDeployedAttr *bestAttr = nullptr;
+
+  for (auto attr : *this) {
+    auto *backDeployedAttr = dyn_cast<BackDeployedAttr>(attr);
+    if (!backDeployedAttr)
+      continue;
+
+    if (backDeployedAttr->isInvalid() ||
+        !backDeployedAttr->isActivePlatform(ctx))
+      continue;
+
+    // We have an attribute that is active for the platform, but
+    // is it more specific than our current best?
+    if (!bestAttr || inheritsAvailabilityFromPlatform(
+                         backDeployedAttr->Platform, bestAttr->Platform)) {
+      bestAttr = backDeployedAttr;
+    }
+  }
+
+  return bestAttr;
+}
+
 void DeclAttributes::dump(const Decl *D) const {
   StreamPrinter P(llvm::errs());
   PrintOptions PO = PrintOptions::printDeclarations();
@@ -516,6 +542,26 @@ static void printShortFormAvailable(ArrayRef<const DeclAttribute *> Attrs,
   }
   if (!forAtSpecialize)
     Printer.printNewline();
+}
+
+static void printShortFormBackDeployed(ArrayRef<const DeclAttribute *> Attrs,
+                                       ASTPrinter &Printer,
+                                       const PrintOptions &Options) {
+  assert(!Attrs.empty());
+  // TODO: Print `@backDeployed` in swiftinterfaces (rdar://104920183)
+  Printer << "@_backDeploy(before: ";
+  bool isFirst = true;
+
+  for (auto *DA : Attrs) {
+    if (!isFirst)
+      Printer << ", ";
+    auto *attr = cast<BackDeployedAttr>(DA);
+    Printer << platformString(attr->Platform) << " "
+            << attr->Version.getAsString();
+    isFirst = false;
+  }
+  Printer << ")";
+  Printer.printNewline();
 }
 
 /// The kind of a parameter in a `wrt:` differentiation parameters clause:
@@ -729,6 +775,7 @@ void DeclAttributes::print(ASTPrinter &Printer, const PrintOptions &Options,
   AttributeVector shortAvailableAttributes;
   const DeclAttribute *swiftVersionAvailableAttribute = nullptr;
   const DeclAttribute *packageDescriptionVersionAvailableAttribute = nullptr;
+  AttributeVector backDeployedAttributes;
   AttributeVector longAttributes;
   AttributeVector attributes;
   AttributeVector modifiers;
@@ -766,6 +813,7 @@ void DeclAttributes::print(ASTPrinter &Printer, const PrintOptions &Options,
     }
 
     AttributeVector &which = DA->isDeclModifier() ? modifiers :
+                             isa<BackDeployedAttr>(DA) ? backDeployedAttributes :
                              isShortAvailable(DA) ? shortAvailableAttributes :
                              DA->isLongAttribute() ? longAttributes :
                              attributes;
@@ -778,6 +826,8 @@ void DeclAttributes::print(ASTPrinter &Printer, const PrintOptions &Options,
     printShortFormAvailable(packageDescriptionVersionAvailableAttribute, Printer, Options);
   if (!shortAvailableAttributes.empty())
     printShortFormAvailable(shortAvailableAttributes, Printer, Options);
+  if (!backDeployedAttributes.empty())
+    printShortFormBackDeployed(backDeployedAttributes, Printer, Options);
 
   for (auto DA : longAttributes)
     DA->print(Printer, Options, D);
@@ -941,6 +991,7 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
   case DAK_Optimize:
   case DAK_Exclusivity:
   case DAK_NonSendable:
+  case DAK_ObjCImplementation:
     if (getKind() == DAK_Effects &&
         cast<EffectsAttr>(this)->getKind() == EffectsKind::Custom) {
       Printer.printAttrName("@_effects");
@@ -1275,12 +1326,45 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     break;
   }
 
-  case DAK_BackDeploy: {
+  case DAK_BackDeployed: {
+    // TODO: Print `@backDeployed` in swiftinterfaces (rdar://104920183)
     Printer.printAttrName("@_backDeploy");
     Printer << "(before: ";
-    auto Attr = cast<BackDeployAttr>(this);
+    auto Attr = cast<BackDeployedAttr>(this);
     Printer << platformString(Attr->Platform) << " " <<
       Attr->Version.getAsString();
+    Printer << ")";
+    break;
+  }
+
+  case DAK_MacroRole: {
+    auto Attr = cast<MacroRoleAttr>(this);
+    switch (Attr->getMacroSyntax()) {
+    case MacroSyntax::Freestanding:
+      Printer.printAttrName("@freestanding");
+      break;
+
+    case MacroSyntax::Attached:
+      Printer.printAttrName("@attached");
+      break;
+    }
+    Printer << "(";
+    Printer << getMacroRoleString(Attr->getMacroRole());
+    if (!Attr->getNames().empty()) {
+      Printer << ", names: ";
+      interleave(
+          Attr->getNames(),
+          [&](MacroIntroducedDeclName name) {
+            Printer << getMacroIntroducedDeclNameString(name.getKind());
+            if (macroIntroducedNameRequiresArgument(name.getKind())) {
+              Printer << "(" << name.getIdentifier() << ")";
+            }
+          },
+          [&] {
+            Printer << ", ";
+          }
+      );
+    }
     Printer << ")";
     break;
   }
@@ -1453,12 +1537,20 @@ StringRef DeclAttribute::getAttrName() const {
     return "transpose";
   case DAK_UnavailableFromAsync:
     return "_unavailableFromAsync";
-  case DAK_BackDeploy:
-    return "_backDeploy";
+  case DAK_BackDeployed:
+    return "backDeployed";
   case DAK_Expose:
     return "_expose";
   case DAK_Documentation:
     return "_documentation";
+  case DAK_MacroRole:
+    switch (cast<MacroRoleAttr>(this)->getMacroSyntax()) {
+    case MacroSyntax::Freestanding:
+      return "freestanding";
+
+    case MacroSyntax::Attached:
+      return "attached";
+    }
   }
   llvm_unreachable("bad DeclAttrKind");
 }
@@ -1702,7 +1794,7 @@ bool AvailableAttr::isActivePlatform(const ASTContext &ctx) const {
   return isPlatformActive(Platform, ctx.LangOpts);
 }
 
-bool BackDeployAttr::isActivePlatform(const ASTContext &ctx) const {
+bool BackDeployedAttr::isActivePlatform(const ASTContext &ctx) const {
   return isPlatformActive(Platform, ctx.LangOpts);
 }
 
@@ -2282,6 +2374,55 @@ bool CustomAttr::isArgUnsafe() const {
   }
 
   return isArgUnsafeBit;
+}
+
+bool CustomAttr::isAttachedMacro(const Decl *decl) const {
+  auto &ctx = decl->getASTContext();
+  auto *dc = decl->getInnermostDeclContext();
+
+  auto *macroDecl = evaluateOrDefault(
+      ctx.evaluator,
+      ResolveMacroRequest{const_cast<CustomAttr *>(this),
+                          getAttachedMacroRoles(), dc},
+      nullptr);
+
+  return macroDecl != nullptr;
+}
+
+MacroRoleAttr::MacroRoleAttr(SourceLoc atLoc, SourceRange range,
+                             MacroSyntax syntax, SourceLoc lParenLoc,
+                             MacroRole role,
+                             ArrayRef<MacroIntroducedDeclName> names,
+                             SourceLoc rParenLoc, bool implicit)
+    : DeclAttribute(DAK_MacroRole, atLoc, range, implicit),
+      syntax(syntax), role(role), numNames(names.size()), lParenLoc(lParenLoc),
+      rParenLoc(rParenLoc) {
+  auto *trailingNamesBuffer = getTrailingObjects<MacroIntroducedDeclName>();
+  std::uninitialized_copy(names.begin(), names.end(), trailingNamesBuffer);
+}
+
+MacroRoleAttr *
+MacroRoleAttr::create(ASTContext &ctx, SourceLoc atLoc, SourceRange range,
+                      MacroSyntax syntax, SourceLoc lParenLoc, MacroRole role,
+                      ArrayRef<MacroIntroducedDeclName> names,
+                      SourceLoc rParenLoc, bool implicit) {
+  unsigned size = totalSizeToAlloc<MacroIntroducedDeclName>(names.size());
+  auto *mem = ctx.Allocate(size, alignof(MacroRoleAttr));
+  return new (mem) MacroRoleAttr(atLoc, range, syntax, lParenLoc, role, names,
+                                 rParenLoc, implicit);
+}
+
+ArrayRef<MacroIntroducedDeclName> MacroRoleAttr::getNames() const {
+  return {
+    getTrailingObjects<MacroIntroducedDeclName>(),
+    numNames
+  };
+}
+
+bool MacroRoleAttr::hasNameKind(MacroIntroducedDeclNameKind kind) const {
+  return llvm::find_if(getNames(), [kind](MacroIntroducedDeclName name) {
+    return name.getKind() == kind;
+  }) != getNames().end();
 }
 
 const DeclAttribute *

@@ -253,7 +253,7 @@ SILValue CheckedCastBrJumpThreading::isArgValueEquivalentToCondition(
 // Return false if an ownership RAUW is necessary but cannot be performed.
 bool CheckedCastBrJumpThreading::Edit::
 canRAUW(OwnershipFixupContext &rauwContext) {
-  if (InvertSuccess || SuccessPreds.empty())
+  if (InvertSuccess || (SuccessPreds.empty() && !hasUnknownPreds))
     return true;
 
   auto *ccbi = cast<CheckedCastBranchInst>(CCBBlock->getTerminator());
@@ -318,10 +318,9 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForFailurePreds(
   for (auto *Pred : FailurePreds) {
     TermInst *TI = Pred->getTerminator();
     // Replace branch to BB by branch to TargetFailureBB.
-    replaceBranchTarget(TI, CCBBlock, TargetFailureBB,
-    /*PreserveArgs=*/true);
+    TI->replaceBranchTarget(CCBBlock, TargetFailureBB);
   }
-  Cloner.updateOSSAAfterCloning();
+  Cloner.updateSSAAfterCloning();
 }
 
 /// Create a copy of the BB or reuse BB as a landing basic block for all
@@ -334,7 +333,7 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
 
   auto *checkedCastBr = cast<CheckedCastBranchInst>(CCBBlock->getTerminator());
   auto *oldSuccessArg = checkedCastBr->getSuccessBB()->getArgument(0);
-  if (InvertSuccess) {
+  if (InvertSuccess || (SuccessPreds.empty() && !hasUnknownPreds)) {
     assert(!hasUnknownPreds && "is not handled, should have been checked");
     // This success path is unused, so undef its uses and delete the cast.
     oldSuccessArg->replaceAllUsesWithUndef();
@@ -370,8 +369,7 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
   for (auto *Pred : SuccessPreds) {
     TermInst *TI = Pred->getTerminator();
     // Replace branch to BB by branch to TargetSuccessBB.
-    replaceBranchTarget(TI, CCBBlock, clonedCCBBlock,
-                        /*PreserveArgs=*/true);
+    TI->replaceBranchTarget(CCBBlock, clonedCCBBlock);
   }
   // Remove the unreachable checked_cast_br target.
   auto *clonedCCBI =
@@ -383,7 +381,7 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
     SILBuilderWithScope Builder(clonedCCBI);
     Builder.createBranch(clonedCCBI->getLoc(), successBB, {SuccessArg});
     clonedCCBI->eraseFromParent();
-    Cloner.updateOSSAAfterCloning();
+    Cloner.updateSSAAfterCloning();
     return;
   }
   // Remove all uses from the failure path so RAUW can erase the
@@ -395,7 +393,7 @@ void CheckedCastBrJumpThreading::Edit::modifyCFGForSuccessPreds(
   // Create nested borrow scopes for new phis either created for the
   // checked_cast's results or during SSA update. This puts the SIL in
   // valid OSSA form before calling OwnershipRAUWHelper.
-  Cloner.updateOSSAAfterCloning();
+  Cloner.updateSSAAfterCloning();
 
   auto *clonedSuccessArg = successBB->getArgument(0);
   OwnershipRAUWHelper rauwUtil(rauwContext, clonedSuccessArg, SuccessArg);
@@ -789,7 +787,7 @@ void CheckedCastBrJumpThreading::optimizeFunction() {
     edit->modifyCFGForSuccessPreds(Cloner, rauwContext);
 
     if (Cloner.wasCloned()) {
-      Cloner.updateOSSAAfterCloning();
+      Cloner.updateSSAAfterCloning();
 
       if (!Cloner.getNewBB()->pred_empty())
         BlocksForWorklist.push_back(Cloner.getNewBB());

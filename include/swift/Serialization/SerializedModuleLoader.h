@@ -137,7 +137,7 @@ protected:
   }
 
   /// Scan the given serialized module file to determine dependencies.
-  llvm::ErrorOr<ModuleDependencies> scanModuleFile(Twine modulePath);
+  llvm::ErrorOr<ModuleDependencyInfo> scanModuleFile(Twine modulePath, bool isFramework);
 
   /// Load the module file into a buffer and also collect its module name.
   static std::unique_ptr<llvm::MemoryBuffer>
@@ -205,7 +205,7 @@ public:
 
   virtual void verifyAllModules() override;
 
-  virtual Optional<ModuleDependencies> getModuleDependencies(
+  virtual Optional<const ModuleDependencyInfo*> getModuleDependencies(
       StringRef moduleName, ModuleDependenciesCache &cache,
       InterfaceSubContextDelegate &delegate) override;
 };
@@ -454,6 +454,8 @@ public:
   virtual StringRef getLoadedFilename() const override;
 
   virtual StringRef getModuleDefiningPath() const override;
+
+  virtual StringRef getExportedModuleName() const override;
 
   ValueDecl *getMainDecl() const override;
 

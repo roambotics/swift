@@ -294,6 +294,7 @@ public:
   void visitExtensionDecl(ExtensionDecl *ed);
   void visitVarDecl(VarDecl *vd);
   void visitSubscriptDecl(SubscriptDecl *sd);
+  void visitMissingDecl(MissingDecl *d);
   void visitMacroDecl(MacroDecl *d);
   void visitMacroExpansionDecl(MacroExpansionDecl *d);
 
@@ -422,7 +423,8 @@ public:
   /// Is the self method of the given nonmutating method passed indirectly?
   bool isNonMutatingSelfIndirect(SILDeclRef method);
 
-  SILDeclRef getAccessorDeclRef(AccessorDecl *accessor);
+  SILDeclRef getAccessorDeclRef(AccessorDecl *accessor,
+                                ResilienceExpansion expansion);
 
   bool canStorageUseStoredKeyPathComponent(AbstractStorageDecl *decl,
                                            ResilienceExpansion expansion);

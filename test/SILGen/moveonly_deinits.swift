@@ -1,5 +1,6 @@
-// RUN: %target-swift-emit-silgen -enable-experimental-move-only %s | %FileCheck -check-prefix=SILGEN %s
-// RUN: %target-swift-emit-sil -enable-experimental-move-only %s | %FileCheck -check-prefix=SIL %s
+// TODO: re-enable the simplification passes once rdar://104875010 is fixed
+// RUN: %target-swift-emit-silgen -enable-experimental-move-only -Xllvm -sil-disable-pass=simplification %s | %FileCheck -check-prefix=SILGEN %s
+// RUN: %target-swift-emit-sil -enable-experimental-move-only -Xllvm -sil-disable-pass=simplification %s | %FileCheck -check-prefix=SIL %s
 
 // Test that makes sure that throughout the pipeline we properly handle
 // conditional releases for trivial and non-trivial move only types.
@@ -72,7 +73,8 @@ var value: Bool { false }
 // SILGEN: } // end sil function '$s16moveonly_deinits24testIntPairWithoutDeinityyF'
 
 // SIL-LABEL: sil @$s16moveonly_deinits24testIntPairWithoutDeinityyF : $@convention(thin) () -> () {
-// SIL: [[VALUE:%.*]] = move_value [lexical]
+// SIL: [[CONSTRUCTOR:%[^,]+]] = function_ref @$s16moveonly_deinits20IntPairWithoutDeinitVACycfC
+// SIL: [[VALUE:%.*]] = apply [[CONSTRUCTOR]]
 // SIL: cond_br {{%.*}}, bb1, bb2
 //
 // SIL: bb1:
@@ -113,7 +115,8 @@ public func testIntPairWithoutDeinit() {
 // SILGEN: } // end sil function '$s16moveonly_deinits21testIntPairWithDeinityyF'
 
 // SIL-LABEL: sil @$s16moveonly_deinits21testIntPairWithDeinityyF : $@convention(thin) () -> () {
-// SIL: [[VALUE:%.*]] = move_value [lexical]
+// SIL: [[CONSTRUCTOR:%[^,]+]] = function_ref @$s16moveonly_deinits17IntPairWithDeinitVACycfC
+// SIL: [[VALUE:%.*]] = apply [[CONSTRUCTOR]]
 // SIL: cond_br {{%.*}}, bb1, bb2
 //
 // SIL: bb1:
@@ -155,7 +158,8 @@ public func testIntPairWithDeinit() {
 // SILGEN: } // end sil function '$s16moveonly_deinits26testKlassPairWithoutDeinityyF'
 
 // SIL-LABEL: sil @$s16moveonly_deinits26testKlassPairWithoutDeinityyF : $@convention(thin) () -> () {
-// SIL: [[VALUE:%.*]] = move_value [lexical]
+// SIL: [[CONSTRUCTOR:%[^,]+]] = function_ref @$s16moveonly_deinits22KlassPairWithoutDeinitVACycfC
+// SIL: [[VALUE:%.*]] = apply [[CONSTRUCTOR]]
 // SIL: cond_br {{%.*}}, bb1, bb2
 //
 // SIL: bb1:
@@ -196,7 +200,8 @@ public func testKlassPairWithoutDeinit() {
 // SILGEN: } // end sil function '$s16moveonly_deinits23testKlassPairWithDeinityyF'
 
 // SIL-LABEL: sil @$s16moveonly_deinits23testKlassPairWithDeinityyF : $@convention(thin) () -> () {
-// SIL: [[VALUE:%.*]] = move_value [lexical]
+// SIL: [[CONSTRUCTOR:%[^,]+]] = function_ref @$s16moveonly_deinits19KlassPairWithDeinitVACycfC
+// SIL: [[VALUE:%.*]] = apply [[CONSTRUCTOR]]
 // SIL: cond_br {{%.*}}, bb1, bb2
 //
 // SIL: bb1:
@@ -283,7 +288,7 @@ func consumeKlassEnumPairWithDeinit(_ x: __owned KlassEnumPairWithDeinit) { }
 // SILGEN: } // end sil function '$s16moveonly_deinits28testIntEnumPairWithoutDeinityyF'
 
 // SIL-LABEL: sil @$s16moveonly_deinits28testIntEnumPairWithoutDeinityyF : $@convention(thin) () -> () {
-// SIL: [[VALUE:%.*]] = move_value [lexical]
+// SIL: [[VALUE:%.*]] = enum $IntEnumPairWithoutDeinit
 // SIL: cond_br {{%.*}}, bb1, bb2
 //
 // SIL: bb1:
@@ -324,7 +329,7 @@ public func testIntEnumPairWithoutDeinit() {
 // SILGEN: } // end sil function '$s16moveonly_deinits25testIntEnumPairWithDeinityyF'
 
 // SIL-LABEL: sil @$s16moveonly_deinits25testIntEnumPairWithDeinityyF : $@convention(thin) () -> () {
-// SIL: [[VALUE:%.*]] = move_value [lexical]
+// SIL: [[VALUE:%.*]] = enum $IntEnumPairWithDeinit
 // SIL: cond_br {{%.*}}, bb1, bb2
 //
 // SIL: bb1:
@@ -366,7 +371,7 @@ public func testIntEnumPairWithDeinit() {
 // SILGEN: } // end sil function '$s16moveonly_deinits30testKlassEnumPairWithoutDeinityyF'
 
 // SIL-LABEL: sil @$s16moveonly_deinits30testKlassEnumPairWithoutDeinityyF : $@convention(thin) () -> () {
-// SIL: [[VALUE:%.*]] = move_value [lexical]
+// SIL: [[VALUE:%.*]] = enum $KlassEnumPairWithoutDeinit
 // SIL: cond_br {{%.*}}, bb1, bb2
 //
 // SIL: bb1:
@@ -407,7 +412,7 @@ public func testKlassEnumPairWithoutDeinit() {
 // SILGEN: } // end sil function '$s16moveonly_deinits27testKlassEnumPairWithDeinityyF'
 
 // SIL-LABEL: sil @$s16moveonly_deinits27testKlassEnumPairWithDeinityyF : $@convention(thin) () -> () {
-// SIL: [[VALUE:%.*]] = move_value [lexical]
+// SIL: [[VALUE:%.*]] = enum $KlassEnumPairWithDeinit
 // SIL: cond_br {{%.*}}, bb1, bb2
 //
 // SIL: bb1:

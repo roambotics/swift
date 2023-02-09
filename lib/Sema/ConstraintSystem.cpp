@@ -352,19 +352,19 @@ ConstraintSystem::getAlternativeLiteralTypes(KnownProtocolKind kind,
   return scratch;
 }
 
-bool ConstraintSystem::containsCodeCompletionLoc(ASTNode node) const {
+bool ConstraintSystem::containsIDEInspectionTarget(ASTNode node) const {
   SourceRange range = node.getSourceRange();
   if (range.isInvalid())
     return false;
-  return Context.SourceMgr.rangeContainsCodeCompletionLoc(range);
+  return Context.SourceMgr.rangeContainsIDEInspectionTarget(range);
 }
 
-bool ConstraintSystem::containsCodeCompletionLoc(
+bool ConstraintSystem::containsIDEInspectionTarget(
     const ArgumentList *args) const {
   SourceRange range = args->getSourceRange();
   if (range.isInvalid())
     return false;
-  return Context.SourceMgr.rangeContainsCodeCompletionLoc(range);
+  return Context.SourceMgr.rangeContainsIDEInspectionTarget(range);
 }
 
 ConstraintLocator *ConstraintSystem::getConstraintLocator(
@@ -491,6 +491,15 @@ ConstraintLocator *ConstraintSystem::getCalleeLocator(
     // KeyPathDynamicMember element to get the callee locator.
     auto iter = path.rbegin();
     if (locator->findLast<LocatorPathElt::KeyPathDynamicMember>(iter)) {
+      auto newPath = path.drop_back(iter - path.rbegin());
+      return getConstraintLocator(anchor, newPath);
+    }
+  }
+
+  {
+    // Pattern match is always a callee regardless of what comes after it.
+    auto iter = path.rbegin();
+    if (locator->findLast<LocatorPathElt::PatternMatch>(iter)) {
       auto newPath = path.drop_back(iter - path.rbegin());
       return getConstraintLocator(anchor, newPath);
     }
@@ -637,6 +646,28 @@ std::pair<Type, OpenedArchetypeType *> ConstraintSystem::openExistentialType(
   return {result, opened};
 }
 
+void ConstraintSystem::addPackElementEnvironment(PackExpansionExpr *expr) {
+  auto *locator = getConstraintLocator(expr);
+  PackExpansionEnvironments[locator] = UUID::fromTime();
+}
+
+GenericEnvironment *
+ConstraintSystem::getPackElementEnvironment(ConstraintLocator *locator,
+                                            CanType shapeClass) {
+  auto result = PackExpansionEnvironments.find(locator);
+  if (result == PackExpansionEnvironments.end())
+    return nullptr;
+
+  auto uuid = result->second;
+  auto &ctx = getASTContext();
+  auto elementSig = ctx.getOpenedElementSignature(
+      DC->getGenericSignatureOfContext().getCanonicalSignature(), shapeClass);
+  auto *contextEnv = DC->getGenericEnvironmentOfContext();
+  auto contextSubs = contextEnv->getForwardingSubstitutionMap();
+  return GenericEnvironment::forOpenedElement(elementSig, uuid, shapeClass,
+                                              contextSubs);
+}
+
 /// Extend the given depth map by adding depths for all of the subexpressions
 /// of the given expression.
 static void extendDepthMap(
@@ -780,7 +811,8 @@ Type ConstraintSystem::openUnboundGenericType(GenericTypeDecl *decl,
       TypeResolution::forInterface(
           DC, None,
           [](auto) -> Type { llvm_unreachable("should not be used"); },
-          [](auto &, auto) -> Type { llvm_unreachable("should not be used"); })
+          [](auto &, auto) -> Type { llvm_unreachable("should not be used"); },
+          [](auto, auto) -> Type { llvm_unreachable("should not be used"); })
           .applyUnboundGenericArguments(decl, parentTy, SourceLoc(), arguments);
   if (!parentTy && !isTypeResolution) {
     result = DC->mapTypeIntoContext(result);
@@ -1281,6 +1313,10 @@ Type ConstraintSystem::getUnopenedTypeOfReference(
   Type requestedType =
       getType(value)->getWithoutSpecifierType()->getReferenceStorageReferent();
 
+  // Strip pack expansion types off of pack references.
+  if (auto *expansion = requestedType->getAs<PackExpansionType>())
+    requestedType = expansion->getPatternType();
+
   // Adjust the type for concurrency if requested.
   if (adjustForPreconcurrency)
     requestedType = adjustVarTypeForConcurrency(
@@ -1401,6 +1437,15 @@ unwrapPropertyWrapperParameterTypes(ConstraintSystem &cs, AbstractFunctionDecl *
   if (!(functionRefKind == FunctionRefKind::Compound ||
         functionRefKind == FunctionRefKind::Unapplied)) {
     return functionType;
+  }
+
+  // This transform is not applicable to pattern matching context.
+  //
+  // Note: If the transform is ever enabled for patterns - new branch
+  // would have to be added to `nameLoc` selection.
+  if (auto last = locator.last()) {
+    if (last->is<LocatorPathElt::PatternMatch>())
+      return functionType;
   }
 
   auto *paramList = funcDecl->getParameters();
@@ -1587,7 +1632,8 @@ ConstraintSystem::getTypeOfReference(ValueDecl *value,
     auto type =
         TypeResolution::forInterface(useDC, TypeResolverContext::InExpression,
                                      /*unboundTyOpener*/ nullptr,
-                                     /*placeholderHandler*/ nullptr)
+                                     /*placeholderHandler*/ nullptr,
+                                     /*packElementOpener*/ nullptr)
             .resolveTypeInContext(typeDecl, /*foundDC*/ nullptr,
                                   /*isSpecialized=*/false);
     type = useDC->mapTypeIntoContext(type);
@@ -1767,6 +1813,23 @@ TypeVariableType *ConstraintSystem::openGenericParameter(
   assert(result.second);
   (void)result;
 
+  // When move-only types are available, add a constraint to force generic
+  // parameters to conform to a "Copyable" protocol.
+  if (getASTContext().LangOpts.hasFeature(Feature::MoveOnly)) {
+    ProtocolDecl *copyable = TypeChecker::getProtocol(
+        getASTContext(), SourceLoc(), KnownProtocolKind::Copyable);
+
+    // FIXME(kavon): there's a dependency ordering issues here with the
+    // protocol being defined in the stdlib, because when trying to build
+    // the stdlib itself, or a Swift program with -parse-stdlib, we can't
+    // load the protocol to add this constraint. (rdar://104898230)
+    assert(copyable && "stdlib is missing _Copyable protocol!");
+    addConstraint(
+        ConstraintKind::ConformsTo, typeVar,
+        copyable->getDeclaredInterfaceType(),
+        locator.withPathElement(LocatorPathElt::GenericParameter(parameter)));
+  }
+
   return typeVar;
 }
 
@@ -1914,16 +1977,11 @@ static bool isMainDispatchQueueMember(ConstraintLocator *locator) {
   if (!typeRepr)
     return false;
 
-  auto identTypeRepr = dyn_cast<IdentTypeRepr>(typeRepr);
-  if (!identTypeRepr)
+  auto declRefTR = dyn_cast<DeclRefTypeRepr>(typeRepr);
+  if (!declRefTR)
     return false;
 
-  auto components = identTypeRepr->getComponentRange();
-  if (components.empty())
-    return false;
-
-  if (components.back()->getNameRef().getBaseName().userFacingName() !=
-        "DispatchQueue")
+  if (declRefTR->getNameRef().getBaseName().userFacingName() != "DispatchQueue")
     return false;
 
   return true;
@@ -2948,7 +3006,8 @@ FunctionType::ExtInfo ClosureEffectsRequest::evaluate(
           castType = TypeResolution::resolveContextualType(
               castTypeRepr, DC, TypeResolverContext::InExpression,
               /*unboundTyOpener*/ nullptr,
-              /*placeholderHandler*/ nullptr);
+              /*placeholderHandler*/ nullptr,
+              /*packElementOpener*/ nullptr);
         } else {
           castType = isp->getCastType();
         }
@@ -3467,7 +3526,7 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
     // contains the completion location
     auto SE = getAsExpr<SubscriptExpr>(locator->getAnchor());
     if (!isForCodeCompletion() ||
-        (SE && !containsCodeCompletionLoc(SE->getArgs()))) {
+        (SE && !containsIDEInspectionTarget(SE->getArgs()))) {
       increaseScore(SK_KeyPathSubscript);
     }
     break;
@@ -3550,6 +3609,16 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
 
         // Otherwise both `Self` and arguments are applied,
         // e.g. `foo.bar()` or `Foo.bar(&foo)()`, and there is nothing to do.
+      }
+    }
+
+    // If we have a macro, check for correct usage.
+    if (auto macro = dyn_cast<MacroDecl>(decl)) {
+      // Macro can only be used in an expansion. If we end up here, it's
+      // because we found a macro but are missing the leading '#'.
+      if (!locator->isForMacroExpansion()) {
+        // Record a fix here
+        (void)recordFix(MacroMissingPound::create(*this, macro, locator));
       }
     }
   }
@@ -4326,7 +4395,15 @@ static bool diagnoseAmbiguityWithContextualType(
   auto name = result->choices.front().getName();
   auto contextualTy = solution.getContextualType(anchor);
 
-  assert(contextualTy);
+  // In some situations `getContextualType` for a contextual type
+  // locator is going to return then empty type. This happens because
+  // e.g. optional-some patterns and patterns with incorrect type don't
+  // have a contextual type for initialization expression but use
+  // a conversion with contextual locator nevertheless to indicate
+  // the purpose. This doesn't affect non-ambiguity diagnostics
+  // because mismatches carry both `from` and `to` types.
+  if (!contextualTy)
+    return false;
 
   DE.diagnose(getLoc(anchor),
               contextualTy->is<ProtocolType>()
@@ -4351,6 +4428,67 @@ static bool diagnoseAmbiguityWithContextualType(
         DE.diagnose(decl, diag::found_candidate_type, type);
       }
     }
+  }
+
+  return true;
+}
+
+/// Diagnose problems with generic requirement fixes that are anchored on
+/// one callee location. The list could contain different kinds of fixes
+/// i.e. missing protocol conformances at different positions,
+/// same-type requirement mismatches, etc.
+static bool diagnoseAmbiguityWithGenericRequirements(
+    ConstraintSystem &cs,
+    ArrayRef<std::pair<const Solution *, const ConstraintFix *>> aggregate) {
+  // If all of the fixes point to the same overload choice,
+  // we can diagnose this an a single error.
+  bool hasNonDeclOverloads = false;
+
+  llvm::SmallSet<ValueDecl *, 4> overloadChoices;
+  for (const auto &entry : aggregate) {
+    const auto &solution = *entry.first;
+    auto *calleeLocator = solution.getCalleeLocator(entry.second->getLocator());
+
+    if (auto overload = solution.getOverloadChoiceIfAvailable(calleeLocator)) {
+      if (auto *D = overload->choice.getDeclOrNull()) {
+        overloadChoices.insert(D);
+      } else {
+        hasNonDeclOverloads = true;
+      }
+    }
+  }
+
+  auto &primaryFix = aggregate.front();
+  {
+    if (overloadChoices.size() > 0) {
+      // Some of the choices are non-declaration,
+      // let's delegate that to ambiguity diagnostics.
+      if (hasNonDeclOverloads)
+        return false;
+
+      if (overloadChoices.size() == 1)
+        return primaryFix.second->diagnose(*primaryFix.first);
+
+      // fall through to the tailored ambiguity diagnostic.
+    } else {
+      // If there are no overload choices it means that
+      // the issue is with types, delegate that to the primary fix.
+      return primaryFix.second->diagnoseForAmbiguity(aggregate);
+    }
+  }
+
+  // Produce "no exact matches" diagnostic.
+  auto &ctx = cs.getASTContext();
+  auto *choice = *overloadChoices.begin();
+  auto name = choice->getName();
+
+  ctx.Diags.diagnose(getLoc(primaryFix.second->getLocator()->getAnchor()),
+                     diag::no_overloads_match_exactly_in_call,
+                     /*isApplication=*/false, choice->getDescriptiveKind(),
+                     name.isSpecial(), name.getBaseName());
+
+  for (const auto &entry : aggregate) {
+    entry.second->diagnose(*entry.first, /*asNote=*/true);
   }
 
   return true;
@@ -4779,14 +4917,80 @@ bool ConstraintSystem::diagnoseAmbiguityWithFixes(
   // overload choices.
   fixes.set_subtract(consideredFixes);
 
+  // Aggregate all requirement fixes that belong to the same callee
+  // and attempt to diagnose possible ambiguities.
+  {
+    auto isResultBuilderMethodRef = [&](ASTNode node) {
+      auto *UDE = getAsExpr<UnresolvedDotExpr>(node);
+      if (!(UDE && UDE->isImplicit()))
+        return false;
+
+      auto &ctx = getASTContext();
+      SmallVector<Identifier, 4> builderMethods(
+          {ctx.Id_buildBlock, ctx.Id_buildExpression, ctx.Id_buildPartialBlock,
+           ctx.Id_buildFinalResult});
+
+      return llvm::any_of(builderMethods, [&](const Identifier &methodId) {
+        return UDE->getName().compare(DeclNameRef(methodId)) == 0;
+      });
+    };
+
+    // Aggregates fixes fixes attached to `buildExpression` and `buildBlock`
+    // methods at the particular source location.
+    llvm::MapVector<SourceLoc, SmallVector<FixInContext, 4>>
+        builderMethodRequirementFixes;
+
+    llvm::MapVector<ConstraintLocator *, SmallVector<FixInContext, 4>>
+        perCalleeRequirementFixes;
+
+    for (const auto &entry : fixes) {
+      auto *fix = entry.second;
+      if (!fix->getLocator()->isLastElement<LocatorPathElt::AnyRequirement>())
+        continue;
+
+      auto *calleeLoc = entry.first->getCalleeLocator(fix->getLocator());
+
+      if (isResultBuilderMethodRef(calleeLoc->getAnchor())) {
+        auto *anchor = castToExpr<Expr>(calleeLoc->getAnchor());
+        builderMethodRequirementFixes[anchor->getLoc()].push_back(entry);
+      } else {
+        perCalleeRequirementFixes[calleeLoc].push_back(entry);
+      }
+    }
+
+    SmallVector<SmallVector<FixInContext, 4>, 4> viableGroups;
+    {
+      auto takeAggregateIfViable =
+          [&](SmallVector<FixInContext, 4> &aggregate) {
+            // Ambiguity only if all of the solutions have a requirement
+            // fix at the given location.
+            if (aggregate.size() == solutions.size())
+              viableGroups.push_back(std::move(aggregate));
+          };
+
+      for (auto &entry : builderMethodRequirementFixes)
+        takeAggregateIfViable(entry.second);
+
+      for (auto &entry : perCalleeRequirementFixes)
+        takeAggregateIfViable(entry.second);
+    }
+
+    for (auto &aggregate : viableGroups) {
+      if (diagnoseAmbiguityWithGenericRequirements(*this, aggregate)) {
+        // Remove diagnosed fixes.
+        fixes.set_subtract(aggregate);
+        diagnosed = true;
+      }
+    }
+  }
+
   llvm::MapVector<std::pair<FixKind, ConstraintLocator *>,
                   SmallVector<FixInContext, 4>>
       fixesByKind;
 
   for (const auto &entry : fixes) {
     const auto *fix = entry.second;
-    fixesByKind[{fix->getKind(), fix->getLocator()}].push_back(
-        {entry.first, fix});
+    fixesByKind[{fix->getKind(), fix->getLocator()}].push_back(entry);
   }
 
   // If leftover fix is contained in all of the solutions let's
@@ -5192,10 +5396,12 @@ void constraints::simplifyLocator(ASTNode &anchor,
       }
       break;
 
-    case ConstraintLocator::ContextualType:
+    case ConstraintLocator::GlobalActorType:
+    case ConstraintLocator::ContextualType: {
       // This was just for identifying purposes, strip it off.
       path = path.slice(1);
       continue;
+    }
 
     case ConstraintLocator::KeyPathComponent: {
       auto elt = path[0].castTo<LocatorPathElt::KeyPathComponent>();
@@ -5247,6 +5453,16 @@ void constraints::simplifyLocator(ASTNode &anchor,
             branch.forThen() ? ifExpr->getThenExpr() : ifExpr->getElseExpr();
       }
 
+      path = path.slice(1);
+      continue;
+    }
+
+    case ConstraintLocator::SingleValueStmtBranch: {
+      auto branchElt = path[0].castTo<LocatorPathElt::SingleValueStmtBranch>();
+      auto exprIdx = branchElt.getExprBranchIndex();
+      auto *SVE = castToExpr<SingleValueStmtExpr>(anchor);
+      SmallVector<Expr *, 4> scratch;
+      anchor = SVE->getSingleExprBranches(scratch)[exprIdx];
       path = path.slice(1);
       continue;
     }
@@ -6107,8 +6323,7 @@ Expr *ConstraintSystem::buildAutoClosureExpr(Expr *expr,
                          ->castTo<FunctionType>();
 
   auto *closure = new (Context)
-      AutoClosureExpr(expr, newClosureType,
-                      AutoClosureExpr::InvalidDiscriminator, ClosureContext);
+      AutoClosureExpr(expr, newClosureType, ClosureContext);
 
   closure->setParameterList(ParameterList::createEmpty(Context));
 
@@ -6228,7 +6443,8 @@ void SolutionApplicationTargetsKey::dump(raw_ostream &OS) const {
 
 SolutionApplicationTarget::SolutionApplicationTarget(
     Expr *expr, DeclContext *dc, ContextualTypePurpose contextualPurpose,
-    TypeLoc convertType, bool isDiscarded) {
+    TypeLoc convertType, ConstraintLocator *convertTypeLocator,
+    bool isDiscarded) {
   // Verify that a purpose was specified if a convertType was.  Note that it is
   // ok to have a purpose without a convertType (which is used for call
   // return types).
@@ -6251,6 +6467,7 @@ SolutionApplicationTarget::SolutionApplicationTarget(
   expression.dc = dc;
   expression.contextualPurpose = contextualPurpose;
   expression.convertType = convertType;
+  expression.convertTypeLocator = convertTypeLocator;
   expression.pattern = nullptr;
   expression.propertyWrapper.wrappedVar = nullptr;
   expression.propertyWrapper.innermostWrappedValueInit = nullptr;
@@ -6359,7 +6576,7 @@ SolutionApplicationTarget SolutionApplicationTarget::forInitialization(
 
   SolutionApplicationTarget target(
       initializer, dc, CTP_Initialization, contextualType,
-      /*isDiscarded=*/false);
+      /*convertTypeLocator*/ nullptr, /*isDiscarded=*/false);
   target.expression.pattern = pattern;
   target.expression.bindPatternVarsOneWay = bindPatternVarsOneWay;
   target.maybeApplyPropertyWrapper();
@@ -6474,6 +6691,7 @@ bool SolutionApplicationTarget::contextualTypeIsOnlyAHint() const {
   case CTP_ComposedPropertyWrapper:
   case CTP_CannotFail:
   case CTP_ExprPattern:
+  case CTP_SingleValueStmtBranch:
     return false;
   }
   llvm_unreachable("invalid contextual type");
@@ -6930,6 +7148,9 @@ bool ConstraintSystem::isArgumentGenericFunction(Type argType, Expr *argExpr) {
 }
 
 bool ConstraintSystem::participatesInInference(ClosureExpr *closure) const {
+  if (getAppliedResultBuilderTransform(closure))
+    return true;
+
   if (closure->hasSingleExpressionBody())
     return true;
 
@@ -6941,7 +7162,13 @@ bool ConstraintSystem::participatesInInference(ClosureExpr *closure) const {
 
   // If body is nested in a parent that has a function builder applied,
   // let's prevent inference until result builders.
-  return !isInResultBuilderContext(closure);
+  if (Options.contains(
+          ConstraintSystemFlags::
+              ClosuresInResultBuildersDontParticipateInInference)) {
+    return !isInResultBuilderContext(closure);
+  } else {
+    return true;
+  }
 }
 
 TypeVarBindingProducer::TypeVarBindingProducer(BindingSet &bindings)
@@ -7083,4 +7310,22 @@ ASTNode constraints::findAsyncNode(ClosureExpr *closure) {
   if (!body)
     return ASTNode();
   return body->findAsyncNode();
+}
+
+void constraints::dumpAnchor(ASTNode anchor, SourceManager *SM,
+                             raw_ostream &out) {
+  if (auto *expr = anchor.dyn_cast<Expr *>()) {
+    out << Expr::getKindName(expr->getKind());
+    if (SM) {
+      out << '@';
+      expr->getLoc().print(out, *SM);
+    }
+  } else if (auto *pattern = anchor.dyn_cast<Pattern *>()) {
+    out << Pattern::getKindName(pattern->getKind()) << "Pattern";
+    if (SM) {
+      out << '@';
+      pattern->getLoc().print(out, *SM);
+    }
+  }
+  // TODO(diagnostics): Implement the rest of the cases.
 }

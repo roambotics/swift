@@ -331,8 +331,10 @@ static ManagedValue emitManagedParameter(SILGenFunction &SGF, SILLocation loc,
       return SGF.emitManagedRValueWithCleanup(value, valueTL);
     }
 
-  case ParameterConvention::Indirect_In_Constant:
   case ParameterConvention::Indirect_InoutAliasable:
+  case ParameterConvention::Pack_Guaranteed:
+  case ParameterConvention::Pack_Owned:
+  case ParameterConvention::Pack_Inout:
     llvm_unreachable("unexpected convention");
   }
   llvm_unreachable("bad convention");
@@ -432,10 +434,12 @@ static void buildFuncToBlockInvokeBody(SILGenFunction &SGF,
         break;
         
       case ParameterConvention::Indirect_In:
-      case ParameterConvention::Indirect_In_Constant:
       case ParameterConvention::Indirect_In_Guaranteed:
       case ParameterConvention::Indirect_Inout:
       case ParameterConvention::Indirect_InoutAliasable:
+      case ParameterConvention::Pack_Guaranteed:
+      case ParameterConvention::Pack_Owned:
+      case ParameterConvention::Pack_Inout:
         llvm_unreachable("indirect params to blocks not supported");
       }
       
@@ -1366,6 +1370,7 @@ static SILFunctionType *emitObjCThunkArguments(SILGenFunction &SGF,
   // Emit the other arguments, taking ownership of arguments if necessary.
   auto inputs = objcFnTy->getParameters();
   auto nativeInputs = swiftFnTy->getParameters();
+  auto fnConv = SGF.silConv.getFunctionConventions(swiftFnTy);
   assert(nativeInputs.size() == bridgedFormalTypes.size());
   assert(nativeInputs.size() == nativeFormalTypes.size());
   assert(inputs.size() ==
@@ -1436,7 +1441,7 @@ static SILFunctionType *emitObjCThunkArguments(SILGenFunction &SGF,
 
     // This can happen if the value is resilient in the calling convention
     // but not resilient locally.
-    if (nativeInputs[i].isFormalIndirect() &&
+    if (fnConv.isSILIndirect(nativeInputs[i]) &&
         !native.getType().isAddress()) {
       auto buf = SGF.emitTemporaryAllocation(loc, native.getType());
       native.forwardInto(SGF, loc, buf);
@@ -1526,7 +1531,8 @@ SILFunction *SILGenFunction::emitNativeAsyncToForeignThunk(SILDeclRef thunk) {
                                               ProfileCounter(),
                                               IsThunk,
                                               IsNotDynamic,
-                                              IsNotDistributed);
+                                              IsNotDistributed,
+                                              IsNotRuntimeAccessible);
   
   auto closureRef = B.createFunctionRef(loc, closure);
   
@@ -2185,8 +2191,10 @@ void SILGenFunction::emitForeignToNativeThunk(SILDeclRef thunk) {
           param = emitManagedRValueWithCleanup(tmp);
           break;
         }
-        case ParameterConvention::Indirect_In_Constant:
-          llvm_unreachable("unsupported convention");
+        case ParameterConvention::Pack_Guaranteed:
+        case ParameterConvention::Pack_Owned:
+        case ParameterConvention::Pack_Inout:
+          llvm_unreachable("bridging a parameter pack?");
         }
 
         while (maybeAddForeignArg());

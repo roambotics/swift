@@ -261,6 +261,13 @@ void *SwiftVarDecl_create(void *ctx, BridgedIdentifier _Nullable nameId,
       reinterpret_cast<DeclContext *>(dc));
 }
 
+void *SingleValueStmtExpr_createWithWrappedBranches(void *_ctx, void *S,
+                                                    void *DC, bool mustBeExpr) {
+  auto &ctx = *static_cast<ASTContext *>(_ctx);
+  return SingleValueStmtExpr::createWithWrappedBranches(
+      ctx, (Stmt *)S, (DeclContext *)DC, mustBeExpr);
+}
+
 void *IfStmt_create(void *ctx, void *ifLoc, void *cond, void *_Nullable then,
                     void *_Nullable elseLoc, void *_Nullable elseStmt) {
   ASTContext &Context = *static_cast<ASTContext *>(ctx);
@@ -385,7 +392,7 @@ void *ClosureExpr_create(void *ctx, void *body, void *dc) {
 
   auto *out = new (Context)
       ClosureExpr(attributes, bracketRange, nullptr, nullptr, asyncLoc,
-                  throwsLoc, arrowLoc, inLoc, nullptr, 0, (DeclContext *)dc);
+                  throwsLoc, arrowLoc, inLoc, nullptr, (DeclContext *)dc);
   out->setBody((BraceStmt *)body, true);
   out->setParameterList(params);
   return (Expr *)out;
@@ -466,10 +473,10 @@ void *ProtocolTypeRepr_create(void *ctx, void *baseType, void *protoLoc) {
   return new (Context) ProtocolTypeRepr((TypeRepr *)baseType, protocolLoc);
 }
 
-void *PackExpansionTypeRepr_create(void *ctx, void *base, void *ellipsisLoc) {
+void *PackExpansionTypeRepr_create(void *ctx, void *base, void *repeatLoc) {
   ASTContext &Context = *static_cast<ASTContext *>(ctx);
   return new (Context) PackExpansionTypeRepr(
-      (TypeRepr *)base, getSourceLocFromPointer(ellipsisLoc));
+      getSourceLocFromPointer(repeatLoc), (TypeRepr *)base);
 }
 
 void *TupleTypeRepr_create(void *ctx, BridgedArrayRef elements, void *lParenLoc,
@@ -497,10 +504,13 @@ void *TupleTypeRepr_create(void *ctx, BridgedArrayRef elements, void *lParenLoc,
                                SourceRange{lParen, rParen});
 }
 
-void *IdentTypeRepr_create(void *ctx, BridgedArrayRef components) {
+void *MemberTypeRepr_create(void *ctx, void *baseComponent,
+                            BridgedArrayRef bridgedMemberComponents) {
   ASTContext &Context = *static_cast<ASTContext *>(ctx);
-  return IdentTypeRepr::create(
-      Context, getArrayRef<ComponentIdentTypeRepr *>(components));
+  auto memberComponents = getArrayRef<IdentTypeRepr *>(bridgedMemberComponents);
+
+  return MemberTypeRepr::create(Context, (TypeRepr *)baseComponent,
+                                memberComponents);
 }
 
 void *CompositionTypeRepr_create(void *ctx, BridgedArrayRef types,

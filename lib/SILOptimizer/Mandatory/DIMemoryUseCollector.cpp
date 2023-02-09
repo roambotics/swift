@@ -413,7 +413,7 @@ DIMemoryObjectInfo::getPathStringToElement(unsigned Element,
                                            std::string &Result) const {
   auto &Module = MemoryInst->getModule();
 
-  if (isAnyInitSelf() || getAsTypeWrapperLocalStorageVar())
+  if (isAnyInitSelf())
     Result = "self";
   else if (ValueDecl *VD =
                dyn_cast_or_null<ValueDecl>(getLoc().getAsASTNode<Decl>()))
@@ -468,24 +468,6 @@ DIMemoryObjectInfo::getPathStringToElement(unsigned Element,
 
 /// If the specified value is a 'let' property in an initializer, return true.
 bool DIMemoryObjectInfo::isElementLetProperty(unsigned Element) const {
-  // If this is an element of a `_storage` tuple, we need to
-  // check the `$Storage` to determine whether underlying storage
-  // backing element is immutable.
-  if (auto *storageVar = getAsTypeWrapperLocalStorageVar()) {
-    auto *wrappedType = cast<NominalTypeDecl>(
-        storageVar->getDeclContext()->getInnermostTypeContext());
-    assert(wrappedType && "_storage reference without type wrapper");
-
-    auto storageVarType = storageVar->getInterfaceType()->getAs<TupleType>();
-    assert(Element < storageVarType->getNumElements());
-    auto propertyName = storageVarType->getElement(Element).getName();
-
-    auto *storageDecl =
-        cast<NominalTypeDecl>(wrappedType->getTypeWrapperStorageDecl());
-    auto *property = storageDecl->lookupDirect(propertyName).front();
-    return cast<VarDecl>(property)->isLet();
-  }
-
   // If we aren't representing 'self' in a non-delegating initializer, then we
   // can't have 'let' properties.
   if (!isNonDelegatingInit())
@@ -553,13 +535,6 @@ ConstructorDecl *DIMemoryObjectInfo::getActorInitSelf() const {
           if (auto *ctor = dyn_cast_or_null<ConstructorDecl>(
                             silFn->getDeclContext()->getAsDecl()))
             return ctor;
-
-  return nullptr;
-}
-
-VarDecl *DIMemoryObjectInfo::getAsTypeWrapperLocalStorageVar() const {
-  if (isTypeWrapperLocalStorageVar(getFunction(), MemoryInst))
-    return getLoc().getAsASTNode<VarDecl>();
 
   return nullptr;
 }
@@ -950,11 +925,13 @@ void ElementUseCollector::collectUses(SILValue Pointer, unsigned BaseEltNo) {
       case ParameterConvention::Direct_Owned:
       case ParameterConvention::Direct_Unowned:
       case ParameterConvention::Direct_Guaranteed:
+      case ParameterConvention::Pack_Guaranteed:
+      case ParameterConvention::Pack_Owned:
+      case ParameterConvention::Pack_Inout:
         llvm_unreachable("address value passed to indirect parameter");
 
       // If this is an in-parameter, it is like a load.
       case ParameterConvention::Indirect_In:
-      case ParameterConvention::Indirect_In_Constant:
       case ParameterConvention::Indirect_In_Guaranteed:
         addElementUses(BaseEltNo, PointeeType, User, DIUseKind::IndirectIn);
         continue;
@@ -2016,33 +1993,4 @@ void swift::ownership::collectDIElementUsesFrom(
   ElementUseCollector collector(MemoryInfo, UseInfo, VisitedClosures);
   collector.collectFrom(MemoryInfo.getUninitializedValue(),
                         /*collectDestroysOfContainer*/ true);
-}
-
-bool swift::ownership::canHaveTypeWrapperLocalStorageVar(SILFunction &F) {
-  auto *DC = F.getDeclContext();
-  if (!DC)
-    return false;
-
-  auto *ctor = dyn_cast_or_null<ConstructorDecl>(DC->getAsDecl());
-  if (!ctor || ctor->isImplicit() || !ctor->isDesignatedInit())
-    return false;
-
-  auto *parentType = ctor->getDeclContext()->getSelfNominalTypeDecl();
-  return parentType && parentType->hasTypeWrapper();
-}
-
-bool swift::ownership::isTypeWrapperLocalStorageVar(
-    SILFunction &F, MarkUninitializedInst *Inst) {
-  if (!Inst->isVar())
-    return false;
-
-  if (!canHaveTypeWrapperLocalStorageVar(F))
-    return false;
-
-  if (auto *var = Inst->getLoc().getAsASTNode<VarDecl>()) {
-    auto &ctx = var->getASTContext();
-    return var->isImplicit() && var->getName() == ctx.Id_localStorageVar;
-  }
-
-  return false;
 }

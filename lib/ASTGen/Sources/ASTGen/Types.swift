@@ -28,51 +28,40 @@ extension ASTGenVisitor {
   }
 
   public func visit(_ node: MemberTypeIdentifierSyntax) -> ASTNode {
-    // Handle metatypes.
-    // FIXME: We might want to do this in the parser instead?
-    if node.name.tokenKind == .identifier("Type") &&
-        node.genericArgumentClause == nil {
-      let baseType = visit(node.baseType).rawValue
-      let nameLoc = self.base.advanced(by: node.name.position.utf8Offset).raw
-      return .type(
-        MetatypeTypeRepr_create(self.ctx, baseType, nameLoc))
-    }
+    // Gather the member components, in decreasing depth order.
+    var reverseMemberComponents = [UnsafeMutableRawPointer]()
 
-    var path = [(TokenSyntax, GenericArgumentClauseSyntax?)]()
-    var memberRef: Syntax? = Syntax(node)
-    while let nestedMember = memberRef?.as(MemberTypeIdentifierSyntax.self) {
-      path.append((nestedMember.name, nestedMember.genericArgumentClause))
-      memberRef = Syntax(nestedMember.baseType)
-    }
+    var baseType = Syntax(node)
+    while let memberType = baseType.as(MemberTypeIdentifierSyntax.self) {
+      let nameToken = memberType.name
+      let generics = memberType.genericArgumentClause
 
-    if let base = memberRef?.as(SimpleTypeIdentifierSyntax.self) {
-      path.append((base.name, base.genericArgumentClause))
-    }
-
-    var elements = [UnsafeMutableRawPointer]()
-    for (pathElement, generics) in path.reversed() {
-      var nameText = pathElement.text
+      var nameText = nameToken.text
       let name = nameText.withUTF8 { buf in
         return SwiftASTContext_getIdentifier(ctx, buf.baseAddress, buf.count)
       }
-      let nameLoc = self.base.advanced(by: pathElement.position.utf8Offset).raw
+      let nameLoc = self.base.advanced(by: nameToken.position.utf8Offset).raw
 
       if let generics = generics {
         let lAngle = self.base.advanced(by: generics.leftAngleBracket.position.utf8Offset).raw
         let rAngle = self.base.advanced(by: generics.rightAngleBracket.position.utf8Offset).raw
-        elements.append(
+        reverseMemberComponents.append(
           generics.arguments.map({ self.visit($0.argumentType) }).withBridgedArrayRef {
             genericArgs in
             GenericIdentTypeRepr_create(self.ctx, name, nameLoc, genericArgs, lAngle, rAngle)
           })
       } else {
-        elements.append(SimpleIdentTypeRepr_create(self.ctx, nameLoc, name))
+        reverseMemberComponents.append(SimpleIdentTypeRepr_create(self.ctx, nameLoc, name))
       }
+
+      baseType = Syntax(memberType.baseType)
     }
 
+    let baseComponent = visit(baseType).rawValue
+
     return .type(
-      elements.withBridgedArrayRef { elements in
-        return IdentTypeRepr_create(self.ctx, elements)
+      reverseMemberComponents.reversed().withBridgedArrayRef { memberComponents in
+        return MemberTypeRepr_create(self.ctx, baseComponent, memberComponents)
       })
   }
 
@@ -118,8 +107,8 @@ extension ASTGenVisitor {
 
   public func visit(_ node: PackExpansionTypeSyntax) -> ASTNode {
     let base = visit(node.patternType).rawValue
-    let ellipsisLoc = self.base.advanced(by: node.ellipsis.position.utf8Offset).raw
-    return .type(PackExpansionTypeRepr_create(self.ctx, base, ellipsisLoc))
+    let repeatLoc = self.base.advanced(by: node.repeatKeyword.position.utf8Offset).raw
+    return .type(PackExpansionTypeRepr_create(self.ctx, base, repeatLoc))
   }
 
   public func visit(_ node: TupleTypeSyntax) -> ASTNode {
@@ -145,12 +134,12 @@ extension ASTGenVisitor {
       let lParenLoc = self.base.advanced(by: node.leftParen.position.utf8Offset).raw
       let rParenLoc = self.base.advanced(by: node.rightParen.position.utf8Offset).raw
       let args = TupleTypeRepr_create(self.ctx, elements, lParenLoc, rParenLoc)
-      let asyncLoc = node.asyncKeyword.map { self.base.advanced(by: $0.position.utf8Offset).raw }
-      let throwsLoc = node.throwsOrRethrowsKeyword.map {
+      let asyncLoc = node.effectSpecifiers?.asyncSpecifier.map { self.base.advanced(by: $0.position.utf8Offset).raw }
+      let throwsLoc = node.effectSpecifiers?.throwsSpecifier.map {
         self.base.advanced(by: $0.position.utf8Offset).raw
       }
-      let arrowLoc = self.base.advanced(by: node.arrow.position.utf8Offset).raw
-      let retTy = visit(node.returnType).rawValue
+      let arrowLoc = self.base.advanced(by: node.output.arrow.position.utf8Offset).raw
+      let retTy = visit(node.output.returnType).rawValue
       return .type(FunctionTypeRepr_create(self.ctx, args, asyncLoc, throwsLoc, arrowLoc, retTy))
     }
   }

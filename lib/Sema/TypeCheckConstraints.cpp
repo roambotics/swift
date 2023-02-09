@@ -422,6 +422,9 @@ TypeChecker::typeCheckTarget(SolutionApplicationTarget &target,
   if (options.contains(TypeCheckExprFlags::LeaveClosureBodyUnchecked))
     csOptions |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
 
+  if (options.contains(TypeCheckExprFlags::DisableMacroExpansions))
+    csOptions |= ConstraintSystemFlags::DisableMacroExpansions;
+
   ConstraintSystem cs(dc, csOptions);
 
   if (auto *expr = target.getAsExpr()) {
@@ -998,11 +1001,6 @@ static Type replaceArchetypesWithTypeVariables(ConstraintSystem &cs,
         return found->second;
 
       if (auto archetypeType = dyn_cast<ArchetypeType>(origType)) {
-        // We leave opaque types and their nested associated types alone here.
-        // They're globally available.
-        if (isa<OpaqueTypeArchetypeType>(archetypeType))
-          return origType;
-
         auto root = archetypeType->getRoot();
         // For other nested types, fail here so the default logic in subst()
         // for nested types applies.
@@ -1033,7 +1031,8 @@ static Type replaceArchetypesWithTypeVariables(ConstraintSystem &cs,
       types[origType] = replacement;
       return replacement;
     },
-    MakeAbstractConformanceForGenericType());
+    MakeAbstractConformanceForGenericType(),
+    SubstFlags::SubstituteOpaqueArchetypes);
 }
 
 bool TypeChecker::typesSatisfyConstraint(Type type1, Type type2,
@@ -1466,9 +1465,13 @@ void ConstraintSystem::print(raw_ostream &out) const {
     if (!info.getType().isNull()) {
       out << "\n";
       out.indent(indent) << "Contextual Type: " << info.getType().getString(PO);
+      out << " at ";
+
+      auto &SM = getASTContext().SourceMgr;
       if (TypeRepr *TR = info.typeLoc.getTypeRepr()) {
-        out << " at ";
-        TR->getSourceRange().print(out, getASTContext().SourceMgr, /*text*/false);
+        TR->getSourceRange().print(out, SM, /*text*/ false);
+      } else {
+        dumpAnchor(contextualTypeEntry.first, &SM, out);
       }
     }
   }
@@ -1656,6 +1659,27 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
        !unwrappedIUO)) {
     return CheckedCastKind::Coercion;
   }
+
+  // Since move-only types currently cannot conform to protocols, nor be a class
+  // type, the subtyping hierarchy is a bit bizarre as of now:
+  //
+  //              noncopyable
+  //           structs and enums
+  //                   |
+  //       +--------- Any
+  //       |           |
+  //   AnyObject    protocol
+  //       |       existentials
+  //       |            |   \
+  //       +---------+  |    +-- structs/enums
+  //                 |  |
+  //                classes
+  //           (and their subtyping)
+  //
+  //
+  // Thus, right now, a move-only type is only a subtype of itself.
+  if (fromType->isPureMoveOnly() || toType->isPureMoveOnly())
+    return CheckedCastKind::Unresolved;
   
   // Check for a bridging conversion.
   // Anything bridges to AnyObject.

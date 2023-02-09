@@ -488,9 +488,10 @@ SymbolicValue ConstExprFunctionState::computeConstantValue(SILValue value) {
   if (auto *bai = dyn_cast<BeginAccessInst>(value))
     return getConstantValue(bai->getOperand());
 
-  // Look through copy_value and begin_borrow since the interpreter doesn't
-  // model these memory management instructions.
-  if (isa<CopyValueInst>(value) || isa<BeginBorrowInst>(value))
+  // Look through copy_value, begin_borrow, and move_value since the
+  // interpreter doesn't model these memory management instructions.
+  if (isa<CopyValueInst>(value) || isa<BeginBorrowInst>(value) ||
+      isa<MoveValueInst>(value))
     return getConstantValue(cast<SingleValueInstruction>(value)->getOperand(0));
 
   // Builtin.RawPointer and addresses have the same representation.
@@ -2203,8 +2204,7 @@ ConstExprStepEvaluator::skipByMakingEffectsNonConstant(
       ApplySite applySite(applyInst);
       SILArgumentConvention convention =
         applySite.getArgumentConvention(operand);
-      if (convention == SILArgumentConvention::Indirect_In_Guaranteed ||
-          convention == SILArgumentConvention::Indirect_In_Constant) {
+      if (convention == SILArgumentConvention::Indirect_In_Guaranteed) {
         continue;
       }
     }

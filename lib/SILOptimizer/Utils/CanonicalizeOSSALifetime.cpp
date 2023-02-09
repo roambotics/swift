@@ -69,6 +69,7 @@
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/NodeDatastructures.h"
 #include "swift/SIL/OwnershipUtils.h"
+#include "swift/SIL/PrunedLiveness.h"
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
 #include "swift/SILOptimizer/Utils/DebugOptUtils.h"
 #include "swift/SILOptimizer/Utils/InstructionDeleter.h"
@@ -78,9 +79,9 @@
 using namespace swift;
 using llvm::SmallSetVector;
 
-llvm::Statistic swift::NumCopiesEliminated = {
-    DEBUG_TYPE, "NumCopiesEliminated",
-    "number of copy_value instructions removed"};
+llvm::Statistic swift::NumCopiesAndMovesEliminated = {
+    DEBUG_TYPE, "NumCopiesAndMovesEliminated",
+    "number of copy_value and move_value instructions removed"};
 
 llvm::Statistic swift::NumCopiesGenerated = {
     DEBUG_TYPE, "NumCopiesGenerated",
@@ -121,17 +122,18 @@ static DestroyValueInst *dynCastToDestroyOf(SILInstruction *instruction,
 
 bool CanonicalizeOSSALifetime::computeCanonicalLiveness() {
   defUseWorklist.initialize(getCurrentDef());
+  // Only the first level of reborrows need to be consider. All nested inner
+  // adjacent reborrows and phis are encapsulated within their lifetimes.
+  SILPhiArgument *arg;
+  if ((arg = dyn_cast<SILPhiArgument>(getCurrentDef())) && arg->isPhi()) {
+    visitInnerAdjacentPhis(arg, [&](SILArgument *reborrow) {
+      defUseWorklist.insert(reborrow);
+      return true;
+    });
+  }
   while (SILValue value = defUseWorklist.pop()) {
-    SILPhiArgument *arg;
-    if ((arg = dyn_cast<SILPhiArgument>(value)) && arg->isPhi()) {
-      visitAdjacentReborrowsOfPhi(arg, [&](SILPhiArgument *reborrow) {
-        defUseWorklist.insert(reborrow);
-        return true;
-      });
-    }
     for (Operand *use : value->getUses()) {
       auto *user = use->getUser();
-
       // Recurse through copies.
       if (auto *copy = dyn_cast<CopyValueInst>(user)) {
         defUseWorklist.insert(copy);
@@ -187,32 +189,31 @@ bool CanonicalizeOSSALifetime::computeCanonicalLiveness() {
       case OperandOwnership::InteriorPointer:
       case OperandOwnership::GuaranteedForwarding:
       case OperandOwnership::EndBorrow:
-        // Guaranteed values are considered uses of the value when the value is
-        // an owned phi and the guaranteed values are adjacent reborrow phis or
-        // reborrow of such.
+        // Guaranteed values are exposed by inner adjacent reborrows. If user is
+        // a guaranteed phi (GuaranteedForwarding), then the owned lifetime
+        // either dominates it or its lifetime ends at an outer adjacent
+        // reborrow. Only instructions that end the reborrow lifetime should
+        // actually affect liveness of the outer owned value.
         liveness.updateForUse(user, /*lifetimeEnding*/ false);
         break;
-      case OperandOwnership::GuaranteedForwardingPhi:
       case OperandOwnership::Reborrow:
-        BranchInst *branch;
-        if (!(branch = dyn_cast<BranchInst>(user))) {
-          // Non-phi reborrows (tuples, etc) never end the lifetime of the owned
-          // value.
-          liveness.updateForUse(user, /*lifetimeEnding*/ false);
-          defUseWorklist.insert(cast<SingleValueInstruction>(user));
-          break;
-        }
-        if (is_contained(user->getOperandValues(), getCurrentDef())) {
-          // An adjacent phi consumes the value being reborrowed.  Although this
-          // use doesn't end the lifetime, this user does.
-          liveness.updateForUse(user, /*lifetimeEnding*/ true);
+        BranchInst *branch = cast<BranchInst>(user);
+        // This is a cheap variation on visitEnclosingDef. We already know that
+        // getCurrentDef() is the enclosing def for this use. If the reborrow's
+        // has a enclosing def is an outer adjacent phi then this branch must
+        // consume getCurrentDef() as the outer phi operand.
+        if (is_contained(branch->getOperandValues(), getCurrentDef())) {
+          // An adjacent phi consumes the value being reborrowed. Although this
+          // use doesn't end the lifetime, this branch does end the lifetime by
+          // consuming the owned value.
+          liveness.updateForUse(branch, /*lifetimeEnding*/ true);
           break;
         }
         // No adjacent phi consumes the value.  This use is not lifetime ending.
-        liveness.updateForUse(user, /*lifetimeEnding*/ false);
+        liveness.updateForUse(branch, /*lifetimeEnding*/ false);
         // This branch reborrows a guaranteed phi whose lifetime is dependent on
         // currentDef.  Uses of the reborrowing phi extend liveness.
-        auto *reborrow = branch->getArgForOperand(use);
+        auto *reborrow = PhiOperand(use).getValue();
         defUseWorklist.insert(reborrow);
         break;
       }
@@ -402,7 +403,7 @@ void CanonicalizeOSSALifetime::extendLivenessThroughOverlappingAccess() {
           continue;
         }
         // Stop at the latest use. An earlier end_access does not overlap.
-        if (blockHasUse && liveness.isInterestingUser(&inst)) {
+        if (blockHasUse && liveness.isInterestingUser(&inst) != PrunedLiveness::NonUser) {
           break;
         }
         if (endsAccessOverlappingPrunedBoundary(&inst)) {
@@ -927,16 +928,8 @@ void CanonicalizeOSSALifetime::rewriteCopies() {
     // If this use was not marked as a final destroy *or* this is not the first
     // consumed operand we visited, then it needs a copy.
     if (!consumes.claimConsume(user)) {
-      maybeNotifyMoveOnlyCopy(use);
       return false;
     }
-
-    // Ok, this is a final user that isn't a destroy_value. Notify our caller if
-    // we were asked to.
-    //
-    // If we need this for diagnostics, we will only use it if we found actual
-    // uses that required copies.
-    maybeNotifyFinalConsumingUse(use);
 
     return true;
   };
@@ -970,7 +963,7 @@ void CanonicalizeOSSALifetime::rewriteCopies() {
       } else {
         if (instsToDelete.insert(srcCopy)) {
           LLVM_DEBUG(llvm::dbgs() << "  Removing " << *srcCopy);
-          ++NumCopiesEliminated;
+          ++NumCopiesAndMovesEliminated;
         }
       }
     }
@@ -997,8 +990,7 @@ void CanonicalizeOSSALifetime::rewriteCopies() {
 //                            MARK: Top-Level API
 //===----------------------------------------------------------------------===//
 
-/// Canonicalize a single extended owned lifetime.
-bool CanonicalizeOSSALifetime::canonicalizeValueLifetime(SILValue def) {
+bool CanonicalizeOSSALifetime::computeLiveness(SILValue def) {
   if (def->getOwnershipKind() != OwnershipKind::Owned)
     return false;
 
@@ -1028,11 +1020,17 @@ bool CanonicalizeOSSALifetime::canonicalizeValueLifetime(SILValue def) {
     clearLiveness();
     return false;
   }
-  extendLivenessThroughOverlappingAccess();
+  if (accessBlockAnalysis) {
+    extendLivenessThroughOverlappingAccess();
+  }
+  return true;
+}
+
+void CanonicalizeOSSALifetime::rewriteLifetimes() {
   // Step 2: compute original boundary
   PrunedLivenessBoundary originalBoundary;
   findOriginalBoundary(originalBoundary);
-  PrunedLivenessBoundary boundary;
+  PrunedLivenessBoundary extendedBoundary;
   if (maximizeLifetime) {
     // Step 3. (optional) maximize lifetimes
     extendUnconsumedLiveness(originalBoundary);
@@ -1041,19 +1039,33 @@ bool CanonicalizeOSSALifetime::canonicalizeValueLifetime(SILValue def) {
     //         liveness
     findOriginalBoundary(originalBoundary);
     // Step 4: extend boundary to destroys
-    findExtendedBoundary(originalBoundary, boundary);
+    findExtendedBoundary(originalBoundary, extendedBoundary);
   } else {
     // Step 3: (skipped)
     // Step 4: extend boundary to destroys
-    findExtendedBoundary(originalBoundary, boundary);
+    findExtendedBoundary(originalBoundary, extendedBoundary);
   }
+
   // Step 5: insert destroys and record consumes
-  insertDestroysOnBoundary(boundary);
+  insertDestroysOnBoundary(extendedBoundary);
   // Step 6: rewrite copies and delete extra destroys
   rewriteCopies();
 
   clearLiveness();
   consumes.clear();
+}
+
+/// Canonicalize a single extended owned lifetime.
+bool CanonicalizeOSSALifetime::canonicalizeValueLifetime(SILValue def) {
+  // Step 1: Compute liveness.
+  if (!computeLiveness(def)) {
+    LLVM_DEBUG(llvm::dbgs() << "Failed to compute liveness boundary!\n");
+    return false;
+  }
+
+  // Steps 2-6. \see rewriteUses for explanation of steps 2-6.
+  rewriteLifetimes();
+
   return true;
 }
 

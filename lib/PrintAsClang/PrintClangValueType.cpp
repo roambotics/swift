@@ -88,13 +88,16 @@ void ClangValueTypePrinter::forwardDeclType(raw_ostream &os,
         typeDecl->getGenericSignature().getCanonicalSignature();
     ClangSyntaxPrinter(os).printGenericSignature(genericSignature);
   }
-  os << "class ";
+  os << "class";
+  ClangSyntaxPrinter(os).printSymbolUSRAttribute(typeDecl);
+  os << ' ';
   ClangSyntaxPrinter(os).printBaseName(typeDecl);
   os << ";\n";
   printTypePrecedingGenericTraits(os, typeDecl, typeDecl->getModuleContext());
 }
 
 static void addCppExtensionsToStdlibType(const NominalTypeDecl *typeDecl,
+                                         raw_ostream &os,
                                          ClangSyntaxPrinter &printer,
                                          raw_ostream &cPrologueOS) {
   if (typeDecl == typeDecl->getASTContext().getStringDecl()) {
@@ -127,7 +130,7 @@ static void addCppExtensionsToStdlibType(const NominalTypeDecl *typeDecl,
                    "memcpy(&result._3, value + 8, 4);\n"
                    "#endif\n"
                    "return result;\n"
-                   "};\n";
+                   "}\n";
     cPrologueOS << "SWIFT_EXTERN void *_Nonnull "
                    "$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF(swift_interop_stub_"
                    "Swift_String) SWIFT_NOEXCEPT SWIFT_CALL;\n";
@@ -135,6 +138,9 @@ static void addCppExtensionsToStdlibType(const NominalTypeDecl *typeDecl,
                    "$sSS10FoundationE36_"
                    "unconditionallyBridgeFromObjectiveCySSSo8NSStringCSgFZ("
                    "void * _Nullable) SWIFT_NOEXCEPT SWIFT_CALL;\n";
+    cPrologueOS << "SWIFT_EXTERN swift_interop_stub_Swift_String "
+                   "$sSS7cStringSSSPys4Int8VG_tcfC("
+                   "const char * _Nonnull) SWIFT_NOEXCEPT SWIFT_CALL;\n";
     printer.printObjCBlock([](raw_ostream &os) {
       os << "  ";
       ClangSyntaxPrinter(os).printInlineForThunk();
@@ -155,6 +161,9 @@ static void addCppExtensionsToStdlibType(const NominalTypeDecl *typeDecl,
       os << "    return result;\n";
       os << "  }\n";
     });
+    // Add additional methods for the `String` declaration.
+    printer.printDefine("SWIFT_CXX_INTEROP_STRING_MIXIN");
+    printer.printIncludeForShimHeader("_SwiftStdlibCxxOverlay.h");
   } else if (typeDecl == typeDecl->getASTContext().getOptionalDecl()) {
     // Add additional methods for the `Optional` declaration.
     printer.printDefine("SWIFT_CXX_INTEROP_OPTIONAL_MIXIN");
@@ -252,7 +261,9 @@ void ClangValueTypePrinter::printValueTypeDecl(
 
   // Print out the C++ class itself.
   printGenericSignature(os);
-  os << "class ";
+  os << "class";
+  ClangSyntaxPrinter(os).printSymbolUSRAttribute(typeDecl);
+  os << ' ';
   ClangSyntaxPrinter(os).printBaseName(typeDecl);
   os << " final {\n";
   os << "public:\n";
@@ -295,7 +306,7 @@ void ClangValueTypePrinter::printValueTypeDecl(
 
   bodyPrinter();
   if (typeDecl->isStdlibDecl())
-    addCppExtensionsToStdlibType(typeDecl, printer, cPrologueOS);
+    addCppExtensionsToStdlibType(typeDecl, os, printer, cPrologueOS);
 
   os << "private:\n";
 

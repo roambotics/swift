@@ -283,9 +283,56 @@ ModuleDecl *DeclContext::getParentModule() const {
 
 SourceFile *DeclContext::getParentSourceFile() const {
   const DeclContext *DC = this;
-  while (!DC->isModuleScopeContext())
+  SourceLoc loc;
+  while (!DC->isModuleScopeContext()) {
+    // If we don't have a source location yet, try to grab one from this
+    // context.
+    if (loc.isInvalid()) {
+      switch (DC->getContextKind()) {
+      case DeclContextKind::AbstractClosureExpr:
+        loc = cast<AbstractClosureExpr>(DC)->getLoc();
+        break;
+
+      case DeclContextKind::AbstractFunctionDecl:
+      case DeclContextKind::EnumElementDecl:
+      case DeclContextKind::ExtensionDecl:
+      case DeclContextKind::GenericTypeDecl:
+      case DeclContextKind::MacroDecl:
+      case DeclContextKind::SubscriptDecl:
+      case DeclContextKind::TopLevelCodeDecl:
+        loc = DC->getAsDecl()->getLoc(/*SerializedOK=*/false);
+        break;
+
+      case DeclContextKind::Initializer:
+      case DeclContextKind::FileUnit:
+      case DeclContextKind::Module:
+      case DeclContextKind::SerializedLocal:
+        break;
+      }
+    }
+
     DC = DC->getParent();
-  return const_cast<SourceFile *>(dyn_cast<SourceFile>(DC));
+  }
+
+  auto fallbackSF = const_cast<SourceFile *>(dyn_cast<SourceFile>(DC));
+  if (auto module = DC->getParentModule()) {
+    if (auto sf = module->getSourceFileContainingLocation(loc))
+      return sf;
+  }
+
+  return fallbackSF;
+}
+
+SourceFile *DeclContext::getOutermostParentSourceFile() const {
+  auto sf = getParentSourceFile();
+  if (!sf)
+    return nullptr;
+
+  // Find the originating source file.
+  while (auto enclosingSF = sf->getEnclosingSourceFile())
+    sf = enclosingSF;
+
+  return sf;
 }
 
 DeclContext *DeclContext::getModuleScopeContext() const {
@@ -431,13 +478,13 @@ swift::FragileFunctionKindRequest::evaluate(Evaluator &evaluator,
                 /*allowUsableFromInline=*/true};
       }
 
-      if (AFD->getAttrs().hasAttribute<BackDeployAttr>()) {
+      if (AFD->getAttrs().hasAttribute<BackDeployedAttr>()) {
         return {FragileFunctionKind::BackDeploy,
                 /*allowUsableFromInline=*/true};
       }
 
       // Property and subscript accessors inherit @_alwaysEmitIntoClient,
-      // @_backDeploy, and @inlinable from their storage declarations.
+      // @backDeployed, and @inlinable from their storage declarations.
       if (auto accessor = dyn_cast<AccessorDecl>(AFD)) {
         auto *storage = accessor->getStorage();
         if (storage->getAttrs().getAttribute<InlinableAttr>()) {
@@ -448,7 +495,7 @@ swift::FragileFunctionKindRequest::evaluate(Evaluator &evaluator,
           return {FragileFunctionKind::AlwaysEmitIntoClient,
                   /*allowUsableFromInline=*/true};
         }
-        if (storage->getAttrs().hasAttribute<BackDeployAttr>()) {
+        if (storage->getAttrs().hasAttribute<BackDeployedAttr>()) {
           return {FragileFunctionKind::BackDeploy,
                   /*allowUsableFromInline=*/true};
         }
@@ -548,7 +595,7 @@ void DeclContext::dumpContext() const {
 void AccessScope::dump() const {
   llvm::errs() << getAccessLevelSpelling(accessLevelForDiagnostics()) << ": ";
 
-  if (isPublic()) {
+  if (isPublic() || isPackage()) {
     llvm::errs() << "(null)\n";
     return;
   }
@@ -727,6 +774,15 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
         break;
       }
       break;
+    }
+
+    case InitializerKind::RuntimeAttribute: {
+      auto init = cast<RuntimeAttributeInitializer>(this);
+      auto *decl = init->getAttachedToDecl();
+
+      OS << "RuntimeAttribute attachedTo="
+         << init->getAttachedToDecl()->getName() << ", attribute=";
+      init->getAttr()->print(OS, decl);
     }
     }
     break;
@@ -940,6 +996,11 @@ void IterableDeclContext::addMemberSilently(Decl *member, Decl *hint,
     if (getASTContext().SourceMgr.isBeforeInBuffer(prevEnd, nextStart))
       return;
 
+    // Synthesized member macros can add new members in a macro expansion buffer.
+    auto *memberSourceFile = member->getInnermostDeclContext()->getParentSourceFile();
+    if (memberSourceFile->getFulfilledMacroRole() == MacroRole::Member)
+      return;
+
     llvm::errs() << "Source ranges out of order in addMember():\n";
     prev->dump(llvm::errs());
     next->dump(llvm::errs());
@@ -1136,14 +1197,16 @@ getPrivateDeclContext(const DeclContext *DC, const SourceFile *useSF) {
   return lastExtension ? lastExtension : DC;
 }
 
-AccessScope::AccessScope(const DeclContext *DC, bool isPrivate)
-    : Value(DC, isPrivate) {
-  if (isPrivate) {
+AccessScope::AccessScope(const DeclContext *DC, AccessLimitKind limitKind)
+    : Value(DC, limitKind) {
+  auto isPrivate = false;
+  if (limitKind == AccessLimitKind::Private) {
     DC = getPrivateDeclContext(DC, DC->getParentSourceFile());
     Value.setPointer(DC);
+    isPrivate = true;
   }
   if (!DC || isa<ModuleDecl>(DC))
-    assert(!isPrivate && "public or internal scope can't be private");
+    assert(!isPrivate && "public, package, or internal scope can't be private");
 }
 
 bool AccessScope::isFileScope() const {
@@ -1159,6 +1222,8 @@ bool AccessScope::isInternal() const {
 AccessLevel AccessScope::accessLevelForDiagnostics() const {
   if (isPublic())
     return AccessLevel::Public;
+  if (isPackage())
+    return AccessLevel::Package;
   if (isa<ModuleDecl>(getDeclContext()))
     return AccessLevel::Internal;
   if (getDeclContext()->isModuleScopeContext()) {

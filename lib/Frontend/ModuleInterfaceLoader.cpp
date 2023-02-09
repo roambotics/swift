@@ -1582,6 +1582,7 @@ InterfaceSubContextDelegateImpl::InterfaceSubContextDelegateImpl(
   // If building an application extension, make sure API use
   // is restricted accordingly in downstream dependnecies.
   if (langOpts.EnableAppExtensionRestrictions) {
+    genericSubInvocation.getLangOptions().EnableAppExtensionRestrictions = true;
     GenericArgs.push_back("-application-extension");
   }
   // Save the parent invocation's Target Triple
@@ -1874,6 +1875,37 @@ struct ExplicitSwiftModuleLoader::Implementation {
     else if (result == std::errc::no_such_file_or_directory)
       Ctx.Diags.diagnose(SourceLoc(), diag::explicit_swift_module_map_missing,
                          fileName);
+
+    // A single module map can define multiple modules; keep track of the ones
+    // we've seen so that we don't generate duplicate flags.
+    std::set<std::string> moduleMapsSeen;
+    std::vector<std::string> &extraClangArgs = Ctx.ClangImporterOpts.ExtraArgs;
+    for (auto &entry : ExplicitModuleMap) {
+      const auto &moduleMapPath = entry.getValue().clangModuleMapPath;
+      if (!moduleMapPath.empty() &&
+          moduleMapsSeen.find(moduleMapPath) == moduleMapsSeen.end()) {
+        moduleMapsSeen.insert(moduleMapPath);
+        extraClangArgs.push_back(
+            (Twine("-fmodule-map-file=") + moduleMapPath).str());
+      }
+
+      const auto &modulePath = entry.getValue().clangModulePath;
+      if (!modulePath.empty()) {
+        extraClangArgs.push_back(
+            (Twine("-fmodule-file=") + entry.getKey() + "=" + modulePath)
+                .str());
+      }
+    }
+  }
+
+  void addCommandLineExplicitInputs(
+      const std::vector<std::pair<std::string, std::string>>
+          &commandLineExplicitInputs) {
+    for (const auto &moduleInput : commandLineExplicitInputs) {
+      ExplicitModuleInfo entry;
+      entry.modulePath = moduleInput.second;
+      ExplicitModuleMap.try_emplace(moduleInput.first, std::move(entry));
+    }
   }
 };
 
@@ -1908,6 +1940,16 @@ bool ExplicitSwiftModuleLoader::findModule(ImportPath::Element ModuleID,
     return false;
   }
   auto &moduleInfo = it->getValue();
+
+  // If this is only a Clang module with no paired Swift module, return false
+  // now so that we don't emit diagnostics about it being missing. This gives
+  // ClangImporter an opportunity to import it.
+  bool hasClangModule = !moduleInfo.clangModuleMapPath.empty() ||
+                        !moduleInfo.clangModulePath.empty();
+  bool hasSwiftModule = !moduleInfo.modulePath.empty();
+  if (hasClangModule && !hasSwiftModule) {
+    return false;
+  }
 
   // Set IsFramework bit according to the moduleInfo
   IsFramework = moduleInfo.isFramework;
@@ -1993,6 +2035,24 @@ bool ExplicitSwiftModuleLoader::canImportModule(
   if (it == Impl.ExplicitModuleMap.end()) {
     return false;
   }
+
+  // If the caller doesn't want version info we're done.
+  if (!versionInfo)
+    return true;
+
+  // Open .swiftmodule file and read out the version
+  auto &fs = *Ctx.SourceMgr.getFileSystem();
+  auto moduleBuf = fs.getBufferForFile(it->second.modulePath);
+  if (!moduleBuf) {
+    Ctx.Diags.diagnose(SourceLoc(), diag::error_opening_explicit_module_file,
+                       it->second.modulePath);
+    return false;
+  }
+  auto metaData = serialization::validateSerializedAST(
+      (*moduleBuf)->getBuffer(), Ctx.SILOpts.EnableOSSAModules,
+      Ctx.LangOpts.SDKName, !Ctx.LangOpts.DebuggerSupport);
+  versionInfo->setVersion(metaData.userModuleVersion,
+                          ModuleVersionSourceKind::SwiftBinaryModule);
   return true;
 }
 
@@ -2007,6 +2067,7 @@ std::unique_ptr<ExplicitSwiftModuleLoader>
 ExplicitSwiftModuleLoader::create(ASTContext &ctx,
     DependencyTracker *tracker, ModuleLoadingMode loadMode,
     StringRef ExplicitSwiftModuleMap,
+    const std::vector<std::pair<std::string, std::string>> &ExplicitSwiftModuleInputs,
     bool IgnoreSwiftSourceInfoFile) {
   auto result = std::unique_ptr<ExplicitSwiftModuleLoader>(
     new ExplicitSwiftModuleLoader(ctx, tracker, loadMode,
@@ -2016,6 +2077,11 @@ ExplicitSwiftModuleLoader::create(ASTContext &ctx,
   if (!ExplicitSwiftModuleMap.empty()) {
     // Parse a JSON file to collect explicitly built modules.
     Impl.parseSwiftExplicitModuleMap(ExplicitSwiftModuleMap);
+  }
+  // If some modules are provided with explicit
+  // '-swift-module-file' options, add those as well.
+  if (!ExplicitSwiftModuleInputs.empty()) {
+    Impl.addCommandLineExplicitInputs(ExplicitSwiftModuleInputs);
   }
 
   return result;

@@ -1768,14 +1768,12 @@ namespace {
       }
     }
 
-    void visitMissingMemberDecl(MissingMemberDecl *placeholder) {
-      llvm_unreachable("should not IRGen classes with missing members");
+    void visitMissingDecl(MissingDecl *missing) {
+      llvm_unreachable("missing decl in IRGen");
     }
 
-    void visitMacroExpansionDecl(MacroExpansionDecl *med) {
-      auto *rewritten = med->getRewritten();
-      assert(rewritten && "Macro should have already been expanded by IRGen");
-      visit(rewritten);
+    void visitMissingMemberDecl(MissingMemberDecl *placeholder) {
+      llvm_unreachable("should not IRGen classes with missing members");
     }
 
     void addIVarInitializer() {

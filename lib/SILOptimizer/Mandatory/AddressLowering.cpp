@@ -347,6 +347,27 @@ static bool isStoreCopy(SILValue value) {
   if (!copyInst->hasOneUse())
     return false;
 
+  auto *user = value->getSingleUse()->getUser();
+  auto *storeInst = dyn_cast<StoreInst>(user);
+  if (!storeInst)
+    return false;
+
+  SSAPrunedLiveness liveness;
+  auto isStoreOutOfRange = [&liveness, storeInst](SILValue root) {
+    liveness.initializeDef(root);
+    auto summary = liveness.computeSimple();
+    if (summary.addressUseKind != AddressUseKind::NonEscaping) {
+      return true;
+    }
+    if (summary.innerBorrowKind != InnerBorrowKind::Contained) {
+      return true;
+    }
+    if (!liveness.isWithinBoundary(storeInst)) {
+      return true;
+    }
+    return false;
+  };
+
   auto source = copyInst->getOperand();
   if (source->getOwnershipKind() == OwnershipKind::Guaranteed) {
     // [in_guaranteed_begin_apply_results] If any root of the source is a
@@ -356,15 +377,30 @@ static bool isStoreCopy(SILValue value) {
     SmallVector<SILValue, 4> roots;
     findGuaranteedReferenceRoots(source, /*lookThroughNestedBorrows=*/true,
                                  roots);
-    if (llvm::any_of(roots, [](SILValue root) {
-          return isa<BeginApplyInst>(root->getDefiningInstruction());
+    // TODO: Rather than checking whether the store is out of range of any
+    // guaranteed root's SSAPrunedLiveness, instead check whether it is out of
+    // range of ExtendedLiveness of the borrow introducers:
+    // - visit borrow introducers via visitBorrowIntroducers
+    // - call ExtendedLiveness.compute on each borrow introducer
+    if (llvm::any_of(roots, [&](SILValue root) {
+          // Handle forwarding phis conservatively rather than recursing.
+          if (SILArgument::asPhi(root) && !BorrowedValue(root))
+            return true;
+
+          if (isa<BeginApplyInst>(root->getDefiningInstruction())) {
+            return true;
+          }
+          return isStoreOutOfRange(root);
         })) {
+      return false;
+    }
+  } else if (source->getOwnershipKind() == OwnershipKind::Owned) {
+    if (isStoreOutOfRange(source)) {
       return false;
     }
   }
 
-  auto *user = value->getSingleUse()->getUser();
-  return isa<StoreInst>(user);
+  return true;
 }
 
 void ValueStorageMap::insertValue(SILValue value, SILValue storageAddress) {
@@ -963,7 +999,7 @@ static bool doesNotNeedStackAllocation(SILValue value) {
   // necessary to introduce new storage and move to it.
   if (isa<LoadBorrowInst>(defInst) ||
       (isa<BeginApplyInst>(defInst) &&
-       value.getOwnershipKind() == OwnershipKind::Guaranteed))
+       value->getOwnershipKind() == OwnershipKind::Guaranteed))
     return true;
 
   return false;
@@ -1301,8 +1337,8 @@ AllocStackInst *OpaqueStorageAllocation::createStackAllocation(SILValue value) {
   // Instructions that produce an opened type never reach here because they
   // have guaranteed ownership--they project their storage. We reach this
   // point after the opened value has been copied.
-  assert((!isa<SingleValueInstruction>(value)
-          || !cast<SingleValueInstruction>(value)->getDefinedOpenedArchetype())
+  assert((!value->getDefiningInstruction() ||
+          !value->getDefiningInstruction()->definesLocalArchetypes())
          && "owned open_existential is unsupported");
 
   SILType allocTy = value->getType();
@@ -1319,7 +1355,7 @@ AllocStackInst *OpaqueStorageAllocation::createStackAllocation(SILValue value) {
 
     if (auto openedTy = getOpenedArchetypeOf(archetype)) {
       auto openingVal =
-          pass.getModule()->getRootOpenedArchetypeDef(openedTy, pass.function);
+          pass.getModule()->getRootLocalArchetypeDef(openedTy, pass.function);
 
       auto *openingInst = openingVal->getDefiningInstruction();
       assert(openingVal && "all opened archetypes should be resolved");
@@ -1350,7 +1386,7 @@ void OpaqueStorageAllocation::finalizeOpaqueStorage() {
   SmallVector<SILBasicBlock *, 4> boundary;
   for (auto maybeAlloc : allocs) {
     // An allocation may be erased when coalescing block arguments.
-    if (!maybeAlloc.hasValue())
+    if (!maybeAlloc.has_value())
       continue;
 
     auto *alloc = maybeAlloc.value();
@@ -2276,9 +2312,9 @@ void ApplyRewriter::convertBeginApplyWithOpaqueYield() {
                                      info.isConsumed() ? IsTake : IsNotTake,
                                      IsInitialization);
       } else {
-        // [in_guaranteed_begin_apply_results] Because OSSA ensure that all uses
-        // of a guaranteed value produced by a begin_apply are used within the
-        // coroutine's range, AddressLowering will not introduce uses of
+        // [in_guaranteed_begin_apply_results] Because OSSA ensures that all
+        // uses of a guaranteed value produced by a begin_apply are used within
+        // the coroutine's range, AddressLowering will not introduce uses of
         // invalid memory by rewriting the uses of a yielded guaranteed opaque
         // value as uses of yielded guaranteed storage.  However, it must
         // allocate storage for copies of [projections of] such values.
@@ -2815,8 +2851,8 @@ void YieldRewriter::rewriteYield(YieldInst *yieldInst) {
 void YieldRewriter::rewriteOperand(YieldInst *yieldInst, unsigned index) {
   auto info = opaqueFnConv.getYieldInfoForOperandIndex(index);
   auto convention = info.getConvention();
-  auto ty =
-      opaqueFnConv.getSILType(info, pass.function->getTypeExpansionContext());
+  auto ty = pass.function->mapTypeIntoContext(
+      opaqueFnConv.getSILType(info, pass.function->getTypeExpansionContext()));
   if (ty.isAddressOnly(*pass.function)) {
     assert(yieldInst->getOperand(index)->getType().isAddress() &&
            "rewriting yield of of address-only value after use rewriting!?");
@@ -2828,12 +2864,14 @@ void YieldRewriter::rewriteOperand(YieldInst *yieldInst, unsigned index) {
   case ParameterConvention::Direct_Unowned:
   case ParameterConvention::Direct_Guaranteed:
   case ParameterConvention::Direct_Owned:
+  case ParameterConvention::Pack_Guaranteed:
+  case ParameterConvention::Pack_Owned:
+  case ParameterConvention::Pack_Inout:
     return;
   case ParameterConvention::Indirect_Inout:
   case ParameterConvention::Indirect_InoutAliasable:
     return;
   case ParameterConvention::Indirect_In:
-  case ParameterConvention::Indirect_In_Constant:
     ownership = OwnershipKind::Owned;
     break;
   case ParameterConvention::Indirect_In_Guaranteed:
@@ -2989,14 +3027,10 @@ protected:
 
   void visitBuiltinInst(BuiltinInst *bi) {
     switch (bi->getBuiltinKind().value_or(BuiltinValueKind::None)) {
-    case BuiltinValueKind::ResumeNonThrowingContinuationReturning: {
-      SILValue opAddr = addrMat.materializeAddress(use->get());
-      bi->setOperand(1, opAddr);
-      break;
-    }
+    case BuiltinValueKind::ResumeNonThrowingContinuationReturning:
     case BuiltinValueKind::ResumeThrowingContinuationReturning: {
       SILValue opAddr = addrMat.materializeAddress(use->get());
-      bi->setOperand(1, opAddr);
+      bi->setOperand(use->getOperandNumber(), opAddr);
       break;
     }
     case BuiltinValueKind::Copy: {
@@ -3101,8 +3135,17 @@ protected:
     llvm::report_fatal_error("Unimplemented SelectValue use.");
   }
 
-  // Opaque enum operand to a switch_enum.
-  void visitSwitchEnumInst(SwitchEnumInst *SEI);
+  void visitStoreBorrowInst(StoreBorrowInst *sbi) {
+    auto addr = addrMat.materializeAddress(use->get());
+    SmallVector<Operand *, 4> uses(sbi->getUses());
+    for (auto *use : uses) {
+      if (auto *ebi = dyn_cast<EndBorrowInst>(use->getUser())) {
+        pass.deleter.forceDelete(ebi);
+      }
+    }
+    sbi->replaceAllUsesWith(addr);
+    pass.deleter.forceDelete(sbi);
+  }
 
   void rewriteStore(SILValue srcVal, SILValue destAddr,
                     IsInitialization_t isInit);
@@ -3133,6 +3176,9 @@ protected:
   // loadable elements that compose a struct can be handled. An address-only
   // member implies an address-only Struct.
   void visitStructInst(StructInst *structInst) {}
+
+  // Opaque enum operand to a switch_enum.
+  void visitSwitchEnumInst(SwitchEnumInst *SEI);
 
   // Opaque call argument.
   void visitTryApplyInst(TryApplyInst *tryApplyInst) {
@@ -3394,7 +3440,7 @@ void UseRewriter::visitSwitchEnumInst(SwitchEnumInst * switchEnum) {
     assert(caseBB->getArguments().size() == 1);
     SILArgument *caseArg = caseBB->getArgument(0);
 
-    assert(&switchEnum->getOperandRef(0) == getReusedStorageOperand(caseArg));
+    assert(&switchEnum->getOperandRef() == getReusedStorageOperand(caseArg));
     assert(caseDecl->hasAssociatedValues() && "caseBB has a payload argument");
 
     SILBuilder caseBuilder = pass.getBuilder(caseBB->begin());
@@ -3753,7 +3799,7 @@ static void rewriteFunction(AddressLoweringState &pass) {
       originalUses.insert(oper);
       UseRewriter::rewriteUse(oper, pass);
     }
-    // Rewrite every new uses that was added.
+    // Rewrite every new use that was added.
     uses.clear();
     for (auto *use : valueDef->getUses()) {
       if (originalUses.contains(use))
@@ -3884,9 +3930,9 @@ static void deleteRewrittenInstructions(AddressLoweringState &pass) {
       continue;
     }
     // willDeleteInstruction was already called for open_existential_value to
-    // update the registered type. Carry out the remaining deletion steps.
-    deadInst->getParent()->remove(deadInst);
-    pass.getModule()->scheduleForDeletion(deadInst);
+    // update the registered type. Now fully erase the instruction, which will
+    // harmlessly call willDeleteInstruction again.
+    deadInst->getParent()->erase(deadInst);
   }
 
   pass.valueStorageMap.clear();

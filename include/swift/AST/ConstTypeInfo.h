@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2022 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -13,6 +13,7 @@
 #ifndef SWIFT_AST_CONST_TYPE_INFO_H
 #define SWIFT_AST_CONST_TYPE_INFO_H
 
+#include "swift/AST/Attr.h"
 #include "swift/AST/Type.h"
 #include <memory>
 #include <string>
@@ -27,7 +28,16 @@ class Type;
 /// in a type property initializer expression
 class CompileTimeValue {
 public:
-  enum ValueKind { RawLiteral, InitCall, Builder, Dictionary, Runtime };
+  enum ValueKind {
+    RawLiteral,
+    InitCall,
+    Builder,
+    Dictionary,
+    Array,
+    Tuple,
+    Enum,
+    Runtime
+  };
 
   ValueKind getKind() const { return Kind; }
 
@@ -65,19 +75,19 @@ struct FunctionParameter {
 /// with a collection of (potentially compile-time-known) parameters
 class InitCallValue : public CompileTimeValue {
 public:
-  InitCallValue(std::string Name, std::vector<FunctionParameter> Parameters)
-  : CompileTimeValue(ValueKind::InitCall), Name(Name),
-  Parameters(Parameters) {}
+  InitCallValue(swift::Type Type, std::vector<FunctionParameter> Parameters)
+      : CompileTimeValue(ValueKind::InitCall), Type(Type),
+        Parameters(Parameters) {}
 
   static bool classof(const CompileTimeValue *T) {
     return T->getKind() == ValueKind::InitCall;
   }
 
-  std::string getName() const { return Name; }
+  swift::Type getType() const { return Type; }
   std::vector<FunctionParameter> getParameters() const { return Parameters; }
 
 private:
-  std::string Name;
+  swift::Type Type;
   std::vector<FunctionParameter> Parameters;
 };
 
@@ -94,14 +104,83 @@ private:
   std::vector<CompileTimeValue> Members;
 };
 
+struct TupleElement {
+  Optional<std::string> Label;
+  swift::Type Type;
+  std::shared_ptr<CompileTimeValue> Value;
+};
+
+/// A representation of a tuple and each tuple-element
+class TupleValue : public CompileTimeValue {
+public:
+  TupleValue(std::vector<TupleElement> Elements)
+      : CompileTimeValue(ValueKind::Tuple), Elements(Elements) {}
+
+  static bool classof(const CompileTimeValue *T) {
+    return T->getKind() == ValueKind::Tuple;
+  }
+
+  std::vector<TupleElement> getElements() const { return Elements; }
+
+private:
+  std::vector<TupleElement> Elements;
+};
+
+/// An array literal value representation
+class ArrayValue : public CompileTimeValue {
+public:
+  ArrayValue(std::vector<std::shared_ptr<CompileTimeValue>> Elements)
+      : CompileTimeValue(ValueKind::Array), Elements(Elements) {}
+
+  static bool classof(const CompileTimeValue *T) {
+    return T->getKind() == ValueKind::Array;
+  }
+  std::vector<std::shared_ptr<CompileTimeValue>> getElements() const {
+    return Elements;
+  }
+
+private:
+  std::vector<std::shared_ptr<CompileTimeValue>> Elements;
+};
+
 /// A dictionary literal value representation
 class DictionaryValue : public CompileTimeValue {
 public:
-  DictionaryValue() : CompileTimeValue(ValueKind::Dictionary) {}
+  DictionaryValue(std::vector<std::shared_ptr<TupleValue>> elements)
+      : CompileTimeValue(ValueKind::Dictionary), Elements(elements) {}
 
   static bool classof(const CompileTimeValue *T) {
     return T->getKind() == ValueKind::Dictionary;
   }
+
+  std::vector<std::shared_ptr<TupleValue>> getElements() const {
+    return Elements;
+  }
+
+private:
+  std::vector<std::shared_ptr<TupleValue>> Elements;
+};
+
+/// An enum value representation
+class EnumValue : public CompileTimeValue {
+public:
+  EnumValue(std::string Identifier,
+            llvm::Optional<std::vector<FunctionParameter>> Parameters)
+      : CompileTimeValue(ValueKind::Enum), Identifier(Identifier),
+        Parameters(Parameters) {}
+
+  std::string getIdentifier() const { return Identifier; }
+  llvm::Optional<std::vector<FunctionParameter>> getParameters() const {
+    return Parameters;
+  }
+
+  static bool classof(const CompileTimeValue *T) {
+    return T->getKind() == ValueKind::Enum;
+  }
+
+private:
+  std::string Identifier;
+  llvm::Optional<std::vector<FunctionParameter>> Parameters;
 };
 
 /// A representation of an arbitrary value that does not fall under
@@ -115,14 +194,44 @@ public:
   }
 };
 
+struct CustomAttrValue {
+  swift::CustomAttr *Attr;
+  std::vector<FunctionParameter> Parameters;
+};
+
+/// A representation of a single associated value for an enumeration case.
+struct EnumElementParameterValue {
+  llvm::Optional<std::string> Label;
+  swift::Type Type;
+};
+
+/// A representation of a single enumeration case.
+struct EnumElementDeclValue {
+  std::string Name;
+  llvm::Optional<std::string> RawValue;
+  llvm::Optional<std::vector<EnumElementParameterValue>> Parameters;
+};
+
 struct ConstValueTypePropertyInfo {
   swift::VarDecl *VarDecl;
   std::shared_ptr<CompileTimeValue> Value;
+  llvm::Optional<std::vector<CustomAttrValue>> PropertyWrappers;
+
+  ConstValueTypePropertyInfo(
+      swift::VarDecl *VarDecl, std::shared_ptr<CompileTimeValue> Value,
+      llvm::Optional<std::vector<CustomAttrValue>> PropertyWrappers)
+      : VarDecl(VarDecl), Value(Value), PropertyWrappers(PropertyWrappers) {}
+
+  ConstValueTypePropertyInfo(swift::VarDecl *VarDecl,
+                             std::shared_ptr<CompileTimeValue> Value)
+      : VarDecl(VarDecl), Value(Value),
+        PropertyWrappers(llvm::Optional<std::vector<CustomAttrValue>>()) {}
 };
 
 struct ConstValueTypeInfo {
   swift::NominalTypeDecl *TypeDecl;
   std::vector<ConstValueTypePropertyInfo> Properties;
+  llvm::Optional<std::vector<EnumElementDeclValue>> EnumElements;
 };
 } // namespace swift
 #endif

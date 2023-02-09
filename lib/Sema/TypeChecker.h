@@ -138,6 +138,9 @@ enum class TypeCheckExprFlags {
 
   /// Don't type check expressions for correct availability.
   DisableExprAvailabilityChecking = 0x08,
+
+  /// Don't expand macros.
+  DisableMacroExpansions = 0x10,
 };
 
 using TypeCheckExprOptions = OptionSet<TypeCheckExprFlags>;
@@ -454,8 +457,9 @@ void typeCheckASTNode(ASTNode &node, DeclContext *DC,
 /// e.g., because of a \c return statement. Otherwise, returns either the
 /// fully type-checked body of the function (on success) or a \c nullptr
 /// value if an error occurred while type checking the transformed body.
-Optional<BraceStmt *> applyResultBuilderBodyTransform(FuncDecl *func,
-                                                        Type builderType);
+Optional<BraceStmt *> applyResultBuilderBodyTransform(
+    FuncDecl *func, Type builderType,
+    bool ClosuresInResultBuilderDontParticipateInInference = true);
 
 /// Find the return statements within the body of the given function.
 std::vector<ReturnStmt *> findReturnStatements(AnyFunctionRef fn);
@@ -914,6 +918,10 @@ lookupPrecedenceGroupForInfixOperator(DeclContext *dc, Expr *op, bool diagnose);
 PrecedenceGroupLookupResult
 lookupPrecedenceGroup(DeclContext *dc, Identifier name, SourceLoc nameLoc);
 
+SmallVector<MacroDecl *, 1>
+lookupMacros(DeclContext *dc, DeclNameRef macroName, SourceLoc loc,
+             MacroRoles contexts);
+
 enum class UnsupportedMemberTypeAccessKind : uint8_t {
   None,
   TypeAliasOfUnboundGeneric,
@@ -1289,6 +1297,11 @@ bool diagnoseInvalidFunctionType(FunctionType *fnTy, SourceLoc loc,
 /// type repr. \param inferredType The type inferred by the type checker.
 void notePlaceholderReplacementTypes(Type writtenType, Type inferredType);
 
+/// Check whether the given extension introduces a conformance
+/// to a protocol annotated with reflection metadata attribute(s).
+/// If that's the case, conforming type supposed to match attribute
+/// requirements.
+void checkReflectionMetadataAttributes(ExtensionDecl *extension);
 } // namespace TypeChecker
 
 /// Returns the protocol requirement kind of the given declaration.

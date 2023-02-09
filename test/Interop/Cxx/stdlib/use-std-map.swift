@@ -5,9 +5,6 @@
 // Enable this everywhere once we have a solution for modularizing other C++ stdlibs: rdar://87654514
 // REQUIRES: OS=macosx || OS=linux-gnu
 
-// This test is failing in Linux CI currently.
-// REQUIRES: rdar102420290
-
 import StdlibUnittest
 import StdMap
 import CxxStdlib
@@ -31,7 +28,6 @@ StdMapTestSuite.test("subscript") {
   expectEqual(m[3], 3)
 }
 
-extension Map.const_iterator : UnsafeCxxInputIterator { }
 extension Map : CxxSequence { }
 
 StdMapTestSuite.test("first(where:)") {

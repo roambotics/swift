@@ -323,8 +323,8 @@ private:
                                        ExtensionDecl *ext) const;
 };
 
-/// Request the nominal type declaration to which the given custom attribute
-/// refers.
+/// Request the nominal type declaration to which the given custom
+/// attribute refers.
 class CustomAttrNominalRequest :
     public SimpleRequest<CustomAttrNominalRequest,
                          NominalTypeDecl *(CustomAttr *, DeclContext *),

@@ -22,10 +22,11 @@
 #include "swift/AST/ParseRequests.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Parse/Lexer.h"
-#include "swift/Parse/CodeCompletionCallbacks.h"
+#include "swift/Parse/IDEInspectionCallbacks.h"
 #include "swift/Parse/ParseSILSupport.h"
 #include "swift/SymbolGraphGen/SymbolGraphOptions.h"
 #include "llvm/Support/Compiler.h"
@@ -101,37 +102,40 @@ using ParsingFlags = SourceFile::ParsingFlags;
 
 void SILParserStateBase::anchor() { }
 
-void swift::performCodeCompletionSecondPass(
-    SourceFile &SF, CodeCompletionCallbacksFactory &Factory) {
+void swift::performIDEInspectionSecondPass(
+    SourceFile &SF, IDEInspectionCallbacksFactory &Factory) {
   return (void)evaluateOrDefault(SF.getASTContext().evaluator,
-                                 CodeCompletionSecondPassRequest{&SF, &Factory},
+                                 IDEInspectionSecondPassRequest{&SF, &Factory},
                                  false);
 }
 
-bool CodeCompletionSecondPassRequest::evaluate(
+bool IDEInspectionSecondPassRequest::evaluate(
     Evaluator &evaluator, SourceFile *SF,
-    CodeCompletionCallbacksFactory *Factory) const {
+    IDEInspectionCallbacksFactory *Factory) const {
   // If we didn't find the code completion token, bail.
   auto *parserState = SF->getDelayedParserState();
-  if (!parserState->hasCodeCompletionDelayedDeclState())
+  if (!parserState->hasIDEInspectionDelayedDeclState())
     return true;
 
-  auto state = parserState->takeCodeCompletionDelayedDeclState();
+  // Decrement the closure discriminator index by one so a top-level closure
+  // gets the same discriminator as before when being re-parsed in the second
+  // pass.
+  auto state = parserState->takeIDEInspectionDelayedDeclState();
   auto &Ctx = SF->getASTContext();
 
-  auto BufferID = Ctx.SourceMgr.getCodeCompletionBufferID();
+  auto BufferID = Ctx.SourceMgr.getIDEInspectionTargetBufferID();
   Parser TheParser(BufferID, *SF, nullptr, parserState);
 
-  std::unique_ptr<CodeCompletionCallbacks> CodeCompletion(
-      Factory->createCodeCompletionCallbacks(TheParser));
-  TheParser.setCodeCompletionCallbacks(CodeCompletion.get());
+  std::unique_ptr<IDEInspectionCallbacks> IDECallbacks(
+      Factory->createIDEInspectionCallbacks(TheParser));
+  TheParser.setIDECallbacks(IDECallbacks.get());
 
-  TheParser.performCodeCompletionSecondPassImpl(*state);
+  TheParser.performIDEInspectionSecondPassImpl(*state);
   return true;
 }
 
-void Parser::performCodeCompletionSecondPassImpl(
-    CodeCompletionDelayedDeclState &info) {
+void Parser::performIDEInspectionSecondPassImpl(
+    IDEInspectionDelayedDeclState &info) {
   // Disable updating the interface hash
   llvm::SaveAndRestore<Optional<StableHasher>> CurrentTokenHashSaver(
       CurrentTokenHash, None);
@@ -146,12 +150,16 @@ void Parser::performCodeCompletionSecondPassImpl(
 
   DeclContext *DC = info.ParentContext;
 
+  // Forget about the fact that we may have already computed local
+  // discriminators.
+  Context.evaluator.clearCachedOutput(LocalDiscriminatorsRequest{DC});
+
   switch (info.Kind) {
-  case CodeCompletionDelayedDeclKind::TopLevelCodeDecl: {
+  case IDEInspectionDelayedDeclKind::TopLevelCodeDecl: {
     // Re-enter the top-level code decl context.
     // FIXME: this can issue discriminators out-of-order?
     auto *TLCD = cast<TopLevelCodeDecl>(DC);
-    ContextChange CC(*this, TLCD, &State->getTopLevelContext());
+    ContextChange CC(*this, TLCD);
 
     SourceLoc StartLoc = Tok.getLoc();
     ASTNode Result;
@@ -163,7 +171,7 @@ void Parser::performCodeCompletionSecondPassImpl(
     break;
   }
 
-  case CodeCompletionDelayedDeclKind::Decl: {
+  case IDEInspectionDelayedDeclKind::Decl: {
     assert((DC->isTypeContext() || DC->isModuleScopeContext()) &&
            "Delayed decl must be a type member or a top-level decl");
     ContextChange CC(*this, DC);
@@ -185,19 +193,19 @@ void Parser::performCodeCompletionSecondPassImpl(
     break;
   }
 
-  case CodeCompletionDelayedDeclKind::FunctionBody: {
+  case IDEInspectionDelayedDeclKind::FunctionBody: {
     auto *AFD = cast<AbstractFunctionDecl>(DC);
     (void)parseAbstractFunctionBodyImpl(AFD);
     break;
   }
   }
 
-  assert(!State->hasCodeCompletionDelayedDeclState() &&
+  assert(!State->hasIDEInspectionDelayedDeclState() &&
          "Second pass should not set any code completion info");
 
-  CodeCompletion->doneParsing(DC->getParentSourceFile());
+  IDECallbacks->doneParsing(DC->getParentSourceFile());
 
-  State->restoreCodeCompletionDelayedDeclState(info);
+  State->restoreIDEInspectionDelayedDeclState(info);
 }
 
 swift::Parser::BacktrackingScopeImpl::~BacktrackingScopeImpl() {
@@ -497,7 +505,7 @@ bool Parser::isInSILMode() const { return SF.Kind == SourceFileKind::SIL; }
 
 bool Parser::isDelayedParsingEnabled() const {
   // Do not delay parsing during code completion's second pass.
-  if (CodeCompletion)
+  if (IDECallbacks)
     return false;
 
   return SF.hasDelayedBodyParsing();
@@ -510,6 +518,18 @@ bool Parser::shouldEvaluatePoundIfDecls() const {
 
 bool Parser::allowTopLevelCode() const {
   return SF.isScriptMode();
+}
+
+bool Parser::isInMacroExpansion(SourceLoc loc) const {
+  if (loc.isInvalid())
+    return false;
+
+  auto bufferID = SourceMgr.findBufferContainingLoc(loc);
+  auto generatedSourceInfo = SourceMgr.getGeneratedSourceInfo(bufferID);
+  if (!generatedSourceInfo)
+    return false;
+
+  return true;
 }
 
 const Token &Parser::peekToken() {

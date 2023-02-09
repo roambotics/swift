@@ -59,6 +59,7 @@ namespace swift {
   struct ASTNode;
   class ASTPrinter;
   class ASTWalker;
+  enum class BuiltinMacroKind: uint8_t;
   class ConstructorDecl;
   class DestructorDecl;
   class DiagnosticEngine;
@@ -78,6 +79,8 @@ namespace swift {
   class GenericSignature;
   class GenericTypeParamDecl;
   class GenericTypeParamType;
+  class MacroDecl;
+  class MacroDefinition;
   class ModuleDecl;
   class NamedPattern;
   class EnumCaseDecl;
@@ -188,6 +191,7 @@ enum class DescriptiveDeclKind : uint8_t {
   DidSet,
   EnumElement,
   Module,
+  Missing,
   MissingMember,
   Requirement,
   OpaqueResultType,
@@ -253,6 +257,9 @@ struct OverloadSignature {
 
   /// Whether this is a type alias.
   unsigned IsTypeAlias : 1;
+
+  /// Whether this is a macro.
+  unsigned IsMacro : 1;
 
   /// Whether this signature is part of a protocol extension.
   unsigned InProtocolExtension : 1;
@@ -605,13 +612,16 @@ protected:
     IsActor : 1
   );
 
-  SWIFT_INLINE_BITFIELD(
-      StructDecl, NominalTypeDecl, 1 + 1,
-      /// True if this struct has storage for fields that aren't accessible in
-      /// Swift.
-      HasUnreferenceableStorage : 1,
-      /// True if this struct is imported from C++ and does not have trivial value witness functions.
-      IsCxxNonTrivial : 1);
+  SWIFT_INLINE_BITFIELD(StructDecl, NominalTypeDecl, 1 + 1 + 1,
+                        /// True if this struct has storage for fields that
+                        /// aren't accessible in Swift.
+                        HasUnreferenceableStorage : 1,
+                        /// True if this struct is imported from C++ and does
+                        /// not have trivial value witness functions.
+                        IsCxxNonTrivial : 1,
+                        /// True if this struct is imported from C and has
+                        /// address diversified ptrauth qualified field.
+                        IsNonTrivialPtrAuth : 1);
 
   SWIFT_INLINE_BITFIELD(EnumDecl, NominalTypeDecl, 2+1,
     /// True if the enum has cases and at least one case has associated values.
@@ -686,13 +696,14 @@ protected:
     NumPathElements : 8
   );
 
-  SWIFT_INLINE_BITFIELD(ExtensionDecl, Decl, 3+1,
+  SWIFT_INLINE_BITFIELD(ExtensionDecl, Decl, 4+1,
     /// An encoding of the default and maximum access level for this extension.
+    /// The value 4 corresponds to AccessLevel::Public
     ///
     /// This is encoded as (1 << (maxAccess-1)) | (1 << (defaultAccess-1)),
     /// which works because the maximum is always greater than or equal to the
     /// default, and 'private' is never used. 0 represents an uncomputed value.
-    DefaultAndMaxAccessLevel : 3,
+    DefaultAndMaxAccessLevel : 4,
 
     /// Whether there is are lazily-loaded conformances for this extension.
     HasLazyConformances : 1
@@ -714,6 +725,10 @@ protected:
   SWIFT_INLINE_BITFIELD(MissingMemberDecl, Decl, 1+2,
     NumberOfFieldOffsetVectorEntries : 1,
     NumberOfVTableEntries : 2
+  );
+
+  SWIFT_INLINE_BITFIELD(MacroExpansionDecl, Decl, 16,
+    Discriminator : 16
   );
 
   } Bits;
@@ -843,6 +858,27 @@ public:
     return Attrs;
   }
 
+  /// Retrieve runtime discoverable attributes (if any) associated
+  /// with this declaration.
+  ArrayRef<CustomAttr *> getRuntimeDiscoverableAttrs() const;
+
+  /// Returns the semantic attributes attached to this declaration,
+  /// including attributes that are generated as the result of member
+  /// attribute macro expansion.
+  DeclAttributes getSemanticAttrs() const;
+
+  using MacroCallback = llvm::function_ref<void(CustomAttr *, MacroDecl *)>;
+
+  /// Iterate over each attached macro with the given role, invoking the
+  /// given callback with each macro custom attribute and corresponding macro
+  /// declaration.
+  void forEachAttachedMacro(MacroRole role, MacroCallback) const;
+
+  /// Retrieve the discriminator for the given custom attribute that names
+  /// an attached macro.
+  unsigned getAttachedMacroDiscriminator(
+      MacroRole role, const CustomAttr *attr) const;
+
   /// Returns the innermost enclosing decl with an availability annotation.
   const Decl *getInnermostDeclWithAvailability() const;
 
@@ -852,9 +888,9 @@ public:
   Optional<llvm::VersionTuple> getIntroducedOSVersion(PlatformKind Kind) const;
 
   /// Returns the OS version in which the decl became ABI as specified by the
-  /// @_backDeploy attribute.
+  /// @backDeployed attribute.
   Optional<llvm::VersionTuple>
-  getBackDeployBeforeOSVersion(ASTContext &Ctx) const;
+  getBackDeployedBeforeOSVersion(ASTContext &Ctx) const;
 
   /// Returns the starting location of the entire declaration.
   SourceLoc getStartLoc() const { return getSourceRange().Start; }
@@ -1092,11 +1128,26 @@ public:
 
   bool isAvailableAsSPI() const;
 
-  /// Whether the declaration is considered unavailable through either being
-  /// explicitly marked as such, or has a parent decl that is semantically
-  /// unavailable. This is a broader notion of unavailability than is checked by
-  /// \c AvailableAttr::isUnavailable.
-  bool isSemanticallyUnavailable() const;
+  /// Retrieve the @available attribute that provides the OS version range that
+  /// this declaration is available in.
+  ///
+  /// This attribute may come from an enclosing decl since availability is
+  /// inherited. The second member of the returned pair is the decl that owns
+  /// the attribute.
+  Optional<std::pair<const AvailableAttr *, const Decl *>>
+  getSemanticAvailableRangeAttr() const;
+
+  /// Retrieve the @available attribute that makes this declaration unavailable,
+  /// if any.
+  ///
+  /// This attribute may come from an enclosing decl since availability is
+  /// inherited. The second member of the returned pair is the decl that owns
+  /// the attribute.
+  ///
+  /// Note that this notion of unavailability is broader than that which is
+  /// checked by \c AvailableAttr::isUnavailable.
+  Optional<std::pair<const AvailableAttr *, const Decl *>>
+  getSemanticUnavailableAttr() const;
 
   // List the SPI groups declared with @_spi or inherited by this decl.
   //
@@ -1968,6 +2019,10 @@ public:
     getMutablePatternList()[i].setInit(E);
   }
 
+  void setOriginalInit(unsigned i, Expr *E) {
+    getMutablePatternList()[i].setOriginalInit(E);
+  }
+
   Pattern *getPattern(unsigned i) const {
     return getPatternList()[i].getPattern();
   }
@@ -2291,10 +2346,14 @@ private:
 /// ValueDecl - All named decls that are values in the language.  These can
 /// have a type, etc.
 class ValueDecl : public Decl {
+public:
+  enum : unsigned { InvalidDiscriminator = 0xFFFF };
+
+private:
   DeclName Name;
   SourceLoc NameLoc;
   llvm::PointerIntPair<Type, 3, OptionalEnum<AccessLevel>> TypeAndAccess;
-  unsigned LocalDiscriminator = 0;
+  unsigned LocalDiscriminator = InvalidDiscriminator;
 
   struct {
     /// Whether the "IsObjC" bit has been computed yet.
@@ -2581,6 +2640,12 @@ public:
   unsigned getLocalDiscriminator() const;
   void setLocalDiscriminator(unsigned index);
 
+  /// Whether this declaration has a local discriminator.
+  bool hasLocalDiscriminator() const;
+
+  /// Return the "raw" local discriminator, without computing it.
+  unsigned getRawLocalDiscriminator() const { return LocalDiscriminator; }
+
   /// Retrieve the declaration that this declaration overrides, if any.
   ValueDecl *getOverriddenDecl() const;
 
@@ -2793,6 +2858,19 @@ public:
   /// 'func foo(Int) -> () -> Self?'.
   GenericParameterReferenceInfo findExistentialSelfReferences(
       Type baseTy, bool treatNonResultCovariantSelfAsInvariant) const;
+
+  /// Retrieve a nominal type declaration backing given runtime discoverable
+  /// attribute.
+  ///
+  /// FIXME: This should be a more general facility but its unclear where
+  ///        to place it for maximum impact.
+  NominalTypeDecl *getRuntimeDiscoverableAttrTypeDecl(CustomAttr *attr) const;
+
+  /// Given a runtime discoverable attribute, return a generator
+  /// which could be used to instantiate it for this declaration
+  /// together with its result type.
+  std::pair<BraceStmt *, Type>
+  getRuntimeDiscoverableAttributeGenerator(CustomAttr *) const;
 };
 
 /// This is a common base class for declarations which declare a type.
@@ -3899,35 +3977,6 @@ public:
     return getGlobalActorInstance() != nullptr;
   }
 
-  /// Returns true if this type has a type wrapper custom attribute.
-  bool hasTypeWrapper() const { return bool(getTypeWrapper()); }
-
-  /// Return a type wrapper (if any) associated with this type.
-  NominalTypeDecl *getTypeWrapper() const;
-
-  /// If this declaration has a type wrapper return a property that
-  /// is used for all type wrapper related operations (mainly for
-  /// applicable property access routing).
-  VarDecl *getTypeWrapperProperty() const;
-
-  /// If this declaration has a type wrapper, return `$Storage`
-  /// declaration that contains all the stored properties managed
-  /// by the wrapper. Note that if this type is a protocol them
-  /// this method returns an associated type for $Storage.
-  TypeDecl *getTypeWrapperStorageDecl() const;
-
-  /// If this declaration is a type wrapper, retrieve
-  /// its required initializer - `init(storageWrapper:)`.
-  ConstructorDecl *getTypeWrapperInitializer() const;
-
-  /// Get an initializer that accepts a type wrapper instance to
-  /// initialize the wrapped type.
-  ConstructorDecl *getTypeWrappedTypeStorageInitializer() const;
-
-  /// Get a memberwise initializer that could be used to instantiate a
-  /// type wrapped type.
-  ConstructorDecl *getTypeWrappedTypeMemberwiseInitializer() const;
-
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) {
     return D->getKind() >= DeclKind::First_NominalTypeDecl &&
@@ -4196,6 +4245,14 @@ public:
   bool isCxxNonTrivial() const { return Bits.StructDecl.IsCxxNonTrivial; }
 
   void setIsCxxNonTrivial(bool v) { Bits.StructDecl.IsCxxNonTrivial = v; }
+
+  bool isNonTrivialPtrAuth() const {
+    return Bits.StructDecl.IsNonTrivialPtrAuth;
+  }
+
+  void setHasNonTrivialPtrAuth(bool v) {
+    Bits.StructDecl.IsNonTrivialPtrAuth = v;
+  }
 
   Type getTemplateInstantiationType() const { return TemplateInstantiationType; }
   void setTemplateInstantiationType(Type t) { TemplateInstantiationType = t; }
@@ -5785,17 +5842,6 @@ public:
   /// wrapper that has storage.
   bool hasStorageOrWrapsStorage() const;
 
-  /// Whether this property belongs to a type wrapped type and has
-  /// all access to it routed through a type wrapper.
-  bool isAccessedViaTypeWrapper() const;
-
-  /// For type wrapped properties (see \c isAccessedViaTypeWrapper)
-  /// all access is routed through a type wrapper.
-  ///
-  /// \returns an underlying type wrapper property which is a
-  /// storage endpoint for all access to this property.
-  VarDecl *getUnderlyingTypeWrapperStorage() const;
-
   /// Visit all auxiliary declarations to this VarDecl.
   ///
   /// An auxiliary declaration is a declaration synthesized by the compiler to support
@@ -5873,11 +5919,6 @@ public:
   /// backing property will be treated as the member-initialized property.
   bool isMemberwiseInitialized(bool preferDeclaredProperties) const;
 
-  /// Check whether this variable presents a local storage synthesized
-  /// by the compiler in a user-defined designated initializer to
-  /// support initialization of type wrapper managed properties.
-  bool isTypeWrapperLocalStorageForInitializer() const;
-
   /// Return the range of semantics attributes attached to this VarDecl.
   auto getSemanticsAttrs() const
       -> decltype(getAttrs().getAttributes<SemanticsAttr>()) {
@@ -5891,6 +5932,8 @@ public:
       return attrValue.equals(attr->Value);
     });
   }
+
+  clang::PointerAuthQualifier getPointerAuthQualifier() const;
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) { 
@@ -6724,8 +6767,8 @@ public:
   /// \return the synthesized thunk, or null if the base of the call has
   ///         diagnosed errors during type checking.
   FuncDecl *getDistributedThunk() const;
-  
-  /// Returns 'true' if the function has (or inherits) the @c @_backDeploy
+
+  /// Returns 'true' if the function has (or inherits) the `@backDeployed`
   /// attribute.
   bool isBackDeployed() const;
 
@@ -7821,12 +7864,6 @@ public:
   /// \endcode
   bool isObjCZeroParameterWithLongSelector() const;
 
-  /// If this is a user-defined constructor that belongs to
-  /// a type wrapped type return a local `_storage` variable
-  /// injected by the compiler for aid with type wrapper
-  /// initialization.
-  VarDecl *getLocalTypeWrapperStorageVar() const;
-
   static bool classof(const Decl *D) {
     return D->getKind() == DeclKind::Constructor;
   }
@@ -8225,6 +8262,34 @@ public:
   }
 };
 
+/// Represents a missing declaration in the source code. This
+/// is used for parser recovery, e.g. when parsing a floating
+/// attribute list.
+class MissingDecl: public Decl {
+  MissingDecl(DeclContext *DC) : Decl(DeclKind::Missing, DC) {
+    setImplicit();
+  }
+
+  friend class Decl;
+  SourceLoc getLocFromSource() const {
+    return SourceLoc();
+  }
+
+public:
+  static MissingDecl *
+  create(ASTContext &ctx, DeclContext *DC) {
+    return new (ctx) MissingDecl(DC);
+  }
+
+  SourceRange getSourceRange() const {
+    return SourceRange();
+  }
+
+  static bool classof(const Decl *D) {
+    return D->getKind() == DeclKind::Missing;
+  }
+};
+
 /// Represents a hole where a declaration should have been.
 ///
 /// Among other things, these are used to keep vtable layout consistent.
@@ -8303,33 +8368,35 @@ public:
   /// The result type.
   TypeLoc resultType;
 
-  /// The module name for the external macro definition.
-  Identifier externalModuleName;
-
-  /// The location of the module name for the external macro definition.
-  SourceLoc externalModuleNameLoc;
-
-  /// The type name for the external macro definition.
-  Identifier externalMacroTypeName;
-
-  /// The location of the type name for the external macro definition.
-  SourceLoc externalMacroTypeNameLoc;
+  /// The macro definition, which should always be a
+  /// \c MacroExpansionExpr in well-formed code.
+  Expr *definition;
 
   MacroDecl(SourceLoc macroLoc, DeclName name, SourceLoc nameLoc,
             GenericParamList *genericParams,
             ParameterList *parameterList,
             SourceLoc arrowOrColonLoc,
             TypeRepr *resultType,
-            Identifier externalModuleName,
-            SourceLoc externalModuleNameLoc,
-            Identifier externalMacroTypeName,
-            SourceLoc externalMacroTypeNameLoc,
+            Expr *definition,
             DeclContext *parent);
 
   SourceRange getSourceRange() const;
 
   /// Retrieve the interface type produced when expanding this macro.
   Type getResultInterfaceType() const;
+
+  /// Determine the contexts in which this macro can be applied.
+  MacroRoles getMacroRoles() const;
+
+  /// Retrieve the attribute that declared the given macro role.
+  const MacroRoleAttr *getMacroRoleAttr(MacroRole role) const;
+
+  /// Retrieve the definition of this macro.
+  MacroDefinition getDefinition() const;
+
+  /// Retrieve the builtin macro kind for this macro, or \c None if it is a
+  /// user-defined macro with no special semantics.
+  Optional<BuiltinMacroKind> getBuiltinKind() const;
 
   static bool classof(const DeclContext *C) {
     if (auto D = C->getAsDecl())
@@ -8348,14 +8415,18 @@ public:
 
 class MacroExpansionDecl : public Decl {
   SourceLoc PoundLoc;
-  DeclNameRef Macro;
-  DeclNameLoc MacroLoc;
+  DeclNameRef MacroName;
+  DeclNameLoc MacroNameLoc;
   SourceLoc LeftAngleLoc, RightAngleLoc;
   ArrayRef<TypeRepr *> GenericArgs;
   ArgumentList *ArgList;
-  Decl *Rewritten;
+
+  /// The referenced macro.
+  ConcreteDeclRef macroRef;
 
 public:
+  enum : unsigned { InvalidDiscriminator = 0xFFFF };
+
   MacroExpansionDecl(DeclContext *dc, SourceLoc poundLoc, DeclNameRef macro,
                      DeclNameLoc macroLoc,
                      SourceLoc leftAngleLoc,
@@ -8363,9 +8434,11 @@ public:
                      SourceLoc rightAngleLoc,
                      ArgumentList *args)
       : Decl(DeclKind::MacroExpansion, dc), PoundLoc(poundLoc),
-        Macro(macro), MacroLoc(macroLoc),
+        MacroName(macro), MacroNameLoc(macroLoc),
         LeftAngleLoc(leftAngleLoc), RightAngleLoc(rightAngleLoc),
-        GenericArgs(genericArgs), ArgList(args), Rewritten(nullptr) {}
+        GenericArgs(genericArgs), ArgList(args) {
+    Bits.MacroExpansionDecl.Discriminator = InvalidDiscriminator;
+  }
 
   ArrayRef<TypeRepr *> getGenericArgs() const { return GenericArgs; }
 
@@ -8376,11 +8449,30 @@ public:
   SourceRange getSourceRange() const;
   SourceLoc getLocFromSource() const { return PoundLoc; }
   SourceLoc getPoundLoc() const { return PoundLoc; }
-  DeclNameLoc getMacroLoc() const { return MacroLoc; }
-  DeclNameRef getMacro() const { return Macro; }
+  DeclNameLoc getMacroNameLoc() const { return MacroNameLoc; }
+  DeclNameRef getMacroName() const { return MacroName; }
   ArgumentList *getArgs() const { return ArgList; }
-  Decl *getRewritten() const { return Rewritten; }
-  void setRewritten(Decl *rewritten) { Rewritten = rewritten; }
+  ArrayRef<Decl *> getRewritten() const;
+  ConcreteDeclRef getMacroRef() const { return macroRef; }
+  void setMacroRef(ConcreteDeclRef ref) { macroRef = ref; }
+
+  /// Returns a discriminator which determines this macro expansion's index
+  /// in the sequence of macro expansions within the current function.
+  unsigned getDiscriminator() const;
+
+  /// Retrieve the raw discriminator, which may not have been computed yet.
+  ///
+  /// Only use this for queries that are checking for (e.g.) reentrancy or
+  /// intentionally do not want to initiate verification.
+  unsigned getRawDiscriminator() const {
+    return Bits.MacroExpansionDecl.Discriminator;
+  }
+
+  void setDiscriminator(unsigned discriminator) {
+    assert(getRawDiscriminator() == InvalidDiscriminator);
+    assert(discriminator != InvalidDiscriminator);
+    Bits.MacroExpansionDecl.Discriminator = discriminator;
+  }
 
   static bool classof(const Decl *D) {
     return D->getKind() == DeclKind::MacroExpansion;

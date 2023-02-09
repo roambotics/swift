@@ -14,10 +14,10 @@
 #define SWIFT_PRINTASCLANG_PRINTCLANGFUNCTION_H
 
 #include "OutputLanguageMode.h"
-#include "swift/AST/GenericRequirement.h"
 #include "swift/AST/Type.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/ClangImporter/ClangImporter.h"
+#include "swift/IRGen/GenericRequirement.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/Optional.h"
@@ -86,6 +86,11 @@ public:
     bool isStatic = false;
     bool isInline = false;
     bool isConst = false;
+    bool isNoexcept = false;
+    bool hasSymbolUSR = true;
+    /// Specific declaration that should be used to emit the symbol's
+    /// USR instead of the original function declaration.
+    const ValueDecl *symbolUSROverride = nullptr;
 
     FunctionSignatureModifiers() {}
   };
@@ -108,14 +113,15 @@ public:
                          const NominalTypeDecl *typeDeclContext,
                          const ModuleDecl *moduleContext, Type resultTy,
                          const ParameterList *params, bool hasThrows = false,
-                         const AnyFunctionType *funcType = nullptr);
+                         const AnyFunctionType *funcType = nullptr,
+                         bool isStaticMethod = false);
 
   /// Print the Swift method as C++ method declaration/definition, including
   /// constructors.
   void printCxxMethod(const NominalTypeDecl *typeDeclContext,
                       const AbstractFunctionDecl *FD,
                       const LoweredFunctionSignature &signature,
-                      StringRef swiftSymbolName, Type resultTy,
+                      StringRef swiftSymbolName, Type resultTy, bool isStatic,
                       bool isDefinition);
 
   /// Print the C++ getter/setter method signature.

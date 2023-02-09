@@ -32,7 +32,7 @@ public:
     VerifyAndApplyFixes
   } VerifyMode = NoVerify;
 
-  enum FormattingStyle { LLVM, Swift };
+  enum FormattingStyle { LLVM, Swift, SwiftSyntax };
 
   /// Indicates whether to allow diagnostics for \c <unknown> locations if
   /// \c VerifyMode is not \c NoVerify.
@@ -72,6 +72,9 @@ public:
   /// Whether to emit diagnostics in the terse LLVM style or in a more
   /// descriptive style that's specific to Swift (currently experimental).
   FormattingStyle PrintedFormattingStyle = FormattingStyle::LLVM;
+
+  /// Whether to emit macro expansion buffers into separate, temporary files.
+  bool EmitMacroExpansionFiles = true;
 
   std::string DiagnosticDocumentationPath = "";
 

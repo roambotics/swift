@@ -287,6 +287,7 @@ namespace {
     IMPL(BuiltinRawUnsafeContinuation, Trivial)
     IMPL(BuiltinJob, Trivial)
     IMPL(BuiltinExecutor, Trivial)
+    IMPL(BuiltinPackIndex, Trivial)
     IMPL(BuiltinNativeObject, Reference)
     IMPL(BuiltinBridgeObject, Reference)
     IMPL(BuiltinVector, Trivial)
@@ -299,6 +300,16 @@ namespace {
     RetTy visitPackType(CanPackType type,
                         AbstractionPattern origType,
                         IsTypeExpansionSensitive_t isSensitive) {
+      return asImpl().handleAddressOnly(type, {IsNotTrivial, IsFixedABI,
+                                               IsAddressOnly, IsNotResilient,
+                                               isSensitive,
+                                               DoesNotHaveRawPointer,
+                                               IsLexical});
+    }
+
+    RetTy visitSILPackType(CanSILPackType type,
+                           AbstractionPattern origType,
+                           IsTypeExpansionSensitive_t isSensitive) {
       return asImpl().handleAddressOnly(type, {IsNotTrivial, IsFixedABI,
                                                IsAddressOnly, IsNotResilient,
                                                isSensitive,
@@ -2173,6 +2184,16 @@ namespace {
       return handleAddressOnly(packType, properties);
     }
 
+    TypeLowering *visitSILPackType(CanSILPackType packType,
+                                   AbstractionPattern origType,
+                                   IsTypeExpansionSensitive_t isSensitive) {
+      RecursiveProperties properties;
+      properties.setAddressOnly();
+      properties = mergeIsTypeExpansionSensitive(isSensitive, properties);
+
+      return handleAddressOnly(packType, properties);
+    }
+
     TypeLowering *visitPackExpansionType(CanPackExpansionType packExpansionType,
                                          AbstractionPattern origType,
                                          IsTypeExpansionSensitive_t isSensitive) {
@@ -2270,6 +2291,10 @@ namespace {
 
       // Classify the type according to its stored properties.
       for (auto field : D->getStoredProperties()) {
+        auto pointerAuthQual = field->getPointerAuthQualifier();
+        if (pointerAuthQual.isPresent()) {
+          properties.setAddressOnly();
+        }
         auto substFieldType =
           field->getInterfaceType().subst(subMap)
                ->getCanonicalType();
@@ -2499,16 +2524,13 @@ static CanTupleType computeLoweredTupleType(TypeConverter &tc,
 
 /// Lower each of the elements of the substituted type according to
 /// the abstraction pattern of the given original type.
-static CanPackType computeLoweredPackType(TypeConverter &tc,
-                                          TypeExpansionContext context,
-                                          AbstractionPattern origType,
-                                          CanPackType substType) {
+static CanSILPackType computeLoweredPackType(TypeConverter &tc,
+                                             TypeExpansionContext context,
+                                             AbstractionPattern origType,
+                                             CanPackType substType) {
   assert(origType.matchesPack(substType));
 
-  // Does the lowered tuple type differ from the substituted type in
-  // any interesting way?
-  bool changed = false;
-  SmallVector<Type, 4> loweredElts;
+  SmallVector<CanType, 4> loweredElts;
   loweredElts.reserve(substType->getNumElements());
 
   for (auto i : indices(substType->getElementTypes())) {
@@ -2517,14 +2539,13 @@ static CanPackType computeLoweredPackType(TypeConverter &tc,
 
     CanType loweredTy =
         tc.getLoweredRValueType(context, origEltType, substEltType);
-    changed = (changed || substEltType != loweredTy);
-
     loweredElts.push_back(loweredTy);
   }
 
-  if (!changed) return substType;
+  bool elementIsAddress = true; // TODO
+  SILPackType::ExtInfo extInfo(elementIsAddress);
 
-  return CanPackType(PackType::get(tc.Context, loweredElts));
+  return SILPackType::get(tc.Context, extInfo, loweredElts);
 }
 
 static CanType computeLoweredOptionalType(TypeConverter &tc,
@@ -3047,9 +3068,12 @@ const TypeLowering &TypeConverter::getTypeLoweringForLoweredType(
     AbstractionPattern origType, CanType loweredType,
     TypeExpansionContext forExpansion,
     IsTypeExpansionSensitive_t isTypeExpansionSensitive) {
-  assert(loweredType->isLegalSILType() && "type is not lowered!");
-  (void)loweredType;
-  
+
+  // For very large types (e.g. tuples with many elements), this assertion is
+  // very expensive to execute, because the `isLegalSILType` status is not cached.
+  // Therefore the assert is commented out and only here for documentation purposes.
+  // assert(loweredType->isLegalSILType() && "type is not lowered!");
+
   // Cache the lowered type record for a contextualized type independent of the
   // abstraction pattern. Lowered type parameters can't be cached or looked up
   // without context. (TODO: We could if they match the out-of-context
@@ -3227,6 +3251,30 @@ static CanAnyFunctionType getStoredPropertyInitializerInterfaceType(
   CanAnyFunctionType::ExtInfo info;
   return CanAnyFunctionType::get(getCanonicalSignatureOrNull(sig), {}, resultTy,
                                  info);
+}
+
+/// Type of runtime discoverable attribute generator is () -> <#AttrType#>
+static CanAnyFunctionType
+getRuntimeAttributeGeneratorInterfaceType(TypeConverter &TC, SILDeclRef c) {
+  auto *attachedToDecl = c.getDecl();
+  auto *attr = c.pointer.get<CustomAttr *>();
+  auto *attrType = attachedToDecl->getRuntimeDiscoverableAttrTypeDecl(attr);
+  auto generator =
+      attachedToDecl->getRuntimeDiscoverableAttributeGenerator(attr);
+
+  auto resultTy = generator.second->getCanonicalType();
+
+  CanType canResultTy = resultTy->getReducedType(
+      attrType->getInnermostDeclContext()->getGenericSignatureOfContext());
+
+  // Remove @noescape from function return types. A @noescape
+  // function return type is a contradiction.
+  canResultTy = removeNoEscape(canResultTy);
+
+  // FIXME: Verify ExtInfo state is correct, not working by accident.
+  CanAnyFunctionType::ExtInfo info;
+  return CanAnyFunctionType::get(/*genericSignature=*/nullptr,
+                                 /*params=*/{}, canResultTy, info);
 }
 
 /// Get the type of a property wrapper backing initializer,
@@ -3489,6 +3537,8 @@ CanAnyFunctionType TypeConverter::makeConstantInterfaceType(SILDeclRef c) {
     return getAsyncEntryPoint(Context);
   case SILDeclRef::Kind::EntryPoint:
     return getEntryPointInterfaceType(Context);
+  case SILDeclRef::Kind::RuntimeAttributeGenerator:
+    return getRuntimeAttributeGeneratorInterfaceType(*this, c);
   }
 
   llvm_unreachable("Unhandled SILDeclRefKind in switch.");
@@ -3542,6 +3592,7 @@ TypeConverter::getConstantGenericSignature(SILDeclRef c) {
     return vd->getDeclContext()->getGenericSignatureOfContext();
   case SILDeclRef::Kind::EntryPoint:
   case SILDeclRef::Kind::AsyncEntryPoint:
+  case SILDeclRef::Kind::RuntimeAttributeGenerator:
     llvm_unreachable("Doesn't have generic signature");
   }
 

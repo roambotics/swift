@@ -257,11 +257,10 @@ swift::checkGlobalActorAttributes(
   NominalTypeDecl *globalActorNominal = nullptr;
   for (auto attr : attrs) {
     // Figure out which nominal declaration this custom attribute refers to.
-    auto nominal = evaluateOrDefault(ctx.evaluator,
-                                     CustomAttrNominalRequest{attr, dc},
-                                     nullptr);
+    auto *nominal = evaluateOrDefault(ctx.evaluator,
+                                      CustomAttrNominalRequest{attr, dc},
+                                      nullptr);
 
-    // Ignore unresolvable custom attributes.
     if (!nominal)
       continue;
 
@@ -1526,6 +1525,41 @@ bool swift::isAsyncDecl(ConcreteDeclRef declRef) {
   return false;
 }
 
+bool swift::safeToDropGlobalActor(
+    DeclContext *dc, Type globalActor, Type ty,
+    llvm::function_ref<ClosureActorIsolation(AbstractClosureExpr *)>
+        getClosureActorIsolation) {
+  auto funcTy = ty->getAs<AnyFunctionType>();
+  if (!funcTy)
+    return false;
+
+  // can't add a different global actor
+  if (auto otherGA = funcTy->getGlobalActor()) {
+    assert(otherGA->getCanonicalType() != globalActor->getCanonicalType()
+           && "not even dropping the actor?");
+    return false;
+  }
+
+  // We currently allow unconditional dropping of global actors from
+  // async function types, despite this confusing Sendable checking
+  // in light of SE-338.
+  if (funcTy->isAsync())
+    return true;
+
+  // fundamentally cannot be sendable if we want to drop isolation info
+  if (funcTy->isSendable())
+    return false;
+
+  // finally, must be in a context with matching isolation.
+  auto dcIsolation = getActorIsolationOfContext(dc, getClosureActorIsolation);
+  if (dcIsolation.isGlobalActor())
+    if (dcIsolation.getGlobalActor()->getCanonicalType()
+        == globalActor->getCanonicalType())
+      return true;
+
+  return false;
+}
+
 static FuncDecl *findAnnotatableFunction(DeclContext *dc) {
   auto fn = dyn_cast<FuncDecl>(dc);
   if (!fn) return nullptr;
@@ -1735,6 +1769,41 @@ namespace {
       }
 
       return false;
+    }
+
+    /// Some function conversions synthesized by the constraint solver may not
+    /// be correct AND the solver doesn't know, so we must emit a diagnostic.
+    void checkFunctionConversion(FunctionConversionExpr *funcConv) {
+      auto subExprType = funcConv->getSubExpr()->getType();
+      if (auto fromType = subExprType->getAs<FunctionType>()) {
+        if (auto fromActor = fromType->getGlobalActor()) {
+          if (auto toType = funcConv->getType()->getAs<FunctionType>()) {
+
+            // ignore some kinds of casts, as they're diagnosed elsewhere.
+            if (toType->hasGlobalActor() || toType->isAsync())
+              return;
+
+            auto dc = const_cast<DeclContext*>(getDeclContext());
+            if (!safeToDropGlobalActor(dc, fromActor, toType)) {
+            // FIXME: this diagnostic is sometimes a duplicate of one emitted
+            // by the constraint solver. Difference is the solver doesn't use
+            // warnUntilSwiftVersion, which appends extra text on the end.
+            // So, I'm making the messages exactly the same so IDEs will
+            // hopefully ignore the second diagnostic!
+
+            // otherwise, it's not a safe cast.
+            dc->getASTContext()
+                .Diags
+                .diagnose(funcConv->getLoc(),
+                          diag::converting_func_loses_global_actor, fromType,
+                          toType, fromActor)
+                .limitBehavior(dc->getASTContext().isSwiftVersionAtLeast(6)
+                                   ? DiagnosticBehavior::Error
+                                   : DiagnosticBehavior::Warning);
+            }
+          }
+        }
+      }
     }
 
     /// Check closure captures for Sendable violations.
@@ -1992,6 +2061,11 @@ namespace {
         for (const auto &entry : captureList->getCaptureList()) {
           captureContexts[entry.getVar()].push_back(closure);
         }
+      }
+
+      // The constraint solver may not have chosen legal casts.
+      if (auto funcConv = dyn_cast<FunctionConversionExpr>(expr)) {
+        checkFunctionConversion(funcConv);
       }
 
       return Action::Continue(expr);
@@ -3442,6 +3516,7 @@ static Optional<MemberIsolationPropagation> getMemberIsolationPropagation(
   case DeclKind::IfConfig:
   case DeclKind::PoundDiagnostic:
   case DeclKind::PrecedenceGroup:
+  case DeclKind::Missing:
   case DeclKind::MissingMember:
   case DeclKind::Class:
   case DeclKind::Enum:
@@ -4515,13 +4590,6 @@ ProtocolConformance *GetImplicitSendableRequest::evaluate(
   if (isa<ProtocolDecl>(nominal))
     return nullptr;
 
-  // Move only nominal types are currently never sendable since we have not yet
-  // finished the generics model for them.
-  //
-  // TODO: Remove this once this is complete!
-  if (nominal->isMoveOnly())
-    return nullptr;
-
   // Actor types are always Sendable; they don't get it via this path.
   auto classDecl = dyn_cast<ClassDecl>(nominal);
   if (classDecl && classDecl->isActor())
@@ -4699,14 +4767,15 @@ static Type applyUnsafeConcurrencyToParameterType(
 
 /// Determine whether the given name is that of a DispatchQueue operation that
 /// takes a closure to be executed on the queue.
-bool swift::isDispatchQueueOperationName(StringRef name) {
-  return llvm::StringSwitch<bool>(name)
-    .Case("sync", true)
-    .Case("async", true)
-    .Case("asyncAndWait", true)
-    .Case("asyncAfter", true)
-    .Case("concurrentPerform", true)
-    .Default(false);
+Optional<DispatchQueueOperation>
+swift::isDispatchQueueOperationName(StringRef name) {
+  return llvm::StringSwitch<Optional<DispatchQueueOperation>>(name)
+    .Case("sync", DispatchQueueOperation::Normal)
+    .Case("async", DispatchQueueOperation::Sendable)
+    .Case("asyncAndWait", DispatchQueueOperation::Normal)
+    .Case("asyncAfter", DispatchQueueOperation::Sendable)
+    .Case("concurrentPerform", DispatchQueueOperation::Sendable)
+    .Default(None);
 }
 
 /// Determine whether this function is implicitly known to have its
@@ -4724,7 +4793,17 @@ static bool hasKnownUnsafeSendableFunctionParams(AbstractFunctionDecl *func) {
   auto nominalName = nominal->getName().str();
   if (nominalName == "DispatchQueue") {
     auto name = func->getBaseName().userFacingName();
-    return isDispatchQueueOperationName(name);
+    auto operation = isDispatchQueueOperationName(name);
+    if (!operation)
+      return false;
+
+    switch (*operation) {
+    case DispatchQueueOperation::Normal:
+      return false;
+
+    case DispatchQueueOperation::Sendable:
+      return true;
+    }
   }
 
   return false;
@@ -5119,6 +5198,7 @@ static bool isNonValueReference(const ValueDecl *value) {
   case DeclKind::IfConfig:
   case DeclKind::Import:
   case DeclKind::InfixOperator:
+  case DeclKind::Missing:
   case DeclKind::MissingMember:
   case DeclKind::Module:
   case DeclKind::PatternBinding:

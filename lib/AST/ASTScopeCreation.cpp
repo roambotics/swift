@@ -248,7 +248,28 @@ ASTSourceFileScope::ASTSourceFileScope(SourceFile *SF,
                                        ScopeCreator *scopeCreator)
     : SF(SF), scopeCreator(scopeCreator) {
   if (auto enclosingSF = SF->getEnclosingSourceFile()) {
-    SourceLoc parentLoc = SF->macroExpansion.getStartLoc();
+    SourceLoc parentLoc;
+    auto macroRole = SF->getFulfilledMacroRole();
+    auto expansion = SF->getMacroExpansion();
+
+    // Determine the parent source location based on the macro role.
+    switch (*macroRole) {
+    case MacroRole::Expression:
+    case MacroRole::Declaration:
+    case MacroRole::Accessor:
+    case MacroRole::MemberAttribute:
+      parentLoc = expansion.getStartLoc();
+      break;
+    case MacroRole::Member: {
+      // For synthesized member macros, take the end loc of the
+      // enclosing declaration (before the closing brace), because
+      // the macro expansion is inside this scope.
+      auto *decl = expansion.getAsDeclContext()->getAsDecl();
+      parentLoc = decl->getEndLoc();
+      break;
+    }
+    }
+
     if (auto parentScope = findStartingScopeForLookup(enclosingSF, parentLoc)) {
       parentAndWasExpanded.setPointer(const_cast<ASTScopeImpl *>(parentScope));
     }
@@ -288,6 +309,7 @@ public:
   VISIT_AND_IGNORE(ModuleDecl)
   VISIT_AND_IGNORE(ParamDecl)
   VISIT_AND_IGNORE(PoundDiagnosticDecl)
+  VISIT_AND_IGNORE(MissingDecl)
   VISIT_AND_IGNORE(MissingMemberDecl)
   VISIT_AND_IGNORE(MacroExpansionDecl)
 
@@ -470,9 +492,15 @@ public:
 
   ASTScopeImpl *visitExpr(Expr *expr, ASTScopeImpl *p,
                           ScopeCreator &scopeCreator) {
-    if (expr)
-      scopeCreator.addExprToScopeTree(expr, p);
+    if (!expr)
+      return p;
 
+    // If we have a single value statement expression, we expand scopes based
+    // on the underlying statement.
+    if (auto *SVE = dyn_cast<SingleValueStmtExpr>(expr))
+      return visit(SVE->getStmt(), p, scopeCreator);
+
+    scopeCreator.addExprToScopeTree(expr, p);
     return p;
   }
 };
@@ -599,7 +627,7 @@ void ASTScopeImpl::addChild(ASTScopeImpl *child, ASTContext &ctx) {
   child->parentAndWasExpanded.setPointer(this);
 
 #ifndef NDEBUG
-  checkSourceRangeBeforeAddingChild(child, ctx);
+  // checkSourceRangeBeforeAddingChild(child, ctx);
 #endif
 
   // If this is the first time we've added children, notify the ASTContext
@@ -900,7 +928,7 @@ namespace {
       }
     }
 
-    return decl->getGenericParams();
+    return decl->getParsedGenericParams();
   }
 }
 

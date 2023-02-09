@@ -23,55 +23,16 @@
 #include <DbgHelp.h>
 #endif
 
+#include "swift/Runtime/Win32.h"
 #include "swift/Threading/Mutex.h"
 
 using namespace swift;
-
-int swift::lookupSymbol(const void *address, SymbolInfo *info) {
-#if defined(__CYGWIN__)
-  Dl_info dlinfo;
-  if (dladdr(address, &dlinfo) == 0) {
-    return 0;
-  }
-
-  info->fileName = dlinfo.dli_fname;
-  info->baseAddress = dlinfo.dli_fbase;
-  info->symbolName = dli_info.dli_sname;
-  info->symbolAddress = dli_saddr;
-  return 1;
-#elif defined(_WIN32)
-  return _swift_win32_withDbgHelpLibrary([&] (HANDLE hProcess) {
-    static const constexpr size_t kSymbolMaxNameLen = 1024;
-
-    if (!hProcess) {
-      return 0;
-    }
-
-    SYMBOL_INFO_PACKAGE symbol = {};
-    symbol.si.SizeOfStruct = sizeof(SYMBOL_INFO);
-    symbol.si.MaxNameLen = MAX_SYM_NAME;
-    if (SymFromAddr(hProcess, reinterpret_cast<const DWORD64>(address),
-                    nullptr, &symbol.si) == FALSE) {
-      return 0;
-    }
-
-    info->fileName = NULL;
-    info->baseAddress = reinterpret_cast<void *>(symbol.si.ModBase);
-    info->symbolName.reset(_strdup(symbol.si.Name));
-    info->symbolAddress = reinterpret_cast<void *>(symbol.si.Address);
-
-    return 1;
-  });
-#else
-  return 0;
-#endif // defined(__CYGWIN__) || defined(_WIN32)
-}
 
 #if defined(_WIN32)
 static LazyMutex mutex;
 static HANDLE dbgHelpHandle = nullptr;
 
-void swift::_swift_win32_withDbgHelpLibrary(
+void _swift_win32_withDbgHelpLibrary(
   void (* body)(HANDLE hProcess, void *context), void *context) {
   mutex.withLock([=] () {
     // If we have not previously created a handle to use with the library, do so

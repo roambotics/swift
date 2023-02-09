@@ -122,7 +122,11 @@ public:
 
   bool isFrozen() const { return frozen; }
 
-  /// Set this map into its frozen state when we
+  /// Set this map into its frozen state. This stable sorts our internal array
+  /// to create our map like context.
+  ///
+  /// After this, one can only use map like operations and non-mutable vector
+  /// operations instead of full mutable/non-mutable vector operations.
   void setFrozen() {
     std::stable_sort(storage.begin(), storage.end(),
                      [&](const std::pair<Key, Optional<Value>> &lhs,
@@ -133,6 +137,13 @@ public:
                      });
     frozen = true;
   }
+
+  /// Unfreeze the map, so one can go back to using mutable vector
+  /// operations. After one calls this until one freezes the map again, one
+  /// cannot use map operations.
+  ///
+  /// This allows one to incrementally update the map.
+  void unfreeze() { frozen = false; }
 
   /// Reset the frozen multimap in an unfrozen state with its storage cleared.
   void reset() {
@@ -245,6 +256,39 @@ public:
     auto baseRange = llvm::make_range(iter1, iter2);
     auto optRange = makeOptionalTransformRange(baseRange, ToNonErasedValues());
     return makeTransformRange(optRange, PairWithTypeErasedOptionalSecondElt());
+  }
+
+  /// Returns true if all values for all keys have been deleted.
+  ///
+  /// This is intended to be used in use cases where a frozen multi map is
+  /// filled up with a multi-map and then as we process keys, we delete values
+  /// we have handled. In certain cases, one wishes to validate after processing
+  /// that all values for all keys were properly handled. One cannot perform
+  /// this operation with getRange() in a nice way.
+  bool allValuesHaveBeenDeleted() const {
+    return llvm::all_of(storage, [](const std::pair<Key, Optional<Value>> &pair) {
+      return !pair.second.hasValue();
+    });
+  }
+
+  typename VectorStorage::iterator vector_begin() {
+    assert(isFrozen() && "Can only call this in map mode");
+    return storage.begin();
+  }
+
+  typename VectorStorage::iterator vector_end() {
+    assert(isFrozen() && "Can only call this in map mode");
+    return storage.end();
+  }
+
+  typename VectorStorage::const_iterator vector_begin() const {
+    assert(isFrozen() && "Can only call this in map mode");
+    return storage.begin();
+  }
+
+  typename VectorStorage::const_iterator vector_end() const {
+    assert(isFrozen() && "Can only call this in map mode");
+    return storage.end();
   }
 };
 

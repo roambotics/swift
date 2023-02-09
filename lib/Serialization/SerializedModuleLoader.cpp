@@ -391,8 +391,8 @@ std::error_code SerializedModuleLoaderBase::openModuleFile(
   return std::error_code();
 }
 
-llvm::ErrorOr<ModuleDependencies> SerializedModuleLoaderBase::scanModuleFile(
-    Twine modulePath) {
+llvm::ErrorOr<ModuleDependencyInfo> SerializedModuleLoaderBase::scanModuleFile(
+    Twine modulePath, bool isFramework) {
   // Open the module file
   auto &fs = *Ctx.SourceMgr.getFileSystem();
   auto moduleBuf = fs.getBufferForFile(modulePath);
@@ -401,7 +401,6 @@ llvm::ErrorOr<ModuleDependencies> SerializedModuleLoaderBase::scanModuleFile(
 
   // Load the module file without validation.
   std::shared_ptr<const ModuleFileSharedCore> loadedModuleFile;
-  bool isFramework = false;
   serialization::ValidationInfo loadInfo = ModuleFileSharedCore::load(
       modulePath.str(), std::move(moduleBuf.get()), nullptr, nullptr,
       isFramework, isRequiredOSSAModules(), Ctx.LangOpts.SDKName,
@@ -411,7 +410,7 @@ llvm::ErrorOr<ModuleDependencies> SerializedModuleLoaderBase::scanModuleFile(
   const std::string moduleDocPath;
   const std::string sourceInfoPath;
   // Map the set of dependencies over to the "module dependencies".
-  auto dependencies = ModuleDependencies::forSwiftBinaryModule(modulePath.str(),
+  auto dependencies = ModuleDependencyInfo::forSwiftBinaryModule(modulePath.str(),
                                                                moduleDocPath,
                                                                sourceInfoPath,
                                                                isFramework);
@@ -421,6 +420,12 @@ llvm::ErrorOr<ModuleDependencies> SerializedModuleLoaderBase::scanModuleFile(
     if (dependency.isHeader())
       continue;
 
+    // Transitive @_implementationOnly dependencies of
+    // binary modules are not required to be imported during normal builds
+    // TODO: This is worth revisiting for debugger purposes
+    if (dependency.isImplementationOnly())
+      continue;
+
     // Find the top-level module name.
     auto modulePathStr = dependency.getPrettyPrintedPath();
     StringRef moduleName = modulePathStr;
@@ -428,7 +433,7 @@ llvm::ErrorOr<ModuleDependencies> SerializedModuleLoaderBase::scanModuleFile(
     if (dotPos != std::string::npos)
       moduleName = moduleName.slice(0, dotPos);
 
-    dependencies.addModuleDependency(moduleName, &addedModuleNames);
+    dependencies.addModuleImport(moduleName, &addedModuleNames);
   }
 
   return std::move(dependencies);
@@ -780,6 +785,8 @@ LoadedFile *SerializedModuleLoaderBase::loadAST(
       M.setABIName(Ctx.getIdentifier(loadedModuleFile->getModuleABIName()));
     if (loadedModuleFile->isConcurrencyChecked())
       M.setIsConcurrencyChecked();
+    if (!loadedModuleFile->getModulePackageName().empty())
+      M.setPackageName(Ctx.getIdentifier(loadedModuleFile->getModulePackageName()));
     M.setUserModuleVersion(loadedModuleFile->getUserModuleVersion());
     for (auto name: loadedModuleFile->getAllowableClientNames()) {
       M.addAllowableClientName(Ctx.getIdentifier(name));

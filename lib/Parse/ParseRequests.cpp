@@ -23,10 +23,6 @@
 #include "swift/Parse/Parser.h"
 #include "swift/Subsystems.h"
 
-#if SWIFT_SWIFT_PARSER
-#include "SwiftCompilerSupport.h"
-#endif
-
 using namespace swift;
 
 namespace swift {
@@ -157,10 +153,10 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
   diags.setSuppressWarnings(didSuppressWarnings || shouldSuppress);
   SWIFT_DEFER { diags.setSuppressWarnings(didSuppressWarnings); };
 
-  // If this buffer is for code completion, hook up the state needed by its
+  // If this buffer is for IDE functionality, hook up the state needed by its
   // second pass.
   PersistentParserState *state = nullptr;
-  if (ctx.SourceMgr.getCodeCompletionBufferID() == bufferID) {
+  if (ctx.SourceMgr.getIDEInspectionTargetBufferID() == bufferID) {
     state = new PersistentParserState();
     SF->setDelayedParserState({state, &deletePersistentParserState});
   }
@@ -168,56 +164,48 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
   Parser parser(*bufferID, *SF, /*SIL*/ nullptr, state);
   PrettyStackTraceParser StackTrace(parser);
 
+  // If the buffer is generated source information, we might have more
+  // context that we need to set up for parsing.
   SmallVector<ASTNode, 128> items;
-  parser.parseTopLevelItems(items);
+  if (auto generatedInfo = ctx.SourceMgr.getGeneratedSourceInfo(*bufferID)) {
+    if (generatedInfo->declContext)
+      parser.CurDeclContext = generatedInfo->declContext;
+
+    switch (generatedInfo->kind) {
+    case GeneratedSourceInfo::FreestandingDeclMacroExpansion:
+    case GeneratedSourceInfo::ExpressionMacroExpansion:
+    case GeneratedSourceInfo::ReplacedFunctionBody:
+    case GeneratedSourceInfo::PrettyPrinted: {
+      parser.parseTopLevelItems(items);
+      break;
+    }
+
+    case GeneratedSourceInfo::MemberMacroExpansion: {
+      parser.parseExpandedMemberList(items);
+      break;
+    }
+
+    case GeneratedSourceInfo::AccessorMacroExpansion: {
+      ASTNode astNode = ASTNode::getFromOpaqueValue(generatedInfo->astNode);
+      auto attachedDecl = astNode.get<Decl *>();
+      auto accessorsForStorage = dyn_cast<AbstractStorageDecl>(attachedDecl);
+
+      parser.parseTopLevelAccessors(accessorsForStorage, items);
+      break;
+    }
+
+    case GeneratedSourceInfo::MemberAttributeMacroExpansion: {
+      parser.parseExpandedAttributeList(items);
+      break;
+    }
+    }
+  } else {
+    parser.parseTopLevelItems(items);
+  }
 
   Optional<ArrayRef<Token>> tokensRef;
   if (auto tokens = parser.takeTokenReceiver()->finalize())
     tokensRef = ctx.AllocateCopy(*tokens);
-
-#if SWIFT_SWIFT_PARSER
-  if ((ctx.LangOpts.hasFeature(Feature::ParserRoundTrip) ||
-       ctx.LangOpts.hasFeature(Feature::ParserValidation)) &&
-      ctx.SourceMgr.getCodeCompletionBufferID() != bufferID &&
-      SF->Kind != SourceFileKind::SIL) {
-    auto bufferRange = ctx.SourceMgr.getRangeForBuffer(*bufferID);
-    unsigned int flags = 0;
-
-    if (ctx.LangOpts.hasFeature(Feature::ParserRoundTrip) &&
-        !parser.L->lexingCutOffOffset()) {
-      flags |= SCC_RoundTrip;
-    }
-
-    if (!ctx.Diags.hadAnyError() &&
-        ctx.LangOpts.hasFeature(Feature::ParserValidation))
-      flags |= SCC_ParseDiagnostics;
-
-    if (ctx.LangOpts.hasFeature(Feature::ParserSequenceFolding) &&
-        !parser.L->lexingCutOffOffset())
-      flags |= SCC_FoldSequences;
-
-    if (flags) {
-      SourceLoc startLoc =
-          parser.SourceMgr.getLocForBufferStart(parser.L->getBufferID());
-      struct ParserContext {
-        SourceLoc startLoc;
-        DiagnosticEngine *engine;
-      } context{startLoc, &parser.Diags};
-      int roundTripResult = swift_parser_consistencyCheck(
-          bufferRange.str().data(), bufferRange.getByteLength(),
-          SF->getFilename().str().c_str(), flags, static_cast<void *>(&context),
-          [](ptrdiff_t off, const char *text, void *ctx) {
-            auto *context = static_cast<ParserContext *>(ctx);
-            SourceLoc loc = context->startLoc.getAdvancedLoc(off);
-            context->engine->diagnose(loc, diag::foreign_diagnostic,
-                                      StringRef(text));
-          });
-
-      if (roundTripResult)
-        ctx.Diags.diagnose(SourceLoc(), diag::new_parser_failure);
-    }
-  }
-#endif
 
   return SourceFileParsingResult{ctx.AllocateCopy(items), tokensRef,
                                  parser.CurrentTokenHash};
@@ -265,15 +253,15 @@ ArrayRef<Decl *> ParseTopLevelDeclsRequest::evaluate(
 }
 
 //----------------------------------------------------------------------------//
-// CodeCompletionSecondPassRequest computation.
+// IDEInspectionSecondPassRequest computation.
 //----------------------------------------------------------------------------//
 
 
 void swift::simple_display(llvm::raw_ostream &out,
-                           const CodeCompletionCallbacksFactory *factory) { }
+                           const IDEInspectionCallbacksFactory *factory) { }
 
 evaluator::DependencySource
-CodeCompletionSecondPassRequest::readDependencySource(
+IDEInspectionSecondPassRequest::readDependencySource(
     const evaluator::DependencyRecorder &e) const {
   return std::get<0>(getStorage());
 }

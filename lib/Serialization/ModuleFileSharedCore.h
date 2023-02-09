@@ -82,6 +82,12 @@ class ModuleFileSharedCore {
   /// The module ABI name.
   StringRef ModuleABIName;
 
+  /// The name of the package this module belongs to.
+  StringRef ModulePackageName;
+
+  /// Module name to use when referenced in clients module interfaces.
+  StringRef ModuleExportAsName;
+
   /// \c true if this module has incremental dependency information.
   bool HasIncrementalInfo = false;
 

@@ -129,7 +129,8 @@ class SearchPathOptions;
 class CompilerInvocation;
 
 /// A ModuleLoader that loads explicitly built Swift modules specified via
-/// -swift-module-file
+/// -swift-module-file or modules found in a provided
+/// -explicit-swift-module-map-file JSON input.
 class ExplicitSwiftModuleLoader: public SerializedModuleLoaderBase {
   explicit ExplicitSwiftModuleLoader(ASTContext &ctx, DependencyTracker *tracker,
                                      ModuleLoadingMode loadMode,
@@ -164,6 +165,7 @@ public:
   create(ASTContext &ctx,
          DependencyTracker *tracker, ModuleLoadingMode loadMode,
          StringRef ExplicitSwiftModuleMap,
+         const std::vector<std::pair<std::string, std::string>> &ExplicitSwiftModuleInputs,
          bool IgnoreSwiftSourceInfoFile);
 
   /// Append visible module names to \p names. Note that names are possibly
@@ -173,19 +175,24 @@ public:
   ~ExplicitSwiftModuleLoader();
 };
 
-/// Information about explicitly specified Swift module files.
+/// Information about explicitly specified Swift and Clang module files.
 struct ExplicitModuleInfo {
-  // Path of the .swiftmodule file.
+  // Path of the .swiftmodule file. Empty for pure Clang modules.
   std::string modulePath;
-  // Path of the .swiftmoduledoc file.
+  // Path of the .swiftmoduledoc file. Empty for pure Clang modules.
   std::string moduleDocPath;
-  // Path of the .swiftsourceinfo file.
+  // Path of the .swiftsourceinfo file. Empty for pure Clang modules.
   std::string moduleSourceInfoPath;
   // A flag that indicates whether this module is a framework
-  bool isFramework;
+  bool isFramework = false;
   // A flag that indicates whether this module is a system module
   // Set the default to be false.
   bool isSystem = false;
+  // Path of the Clang module map file. Empty for pure Swift modules.
+  std::string clangModuleMapPath;
+  // Path of a compiled Clang explicit module file. Empty for pure Swift
+  // modules.
+  std::string clangModulePath;
 };
 
 /// Parser of explicit module maps passed into the compiler.
@@ -194,15 +201,19 @@ struct ExplicitModuleInfo {
 //      "moduleName": "A",
 //      "modulePath": "A.swiftmodule",
 //      "docPath": "A.swiftdoc",
-//      "sourceInfoPath": "A.swiftsourceinfo"
-//      "isFramework": false
+//      "sourceInfoPath": "A.swiftsourceinfo",
+//      "isFramework": false,
+//      "clangModuleMapPath": "A/module.modulemap",
+//      "clangModulePath": "A.pcm",
 //    },
 //    {
 //      "moduleName": "B",
 //      "modulePath": "B.swiftmodule",
 //      "docPath": "B.swiftdoc",
-//      "sourceInfoPath": "B.swiftsourceinfo"
-//      "isFramework": false
+//      "sourceInfoPath": "B.swiftsourceinfo",
+//      "isFramework": false,
+//      "clangModuleMapPath": "B/module.modulemap",
+//      "clangModulePath": "B.pcm",
 //    }
 //  ]
 class ExplicitModuleMapParser {
@@ -279,6 +290,10 @@ private:
         result.isFramework = parseBoolValue(val);
       } else if (key == "isSystem") {
         result.isSystem = parseBoolValue(val);
+      } else if (key == "clangModuleMapPath") {
+        result.clangModuleMapPath = val.str();
+      } else if (key == "clangModulePath") {
+        result.clangModulePath = val.str();
       } else {
         // Being forgiving for future fields.
         continue;

@@ -86,10 +86,15 @@ LANGUAGE_FEATURE(BuiltinTaskRunInline, 0, "Builtin.taskRunInline", true)
 LANGUAGE_FEATURE(BuiltinUnprotectedAddressOf, 0, "Builtin.unprotectedAddressOf", true)
 SUPPRESSIBLE_LANGUAGE_FEATURE(SpecializeAttributeWithAvailability, 0, "@_specialize attribute with availability", true)
 LANGUAGE_FEATURE(BuiltinAssumeAlignment, 0, "Builtin.assumeAlignment", true)
+LANGUAGE_FEATURE(BuiltinCreateTaskGroupWithFlags, 0, "Builtin.createTaskGroupWithFlags", true)
 SUPPRESSIBLE_LANGUAGE_FEATURE(UnsafeInheritExecutor, 0, "@_unsafeInheritExecutor", true)
 SUPPRESSIBLE_LANGUAGE_FEATURE(PrimaryAssociatedTypes2, 346, "Primary associated types", true)
 SUPPRESSIBLE_LANGUAGE_FEATURE(UnavailableFromAsync, 0, "@_unavailableFromAsync", true)
 SUPPRESSIBLE_LANGUAGE_FEATURE(NoAsyncAvailability, 340, "@available(*, noasync)", true)
+LANGUAGE_FEATURE(BuiltinIntLiteralAccessors, 368, "Builtin.IntLiteral accessors", true)
+LANGUAGE_FEATURE(
+    FreestandingExpressionMacros, 0, "@freestanding(expression) macros",
+    langOpts.hasFeature(Feature::Macros))
 
 UPCOMING_FEATURE(ConciseMagicFile, 274, 6)
 UPCOMING_FEATURE(ForwardTrailingClosures, 286, 6)
@@ -100,11 +105,17 @@ EXPERIMENTAL_FEATURE(StaticAssert, false)
 EXPERIMENTAL_FEATURE(VariadicGenerics, false)
 EXPERIMENTAL_FEATURE(NamedOpaqueTypes, false)
 EXPERIMENTAL_FEATURE(FlowSensitiveConcurrencyCaptures, false)
-EXPERIMENTAL_FEATURE(MoveOnly, false)
+EXPERIMENTAL_FEATURE(MoveOnly, true)
+
+// FIXME: MoveOnlyClasses is not intended to be in production,
+// but our tests currently rely on it, and we want to run those
+// tests in non-asserts builds too.
+EXPERIMENTAL_FEATURE(MoveOnlyClasses, true)
+
 EXPERIMENTAL_FEATURE(OneWayClosureParameters, false)
 EXPERIMENTAL_FEATURE(TypeWitnessSystemInference, false)
-EXPERIMENTAL_FEATURE(ResultBuilderASTTransform, true)
-EXPERIMENTAL_FEATURE(LayoutPrespecialization, false)
+EXPERIMENTAL_FEATURE(LayoutPrespecialization, true)
+EXPERIMENTAL_FEATURE(ModuleInterfaceExportAs, true)
 
 /// Whether to enable experimental differentiable programming features:
 /// `@differentiable` declaration attribute, etc.
@@ -124,11 +135,6 @@ EXPERIMENTAL_FEATURE(SendableCompletionHandlers, false)
 /// Enables opaque type erasure without also enabling implict dynamic
 EXPERIMENTAL_FEATURE(OpaqueTypeErasure, false)
 
-/// Whether to enable experimental @typeWrapper feature which allows to
-/// declare a type that controls access to all stored properties of the
-/// wrapped type.
-EXPERIMENTAL_FEATURE(TypeWrappers, false)
-
 /// Whether to perform round-trip testing of the Swift Swift parser.
 EXPERIMENTAL_FEATURE(ParserRoundTrip, false)
 
@@ -136,9 +142,10 @@ EXPERIMENTAL_FEATURE(ParserRoundTrip, false)
 /// Swift parser.
 EXPERIMENTAL_FEATURE(ParserValidation, false)
 
-/// Whether to fold sequence expressions in the syntax tree produced by the
-/// Swift Swift parser.
-EXPERIMENTAL_FEATURE(ParserSequenceFolding, false)
+/// Whether to emit diagnostics from the new parser first, and only emit
+/// diagnostics from the existing parser when there are none from the new
+/// parser.
+EXPERIMENTAL_FEATURE(ParserDiagnostics, false)
 
 /// Enables implicit some while also enabling existential `any`
 EXPERIMENTAL_FEATURE(ImplicitSome, false)
@@ -148,7 +155,7 @@ EXPERIMENTAL_FEATURE(ImplicitSome, false)
 EXPERIMENTAL_FEATURE(ParserASTGen, false)
 
 /// Enable the experimental macros feature.
-EXPERIMENTAL_FEATURE(Macros, false)
+EXPERIMENTAL_FEATURE(Macros, true)
 
 /// Parse using the Swift (swift-syntax) parser and use ASTGen to generate the
 /// corresponding syntax tree.
@@ -157,6 +164,11 @@ EXPERIMENTAL_FEATURE(BuiltinMacros, false)
 /// Whether to enable experimental @runtimeMetadata feature which allows to
 /// declare an attribute which is discoverable and constructable at runtime.
 EXPERIMENTAL_FEATURE(RuntimeDiscoverableAttrs, false)
+
+/// Import C++ class templates as semantically-meaningless symbolic
+/// Swift types and C++ methods as symbolic functions with blank
+/// signatures.
+EXPERIMENTAL_FEATURE(ImportSymbolicCXXDecls, false)
 
 #undef EXPERIMENTAL_FEATURE
 #undef UPCOMING_FEATURE

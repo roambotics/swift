@@ -537,7 +537,7 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
       optimizationMode, perfConstr,
       subclassScope, hasCReferences, effect, numAttrs,
       hasQualifiedOwnership, isWeakImported, LIST_VER_TUPLE_PIECES(available),
-      isDynamic, isExactSelfClass, isDistributed;
+      isDynamic, isExactSelfClass, isDistributed, isRuntimeAccessible;
   ArrayRef<uint64_t> SemanticsIDs;
   SILFunctionLayout::readRecord(
       scratch, rawLinkage, isTransparent, isSerialized, isThunk,
@@ -545,7 +545,7 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
       optimizationMode, perfConstr,
       subclassScope, hasCReferences, effect, numAttrs,
       hasQualifiedOwnership, isWeakImported, LIST_VER_TUPLE_PIECES(available),
-      isDynamic, isExactSelfClass, isDistributed, funcTyID,
+      isDynamic, isExactSelfClass, isDistributed, isRuntimeAccessible, funcTyID,
       replacedFunctionID, usedAdHocWitnessFunctionID,
       genericSigID, clangNodeOwnerID, parentModuleID, SemanticsIDs);
 
@@ -679,6 +679,7 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
     fn->setIsDynamic(IsDynamicallyReplaceable_t(isDynamic));
     fn->setIsExactSelfClass(IsExactSelfClass_t(isExactSelfClass));
     fn->setIsDistributed(IsDistributed_t(isDistributed));
+    fn->setIsRuntimeAccessible(IsRuntimeAccessible_t(isRuntimeAccessible));
     if (replacedFunction)
       fn->setDynamicallyReplacedFunction(replacedFunction);
     if (!replacedObjectiveCFunc.empty())
@@ -908,11 +909,11 @@ SILDeserializer::readSILFunctionChecked(DeclID FID, SILFunction *existingFn,
   if (fn->empty() && errorIfEmptyBody)
     return nullptr;
 
-  // Check that there are no unresolved forward definitions of opened
+  // Check that there are no unresolved forward definitions of local
   // archetypes.
-  if (SILMod.hasUnresolvedOpenedArchetypeDefinitions())
+  if (SILMod.hasUnresolvedLocalArchetypeDefinitions())
     llvm_unreachable(
-        "All forward definitions of opened archetypes should be resolved");
+        "All forward definitions of local archetypes should be resolved");
 
   if (Callback)
     Callback->didDeserializeFunctionBody(MF->getAssociatedModule(), fn);
@@ -966,6 +967,8 @@ SILBasicBlock *SILDeserializer::readSILBasicBlock(SILFunction *Fn,
       fArg->setNoImplicitCopy(isNoImplicitCopy);
       auto lifetime = (LifetimeAnnotation::Case)((Args[I + 1] >> 17) & 0x3);
       fArg->setLifetimeAnnotation(lifetime);
+      bool isClosureCapture = (Args[I + 1] >> 19) & 0x1;
+      fArg->setClosureCapture(isClosureCapture);
       Arg = fArg;
     } else {
       auto OwnershipKind = ValueOwnershipKind((Args[I + 1] >> 8) & 0xF);
@@ -1277,6 +1280,20 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     SILInstHasSymbolLayout::readRecord(scratch, ValID, ListOfValues);
     RawOpCode = (unsigned)SILInstructionKind::HasSymbolInst;
     break;
+  case SIL_PACK_ELEMENT_GET:
+    SILPackElementGetLayout::readRecord(scratch,
+                                        TyID, TyCategory,
+                                        TyID2, TyCategory2, ValID2,
+                                        ValID3);
+    RawOpCode = (unsigned)SILInstructionKind::PackElementGetInst;
+    break;
+  case SIL_PACK_ELEMENT_SET:
+    SILPackElementSetLayout::readRecord(scratch,
+                                        TyID, TyCategory, ValID,
+                                        TyID2, TyCategory2, ValID2,
+                                        ValID3);
+    RawOpCode = (unsigned)SILInstructionKind::PackElementSetInst;
+    break;
   }
 
   // FIXME: validate
@@ -1285,6 +1302,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   SILInstruction *ResultInst;
   switch (OpCode) {
   case SILInstructionKind::DebugValueInst:
+  case SILInstructionKind::DebugStepInst:
   case SILInstructionKind::TestSpecificationInst:
     llvm_unreachable("not supported");
 
@@ -1303,6 +1321,12 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     ResultInst = Builder.createAllocStack(
         Loc, getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn),
         None, hasDynamicLifetime, isLexical, wasMoved);
+    break;
+  }
+  case SILInstructionKind::AllocPackInst: {
+    assert(RecordKind == SIL_ONE_TYPE && "Layout should be OneType.");
+    ResultInst = Builder.createAllocStack(
+        Loc, getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
     break;
   }
   case SILInstructionKind::MetatypeInst:
@@ -1360,6 +1384,80 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
         Attr == 0 ? OpenedExistentialAccess::Immutable
                   : OpenedExistentialAccess::Mutable);
     break;
+  case SILInstructionKind::DynamicPackIndexInst: {
+    assert(RecordKind == SIL_ONE_TYPE_ONE_OPERAND &&
+           "Layout should be OneTypeOneOperand.");
+    auto indexOperand =
+      getLocalValue(ValID,
+        getSILType(MF->getType(TyID2), (SILValueCategory)TyCategory2, Fn));
+    auto packType = cast<PackType>(MF->getType(TyID)->getCanonicalType());
+    ResultInst = Builder.createDynamicPackIndex(Loc, indexOperand, packType);
+    break;
+  }
+  case SILInstructionKind::PackPackIndexInst: {
+    assert(RecordKind == SIL_ONE_TYPE_ONE_OPERAND &&
+           "Layout should be OneTypeOneOperand.");
+    auto indexOperand =
+      getLocalValue(ValID,
+        getSILType(MF->getType(TyID2), (SILValueCategory)TyCategory2, Fn));
+    auto packType = cast<PackType>(MF->getType(TyID)->getCanonicalType());
+    ResultInst =
+      Builder.createPackPackIndex(Loc, Attr, indexOperand, packType);
+    break;
+  }
+  case SILInstructionKind::ScalarPackIndexInst: {
+    assert(RecordKind == SIL_ONE_TYPE && "Layout should be OneType.");
+    auto packType = cast<PackType>(MF->getType(TyID)->getCanonicalType());
+    ResultInst = Builder.createScalarPackIndex(Loc, Attr, packType);
+    break;
+  }
+  case SILInstructionKind::OpenPackElementInst: {
+    assert(RecordKind == SIL_ONE_OPERAND && "Layout should be OneOperand");
+    auto index = getLocalValue(ValID,
+        getSILType(MF->getType(TyID), (SILValueCategory) TyCategory, Fn));
+    auto env = MF->getGenericEnvironmentChecked(Attr);
+    if (!env) MF->fatal(env.takeError());
+    ResultInst = Builder.createOpenPackElement(Loc, index, *env);
+    break;
+  }
+  case SILInstructionKind::PackElementGetInst: {
+    assert(RecordKind == SIL_PACK_ELEMENT_GET);
+    auto elementType = getSILType(MF->getType(TyID),
+                                  (SILValueCategory) TyCategory, Fn);
+    auto packType = getSILType(MF->getType(TyID2),
+                               (SILValueCategory) TyCategory2, Fn);
+    auto pack = getLocalValue(ValID2, packType);
+    auto indexType = SILType::getPackIndexType(MF->getContext());
+    auto index = getLocalValue(ValID3, indexType);
+    ResultInst = Builder.createPackElementGet(Loc, index, pack, elementType);
+    break;
+  }
+  case SILInstructionKind::PackElementSetInst: {
+    assert(RecordKind == SIL_PACK_ELEMENT_SET);
+    auto elementType = getSILType(MF->getType(TyID),
+                                  (SILValueCategory) TyCategory, Fn);
+    auto value = getLocalValue(ValID, elementType);
+    auto packType = getSILType(MF->getType(TyID2),
+                               (SILValueCategory) TyCategory2, Fn);
+    auto pack = getLocalValue(ValID2, packType);
+    auto indexType = SILType::getPackIndexType(MF->getContext());
+    auto index = getLocalValue(ValID3, indexType);
+    ResultInst = Builder.createPackElementSet(Loc, value, index, pack);
+    break;
+  }
+  case SILInstructionKind::TuplePackElementAddrInst: {
+    assert(RecordKind == SIL_PACK_ELEMENT_GET);
+    auto elementType = getSILType(MF->getType(TyID),
+                                  (SILValueCategory) TyCategory, Fn);
+    auto tupleType = getSILType(MF->getType(TyID2),
+                               (SILValueCategory) TyCategory2, Fn);
+    auto tuple = getLocalValue(ValID2, tupleType);
+    auto indexType = SILType::getPackIndexType(MF->getContext());
+    auto index = getLocalValue(ValID3, indexType);
+    ResultInst = Builder.createTuplePackElementAddr(Loc, index, tuple,
+                                                    elementType);
+    break;
+  }
 
 #define ONEOPERAND_ONETYPE_INST(ID)                                            \
   case SILInstructionKind::ID##Inst:                                           \
@@ -1739,6 +1837,13 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   case SILInstructionKind::DeallocStackRefInst: {
     auto Ty = MF->getType(TyID);
     ResultInst = Builder.createDeallocStackRef(
+        Loc,
+        getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)));
+    break;
+  }
+  case SILInstructionKind::DeallocPackInst: {
+    auto Ty = MF->getType(TyID);
+    ResultInst = Builder.createDeallocPack(
         Loc,
         getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)));
     break;
@@ -3096,7 +3201,7 @@ bool SILDeserializer::hasSILFunction(StringRef Name,
       optimizationMode, perfConstr,
       subclassScope, hasCReferences, effect, numSpecAttrs,
       hasQualifiedOwnership, isWeakImported, LIST_VER_TUPLE_PIECES(available),
-      isDynamic, isExactSelfClass, isDistributed;
+      isDynamic, isExactSelfClass, isDistributed, isRuntimeAccessible;
   ArrayRef<uint64_t> SemanticsIDs;
   SILFunctionLayout::readRecord(
       scratch, rawLinkage, isTransparent, isSerialized, isThunk,
@@ -3104,7 +3209,7 @@ bool SILDeserializer::hasSILFunction(StringRef Name,
       optimizationMode, perfConstr,
       subclassScope, hasCReferences, effect, numSpecAttrs,
       hasQualifiedOwnership, isWeakImported, LIST_VER_TUPLE_PIECES(available),
-      isDynamic, isExactSelfClass, isDistributed, funcTyID,
+      isDynamic, isExactSelfClass, isDistributed, isRuntimeAccessible, funcTyID,
       replacedFunctionID, usedAdHocWitnessFunctionID,
       genericSigID, clangOwnerID, parentModuleID, SemanticsIDs);
   auto linkage = fromStableSILLinkage(rawLinkage);

@@ -99,7 +99,7 @@ static bool shouldProfile(SILDeclRef Constant) {
   // Do not profile AST nodes in unavailable contexts.
   auto *DC = Constant.getInnermostDeclContext();
   if (auto *D = DC->getInnermostDeclarationDeclContext()) {
-    if (D->isSemanticallyUnavailable()) {
+    if (D->getSemanticUnavailableAttr()) {
       LLVM_DEBUG(llvm::dbgs() << "Skipping ASTNode: unavailable context\n");
       return false;
     }
@@ -213,8 +213,6 @@ shouldWalkIntoExpr(Expr *E, ASTWalker::ParentTy Parent, SILDeclRef Constant) {
     // initializer instead.
     if (!Parent.isNull() || !Constant || !Constant.getAbstractClosureExpr())
       return Action::SkipChildren(E);
-
-    assert(CE->hasBody());
   }
   return Action::Continue(E);
 }

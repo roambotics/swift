@@ -1031,7 +1031,8 @@ DefaultDefinitionTypeRequest::evaluate(Evaluator &evaluator,
                                         // Diagnose unbound generics and
                                         // placeholders.
                                         /*unboundTyOpener*/ nullptr,
-                                        /*placeholderHandler*/ nullptr)
+                                        /*placeholderHandler*/ nullptr,
+                                        /*packElementOpener*/ nullptr)
         .resolveType(defaultDefinition);
   }
 
@@ -1042,6 +1043,9 @@ bool
 NeedsNewVTableEntryRequest::evaluate(Evaluator &evaluator,
                                      AbstractFunctionDecl *decl) const {
   auto *dc = decl->getDeclContext();
+
+  // FIXME: This is mysterious and seems wrong. However, changing it to return
+  // false (as it seems like it should) breaks a couple Serialization tests.
   if (!isa<ClassDecl>(dc))
     return true;
 
@@ -1596,6 +1600,25 @@ TypeChecker::lookupPrecedenceGroup(DeclContext *dc, Identifier name,
   return PrecedenceGroupLookupResult(dc, name, std::move(groups));
 }
 
+SmallVector<MacroDecl *, 1>
+TypeChecker::lookupMacros(DeclContext *dc, DeclNameRef macroName,
+                          SourceLoc loc, MacroRoles roles) {
+  SmallVector<MacroDecl *, 1> choices;
+  auto moduleScopeDC = dc->getModuleScopeContext();
+  ASTContext &ctx = moduleScopeDC->getASTContext();
+  UnqualifiedLookupDescriptor descriptor(macroName, moduleScopeDC);
+  auto lookup = evaluateOrDefault(
+      ctx.evaluator, UnqualifiedLookupRequest{descriptor}, {});
+  for (const auto &found : lookup.allResults()) {
+    if (auto macro = dyn_cast<MacroDecl>(found.getValueDecl())) {
+      auto foundRoles = macro->getMacroRoles();
+      if (foundRoles && roles.contains(foundRoles))
+        choices.push_back(macro);
+    }
+  }
+  return choices;
+}
+
 /// Validate the given operator declaration.
 ///
 /// This establishes key invariants, such as an InfixOperatorDecl's
@@ -1868,7 +1891,8 @@ UnderlyingTypeRequest::evaluate(Evaluator &evaluator,
   const auto result =
       TypeResolution::forInterface(typeAlias, options,
                                    /*unboundTyOpener*/ nullptr,
-                                   /*placeholderHandler*/ nullptr)
+                                   /*placeholderHandler*/ nullptr,
+                                   /*packElementOpener*/ nullptr)
           .resolveType(underlyingRepr);
 
   if (result->hasError()) {
@@ -2116,11 +2140,8 @@ ResultTypeRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
     return TupleType::getEmpty(ctx);
 
   // Handle opaque types.
-  if (decl->getOpaqueResultTypeRepr()) {
-    auto *opaqueDecl = decl->getOpaqueResultTypeDecl();
-    return (opaqueDecl
-            ? opaqueDecl->getDeclaredInterfaceType()
-            : ErrorType::get(ctx));
+  if (auto *opaqueDecl = decl->getOpaqueResultTypeDecl()) {
+      return opaqueDecl->getDeclaredInterfaceType();
   }
 
   auto options =
@@ -2131,7 +2152,8 @@ ResultTypeRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
   auto *const dc = decl->getInnermostDeclContext();
   return TypeResolution::forInterface(dc, options,
                                       /*unboundTyOpener*/ nullptr,
-                                      PlaceholderType::get)
+                                      PlaceholderType::get,
+                                      /*packElementOpener*/ nullptr)
       .resolveType(resultTyRepr);
 }
 
@@ -2255,40 +2277,28 @@ static Type validateParameterType(ParamDecl *decl) {
     break;
   }
 
-  if (auto *packExpansionRepr = dyn_cast<PackExpansionTypeRepr>(nestedRepr)) {
+  if (auto *varargTypeRepr = dyn_cast<VarargTypeRepr>(nestedRepr)) {
     // If the element is a variadic parameter, resolve the parameter type as if
     // it were in non-parameter position, since we want functions to be
     // @escaping in this case.
     options.setContext(TypeResolverContext::VariadicFunctionInput);
     options |= TypeResolutionFlags::Direct;
 
-    // FIXME: This duplicates code found elsewhere
-    auto *patternRepr = packExpansionRepr->getPatternType();
-
     const auto resolution =
         TypeResolution::forInterface(dc, options, unboundTyOpener,
-                                     PlaceholderType::get);
-    Ty = resolution.resolveType(patternRepr);
+                                     PlaceholderType::get,
+                                     /*packElementOpener*/ nullptr);
+    Ty = resolution.resolveType(nestedRepr);
 
-    // Find the first type parameter pack and use that as the count type.
-    SmallVector<Type, 2> rootParameterPacks;
-    Ty->getTypeParameterPacks(rootParameterPacks);
+    // Monovariadic types (T...) for <T> resolve to [T].
+    Ty = VariadicSequenceType::get(Ty);
 
-    // Handle the monovariadic/polyvariadic interface type split.
-    if (!rootParameterPacks.empty()) {
-      // Polyvariadic types (T...) for <T...> resolve to pack expansions.
-      Ty = PackExpansionType::get(Ty, rootParameterPacks[0]);
-    } else {
-      // Monovariadic types (T...) for <T> resolve to [T].
-      Ty = VariadicSequenceType::get(Ty);
-
-      // Set the old-style variadic bit.
-      decl->setVariadic();
-      if (!ctx.getArrayDecl()) {
-        ctx.Diags.diagnose(decl->getTypeRepr()->getLoc(),
-                           diag::sugar_type_not_found, 0);
-        return ErrorType::get(ctx);
-      }
+    // Set the old-style variadic bit.
+    decl->setVariadic();
+    if (!ctx.getArrayDecl()) {
+      ctx.Diags.diagnose(decl->getTypeRepr()->getLoc(),
+                         diag::sugar_type_not_found, 0);
+      return ErrorType::get(ctx);
     }
   } else {
     options.setContext(TypeResolverContext::FunctionInput);
@@ -2296,7 +2306,8 @@ static Type validateParameterType(ParamDecl *decl) {
 
     const auto resolution =
         TypeResolution::forInterface(dc, options, unboundTyOpener,
-                                     PlaceholderType::get);
+                                     PlaceholderType::get,
+                                     /*packElementOpener*/ nullptr);
     Ty = resolution.resolveType(decl->getTypeRepr());
   }
 
@@ -2326,6 +2337,7 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
   case DeclKind::PrecedenceGroup:
   case DeclKind::IfConfig:
   case DeclKind::PoundDiagnostic:
+  case DeclKind::Missing:
   case DeclKind::MissingMember:
   case DeclKind::Module:
   case DeclKind::OpaqueType:
@@ -2773,14 +2785,14 @@ static ArrayRef<Decl *> evaluateMembersRequest(
       ResolveImplicitMemberRequest{nominal,
                  ImplicitMemberAction::ResolveCodingKeys},
       {});
-
-    // Synthesize $Storage type and `var $storage` associated with
-    // type wrapped type.
-    if (nominal->hasTypeWrapper()) {
-      (void)nominal->getTypeWrapperStorageDecl();
-      (void)nominal->getTypeWrapperProperty();
-    }
   }
+
+  // Expand synthesized member macros.
+  auto *mutableDecl = const_cast<Decl *>(idc->getDecl());
+  (void)evaluateOrDefault(
+      ctx.evaluator,
+      ExpandSynthesizedMemberMacroRequest{mutableDecl},
+      false);
 
   // If the decl has a @main attribute, we need to force synthesis of the
   // $main function.
@@ -2909,7 +2921,8 @@ ExtendedTypeRequest::evaluate(Evaluator &eval, ExtensionDecl *ext) const {
       ext->getDeclContext(), options, nullptr,
       // FIXME: Don't let placeholder types escape type resolution.
       // For now, just return the placeholder type.
-      PlaceholderType::get);
+      PlaceholderType::get,
+      /*packElementOpener*/ nullptr);
 
   const auto extendedType = resolution.resolveType(extendedRepr);
 

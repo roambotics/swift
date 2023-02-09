@@ -20,6 +20,7 @@
 #include "TypeCheckAvailability.h"
 #include "TypeCheckConcurrency.h"
 #include "TypeCheckDecl.h"
+#include "TypeCheckMacros.h"
 #include "TypeCheckType.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTWalker.h"
@@ -28,6 +29,7 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Initializer.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/PropertyWrappers.h"
@@ -106,10 +108,11 @@ static bool hasStoredProperties(NominalTypeDecl *decl,
 
 static void computeLoweredStoredProperties(NominalTypeDecl *decl,
                                            IterableDeclContext *implDecl) {
-  // If declaration has a type wrapper, make sure that
-  // `$storage` property is synthesized.
-  if (decl->hasTypeWrapper())
-    (void)decl->getTypeWrapperProperty();
+  // Expand synthesized member macros.
+  auto &ctx = decl->getASTContext();
+  evaluateOrDefault(ctx.evaluator,
+                    ExpandSynthesizedMemberMacroRequest{decl},
+                    false);
 
   // Just walk over the members of the type, forcing backing storage
   // for lazy properties and property wrappers to be synthesized.
@@ -124,10 +127,6 @@ static void computeLoweredStoredProperties(NominalTypeDecl *decl,
     if (var->hasAttachedPropertyWrapper()) {
       (void) var->getPropertyWrapperAuxiliaryVariables();
       (void) var->getPropertyWrapperInitializerInfo();
-    }
-
-    if (var->isAccessedViaTypeWrapper()) {
-      (void)var->getUnderlyingTypeWrapperStorage();
     }
   }
 
@@ -272,6 +271,27 @@ StoredPropertiesAndMissingMembersRequest::evaluate(Evaluator &evaluator,
   return decl->getASTContext().AllocateCopy(results);
 }
 
+/// Check whether the pattern may have storage.
+///
+/// This query is careful not to trigger accessor macro expansion, which
+/// creates a cycle. It conservatively assumes that all accessor macros
+/// produce computed properties, which is... incorrect.
+static bool mayHaveStorage(Pattern *pattern) {
+  // Check whether there are any accessor macros.
+  bool hasAccessorMacros = false;
+  pattern->forEachVariable([&](VarDecl *VD) {
+    VD->forEachAttachedMacro(MacroRole::Accessor,
+      [&](CustomAttr *customAttr, MacroDecl *macro) {
+        hasAccessorMacros = true;
+      });
+  });
+
+  if (hasAccessorMacros)
+    return false;
+
+  return pattern->hasStorage();
+}
+
 /// Validate the \c entryNumber'th entry in \c binding.
 const PatternBindingEntry *PatternBindingEntryRequest::evaluate(
     Evaluator &eval, PatternBindingDecl *binding, unsigned entryNumber,
@@ -372,7 +392,7 @@ const PatternBindingEntry *PatternBindingEntryRequest::evaluate(
   // default-initializable. If so, do it.
   if (!pbe.isInitialized() &&
       binding->isDefaultInitializable(entryNumber) &&
-      pattern->hasStorage()) {
+      mayHaveStorage(pattern)) {
     if (auto defaultInit = TypeChecker::buildDefaultInitializer(patternType)) {
       // If we got a default initializer, install it and re-type-check it
       // to make sure it is properly coerced to the pattern type.
@@ -926,9 +946,7 @@ static Expr *buildStorageReference(AccessorDecl *accessor,
         underlyingVars.push_back({ wrappedValue, isWrapperRefLValue });
       }
     }
-    semantics = backing->isAccessedViaTypeWrapper()
-                    ? AccessSemantics::DirectToImplementation
-                    : AccessSemantics::DirectToStorage;
+    semantics = AccessSemantics::DirectToStorage;
     selfAccessKind = SelfAccessorKind::Peer;
     break;
   }
@@ -957,9 +975,7 @@ static Expr *buildStorageReference(AccessorDecl *accessor,
         { var->getAttachedPropertyWrapperTypeInfo(0).projectedValueVar,
           isLValue });
     }
-    semantics = backing->isAccessedViaTypeWrapper()
-                    ? AccessSemantics::DirectToImplementation
-                    : AccessSemantics::DirectToStorage;
+    semantics = AccessSemantics::DirectToStorage;
     selfAccessKind = SelfAccessorKind::Peer;
     break;
   }
@@ -1518,35 +1534,12 @@ synthesizeInvalidAccessor(AccessorDecl *accessor, ASTContext &ctx) {
   return { BraceStmt::create(ctx, loc, ArrayRef<ASTNode>(), loc, true), true };
 }
 
-/// Synthesize the body of a getter for a stored property that belongs to
-/// a type wrapped type.
-static std::pair<BraceStmt *, bool>
-synthesizeTypeWrappedPropertyGetterBody(AccessorDecl *getter, ASTContext &ctx) {
-  auto *body = evaluateOrDefault(
-      ctx.evaluator, SynthesizeTypeWrappedPropertyGetterBody{getter}, nullptr);
-  return body ? std::make_pair(body, /*isTypeChecked=*/false)
-              : synthesizeInvalidAccessor(getter, ctx);
-}
-
-static std::pair<BraceStmt *, bool>
-synthesizeTypeWrappedPropertySetterBody(AccessorDecl *getter, ASTContext &ctx) {
-  auto *body = evaluateOrDefault(
-      ctx.evaluator, SynthesizeTypeWrappedPropertySetterBody{getter}, nullptr);
-  return body ? std::make_pair(body, /*isTypeChecked=*/false)
-              : synthesizeInvalidAccessor(getter, ctx);
-}
-
 static std::pair<BraceStmt *, bool>
 synthesizeGetterBody(AccessorDecl *getter, ASTContext &ctx) {
   auto storage = getter->getStorage();
 
   // Synthesize the getter for a lazy property or property wrapper.
   if (auto var = dyn_cast<VarDecl>(storage)) {
-    // If the type this stored property belongs to has a type wrapper
-    // we need to route getter/setter through the wrapper.
-    if (var->isAccessedViaTypeWrapper())
-      return synthesizeTypeWrappedPropertyGetterBody(getter, ctx);
-
     if (var->getAttrs().hasAttribute<LazyAttr>()) {
       auto *storage = var->getLazyStorageProperty();
       return synthesizeLazyGetterBody(getter, var, storage, ctx);
@@ -1783,11 +1776,6 @@ synthesizeSetterBody(AccessorDecl *setter, ASTContext &ctx) {
 
   // Synthesize the setter for a lazy property or property wrapper.
   if (auto var = dyn_cast<VarDecl>(storage)) {
-    // If the type this stored property belongs to has a type wrapper
-    // we need to route getter/setter through the wrapper.
-    if (var->isAccessedViaTypeWrapper())
-      return synthesizeTypeWrappedPropertySetterBody(setter, ctx);
-
     if (var->getAttrs().hasAttribute<LazyAttr>()) {
       // Lazy property setters write to the underlying storage.
       if (var->hasObservers()) {
@@ -2471,12 +2459,6 @@ IsAccessorTransparentRequest::evaluate(Evaluator &evaluator,
 
   switch (accessor->getAccessorKind()) {
   case AccessorKind::Get:
-    // Synthesized getter for a type wrapped variable is never transparent.
-    if (auto var = dyn_cast<VarDecl>(storage)) {
-      if (var->isAccessedViaTypeWrapper())
-        return false;
-    }
-
     break;
 
   case AccessorKind::Set:
@@ -2495,10 +2477,6 @@ IsAccessorTransparentRequest::evaluate(Evaluator &evaluator,
                      PropertyWrapperSynthesizedPropertyKind::Projection)) {
           break;
         }
-
-        // Synthesized setter for a type wrapped variable is never transparent.
-        if (var->isAccessedViaTypeWrapper())
-          return false;
       }
 
       if (auto subscript = dyn_cast<SubscriptDecl>(storage)) {
@@ -3293,9 +3271,6 @@ static void finishStorageImplInfo(AbstractStorageDecl *storage,
       finishNSManagedImplInfo(var, info);
     } else if (var->hasAttachedPropertyWrapper()) {
       finishPropertyWrapperImplInfo(var, info);
-    } else if (var->isAccessedViaTypeWrapper()) {
-      info = var->isLet() ? StorageImplInfo::getImmutableComputed()
-                          : StorageImplInfo::getMutableComputed();
     }
   }
 
@@ -3424,12 +3399,6 @@ StorageImplInfoRequest::evaluate(Evaluator &evaluator,
       readWriteImpl = ReadWriteImplKind::MaterializeToTemporary;
     } else if (storage->getParsedAccessor(AccessorKind::Get)) {
       readImpl = ReadImplKind::Get;
-    } else if (storage->getName() ==
-               storage->getASTContext().Id_TypeWrapperProperty) {
-      // Type wrapper `$storage` property is `get set` requirement.
-      readImpl = ReadImplKind::Get;
-      writeImpl = WriteImplKind::Set;
-      readWriteImpl = ReadWriteImplKind::Modify;
     }
 
     StorageImplInfo info(readImpl, writeImpl, readWriteImpl);
@@ -3437,6 +3406,12 @@ StorageImplInfoRequest::evaluate(Evaluator &evaluator,
 
     return info;
   }
+
+  // Expand any attached accessor macros.
+  storage->forEachAttachedMacro(MacroRole::Accessor,
+      [&](CustomAttr *customAttr, MacroDecl *macro) {
+        expandAccessors(storage, customAttr, macro);
+      });
 
   bool hasWillSet = storage->getParsedAccessor(AccessorKind::WillSet);
   bool hasDidSet = storage->getParsedAccessor(AccessorKind::DidSet);
@@ -3572,7 +3547,7 @@ bool SimpleDidSetRequest::evaluate(Evaluator &evaluator,
   }
 
   // Always assume non-simple 'didSet' in code completion mode.
-  if (decl->getASTContext().SourceMgr.hasCodeCompletionBuffer())
+  if (decl->getASTContext().SourceMgr.hasIDEInspectionTargetBuffer())
     return false;
 
   // didSet must have a single parameter.

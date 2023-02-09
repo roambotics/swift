@@ -20,7 +20,7 @@ extension ASTGenVisitor {
       let tupleElement = TupleExprElementSyntax(
         label: nil, colon: nil, expression: ExprSyntax(trailingClosure), trailingComma: nil)
 
-      return visit(node.addArgument(tupleElement).withTrailingClosure(nil))
+      return visit(node.addArgument(tupleElement).with(\.trailingClosure, nil))
     }
 
     let args = visit(node.argumentList).rawValue
@@ -60,6 +60,15 @@ extension ASTGenVisitor {
     }
 
     return .expr(UnresolvedDotExpr_create(ctx, base, loc, name, loc))
+  }
+
+  public func visit(_ node: IfExprSyntax) -> ASTNode {
+    let stmt = makeIfStmt(node).rawValue
+
+    // Wrap in a SingleValueStmtExpr to embed as an expression.
+    let sve = SingleValueStmtExpr_createWithWrappedBranches(
+      ctx, stmt, declContext, /*mustBeExpr*/ true)
+    return .expr(sve)
   }
 
   public func visit(_ node: TupleExprElementListSyntax) -> ASTNode {

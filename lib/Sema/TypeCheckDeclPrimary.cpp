@@ -23,6 +23,7 @@
 #include "TypeCheckAvailability.h"
 #include "TypeCheckConcurrency.h"
 #include "TypeCheckDecl.h"
+#include "TypeCheckMacros.h"
 #include "TypeCheckObjC.h"
 #include "TypeCheckType.h"
 #include "TypeChecker.h"
@@ -31,6 +32,7 @@
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/AccessNotes.h"
 #include "swift/AST/AccessScope.h"
+#include "swift/AST/Attr.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/DiagnosticsSema.h"
@@ -39,6 +41,7 @@
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Initializer.h"
+#include "swift/AST/MacroDefinition.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/PrettyStackTrace.h"
@@ -539,7 +542,8 @@ static void checkRedeclaration(PrecedenceGroupDecl *group) {
 
 /// Check whether \c current is a redeclaration.
 evaluator::SideEffect
-CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
+CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current,
+                                    NominalTypeDecl *SelfNominalType) const {
   // Ignore invalid and anonymous declarations.
   if (current->isInvalid() || !current->hasName())
     return std::make_tuple<>();
@@ -1869,11 +1873,26 @@ public:
       // Force some requests, which can produce diagnostics.
 
       // Check redeclaration.
-      (void) evaluateOrDefault(Context.evaluator,
-                               CheckRedeclarationRequest{VD}, {});
+      (void)evaluateOrDefault(
+          Context.evaluator,
+          CheckRedeclarationRequest{
+              VD, VD->getDeclContext()->getSelfNominalTypeDecl()},
+          {});
 
       // Compute access level.
       (void) VD->getFormalAccess();
+
+      // Force runtime discoverable attribute checking.
+      {
+        auto runtimeDiscoverableAttrs = VD->getRuntimeDiscoverableAttrs();
+        if (!runtimeDiscoverableAttrs.empty()) {
+          // Register the declaration only if all of its attributes are valid.
+          if (llvm::all_of(runtimeDiscoverableAttrs, [&](CustomAttr *attr) {
+                return VD->getRuntimeDiscoverableAttributeGenerator(attr).first;
+              }))
+            SF->addDeclWithRuntimeDiscoverableAttrs(VD);
+        }
+      }
 
       // Compute overrides.
       if (!VD->getOverriddenDecls().empty())
@@ -1978,6 +1997,8 @@ public:
     checkAccessControl(PGD);
   }
 
+  void visitMissingDecl(MissingDecl *missing) {  }
+
   void visitMissingMemberDecl(MissingMemberDecl *MMD) {
     llvm_unreachable("should always be type-checked already");
   }
@@ -1986,12 +2007,56 @@ public:
     TypeChecker::checkDeclAttributes(MD);
     checkAccessControl(MD);
 
+    if (!Ctx.LangOpts.hasFeature(Feature::Macros))
+      MD->diagnose(diag::macro_experimental);
     if (!MD->getDeclContext()->isModuleScopeContext())
       MD->diagnose(diag::macro_in_nested, MD->getName());
+    if (!MD->getAttrs().hasAttribute<MacroRoleAttr>(/*AllowInvalid*/ true))
+      MD->diagnose(diag::macro_without_role, MD->getName());
+
+    // Check the macro definition.
+    switch (auto macroDef = MD->getDefinition()) {
+    case MacroDefinition::Kind::Undefined:
+      MD->diagnose(diag::macro_must_be_defined, MD->getName());
+      break;
+
+    case MacroDefinition::Kind::Invalid:
+    case MacroDefinition::Kind::Builtin:
+      // Nothing else to check here.
+      break;
+
+    case MacroDefinition::Kind::External: {
+        // Retrieve the external definition of the macro.
+      auto external = macroDef.getExternalMacro();
+      ExternalMacroDefinitionRequest request{
+        &Ctx, external.moduleName, external.macroTypeName
+      };
+      auto externalDef = evaluateOrDefault(
+          Ctx.evaluator, request, ExternalMacroDefinition()
+      );
+      if (!externalDef.opaqueHandle) {
+        MD->diagnose(
+            diag::external_macro_not_found,
+            external.moduleName.str(),
+            external.macroTypeName.str(),
+            MD->getName()
+        ).limitBehavior(DiagnosticBehavior::Warning);
+      }
+
+      break;
+    }
+    }
   }
 
   void visitMacroExpansionDecl(MacroExpansionDecl *MED) {
-    llvm_unreachable("FIXME: macro expansion decl not handled in DeclChecker");
+    // Assign a discriminator.
+    (void)MED->getDiscriminator();
+
+    auto rewritten = evaluateOrDefault(
+        Ctx.evaluator, ExpandMacroExpansionDeclRequest{MED}, {});
+
+    for (auto *decl : rewritten)
+      visit(decl);
   }
 
   void visitBoundVariable(VarDecl *VD) {
@@ -2122,6 +2187,21 @@ public:
     VD->visitEmittedAccessors([&](AccessorDecl *accessor) {
       visit(accessor);
     });
+
+    // If this var decl is a no implicit copy varDecl, error if its type is a
+    // move only type. No implicit copy is redundant.
+    //
+    // NOTE: We do this here instead of TypeCheckAttr since types are not
+    // completely type checked at that point.
+    if (auto attr = VD->getAttrs().getAttribute<NoImplicitCopyAttr>()) {
+      if (auto *nom = VD->getType()->getCanonicalType()->getNominalOrBoundGenericNominal()) {
+        if (nom->isMoveOnly()) {
+          DE.diagnose(attr->getLocation(),
+                      diag::noimplicitcopy_attr_not_allowed_on_moveonlytype)
+            .fixItRemove(attr->getRange());
+        }
+      }
+    }
   }
 
   void visitPatternBindingDecl(PatternBindingDecl *PBD) {
@@ -2504,6 +2584,7 @@ public:
       }
     }
 
+    // FIXME(kavon): see if these can be integrated into other parts of Sema
     diagnoseCopyableTypeContainingMoveOnlyType(ED);
     diagnoseMoveOnlyNominalDeclDoesntConformToProtocols(ED);
 
@@ -2512,6 +2593,20 @@ public:
     TypeChecker::checkDeclCircularity(ED);
 
     TypeChecker::checkConformancesInContext(ED);
+
+    // If our enum is marked as move only, it cannot be indirect or have any
+    // indirect cases.
+    if (ED->getAttrs().hasAttribute<MoveOnlyAttr>()) {
+      if (ED->isIndirect())
+        ED->diagnose(diag::moveonly_enums_do_not_support_indirect,
+                     ED->getBaseIdentifier());
+      for (auto *elt : ED->getAllElements()) {
+        if (elt->isIndirect()) {
+          elt->diagnose(diag::moveonly_enums_do_not_support_indirect,
+                        ED->getBaseIdentifier());
+        }
+      }
+    }
   }
 
   void visitStructDecl(StructDecl *SD) {
@@ -2658,6 +2753,12 @@ public:
       return;
 
     for (auto *prot : nomDecl->getLocalProtocols()) {
+      // Permit conformance to marker protocol Sendable.
+      if (prot->isSpecificProtocol(KnownProtocolKind::Sendable)) {
+        assert(prot->isMarkerProtocol());
+        continue;
+      }
+
       nomDecl->diagnose(diag::moveonly_cannot_conform_to_protocol_with_name,
                         nomDecl->getDescriptiveKind(),
                         nomDecl->getBaseName(), prot->getBaseName());
@@ -2828,6 +2929,16 @@ public:
     maybeDiagnoseClassWithoutInitializers(CD);
 
     diagnoseMoveOnlyNominalDeclDoesntConformToProtocols(CD);
+
+    // Ban non-final classes from having move only fields.
+    if (!CD->isFinal()) {
+      for (auto *field : CD->getStoredProperties()) {
+        if (field->getType()->isPureMoveOnly()) {
+          field->diagnose(
+              diag::moveonly_non_final_class_cannot_contain_moveonly_field);
+        }
+      }
+    }
   }
 
   void visitProtocolDecl(ProtocolDecl *PD) {
@@ -3173,21 +3284,31 @@ public:
       const bool wasAlreadyInvalid = ED->isInvalid();
       ED->setInvalid();
       if (!extType->hasError() && extType->getAnyNominal()) {
+        auto canExtType = extType->getCanonicalType();
+        if (auto existential = canExtType->getAs<ExistentialType>()) {
+          ED->diagnose(diag::unsupported_existential_extension, extType)
+              .highlight(ED->getExtendedTypeRepr()->getSourceRange());
+          ED->diagnose(diag::invalid_extension_rewrite,
+                       existential->getConstraintType())
+              .fixItReplace(ED->getExtendedTypeRepr()->getSourceRange(),
+                            existential->getConstraintType()->getString());
+          return;
+        }
+
         // If we've got here, then we have some kind of extension of a prima
-        // fascie non-nominal type.  This can come up when we're projecting
+        // facie non-nominal type.  This can come up when we're projecting
         // typealiases out of bound generic types.
         //
         // struct Array<T> { typealias Indices = Range<Int> }
         // extension Array.Indices.Bound {}
         //
         // Offer to rewrite it to the underlying nominal type.
-        auto canExtType = extType->getCanonicalType();
         if (canExtType.getPointer() != extType.getPointer()) {
           ED->diagnose(diag::invalid_nominal_extension, extType, canExtType)
-            .highlight(ED->getExtendedTypeRepr()->getSourceRange());
-          ED->diagnose(diag::invalid_nominal_extension_rewrite, canExtType)
-            .fixItReplace(ED->getExtendedTypeRepr()->getSourceRange(),
-                          canExtType->getString());
+              .highlight(ED->getExtendedTypeRepr()->getSourceRange());
+          ED->diagnose(diag::invalid_extension_rewrite, canExtType)
+              .fixItReplace(ED->getExtendedTypeRepr()->getSourceRange(),
+                            canExtType->getString());
           return;
         }
       }
@@ -3288,6 +3409,8 @@ public:
       ED->diagnose(diag::moveonly_cannot_conform_to_protocol,
                    nominal->getDescriptiveKind(), nominal->getBaseName());
     }
+
+    TypeChecker::checkReflectionMetadataAttributes(ED);
   }
 
   void visitTopLevelCodeDecl(TopLevelCodeDecl *TLCD) {
@@ -3420,6 +3543,7 @@ public:
         case AccessLevel::Open:
           requiredAccess = AccessLevel::Public;
           break;
+        case AccessLevel::Package:
         case AccessLevel::Public:
         case AccessLevel::Internal:
           requiredAccess = AccessLevel::Internal;
@@ -3584,6 +3708,17 @@ void TypeChecker::checkParameterList(ParameterList *params,
           DeclChecker(param->getASTContext(), SF).visitBoundVariable(auxiliaryDecl);
       });
     }
+
+    // If we have a noimplicitcopy parameter, make sure that the underlying type
+    // is not move only. It is redundant.
+    if (auto attr = param->getAttrs().getAttribute<NoImplicitCopyAttr>()) {
+      if (auto *nom = param->getType()->getCanonicalType()->getNominalOrBoundGenericNominal()) {
+        if (nom->isMoveOnly()) {
+          param->diagnose(diag::noimplicitcopy_attr_not_allowed_on_moveonlytype)
+            .fixItRemove(attr->getRange());
+        }
+      }
+    }
   }
 
   // For source compatibility, allow duplicate internal parameter names
@@ -3595,4 +3730,45 @@ void TypeChecker::checkParameterList(ParameterList *params,
     // Check for duplicate parameter names.
     diagnoseDuplicateDecls(*params);
   }
+}
+
+ArrayRef<Decl *>
+ExpandMacroExpansionDeclRequest::evaluate(Evaluator &evaluator,
+                                          MacroExpansionDecl *MED) const {
+  auto &ctx = MED->getASTContext();
+  auto *dc = MED->getDeclContext();
+  auto foundMacros = TypeChecker::lookupMacros(
+      MED->getDeclContext(), MED->getMacroName(),
+      MED->getLoc(), MacroRole::Declaration);
+  if (foundMacros.empty()) {
+    MED->diagnose(diag::macro_undefined, MED->getMacroName().getBaseIdentifier())
+        .highlight(MED->getMacroNameLoc().getSourceRange());
+    return {};
+  }
+  // Resolve macro candidates.
+  MacroDecl *macro;
+  if (auto *args = MED->getArgs()) {
+    macro = evaluateOrDefault(
+        ctx.evaluator, ResolveMacroRequest{MED, MacroRole::Declaration, dc},
+        nullptr);
+  }
+  else {
+    if (foundMacros.size() > 1) {
+      MED->diagnose(diag::ambiguous_decl_ref, MED->getMacroName())
+          .highlight(MED->getMacroNameLoc().getSourceRange());
+      for (auto *candidate : foundMacros)
+        candidate->diagnose(diag::found_candidate);
+      return {};
+    }
+    macro = foundMacros.front();
+  }
+  if (!macro)
+    return {};
+  MED->setMacroRef(macro);
+
+  // Expand the macro.
+  SmallVector<Decl *, 2> expandedTemporary;
+  if (!expandFreestandingDeclarationMacro(MED, expandedTemporary))
+    return {};
+  return ctx.AllocateCopy(expandedTemporary);
 }

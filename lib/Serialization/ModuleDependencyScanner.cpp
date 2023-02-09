@@ -43,7 +43,7 @@ std::error_code ModuleDependencyScanner::findModuleFilesInDirectory(
   if (LoadMode == ModuleLoadingMode::OnlySerialized || !fs.exists(InPath)) {
     if (fs.exists(ModPath)) {
       // The module file will be loaded directly.
-      auto dependencies = scanModuleFile(ModPath);
+      auto dependencies = scanModuleFile(ModPath, IsFramework);
       if (dependencies) {
         this->dependencies = std::move(dependencies.get());
         return std::error_code();
@@ -82,7 +82,7 @@ bool PlaceholderSwiftModuleScanner::findModule(
     return false;
   }
   auto &moduleInfo = it->getValue();
-  auto dependencies = ModuleDependencies::forPlaceholderSwiftModuleStub(
+  auto dependencies = ModuleDependencyInfo::forPlaceholderSwiftModuleStub(
       moduleInfo.modulePath, moduleInfo.moduleDocPath,
       moduleInfo.moduleSourceInfoPath);
   this->dependencies = std::move(dependencies);
@@ -96,7 +96,7 @@ static std::vector<std::string> getCompiledCandidates(ASTContext &ctx,
       moduleName.str(), interfacePath);
 }
 
-ErrorOr<ModuleDependencies> ModuleDependencyScanner::scanInterfaceFile(
+ErrorOr<ModuleDependencyInfo> ModuleDependencyScanner::scanInterfaceFile(
     Twine moduleInterfacePath, bool isFramework) {
   // Create a module filename.
   // FIXME: Query the module interface loader to determine an appropriate
@@ -105,28 +105,45 @@ ErrorOr<ModuleDependencies> ModuleDependencyScanner::scanInterfaceFile(
   auto realModuleName = Ctx.getRealModuleName(moduleName);
   llvm::SmallString<32> modulePath = realModuleName.str();
   llvm::sys::path::replace_extension(modulePath, newExt);
-  Optional<ModuleDependencies> Result;
+  Optional<ModuleDependencyInfo> Result;
   std::error_code code =
     astDelegate.runInSubContext(realModuleName.str(),
                                               moduleInterfacePath.str(),
                                               StringRef(),
                                               SourceLoc(),
                 [&](ASTContext &Ctx, ModuleDecl *mainMod,
-                    ArrayRef<StringRef> Args,
+                    ArrayRef<StringRef> BaseArgs,
                     ArrayRef<StringRef> PCMArgs, StringRef Hash) {
     assert(mainMod);
     std::string InPath = moduleInterfacePath.str();
     auto compiledCandidates = getCompiledCandidates(Ctx, realModuleName.str(),
                                                     InPath);
+    std::vector<std::string> Args(BaseArgs.begin(), BaseArgs.end());
 
+    // Add explicit Swift dependency compilation flags
+    Args.push_back("-explicit-interface-module-build");
+    Args.push_back("-disable-implicit-swift-modules");
+    Args.push_back("-Xcc"); Args.push_back("-fno-implicit-modules");
+    Args.push_back("-Xcc"); Args.push_back("-fno-implicit-module-maps");
+    for (const auto &candidate : compiledCandidates) {
+      Args.push_back("-candidate-module-file");
+      Args.push_back(candidate);
+    }
+
+    // Compute the output path and add it to the command line
     SmallString<128> outputPathBase(moduleCachePath);
     llvm::sys::path::append(
         outputPathBase,
         moduleName.str() + "-" + Hash + "." +
             file_types::getExtension(file_types::TY_SwiftModuleFile));
-    Result = ModuleDependencies::forSwiftInterfaceModule(
-        outputPathBase.str().str(), InPath, compiledCandidates, Args, PCMArgs,
+    Args.push_back("-o");
+    Args.push_back(outputPathBase.str().str());
+
+    std::vector<StringRef> ArgsRefs(Args.begin(), Args.end());
+    Result = ModuleDependencyInfo::forSwiftInterfaceModule(
+        outputPathBase.str().str(), InPath, compiledCandidates, ArgsRefs, PCMArgs,
         Hash, isFramework);
+
     // Open the interface file.
     auto &fs = *Ctx.SourceMgr.getFileSystem();
     auto interfaceBuf = fs.getBufferForFile(moduleInterfacePath);
@@ -143,13 +160,13 @@ ErrorOr<ModuleDependencies> ModuleDependencyScanner::scanInterfaceFile(
 
     // Walk the source file to find the import declarations.
     llvm::StringSet<> alreadyAddedModules;
-    Result->addModuleDependencies(*sourceFile, alreadyAddedModules);
+    Result->addModuleImport(*sourceFile, alreadyAddedModules);
 
     // Collect implicitly imported modules in case they are not explicitly
     // printed in the interface file, e.g. SwiftOnoneSupport.
     auto &imInfo = mainMod->getImplicitImportInfo();
     for (auto import: imInfo.AdditionalUnloadedImports) {
-      Result->addModuleDependency(import.module.getModulePath(), &alreadyAddedModules);
+      Result->addModuleImport(import.module.getModulePath(), &alreadyAddedModules);
     }
     return std::error_code();
   });
@@ -160,25 +177,9 @@ ErrorOr<ModuleDependencies> ModuleDependencyScanner::scanInterfaceFile(
   return *Result;
 }
 
-Optional<ModuleDependencies> SerializedModuleLoaderBase::getModuleDependencies(
+Optional<const ModuleDependencyInfo*> SerializedModuleLoaderBase::getModuleDependencies(
     StringRef moduleName, ModuleDependenciesCache &cache,
     InterfaceSubContextDelegate &delegate) {
-  auto currentSearchPathSet = Ctx.getAllModuleSearchPathsSet();
-
-  // Check whether we've cached this result.
-  if (auto found = cache.findDependencies(
-           moduleName, ModuleDependenciesKind::SwiftInterface))
-    return found;
-  if (auto found = cache.findDependencies(
-           moduleName, ModuleDependenciesKind::SwiftSource))
-    return found;
-  if (auto found = cache.findDependencies(
-            moduleName, ModuleDependenciesKind::SwiftBinary))
-    return found;
-  if (auto found = cache.findDependencies(
-            moduleName, ModuleDependenciesKind::SwiftPlaceholder))
-    return found;
-
   ImportPath::Module::Builder builder(Ctx, moduleName, /*separator=*/'.');
   auto modulePath = builder.get();
   auto moduleId = modulePath.front().Item;
@@ -201,8 +202,8 @@ Optional<ModuleDependencies> SerializedModuleLoaderBase::getModuleDependencies(
   for (auto &scanner : scanners) {
     if (scanner->canImportModule(modulePath, nullptr)) {
       // Record the dependencies.
-      cache.recordDependencies(moduleName, *(scanner->dependencies));
-      return std::move(scanner->dependencies);
+      cache.recordDependency(moduleName, *(scanner->dependencies));
+      return cache.findDependency(moduleName, scanner->dependencies->getKind());
     }
   }
 

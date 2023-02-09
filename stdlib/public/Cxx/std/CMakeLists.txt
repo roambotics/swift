@@ -127,7 +127,7 @@ add_dependencies(sdk-overlay libstdcxx-modulemap)
 #
 # C++ Standard Library Overlay.
 #
-add_swift_target_library(swiftstd STATIC NO_LINK_NAME IS_STDLIB
+add_swift_target_library(swiftCxxStdlib STATIC NO_LINK_NAME IS_STDLIB
     std.swift
     String.swift
 
@@ -147,6 +147,6 @@ add_swift_target_library(swiftstd STATIC NO_LINK_NAME IS_STDLIB
 
     LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
     TARGET_SDKS ALL_APPLE_PLATFORMS LINUX
-    INSTALL_IN_COMPONENT sdk-overlay
+    INSTALL_IN_COMPONENT compiler
     INSTALL_WITH_SHARED
     DEPENDS libstdcxx-modulemap)

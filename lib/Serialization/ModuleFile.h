@@ -532,6 +532,14 @@ public:
     return Core->Name;
   }
 
+  StringRef getModulePackageName() const {
+    return Core->ModulePackageName;
+  }
+
+  StringRef getModuleExportAsName() const {
+    return Core->ModuleExportAsName;
+  }
+
   /// The ABI name of the module.
   StringRef getModuleABIName() const {
     return Core->ModuleABIName;

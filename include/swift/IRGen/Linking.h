@@ -341,6 +341,11 @@ class LinkEntity {
     /// the metadata cache once.
     CanonicalPrespecializedGenericTypeCachingOnceToken,
 
+    /// The record that describes an attribute that could be looked
+    /// up at runtime together with all types it's attached to and
+    /// generator functions.
+    RuntimeDiscoverableAttributeRecord,
+
     /// The same as AsyncFunctionPointer but with a different stored value, for
     /// use by TBDGen.
     /// The pointer is an AbstractFunctionDecl*.
@@ -1263,8 +1268,7 @@ public:
 
     case LinkEntity::Kind::DistributedAccessor: {
       entity.Data = LINKENTITY_SET_FIELD(
-          Kind,
-          unsigned(LinkEntity::Kind::DistributedAccessorAsyncPointer));
+          Kind, unsigned(LinkEntity::Kind::DistributedAccessorAsyncPointer));
       break;
     }
 
@@ -1377,6 +1381,12 @@ public:
         LINKENTITY_SET_FIELD(Kind, unsigned(Kind::ExtendedExistentialTypeShape))
       | LINKENTITY_SET_FIELD(ExtendedExistentialIsUnique, unsigned(isUnique))
       | LINKENTITY_SET_FIELD(ExtendedExistentialIsShared, unsigned(isShared));
+    return entity;
+  }
+
+  static LinkEntity forRuntimeDiscoverableAttributeRecord(NominalTypeDecl *attr) {
+    LinkEntity entity;
+    entity.setForDecl(Kind::RuntimeDiscoverableAttributeRecord, attr);
     return entity;
   }
 
@@ -1509,6 +1519,9 @@ public:
            getKind() == Kind::OpaqueTypeDescriptorAccessorKey ||
            getKind() == Kind::OpaqueTypeDescriptorAccessorVar;
   }
+  bool isOpaqueTypeDescriptorAccessorImpl() const {
+    return getKind() == Kind::OpaqueTypeDescriptorAccessorImpl;
+  }
   bool isAllocator() const {
     assert(getKind() == Kind::DynamicallyReplaceableFunctionImpl ||
            getKind() == Kind::DynamicallyReplaceableFunctionKeyAST ||
@@ -1539,6 +1552,9 @@ public:
   }
   bool isDynamicallyReplaceableFunctionKey() const {
     return getKind() == Kind::DynamicallyReplaceableFunctionKey;
+  }
+  bool isDynamicallyReplaceableFunctionImpl() const {
+    return getKind() == Kind::DynamicallyReplaceableFunctionImpl;
   }
   bool isTypeMetadataAccessFunction() const {
     return getKind() == Kind::TypeMetadataAccessFunction;

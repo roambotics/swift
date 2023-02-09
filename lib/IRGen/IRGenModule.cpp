@@ -621,6 +621,10 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
                        {RelativeAddressTy, RelativeAddressTy, RelativeAddressTy,
                         RelativeAddressTy, Int32Ty});
 
+  RuntimeDiscoverableAttributeTy =
+    createStructType(*this, "swift.runtime_attr",
+                     {Int32Ty, RelativeAddressTy, Int32Ty});
+
   AsyncFunctionPointerTy = createStructType(*this, "swift.async_func_pointer",
                                             {RelativeAddressTy, Int32Ty}, true);
   SwiftContextTy = llvm::StructType::create(getLLVMContext(), "swift.context");
@@ -1192,6 +1196,12 @@ Address IRGenModule::getAddrOfObjCISAMask() {
   return Address(ObjCISAMaskPtr, IntPtrTy, getPointerAlignment());
 }
 
+llvm::Constant *
+IRGenModule::getAddrOfAccessibleFunctionRecord(SILFunction *accessibleFn) {
+  auto entity = LinkEntity::forAccessibleFunctionRecord(accessibleFn);
+  return getAddrOfLLVMVariable(entity, ConstantInit(), DebugTypeInfo());
+}
+
 ModuleDecl *IRGenModule::getSwiftModule() const {
   return IRGen.SIL.getSwiftModule();
 }
@@ -1300,7 +1310,7 @@ bool swift::irgen::shouldRemoveTargetFeature(StringRef feature) {
 }
 
 void IRGenModule::setHasNoFramePointer(llvm::AttrBuilder &Attrs) {
-  Attrs.addAttribute("frame-pointer", "none");
+  Attrs.addAttribute("frame-pointer", "non-leaf");
 }
 
 void IRGenModule::setHasNoFramePointer(llvm::Function *F) {
@@ -1871,6 +1881,7 @@ bool IRGenModule::canMakeStaticObjectsReadOnly() {
   // rdar://101126543
   return false;
 
+#if 0
   if (getOptions().DisableReadonlyStaticObjects)
     return false;
 
@@ -1881,6 +1892,7 @@ bool IRGenModule::canMakeStaticObjectsReadOnly() {
 
   return getAvailabilityContext().isContainedIn(
           Context.getImmortalRefCountSymbolsAvailability());
+#endif
 }
 
 void IRGenerator::addGenModule(SourceFile *SF, IRGenModule *IGM) {
@@ -1907,10 +1919,11 @@ IRGenModule *IRGenerator::getGenModule(DeclContext *ctxt) {
   if (GenModules.size() == 1 || !ctxt) {
     return getPrimaryIGM();
   }
-  SourceFile *SF = ctxt->getParentSourceFile();
+  SourceFile *SF = ctxt->getOutermostParentSourceFile();
   if (!SF) {
     return getPrimaryIGM();
   }
+
   IRGenModule *IGM = GenModules[SF];
   assert(IGM);
   return IGM;

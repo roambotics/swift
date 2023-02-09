@@ -356,11 +356,17 @@ namespace swift {
     /// new enough?
     bool EnableTargetOSChecking = true;
 
-    /// Whether to attempt to recover from missing cross-references and other
-    /// errors when deserializing from a Swift module.
+    /// Whether to attempt to recover from missing cross-references,
+    /// differences in APIs between language versions, and other
+    /// errors when deserializing from a binary swiftmodule file.
     ///
-    /// This is a staging flag; eventually it will be removed.
+    /// This feature should only be disabled for testing as regular builds
+    /// rely heavily on it.
     bool EnableDeserializationRecovery = true;
+
+    /// Enable early skipping deserialization of decls that are marked as
+    /// unsafe to read.
+    bool EnableDeserializationSafety = true;
 
     /// Whether to enable the new operator decl and precedencegroup lookup
     /// behavior. This is a staging flag, and will be removed in the future.
@@ -631,7 +637,16 @@ namespace swift {
     /// Return a hash code of any components from these options that should
     /// contribute to a Swift Dependency Scanning hash.
     llvm::hash_code getModuleScanningHashComponents() const {
-      return getPCHHashComponents();
+      auto hashValue = getPCHHashComponents();
+      if (TargetVariant.has_value())
+        hashValue = llvm::hash_combine(hashValue, TargetVariant.value().str());
+      if (ClangTarget.has_value())
+        hashValue = llvm::hash_combine(hashValue, ClangTarget.value().str());
+      if (SDKVersion.has_value())
+        hashValue = llvm::hash_combine(hashValue, SDKVersion.value().getAsString());
+      if (VariantSDKVersion.has_value())
+        hashValue = llvm::hash_combine(hashValue, VariantSDKVersion.value().getAsString());
+      return hashValue;
     }
 
   private:

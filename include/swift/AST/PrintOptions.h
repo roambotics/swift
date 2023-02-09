@@ -285,6 +285,9 @@ struct PrintOptions {
 
   bool PrintImplicitAttrs = true;
 
+  /// Whether to print the \c each keyword for pack archetypes.
+  bool PrintExplicitEach = false;
+
   /// Whether to print the \c any keyword for existential
   /// types.
   bool PrintExplicitAny = false;
@@ -314,6 +317,9 @@ struct PrintOptions {
 
   /// Suppress emitting @available(*, noasync)
   bool SuppressNoAsyncAvailabilityAttr = false;
+
+  /// Whether to print the \c{/*not inherited*/} comment on factory initializers.
+  bool PrintFactoryInitializerComment = true;
 
   /// How to print opaque return types.
   enum class OpaqueReturnTypePrintingMode {
@@ -530,6 +536,16 @@ struct PrintOptions {
   /// parameter.
   bool PrintSpecializeAttributeWithAvailability = true;
 
+  /// Whether to always desugar array types from `[base_type]` to `Array<base_type>`
+  bool AlwaysDesugarArraySliceTypes = false;
+
+  /// Whether to always desugar dictionary types
+  /// from `[key_type:value_type]` to `Dictionary<key_type,value_type>`
+  bool AlwaysDesugarDictionaryTypes = false;
+
+  /// Whether to always desugar optional types from `base_type?` to `Optional<base_type>`
+  bool AlwaysDesugarOptionalTypes = false;
+
   /// \see ShouldQualifyNestedDeclarations
   enum class QualifyNestedDeclarations {
     Never,
@@ -649,6 +665,7 @@ struct PrintOptions {
                                               bool preferTypeRepr,
                                               bool printFullConvention,
                                               bool printSPIs,
+                                              bool useExportedModuleNames,
                                               bool aliasModuleNames,
                                               llvm::SmallSet<StringRef, 4>
                                                 *aliasModuleNamesTargets

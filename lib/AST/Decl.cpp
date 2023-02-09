@@ -32,6 +32,8 @@
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/LazyResolver.h"
+#include "swift/AST/MacroDefinition.h"
+#include "swift/AST/MacroDiscriminatorContext.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/NameLookupRequests.h"
@@ -56,6 +58,7 @@
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/Parse/Lexer.h" // FIXME: Bad dependency
 #include "clang/Lex/MacroInfo.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallString.h"
@@ -167,6 +170,7 @@ DescriptiveDeclKind Decl::getDescriptiveKind() const {
   TRIVIAL_KIND(EnumElement);
   TRIVIAL_KIND(Param);
   TRIVIAL_KIND(Module);
+  TRIVIAL_KIND(Missing);
   TRIVIAL_KIND(MissingMember);
   TRIVIAL_KIND(Macro);
   TRIVIAL_KIND(MacroExpansion);
@@ -351,6 +355,7 @@ StringRef Decl::getDescriptiveKindName(DescriptiveDeclKind K) {
   ENTRY(ModifyAccessor, "_modify accessor");
   ENTRY(EnumElement, "enum case");
   ENTRY(Module, "module");
+  ENTRY(Missing, "missing decl");
   ENTRY(MissingMember, "missing member placeholder");
   ENTRY(Requirement, "requirement");
   ENTRY(OpaqueResultType, "result");
@@ -362,15 +367,67 @@ StringRef Decl::getDescriptiveKindName(DescriptiveDeclKind K) {
   llvm_unreachable("bad DescriptiveDeclKind");
 }
 
-const Decl *Decl::getInnermostDeclWithAvailability() const {
-  const Decl *enclosingDecl = this;
-  // Find the innermost enclosing declaration with an @available annotation.
-  while (enclosingDecl != nullptr) {
-    if (enclosingDecl->getAttrs().hasAttribute<AvailableAttr>())
-      return enclosingDecl;
+DeclAttributes Decl::getSemanticAttrs() const {
+  auto mutableThis = const_cast<Decl *>(this);
+  evaluateOrDefault(getASTContext().evaluator,
+                    ExpandMemberAttributeMacros{mutableThis},
+                    false);
 
-    enclosingDecl = enclosingDecl->getDeclContext()->getAsDecl();
+  return getAttrs();
+}
+
+void Decl::forEachAttachedMacro(MacroRole role,
+                                MacroCallback macroCallback) const {
+  auto *dc = getDeclContext();
+  auto &ctx = dc->getASTContext();
+
+  for (auto customAttrConst : getSemanticAttrs().getAttributes<CustomAttr>()) {
+    auto customAttr = const_cast<CustomAttr *>(customAttrConst);
+    auto *macroDecl = evaluateOrDefault(
+        ctx.evaluator,
+        ResolveMacroRequest{customAttr, getAttachedMacroRoles(), dc},
+        nullptr);
+
+    if (!macroDecl)
+      continue;
+
+    if (!macroDecl->getMacroRoles().contains(role))
+      continue;
+
+    macroCallback(customAttr, macroDecl);
   }
+}
+
+unsigned Decl::getAttachedMacroDiscriminator(
+    MacroRole role, const CustomAttr *attr
+) const {
+  assert(isAttachedMacro(role) && "Not an attached macro role");
+
+  // Member-attribute macros are written on the enclosing declaration,
+  // but apply to the member itself. Adjust the owning declaration accordingly.
+  const Decl *owningDecl = this;
+  if (role == MacroRole::MemberAttribute) {
+    owningDecl = getDeclContext()->getAsDecl();
+  }
+
+  llvm::SmallDenseMap<Identifier, unsigned> nextDiscriminator;
+  Optional<unsigned> foundDiscriminator;
+
+  owningDecl->forEachAttachedMacro(
+    role,
+    [&](CustomAttr *foundAttr, MacroDecl *foundMacro) {
+      unsigned discriminator =
+        nextDiscriminator[foundMacro->getBaseIdentifier()]++;
+      if (attr == foundAttr)
+        foundDiscriminator = discriminator;
+    });
+
+  return *foundDiscriminator;
+}
+
+const Decl *Decl::getInnermostDeclWithAvailability() const {
+  if (auto attrAndDecl = getSemanticAvailableRangeAttr())
+    return attrAndDecl.value().second;
 
   return nullptr;
 }
@@ -388,20 +445,13 @@ Decl::getIntroducedOSVersion(PlatformKind Kind) const {
 }
 
 Optional<llvm::VersionTuple>
-Decl::getBackDeployBeforeOSVersion(ASTContext &Ctx) const {
-  for (auto *attr : getAttrs()) {
-    if (auto *backDeployAttr = dyn_cast<BackDeployAttr>(attr)) {
-      if (backDeployAttr->isActivePlatform(Ctx) && backDeployAttr->Version) {
-        return backDeployAttr->Version;
-      }
-    }
-  }
+Decl::getBackDeployedBeforeOSVersion(ASTContext &Ctx) const {
+  if (auto *attr = getAttrs().getBackDeployed(Ctx))
+    return attr->Version;
 
-  // Accessors may inherit `@_backDeploy`.
-  if (getKind() == DeclKind::Accessor) {
-    return cast<AccessorDecl>(this)->getStorage()->getBackDeployBeforeOSVersion(
-        Ctx);
-  }
+  // Accessors may inherit `@backDeployed`.
+  if (auto *AD = dyn_cast<AccessorDecl>(this))
+    return AD->getStorage()->getBackDeployedBeforeOSVersion(Ctx);
 
   return None;
 }
@@ -949,8 +999,8 @@ AvailabilityContext Decl::getAvailabilityForLinkage() const {
   ASTContext &ctx = getASTContext();
 
   // When computing availability for linkage, use the "before" version from
-  // the @_backDeploy attribute, if present.
-  if (auto backDeployVersion = getBackDeployBeforeOSVersion(ctx))
+  // the @backDeployed attribute, if present.
+  if (auto backDeployVersion = getBackDeployedBeforeOSVersion(ctx))
     return AvailabilityContext{VersionRange::allGTE(*backDeployVersion)};
 
   auto containingContext =
@@ -1193,6 +1243,7 @@ ImportKind ImportDecl::getBestImportKind(const ValueDecl *VD) {
   case DeclKind::IfConfig:
   case DeclKind::PoundDiagnostic:
   case DeclKind::PrecedenceGroup:
+  case DeclKind::Missing:
   case DeclKind::MissingMember:
   case DeclKind::MacroExpansion:
     llvm_unreachable("not a ValueDecl");
@@ -1528,6 +1579,7 @@ PatternBindingDecl *PatternBindingDecl::createImplicit(
                         Pat, /*EqualLoc*/ SourceLoc(), nullptr, Parent);
   Result->setImplicit();
   Result->setInit(0, E);
+  Result->setOriginalInit(0, E);
   return Result;
 }
 
@@ -2032,11 +2084,11 @@ SourceLoc PatternBindingDecl::getEqualLoc(unsigned i) const {
 }
 
 SourceLoc TopLevelCodeDecl::getStartLoc() const {
-  return Body->getStartLoc();
+  return Body ? Body->getStartLoc() : SourceLoc();
 }
 
 SourceRange TopLevelCodeDecl::getSourceRange() const {
-  return Body->getSourceRange();
+  return Body? Body->getSourceRange() : SourceRange();
 }
 
 SourceRange IfConfigDecl::getSourceRange() const {
@@ -2113,7 +2165,7 @@ static bool isDirectToStorageAccess(const DeclContext *UseDC,
   if (!var->hasStorage())
     return false;
 
-  auto *AFD = dyn_cast<AbstractFunctionDecl>(UseDC);
+  auto *AFD = dyn_cast_or_null<AbstractFunctionDecl>(UseDC);
   if (AFD == nullptr)
     return false;
 
@@ -2642,6 +2694,7 @@ bool ValueDecl::isInstanceMember() const {
   case DeclKind::IfConfig:
   case DeclKind::PoundDiagnostic:
   case DeclKind::PrecedenceGroup:
+  case DeclKind::Missing:
   case DeclKind::MissingMember:
   case DeclKind::MacroExpansion:
     llvm_unreachable("Not a ValueDecl");
@@ -2695,13 +2748,55 @@ bool ValueDecl::isInstanceMember() const {
   llvm_unreachable("bad DeclKind");
 }
 
+bool ValueDecl::hasLocalDiscriminator() const {
+  // Generic parameters and unnamed parameters never have local discriminators.
+  if (isa<GenericTypeParamDecl>(this) ||
+      (isa<ParamDecl>(this) && !hasName()))
+    return false;
+
+  // Opaque types never have local discriminators.
+  if (isa<OpaqueTypeDecl>(this))
+    return false;
+
+  // Accessors never have local discriminators.
+  if (isa<AccessorDecl>(this))
+    return false;
+
+  // Implicit and unnamed declarations never have local discriminators.
+  if (getBaseName().isSpecial())
+    return false;
+
+  // If we are not in a local context, there's nothing to do.
+  if (!getDeclContext()->isLocalContext())
+    return false;
+
+  return true;
+}
+
 unsigned ValueDecl::getLocalDiscriminator() const {
+  // If we have already assigned a local discriminator, we're done.
+  if (LocalDiscriminator != InvalidDiscriminator)
+    return LocalDiscriminator;
+
+  // If this declaration does not have a local discriminator, use 0 as a
+  // stand-in.
+  if (!hasLocalDiscriminator())
+    return 0;
+
+  // Assign local discriminators in this context.
+  evaluateOrDefault(
+      getASTContext().evaluator,
+      LocalDiscriminatorsRequest{getDeclContext()}, InvalidDiscriminator);
+
+  assert(LocalDiscriminator != InvalidDiscriminator);
+
   return LocalDiscriminator;
 }
 
 void ValueDecl::setLocalDiscriminator(unsigned index) {
-  assert(getDeclContext()->isLocalContext());
-  assert(LocalDiscriminator == 0 && "LocalDiscriminator is set multiple times");
+  assert(hasLocalDiscriminator());
+  assert(LocalDiscriminator == InvalidDiscriminator &&
+         "LocalDiscriminator is set multiple times");
   LocalDiscriminator = index;
 }
 
@@ -2740,6 +2835,10 @@ bool swift::conflicting(const OverloadSignature& sig1,
 
   // If one is an async function and the other is not, they can't conflict.
   if (sig1.IsAsyncFunction != sig2.IsAsyncFunction)
+    return false;
+
+  // If one is a macro and the other is not, they can't conflict.
+  if (sig1.IsMacro != sig2.IsMacro)
     return false;
 
   // If one is a compound name and the other is not, they do not conflict
@@ -2973,6 +3072,7 @@ OverloadSignature ValueDecl::getOverloadSignature() const {
   signature.IsEnumElement = isa<EnumElementDecl>(this);
   signature.IsNominal = isa<NominalTypeDecl>(this);
   signature.IsTypeAlias = isa<TypeAliasDecl>(this);
+  signature.IsMacro = isa<MacroDecl>(this);
   signature.HasOpaqueReturnType =
                        !signature.IsVariable && (bool)getOpaqueResultTypeDecl();
 
@@ -3597,6 +3697,7 @@ AccessLevel ValueDecl::getEffectiveAccess() const {
   switch (effectiveAccess) {
   case AccessLevel::Open:
     break;
+  case AccessLevel::Package:
   case AccessLevel::Public:
   case AccessLevel::Internal:
     if (getModuleContext()->isTestingEnabled() ||
@@ -3677,11 +3778,13 @@ getAccessScopeForFormalAccess(const ValueDecl *VD,
   while (!resultDC->isModuleScopeContext()) {
     if (isa<TopLevelCodeDecl>(resultDC)) {
       return AccessScope(resultDC->getModuleScopeContext(),
-                         access == AccessLevel::Private);
+                         access == AccessLevel::Private
+                             ? AccessLimitKind::Private
+                             : AccessLimitKind::None);
     }
 
     if (resultDC->isLocalContext() || access == AccessLevel::Private)
-      return AccessScope(resultDC, /*private*/true);
+      return AccessScope(resultDC, AccessLimitKind::Private);
 
     if (auto enclosingNominal = dyn_cast<GenericTypeDecl>(resultDC)) {
       auto enclosingAccess =
@@ -3712,9 +3815,13 @@ getAccessScopeForFormalAccess(const ValueDecl *VD,
   case AccessLevel::Private:
   case AccessLevel::FilePrivate:
     assert(resultDC->isModuleScopeContext());
-    return AccessScope(resultDC, access == AccessLevel::Private);
+    return AccessScope(resultDC, access == AccessLevel::Private
+                                     ? AccessLimitKind::Private
+                                     : AccessLimitKind::None);
   case AccessLevel::Internal:
     return AccessScope(resultDC->getParentModule());
+  case AccessLevel::Package:
+    return AccessScope::getPackage();
   case AccessLevel::Public:
   case AccessLevel::Open:
     return AccessScope::getPublic();
@@ -3750,8 +3857,15 @@ static bool checkAccessUsingAccessScopes(const DeclContext *useDC,
   if (accessScope.getDeclContext() == useDC) return true;
   if (!AccessScope(useDC).isChildOf(accessScope)) return false;
 
+  // useDC is null only when caller wants to skip non-public type checks.
+  if (!useDC) return true;
+
+  // Check package access; accessing package decl should not be allowed if package names are different
+  if (accessScope.isPackage())
+    return VD->getDeclContext()->getParentModule()->getPackageName() == useDC->getParentModule()->getPackageName();
+
   // Check SPI access
-  if (!useDC || !VD->isSPI()) return true;
+  if (!VD->isSPI()) return true;
   auto useSF = dyn_cast<SourceFile>(useDC->getModuleScopeContext());
   return !useSF || useSF->isImportedAsSPI(VD) ||
          VD->getDeclContext()->getParentModule() == useDC->getParentModule();
@@ -3864,6 +3978,7 @@ static bool checkAccess(const DeclContext *useDC, const ValueDecl *VD,
     auto *useSF = dyn_cast<SourceFile>(useFile);
     return useSF && useSF->hasTestableOrPrivateImport(access, sourceModule);
   }
+  case AccessLevel::Package:
   case AccessLevel::Public:
   case AccessLevel::Open:
     return true;
@@ -4998,8 +5113,8 @@ bool ClassDecl::hasResilientMetadata() const {
     return false;
 
   // If the class is not public, we can't use it outside the module at all.
-  if (!getFormalAccessScope(/*useDC=*/nullptr,
-                            /*treatUsableFromInlineAsPublic=*/true).isPublic())
+  // Take enable testing into account.
+  if (getEffectiveAccess() < AccessLevel::Public)
     return false;
 
   // Otherwise we access metadata members, such as vtable entries, resiliently.
@@ -6598,14 +6713,6 @@ bool VarDecl::isMemberwiseInitialized(bool preferDeclaredProperties) const {
   return true;
 }
 
-bool VarDecl::isTypeWrapperLocalStorageForInitializer() const {
-  if (auto *ctor =
-          dyn_cast_or_null<ConstructorDecl>(getDeclContext()->getAsDecl())) {
-    return this == ctor->getLocalTypeWrapperStorageVar();
-  }
-  return false;
-}
-
 bool VarDecl::isLet() const {
   // An awful hack that stabilizes the value of 'isLet' for ParamDecl instances.
   //
@@ -6698,10 +6805,8 @@ llvm::TinyPtrVector<CustomAttr *> VarDecl::getAttachedPropertyWrappers() const {
 
 /// Whether this property has any attached property wrappers.
 bool VarDecl::hasAttachedPropertyWrapper() const {
-  if (getAttrs().hasAttribute<CustomAttr>()) {
-    if (!getAttachedPropertyWrappers().empty())
-      return true;
-  }
+  if (!getAttachedPropertyWrappers().empty())
+    return true;
 
   if (hasImplicitPropertyWrapper())
     return true;
@@ -7018,6 +7123,15 @@ void VarDecl::emitLetToVarNoteIfSimple(DeclContext *UseDC) const {
      .fixItReplace(PBD->getLoc(), "var");
     return;
   }
+}
+
+clang::PointerAuthQualifier VarDecl::getPointerAuthQualifier() const {
+  if (auto *clangDecl = getClangDecl()) {
+    if (auto *valueDecl = dyn_cast<clang::ValueDecl>(clangDecl)) {
+      return valueDecl->getType().getPointerAuth();
+    }
+  }
+  return clang::PointerAuthQualifier();
 }
 
 ParamDecl::ParamDecl(SourceLoc specifierLoc,
@@ -7996,12 +8110,12 @@ bool AbstractFunctionDecl::isSendable() const {
 }
 
 bool AbstractFunctionDecl::isBackDeployed() const {
-  if (getAttrs().hasAttribute<BackDeployAttr>())
+  if (getAttrs().hasAttribute<BackDeployedAttr>())
     return true;
 
   // Property and subscript accessors inherit the attribute.
   if (auto *AD = dyn_cast<AccessorDecl>(this)) {
-    if (AD->getStorage()->getAttrs().hasAttribute<BackDeployAttr>())
+    if (AD->getStorage()->getAttrs().hasAttribute<BackDeployedAttr>())
       return true;
   }
 
@@ -8017,9 +8131,9 @@ BraceStmt *AbstractFunctionDecl::getBody(bool canSynthesize) const {
   ASTContext &ctx = getASTContext();
 
   // Don't allow getBody() to trigger parsing of an unparsed body containing the
-  // code completion location.
+  // IDE inspection location.
   if (getBodyKind() == BodyKind::Unparsed &&
-      ctx.SourceMgr.rangeContainsCodeCompletionLoc(getBodySourceRange())) {
+      ctx.SourceMgr.rangeContainsIDEInspectionTarget(getBodySourceRange())) {
     return nullptr;
   }
 
@@ -8890,14 +9004,6 @@ bool ConstructorDecl::isObjCZeroParameterWithLongSelector() const {
   return params->get(0)->getInterfaceType()->isVoid();
 }
 
-VarDecl *ConstructorDecl::getLocalTypeWrapperStorageVar() const {
-  auto &ctx = getASTContext();
-  auto *mutableSelf = const_cast<ConstructorDecl *>(this);
-  return evaluateOrDefault(
-      ctx.evaluator, SynthesizeLocalVariableForTypeWrapperStorage{mutableSelf},
-      nullptr);
-}
-
 DestructorDecl::DestructorDecl(SourceLoc DestructorLoc, DeclContext *Parent)
   : AbstractFunctionDecl(DeclKind::Destructor, Parent,
                          DeclBaseName::createDestructor(), DestructorLoc,
@@ -9104,6 +9210,20 @@ Type ConstructorDecl::getInitializerInterfaceType() {
 }
 
 CtorInitializerKind ConstructorDecl::getInitKind() const {
+  const auto *ED =
+      dyn_cast_or_null<ExtensionDecl>(getDeclContext()->getAsDecl());
+  if (ED && !ED->hasBeenBound()) {
+    // When the declaration context is an extension and this is called when the
+    // extended nominal hasn't be bound yet, e.g. dumping pre-typechecked AST,
+    // there is not enough information about extended nominal to use for
+    // computing init kind on InitKindRequest as bindExtensions is done at
+    // typechecking, so in that case just look to parsed attribute in init
+    // declaration.
+    return getAttrs().hasAttribute<ConvenienceAttr>()
+               ? CtorInitializerKind::Convenience
+               : CtorInitializerKind::Designated;
+  }
+
   return evaluateOrDefault(getASTContext().evaluator,
     InitKindRequest{const_cast<ConstructorDecl *>(this)},
     CtorInitializerKind::Designated);
@@ -9245,38 +9365,26 @@ Type TypeBase::getSwiftNewtypeUnderlyingType() {
 }
 
 const VarDecl *ClassDecl::getUnownedExecutorProperty() const {
-  auto &ctx = getASTContext();
+  auto &C = getASTContext();
 
-  auto hasUnownedSerialExecutorType = [&](VarDecl *property) {
-    if (auto type = property->getInterfaceType())
-      if (auto td = type->getAnyNominal())
-        if (td == ctx.getUnownedSerialExecutorDecl())
-          return true;
-    return false;
-  };
+  if (!isAnyActor())
+    return nullptr;
 
-  VarDecl *candidate = nullptr;
-  for (auto member: getMembers()) {
-    // Instance properties called unownedExecutor.
-    if (auto property = dyn_cast<VarDecl>(member)) {
-      if (property->getName() == ctx.Id_unownedExecutor &&
-          !property->isStatic()) {
-        if (!candidate) {
-          candidate = property;
-          continue;
-        }
+  llvm::SmallVector<ValueDecl *, 2> results;
+  this->lookupQualified(getSelfNominalTypeDecl(),
+                        DeclNameRef(C.Id_unownedExecutor),
+                        NL_ProtocolMembers,
+                        results);
 
-        bool oldHasRightType = hasUnownedSerialExecutorType(candidate);
-        if (oldHasRightType == hasUnownedSerialExecutorType(property)) {
-          // just ignore the new property, we should diagnose this eventually
-        } else if (!oldHasRightType) {
-          candidate = property;
-        }
-      }
-    }
+  for (auto candidate: results) {
+    if (isa<ProtocolDecl>(candidate->getDeclContext()))
+      continue;
+
+    if (VarDecl *var = dyn_cast<VarDecl>(candidate))
+      return var;
   }
 
-  return candidate;
+  return nullptr;
 }
 
 bool ClassDecl::isRootDefaultActor() const {
@@ -9629,26 +9737,99 @@ BuiltinTupleDecl::BuiltinTupleDecl(Identifier Name, DeclContext *Parent)
     : NominalTypeDecl(DeclKind::BuiltinTuple, Parent, Name, SourceLoc(),
                       ArrayRef<InheritedEntry>(), nullptr) {}
 
+StringRef swift::getMacroRoleString(MacroRole role) {
+  switch (role) {
+  case MacroRole::Expression:
+    return "expression";
+
+  case MacroRole::Declaration:
+    return "freestanding";
+
+  case MacroRole::Accessor:
+    return "accessor";
+
+  case MacroRole::MemberAttribute:
+    return "memberAttribute";
+
+  case MacroRole::Member:
+    return "member";
+  }
+}
+
+bool swift::macroIntroducedNameRequiresArgument(
+  MacroIntroducedDeclNameKind kind
+) {
+  switch (kind) {
+  case MacroIntroducedDeclNameKind::Named:
+  case MacroIntroducedDeclNameKind::Prefixed:
+  case MacroIntroducedDeclNameKind::Suffixed:
+    return true;
+
+  case MacroIntroducedDeclNameKind::Overloaded:
+  case MacroIntroducedDeclNameKind::Arbitrary:
+    return false;
+  }
+}
+
+StringRef swift::getMacroIntroducedDeclNameString(
+    MacroIntroducedDeclNameKind kind) {
+  switch (kind) {
+  case MacroIntroducedDeclNameKind::Named:
+    return "named";
+
+  case MacroIntroducedDeclNameKind::Overloaded:
+    return "overloaded";
+
+  case MacroIntroducedDeclNameKind::Prefixed:
+    return "prefixed";
+
+  case MacroIntroducedDeclNameKind::Suffixed:
+    return "suffixed";
+
+  case MacroIntroducedDeclNameKind::Arbitrary:
+    return "arbitrary";
+  }
+}
+
+static MacroRoles freestandingMacroRoles =
+  (MacroRoles() |
+   MacroRole::Expression |
+   MacroRole::Declaration);
+static MacroRoles attachedMacroRoles = (MacroRoles() |
+                                        MacroRole::Accessor |
+                                        MacroRole::MemberAttribute |
+                                        MacroRole::Member);
+
+bool swift::isFreestandingMacro(MacroRoles contexts) {
+  return bool(contexts & freestandingMacroRoles);
+}
+
+MacroRoles swift::getFreestandingMacroRoles() {
+  return freestandingMacroRoles;
+}
+
+bool swift::isAttachedMacro(MacroRoles contexts) {
+  return bool(contexts & attachedMacroRoles);
+}
+
+MacroRoles swift::getAttachedMacroRoles() {
+  return attachedMacroRoles;
+}
+
 MacroDecl::MacroDecl(
     SourceLoc macroLoc, DeclName name, SourceLoc nameLoc,
     GenericParamList *genericParams,
     ParameterList *parameterList,
     SourceLoc arrowOrColonLoc,
     TypeRepr *resultType,
-    Identifier externalModuleName,
-    SourceLoc externalModuleNameLoc,
-    Identifier externalMacroTypeName,
-    SourceLoc externalMacroTypeNameLoc,
+    Expr *definition,
     DeclContext *parent
 ) : GenericContext(DeclContextKind::MacroDecl, parent, genericParams),
     ValueDecl(DeclKind::Macro, parent, name, nameLoc),
     macroLoc(macroLoc), parameterList(parameterList),
     arrowOrColonLoc(arrowOrColonLoc),
     resultType(resultType),
-    externalModuleName(externalModuleName),
-    externalModuleNameLoc(externalModuleNameLoc),
-    externalMacroTypeName(externalMacroTypeName),
-    externalMacroTypeNameLoc(externalMacroTypeNameLoc) {
+    definition(definition) {
 
   if (parameterList)
     parameterList->setDeclContextOfParamDecls(this);
@@ -9665,10 +9846,42 @@ Type MacroDecl::getResultInterfaceType() const {
 }
 
 SourceRange MacroDecl::getSourceRange() const {
-  SourceLoc endLoc = externalMacroTypeNameLoc;
+  SourceLoc endLoc = getNameLoc();
+  if (parameterList)
+    endLoc = parameterList->getEndLoc();
+  if (definition)
+    endLoc = definition->getEndLoc();
   if (auto trailing = getTrailingWhereClause())
     endLoc = trailing->getSourceRange().End;
   return SourceRange(macroLoc, endLoc);
+}
+
+MacroRoles MacroDecl::getMacroRoles() const {
+  MacroRoles contexts = None;
+  for (auto attr : getAttrs().getAttributes<MacroRoleAttr>())
+    contexts |= attr->getMacroRole();
+  return contexts;
+}
+
+const MacroRoleAttr *MacroDecl::getMacroRoleAttr(MacroRole role) const {
+  for (auto attr : getAttrs().getAttributes<MacroRoleAttr>())
+    if (attr->getMacroRole() == role)
+      return attr;
+  llvm_unreachable("Macro role not declared for this MacroDecl");
+}
+
+MacroDefinition MacroDecl::getDefinition() const {
+  return evaluateOrDefault(
+      getASTContext().evaluator,
+      MacroDefinitionRequest{const_cast<MacroDecl *>(this)},
+      MacroDefinition::forUndefined());
+}
+
+Optional<BuiltinMacroKind> MacroDecl::getBuiltinKind() const {
+  auto def = getDefinition();
+  if (def.kind != MacroDefinition::Kind::Builtin)
+    return None;
+  return def.getBuiltinKind();
 }
 
 SourceRange MacroExpansionDecl::getSourceRange() const {
@@ -9678,7 +9891,103 @@ SourceRange MacroExpansionDecl::getSourceRange() const {
   else if (RightAngleLoc.isValid())
     endLoc = RightAngleLoc;
   else
-    endLoc = MacroLoc.getEndLoc();
+    endLoc = MacroNameLoc.getEndLoc();
 
   return SourceRange(PoundLoc, endLoc);
+}
+
+unsigned MacroExpansionDecl::getDiscriminator() const {
+  if (getRawDiscriminator() != InvalidDiscriminator)
+    return getRawDiscriminator();
+
+  auto mutableThis = const_cast<MacroExpansionDecl *>(this);
+  auto dc = getDeclContext();
+  ASTContext &ctx = dc->getASTContext();
+  auto discriminatorContext =
+      MacroDiscriminatorContext::getParentOf(mutableThis);
+  mutableThis->setDiscriminator(
+      ctx.getNextMacroDiscriminator(
+          discriminatorContext, getMacroName().getBaseName()));
+
+  assert(getRawDiscriminator() != InvalidDiscriminator);
+  return getRawDiscriminator();
+}
+
+ArrayRef<Decl *> MacroExpansionDecl::getRewritten() const {
+  auto mutableThis = const_cast<MacroExpansionDecl *>(this);
+  return evaluateOrDefault(
+      getASTContext().evaluator,
+      ExpandMacroExpansionDeclRequest{mutableThis}, {});
+}
+
+NominalTypeDecl *
+ValueDecl::getRuntimeDiscoverableAttrTypeDecl(CustomAttr *attr) const {
+  auto &ctx = getASTContext();
+  auto *nominal = evaluateOrDefault(
+      ctx.evaluator, CustomAttrNominalRequest{attr, getDeclContext()}, nullptr);
+  assert(nominal->getAttrs().hasAttribute<RuntimeMetadataAttr>());
+  return nominal;
+}
+
+ArrayRef<CustomAttr *> Decl::getRuntimeDiscoverableAttrs() const {
+  auto *mutableSelf = const_cast<Decl *>(this);
+  return evaluateOrDefault(getASTContext().evaluator,
+                           GetRuntimeDiscoverableAttributes{mutableSelf},
+                           nullptr);
+}
+
+/// Retrieve the parent discriminator context for the given macro.
+MacroDiscriminatorContext MacroDiscriminatorContext::getParentOf(
+    SourceLoc loc, DeclContext *origDC) {
+  if (loc.isInvalid())
+    return origDC;
+
+  ASTContext &ctx = origDC->getASTContext();
+  SourceManager &sourceMgr = ctx.SourceMgr;
+
+  auto bufferID = sourceMgr.findBufferContainingLoc(loc);
+  auto generatedSourceInfo = sourceMgr.getGeneratedSourceInfo(bufferID);
+  if (!generatedSourceInfo)
+    return origDC;
+
+  switch (generatedSourceInfo->kind) {
+  case GeneratedSourceInfo::ExpressionMacroExpansion: {
+    auto expansion =
+        cast<MacroExpansionExpr>(
+                             ASTNode::getFromOpaqueValue(generatedSourceInfo->astNode)
+                             .get<Expr *>());
+    if (!origDC->isChildContextOf(expansion->getDeclContext()))
+      return MacroDiscriminatorContext(expansion);
+    return origDC;
+  }
+
+  case GeneratedSourceInfo::FreestandingDeclMacroExpansion: {
+    auto expansion =
+        cast<MacroExpansionDecl>(
+          ASTNode::getFromOpaqueValue(generatedSourceInfo->astNode)
+            .get<Decl *>());
+    if (!origDC->isChildContextOf(expansion->getDeclContext()))
+      return MacroDiscriminatorContext(expansion);
+    return origDC;
+  }
+
+  case GeneratedSourceInfo::AccessorMacroExpansion:
+  case GeneratedSourceInfo::MemberAttributeMacroExpansion:
+  case GeneratedSourceInfo::MemberMacroExpansion:
+  case GeneratedSourceInfo::PrettyPrinted:
+  case GeneratedSourceInfo::ReplacedFunctionBody:
+    return origDC;
+  }
+}
+
+MacroDiscriminatorContext
+MacroDiscriminatorContext::getParentOf(MacroExpansionExpr *expansion) {
+  return getParentOf(
+      expansion->getLoc(), expansion->getDeclContext());
+}
+
+MacroDiscriminatorContext
+MacroDiscriminatorContext::getParentOf(MacroExpansionDecl *expansion) {
+  return getParentOf(
+      expansion->getLoc(), expansion->getDeclContext());
 }

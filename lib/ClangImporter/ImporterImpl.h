@@ -452,6 +452,7 @@ public:
   const bool BridgingHeaderExplicitlyRequested;
   const bool DisableOverlayModules;
   const bool EnableClangSPI;
+  bool importSymbolicCXXDecls;
 
   bool IsReadingBridgingPCH;
   llvm::SmallVector<clang::serialization::SubmoduleID, 2> PCHImportedSubmodules;
@@ -613,14 +614,6 @@ public:
   /// `.second` corresponds to a setter
   llvm::MapVector<std::pair<NominalTypeDecl *, Type>,
                   std::pair<FuncDecl *, FuncDecl *>> cxxSubscripts;
-
-  /// Keep track of cxx function names, params etc in order to
-  /// allow for de-duping functions that differ strictly on "constness".
-  llvm::DenseMap<const clang::DeclContext *, llvm::DenseMap<llvm::StringRef,
-                 std::pair<
-                     llvm::DenseSet<clang::FunctionDecl *>,
-                     llvm::DenseSet<clang::FunctionDecl *>>>>
-      cxxMethods;
 
   // Keep track of the decls that were already cloned for this specific class.
   llvm::DenseMap<std::pair<ValueDecl *, DeclContext *>, ValueDecl *>
@@ -1652,6 +1645,9 @@ public:
   /// about the directly-parsed headers.
   SwiftLookupTable *findLookupTable(const clang::Module *clangModule);
 
+  /// Find the lookup table that should contain the given Clang declaration.
+  SwiftLookupTable *findLookupTable(const clang::Decl *decl);
+
   /// Visit each of the lookup tables in some deterministic order.
   ///
   /// \param fn Invoke the given visitor for each table. If the
@@ -1931,20 +1927,13 @@ inline Optional<const clang::EnumDecl *> findAnonymousEnumForTypedef(
   return None;
 }
 
-inline bool requiresCPlusPlus(const clang::Module *module) {
-  // The libc++ modulemap doesn't currently declare the requirement.
-  if (module->getTopLevelModuleName() == "std")
-    return true;
-
-  // Modulemaps often declare the requirement for the top-level module only.
-  if (auto parent = module->Parent) {
-    if (requiresCPlusPlus(parent))
-      return true;
-  }
-
-  return llvm::any_of(module->Requirements, [](clang::Module::Requirement req) {
-    return req.first == "cplusplus";
-  });
+inline std::string getPrivateOperatorName(const std::string &OperatorToken) {
+#define OVERLOADED_OPERATOR(Name, Spelling, Token, Unary, Binary, MemberOnly)  \
+  if (OperatorToken == Spelling) {                                             \
+    return "__operator" #Name;                                                 \
+  };
+#include "clang/Basic/OperatorKinds.def"
+  return "None";
 }
 
 }

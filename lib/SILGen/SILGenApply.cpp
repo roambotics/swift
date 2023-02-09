@@ -259,6 +259,31 @@ static void convertOwnershipConventionsGivenParamInfos(
                   });
 }
 
+static bool shouldApplyBackDeploymentThunk(ValueDecl *decl, ASTContext &ctx,
+                                           ResilienceExpansion expansion) {
+  auto backDeployBeforeVersion = decl->getBackDeployedBeforeOSVersion(ctx);
+  if (!backDeployBeforeVersion)
+    return false;
+
+  // If the context of the application is inlinable then we must always call the
+  // back deployment thunk since we can't predict the deployment targets of
+  // other modules.
+  if (expansion != ResilienceExpansion::Maximal)
+    return true;
+
+  // In resilient function bodies skip calling the back deployment thunk when
+  // the deployment target is high enough that the ABI implementation of the
+  // back deployed function is guaranteed to be available.
+  auto deploymentAvailability = AvailabilityContext::forDeploymentTarget(ctx);
+  auto declAvailability =
+      AvailabilityContext(VersionRange::allGTE(*backDeployBeforeVersion));
+
+  if (deploymentAvailability.isContainedIn(declAvailability))
+    return false;
+
+  return true;
+}
+
 //===----------------------------------------------------------------------===//
 //                                   Callee
 //===----------------------------------------------------------------------===//
@@ -1104,6 +1129,28 @@ public:
     }
   }
 
+  SILDeclRef getDeclRefForStaticDispatchApply(DeclRefExpr *e) {
+    auto *afd = cast<AbstractFunctionDecl>(e->getDecl());
+    auto &ctx = SGF.getASTContext();
+
+    // A call to a `distributed` function may need to go through a thunk.
+    if (callSite && callSite->shouldApplyDistributedThunk()) {
+      if (auto distributedThunk = afd->getDistributedThunk())
+        return SILDeclRef(distributedThunk).asDistributed();
+    }
+
+    // A call to `@backDeployed` function may need to go through a thunk.
+    if (shouldApplyBackDeploymentThunk(afd, ctx,
+                                       SGF.F.getResilienceExpansion())) {
+      return SILDeclRef(afd).asBackDeploymentKind(
+          SILDeclRef::BackDeploymentKind::Thunk);
+    }
+
+    return SILDeclRef(afd).asForeign(
+        !isConstructorWithGeneratedAllocatorThunk(afd) &&
+        requiresForeignEntryPoint(afd));
+  }
+
   //
   // Known callees.
   //
@@ -1144,25 +1191,7 @@ public:
     }
 
     // Otherwise, we have a statically-dispatched call.
-    SILDeclRef constant = SILDeclRef(e->getDecl());
-
-    /// Some special handling may be necessary for thunks:
-    if (callSite && callSite->shouldApplyDistributedThunk()) {
-      if (auto distributedThunk = cast<AbstractFunctionDecl>(e->getDecl())->getDistributedThunk()) {
-        constant = SILDeclRef(distributedThunk).asDistributed();
-      }
-    } else if (afd->isBackDeployed()) {
-      // If we're calling a back deployed function then we need to call a
-      // thunk instead that will handle the fallback when the original
-      // function is unavailable at runtime.
-      constant =
-          constant.asBackDeploymentKind(SILDeclRef::BackDeploymentKind::Thunk);
-    } else {
-      constant = constant.asForeign(
-                   !isConstructorWithGeneratedAllocatorThunk(e->getDecl())
-                   && requiresForeignEntryPoint(e->getDecl()));
-    }
-
+    SILDeclRef constant = getDeclRefForStaticDispatchApply(e);
     auto captureInfo = SGF.SGM.Types.getLoweredLocalCaptures(constant);
     SGF.SGM.Types.setCaptureTypeExpansionContext(constant, SGF.SGM.M);
     
@@ -2968,6 +2997,41 @@ Expr *ArgumentSource::findStorageReferenceExprForMoveOnlyBorrow(
   return lvExpr;
 }
 
+Expr *
+ArgumentSource::findStorageReferenceExprForBorrowExpr(SILGenFunction &SGF) && {
+  if (!isExpr())
+    return nullptr;
+
+  // We support two patterns:
+  //
+  // (load_expr (borrow_expr))
+  //   *or*
+  // (paren_expr (load_expr (borrow_expr)))
+  //
+  // The first happens if a borrow is used on a non-self argument. The second
+  // happens if we pass self as a borrow.
+  auto *argExpr = asKnownExpr();
+
+  if (auto *parenExpr = dyn_cast<ParenExpr>(argExpr))
+    argExpr = parenExpr->getSubExpr();
+
+  auto *li = dyn_cast<LoadExpr>(argExpr);
+  if (!li)
+    return nullptr;
+  auto *borrowExpr = dyn_cast<BorrowExpr>(li->getSubExpr());
+  if (!borrowExpr)
+    return nullptr;
+
+  auto *lvExpr = ::findStorageReferenceExprForBorrow(borrowExpr->getSubExpr());
+
+  // Claim the value of this argument.
+  if (lvExpr) {
+    (void)std::move(*this).asKnownExpr();
+  }
+
+  return lvExpr;
+}
+
 Expr *ArgumentSource::findStorageReferenceExprForBorrow() && {
   if (!isExpr()) return nullptr;
 
@@ -3097,18 +3161,23 @@ private:
       return;
     }
 
-    // If this is a yield, and the yield is borrowed, emit a borrowed r-value.
-    if (IsYield && param.isGuaranteed()) {
-      if (tryEmitBorrowed(std::move(arg), loweredSubstArgType,
-                          loweredSubstParamType, origParamType, paramSlice))
-        return;
-    }
-
-    // If we have a guaranteed paramter, see if we have a move only type and can
-    // emit it borrow.
-    //
-    // We check for move only in tryEmitBorrowedMoveOnly.
+    // If we have a guaranteed +0 parameter...
     if (param.isGuaranteed()) {
+      // And this is a yield, emit a borrowed r-value.
+      if (IsYield) {
+        if (tryEmitBorrowed(std::move(arg), loweredSubstArgType,
+                            loweredSubstParamType, origParamType, paramSlice))
+          return;
+      }
+
+      if (tryEmitBorrowExpr(std::move(arg), loweredSubstArgType,
+                            loweredSubstParamType, origParamType, paramSlice))
+        return;
+
+      // If we have a guaranteed paramter, see if we have a move only type and
+      // can emit it borrow.
+      //
+      // We check for move only in tryEmitBorrowedMoveOnly.
       if (tryEmitBorrowedMoveOnly(std::move(arg), loweredSubstArgType,
                                   loweredSubstParamType, origParamType,
                                   paramSlice))
@@ -3293,6 +3362,23 @@ private:
 
     // Try to find an expression we can emit as a borrowed l-value.
     auto lvExpr = std::move(arg).findStorageReferenceExprForMoveOnlyBorrow(SGF);
+    if (!lvExpr)
+      return false;
+
+    emitBorrowed(lvExpr, loweredSubstArgType, loweredSubstParamType,
+                 origParamType, paramsSlice);
+
+    return true;
+  }
+
+  bool tryEmitBorrowExpr(ArgumentSource &&arg, SILType loweredSubstArgType,
+                         SILType loweredSubstParamType,
+                         AbstractionPattern origParamType,
+                         ClaimedParamsRef paramsSlice) {
+    assert(paramsSlice.size() == 1);
+
+    // Try to find an expression we can emit as a borrowed l-value.
+    auto lvExpr = std::move(arg).findStorageReferenceExprForBorrowExpr(SGF);
     if (!lvExpr)
       return false;
 
@@ -4686,9 +4772,11 @@ RValue SILGenFunction::emitApply(
 
     case ParameterConvention::Indirect_In_Guaranteed:
     case ParameterConvention::Indirect_In:
-    case ParameterConvention::Indirect_In_Constant:
     case ParameterConvention::Indirect_Inout:
     case ParameterConvention::Indirect_InoutAliasable:
+    case ParameterConvention::Pack_Guaranteed:
+    case ParameterConvention::Pack_Owned:
+    case ParameterConvention::Pack_Inout:
       // We may need to support this at some point, but currently only imported
       // objc methods are returns_inner_pointer.
       llvm_unreachable("indirect self argument to method that"
@@ -4828,6 +4916,9 @@ RValue SILGenFunction::emitApply(
     case ResultConvention::Indirect:
       assert(!substFnConv.isSILIndirect(resultInfo) &&
              "indirect direct result?");
+      break;
+
+    case ResultConvention::Pack:
       break;
 
     case ResultConvention::Owned:
@@ -5646,6 +5737,11 @@ bool AccessorBaseArgPreparer::shouldLoadBaseAddress() const {
   case ParameterConvention::Indirect_InoutAliasable:
     return false;
 
+  case ParameterConvention::Pack_Guaranteed:
+  case ParameterConvention::Pack_Owned:
+  case ParameterConvention::Pack_Inout:
+    llvm_unreachable("self parameter was a pack?");
+
   // If the accessor wants the value 'in', we have to copy if the
   // base isn't a temporary.  We aren't allowed to pass aliased
   // memory to 'in', and we have pass at +1.
@@ -5663,10 +5759,6 @@ bool AccessorBaseArgPreparer::shouldLoadBaseAddress() const {
   case ParameterConvention::Direct_Unowned:
   case ParameterConvention::Direct_Guaranteed:
     return true;
-
-  // Should not show up here.
-  case ParameterConvention::Indirect_In_Constant:
-    break;
   }
   llvm_unreachable("bad convention");
 }
@@ -5891,9 +5983,11 @@ SILGenFunction::prepareSubscriptIndices(SubscriptDecl *subscript,
   return result;
 }
 
-SILDeclRef SILGenModule::getAccessorDeclRef(AccessorDecl *accessor) {
+SILDeclRef SILGenModule::getAccessorDeclRef(AccessorDecl *accessor,
+                                            ResilienceExpansion expansion) {
   auto declRef = SILDeclRef(accessor, SILDeclRef::Kind::Func);
-  if (accessor->isBackDeployed())
+
+  if (shouldApplyBackDeploymentThunk(accessor, getASTContext(), expansion))
     return declRef.asBackDeploymentKind(SILDeclRef::BackDeploymentKind::Thunk);
 
   return declRef.asForeign(requiresForeignEntryPoint(accessor));

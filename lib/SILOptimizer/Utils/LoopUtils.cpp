@@ -33,7 +33,7 @@ static SILBasicBlock *createInitialPreheader(SILBasicBlock *Header) {
   llvm::SmallVector<SILValue, 8> Args;
   for (auto *HeaderArg : Header->getArguments()) {
     Args.push_back(Preheader->createPhiArgument(HeaderArg->getType(),
-                                                OwnershipKind::Owned));
+                                                HeaderArg->getOwnershipKind()));
   }
 
   // Create the branch to the header.
@@ -63,8 +63,7 @@ static SILBasicBlock *insertPreheader(SILLoop *L, DominanceInfo *DT,
   // Then change all of the original predecessors to target Preheader instead of
   // header.
   for (auto *Pred : Preds) {
-    replaceBranchTarget(Pred->getTerminator(), Header, Preheader,
-                        true /*PreserveArgs*/);
+    Pred->getTerminator()->replaceBranchTarget(Header, Preheader);
   }
 
   // Update dominance info.

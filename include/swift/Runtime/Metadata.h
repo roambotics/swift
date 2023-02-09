@@ -18,7 +18,7 @@
 #define SWIFT_RUNTIME_METADATA_H
 
 #include "swift/ABI/Metadata.h"
-#include "swift/Reflection/Records.h"
+#include "swift/RemoteInspection/Records.h"
 #include "swift/Runtime/Once.h"
 #include "swift/shims/Visibility.h"
 
@@ -313,7 +313,7 @@ swift_getGenericMetadata(MetadataRequest request,
 ///   - installing new v-table entries and overrides; and
 ///   - registering the class with the runtime under ObjC interop.
 /// Most of this work can be achieved by calling swift_initClassMetadata.
-SWIFT_RETURNS_NONNULL SWIFT_NODISCARD SWIFT_RUNTIME_EXPORT
+SWIFT_EXTERN_C SWIFT_RETURNS_NONNULL SWIFT_NODISCARD SWIFT_RUNTIME_EXPORT_ATTRIBUTE
 ClassMetadata *
 swift_allocateGenericClassMetadata(const ClassDescriptor *description,
                                    const void *arguments,
@@ -322,7 +322,7 @@ swift_allocateGenericClassMetadata(const ClassDescriptor *description,
 /// Allocate a generic value metadata object.  This is intended to be
 /// called by the metadata instantiation function of a generic struct or
 /// enum.
-SWIFT_RETURNS_NONNULL SWIFT_NODISCARD SWIFT_RUNTIME_EXPORT
+SWIFT_EXTERN_C SWIFT_RETURNS_NONNULL SWIFT_NODISCARD SWIFT_RUNTIME_EXPORT_ATTRIBUTE
 ValueMetadata *
 swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description,
                                    const void *arguments,
@@ -354,6 +354,14 @@ swift_getWitnessTable(const ProtocolConformanceDescriptor *conformance,
                       const Metadata *type,
                       const void * const *instantiationArgs);
 
+#if SWIFT_STDLIB_USE_RELATIVE_PROTOCOL_WITNESS_TABLES
+SWIFT_RUNTIME_EXPORT
+const RelativeWitnessTable *
+swift_getWitnessTableRelative(const ProtocolConformanceDescriptor *conformance,
+                      const Metadata *type,
+                      const void * const *instantiationArgs);
+#endif
+
 /// Retrieve an associated type witness from the given witness table.
 ///
 /// \param wtable The witness table.
@@ -369,7 +377,15 @@ MetadataResponse swift_getAssociatedTypeWitness(
                                           const Metadata *conformingType,
                                           const ProtocolRequirement *reqBase,
                                           const ProtocolRequirement *assocType);
-
+#if SWIFT_STDLIB_USE_RELATIVE_PROTOCOL_WITNESS_TABLES
+SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
+MetadataResponse swift_getAssociatedTypeWitnessRelative(
+                                          MetadataRequest request,
+                                          RelativeWitnessTable *wtable,
+                                          const Metadata *conformingType,
+                                          const ProtocolRequirement *reqBase,
+                                          const ProtocolRequirement *assocType);
+#endif
 /// Retrieve an associated conformance witness table from the given witness
 /// table.
 ///
@@ -387,6 +403,16 @@ const WitnessTable *swift_getAssociatedConformanceWitness(
                                   const Metadata *assocType,
                                   const ProtocolRequirement *reqBase,
                                   const ProtocolRequirement *assocConformance);
+
+#if SWIFT_STDLIB_USE_RELATIVE_PROTOCOL_WITNESS_TABLES
+SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
+const RelativeWitnessTable *swift_getAssociatedConformanceWitnessRelative(
+                                  RelativeWitnessTable *wtable,
+                                  const Metadata *conformingType,
+                                  const Metadata *assocType,
+                                  const ProtocolRequirement *reqBase,
+                                  const ProtocolRequirement *assocConformance);
+#endif
 
 /// Determine whether two protocol conformance descriptors describe the same
 /// conformance of a type to a protocol.
@@ -852,6 +878,11 @@ const Metadata *_swift_class_getSuperclass(const Metadata *theClass);
 SWIFT_CC(swift)
 SWIFT_RUNTIME_STDLIB_INTERNAL MetadataResponse
 getSuperclassMetadata(MetadataRequest request, const ClassMetadata *self);
+
+SWIFT_CC(swift)
+SWIFT_RUNTIME_STDLIB_SPI
+bool _swift_class_isSubclass(const Metadata *subclass,
+                             const Metadata *superclass);
 
 #if !NDEBUG
 /// Verify that the given metadata pointer correctly roundtrips its

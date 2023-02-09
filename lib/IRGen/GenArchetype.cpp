@@ -60,6 +60,8 @@ MetadataResponse
 irgen::emitArchetypeTypeMetadataRef(IRGenFunction &IGF,
                                     CanArchetypeType archetype,
                                     DynamicMetadataRequest request) {
+  assert(!isa<PackArchetypeType>(archetype));
+
   // Check for an existing cache entry.
   if (auto response = IGF.tryGetLocalTypeMetadata(archetype, request))
     return response;
@@ -258,6 +260,7 @@ llvm::Value *irgen::emitArchetypeWitnessTableRef(IRGenFunction &IGF,
                                        /*request*/ MetadataState::Complete,
                                        nullptr).getMetadata();
 
+  IGF.setScopedLocalTypeData(archetype, localDataKind, wtable);
   return wtable;
 }
 
@@ -435,14 +438,15 @@ withOpaqueTypeGenericArgs(IRGenFunction &IGF,
     enumerateGenericSignatureRequirements(
         opaqueDecl->getGenericSignature().getCanonicalSignature(),
         [&](GenericRequirement reqt) {
-          auto ty = reqt.TypeParameter.subst(archetype->getSubstitutions())
+          auto ty = reqt.getTypeParameter().subst(archetype->getSubstitutions())
                         ->getReducedType(opaqueDecl->getGenericSignature());
-          if (reqt.Protocol) {
+          if (reqt.isWitnessTable()) {
             auto ref =
-                ProtocolConformanceRef(reqt.Protocol)
-                    .subst(reqt.TypeParameter, archetype->getSubstitutions());
+                ProtocolConformanceRef(reqt.getProtocol())
+                    .subst(reqt.getTypeParameter(), archetype->getSubstitutions());
             args.push_back(emitWitnessTableRef(IGF, ty, ref));
           } else {
+            assert(reqt.isMetadata());
             args.push_back(IGF.emitAbstractTypeMetadataRef(ty));
           }
           types.push_back(args.back()->getType());

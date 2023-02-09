@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 #include "swift/Sema/CSBindings.h"
 #include "TypeChecker.h"
+#include "swift/AST/GenericEnvironment.h"
 #include "swift/Sema/ConstraintGraph.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/SetVector.h"
@@ -1404,11 +1405,50 @@ void PotentialBindings::infer(Constraint *constraint) {
   case ConstraintKind::SyntacticElement:
   case ConstraintKind::Conjunction:
   case ConstraintKind::BindTupleOfFunctionParams:
-  case ConstraintKind::PackElementOf:
   case ConstraintKind::ShapeOf:
   case ConstraintKind::ExplicitGenericArguments:
     // Constraints from which we can't do anything.
     break;
+
+  case ConstraintKind::PackElementOf: {
+    auto elementType = CS.simplifyType(constraint->getFirstType());
+    auto packType = CS.simplifyType(constraint->getSecondType());
+
+    if (elementType->isTypeVariableOrMember() && packType->isTypeVariableOrMember())
+      break;
+
+    auto *elementVar = elementType->getAs<TypeVariableType>();
+    auto *packVar = packType->getAs<TypeVariableType>();
+
+    if (elementVar == TypeVar && !packVar) {
+      // Produce a potential binding to the opened element archetype corresponding
+      // to the pack type.
+      auto shapeClass = packType->getReducedShape();
+      packType = packType->mapTypeOutOfContext();
+      auto *elementEnv = CS.getPackElementEnvironment(constraint->getLocator(),
+                                                      shapeClass);
+      auto elementType = elementEnv->mapPackTypeIntoElementContext(packType);
+      addPotentialBinding({elementType, AllowedBindingKind::Exact, constraint});
+
+      break;
+    } else if (packVar == TypeVar && !elementVar) {
+      // Produce a potential binding to the pack archetype corresponding to
+      // the opened element type.
+      Type patternType;
+      auto *packEnv = CS.DC->getGenericEnvironmentOfContext();
+      if (!elementType->hasElementArchetype()) {
+        patternType = elementType;
+      } else {
+        patternType = packEnv->mapElementTypeIntoPackContext(elementType);
+      }
+
+      addPotentialBinding({patternType, AllowedBindingKind::Exact, constraint});
+
+      break;
+    }
+
+    break;
+  }
 
   // For now let's avoid inferring protocol requirements from
   // this constraint, but in the future we could do that to
@@ -2107,6 +2147,14 @@ TypeVariableBinding::fixForHole(ConstraintSystem &cs) const {
   }
 
   if (srcLocator->isLastElement<LocatorPathElt::PlaceholderType>()) {
+    // When a 'nil' has a placeholder as contextual type there is not enough
+    // information to resolve it, so let's record a specify contextual type for
+    // nil fix.
+    if (isExpr<NilLiteralExpr>(srcLocator->getAnchor())) {
+      ConstraintFix *fix = SpecifyContextualTypeForNil::create(cs, dstLocator);
+      return std::make_pair(fix, /*impact=*/(unsigned)10);
+    }
+
     ConstraintFix *fix = SpecifyTypeForPlaceholder::create(cs, srcLocator);
     return std::make_pair(fix, defaultImpact);
   }

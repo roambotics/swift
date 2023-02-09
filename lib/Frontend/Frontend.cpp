@@ -274,6 +274,11 @@ bool CompilerInstance::setUpASTContextIfNeeded() {
 
   registerIRGenSILTransforms(*Context);
 
+  if (Invocation.getFrontendOptions().RequestedAction ==
+        FrontendOptions::ActionType::MergeModules ||
+      Invocation.getLangOptions().DebuggerSupport)
+    Invocation.getLangOptions().EnableDeserializationSafety = false;
+
   if (setUpModuleLoaders())
     return true;
 
@@ -381,6 +386,11 @@ void CompilerInstance::setupDependencyTrackerIfNeeded() {
     return;
 
   DepTracker = std::make_unique<DependencyTracker>(*collectionMode);
+
+  // Collect compiler plugin dependencies.
+  auto &searchPathOpts = Invocation.getSearchPathOptions();
+  for (auto &path : searchPathOpts.getCompilerPluginLibraryPaths())
+    DepTracker->addDependency(path, /*isSystem=*/false);
 }
 
 bool CompilerInstance::setup(const CompilerInvocation &Invoke,
@@ -549,6 +559,22 @@ bool CompilerInstance::setUpModuleLoaders() {
     Context->addModuleLoader(std::move(MemoryBufferLoader));
   }
 
+  // If using `-explicit-swift-module-map-file`, create the explicit loader
+  // before creating `ClangImporter` because the entries in the map influence
+  // the Clang flags. The loader is added to the context below.
+  std::unique_ptr<ExplicitSwiftModuleLoader> ESML = nullptr;
+  bool ExplicitModuleBuild =
+      Invocation.getFrontendOptions().DisableImplicitModules;
+  if (ExplicitModuleBuild ||
+      !Invocation.getSearchPathOptions().ExplicitSwiftModuleMap.empty() ||
+      !Invocation.getSearchPathOptions().ExplicitSwiftModuleInputs.empty()) {
+    ESML = ExplicitSwiftModuleLoader::create(
+        *Context, getDependencyTracker(), MLM,
+        Invocation.getSearchPathOptions().ExplicitSwiftModuleMap,
+        Invocation.getSearchPathOptions().ExplicitSwiftModuleInputs,
+        IgnoreSourceInfoFile);
+  }
+
   // Wire up the Clang importer. If the user has specified an SDK, use it.
   // Otherwise, we just keep it around as our interface to Clang's ABI
   // knowledge.
@@ -570,15 +596,9 @@ bool CompilerInstance::setUpModuleLoaders() {
           *Context, ModuleCachePath, FEOpts.PrebuiltModuleCachePath,
           FEOpts.BackupModuleInterfaceDir, LoaderOpts,
           RequireOSSAModules_t(Invocation.getSILOptions())));
-  // If implicit modules are disabled, we need to install an explicit module
-  // loader.
-  bool ExplicitModuleBuild = Invocation.getFrontendOptions().DisableImplicitModules;
-  if (ExplicitModuleBuild || !Invocation.getSearchPathOptions().ExplicitSwiftModuleMap.empty()) {
-    auto ESML = ExplicitSwiftModuleLoader::create(
-        *Context,
-        getDependencyTracker(), MLM,
-        Invocation.getSearchPathOptions().ExplicitSwiftModuleMap,
-        IgnoreSourceInfoFile);
+
+  // Install an explicit module loader if it was created earlier.
+  if (ESML) {
     this->DefaultSerializedLoader = ESML.get();
     Context->addModuleLoader(std::move(ESML));
   }
@@ -631,30 +651,31 @@ bool CompilerInstance::setUpModuleLoaders() {
   return false;
 }
 
-Optional<unsigned> CompilerInstance::setUpCodeCompletionBuffer() {
-  Optional<unsigned> codeCompletionBufferID;
-  auto codeCompletePoint = Invocation.getCodeCompletionPoint();
-  if (codeCompletePoint.first) {
-    auto memBuf = codeCompletePoint.first;
+Optional<unsigned> CompilerInstance::setUpIDEInspectionTargetBuffer() {
+  Optional<unsigned> ideInspectionTargetBufferID;
+  auto ideInspectionTarget = Invocation.getIDEInspectionTarget();
+  if (ideInspectionTarget.first) {
+    auto memBuf = ideInspectionTarget.first;
     // CompilerInvocation doesn't own the buffers, copy to a new buffer.
-    codeCompletionBufferID = SourceMgr.addMemBufferCopy(memBuf);
-    InputSourceCodeBufferIDs.push_back(*codeCompletionBufferID);
-    SourceMgr.setCodeCompletionPoint(*codeCompletionBufferID,
-                                     codeCompletePoint.second);
+    ideInspectionTargetBufferID = SourceMgr.addMemBufferCopy(memBuf);
+    InputSourceCodeBufferIDs.push_back(*ideInspectionTargetBufferID);
+    SourceMgr.setIDEInspectionTarget(*ideInspectionTargetBufferID,
+                                    ideInspectionTarget.second);
   }
-  return codeCompletionBufferID;
+  return ideInspectionTargetBufferID;
 }
 
-SourceFile *CompilerInstance::getCodeCompletionFile() const {
+SourceFile *CompilerInstance::getIDEInspectionFile() const {
   auto *mod = getMainModule();
   auto &eval = mod->getASTContext().evaluator;
-  return evaluateOrDefault(eval, CodeCompletionFileRequest{mod}, nullptr);
+  return evaluateOrDefault(eval, IDEInspectionFileRequest{mod}, nullptr);
 }
 
 bool CompilerInstance::setUpInputs() {
   // Adds to InputSourceCodeBufferIDs, so may need to happen before the
   // per-input setup.
-  const Optional<unsigned> codeCompletionBufferID = setUpCodeCompletionBuffer();
+  const Optional<unsigned> ideInspectionTargetBufferID =
+      setUpIDEInspectionTargetBuffer();
 
   const auto &Inputs =
       Invocation.getFrontendOptions().InputsAndOutputs.getAllInputs();
@@ -676,11 +697,11 @@ bool CompilerInstance::setUpInputs() {
   if (hasFailed)
     return true;
 
-  // Set the primary file to the code-completion point if one exists.
-  if (codeCompletionBufferID.has_value() &&
-      !isPrimaryInput(*codeCompletionBufferID)) {
+  // Set the primary file to the IDE inspection point if one exists.
+  if (ideInspectionTargetBufferID.has_value() &&
+      !isPrimaryInput(*ideInspectionTargetBufferID)) {
     assert(PrimaryBufferIDs.empty() && "re-setting PrimaryBufferID");
-    recordPrimaryInputBuffer(*codeCompletionBufferID);
+    recordPrimaryInputBuffer(*ideInspectionTargetBufferID);
   }
 
   return false;
@@ -869,6 +890,13 @@ bool CompilerInstance::canImportSwiftConcurrency() const {
   return getASTContext().canImportModule(modulePath);
 }
 
+bool CompilerInstance::canImportSwiftConcurrencyShims() const {
+  ImportPath::Module::Builder builder(
+      getASTContext().getIdentifier(SWIFT_CONCURRENCY_SHIMS_NAME));
+  auto modulePath = builder.get();
+  return getASTContext().canImportModule(modulePath);
+}
+
 void CompilerInstance::verifyImplicitStringProcessingImport() {
   if (Invocation.shouldImportSwiftStringProcessing() &&
       !canImportSwiftStringProcessing()) {
@@ -929,6 +957,8 @@ ImplicitImportInfo CompilerInstance::getImplicitImportInfo() const {
     case ImplicitStdlibKind::Stdlib:
       if (canImportSwiftConcurrency())
         pushImport(SWIFT_CONCURRENCY_NAME);
+      if (canImportSwiftConcurrencyShims())
+        pushImport(SWIFT_CONCURRENCY_SHIMS_NAME);
       break;
     }
   }
@@ -1057,6 +1087,14 @@ ModuleDecl *CompilerInstance::getMainModule() const {
     if (!Invocation.getFrontendOptions().ModuleABIName.empty()) {
       MainModule->setABIName(getASTContext().getIdentifier(
           Invocation.getFrontendOptions().ModuleABIName));
+    }
+    if (!Invocation.getFrontendOptions().PackageName.empty()) {
+      MainModule->setPackageName(getASTContext().getIdentifier(
+          Invocation.getFrontendOptions().PackageName));
+    }
+    if (!Invocation.getFrontendOptions().ExportAsName.empty()) {
+      MainModule->setExportAsName(getASTContext().getIdentifier(
+          Invocation.getFrontendOptions().ExportAsName));
     }
     if (Invocation.getFrontendOptions().EnableLibraryEvolution)
       MainModule->setResilienceStrategy(ResilienceStrategy::Resilient);

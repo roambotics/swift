@@ -185,6 +185,10 @@ def disable_typo_correction : Flag<["-"], "disable-typo-correction">,
 def disable_implicit_swift_modules: Flag<["-"], "disable-implicit-swift-modules">,
   HelpText<"Disable building Swift modules implicitly by the compiler">;
 
+def swift_module_file: Joined<["-"], "swift-module-file=">,
+  MetaVarName<"<name>=<path>">,
+  HelpText<"Specify Swift module input explicitly built from textual interface">;
+
 def explicit_swift_module_map
   : Separate<["-"], "explicit-swift-module-map-file">, MetaVarName<"<path>">,
     HelpText<"Specify a JSON file containing information of explicit Swift modules">;
@@ -342,6 +346,8 @@ def debug_requirement_machine : Joined<["-"], "debug-requirement-machine=">,
 
 def dump_macro_expansions : Flag<["-"], "dump-macro-expansions">,
   HelpText<"Dumps the results of each macro expansion">;
+def emit_macro_expansion_files : Separate<["-"], "emit-macro-expansion-files">,
+  HelpText<"Specify when to emit macro expansion file: 'none', 'debug', or 'diagnostics'">;
 
 def analyze_requirement_machine : Flag<["-"], "analyze-requirement-machine">,
   Flags<[FrontendOption, HelpHidden, DoesNotAffectIncrementalBuild]>,
@@ -563,6 +569,13 @@ def enable_deserialization_recovery :
 def disable_deserialization_recovery :
   Flag<["-"], "disable-deserialization-recovery">,
   HelpText<"Don't attempt to recover from missing xrefs (etc) in swiftmodules">;
+
+def enable_deserialization_safety :
+  Flag<["-"], "enable-deserialization-safety">,
+  HelpText<"Avoid reading potentially unsafe decls in swiftmodules">;
+def disable_deserialization_safety :
+  Flag<["-"], "disable-deserialization-safety">,
+  HelpText<"Don't avoid reading potentially unsafe decls in swiftmodules">;
 
 def enable_experimental_string_processing :
   Flag<["-"], "enable-experimental-string-processing">,
@@ -1105,12 +1118,26 @@ def enable_move_inout_stack_protector :
   Flag<["-"], "enable-move-inout-stack-protector">,
   HelpText<"Enable the stack protector by moving values to temporaries">;
 
+def enable_import_ptrauth_field_function_pointers :
+  Flag<["-"], "enable-import-ptrauth-field-function-pointers">,
+  HelpText<"Enable import of custom ptrauth qualified field function pointers">;
+def disable_import_ptrauth_field_function_pointers :
+  Flag<["-"], "disable-import-ptrauth-field-function-pointers">,
+  HelpText<"Disable import of custom ptrauth qualified field function pointers">;
+
 def enable_collocate_metadata_functions :
   Flag<["-"], "enable-collocate-metadata-functions">,
   HelpText<"Enable collocate metadata functions">;
 def disable_collocate_metadata_functions :
   Flag<["-"], "disable-collocate-metadata-functions">,
   HelpText<"Disable collocate metadata functions">;
+
+def enable_relative_protocol_witness_tables :
+  Flag<["-"], "enable-relative-protocol-witness-tables">,
+  HelpText<"Enable relative protocol witness tables">;
+def disable_relative_protocol_witness_tables :
+  Flag<["-"], "disable-relative-protocol-witness-tables">,
+  HelpText<"Disable relative protocol witness tables">;
 
 def enable_new_llvm_pass_manager :
   Flag<["-"], "enable-new-llvm-pass-manager">,

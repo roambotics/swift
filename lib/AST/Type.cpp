@@ -165,9 +165,17 @@ bool TypeBase::isAny() {
   return constraint->isEqual(getASTContext().TheAnyType);
 }
 
-bool TypeBase::isPureMoveOnly() const {
-  if (auto *nom = getCanonicalType()->getNominalOrBoundGenericNominal())
+bool TypeBase::isPureMoveOnly() {
+  if (auto *nom = getNominalOrBoundGenericNominal())
     return nom->isMoveOnly();
+
+  // if any components of the tuple are move-only, then the tuple is move-only.
+  if (auto *tupl = getCanonicalType()->getAs<TupleType>()) {
+    for (auto eltTy : tupl->getElementTypes())
+      if (eltTy->isPureMoveOnly())
+        return true;
+  }
+
   return false;
 }
 
@@ -242,6 +250,7 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::BuiltinJob:
   case TypeKind::BuiltinExecutor:
   case TypeKind::BuiltinDefaultActorStorage:
+  case TypeKind::BuiltinPackIndex:
   case TypeKind::BuiltinUnsafeValueBuffer:
   case TypeKind::BuiltinVector:
   case TypeKind::Tuple:
@@ -259,6 +268,7 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::SILToken:
   case TypeKind::Pack:
   case TypeKind::PackExpansion:
+  case TypeKind::SILPack:
 #define REF_STORAGE(Name, ...) \
   case TypeKind::Name##Storage:
 #include "swift/AST/ReferenceStorage.def"
@@ -655,13 +665,8 @@ static bool isLegalSILType(CanType type) {
     return true;
   }
 
-  // Packs are legal if all their elements are legal.
-  if (auto packType = dyn_cast<PackType>(type)) {
-    for (auto eltType : packType.getElementTypes()) {
-      if (!isLegalSILType(eltType)) return false;
-    }
-    return true;
-  }
+  // Packs must be lowered.
+  if (isa<PackType>(type)) return false;
 
   // Pack expansions are legal if all their pattern and count types are legal.
   if (auto packExpansionType = dyn_cast<PackExpansionType>(type)) {
@@ -691,6 +696,9 @@ static bool isLegalFormalType(CanType type) {
 
   // Function types must not be lowered.
   if (isa<SILFunctionType>(type)) return false;
+
+  // Pack types must not be lowered.
+  if (isa<SILPackType>(type)) return false;
 
   // Reference storage types are not formal types.
   if (isa<ReferenceStorageType>(type)) return false;
@@ -3964,11 +3972,12 @@ OpenedArchetypeType::OpenedArchetypeType(
     GenericEnvironment *environment, Type interfaceType,
     ArrayRef<ProtocolDecl *> conformsTo, Type superclass,
     LayoutConstraint layout)
-  : ArchetypeType(TypeKind::OpenedArchetype, interfaceType->getASTContext(),
-                  RecursiveTypeProperties::HasArchetype
-                    | RecursiveTypeProperties::HasOpenedExistential,
-                  interfaceType, conformsTo, superclass, layout,
-                  environment)
+  : LocalArchetypeType(TypeKind::OpenedArchetype,
+                       interfaceType->getASTContext(),
+                       RecursiveTypeProperties::HasArchetype
+                         | RecursiveTypeProperties::HasOpenedExistential,
+                       interfaceType, conformsTo, superclass, layout,
+                       environment)
 {
   assert(!interfaceType->isParameterPack());
 }
@@ -4022,9 +4031,11 @@ ElementArchetypeType::ElementArchetypeType(
     const ASTContext &Ctx, GenericEnvironment *GenericEnv, Type InterfaceType,
     ArrayRef<ProtocolDecl *> ConformsTo, Type Superclass,
     LayoutConstraint Layout)
-    : ArchetypeType(TypeKind::ElementArchetype, Ctx,
-                    RecursiveTypeProperties::HasArchetype, InterfaceType,
-                    ConformsTo, Superclass, Layout, GenericEnv) {
+    : LocalArchetypeType(TypeKind::ElementArchetype, Ctx,
+                         RecursiveTypeProperties::HasArchetype |
+                         RecursiveTypeProperties::HasElementArchetype,
+                         InterfaceType,
+                         ConformsTo, Superclass, Layout, GenericEnv) {
 }
 
 CanTypeWrapper<ElementArchetypeType> ElementArchetypeType::getNew(
@@ -4707,7 +4718,7 @@ static Type substType(Type derivedType,
     if (origArchetype->isRoot()) {
       // Root opened archetypes are not required to be substituted. Other root
       // archetypes must already have been substituted above.
-      if (isa<OpenedArchetypeType>(origArchetype)) {
+      if (isa<LocalArchetypeType>(origArchetype)) {
         return Type(type);
       } else {
         return ErrorType::get(type);
@@ -4916,7 +4927,7 @@ TypeBase::getContextSubstitutions(const DeclContext *dc,
       continue;
     }
 
-    // There are no subtitutions to apply if the type is still unbound,
+    // There are no substitutions to apply if the type is still unbound,
     // continue looking into the parent.
     if (auto unboundGeneric = baseTy->getAs<UnboundGenericType>()) {
       baseTy = unboundGeneric->getParent();
@@ -5588,6 +5599,52 @@ case TypeKind::Id:
     return PackType::get(Ptr->getASTContext(), elements)->flattenPackTypes();
   }
 
+  case TypeKind::SILPack: {
+    auto pack = cast<SILPackType>(base);
+    bool anyChanged = false;
+    SmallVector<CanType, 4> elements;
+    unsigned Index = 0;
+    for (Type eltTy : pack->getElementTypes()) {
+      Type transformedEltTy =
+          eltTy.transformWithPosition(TypePosition::Invariant, fn);
+      if (!transformedEltTy)
+        return Type();
+
+      // If nothing has changed, just keep going.
+      if (!anyChanged &&
+          transformedEltTy.getPointer() == eltTy.getPointer()) {
+        ++Index;
+        continue;
+      }
+
+      // If this is the first change we've seen, copy all of the previous
+      // elements.
+      if (!anyChanged) {
+        // Copy all of the previous elements.
+        elements.append(pack->getElementTypes().begin(),
+                        pack->getElementTypes().begin() + Index);
+        anyChanged = true;
+      }
+
+      auto transformedEltCanTy = transformedEltTy->getCanonicalType();
+
+      // Flatten immediately.
+      if (auto transformedEltPack =
+            dyn_cast<SILPackType>(transformedEltCanTy)) {
+        auto elementElements = transformedEltPack->getElementTypes();
+        elements.append(elementElements.begin(), elementElements.end());
+      } else {
+        assert(!isa<PackType>(transformedEltCanTy));
+        elements.push_back(transformedEltCanTy);
+      }
+    }
+
+    if (!anyChanged)
+      return *this;
+
+    return SILPackType::get(Ptr->getASTContext(), pack->getExtInfo(), elements);
+  }
+
   case TypeKind::PackExpansion: {
     auto expand = cast<PackExpansionType>(base);
 
@@ -6090,6 +6147,7 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::BuiltinJob:
   case TypeKind::BuiltinExecutor:
   case TypeKind::BuiltinDefaultActorStorage:
+  case TypeKind::BuiltinPackIndex:
   case TypeKind::BuiltinUnsafeValueBuffer:
   case TypeKind::BuiltinVector:
   case TypeKind::Tuple:
@@ -6109,6 +6167,7 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::DependentMember:
   case TypeKind::Pack:
   case TypeKind::PackExpansion:
+  case TypeKind::SILPack:
   case TypeKind::BuiltinTuple:
 #define REF_STORAGE(Name, ...) \
   case TypeKind::Name##Storage:

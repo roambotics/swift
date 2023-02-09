@@ -49,22 +49,24 @@ class ContextFinder : public SourceEntityWalker {
   ASTContext &Ctx;
   SourceManager &SM;
   SourceRange Target;
-  function_ref<bool(ASTNode)> IsContext;
+  std::function<bool(ASTNode)> IsContext;
   SmallVector<ASTNode, 4> AllContexts;
   bool contains(ASTNode Enclosing) {
-    auto Result = SM.rangeContains(Enclosing.getSourceRange(), Target);
-    if (Result && IsContext(Enclosing))
+    auto Result = SM.rangeContainsRespectingReplacedRanges(
+        Enclosing.getSourceRange(), Target);
+    if (Result && IsContext(Enclosing)) {
       AllContexts.push_back(Enclosing);
+    }
     return Result;
   }
 public:
   ContextFinder(SourceFile &SF, ASTNode TargetNode,
-                function_ref<bool(ASTNode)> IsContext =
+                std::function<bool(ASTNode)> IsContext =
                   [](ASTNode N) { return true; }) :
                   SF(SF), Ctx(SF.getASTContext()), SM(Ctx.SourceMgr),
                   Target(TargetNode.getSourceRange()), IsContext(IsContext) {}
   ContextFinder(SourceFile &SF, SourceLoc TargetLoc,
-                function_ref<bool(ASTNode)> IsContext =
+                std::function<bool(ASTNode)> IsContext =
                   [](ASTNode N) { return true; }) :
                   SF(SF), Ctx(SF.getASTContext()), SM(Ctx.SourceMgr),
                   Target(TargetLoc), IsContext(IsContext) {
@@ -661,8 +663,7 @@ private:
           assert(existingLoc->OldName == loc->OldName &&
                  existingLoc->NewName == loc->NewName &&
                  existingLoc->IsFunctionLike == loc->IsFunctionLike &&
-                 existingLoc->IsNonProtocolType ==
-                     existingLoc->IsNonProtocolType &&
+                 existingLoc->IsNonProtocolType == loc->IsNonProtocolType &&
                  "Asked to do a different rename for the same location?");
         }
       }
@@ -743,7 +744,7 @@ SourceFile *getContainingFile(ModuleDecl *M, RangeConfig Range) {
   SmallVector<SourceFile*, 4> Files;
   for (auto File : collectSourceFiles(M, Files)) {
     if (File->getBufferID()) {
-      if (File->getBufferID().getValue() == Range.BufferId) {
+      if (File->getBufferID().value() == Range.BufferId) {
         return File;
       }
     }
@@ -857,15 +858,15 @@ isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
                ValueRefInfo->isKeywordArgument()};
 
   auto RenameOp = getAvailableRenameForDecl(ValueRefInfo->getValueD(), RefInfo);
-  return RenameOp.hasValue() &&
-    RenameOp.getValue() == RefactoringKind::LocalRename;
+  return RenameOp.has_value() &&
+    RenameOp.value() == RefactoringKind::LocalRename;
 }
 
 static void analyzeRenameScope(ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
                                DiagnosticEngine &Diags,
                                SmallVectorImpl<DeclContext *> &Scopes) {
   Scopes.clear();
-  if (!getAvailableRenameForDecl(VD, RefInfo).hasValue()) {
+  if (!getAvailableRenameForDecl(VD, RefInfo).has_value()) {
     Diags.diagnose(SourceLoc(), diag::value_decl_no_loc, VD->getName());
     return;
   }
@@ -913,6 +914,11 @@ bool RefactoringActionLocalRename::performChange() {
   auto ValueRefCursorInfo = dyn_cast<ResolvedValueRefCursorInfo>(&CursorInfo);
   if (ValueRefCursorInfo && ValueRefCursorInfo->getValueD()) {
     ValueDecl *VD = ValueRefCursorInfo->typeOrValue();
+    // The index always uses the outermost shadow for references
+    if (!ValueRefCursorInfo->getShorthandShadowedDecls().empty()) {
+      VD = ValueRefCursorInfo->getShorthandShadowedDecls().back();
+    }
+
     SmallVector<DeclContext *, 8> Scopes;
 
     Optional<RenameRefInfo> RefInfo;
@@ -1218,7 +1224,7 @@ getNotableRegions(StringRef SourceText, unsigned NameOffset, StringRef Name,
   if (Instance->setup(Invocation, InstanceSetupError))
     llvm_unreachable(InstanceSetupError.c_str());
 
-  unsigned BufferId = Instance->getPrimarySourceFile()->getBufferID().getValue();
+  unsigned BufferId = Instance->getPrimarySourceFile()->getBufferID().value();
   SourceManager &SM = Instance->getSourceMgr();
   SourceLoc NameLoc = SM.getLocForOffset(BufferId, NameOffset);
   auto LineAndCol = SM.getLineAndColumnInBuffer(NameLoc);
@@ -2987,7 +2993,7 @@ static void collectAvailableRefactoringsAtCursor(
   DiagnosticEngine DiagEngine(SM);
   std::for_each(DiagConsumers.begin(), DiagConsumers.end(),
                 [&](DiagnosticConsumer *Con) { DiagEngine.addConsumer(*Con); });
-  SourceLoc Loc = SM.getLocForLineCol(SF->getBufferID().getValue(), Line, Column);
+  SourceLoc Loc = SM.getLocForLineCol(SF->getBufferID().value(), Line, Column);
   if (Loc.isInvalid())
     return;
 
@@ -4854,7 +4860,7 @@ struct CallbackCondition {
     }
   }
 
-  bool isValid() const { return Type.hasValue(); }
+  bool isValid() const { return Type.has_value(); }
 
 private:
   void initFromEnumPattern(const Decl *D, const EnumElementPattern *EEP) {
@@ -5350,32 +5356,61 @@ private:
       : Blocks(Blocks), Params(Params), HandledSwitches(HandledSwitches),
         DiagEngine(DiagEngine), CurrentBlock(&Blocks.SuccessBlock) {}
 
-  void classifyNodes(ArrayRef<ASTNode> Nodes, SourceLoc endCommentLoc) {
-    for (auto I = Nodes.begin(), E = Nodes.end(); I < E; ++I) {
-      auto *Statement = I->dyn_cast<Stmt *>();
-      if (auto *IS = dyn_cast_or_null<IfStmt>(Statement)) {
-        NodesToPrint TempNodes;
-        if (auto *BS = dyn_cast<BraceStmt>(IS->getThenStmt())) {
-          TempNodes = NodesToPrint::inBraceStmt(BS);
-        } else {
-          TempNodes = NodesToPrint({IS->getThenStmt()}, /*commentLocs*/ {});
-        }
+  /// Attempt to apply custom classification logic to a given node, returning
+  /// \c true if the node was classified, otherwise \c false.
+  bool tryClassifyNode(ASTNode Node) {
+    auto *Statement = Node.dyn_cast<Stmt *>();
+    if (!Statement)
+      return false;
 
-        classifyConditional(IS, IS->getCond(), std::move(TempNodes),
-                            IS->getElseStmt());
-      } else if (auto *GS = dyn_cast_or_null<GuardStmt>(Statement)) {
-        classifyConditional(GS, GS->getCond(), NodesToPrint(), GS->getBody());
-      } else if (auto *SS = dyn_cast_or_null<SwitchStmt>(Statement)) {
-        classifySwitch(SS);
+    if (auto *IS = dyn_cast<IfStmt>(Statement)) {
+      NodesToPrint TempNodes;
+      if (auto *BS = dyn_cast<BraceStmt>(IS->getThenStmt())) {
+        TempNodes = NodesToPrint::inBraceStmt(BS);
       } else {
-        CurrentBlock->addNode(*I);
+        TempNodes = NodesToPrint({IS->getThenStmt()}, /*commentLocs*/ {});
       }
 
-      if (DiagEngine.hadAnyError())
+      classifyConditional(IS, IS->getCond(), std::move(TempNodes),
+                          IS->getElseStmt());
+      return true;
+    } else if (auto *GS = dyn_cast<GuardStmt>(Statement)) {
+      classifyConditional(GS, GS->getCond(), NodesToPrint(), GS->getBody());
+      return true;
+    } else if (auto *SS = dyn_cast<SwitchStmt>(Statement)) {
+      classifySwitch(SS);
+      return true;
+    } else if (auto *RS = dyn_cast<ReturnStmt>(Statement)) {
+      // We can look through an implicit Void return of a SingleValueStmtExpr,
+      // as that's semantically a statement.
+      if (RS->hasResult() && RS->isImplicit()) {
+        auto Ty = RS->getResult()->getType();
+        if (Ty && Ty->isVoid()) {
+          if (auto *SVE = dyn_cast<SingleValueStmtExpr>(RS->getResult()))
+            return tryClassifyNode(SVE->getStmt());
+        }
+      }
+    }
+    return false;
+  }
+
+  /// Classify a node, or add the node to the block if it cannot be classified.
+  /// Returns \c true if there was an error.
+  bool classifyNode(ASTNode Node) {
+    auto DidClassify = tryClassifyNode(Node);
+    if (!DidClassify)
+      CurrentBlock->addNode(Node);
+    return DiagEngine.hadAnyError();
+  }
+
+  void classifyNodes(ArrayRef<ASTNode> Nodes, SourceLoc EndCommentLoc) {
+    for (auto Node : Nodes) {
+      auto HadError = classifyNode(Node);
+      if (HadError)
         return;
     }
     // Make sure to pick up any trailing comments.
-    CurrentBlock->addPossibleCommentLoc(endCommentLoc);
+    CurrentBlock->addPossibleCommentLoc(EndCommentLoc);
   }
 
   /// Whether any of the provided ASTNodes have a child expression that force
@@ -6750,6 +6785,15 @@ private:
       }
     }
 
+    // A void SingleValueStmtExpr is semantically more like a statement than
+    // an expression, so recurse without bumping the expr depth or wrapping in
+    // continuation.
+    if (auto *SVE = dyn_cast<SingleValueStmtExpr>(E)) {
+      auto ty = SVE->getType();
+      if (!ty || ty->isVoid())
+        return true;
+    }
+
     // We didn't do any special conversion for this expression. If needed, wrap
     // it in a continuation.
     wrapScopeInContinationIfNecessary(E);
@@ -6767,6 +6811,11 @@ private:
   }
 
   bool walkToExprPost(Expr *E) override {
+    if (auto *SVE = dyn_cast<SingleValueStmtExpr>(E)) {
+      auto ty = SVE->getType();
+      if (!ty || ty->isVoid())
+        return true;
+    }
     NestedExprCount--;
     return true;
   }
@@ -8080,7 +8129,7 @@ private:
     // type. If this is for an Error? parameter, we'll need to add parens around
     // the cast to silence a compiler warning about force casting never
     // producing nil.
-    auto RequiresParens = HandlerDesc.getErrorParam().hasValue();
+    auto RequiresParens = HandlerDesc.getErrorParam().has_value();
     if (RequiresParens)
       OS << tok::l_paren;
 
@@ -8549,7 +8598,7 @@ struct swift::ide::FindRenameRangesAnnotatingConsumer::Implementation {
     llvm::raw_string_ostream OS(NewText);
     StringRef Tag = tag(Range.RangeKind);
     OS << "<" << Tag;
-    if (Range.Index.hasValue())
+    if (Range.Index.has_value())
       OS << " index=" << *Range.Index;
     OS << ">" << Range.Range.str() << "</" << Tag << ">";
     pRewriter->accept(SM, {Range.Range, OS.str(), {}});
@@ -8667,9 +8716,9 @@ void swift::ide::collectAvailableRefactorings(
                    ValueRefInfo.isKeywordArgument()};
       auto RenameOp =
           getAvailableRenameForDecl(ValueRefInfo.getValueD(), RefInfo);
-      if (RenameOp.hasValue() &&
-          RenameOp.getValue() == RefactoringKind::GlobalRename)
-        Kinds.push_back(RenameOp.getValue());
+      if (RenameOp.has_value() &&
+          RenameOp.value() == RefactoringKind::GlobalRename)
+        Kinds.push_back(RenameOp.value());
     }
     }
   }
@@ -8749,7 +8798,7 @@ static std::vector<ResolvedLoc>
 resolveRenameLocations(ArrayRef<RenameLoc> RenameLocs, SourceFile &SF,
                        DiagnosticEngine &Diags) {
   SourceManager &SM = SF.getASTContext().SourceMgr;
-  unsigned BufferID = SF.getBufferID().getValue();
+  unsigned BufferID = SF.getBufferID().value();
 
   std::vector<UnresolvedLoc> UnresolvedLocs;
   for (const RenameLoc &RenameLoc : RenameLocs) {

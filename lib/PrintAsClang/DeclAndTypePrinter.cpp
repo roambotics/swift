@@ -522,18 +522,24 @@ private:
                   elementDecl->getParentEnum()->getModuleContext());
               outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
               outOfLineOS << ">::type";
-              outOfLineOS << "::returnNewValue([&](char * _Nonnull result) {\n";
-              outOfLineOS << "      swift::"
-                          << cxx_synthesis::getCxxImplNamespaceName();
-              outOfLineOS << "::implClassFor<";
-              outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
-                  objectTypeDecl->getModuleContext(),
-                  elementDecl->getParentEnum()->getModuleContext());
-              outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
-              outOfLineOS << ">::type";
-              outOfLineOS
-                  << "::initializeWithTake(result, payloadFromDestruction);\n";
-              outOfLineOS << "    });\n  ";
+              if (isa<ClassDecl>(objectTypeDecl)) {
+                outOfLineOS << "::makeRetained(*reinterpret_cast<void "
+                               "**>(payloadFromDestruction));\n  ";
+              } else {
+                outOfLineOS
+                    << "::returnNewValue([&](char * _Nonnull result) {\n";
+                outOfLineOS << "      swift::"
+                            << cxx_synthesis::getCxxImplNamespaceName();
+                outOfLineOS << "::implClassFor<";
+                outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
+                    objectTypeDecl->getModuleContext(),
+                    elementDecl->getParentEnum()->getModuleContext());
+                outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                outOfLineOS << ">::type";
+                outOfLineOS << "::initializeWithTake(result, "
+                               "payloadFromDestruction);\n";
+                outOfLineOS << "    });\n  ";
+              }
             }
           },
           ED, ED->getModuleContext(), outOfLineOS);
@@ -666,6 +672,13 @@ private:
                     outOfLineOS
                         << "    memcpy(result._getOpaquePointer(), &val, "
                            "sizeof(val));\n";
+                  } else if (isa<ClassDecl>(objectTypeDecl)) {
+                    outOfLineOS
+                        << "    auto op = swift::"
+                        << cxx_synthesis::getCxxImplNamespaceName()
+                        << "::_impl_RefCountedClass::copyOpaquePointer(val);\n";
+                    outOfLineOS << "    memcpy(result._getOpaquePointer(), "
+                                   "&op, sizeof(op));\n";
                   } else {
                     objectTypeDecl =
                         paramType->getNominalOrBoundGenericNominal();
@@ -731,6 +744,8 @@ private:
       }
       os << "  } ";
       syntaxPrinter.printIdentifier(caseName);
+      if (elementDecl)
+        syntaxPrinter.printSymbolUSRAttribute(elementDecl);
       os << ";\n";
     };
 
@@ -742,6 +757,7 @@ private:
           [&](const auto &pair) {
             os << "\n    ";
             syntaxPrinter.printIdentifier(pair.first->getNameStr());
+            syntaxPrinter.printSymbolUSRAttribute(pair.first);
           },
           ",");
       // TODO: allow custom name for this special case
@@ -961,6 +977,10 @@ private:
         getForeignResultType(AFD, methodTy, asyncConvention, errorConvention);
 
     if (outputLang == OutputLanguageMode::Cxx) {
+      // FIXME: Support operators.
+      if (AFD->isOperator() || (AFD->isStatic() && AFD->isImplicit()))
+        return;
+
       auto *typeDeclContext = dyn_cast<NominalTypeDecl>(AFD->getParent());
       if (!typeDeclContext) {
         typeDeclContext =
@@ -997,6 +1017,7 @@ private:
         declPrinter.printCxxMethod(typeDeclContext, AFD,
                                    funcABI->getSignature(),
                                    funcABI->getSymbolName(), resultTy,
+                                   /*isStatic=*/isClassMethod,
                                    /*isDefinition=*/false);
       }
 
@@ -1019,6 +1040,7 @@ private:
       } else {
         defPrinter.printCxxMethod(typeDeclContext, AFD, funcABI->getSignature(),
                                   funcABI->getSymbolName(), resultTy,
+                                  /*isStatic=*/isClassMethod,
                                   /*isDefinition=*/true);
       }
 
@@ -1413,6 +1435,8 @@ private:
         owningPrinter.interopContext, owningPrinter);
     DeclAndTypeClangFunctionPrinter::FunctionSignatureModifiers modifiers;
     modifiers.isInline = true;
+    // FIXME: Support throwing exceptions for Swift errors.
+    modifiers.isNoexcept = !funcTy->isThrowing();
     auto result = funcPrinter.printFunctionSignature(
         FD, funcABI.getSignature(), cxx_translation::getNameForCxx(FD),
         resultTy,
@@ -1420,9 +1444,6 @@ private:
         modifiers);
     assert(
         !result.isUnsupported()); // The C signature should be unsupported too.
-    // FIXME: Support throwing exceptions for Swift errors.
-    if (!funcTy->isThrowing())
-      os << " noexcept";
     printFunctionClangAttributes(FD, funcTy);
     printAvailability(FD);
     os << " {\n";
@@ -1637,9 +1658,6 @@ private:
 
   void visitFuncDecl(FuncDecl *FD) {
     if (outputLang == OutputLanguageMode::Cxx) {
-      // FIXME: Support static methods.
-      if (FD->getDeclContext()->isTypeContext() && FD->isStatic())
-        return;
       if (FD->getDeclContext()->isTypeContext())
         return printAbstractFunctionAsMethod(FD, FD->isStatic());
 
@@ -2608,6 +2626,15 @@ static bool isAsyncAlternativeOfOtherDecl(const ValueDecl *VD) {
   return false;
 }
 
+static bool isStringNestedType(const ValueDecl *VD, StringRef Typename) {
+  auto ctx = VD->getDeclContext();
+  return VD->hasName() && VD->getName().isSimpleName() &&
+         VD->getBaseIdentifier().str() == Typename &&
+         isa<ExtensionDecl>(ctx->getAsDecl()) &&
+         cast<ExtensionDecl>(ctx->getAsDecl())->getExtendedNominal() ==
+             VD->getASTContext().getStringDecl();
+}
+
 static bool hasExposeAttr(const ValueDecl *VD, bool isExtension = false) {
   if (isa<NominalTypeDecl>(VD) && VD->getModuleContext()->isStdlibModule()) {
     if (VD == VD->getASTContext().getStringDecl() && !isExtension)
@@ -2615,6 +2642,8 @@ static bool hasExposeAttr(const ValueDecl *VD, bool isExtension = false) {
     if (VD == VD->getASTContext().getArrayDecl())
       return true;
     if (VD == VD->getASTContext().getOptionalDecl() && !isExtension)
+      return true;
+    if (isStringNestedType(VD, "UTF8View") || isStringNestedType(VD, "Index"))
       return true;
     return false;
   }
@@ -2631,6 +2660,33 @@ static bool hasExposeAttr(const ValueDecl *VD, bool isExtension = false) {
     // should be renamed automatically or using the expose attribute.
     if (ED->getExtendedNominal() == VD->getASTContext().getArrayDecl()) {
       if (isa<AbstractFunctionDecl>(VD) &&
+          !cast<AbstractFunctionDecl>(VD)
+               ->getName()
+               .getBaseName()
+               .isSpecial() &&
+          cast<AbstractFunctionDecl>(VD)
+              ->getName()
+              .getBaseName()
+              .getIdentifier()
+              .str()
+              .contains_insensitive("index"))
+        return false;
+    }
+    if (ED->getExtendedNominal() == VD->getASTContext().getStringDecl()) {
+      if (isa<ValueDecl>(VD) &&
+          !cast<ValueDecl>(VD)->getName().getBaseName().isSpecial() &&
+          cast<ValueDecl>(VD)
+              ->getName()
+              .getBaseName()
+              .getIdentifier()
+              .str()
+              .contains_insensitive("utf8"))
+        return true;
+    }
+    if (isStringNestedType(ED->getExtendedNominal(), "UTF8View")) {
+      // Do not expose ambiguous 'index(after:' / 'index(before:' overloads.
+      if (isa<AbstractFunctionDecl>(VD) &&
+          cast<AbstractFunctionDecl>(VD)->getParameters()->size() == 1 &&
           !cast<AbstractFunctionDecl>(VD)
                ->getName()
                .getBaseName()

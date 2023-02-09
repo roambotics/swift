@@ -911,6 +911,24 @@ static void setLocationInfo(const ValueDecl *VD,
     Location.Length = NameLen;
     std::tie(Location.Line, Location.Column) = SM.getLineAndColumnInBuffer(
         Loc, DeclBufID);
+    if (auto GeneratedSourceInfo = SM.getGeneratedSourceInfo(DeclBufID)) {
+      if (GeneratedSourceInfo->kind ==
+          GeneratedSourceInfo::ReplacedFunctionBody) {
+        // The location was in a temporary source buffer that just contains the
+        // function body and which we created while reusing the ASTContext for
+        // the rest of the file. Map the location back to the original file.
+        unsigned OriginalBufID = SM.findBufferContainingLoc(
+            GeneratedSourceInfo->originalSourceRange.Start);
+        auto OriginalStartOffset = SM.getLocOffsetInBuffer(
+            GeneratedSourceInfo->originalSourceRange.Start, OriginalBufID);
+        auto GeneratedStartOffset = SM.getLocOffsetInBuffer(
+            GeneratedSourceInfo->generatedSourceRange.Start, DeclBufID);
+        Location.Offset += OriginalStartOffset - GeneratedStartOffset;
+        assert(SM.findBufferContainingLoc(Loc) == DeclBufID);
+        std::tie(Location.Line, Location.Column) =
+            SM.getPresumedLineAndColumnForLoc(Loc, DeclBufID);
+      }
+    }
   } else if (ClangNode) {
     ClangImporter *Importer =
         static_cast<ClangImporter*>(Ctx.getClangModuleLoader());
@@ -1146,6 +1164,7 @@ static bool passCursorInfoForDecl(
     bool AddSymbolGraph, ArrayRef<RefactoringInfo> KnownRefactoringInfo,
     SwiftLangSupport &Lang, const CompilerInvocation &Invoc,
     std::string &Diagnostic, ArrayRef<ImmutableTextSnapshotRef> PreviousSnaps,
+    bool DidReuseAST,
     std::function<void(const RequestResult<CursorInfoData> &)> Receiver) {
   DeclInfo OrigInfo(Info.getValueD(), Info.getContainerType(), Info.isRef(),
                     Info.isDynamic(), Info.getReceiverTypes(), Invoc);
@@ -1172,6 +1191,7 @@ static bool passCursorInfoForDecl(
     });
     return false;
   }
+
   if (MainInfo.VD != OrigInfo.VD && !OrigInfo.Unavailable) {
     CursorSymbolInfo &CtorSymbol = Symbols.emplace_back();
     if (auto Err =
@@ -1182,16 +1202,21 @@ static bool passCursorInfoForDecl(
       Symbols.pop_back();
     }
   }
-  for (auto D : Info.getShorthandShadowedDecls()) {
-    CursorSymbolInfo &SymbolInfo = Symbols.emplace_back();
-    DeclInfo DInfo(D, Type(), /*IsRef=*/true, /*IsDynamic=*/false,
-                   ArrayRef<NominalTypeDecl *>(), Invoc);
-    if (auto Err =
-            fillSymbolInfo(SymbolInfo, DInfo, Info.getLoc(), AddSymbolGraph,
-                           Lang, Invoc, PreviousSnaps, Allocator)) {
-      // Ignore but make sure to remove the partially-filled symbol
-      llvm::handleAllErrors(std::move(Err), [](const llvm::StringError &E) {});
-      Symbols.pop_back();
+
+  // Add in shadowed declarations if on a decl. For references just go to the
+  // actual declaration.
+  if (!Info.isRef()) {
+    for (auto D : Info.getShorthandShadowedDecls()) {
+      CursorSymbolInfo &SymbolInfo = Symbols.emplace_back();
+      DeclInfo DInfo(D, Type(), /*IsRef=*/true, /*IsDynamic=*/false,
+                     ArrayRef<NominalTypeDecl *>(), Invoc);
+      if (auto Err =
+          fillSymbolInfo(SymbolInfo, DInfo, Info.getLoc(), AddSymbolGraph,
+                         Lang, Invoc, PreviousSnaps, Allocator)) {
+        // Ignore but make sure to remove the partially-filled symbol
+        llvm::handleAllErrors(std::move(Err), [](const llvm::StringError &E) {});
+        Symbols.pop_back();
+      }
     }
   }
 
@@ -1209,6 +1234,7 @@ static bool passCursorInfoForDecl(
   CursorInfoData Data;
   Data.Symbols = llvm::makeArrayRef(Symbols);
   Data.AvailableActions = llvm::makeArrayRef(Refactorings);
+  Data.DidReuseAST = DidReuseAST;
   Receiver(RequestResult<CursorInfoData>::fromResult(Data));
   return true;
 }
@@ -1548,7 +1574,8 @@ static void resolveCursor(
         bool Success = passCursorInfoForDecl(
             cast<ResolvedValueRefCursorInfo>(CursorInfo), Actionables,
             SymbolGraph, Actions, Lang, CompInvok, Diagnostic,
-            getPreviousASTSnaps(), Receiver);
+            getPreviousASTSnaps(),
+            /*DidReuseAST=*/false, Receiver);
         if (!Success) {
           if (!getPreviousASTSnaps().empty()) {
             // Attempt again using the up-to-date AST.
@@ -1854,11 +1881,39 @@ resolveRange(SwiftLangSupport &Lang, StringRef InputFile, unsigned Offset,
                                         llvm::vfs::getRealFileSystem());
 }
 
+static void deliverCursorInfoResults(
+    std::function<void(const RequestResult<CursorInfoData> &)> Receiver,
+    CancellableResult<CursorInfoResults> Results, SwiftLangSupport &Lang,
+    const CompilerInvocation &Invoc, bool AddRefactorings,
+    bool AddSymbolGraph) {
+  switch (Results.getKind()) {
+  case CancellableResultKind::Success: {
+    // TODO: Implement delivery of other result types as more cursor info kinds
+    // are migrated to be completion-like.
+    if (auto Result = dyn_cast_or_null<ResolvedValueRefCursorInfo>(
+            Results.getResult().Result)) {
+      std::string Diagnostic; // Unused
+      passCursorInfoForDecl(*Result, AddRefactorings, AddSymbolGraph, {}, Lang,
+                            Invoc, Diagnostic, /*PreviousSnaps=*/{},
+                            Results->DidReuseAST, Receiver);
+    }
+    break;
+  }
+  case CancellableResultKind::Failure:
+    Receiver(RequestResult<CursorInfoData>::fromError(Results.getError()));
+    break;
+  case CancellableResultKind::Cancelled:
+    Receiver(RequestResult<CursorInfoData>::cancelled());
+    break;
+  }
+}
+
 void SwiftLangSupport::getCursorInfo(
     StringRef InputFile, unsigned Offset, unsigned Length, bool Actionables,
     bool SymbolGraph, bool CancelOnSubsequentRequest,
     ArrayRef<const char *> Args, Optional<VFSOptions> vfsOptions,
     SourceKitCancellationToken CancellationToken,
+    bool VerifySolverBasedCursorInfo,
     std::function<void(const RequestResult<CursorInfoData> &)> Receiver) {
 
   std::string error;
@@ -1882,8 +1937,10 @@ void SwiftLangSupport::getCursorInfo(
           ResolvedValueRefCursorInfo Info;
           Info.setValueD(const_cast<ValueDecl *>(Entity.Dcl));
           Info.setIsRef(Entity.IsRef);
-          passCursorInfoForDecl(Info, Actionables, SymbolGraph, {}, *this,
-                                Invok, Diagnostic, {}, Receiver);
+          passCursorInfoForDecl(
+              Info, Actionables, SymbolGraph, {}, *this, Invok, Diagnostic,
+              /*PreviousSnaps=*/{},
+              /*DidReuseAST=*/false, Receiver);
         }
       } else {
         CursorInfoData Info;
@@ -1906,9 +1963,141 @@ void SwiftLangSupport::getCursorInfo(
     return;
   }
 
+  /// Counts how many symbols \p Res contains.
+  auto ResultCount = [](const RequestResult<CursorInfoData> &Res) -> size_t {
+    if (Res.isValue()) {
+      return Res.value().Symbols.size();
+    } else {
+      return 0;
+    }
+  };
+
+  /// Serializes \c CursorInfoData into a string.
+  auto ResultDescription =
+      [](const RequestResult<CursorInfoData> &Res) -> std::string {
+    if (Res.isCancelled()) {
+      return "cancelled";
+    } else if (Res.isError()) {
+      return Res.getError().str();
+    } else {
+      std::string Description;
+      llvm::raw_string_ostream OS(Description);
+      Res.value().print(OS, /*Indentation=*/"",
+                        /*ForSolverBasedCursorInfoVerification=*/true);
+      return OS.str();
+    }
+  };
+
+  // Currently, we only verify that the solver-based cursor implementation
+  // produces the same results as the AST-based implementation. Only enable it
+  // in assert builds for now.
+
+  // If solver based completion is enabled, a string description of the cursor
+  // info result produced by the solver-based implementation. Once the AST-based
+  // result is produced, we verify that the solver-based result matches the
+  // AST-based result.
+  std::string SolverBasedResultDescription;
+  size_t SolverBasedResultCount = 0;
+  bool SolverBasedReusedAST = false;
+  if (VerifySolverBasedCursorInfo) {
+    std::string InputFileError;
+    llvm::SmallString<64> RealInputFilePath;
+    fileSystem->getRealPath(InputFile, RealInputFilePath);
+    std::unique_ptr<llvm::MemoryBuffer> UnresolvedInputFile =
+        getASTManager()->getMemoryBuffer(RealInputFilePath, fileSystem,
+                                         InputFileError);
+    if (UnresolvedInputFile) {
+      auto SolverBasedReceiver = [&](const RequestResult<CursorInfoData> &Res) {
+        SolverBasedResultCount = ResultCount(Res);
+        SolverBasedResultDescription = ResultDescription(Res);
+        if (Res.isValue()) {
+          SolverBasedReusedAST = Res.value().DidReuseAST;
+        }
+      };
+
+      CompilerInvocation CompInvok;
+      Invok->applyTo(CompInvok);
+
+      performWithParamsToCompletionLikeOperation(
+          UnresolvedInputFile.get(), Offset,
+          /*InsertCodeCompletionToken=*/false, Args, fileSystem,
+          CancellationToken,
+          [&](CancellableResult<CompletionLikeOperationParams> ParmsResult) {
+            ParmsResult.mapAsync<CursorInfoResults>(
+                [&](auto &Params, auto DeliverTransformed) {
+                  getIDEInspectionInstance()->cursorInfo(
+                      Params.Invocation, Args, fileSystem,
+                      Params.completionBuffer, Offset, Params.DiagC,
+                      Params.CancellationFlag, DeliverTransformed);
+                },
+                [&](auto Result) {
+                  deliverCursorInfoResults(SolverBasedReceiver, Result, *this,
+                                           CompInvok, Actionables, SymbolGraph);
+                });
+          });
+    }
+  }
+
+  /// If the solver-based implementation returned a different result than the
+  /// AST-based implementation, return an error message, describing the
+  /// difference. Otherwise, return an empty string.
+  auto VerifySolverBasedResult =
+      [ResultCount, ResultDescription, SolverBasedResultCount,
+       SolverBasedResultDescription](
+          const RequestResult<CursorInfoData> &ASTBasedResult) -> std::string {
+    if (SolverBasedResultDescription.empty()) {
+      // We did not run the solver-based implementation. Nothing to check.
+      return "";
+    }
+    auto ASTResultDescription = ResultDescription(ASTBasedResult);
+    auto ASTResultCount = ResultCount(ASTBasedResult);
+    if (ASTResultCount == 0 && SolverBasedResultCount > 0) {
+      // The AST-based implementation did not return any results but the
+      // solver-based did. That's an improvement. Success.
+      return "";
+    }
+    if (SolverBasedResultDescription == ASTResultDescription) {
+      // The solver-based and AST-based implementation produced the same
+      // results. Success.
+      return "";
+    }
+    // The solver-based implementation differed from the AST-based
+    // implementation. Report a failure.
+    std::string ErrorMessage;
+    llvm::raw_string_ostream OS(ErrorMessage);
+    OS << "The solver-based implementation returned a different result than "
+          "the AST-based implementation:\n";
+    OS << SolverBasedResultDescription << "\n";
+    OS << "===== (solver-based vs. AST-based) =====\n";
+    OS << ASTResultDescription << "\n";
+    return OS.str();
+  };
+
+  // Thunk around `Receiver` that, if solver-based cursor info is enabled,
+  // verifies that the solver-based cursor info result matches the AST-based
+  // result.
+  auto ReceiverThunk =
+      [Receiver, VerifySolverBasedResult,
+       SolverBasedReusedAST](const RequestResult<CursorInfoData> &Res) {
+        auto VerificationError = VerifySolverBasedResult(Res);
+        if (VerificationError.empty()) {
+          if (Res.isValue()) {
+            // Report whether the solver-based implemenatation reused the AST so
+            // we can check it in test cases.
+            auto Value = Res.value();
+            Value.DidReuseAST = SolverBasedReusedAST;
+            Receiver(RequestResult<CursorInfoData>::fromResult(Value));
+          } else {
+            Receiver(Res);
+          }
+        } else {
+          Receiver(RequestResult<CursorInfoData>::fromError(VerificationError));
+        }
+      };
+
   resolveCursor(*this, InputFile, Offset, Length, Actionables, SymbolGraph,
                 Invok, /*TryExistingAST=*/true, CancelOnSubsequentRequest,
-                fileSystem, CancellationToken, Receiver);
+                fileSystem, CancellationToken, ReceiverThunk);
 }
 
 void SwiftLangSupport::getDiagnostics(
@@ -2096,10 +2285,11 @@ static void resolveCursorFromUSR(
         }
 
         std::string Diagnostic;
-        bool Success =
-            passCursorInfoForDecl(Info, /*AddRefactorings*/ false,
-                                  /*AddSymbolGraph*/ false, {}, Lang, CompInvok,
-                                  Diagnostic, PreviousASTSnaps, Receiver);
+        bool Success = passCursorInfoForDecl(
+            Info, /*AddRefactorings*/ false,
+            /*AddSymbolGraph*/ false, {}, Lang, CompInvok, Diagnostic,
+            PreviousASTSnaps,
+            /*DidReuseAST=*/false, Receiver);
         if (!Success) {
           if (!PreviousASTSnaps.empty()) {
             // Attempt again using the up-to-date AST.

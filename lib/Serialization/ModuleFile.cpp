@@ -885,8 +885,13 @@ void ModuleFile::lookupObjCMethods(
   auto found = *known;
   for (const auto &result : found) {
     // Deserialize the method and add it to the list.
-    if (auto func = dyn_cast_or_null<AbstractFunctionDecl>(
-                      getDecl(std::get<2>(result))))
+    auto declOrError = getDeclChecked(std::get<2>(result));
+    if (!declOrError) {
+        consumeError(declOrError.takeError());
+        continue;
+    }
+
+    if (auto func = dyn_cast_or_null<AbstractFunctionDecl>(declOrError.get()))
       results.push_back(func);
   }
 }
@@ -1318,4 +1323,11 @@ StringRef SerializedASTFile::getModuleDefiningPath() const {
     return parentDir;
 
   return moduleFilename;
+}
+
+StringRef SerializedASTFile::getExportedModuleName() const {
+  auto name = File.getModuleExportAsName();
+  if (!name.empty())
+    return name;
+  return FileUnit::getExportedModuleName();
 }

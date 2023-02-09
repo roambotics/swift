@@ -110,6 +110,8 @@ ERROR(error_cannot_direct_cc1_pcm_build_in_mode,none,
       "'-direct-clang-cc1-module-build' only supported when building a PCM ('-emit-pcm')'", ())
 ERROR(error_unsupported_option_argument,none,
       "unsupported argument '%1' to option '%0'", (StringRef, StringRef))
+ERROR(error_swift_module_file_requires_delimeter,none,
+      "-swift-module-file= argument requires format <name>=<path>, got: '%0'", (StringRef))
 ERROR(error_immediate_mode_missing_stdlib,none,
       "could not load the swift standard library", ())
 ERROR(error_immediate_mode_missing_library,none,
@@ -180,6 +182,17 @@ ERROR(error_stdlib_module_name,none,
       "module name \"%0\" is reserved for the standard library"
       "%select{|; use -module-name flag to specify an alternate name}1",
       (StringRef, bool))
+
+ERROR(error_bad_export_as_name,none,
+      "export-as name \"%0\" is not a valid identifier",
+      (StringRef))
+
+ERROR(error_bad_package_name,none,
+      "package name \"%0\" is not a valid identifier",
+      (StringRef))
+ERROR(error_stdlib_package_name,none,
+      "package name \"%0\" is reserved for the standard library",
+      (StringRef))
 ERROR(error_stdlib_not_found,Fatal,
       "unable to load standard library for target '%0'", (StringRef))
 ERROR(error_module_alias_invalid_format,none,
@@ -258,6 +271,17 @@ ERROR(error_index_inputs_more_than_outputs,none,
 REMARK(remark_indexing_system_module,none,
        "indexing system module at %0"
        "%select{|; skipping because of a broken swiftinterface}1",
+       (StringRef, bool))
+
+ERROR(error_create_symbolic_interfaces_dir,none,
+      "creating symbolic interfaces directory: %0", (StringRef))
+ERROR(error_symbolic_interfaces_failed_status_check,none,
+      "failed file status check: %0", (StringRef))
+ERROR(error_write_symbolic_interface,none,
+      "writing symbolic interface file: %0", (StringRef))
+REMARK(remark_emitting_symbolic_interface_module,none,
+       "emitting symbolic interface at %0"
+       "%select{|; skipping because it's up to date}1",
        (StringRef, bool))
 
 ERROR(error_wrong_number_of_arguments,none,

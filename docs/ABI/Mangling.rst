@@ -9,6 +9,7 @@ Mangling
 ::
 
   mangled-name ::= '$s' global  // Swift stable mangling
+  mangled-name ::= '@__swiftmacro_' global // Swift mangling for filenames
   mangled-name ::= '_T0' global // Swift 4.0
   mangled-name ::= '$S' global  // Swift 4.2
 
@@ -149,6 +150,7 @@ Globals
   #endif
   global ::= protocol-conformance 'Hc'   // protocol conformance runtime record
   global ::= global 'HF'                 // accessible function runtime record
+  global ::= global 'Ha'                 // runtime discoverable attribute record
 
   global ::= nominal-type 'Mo'           // class metadata immediate member base offset
 
@@ -346,6 +348,7 @@ Entities
   entity-spec ::= type 'fU' INDEX            // explicit anonymous closure expression
   entity-spec ::= type 'fu' INDEX            // implicit anonymous closure
   entity-spec ::= 'fA' INDEX                 // default argument N+1 generator
+  entity-spec ::= entity 'fa'                // runtime discoverable attribute generator
   entity-spec ::= 'fi'                       // non-local variable initializer
   entity-spec ::= 'fP'                       // property wrapper backing initializer
   entity-spec ::= 'fW'                       // property wrapper init from projected value
@@ -363,6 +366,7 @@ Entities
   entity-spec ::= decl-name type 'fp'                                               // generic type parameter
   entity-spec ::= decl-name type 'fo'                                               // enum element (currently not used)
   entity-spec ::= decl-name label-list? type generic-signature? 'fm'   // macro
+  entity-spec ::= context macro-discriminator-list  // macro expansion
   entity-spec ::= identifier 'Qa'                                                   // associated type declaration
 
   ACCESSOR ::= 'm'                           // materializeForSet
@@ -389,6 +393,14 @@ Entities
 
   RELATED-DISCRIMINATOR ::= [a-j]
   RELATED-DISCRIMINATOR ::= [A-J]
+
+  macro-discriminator-list ::= macro-discriminator-list? 'fM' macro-expansion-operator INDEX
+
+  macro-expansion-operator ::= identifier 'a' // accessor attached macro
+  macro-expansion-operator ::= identifier 'A' // member-attribute attached macro
+  macro-expansion-operator ::= identifier 'f' // freestanding macro
+  macro-expansion-operator ::= identifier 'm' // member attached macro
+  macro-expansion-operator ::= identifier 'u' // uniquely-named entity
 
   file-discriminator ::= identifier 'Ll'     // anonymous file-discriminated declaration
 
@@ -568,6 +580,7 @@ Types
   #if SWIFT_RUNTIME_VERSION >= 5.5
     type ::= 'Bj'                              // Builtin.Job
   #endif
+  type ::= 'BP'                              // Builtin.PackIndex
   type ::= 'BO'                              // Builtin.UnknownObject (no longer a distinct type, but still used for AnyObject)
   type ::= 'Bo'                              // Builtin.NativeObject
   type ::= 'Bp'                              // Builtin.RawPointer
@@ -653,9 +666,11 @@ Types
   type ::= assoc-type-name 'Qz'                      // shortcut for 'Qyz'
   type ::= assoc-type-list 'QY' GENERIC-PARAM-INDEX  // associated type at depth
   type ::= assoc-type-list 'QZ'                      // shortcut for 'QYz'
+  type ::= opaque-type-decl-name bound-generic-args 'Qo' INDEX // opaque type
   
   type ::= pattern-type count-type 'Qp'      // pack expansion type
   type ::= pack-element-list 'QP'            // pack type
+  type ::= pack-element-list 'QS' DIRECTNESS // SIL pack type
 
   pack-element-list ::= type '_' type*
   pack-element-list ::= empty-list
@@ -737,6 +752,9 @@ mangled in to disambiguate.
   PARAM-CONVENTION ::= 'y'                   // direct unowned
   PARAM-CONVENTION ::= 'g'                   // direct guaranteed
   PARAM-CONVENTION ::= 'e'                   // direct deallocating
+  PARAM-CONVENTION ::= 'v'                   // pack owned
+  PARAM-CONVENTION ::= 'p'                   // pack guaranteed
+  PARAM-CONVENTION ::= 'm'                   // pack inout
 
   PARAM-DIFFERENTIABILITY ::= 'w'            // @noDerivative
 
@@ -745,8 +763,12 @@ mangled in to disambiguate.
   RESULT-CONVENTION ::= 'd'                  // unowned
   RESULT-CONVENTION ::= 'u'                  // unowned inner pointer
   RESULT-CONVENTION ::= 'a'                  // auto-released
+  RESULT-CONVENTION ::= 'k'                  // pack
 
   RESULT-DIFFERENTIABILITY ::= 'w'            // @noDerivative
+
+  DIRECTNESS ::= 'i'                         // indirect
+  DIRECTNESS ::= 'd'                         // direct
 
 For the most part, manglings follow the structure of formal language
 types.  However, in some cases it is more useful to encode the exact

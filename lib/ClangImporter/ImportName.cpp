@@ -2173,6 +2173,11 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
 
   if (auto classTemplateSpecDecl =
           dyn_cast<clang::ClassTemplateSpecializationDecl>(D)) {
+    /// Symbolic specializations get imported as the symbolic class template
+    /// type.
+    if (importSymbolicCXXDecls)
+      return importNameImpl(classTemplateSpecDecl->getSpecializedTemplate(),
+                            version, givenName);
     if (!isa<clang::ClassTemplatePartialSpecializationDecl>(D)) {
 
       auto &astContext = classTemplateSpecDecl->getASTContext();
@@ -2197,6 +2202,34 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
       mangledName << CXX_TEMPLATE_INST_PREFIX << buffer.str().drop_front(4);
 
       baseName = swiftCtx.getIdentifier(mangledName.str()).get();
+    }
+  }
+
+  SmallString<16> newName;
+  // Check if we need to rename the C++ method to disambiguate it.
+  if (auto method = dyn_cast<clang::CXXMethodDecl>(D)) {
+    if (!method->isConst() && !method->isOverloadedOperator()) {
+      // See if any other methods within the same struct have the same name, but
+      // differ in constness.
+      auto otherDecls = dc->lookup(method->getDeclName());
+      bool shouldRename = false;
+      for (auto otherDecl : otherDecls) {
+        if (otherDecl == D)
+          continue;
+        if (auto otherMethod = dyn_cast<clang::CXXMethodDecl>(otherDecl)) {
+          // TODO: what if the other method is also non-const?
+          if (otherMethod->isConst()) {
+            shouldRename = true;
+            break;
+          }
+        }
+      }
+
+      if (shouldRename) {
+        newName = baseName;
+        newName += "Mutating";
+        baseName = newName;
+      }
     }
   }
 

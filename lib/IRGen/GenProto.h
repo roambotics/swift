@@ -99,10 +99,24 @@ namespace irgen {
     return -1 - (int)index;
   }
 
+  llvm::Value *loadParentProtocolWitnessTable(IRGenFunction &IGF,
+                                              llvm::Value *wtable,
+                                              WitnessIndex index);
+
+  llvm::Value *loadConditionalConformance(IRGenFunction &IGF,
+                                          llvm::Value *wtable,
+                                          WitnessIndex index);
+
+  struct ExpandedSignature {
+    unsigned numShapes;
+    unsigned numTypeMetadataPtrs;
+    unsigned numWitnessTablePtrs;
+  };
+
   /// Add the witness parameters necessary for calling a function with
   /// the given generics clause.
-  /// Returns the number of type metadata pointers added to `types`.
-  unsigned expandPolymorphicSignature(
+  /// Returns the number of lowered parameters of each kind.
+  ExpandedSignature expandPolymorphicSignature(
       IRGenModule &IGM, CanSILFunctionType type,
       SmallVectorImpl<llvm::Type *> &types,
       SmallVectorImpl<PolymorphicSignatureExpandedTypeSource> *outReqs =

@@ -185,13 +185,15 @@ void swift_task_future_wait_throwing(
 /// func swift_taskGroup_wait_next_throwing(
 ///     waitingTask: Builtin.NativeObject, // current task
 ///     group: Builtin.RawPointer
-/// ) async -> T
+/// ) async throws -> T
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency)
 SWIFT_CC(swiftasync)
 void swift_taskGroup_wait_next_throwing(
-    OpaqueValue *resultPointer, SWIFT_ASYNC_CONTEXT AsyncContext *callerContext,
-    TaskGroup *group, ThrowingTaskFutureWaitContinuationFunction *resumeFn,
+    OpaqueValue *resultPointer,
+    SWIFT_ASYNC_CONTEXT AsyncContext *callerContext,
+    TaskGroup *group,
+    ThrowingTaskFutureWaitContinuationFunction *resumeFn,
     AsyncContext *callContext);
 
 /// Initialize a `TaskGroup` in the passed `group` memory location.
@@ -204,6 +206,17 @@ void swift_taskGroup_wait_next_throwing(
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_taskGroup_initialize(TaskGroup *group, const Metadata *T);
+
+/// Initialize a `TaskGroup` in the passed `group` memory location.
+/// The caller is responsible for retaining and managing the group's lifecycle.
+///
+/// Its Swift signature is
+///
+/// \code
+/// func swift_taskGroup_initialize(flags: Int, group: Builtin.RawPointer)
+/// \endcode
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_taskGroup_initializeWithFlags(size_t flags, TaskGroup *group, const Metadata *T);
 
 /// Attach a child task to the parent task's task group record.
 ///
@@ -275,6 +288,28 @@ void swift_taskGroup_cancelAll(TaskGroup *group);
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 bool swift_taskGroup_isCancelled(TaskGroup *group);
+
+/// Wait until all pending tasks from the task group have completed.
+/// If this task group is accumulating results, this also discards all those results.
+///
+/// This can be called from any thread. Its Swift signature is
+///
+/// \code
+/// func swift_taskGroup_waitAll(
+///     waitingTask: Builtin.NativeObject, // current task
+///     group: Builtin.RawPointer,
+///     bodyError: Swift.Error?
+/// ) async throws
+/// \endcode
+  SWIFT_EXPORT_FROM(swift_Concurrency)
+  SWIFT_CC(swiftasync)
+  void swift_taskGroup_waitAll(
+      OpaqueValue *resultPointer,
+      SWIFT_ASYNC_CONTEXT AsyncContext *callerContext,
+      TaskGroup *group,
+      SwiftError *bodyError,
+      ThrowingTaskFutureWaitContinuationFunction *resumeFn,
+      AsyncContext *callContext);
 
 /// Check the readyQueue of a task group, return true if it has no pending tasks.
 ///
@@ -694,6 +729,13 @@ void swift_task_enqueueGlobalWithDeadline(long long sec, long long nsec,
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_task_enqueueMainExecutor(Job *job);
 
+/// Return true if the caller is running in a Task on the passed Executor.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+bool swift_task_isOnExecutor(
+    HeapObject * executor,
+    const Metadata *selfType,
+    const SerialExecutorWitnessTable *wtable);
+
 #if SWIFT_CONCURRENCY_ENABLE_DISPATCH
 
 /// Enqueue the given job on the main executor.
@@ -730,6 +772,17 @@ SWIFT_CC(swift) void (*swift_task_enqueueGlobalWithDeadline_hook)(
     long long tnsec,
     int clock, Job *job,
     swift_task_enqueueGlobalWithDeadline_original original);
+
+typedef SWIFT_CC(swift) bool (*swift_task_isOnExecutor_original)(
+    HeapObject *executor,
+    const Metadata *selfType,
+    const SerialExecutorWitnessTable *wtable);
+SWIFT_EXPORT_FROM(swift_Concurrency)
+SWIFT_CC(swift) bool (*swift_task_isOnExecutor_hook)(
+    HeapObject *executor,
+    const Metadata *selfType,
+    const SerialExecutorWitnessTable *wtable,
+    swift_task_isOnExecutor_original original);
 
 /// A hook to take over main executor enqueueing.
 typedef SWIFT_CC(swift) void (*swift_task_enqueueMainExecutor_original)(

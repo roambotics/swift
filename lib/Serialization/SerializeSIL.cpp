@@ -518,6 +518,7 @@ void SILSerializer::writeSILFunction(const SILFunction &F, bool DeclOnly) {
       (unsigned)F.isDynamicallyReplaceable(),
       (unsigned)F.isExactSelfClass(),
       (unsigned)F.isDistributed(),
+      (unsigned)F.isRuntimeAccessible(),
       FnID, replacedFunctionID, usedAdHocWitnessFunctionID,
       genericSigID, clangNodeOwnerID, parentModuleID, SemanticsIDs);
 
@@ -646,6 +647,7 @@ void SILSerializer::writeSILBasicBlock(const SILBasicBlock &BB) {
     if (auto *SFA = dyn_cast<SILFunctionArgument>(SA)) {
       packedMetadata |= unsigned(SFA->isNoImplicitCopy()) << 16; // 1 bit
       packedMetadata |= unsigned(SFA->getLifetimeAnnotation()) << 17; // 2 bits
+      packedMetadata |= unsigned(SFA->isClosureCapture()) << 19;      // 1 bit
     }
     // Used: 19 bits. Free: 13.
     //
@@ -913,8 +915,9 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   }
 
   case SILInstructionKind::DebugValueInst:
-    // Currently we don't serialize debug variable infos, so it doesn't make
-    // sense to write the instruction at all.
+  case SILInstructionKind::DebugStepInst:
+    // Currently we don't serialize debug info, so it doesn't make
+    // sense to write those instructions at all.
     // TODO: decide if we want to serialize those instructions.
     return;
   case SILInstructionKind::TestSpecificationInst:
@@ -1079,6 +1082,11 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
     attr |= unsigned(ASI->isLexical()) << 1;
     attr |= unsigned(ASI->getWasMoved()) << 2;
     writeOneTypeLayout(ASI->getKind(), attr, ASI->getElementType());
+    break;
+  }
+  case SILInstructionKind::AllocPackInst: {
+    const AllocPackInst *API = cast<AllocPackInst>(&SI);
+    writeOneTypeLayout(API->getKind(), 0, API->getPackType());
     break;
   }
   case SILInstructionKind::ProjectBoxInst: {
@@ -1480,6 +1488,7 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   case SILInstructionKind::SetDeallocatingInst:
   case SILInstructionKind::DeallocStackInst:
   case SILInstructionKind::DeallocStackRefInst:
+  case SILInstructionKind::DeallocPackInst:
   case SILInstructionKind::DeallocRefInst:
   case SILInstructionKind::DeinitExistentialAddrInst:
   case SILInstructionKind::DeinitExistentialValueInst:
@@ -1646,6 +1655,66 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
         addValueRef(operand2));
     break;
   }
+  case SILInstructionKind::PackElementGetInst: {
+    auto PEGI = cast<PackElementGetInst>(&SI);
+    auto elementType = PEGI->getElementType();
+    auto elementTypeRef = S.addTypeRef(elementType.getASTType());
+    auto pack = PEGI->getPack();
+    auto packType = pack->getType();
+    auto packTypeRef = S.addTypeRef(packType.getASTType());
+    auto packRef = addValueRef(pack);
+    auto indexRef = addValueRef(PEGI->getIndex());
+    SILPackElementGetLayout::emitRecord(Out, ScratchRecord,
+        SILAbbrCodes[SILPackElementGetLayout::Code],
+        elementTypeRef,
+        (unsigned) elementType.getCategory(),
+        packTypeRef,
+        (unsigned) packType.getCategory(),
+        packRef,
+        indexRef);
+    break;
+  }
+  case SILInstructionKind::PackElementSetInst: {
+    auto PESI = cast<PackElementSetInst>(&SI);
+    auto value = PESI->getValue();
+    auto valueType = value->getType();
+    auto valueTypeRef = S.addTypeRef(valueType.getASTType());
+    auto valueRef = addValueRef(value);
+    auto pack = PESI->getPack();
+    auto packType = pack->getType();
+    auto packTypeRef = S.addTypeRef(packType.getASTType());
+    auto packRef = addValueRef(pack);
+    auto indexRef = addValueRef(PESI->getIndex());
+    SILPackElementSetLayout::emitRecord(Out, ScratchRecord,
+        SILAbbrCodes[SILPackElementSetLayout::Code],
+        valueTypeRef,
+        (unsigned) valueType.getCategory(),
+        valueRef,
+        packTypeRef,
+        (unsigned) packType.getCategory(),
+        packRef,
+        indexRef);
+    break;
+  }
+  case SILInstructionKind::TuplePackElementAddrInst: {
+    auto TPEAI = cast<TuplePackElementAddrInst>(&SI);
+    auto elementType = TPEAI->getElementType();
+    auto elementTypeRef = S.addTypeRef(elementType.getASTType());
+    auto tuple = TPEAI->getTuple();
+    auto tupleType = tuple->getType();
+    auto tupleTypeRef = S.addTypeRef(tupleType.getASTType());
+    auto tupleRef = addValueRef(tuple);
+    auto indexRef = addValueRef(TPEAI->getIndex());
+    SILPackElementGetLayout::emitRecord(Out, ScratchRecord,
+        SILAbbrCodes[SILPackElementGetLayout::Code],
+        elementTypeRef,
+        (unsigned) elementType.getCategory(),
+        tupleTypeRef,
+        (unsigned) tupleType.getCategory(),
+        tupleRef,
+        indexRef);
+    break;
+  }
   case SILInstructionKind::TailAddrInst: {
     const TailAddrInst *TAI = cast<TailAddrInst>(&SI);
     SILTailAddrLayout::emitRecord(Out, ScratchRecord,
@@ -1756,6 +1825,35 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
                          ? 0 : 1;
     writeOneTypeOneOperandLayout(open.getKind(), attrs, open.getType(),
                                  open.getOperand());
+    break;
+  }
+  case SILInstructionKind::DynamicPackIndexInst: {
+    auto &dpii = cast<DynamicPackIndexInst>(SI);
+    writeOneTypeOneOperandLayout(dpii.getKind(), 0,
+                                 dpii.getIndexedPackType(),
+                                 dpii.getOperand());
+    break;
+  }
+  case SILInstructionKind::PackPackIndexInst: {
+    auto &ppii = cast<PackPackIndexInst>(SI);
+    writeOneTypeOneOperandLayout(ppii.getKind(),
+                                 ppii.getComponentStartIndex(),
+                                 ppii.getIndexedPackType(),
+                                 ppii.getOperand());
+    break;
+  }
+  case SILInstructionKind::ScalarPackIndexInst: {
+    auto &spii = cast<ScalarPackIndexInst>(SI);
+    writeOneTypeLayout(spii.getKind(),
+                       spii.getComponentIndex(),
+                       spii.getIndexedPackType());
+    break;
+  }
+  case SILInstructionKind::OpenPackElementInst: {
+    auto &opei = cast<OpenPackElementInst>(SI);
+    auto envRef =
+      S.addGenericEnvironmentRef(opei.getOpenedGenericEnvironment());
+    writeOneOperandLayout(SI.getKind(), envRef, opei.getIndexOperand());
     break;
   }
   case SILInstructionKind::GetAsyncContinuationAddrInst: {

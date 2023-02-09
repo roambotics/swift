@@ -39,6 +39,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/type_traits.h"
 #include "swift/SIL/Consumption.h"
@@ -165,12 +166,8 @@ SILGenFunction::emitManagedBeginBorrow(SILLocation loc, SILValue v,
 
 EndBorrowCleanup::EndBorrowCleanup(SILValue borrowedValue)
     : borrowedValue(borrowedValue) {
-  if (auto *arg = dyn_cast<SILPhiArgument>(borrowedValue)) {
-    if (auto *ti = arg->getSingleTerminator()) {
-      assert(!ti->isTransformationTerminator() &&
-             "Transforming terminators do not have end_borrow");
-    }
-  }
+  assert(!SILArgument::isTerminatorResult(borrowedValue) &&
+         "Transforming terminators do not have end_borrow");
 }
 
 void EndBorrowCleanup::emit(SILGenFunction &SGF, CleanupLocation l,
@@ -448,6 +445,7 @@ namespace {
              SGFContext C);
     RValue visitBridgeToObjCExpr(BridgeToObjCExpr *E, SGFContext C);
     RValue visitPackExpansionExpr(PackExpansionExpr *E, SGFContext C);
+    RValue visitPackElementExpr(PackElementExpr *E, SGFContext C);
     RValue visitBridgeFromObjCExpr(BridgeFromObjCExpr *E, SGFContext C);
     RValue visitConditionalBridgeFromObjCExpr(ConditionalBridgeFromObjCExpr *E,
                                               SGFContext C);
@@ -511,6 +509,8 @@ namespace {
 
     RValue visitAssignExpr(AssignExpr *E, SGFContext C);
     RValue visitEnumIsCaseExpr(EnumIsCaseExpr *E, SGFContext C);
+
+    RValue visitSingleValueStmtExpr(SingleValueStmtExpr *E, SGFContext C);
 
     RValue visitBindOptionalExpr(BindOptionalExpr *E, SGFContext C);
     RValue visitOptionalEvaluationExpr(OptionalEvaluationExpr *E,
@@ -1519,6 +1519,11 @@ RValueEmitter::visitPackExpansionExpr(PackExpansionExpr *E,
   llvm_unreachable("not implemented for PackExpansionExpr");
 }
 
+RValue
+RValueEmitter::visitPackElementExpr(PackElementExpr *E, SGFContext C) {
+  llvm_unreachable("not implemented for PackElementExpr");
+}
+
 RValue RValueEmitter::visitArchetypeToSuperExpr(ArchetypeToSuperExpr *E,
                                                 SGFContext C) {
   ManagedValue archetype = SGF.emitRValueAsSingleValue(E->getSubExpr());
@@ -2118,6 +2123,39 @@ RValue RValueEmitter::visitEnumIsCaseExpr(EnumIsCaseExpr *E,
   }
   
   return emitBoolLiteral(SGF, E, selected, C);
+}
+
+RValue RValueEmitter::visitSingleValueStmtExpr(SingleValueStmtExpr *E,
+                                               SGFContext C) {
+  // A void SingleValueStmtExpr either only has Void expression branches, or
+  // we've decided that it should have purely statement semantics. In either
+  // case, we can just emit the statement as-is, and produce the void rvalue.
+  if (E->getType()->isVoid()) {
+    SGF.emitStmt(E->getStmt());
+    return SGF.emitEmptyTupleRValue(E, C);
+  }
+  auto &lowering = SGF.getTypeLowering(E->getType());
+  auto resultAddr = SGF.emitTemporaryAllocation(E, lowering.getLoweredType());
+
+  // This won't give us a useful diagnostic if the result doesn't end up
+  // initialized ("variable '<unknown>' used before being initialized"), but it
+  // will at least catch a potential miscompile when the SIL verifier is
+  // disabled.
+  resultAddr = SGF.B.createMarkUninitialized(
+      E, resultAddr, MarkUninitializedInst::Kind::Var);
+  KnownAddressInitialization init(resultAddr);
+
+  // Collect the target exprs that will be used for initialization.
+  SmallVector<Expr *, 4> scratch;
+  SILGenFunction::SingleValueStmtInitialization initInfo(&init);
+  for (auto *E : E->getSingleExprBranches(scratch))
+    initInfo.Exprs.insert(E);
+
+  // Push the initialization for branches of the statement to initialize into.
+  SGF.SingleValueStmtInitStack.push_back(std::move(initInfo));
+  SWIFT_DEFER { SGF.SingleValueStmtInitStack.pop_back(); };
+  SGF.emitStmt(E->getStmt());
+  return RValue(SGF, E, SGF.emitManagedRValueWithCleanup(resultAddr));
 }
 
 RValue RValueEmitter::visitCoerceExpr(CoerceExpr *E, SGFContext C) {
@@ -2747,9 +2785,11 @@ emitKeyPathRValueBase(SILGenFunction &subSGF,
   // There no real argument to pass to the underlying accessors.
   if (!storage->getDeclContext()->isTypeContext())
     return ManagedValue();
-  
-  auto paramOrigValue =
-      ManagedValue::forBorrowedRValue(paramArg).copy(subSGF, loc);
+
+  auto paramOrigValue = paramArg->getType().isTrivial(subSGF.F)
+                            ? ManagedValue::forTrivialRValue(paramArg)
+                            : ManagedValue::forBorrowedRValue(paramArg);
+  paramOrigValue = paramOrigValue.copy(subSGF, loc);
   auto paramSubstValue = subSGF.emitOrigToSubstValue(loc, paramOrigValue,
                                              AbstractionPattern::getOpaque(),
                                              baseType);
@@ -2927,7 +2967,8 @@ static SILFunction *getOrCreateKeyPathGetter(SILGenModule &SGM,
       (expansion == ResilienceExpansion::Minimal
        ? IsSerialized
        : IsNotSerialized),
-      ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed);
+      ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed,
+      IsNotRuntimeAccessible);
   if (!thunk->empty())
     return thunk;
   
@@ -2946,15 +2987,20 @@ static SILFunction *getOrCreateKeyPathGetter(SILGenModule &SGM,
     subSGF.F.getTypeExpansionContext());
 
   auto entry = thunk->begin();
-  auto resultArgTy = signature->getSingleResult().getSILStorageType(
-      SGM.M, signature, subSGF.F.getTypeExpansionContext());
-  auto baseArgTy = signature->getParameters()[0].getSILStorageType(
-      SGM.M, signature, subSGF.F.getTypeExpansionContext());
+  auto resultArgTy =
+      subSGF.silConv.getSILType(signature->getSingleResult(), signature,
+                                subSGF.F.getTypeExpansionContext());
+  auto baseArgTy =
+      subSGF.silConv.getSILType(signature->getParameters()[0], signature,
+                                subSGF.F.getTypeExpansionContext());
   if (genericEnv) {
     resultArgTy = genericEnv->mapTypeIntoContext(SGM.M, resultArgTy);
     baseArgTy = genericEnv->mapTypeIntoContext(SGM.M, baseArgTy);
   }
-  auto resultArg = entry->createFunctionArgument(resultArgTy);
+  SILFunctionArgument *resultArg = nullptr;
+  if (SGM.M.useLoweredAddresses()) {
+    resultArg = entry->createFunctionArgument(resultArgTy);
+  }
   auto baseArg = entry->createFunctionArgument(baseArgTy);
   SILValue indexPtrArg;
   if (!indexes.empty()) {
@@ -3001,15 +3047,21 @@ static SILFunction *getOrCreateKeyPathGetter(SILGenModule &SGM,
     resultSubst = std::move(resultRValue).getAsSingleValue(subSGF, loc);
   }
 
-  if (resultSubst.getType().getAddressType() != resultArg->getType())
+  if (resultSubst.getType().getAddressType() != resultArgTy)
     resultSubst = subSGF.emitSubstToOrigValue(loc, resultSubst,
                                          AbstractionPattern::getOpaque(),
                                          propertyType);
-  
-  resultSubst.forwardInto(subSGF, loc, resultArg);
-  scope.pop();
-  
-  subSGF.B.createReturn(loc, subSGF.emitEmptyTuple(loc));
+
+  if (SGM.M.useLoweredAddresses()) {
+    resultSubst.forwardInto(subSGF, loc, resultArg);
+    scope.pop();
+
+    subSGF.B.createReturn(loc, subSGF.emitEmptyTuple(loc));
+  } else {
+    auto result = resultSubst.forward(subSGF);
+    scope.pop();
+    subSGF.B.createReturn(loc, result);
+  }
 
   SGM.emitLazyConformancesForFunction(thunk);
   return thunk;
@@ -3098,7 +3150,8 @@ static SILFunction *getOrCreateKeyPathSetter(SILGenModule &SGM,
       (expansion == ResilienceExpansion::Minimal
        ? IsSerialized
        : IsNotSerialized),
-      ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed);
+      ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed,
+      IsNotRuntimeAccessible);
   if (!thunk->empty())
     return thunk;
   
@@ -3283,7 +3336,8 @@ getOrCreateKeyPathEqualsAndHash(SILGenModule &SGM,
         (expansion == ResilienceExpansion::Minimal
          ? IsSerialized
          : IsNotSerialized),
-        ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed);
+        ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed,
+        IsNotRuntimeAccessible);
     if (!equals->empty()) {
       return;
     }
@@ -3460,7 +3514,8 @@ getOrCreateKeyPathEqualsAndHash(SILGenModule &SGM,
         (expansion == ResilienceExpansion::Minimal
          ? IsSerialized
          : IsNotSerialized),
-        ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed);
+        ProfileCounter(), IsThunk, IsNotDynamic, IsNotDistributed,
+        IsNotRuntimeAccessible);
     if (!hash->empty()) {
       return;
     }
@@ -3533,6 +3588,7 @@ getOrCreateKeyPathEqualsAndHash(SILGenModule &SGM,
 static KeyPathPatternComponent::ComputedPropertyId
 getIdForKeyPathComponentComputedProperty(SILGenModule &SGM,
                                          AbstractStorageDecl *storage,
+                                         ResilienceExpansion expansion,
                                          AccessStrategy strategy) {
   switch (strategy.getKind()) {
   case AccessStrategy::Storage:
@@ -3544,7 +3600,8 @@ getIdForKeyPathComponentComputedProperty(SILGenModule &SGM,
     strategy = strategy.getReadStrategy();
     if (strategy.getKind() != AccessStrategy::Storage ||
         !getRepresentativeAccessorForKeyPath(storage)) {
-      return getIdForKeyPathComponentComputedProperty(SGM, storage, strategy);
+      return getIdForKeyPathComponentComputedProperty(SGM, storage, expansion,
+                                                      strategy);
     }
     LLVM_FALLTHROUGH;
   case AccessStrategy::DirectToAccessor: {
@@ -3564,7 +3621,8 @@ getIdForKeyPathComponentComputedProperty(SILGenModule &SGM,
   }
   case AccessStrategy::DispatchToAccessor: {
     // Identify the property by its vtable or wtable slot.
-    return SGM.getAccessorDeclRef(getRepresentativeAccessorForKeyPath(storage));
+    return SGM.getAccessorDeclRef(getRepresentativeAccessorForKeyPath(storage),
+                                  expansion);
   }
 
   case AccessStrategy::DispatchToDistributedThunk: {
@@ -3687,7 +3745,7 @@ SILGenModule::emitKeyPathComponentForDecl(SILLocation loc,
     // either.
     if (baseDecl->requiresOpaqueAccessors()) {
       auto representative = getAccessorDeclRef(
-                           getRepresentativeAccessorForKeyPath(baseDecl));
+          getRepresentativeAccessorForKeyPath(baseDecl), expansion);
       if (representative.isForeign)
         return false;
       if (representative.getLinkage(ForDefinition) > SILLinkage::PublicNonABI)
@@ -3766,7 +3824,7 @@ SILGenModule::emitKeyPathComponentForDecl(SILLocation loc,
 
     // We need thunks to bring the getter and setter to the right signature
     // expected by the key path runtime.
-    auto id = getIdForKeyPathComponentComputedProperty(*this, var,
+    auto id = getIdForKeyPathComponentComputedProperty(*this, var, expansion,
                                                        strategy);
     auto getter = getOrCreateKeyPathGetter(*this,
              var, subs,
@@ -3823,8 +3881,9 @@ SILGenModule::emitKeyPathComponentForDecl(SILLocation loc,
                indexPatterns,
                indexEquals, indexHash);
     }
-    
-    auto id = getIdForKeyPathComponentComputedProperty(*this, decl, strategy);
+
+    auto id = getIdForKeyPathComponentComputedProperty(*this, decl, expansion,
+                                                       strategy);
     auto getter = getOrCreateKeyPathGetter(*this,
              decl, subs,
              needsGenericContext ? genericEnv : nullptr,
@@ -5976,6 +6035,11 @@ RValue RValueEmitter::visitMacroExpansionExpr(MacroExpansionExpr *E,
                                               SGFContext C) {
   auto *rewritten = E->getRewritten();
   assert(rewritten && "Macro should have been rewritten by SILGen");
+  Mangle::ASTMangler mangler;
+  auto name =
+      SGF.getASTContext().getIdentifier(mangler.mangleMacroExpansion(E));
+  MacroScope scope(SGF, CleanupLocation(rewritten), E, name.str(),
+                   E->getMacroRef().getDecl());
   return visit(rewritten, C);
 }
 
