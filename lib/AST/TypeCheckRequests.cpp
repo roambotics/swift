@@ -1012,6 +1012,25 @@ void NamingPatternRequest::cacheResult(NamedPattern *value) const {
 }
 
 //----------------------------------------------------------------------------//
+// ExprPatternMatchRequest caching.
+//----------------------------------------------------------------------------//
+
+Optional<ExprPatternMatchResult>
+ExprPatternMatchRequest::getCachedResult() const {
+  auto *EP = std::get<0>(getStorage());
+  if (!EP->MatchVar)
+    return None;
+
+  return ExprPatternMatchResult(EP->MatchVar, EP->MatchExpr);
+}
+
+void ExprPatternMatchRequest::cacheResult(ExprPatternMatchResult result) const {
+  auto *EP = std::get<0>(getStorage());
+  EP->MatchVar = result.getMatchVar();
+  EP->MatchExpr = result.getMatchExpr();
+}
+
+//----------------------------------------------------------------------------//
 // InterfaceTypeRequest computation.
 //----------------------------------------------------------------------------//
 
@@ -1740,6 +1759,16 @@ ArgumentList *UnresolvedMacroReference::getArgs() const {
   if (auto *attr = pointer.dyn_cast<CustomAttr *>())
     return attr->getArgs();
   llvm_unreachable("Unhandled case");
+}
+
+MacroRoles UnresolvedMacroReference::getMacroRoles() const {
+  if (pointer.is<MacroExpansionExpr *>() || pointer.is<MacroExpansionDecl *>())
+    return getFreestandingMacroRoles();
+
+  if (pointer.is<CustomAttr *>())
+    return getAttachedMacroRoles();
+
+  llvm_unreachable("Unsupported macro reference");
 }
 
 void swift::simple_display(llvm::raw_ostream &out,

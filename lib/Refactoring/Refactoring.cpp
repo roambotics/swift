@@ -59,19 +59,28 @@ class ContextFinder : public SourceEntityWalker {
     }
     return Result;
   }
+
 public:
   ContextFinder(SourceFile &SF, ASTNode TargetNode,
                 std::function<bool(ASTNode)> IsContext =
                   [](ASTNode N) { return true; }) :
                   SF(SF), Ctx(SF.getASTContext()), SM(Ctx.SourceMgr),
                   Target(TargetNode.getSourceRange()), IsContext(IsContext) {}
+
   ContextFinder(SourceFile &SF, SourceLoc TargetLoc,
                 std::function<bool(ASTNode)> IsContext =
                   [](ASTNode N) { return true; }) :
                   SF(SF), Ctx(SF.getASTContext()), SM(Ctx.SourceMgr),
                   Target(TargetLoc), IsContext(IsContext) {
                     assert(TargetLoc.isValid() && "Invalid loc to find");
-                  }
+  }
+
+  // Only need expansions for the expands refactoring, but we
+  // skip nodes that don't contain the passed location anyway.
+  virtual MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
   bool walkToDeclPre(Decl *D, CharSourceRange Range) override { return contains(D); }
   bool walkToStmtPre(Stmt *S) override { return contains(S); }
   bool walkToExprPre(Expr *E) override { return contains(E); }
@@ -477,7 +486,7 @@ public:
 
 class TextReplacementsRenamer : public Renamer {
   llvm::StringSet<> &ReplaceTextContext;
-  std::vector<Replacement> Replacements;
+  SmallVector<Replacement> Replacements;
 
 public:
   const DeclNameViewer New;
@@ -571,7 +580,8 @@ private:
     StringRef Text =
         getReplacementText(ExistingLabel, RangeKind, OldLabel, NewLabel);
     if (Text != ExistingLabel)
-      Replacements.push_back({LabelRange, Text, {}});
+      Replacements.push_back({/*Path=*/{}, LabelRange, /*BufferName=*/{}, Text,
+                              /*RegionsWorthNote=*/{}});
   }
 
   void doRenameLabel(CharSourceRange Label, RefactoringRangeKind RangeKind,
@@ -582,7 +592,9 @@ private:
 
   void doRenameBase(CharSourceRange Range, RefactoringRangeKind) override {
     if (Old.base() != New.base())
-      Replacements.push_back({Range, registerText(New.base()), {}});
+      Replacements.push_back({/*Path=*/{}, Range, /*BufferName=*/{},
+                              registerText(New.base()),
+                              /*RegionsWorthNote=*/{}});
   }
 
 public:
@@ -595,48 +607,71 @@ public:
     assert(Old.partsCount() == New.partsCount());
   }
 
-  std::vector<Replacement> getReplacements() const {
-    return std::move(Replacements);
-  }
+  ArrayRef<Replacement> getReplacements() const { return Replacements; }
 };
 
 static const ValueDecl *getRelatedSystemDecl(const ValueDecl *VD) {
-  if (VD->getModuleContext()->isSystemModule())
+  if (VD->getModuleContext()->isNonUserModule())
     return VD;
   for (auto *Req : VD->getSatisfiedProtocolRequirements()) {
-    if (Req->getModuleContext()->isSystemModule())
+    if (Req->getModuleContext()->isNonUserModule())
       return Req;
   }
   for (auto Over = VD->getOverriddenDecl(); Over;
        Over = Over->getOverriddenDecl()) {
-    if (Over->getModuleContext()->isSystemModule())
+    if (Over->getModuleContext()->isNonUserModule())
       return Over;
   }
   return nullptr;
 }
 
-static Optional<RefactoringKind>
-getAvailableRenameForDecl(const ValueDecl *VD,
-                          Optional<RenameRefInfo> RefInfo) {
-  SmallVector<RenameAvailabilityInfo, 2> Infos;
-  collectRenameAvailabilityInfo(VD, RefInfo, Infos);
-  for (auto &Info : Infos) {
-    if (Info.AvailableKind == RenameAvailableKind::Available)
-      return Info.Kind;
+struct RenameInfo {
+  ValueDecl *VD;
+  RenameAvailabilityInfo Availability;
+};
+
+/// Given a cursor, return the decl and its rename availability. \c None if
+/// the cursor did not resolve to a decl or it resolved to a decl that we do
+/// not allow renaming on.
+static Optional<RenameInfo> getRenameInfo(ResolvedCursorInfoPtr cursorInfo) {
+  auto valueCursor = dyn_cast<ResolvedValueRefCursorInfo>(cursorInfo);
+  if (!valueCursor)
+    return None;
+
+  ValueDecl *VD = valueCursor->typeOrValue();
+  if (!VD)
+    return None;
+
+  Optional<RenameRefInfo> refInfo;
+  if (!valueCursor->getShorthandShadowedDecls().empty()) {
+    // Find the outermost decl for a shorthand if let/closure capture
+    VD = valueCursor->getShorthandShadowedDecls().back();
+  } else if (valueCursor->isRef()) {
+    refInfo = {valueCursor->getSourceFile(), valueCursor->getLoc(),
+               valueCursor->isKeywordArgument()};
   }
-  return None;
+
+  Optional<RenameAvailabilityInfo> info = renameAvailabilityInfo(VD, refInfo);
+  if (!info)
+    return None;
+
+  return RenameInfo{VD, *info};
 }
 
 class RenameRangeCollector : public IndexDataConsumer {
 public:
   RenameRangeCollector(StringRef USR, StringRef newName)
-      : USR(USR.str()), newName(newName.str()) {}
+      : USR(USR), newName(newName) {}
 
   RenameRangeCollector(const ValueDecl *D, StringRef newName)
-      : newName(newName.str()) {
-    llvm::raw_string_ostream OS(USR);
+      : newName(newName) {
+    SmallString<64> SS;
+    llvm::raw_svector_ostream OS(SS);
     printValueDeclUSR(D, OS);
+    USR = stringStorage.copyString(SS.str());
   }
+
+  RenameRangeCollector(RenameRangeCollector &&collector) = default;
 
   ArrayRef<RenameLoc> results() const { return locations; }
 
@@ -679,8 +714,8 @@ private:
                                              StringRef NewName);
 
 private:
-  std::string USR;
-  std::string newName;
+  StringRef USR;
+  StringRef newName;
   StringScratchSpace stringStorage;
   std::vector<RenameLoc> locations;
 };
@@ -729,27 +764,12 @@ RenameRangeCollector::indexSymbolToRenameLoc(const index::IndexSymbol &symbol,
                    isFunctionLike, isNonProtocolType};
 }
 
-ArrayRef<SourceFile*>
-collectSourceFiles(ModuleDecl *MD, SmallVectorImpl<SourceFile *> &Scratch) {
-  for (auto Unit : MD->getFiles()) {
-    if (auto SF = dyn_cast<SourceFile>(Unit)) {
-      Scratch.push_back(SF);
-    }
-  }
-  return llvm::makeArrayRef(Scratch);
-}
-
-/// Get the source file that contains the given range and belongs to the module.
+/// Get the source file that corresponds to the given buffer.
 SourceFile *getContainingFile(ModuleDecl *M, RangeConfig Range) {
-  SmallVector<SourceFile*, 4> Files;
-  for (auto File : collectSourceFiles(M, Files)) {
-    if (File->getBufferID()) {
-      if (File->getBufferID().value() == Range.BufferId) {
-        return File;
-      }
-    }
-  }
-  return nullptr;
+  auto &SM = M->getASTContext().SourceMgr;
+  // TODO: We should add an ID -> SourceFile mapping.
+  return M->getSourceFileContainingLocation(
+      SM.getRangeForBuffer(Range.BufferID).getStart());
 }
 
 class RefactoringAction {
@@ -788,33 +808,35 @@ RefactoringAction(ModuleDecl *MD, RefactoringOptions &Opts,
 /// rename or reverse if statement.
 class TokenBasedRefactoringAction : public RefactoringAction {
 protected:
-  ResolvedCursorInfo CursorInfo;
+  ResolvedCursorInfoPtr CursorInfo;
+
 public:
   TokenBasedRefactoringAction(ModuleDecl *MD, RefactoringOptions &Opts,
                               SourceEditConsumer &EditConsumer,
                               DiagnosticConsumer &DiagConsumer) :
   RefactoringAction(MD, Opts, EditConsumer, DiagConsumer) {
   // Resolve the sema token and save it for later use.
-  CursorInfo = evaluateOrDefault(TheFile->getASTContext().evaluator,
-                          CursorInfoRequest{ CursorInfoOwner(TheFile, StartLoc)},
-                                 ResolvedCursorInfo());
+  CursorInfo =
+      evaluateOrDefault(TheFile->getASTContext().evaluator,
+                        CursorInfoRequest{CursorInfoOwner(TheFile, StartLoc)},
+                        new ResolvedCursorInfo());
   }
 };
 
-#define CURSOR_REFACTORING(KIND, NAME, ID)                                    \
-class RefactoringAction##KIND: public TokenBasedRefactoringAction {           \
-  public:                                                                     \
-  RefactoringAction##KIND(ModuleDecl *MD, RefactoringOptions &Opts,           \
-                          SourceEditConsumer &EditConsumer,                   \
-                          DiagnosticConsumer &DiagConsumer) :                 \
-    TokenBasedRefactoringAction(MD, Opts, EditConsumer, DiagConsumer) {}      \
-  bool performChange() override;                                              \
-  static bool isApplicable(const ResolvedCursorInfo &Info,                    \
-                           DiagnosticEngine &Diag);                           \
-  bool isApplicable() {                                                       \
-    return RefactoringAction##KIND::isApplicable(CursorInfo, DiagEngine) ;    \
-  }                                                                           \
-};
+#define CURSOR_REFACTORING(KIND, NAME, ID)                                     \
+  class RefactoringAction##KIND : public TokenBasedRefactoringAction {         \
+  public:                                                                      \
+    RefactoringAction##KIND(ModuleDecl *MD, RefactoringOptions &Opts,          \
+                            SourceEditConsumer &EditConsumer,                  \
+                            DiagnosticConsumer &DiagConsumer)                  \
+        : TokenBasedRefactoringAction(MD, Opts, EditConsumer, DiagConsumer) {} \
+    bool performChange() override;                                             \
+    static bool isApplicable(ResolvedCursorInfoPtr Info,                       \
+                             DiagnosticEngine &Diag);                          \
+    bool isApplicable() {                                                      \
+      return RefactoringAction##KIND::isApplicable(CursorInfo, DiagEngine);    \
+    }                                                                          \
+  };
 #include "swift/Refactoring/RefactoringKinds.def"
 
 class RangeBasedRefactoringAction : public RefactoringAction {
@@ -846,31 +868,16 @@ class RefactoringAction##KIND: public RangeBasedRefactoringAction {           \
 };
 #include "swift/Refactoring/RefactoringKinds.def"
 
-bool RefactoringActionLocalRename::
-isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
-  auto ValueRefInfo = dyn_cast<ResolvedValueRefCursorInfo>(&CursorInfo);
-  if (!ValueRefInfo)
-    return false;
-
-  Optional<RenameRefInfo> RefInfo;
-  if (ValueRefInfo->isRef())
-    RefInfo = {CursorInfo.getSourceFile(), CursorInfo.getLoc(),
-               ValueRefInfo->isKeywordArgument()};
-
-  auto RenameOp = getAvailableRenameForDecl(ValueRefInfo->getValueD(), RefInfo);
-  return RenameOp.has_value() &&
-    RenameOp.value() == RefactoringKind::LocalRename;
+bool RefactoringActionLocalRename::isApplicable(
+    ResolvedCursorInfoPtr CursorInfo, DiagnosticEngine &Diag) {
+  Optional<RenameInfo> Info = getRenameInfo(CursorInfo);
+  return Info &&
+         Info->Availability.AvailableKind == RenameAvailableKind::Available &&
+         Info->Availability.Kind == RefactoringKind::LocalRename;
 }
 
-static void analyzeRenameScope(ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
-                               DiagnosticEngine &Diags,
+static void analyzeRenameScope(ValueDecl *VD,
                                SmallVectorImpl<DeclContext *> &Scopes) {
-  Scopes.clear();
-  if (!getAvailableRenameForDecl(VD, RefInfo).has_value()) {
-    Diags.diagnose(SourceLoc(), diag::value_decl_no_loc, VD->getName());
-    return;
-  }
-
   auto *Scope = VD->getDeclContext();
   // There may be sibling decls that the renamed symbol is visible from.
   switch (Scope->getContextKind()) {
@@ -885,6 +892,7 @@ static void analyzeRenameScope(ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
   case DeclContextKind::AbstractClosureExpr:
   case DeclContextKind::Initializer:
   case DeclContextKind::SerializedLocal:
+  case DeclContextKind::Package:
   case DeclContextKind::Module:
   case DeclContextKind::FileUnit:
   case DeclContextKind::MacroDecl:
@@ -892,6 +900,53 @@ static void analyzeRenameScope(ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
   }
 
   Scopes.push_back(Scope);
+}
+
+static Optional<RenameRangeCollector> localRenames(SourceFile *SF,
+                                                   SourceLoc startLoc,
+                                                   StringRef preferredName,
+                                                   DiagnosticEngine &diags) {
+  auto cursorInfo =
+      evaluateOrDefault(SF->getASTContext().evaluator,
+                        CursorInfoRequest{CursorInfoOwner(SF, startLoc)},
+                        new ResolvedCursorInfo());
+
+  Optional<RenameInfo> info = getRenameInfo(cursorInfo);
+  if (!info) {
+    diags.diagnose(startLoc, diag::unresolved_location);
+    return None;
+  }
+
+  switch (info->Availability.AvailableKind) {
+  case RenameAvailableKind::Available:
+    break;
+  case RenameAvailableKind::Unavailable_system_symbol:
+    diags.diagnose(startLoc, diag::decl_is_system_symbol, info->VD->getName());
+    return None;
+  case RenameAvailableKind::Unavailable_has_no_location:
+    diags.diagnose(startLoc, diag::value_decl_no_loc, info->VD->getName());
+    return None;
+  case RenameAvailableKind::Unavailable_has_no_name:
+    diags.diagnose(startLoc, diag::decl_has_no_name);
+    return None;
+  case RenameAvailableKind::Unavailable_has_no_accessibility:
+    diags.diagnose(startLoc, diag::decl_no_accessibility);
+    return None;
+  case RenameAvailableKind::Unavailable_decl_from_clang:
+    diags.diagnose(startLoc, diag::decl_from_clang);
+    return None;
+  }
+
+  SmallVector<DeclContext *, 8> scopes;
+  analyzeRenameScope(info->VD, scopes);
+  if (scopes.empty())
+    return None;
+
+  RenameRangeCollector rangeCollector(info->VD, preferredName);
+  for (DeclContext *DC : scopes)
+    indexDeclContext(DC, rangeCollector);
+
+  return rangeCollector;
 }
 
 bool RefactoringActionLocalRename::performChange() {
@@ -908,39 +963,16 @@ bool RefactoringActionLocalRename::performChange() {
                         MD->getNameStr());
     return true;
   }
-  CursorInfo = evaluateOrDefault(TheFile->getASTContext().evaluator,
-                          CursorInfoRequest{CursorInfoOwner(TheFile, StartLoc)},
-                                 ResolvedCursorInfo());
-  auto ValueRefCursorInfo = dyn_cast<ResolvedValueRefCursorInfo>(&CursorInfo);
-  if (ValueRefCursorInfo && ValueRefCursorInfo->getValueD()) {
-    ValueDecl *VD = ValueRefCursorInfo->typeOrValue();
-    // The index always uses the outermost shadow for references
-    if (!ValueRefCursorInfo->getShorthandShadowedDecls().empty()) {
-      VD = ValueRefCursorInfo->getShorthandShadowedDecls().back();
-    }
 
-    SmallVector<DeclContext *, 8> Scopes;
-
-    Optional<RenameRefInfo> RefInfo;
-    if (ValueRefCursorInfo->isRef())
-      RefInfo = {CursorInfo.getSourceFile(), CursorInfo.getLoc(),
-                 ValueRefCursorInfo->isKeywordArgument()};
-
-    analyzeRenameScope(VD, RefInfo, DiagEngine, Scopes);
-    if (Scopes.empty())
-      return true;
-    RenameRangeCollector rangeCollector(VD, PreferredName);
-    for (DeclContext *DC : Scopes)
-      indexDeclContext(DC, rangeCollector);
-
-    auto consumers = DiagEngine.takeConsumers();
-    assert(consumers.size() == 1);
-    return syntacticRename(TheFile, rangeCollector.results(), EditConsumer,
-                           *consumers[0]);
-  } else {
-    DiagEngine.diagnose(StartLoc, diag::unresolved_location);
+  Optional<RenameRangeCollector> rangeCollector =
+      localRenames(TheFile, StartLoc, PreferredName, DiagEngine);
+  if (!rangeCollector)
     return true;
-  }
+
+  auto consumers = DiagEngine.takeConsumers();
+  assert(consumers.size() == 1);
+  return syntacticRename(TheFile, rangeCollector->results(), EditConsumer,
+                         *consumers[0]);
 }
 
 StringRef getDefaultPreferredName(RefactoringKind Kind) {
@@ -994,7 +1026,7 @@ public:
 ExtractCheckResult checkExtractConditions(const ResolvedRangeInfo &RangeInfo,
                                           DiagnosticEngine &DiagEngine) {
   SmallVector<CannotExtractReason, 2> AllReasons;
-  // If any declared declaration is refered out of the given range, return false.
+  // If any declared declaration is referred out of the given range, return false.
   auto Declared = RangeInfo.DeclaredDecls;
   auto It = std::find_if(Declared.begin(), Declared.end(),
                          [](DeclaredDecl DD) { return DD.ReferredAfterRange; });
@@ -1081,6 +1113,7 @@ ExtractCheckResult checkExtractConditions(const ResolvedRangeInfo &RangeInfo,
     break;
 
   case swift::DeclContextKind::SerializedLocal:
+  case swift::DeclContextKind::Package:
   case swift::DeclContextKind::Module:
   case swift::DeclContextKind::FileUnit:
   case swift::DeclContextKind::GenericTypeDecl:
@@ -1826,8 +1859,8 @@ bool RefactoringActionReplaceBodiesWithFatalError::performChange() {
 }
 
 static std::pair<IfStmt *, IfStmt *>
-findCollapseNestedIfTarget(const ResolvedCursorInfo &CursorInfo) {
-  auto StmtStartInfo = dyn_cast<ResolvedStmtStartCursorInfo>(&CursorInfo);
+findCollapseNestedIfTarget(ResolvedCursorInfoPtr CursorInfo) {
+  auto StmtStartInfo = dyn_cast<ResolvedStmtStartCursorInfo>(CursorInfo);
   if (!StmtStartInfo)
     return {};
 
@@ -1855,8 +1888,8 @@ findCollapseNestedIfTarget(const ResolvedCursorInfo &CursorInfo) {
   return {OuterIf, InnerIf};
 }
 
-bool RefactoringActionCollapseNestedIfStmt::
-isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
+bool RefactoringActionCollapseNestedIfStmt::isApplicable(
+    ResolvedCursorInfoPtr CursorInfo, DiagnosticEngine &Diag) {
   return findCollapseNestedIfTarget(CursorInfo).first;
 }
 
@@ -2400,6 +2433,10 @@ isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
     bool ConditionUseOnlyAllowedFunctions = false;
     StringRef ExpectName;
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
+
     PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
       if (E->getKind() != ExprKind::DeclRef)
         return Action::Continue(E);
@@ -2498,6 +2535,10 @@ bool RefactoringActionConvertToSwitchStmt::performChange() {
   public:
     std::string VarName;
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
+
     PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
       if (E->getKind() != ExprKind::DeclRef)
         return Action::Continue(E);
@@ -2514,6 +2555,10 @@ bool RefactoringActionConvertToSwitchStmt::performChange() {
     ConditionalPatternFinder(SourceManager &SM) : SM(SM) {}
 
     SmallString<64> ConditionalPattern = SmallString<64>();
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
 
     PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
       auto *BE = dyn_cast<BinaryExpr>(E);
@@ -2897,8 +2942,8 @@ public:
 
   FillProtocolStubContext() : DC(nullptr), Adopter(), FillingContents({}) {};
 
-  static FillProtocolStubContext getContextFromCursorInfo(
-      const ResolvedCursorInfo &Tok);
+  static FillProtocolStubContext
+  getContextFromCursorInfo(ResolvedCursorInfoPtr Tok);
 
   ArrayRef<ValueDecl*> getFillingContents() const {
     return llvm::makeArrayRef(FillingContents);
@@ -2916,11 +2961,11 @@ public:
   SourceLoc getBraceStartLoc() const { return BraceStartLoc; }
 };
 
-FillProtocolStubContext FillProtocolStubContext::
-getContextFromCursorInfo(const ResolvedCursorInfo &CursorInfo) {
-  if(!CursorInfo.isValid())
+FillProtocolStubContext FillProtocolStubContext::getContextFromCursorInfo(
+    ResolvedCursorInfoPtr CursorInfo) {
+  if (!CursorInfo->isValid())
     return FillProtocolStubContext();
-  auto ValueRefInfo = dyn_cast<ResolvedValueRefCursorInfo>(&CursorInfo);
+  auto ValueRefInfo = dyn_cast<ResolvedValueRefCursorInfo>(CursorInfo);
   if (!ValueRefInfo) {
     return FillProtocolStubContext();
   }
@@ -2952,8 +2997,8 @@ getUnsatisfiedRequirements(const IterableDeclContext *IDC) {
   return NonWitnessedReqs;
 }
 
-bool RefactoringActionFillProtocolStub::
-isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
+bool RefactoringActionFillProtocolStub::isApplicable(ResolvedCursorInfoPtr Tok,
+                                                     DiagnosticEngine &Diag) {
   return FillProtocolStubContext::getContextFromCursorInfo(Tok).canProceed();
 }
 
@@ -2997,9 +3042,11 @@ static void collectAvailableRefactoringsAtCursor(
   if (Loc.isInvalid())
     return;
 
-  ResolvedCursorInfo Tok = evaluateOrDefault(SF->getASTContext().evaluator,
-    CursorInfoRequest{CursorInfoOwner(SF, Lexer::getLocForStartOfToken(SM, Loc))},
-                                             ResolvedCursorInfo());
+  ResolvedCursorInfoPtr Tok =
+      evaluateOrDefault(SF->getASTContext().evaluator,
+                        CursorInfoRequest{CursorInfoOwner(
+                            SF, Lexer::getLocForStartOfToken(SM, Loc))},
+                        new ResolvedCursorInfo());
   collectAvailableRefactorings(Tok, Kinds, /*Exclude rename*/ false);
 }
 
@@ -3071,19 +3118,19 @@ static SwitchStmt* findEnclosingSwitchStmt(CaseStmt *CS,
   return SwitchS;
 }
 
-bool RefactoringActionExpandDefault::
-isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
+bool RefactoringActionExpandDefault::isApplicable(
+    ResolvedCursorInfoPtr CursorInfo, DiagnosticEngine &Diag) {
   auto Exit = [&](bool Applicable) {
     if (!Applicable)
       Diag.diagnose(SourceLoc(), diag::invalid_default_location);
     return Applicable;
   };
-  auto StmtStartInfo = dyn_cast<ResolvedStmtStartCursorInfo>(&CursorInfo);
+  auto StmtStartInfo = dyn_cast<ResolvedStmtStartCursorInfo>(CursorInfo);
   if (!StmtStartInfo)
     return Exit(false);
   if (auto *CS = dyn_cast<CaseStmt>(StmtStartInfo->getTrailingStmt())) {
     auto EnclosingSwitchStmt =
-        findEnclosingSwitchStmt(CS, CursorInfo.getSourceFile(), Diag);
+        findEnclosingSwitchStmt(CS, CursorInfo->getSourceFile(), Diag);
     if (!EnclosingSwitchStmt)
       return false;
     auto EnumD = getEnumDeclFromSwitchStmt(EnclosingSwitchStmt);
@@ -3097,7 +3144,7 @@ bool RefactoringActionExpandDefault::performChange() {
   // If we've not seen the default statement inside the switch statement, issue
   // error.
   auto StmtStartInfo = cast<ResolvedStmtStartCursorInfo>(CursorInfo);
-  auto *CS = static_cast<CaseStmt *>(StmtStartInfo.getTrailingStmt());
+  auto *CS = static_cast<CaseStmt *>(StmtStartInfo->getTrailingStmt());
   auto *SwitchS = findEnclosingSwitchStmt(CS, TheFile, DiagEngine);
   assert(SwitchS);
   EditorConsumerInsertStream OS(EditConsumer, SM,
@@ -3109,9 +3156,9 @@ bool RefactoringActionExpandDefault::performChange() {
                                            OS);
 }
 
-bool RefactoringActionExpandSwitchCases::
-isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &DiagEngine) {
-  auto StmtStartInfo = dyn_cast<ResolvedStmtStartCursorInfo>(&CursorInfo);
+bool RefactoringActionExpandSwitchCases::isApplicable(
+    ResolvedCursorInfoPtr CursorInfo, DiagnosticEngine &DiagEngine) {
+  auto StmtStartInfo = dyn_cast<ResolvedStmtStartCursorInfo>(CursorInfo);
   if (!StmtStartInfo || !StmtStartInfo->getTrailingStmt())
     return false;
   if (auto *Switch = dyn_cast<SwitchStmt>(StmtStartInfo->getTrailingStmt())) {
@@ -3122,7 +3169,7 @@ isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &DiagEngine)
 
 bool RefactoringActionExpandSwitchCases::performChange() {
   auto StmtStartInfo = cast<ResolvedStmtStartCursorInfo>(CursorInfo);
-  auto *SwitchS = dyn_cast<SwitchStmt>(StmtStartInfo.getTrailingStmt());
+  auto *SwitchS = dyn_cast<SwitchStmt>(StmtStartInfo->getTrailingStmt());
   assert(SwitchS);
 
   auto InsertRange = CharSourceRange();
@@ -3149,8 +3196,8 @@ bool RefactoringActionExpandSwitchCases::performChange() {
   return Result;
 }
 
-static Expr *findLocalizeTarget(const ResolvedCursorInfo &CursorInfo) {
-  auto ExprStartInfo = dyn_cast<ResolvedExprStartCursorInfo>(&CursorInfo);
+static Expr *findLocalizeTarget(ResolvedCursorInfoPtr CursorInfo) {
+  auto ExprStartInfo = dyn_cast<ResolvedExprStartCursorInfo>(CursorInfo);
   if (!ExprStartInfo)
     return nullptr;
   struct StringLiteralFinder: public SourceEntityWalker {
@@ -3173,8 +3220,8 @@ static Expr *findLocalizeTarget(const ResolvedCursorInfo &CursorInfo) {
   return Walker.Target;
 }
 
-bool RefactoringActionLocalizeString::
-isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
+bool RefactoringActionLocalizeString::isApplicable(ResolvedCursorInfoPtr Tok,
+                                                   DiagnosticEngine &Diag) {
   return findLocalizeTarget(Tok);
 }
 
@@ -3255,9 +3302,9 @@ static void generateMemberwiseInit(SourceEditConsumer &EditConsumer,
 }
 
 static SourceLoc
-collectMembersForInit(const ResolvedCursorInfo &CursorInfo,
+collectMembersForInit(ResolvedCursorInfoPtr CursorInfo,
                       SmallVectorImpl<MemberwiseParameter> &memberVector) {
-  auto ValueRefInfo = dyn_cast<ResolvedValueRefCursorInfo>(&CursorInfo);
+  auto ValueRefInfo = dyn_cast<ResolvedValueRefCursorInfo>(CursorInfo);
   if (!ValueRefInfo || !ValueRefInfo->getValueD())
     return SourceLoc();
 
@@ -3314,13 +3361,13 @@ collectMembersForInit(const ResolvedCursorInfo &CursorInfo,
   return targetLocation;
 }
 
-bool RefactoringActionMemberwiseInitLocalRefactoring::
-isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
-  
+bool RefactoringActionMemberwiseInitLocalRefactoring::isApplicable(
+    ResolvedCursorInfoPtr Tok, DiagnosticEngine &Diag) {
+
   SmallVector<MemberwiseParameter, 8> memberVector;
   return collectMembersForInit(Tok, memberVector).isValid();
 }
-    
+
 bool RefactoringActionMemberwiseInitLocalRefactoring::performChange() {
   
   SmallVector<MemberwiseParameter, 8> memberVector;
@@ -3424,7 +3471,7 @@ public:
   Protocols(), StoredProperties(), Range(nullptr, nullptr) {};
 
   static AddEquatableContext
-  getDeclarationContextFromInfo(const ResolvedCursorInfo &Info);
+  getDeclarationContextFromInfo(ResolvedCursorInfoPtr Info);
 
   std::string getInsertionTextForProtocol();
 
@@ -3537,9 +3584,9 @@ getProtocolRequirements() {
   return Collection;
 }
 
-AddEquatableContext AddEquatableContext::
-getDeclarationContextFromInfo(const ResolvedCursorInfo &Info) {
-  auto ValueRefInfo = dyn_cast<ResolvedValueRefCursorInfo>(&Info);
+AddEquatableContext
+AddEquatableContext::getDeclarationContextFromInfo(ResolvedCursorInfoPtr Info) {
+  auto ValueRefInfo = dyn_cast<ResolvedValueRefCursorInfo>(Info);
   if (!ValueRefInfo) {
     return AddEquatableContext();
   }
@@ -3582,8 +3629,8 @@ printFunctionBody(ASTPrinter &Printer, StringRef ExtraIndent, ParameterList *Par
   }
 }
 
-bool RefactoringActionAddEquatableConformance::
-isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
+bool RefactoringActionAddEquatableConformance::isApplicable(
+    ResolvedCursorInfoPtr Tok, DiagnosticEngine &Diag) {
   return AddEquatableContext::getDeclarationContextFromInfo(Tok).isValid();
 }
 
@@ -3634,10 +3681,10 @@ public:
   AddCodableContext() : DC(nullptr), Protocols(), Range(nullptr, nullptr){};
 
   static AddCodableContext
-  getDeclarationContextFromInfo(const ResolvedCursorInfo &Info);
+  getDeclarationContextFromInfo(ResolvedCursorInfoPtr Info);
 
-  void printInsertionText(const ResolvedCursorInfo &CursorInfo,
-                          SourceManager &SM, llvm::raw_ostream &OS);
+  void printInsertionText(ResolvedCursorInfoPtr CursorInfo, SourceManager &SM,
+                          llvm::raw_ostream &OS);
 
   bool isValid() { return StartLoc.isValid() && conformsToCodableProtocol(); }
 
@@ -3662,6 +3709,10 @@ private:
 
 public:
   SynthesizedCodablePrinter(ASTPrinter &Printer) : Printer(Printer) {}
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Arguments;
+  }
 
   PreWalkAction walkToDeclPre(Decl *D) override {
     auto *VD = dyn_cast<ValueDecl>(D);
@@ -3717,7 +3768,7 @@ public:
   }
 };
 
-void AddCodableContext::printInsertionText(const ResolvedCursorInfo &CursorInfo,
+void AddCodableContext::printInsertionText(ResolvedCursorInfoPtr CursorInfo,
                                            SourceManager &SM,
                                            llvm::raw_ostream &OS) {
   StringRef ExtraIndent;
@@ -3736,9 +3787,9 @@ void AddCodableContext::printInsertionText(const ResolvedCursorInfo &CursorInfo,
   DC->getAsDecl()->walk(Walker);
 }
 
-AddCodableContext AddCodableContext::getDeclarationContextFromInfo(
-    const ResolvedCursorInfo &Info) {
-  auto ValueRefInfo = dyn_cast<ResolvedValueRefCursorInfo>(&Info);
+AddCodableContext
+AddCodableContext::getDeclarationContextFromInfo(ResolvedCursorInfoPtr Info) {
+  auto ValueRefInfo = dyn_cast<ResolvedValueRefCursorInfo>(Info);
   if (!ValueRefInfo) {
     return AddCodableContext();
   }
@@ -3754,7 +3805,7 @@ AddCodableContext AddCodableContext::getDeclarationContextFromInfo(
 }
 
 bool RefactoringActionAddExplicitCodableImplementation::isApplicable(
-    const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
+    ResolvedCursorInfoPtr Tok, DiagnosticEngine &Diag) {
   return AddCodableContext::getDeclarationContextFromInfo(Tok).isValid();
 }
 
@@ -3798,9 +3849,9 @@ findSourceRangeToWrapInCatch(const ResolvedExprStartCursorInfo &CursorInfo,
   return ConvertToCharRange(TargetNode.getSourceRange());
 }
 
-bool RefactoringActionConvertToDoCatch::
-isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
-  auto ExprStartInfo = dyn_cast<ResolvedExprStartCursorInfo>(&Tok);
+bool RefactoringActionConvertToDoCatch::isApplicable(ResolvedCursorInfoPtr Tok,
+                                                     DiagnosticEngine &Diag) {
+  auto ExprStartInfo = dyn_cast<ResolvedExprStartCursorInfo>(Tok);
   if (!ExprStartInfo || !ExprStartInfo->getTrailingExpr())
     return false;
   return isa<ForceTryExpr>(ExprStartInfo->getTrailingExpr());
@@ -3808,9 +3859,9 @@ isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
 
 bool RefactoringActionConvertToDoCatch::performChange() {
   auto ExprStartInfo = cast<ResolvedExprStartCursorInfo>(CursorInfo);
-  auto *TryExpr = dyn_cast<ForceTryExpr>(ExprStartInfo.getTrailingExpr());
+  auto *TryExpr = dyn_cast<ForceTryExpr>(ExprStartInfo->getTrailingExpr());
   assert(TryExpr);
-  auto Range = findSourceRangeToWrapInCatch(ExprStartInfo, TheFile, SM);
+  auto Range = findSourceRangeToWrapInCatch(*ExprStartInfo, TheFile, SM);
   if (!Range.isValid())
     return true;
   // Wrap given range in do catch block.
@@ -3827,10 +3878,9 @@ bool RefactoringActionConvertToDoCatch::performChange() {
 
 /// Given a cursor position, this function tries to collect a number literal
 /// expression immediately following the cursor.
-static NumberLiteralExpr *getTrailingNumberLiteral(
-    const ResolvedCursorInfo &Tok) {
+static NumberLiteralExpr *getTrailingNumberLiteral(ResolvedCursorInfoPtr Tok) {
   // This cursor must point to the start of an expression.
-  auto ExprStartInfo = dyn_cast<ResolvedExprStartCursorInfo>(&Tok);
+  auto ExprStartInfo = dyn_cast<ResolvedExprStartCursorInfo>(Tok);
   if (!ExprStartInfo)
     return nullptr;
 
@@ -3843,6 +3893,10 @@ static NumberLiteralExpr *getTrailingNumberLiteral(
     NumberLiteralExpr *found = nullptr;
 
     explicit FindLiteralNumber(Expr *parent) : parent(parent) { }
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
 
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
       if (auto *literal = dyn_cast<NumberLiteralExpr>(expr)) {
@@ -3898,8 +3952,8 @@ void insertUnderscoreInDigits(StringRef Digits,
   }
 }
 
-bool RefactoringActionSimplifyNumberLiteral::
-isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
+bool RefactoringActionSimplifyNumberLiteral::isApplicable(
+    ResolvedCursorInfoPtr Tok, DiagnosticEngine &Diag) {
   if (auto *Literal = getTrailingNumberLiteral(Tok)) {
     SmallString<64> Buffer;
     llvm::raw_svector_ostream OS(Buffer);
@@ -3927,15 +3981,15 @@ bool RefactoringActionSimplifyNumberLiteral::performChange() {
   return true;
 }
 
-static CallExpr *findTrailingClosureTarget(
-    SourceManager &SM, const ResolvedCursorInfo &CursorInfo) {
-  if (CursorInfo.getKind() == CursorInfoKind::StmtStart)
+static CallExpr *findTrailingClosureTarget(SourceManager &SM,
+                                           ResolvedCursorInfoPtr CursorInfo) {
+  if (CursorInfo->getKind() == CursorInfoKind::StmtStart)
     // StmtStart postion can't be a part of CallExpr.
     return nullptr;
 
   // Find inner most CallExpr
   ContextFinder Finder(
-      *CursorInfo.getSourceFile(), CursorInfo.getLoc(), [](ASTNode N) {
+      *CursorInfo->getSourceFile(), CursorInfo->getLoc(), [](ASTNode N) {
         return N.isStmt(StmtKind::Brace) || N.isExpr(ExprKind::Call);
       });
   Finder.resolve();
@@ -3967,9 +4021,9 @@ static CallExpr *findTrailingClosureTarget(
   return nullptr;
 }
 
-bool RefactoringActionTrailingClosure::
-isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
-  SourceManager &SM = CursorInfo.getSourceFile()->getASTContext().SourceMgr;
+bool RefactoringActionTrailingClosure::isApplicable(
+    ResolvedCursorInfoPtr CursorInfo, DiagnosticEngine &Diag) {
+  SourceManager &SM = CursorInfo->getSourceFile()->getASTContext().SourceMgr;
   return findTrailingClosureTarget(SM, CursorInfo);
 }
 
@@ -4160,7 +4214,7 @@ FuncDecl *getUnderlyingFunc(const Expr *Fn) {
 }
 
 /// Find the outermost call of the given location
-CallExpr *findOuterCall(const ResolvedCursorInfo &CursorInfo) {
+CallExpr *findOuterCall(ResolvedCursorInfoPtr CursorInfo) {
   auto IncludeInContext = [](ASTNode N) {
     if (auto *E = N.dyn_cast<Expr *>())
       return !E->isImplicit();
@@ -4170,7 +4224,7 @@ CallExpr *findOuterCall(const ResolvedCursorInfo &CursorInfo) {
   // TODO: Bit pointless using the "ContextFinder" here. Ideally we would have
   //       already generated a slice of the AST for anything that contains
   //       the cursor location
-  ContextFinder Finder(*CursorInfo.getSourceFile(), CursorInfo.getLoc(),
+  ContextFinder Finder(*CursorInfo->getSourceFile(), CursorInfo->getLoc(),
                        IncludeInContext);
   Finder.resolve();
   auto Contexts = Finder.getContexts();
@@ -4181,22 +4235,22 @@ CallExpr *findOuterCall(const ResolvedCursorInfo &CursorInfo) {
   if (!CE)
     return nullptr;
 
-  SourceManager &SM = CursorInfo.getSourceFile()->getASTContext().SourceMgr;
-  if (!SM.rangeContains(CE->getFn()->getSourceRange(), CursorInfo.getLoc()))
+  SourceManager &SM = CursorInfo->getSourceFile()->getASTContext().SourceMgr;
+  if (!SM.rangeContains(CE->getFn()->getSourceRange(), CursorInfo->getLoc()))
     return nullptr;
   return CE;
 }
 
 /// Find the function matching the given location if it is not an accessor and
 /// either has a body or is a member of a protocol
-FuncDecl *findFunction(const ResolvedCursorInfo &CursorInfo) {
+FuncDecl *findFunction(ResolvedCursorInfoPtr CursorInfo) {
   auto IncludeInContext = [](ASTNode N) {
     if (auto *D = N.dyn_cast<Decl *>())
       return !D->isImplicit();
     return false;
   };
 
-  ContextFinder Finder(*CursorInfo.getSourceFile(), CursorInfo.getLoc(),
+  ContextFinder Finder(*CursorInfo->getSourceFile(), CursorInfo->getLoc(),
                        IncludeInContext);
   Finder.resolve();
 
@@ -4215,10 +4269,10 @@ FuncDecl *findFunction(const ResolvedCursorInfo &CursorInfo) {
   if (!Body && !isa<ProtocolDecl>(FD->getDeclContext()))
     return nullptr;
 
-  SourceManager &SM = CursorInfo.getSourceFile()->getASTContext().SourceMgr;
+  SourceManager &SM = CursorInfo->getSourceFile()->getASTContext().SourceMgr;
   SourceLoc DeclEnd = Body ? Body->getLBraceLoc() : FD->getEndLoc();
   if (!SM.rangeContains(SourceRange(FD->getStartLoc(), DeclEnd),
-                        CursorInfo.getLoc()))
+                        CursorInfo->getLoc()))
     return nullptr;
 
   return FD;
@@ -5428,6 +5482,10 @@ private:
       explicit ErrUnwrapFinder(const ParamDecl *ErrParam)
           : ErrParam(ErrParam) {}
       bool foundUnwrap() const { return FoundUnwrap; }
+
+      MacroWalking getMacroWalkingBehavior() const override {
+        return MacroWalking::Arguments;
+      }
 
       PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
         // Don't walk into ternary conditionals as they may have additional
@@ -8300,7 +8358,7 @@ private:
 } // namespace asyncrefactorings
 
 bool RefactoringActionConvertCallToAsyncAlternative::isApplicable(
-    const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
+    ResolvedCursorInfoPtr CursorInfo, DiagnosticEngine &Diag) {
   using namespace asyncrefactorings;
 
   // Currently doesn't check that the call is in an async context. This seems
@@ -8332,7 +8390,7 @@ bool RefactoringActionConvertCallToAsyncAlternative::performChange() {
 
   // Find the scope this call is in
   ContextFinder Finder(
-      *CursorInfo.getSourceFile(), CursorInfo.getLoc(),
+      *CursorInfo->getSourceFile(), CursorInfo->getLoc(),
       [](ASTNode N) { return N.isStmt(StmtKind::Brace) && !N.isImplicit(); });
   Finder.resolve();
   auto Scopes = Finder.getContexts();
@@ -8349,7 +8407,7 @@ bool RefactoringActionConvertCallToAsyncAlternative::performChange() {
 }
 
 bool RefactoringActionConvertToAsync::isApplicable(
-    const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
+    ResolvedCursorInfoPtr CursorInfo, DiagnosticEngine &Diag) {
   using namespace asyncrefactorings;
 
   // As with the call refactoring, should possibly only apply if there's
@@ -8378,7 +8436,7 @@ bool RefactoringActionConvertToAsync::performChange() {
 }
 
 bool RefactoringActionAddAsyncAlternative::isApplicable(
-    const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
+    ResolvedCursorInfoPtr CursorInfo, DiagnosticEngine &Diag) {
   using namespace asyncrefactorings;
 
   auto *FD = findFunction(CursorInfo);
@@ -8430,7 +8488,7 @@ bool RefactoringActionAddAsyncAlternative::performChange() {
 }
 
 bool RefactoringActionAddAsyncWrapper::isApplicable(
-    const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
+    ResolvedCursorInfoPtr CursorInfo, DiagnosticEngine &Diag) {
   using namespace asyncrefactorings;
 
   auto *FD = findFunction(CursorInfo);
@@ -8470,59 +8528,214 @@ bool RefactoringActionAddAsyncWrapper::performChange() {
   return false;
 }
 
-static MacroExpansionExpr *
-findMacroExpansionTargetExpr(const ResolvedCursorInfo &Info) {
-
-  // Handle '#' position in '#macroName(...)'.
-  if (auto exprInfo = dyn_cast<ResolvedExprStartCursorInfo>(&Info)) {
-    if (auto target =
-            dyn_cast_or_null<MacroExpansionExpr>(exprInfo->getTrailingExpr()))
-      if (target->getRewritten())
-        return target;
-    return nullptr;
+/// Retrieve the macro expansion buffer for the given macro expansion
+/// expression.
+static Optional<unsigned> getMacroExpansionBuffer(
+    SourceManager &sourceMgr, MacroExpansionExpr *expansion) {
+  if (auto rewritten = expansion->getRewritten()) {
+    return sourceMgr.findBufferContainingLoc(rewritten->getStartLoc());
   }
 
-  // Handle 'macroName' position in '#macroName(...)'.
-  if (auto refInfo = dyn_cast<ResolvedValueRefCursorInfo>(&Info)) {
-    if (refInfo->isRef() && isa_and_nonnull<MacroDecl>(refInfo->getValueD())) {
-      ContextFinder Finder(
-          *Info.getSourceFile(), Info.getLoc(), [&](ASTNode N) {
-            auto *expr =
-                dyn_cast_or_null<MacroExpansionExpr>(N.dyn_cast<Expr *>());
-            return expr &&
-                   (expr->getMacroNameLoc().getBaseNameLoc() == Info.getLoc());
-          });
-      Finder.resolve();
-      if (!Finder.getContexts().empty()) {
-        auto *target =
-            dyn_cast<MacroExpansionExpr>(Finder.getContexts()[0].get<Expr *>());
-        if (target->getRewritten())
-          return target;
-      }
-    }
-    return nullptr;
-  }
-
-  // TODO: handle MacroExpansionDecl.
-  return nullptr;
+  return None;
 }
 
-bool RefactoringActionExpandMacro::isApplicable(const ResolvedCursorInfo &Info,
+/// Retrieve the macro expansion buffer for the given macro expansion
+/// declaration.
+static Optional<unsigned>
+getMacroExpansionBuffer(SourceManager &sourceMgr,
+                        MacroExpansionDecl *expansion) {
+  return evaluateOrDefault(expansion->getASTContext().evaluator,
+                           ExpandMacroExpansionDeclRequest{expansion}, {});
+}
+
+/// Retrieve the macro expansion buffers for the given attached macro reference.
+static llvm::SmallVector<unsigned, 2>
+getMacroExpansionBuffers(MacroDecl *macro, const CustomAttr *attr, Decl *decl) {
+  auto roles = macro->getMacroRoles() & getAttachedMacroRoles();
+  if (!roles)
+    return { };
+
+  ASTContext &ctx = macro->getASTContext();
+  llvm::SmallVector<unsigned, 2> allBufferIDs;
+  if (roles.contains(MacroRole::Accessor)) {
+    if (auto storage = dyn_cast<AbstractStorageDecl>(decl)) {
+      auto bufferIDs = evaluateOrDefault(
+          ctx.evaluator, ExpandAccessorMacros{storage}, { });
+      allBufferIDs.append(bufferIDs.begin(), bufferIDs.end());
+    }
+  }
+
+  if (roles.contains(MacroRole::MemberAttribute)) {
+    if (auto idc = dyn_cast<IterableDeclContext>(decl)) {
+      for (auto memberDecl : idc->getAllMembers()) {
+        auto bufferIDs = evaluateOrDefault(
+            ctx.evaluator, ExpandMemberAttributeMacros{memberDecl}, { });
+        allBufferIDs.append(bufferIDs.begin(), bufferIDs.end());
+      }
+    }
+  }
+
+  if (roles.contains(MacroRole::Member)) {
+    auto bufferIDs = evaluateOrDefault(
+        ctx.evaluator, ExpandSynthesizedMemberMacroRequest{decl}, { });
+    allBufferIDs.append(bufferIDs.begin(), bufferIDs.end());
+  }
+
+  if (roles.contains(MacroRole::Peer)) {
+    auto bufferIDs = evaluateOrDefault(
+        ctx.evaluator, ExpandPeerMacroRequest{decl}, { });
+    allBufferIDs.append(bufferIDs.begin(), bufferIDs.end());
+  }
+
+  if (roles.contains(MacroRole::Conformance)) {
+    if (auto nominal = dyn_cast<NominalTypeDecl>(decl)) {
+      auto bufferIDs = evaluateOrDefault(
+          ctx.evaluator, ExpandConformanceMacros{nominal}, { });
+      allBufferIDs.append(bufferIDs.begin(), bufferIDs.end());
+    }
+  }
+
+  // Drop any buffers that come from other macros. We could eliminate this
+  // step by adding more fine-grained requests above, which only expand for a
+  // single custom attribute.
+  SourceManager &sourceMgr = ctx.SourceMgr;
+  auto removedAt = std::remove_if(
+      allBufferIDs.begin(), allBufferIDs.end(),
+      [&](unsigned bufferID) {
+        auto generatedInfo = sourceMgr.getGeneratedSourceInfo(bufferID);
+        if (!generatedInfo)
+          return true;
+
+        return generatedInfo->attachedMacroCustomAttr != attr;
+      });
+  allBufferIDs.erase(removedAt, allBufferIDs.end());
+  return allBufferIDs;
+}
+
+/// Given a resolved cursor, determine whether it is for a macro expansion and
+/// return the list of macro expansion buffer IDs that are associated with the
+/// macro reference here.
+static llvm::SmallVector<unsigned, 2>
+getMacroExpansionBuffers(SourceManager &sourceMgr, ResolvedCursorInfoPtr Info) {
+  auto *refInfo = dyn_cast<ResolvedValueRefCursorInfo>(Info);
+  if (!refInfo || !refInfo->isRef())
+    return {};
+
+  auto *macro = dyn_cast_or_null<MacroDecl>(refInfo->getValueD());
+  if (!macro)
+    return {};
+
+  // Attached macros
+  if (auto customAttrRef = refInfo->getCustomAttrRef()) {
+    auto macro = cast<MacroDecl>(refInfo->getValueD());
+    return getMacroExpansionBuffers(macro, customAttrRef->first,
+                                    customAttrRef->second);
+  }
+
+  // FIXME: A resolved cursor should contain a slice up to its reference.
+  // We shouldn't need to find it again.
+  ContextFinder Finder(*Info->getSourceFile(), Info->getLoc(), [&](ASTNode N) {
+    if (auto *expr =
+            dyn_cast_or_null<MacroExpansionExpr>(N.dyn_cast<Expr *>())) {
+      return expr->getStartLoc() == Info->getLoc() ||
+             expr->getMacroNameLoc().getBaseNameLoc() == Info->getLoc();
+    } else if (auto *decl =
+                   dyn_cast_or_null<MacroExpansionDecl>(N.dyn_cast<Decl *>())) {
+      return decl->getStartLoc() == Info->getLoc() ||
+             decl->getMacroNameLoc().getBaseNameLoc() == Info->getLoc();
+    }
+
+    return false;
+  });
+  Finder.resolve();
+
+  if (!Finder.getContexts().empty()) {
+    Optional<unsigned> bufferID;
+    if (auto *target = dyn_cast_or_null<MacroExpansionExpr>(
+            Finder.getContexts()[0].dyn_cast<Expr *>())) {
+      bufferID = getMacroExpansionBuffer(sourceMgr, target);
+    } else if (auto *target = dyn_cast_or_null<MacroExpansionDecl>(
+                   Finder.getContexts()[0].dyn_cast<Decl *>())) {
+      bufferID = getMacroExpansionBuffer(sourceMgr, target);
+    }
+
+    if (bufferID)
+      return {*bufferID};
+  }
+
+  return {};
+}
+
+bool RefactoringActionExpandMacro::isApplicable(ResolvedCursorInfoPtr Info,
                                                 DiagnosticEngine &Diag) {
-  return findMacroExpansionTargetExpr(Info) != nullptr;
+  return !getMacroExpansionBuffers(Diag.SourceMgr, Info).empty();
 }
 
 bool RefactoringActionExpandMacro::performChange() {
-  auto target = findMacroExpansionTargetExpr(CursorInfo);
-  if (!target)
+  auto bufferIDs = getMacroExpansionBuffers(SM, CursorInfo);
+  if (bufferIDs.empty())
     return true;
 
-  auto exprRange =
-      Lexer::getCharSourceRangeFromSourceRange(SM, target->getSourceRange());
-  auto rewrittenRange = Lexer::getCharSourceRangeFromSourceRange(
-      SM, target->getRewritten()->getSourceRange());
-  auto rewrittenBuffer = SM.extractText(rewrittenRange);
-  EditConsumer.accept(SM, exprRange, rewrittenBuffer);
+  // Send all of the rewritten buffer snippets.
+  CustomAttr *attachedMacroAttr = nullptr;
+  for (auto bufferID: bufferIDs) {
+    auto generatedInfo = SM.getGeneratedSourceInfo(bufferID);
+    if (!generatedInfo || generatedInfo->originalSourceRange.isInvalid())
+      continue;
+
+    auto rewrittenBuffer = SM.extractText(generatedInfo->generatedSourceRange);
+
+    // If there's no change, drop the edit entirely.
+    if (generatedInfo->originalSourceRange.getStart() ==
+          generatedInfo->originalSourceRange.getEnd() &&
+        rewrittenBuffer.empty())
+      continue;
+
+    // `TheFile` is the file of the actual expansion site, where as
+    // `OriginalFile` is the possibly enclosing buffer. Concretely:
+    // ```
+    // // m.swift
+    // @AddMemberAttributes
+    // struct Foo {
+    //   // --- expanded from @AddMemberAttributes eg. @_someBufferName ---
+    //   @AddedAttribute
+    //   // ---
+    //   let someMember: Int
+    // }
+    // ```
+    //
+    // When expanding `AddedAttribute`, the expansion actually applies to the
+    // original source (`m.swift`) rather than the buffer of the expansion
+    // site (`@_someBufferName`). Thus, we need to include the path to the
+    // original source as well. Note that this path could itself be another
+    // expansion.
+    auto originalSourceRange = generatedInfo->originalSourceRange;
+    SourceFile *originalFile =
+        MD->getSourceFileContainingLocation(originalSourceRange.getStart());
+    StringRef originalPath;
+    if (originalFile->getBufferID().hasValue() &&
+        TheFile->getBufferID() != originalFile->getBufferID()) {
+      originalPath = SM.getIdentifierForBuffer(*originalFile->getBufferID());
+    }
+
+    EditConsumer.accept(SM, {originalPath,
+                             originalSourceRange,
+                             SM.getIdentifierForBuffer(bufferID),
+                             rewrittenBuffer,
+                             {}});
+
+    if (generatedInfo->attachedMacroCustomAttr && !attachedMacroAttr)
+      attachedMacroAttr = generatedInfo->attachedMacroCustomAttr;
+  }
+
+  // For an attached macro, remove the custom attribute; it's been fully
+  // subsumed by its expansions.
+  if (attachedMacroAttr) {
+    SourceRange range = attachedMacroAttr->getRangeWithAt();
+    auto charRange = Lexer::getCharSourceRangeFromSourceRange(SM, range);
+    EditConsumer.accept(SM, charRange, StringRef());
+  }
+
   return false;
 }
 
@@ -8559,7 +8772,7 @@ getDescriptiveRefactoringKindName(RefactoringKind Kind) {
   }
 
 SourceLoc swift::ide::RangeConfig::getStart(SourceManager &SM) {
-  return SM.getLocForLineCol(BufferId, Line, Column);
+  return SM.getLocForLineCol(BufferID, Line, Column);
 }
 
 SourceLoc swift::ide::RangeConfig::getEnd(SourceManager &SM) {
@@ -8601,7 +8814,8 @@ struct swift::ide::FindRenameRangesAnnotatingConsumer::Implementation {
     if (Range.Index.has_value())
       OS << " index=" << *Range.Index;
     OS << ">" << Range.Range.str() << "</" << Tag << ">";
-    pRewriter->accept(SM, {Range.Range, OS.str(), {}});
+    pRewriter->accept(SM, {/*Path=*/{}, Range.Range, /*BufferName=*/{},
+                           OS.str(), /*RegionsWorthNote=*/{}});
   }
 };
 
@@ -8624,15 +8838,15 @@ accept(SourceManager &SM, RegionType RegionType,
   }
 }
 
-void swift::ide::collectRenameAvailabilityInfo(
-    const ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
-    SmallVectorImpl<RenameAvailabilityInfo> &Infos) {
+Optional<RenameAvailabilityInfo>
+swift::ide::renameAvailabilityInfo(const ValueDecl *VD,
+                                   Optional<RenameRefInfo> RefInfo) {
   RenameAvailableKind AvailKind = RenameAvailableKind::Available;
   if (getRelatedSystemDecl(VD)){
     AvailKind = RenameAvailableKind::Unavailable_system_symbol;
   } else if (VD->getClangDecl()) {
     AvailKind = RenameAvailableKind::Unavailable_decl_from_clang;
-  } else if (VD->getStartLoc().isInvalid()) {
+  } else if (VD->getLoc().isInvalid()) {
     AvailKind = RenameAvailableKind::Unavailable_has_no_location;
   } else if (!VD->hasName()) {
     AvailKind = RenameAvailableKind::Unavailable_has_no_name;
@@ -8641,22 +8855,22 @@ void swift::ide::collectRenameAvailabilityInfo(
   if (isa<AbstractFunctionDecl>(VD)) {
     // Disallow renaming accessors.
     if (isa<AccessorDecl>(VD))
-      return;
+      return None;
 
     // Disallow renaming deinit.
     if (isa<DestructorDecl>(VD))
-      return;
+      return None;
 
     // Disallow renaming init with no arguments.
     if (auto CD = dyn_cast<ConstructorDecl>(VD)) {
       if (!CD->getParameters()->size())
-        return;
+        return None;
 
       if (RefInfo && !RefInfo->IsArgLabel) {
         NameMatcher Matcher(*(RefInfo->SF));
         auto Resolved = Matcher.resolve({RefInfo->Loc, /*ResolveArgs*/true});
         if (Resolved.LabelRanges.empty())
-          return;
+          return None;
       }
     }
 
@@ -8666,13 +8880,13 @@ void swift::ide::collectRenameAvailabilityInfo(
       // whether it's an instance method, so we do the same here for now.
       if (FD->getBaseIdentifier() == FD->getASTContext().Id_callAsFunction) {
         if (!FD->getParameters()->size())
-          return;
+          return None;
 
         if (RefInfo && !RefInfo->IsArgLabel) {
           NameMatcher Matcher(*(RefInfo->SF));
           auto Resolved = Matcher.resolve({RefInfo->Loc, /*ResolveArgs*/true});
           if (Resolved.LabelRanges.empty())
-            return;
+            return None;
         }
       }
     }
@@ -8680,46 +8894,26 @@ void swift::ide::collectRenameAvailabilityInfo(
 
   // Always return local rename for parameters.
   // FIXME: if the cursor is on the argument, we should return global rename.
-  if (isa<ParamDecl>(VD)) {
-    Infos.emplace_back(RefactoringKind::LocalRename, AvailKind);
-    return;
-  }
+  if (isa<ParamDecl>(VD))
+    return RenameAvailabilityInfo{RefactoringKind::LocalRename, AvailKind};
 
   // If the indexer considers VD a global symbol, then we apply global rename.
   if (index::isLocalSymbol(VD))
-    Infos.emplace_back(RefactoringKind::LocalRename, AvailKind);
-  else
-    Infos.emplace_back(RefactoringKind::GlobalRename, AvailKind);
+    return RenameAvailabilityInfo{RefactoringKind::LocalRename, AvailKind};
+  return RenameAvailabilityInfo{RefactoringKind::GlobalRename, AvailKind};
 }
 
 void swift::ide::collectAvailableRefactorings(
-    const ResolvedCursorInfo &CursorInfo,
-    SmallVectorImpl<RefactoringKind> &Kinds, bool ExcludeRename) {
+    ResolvedCursorInfoPtr CursorInfo, SmallVectorImpl<RefactoringKind> &Kinds,
+    bool ExcludeRename) {
   DiagnosticEngine DiagEngine(
-      CursorInfo.getSourceFile()->getASTContext().SourceMgr);
+      CursorInfo->getSourceFile()->getASTContext().SourceMgr);
 
   if (!ExcludeRename) {
-    if (RefactoringActionLocalRename::isApplicable(CursorInfo, DiagEngine))
-      Kinds.push_back(RefactoringKind::LocalRename);
-
-    switch (CursorInfo.getKind()) {
-    case CursorInfoKind::ModuleRef:
-    case CursorInfoKind::Invalid:
-    case CursorInfoKind::StmtStart:
-    case CursorInfoKind::ExprStart:
-      break;
-    case CursorInfoKind::ValueRef: {
-      auto ValueRefInfo = cast<ResolvedValueRefCursorInfo>(CursorInfo);
-      Optional<RenameRefInfo> RefInfo;
-      if (ValueRefInfo.isRef())
-        RefInfo = {CursorInfo.getSourceFile(), CursorInfo.getLoc(),
-                   ValueRefInfo.isKeywordArgument()};
-      auto RenameOp =
-          getAvailableRenameForDecl(ValueRefInfo.getValueD(), RefInfo);
-      if (RenameOp.has_value() &&
-          RenameOp.value() == RefactoringKind::GlobalRename)
-        Kinds.push_back(RenameOp.value());
-    }
+    if (auto Info = getRenameInfo(CursorInfo)) {
+      if (Info->Availability.AvailableKind == RenameAvailableKind::Available) {
+        Kinds.push_back(Info->Availability.Kind);
+      }
     }
   }
 
@@ -8925,29 +9119,11 @@ int swift::ide::findLocalRenameRanges(
   Diags.addConsumer(DiagConsumer);
 
   auto StartLoc = Lexer::getLocForStartOfToken(SM, Range.getStart(SM));
-  ResolvedCursorInfo CursorInfo =
-    evaluateOrDefault(SF->getASTContext().evaluator,
-                      CursorInfoRequest{CursorInfoOwner(SF, StartLoc)},
-                      ResolvedCursorInfo());
-  auto ValueRefCursorInfo = dyn_cast<ResolvedValueRefCursorInfo>(&CursorInfo);
-  if (!ValueRefCursorInfo || !ValueRefCursorInfo->getValueD()) {
-    Diags.diagnose(StartLoc, diag::unresolved_location);
+  Optional<RenameRangeCollector> RangeCollector =
+      localRenames(SF, StartLoc, StringRef(), Diags);
+  if (!RangeCollector)
     return true;
-  }
-  ValueDecl *VD = ValueRefCursorInfo->typeOrValue();
-  Optional<RenameRefInfo> RefInfo;
-  if (ValueRefCursorInfo->isRef())
-    RefInfo = {CursorInfo.getSourceFile(), CursorInfo.getLoc(),
-               ValueRefCursorInfo->isKeywordArgument()};
 
-  llvm::SmallVector<DeclContext *, 8> Scopes;
-  analyzeRenameScope(VD, RefInfo, Diags, Scopes);
-  if (Scopes.empty())
-    return true;
-  RenameRangeCollector RangeCollector(VD, StringRef());
-  for (DeclContext *DC : Scopes)
-    indexDeclContext(DC, RangeCollector);
-
-  return findSyntacticRenameRanges(SF, RangeCollector.results(), RenameConsumer,
-                                   DiagConsumer);
+  return findSyntacticRenameRanges(SF, RangeCollector->results(),
+                                   RenameConsumer, DiagConsumer);
 }

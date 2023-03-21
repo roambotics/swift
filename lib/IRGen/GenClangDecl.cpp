@@ -67,6 +67,13 @@ public:
     return true;
   }
 
+  bool VisitCXXDeleteExpr(clang::CXXDeleteExpr *deleteExpr) {
+    if (auto cxxRecord = deleteExpr->getDestroyedType()->getAsCXXRecordDecl())
+      if (auto dtor = cxxRecord->getDestructor())
+        callback(dtor);
+    return true;
+  }
+
   bool VisitVarDecl(clang::VarDecl *VD) {
     if (auto cxxRecord = VD->getType()->getAsCXXRecordDecl())
       if (auto dtor = cxxRecord->getDestructor())
@@ -95,14 +102,26 @@ public:
     return true;
   }
 
+  bool VisitCXXInheritedCtorInitExpr(clang::CXXInheritedCtorInitExpr *CIE) {
+    if (auto ctor = CIE->getConstructor())
+      callback(ctor);
+    return true;
+  }
+
   // Do not traverse unevaluated expressions. Doing to might result in compile
   // errors if we try to instantiate an un-instantiatable template.
 
-  bool VisitCXXNoexceptExpr(clang::CXXNoexceptExpr *NEE) { return false; }
+  bool TraverseCXXNoexceptExpr(clang::CXXNoexceptExpr *NEE) { return true; }
 
-  bool VisitCXXTypeidExpr(clang::CXXTypeidExpr *TIE) {
-    return TIE->isPotentiallyEvaluated();
+  bool TraverseCXXTypeidExpr(clang::CXXTypeidExpr *TIE) {
+    if (TIE->isPotentiallyEvaluated())
+      clang::RecursiveASTVisitor<ClangDeclFinder>::TraverseCXXTypeidExpr(TIE);
+    return true;
   }
+
+  // Do not traverse type locs, as they might contain expressions that reference
+  // code that should not be instantiated and/or emitted.
+  bool TraverseTypeLoc(clang::TypeLoc TL) { return true; }
 
   bool shouldVisitTemplateInstantiations() const { return true; }
   bool shouldVisitImplicitCode() const { return true; }

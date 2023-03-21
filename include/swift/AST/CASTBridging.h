@@ -13,8 +13,13 @@
 #ifndef SWIFT_C_AST_ASTBRIDGING_H
 #define SWIFT_C_AST_ASTBRIDGING_H
 
+#include "swift/Basic/CBasicBridging.h"
 #include "swift/Basic/Compiler.h"
+
 #include <inttypes.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #if __clang__
 // Provide macros to temporarily suppress warning about the use of
@@ -113,17 +118,18 @@ extern "C" {
 /// information and then must be finished via \c SwiftDiagnostic_finish.
 BridgedDiagnostic SwiftDiagnostic_create(
     void *diagnosticEngine, BridgedDiagnosticSeverity severity,
-    void *_Nullable sourceLoc,
+    const void *_Nullable sourceLoc,
     const uint8_t *_Nullable text, long textLen);
 
 /// Highlight a source range as part of the diagnostic.
 void SwiftDiagnostic_highlight(
-    BridgedDiagnostic diag, void *_Nullable startLoc, void *_Nullable endLoc);
+    BridgedDiagnostic diag, const void *_Nullable startLoc, const void *_Nullable endLoc);
 
 /// Add a Fix-It to replace a source range as part of the diagnostic.
 void SwiftDiagnostic_fixItReplace(
     BridgedDiagnostic diag,
-    void *_Nullable replaceStartLoc, void *_Nullable replaceEndLoc,
+    const void *_Nullable replaceStartLoc,
+    const void *_Nullable replaceEndLoc,
     const uint8_t *_Nullable newText, long newTextLen);
 
 /// Finish the given diagnostic and emit it.
@@ -263,7 +269,7 @@ void *GenericParamList_create(void *ctx, void *lAngleLoc,
                               BridgedArrayRef reqs, void *rAngleLoc);
 void *GenericTypeParamDecl_create(void *ctx, void *declContext,
                                   BridgedIdentifier name, void *nameLoc,
-                                  void *_Nullable ellipsisLoc, long index,
+                                  void *_Nullable eachLoc, long index,
                                   _Bool isParameterPack);
 void GenericTypeParamDecl_setInheritedType(void *ctx, void *Param, void *ty);
 
@@ -279,6 +285,34 @@ void Expr_dump(void *);
 void Decl_dump(void *);
 void Stmt_dump(void *);
 void Type_dump(void *);
+
+//===----------------------------------------------------------------------===//
+// Plugins
+//===----------------------------------------------------------------------===//
+
+typedef void *PluginHandle;
+typedef const void *PluginCapabilityPtr;
+
+/// Set a capability data to the plugin object. Since the data is just a opaque
+/// pointer, it's not used in AST at all.
+void Plugin_setCapability(PluginHandle handle, PluginCapabilityPtr data);
+
+/// Get a capability data set by \c Plugin_setCapability .
+PluginCapabilityPtr _Nullable Plugin_getCapability(PluginHandle handle);
+
+/// Lock the plugin. Clients should lock it during sending and recving the
+/// response.
+void Plugin_lock(PluginHandle handle);
+
+/// Unlock the plugin.
+void Plugin_unlock(PluginHandle handle);
+
+/// Sends the message to the plugin, returns true if there was an error.
+/// Clients should receive the response  by \c Plugin_waitForNextMessage .
+_Bool Plugin_sendMessage(PluginHandle handle, const BridgedData data);
+
+/// Receive a message from the plugin.
+_Bool Plugin_waitForNextMessage(PluginHandle handle, BridgedData *data);
 
 #ifdef __cplusplus
 }

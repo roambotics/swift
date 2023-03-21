@@ -19,19 +19,20 @@
 
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTNode.h"
-#include "swift/AST/Expr.h"
 #include "swift/AST/DiagnosticsParse.h"
+#include "swift/AST/Expr.h"
 #include "swift/AST/LayoutConstraint.h"
 #include "swift/AST/ParseRequests.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/Stmt.h"
 #include "swift/Basic/OptionSet.h"
+#include "swift/Config.h"
 #include "swift/Parse/Lexer.h"
-#include "swift/Parse/PersistentParserState.h"
-#include "swift/Parse/Token.h"
 #include "swift/Parse/ParserPosition.h"
 #include "swift/Parse/ParserResult.h"
-#include "swift/Config.h"
+#include "swift/Parse/PatternBindingState.h"
+#include "swift/Parse/PersistentParserState.h"
+#include "swift/Parse/Token.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 
 namespace llvm {
@@ -40,7 +41,8 @@ namespace llvm {
 
 namespace swift {
   class IdentTypeRepr;
-  class IDEInspectionCallbacks;
+  class CodeCompletionCallbacks;
+  class DoneParsingCallback;
   class IDEInspectionCallbacksFactory;
   class DefaultArgumentInitializer;
   class DiagnosticEngine;
@@ -128,7 +130,8 @@ public:
   std::unique_ptr<PersistentParserState> OwnedState;
   DeclContext *CurDeclContext;
   ASTContext &Context;
-  IDEInspectionCallbacks *IDECallbacks = nullptr;
+  CodeCompletionCallbacks *CodeCompletionCallbacks = nullptr;
+  DoneParsingCallback *DoneParsingCallback = nullptr;
   std::vector<Located<std::vector<ParamDecl*>>> AnonClosureVars;
 
   /// The current token hash, or \c None if the parser isn't computing a hash
@@ -142,39 +145,14 @@ public:
 
   void recordTokenHash(StringRef token);
 
-  enum {
-    /// InVarOrLetPattern has this value when not parsing a pattern.
-    IVOLP_NotInVarOrLet,
-    
-    /// InVarOrLetPattern has this value when we're in a matching pattern, but
-    /// not within a var/let pattern.  In this phase, identifiers are references
-    /// to the enclosing scopes, not a variable binding.
-    IVOLP_InMatchingPattern,
-    
-    /// InVarOrLetPattern has this value when parsing a pattern in which bound
-    /// variables are implicitly immutable, but allowed to be marked mutable by
-    /// using a 'var' pattern.  This happens in for-each loop patterns.
-    IVOLP_ImplicitlyImmutable,
-    
-    /// When InVarOrLetPattern has this value, bound variables are mutable, and
-    /// nested let/var patterns are not permitted. This happens when parsing a
-    /// 'var' decl or when parsing inside a 'var' pattern.
-    IVOLP_InVar,
-
-    /// When InVarOrLetPattern has this value, bound variables are immutable,and
-    /// nested let/var patterns are not permitted. This happens when parsing a
-    /// 'let' decl or when parsing inside a 'let' pattern.
-    IVOLP_InLet
-  } InVarOrLetPattern = IVOLP_NotInVarOrLet;
+  PatternBindingState InBindingPattern = PatternBindingState::NotInBinding;
 
   /// Whether this context has an async attribute.
   bool InPatternWithAsyncAttribute = false;
 
   bool InPoundLineEnvironment = false;
   bool InPoundIfEnvironment = false;
-  /// Do not call \c addUnvalidatedDeclWithOpaqueResultType when in an inactive
-  /// clause because ASTScopes are not created in those contexts and lookups to
-  /// those decls will fail.
+  /// ASTScopes are not created in inactive clauses and lookups to decls will fail.
   bool InInactiveClauseEnvironment = false;
   bool InSwiftKeyPath = false;
 
@@ -187,12 +165,16 @@ public:
   /// the #if decl.
   bool shouldEvaluatePoundIfDecls() const;
 
-  void setIDECallbacks(IDEInspectionCallbacks *Callbacks) {
-    IDECallbacks = Callbacks;
+  void setCodeCompletionCallbacks(class CodeCompletionCallbacks *Callbacks) {
+    CodeCompletionCallbacks = Callbacks;
+  }
+
+  void setDoneParsingCallback(class DoneParsingCallback *Callback) {
+    this->DoneParsingCallback = Callback;
   }
 
   bool isIDEInspectionFirstPass() const {
-    return SourceMgr.hasIDEInspectionTargetBuffer() && !IDECallbacks;
+    return SourceMgr.hasIDEInspectionTargetBuffer() && !DoneParsingCallback;
   }
 
   bool allowTopLevelCode() const;
@@ -616,6 +598,25 @@ public:
     return (Tok.isContextualKeyword("yield") &&
             isa<AccessorDecl>(CurDeclContext) &&
             cast<AccessorDecl>(CurDeclContext)->isCoroutine());
+  }
+
+  /// `forget self` is the only valid phrase, but we peek ahead for just any
+  /// identifier after `forget` to determine if it's the statement. This helps
+  /// us avoid interpreting `forget(self)` as the statement and not a call.
+  /// We also want to be mindful of statements like `forget ++ something` where
+  /// folks have defined a custom operator returning void.
+  ///
+  /// Later, type checking will verify that you're forgetting the right thing
+  /// so that when people make a mistake, thinking they can `forget x` we give
+  /// a nice diagnostic.
+  bool isContextualForgetKeyword() {
+    // must be `forget` ...
+    if (!Tok.isContextualKeyword("_forget"))
+      return false;
+
+    // followed by either an identifier, `self`, or `Self`.
+    return !peekToken().isAtStartOfLine()
+      && peekToken().isAny(tok::identifier, tok::kw_self, tok::kw_Self);
   }
   
   /// Read tokens until we get to one of the specified tokens, then
@@ -1146,15 +1147,36 @@ public:
   bool parseVersionTuple(llvm::VersionTuple &Version, SourceRange &Range,
                          const Diagnostic &D);
 
+  bool canHaveParameterSpecifierContextualKeyword() {
+    // The parameter specifiers like `isolated`, `consuming`, `borrowing` are
+    // also valid identifiers and could be the name of a type. Check whether
+    // the following token is something that can introduce a type. Thankfully
+    // none of these tokens overlap with the set of tokens that can follow an
+    // identifier in a type production.
+    return Tok.is(tok::identifier)
+      && peekToken().isAny(tok::at_sign,
+                           tok::kw_inout,
+                           tok::l_paren,
+                           tok::identifier,
+                           tok::l_square,
+                           tok::kw_Any,
+                           tok::kw_Self,
+                           tok::kw__,
+                           tok::kw_var,
+                           tok::kw_let);
+  }
+
   ParserStatus parseTypeAttributeList(ParamDecl::Specifier &Specifier,
                                       SourceLoc &SpecifierLoc,
                                       SourceLoc &IsolatedLoc,
                                       SourceLoc &ConstLoc,
                                       TypeAttributes &Attributes) {
     if (Tok.isAny(tok::at_sign, tok::kw_inout) ||
-        (Tok.is(tok::identifier) &&
+        (canHaveParameterSpecifierContextualKeyword() &&
          (Tok.getRawText().equals("__shared") ||
           Tok.getRawText().equals("__owned") ||
+          Tok.getRawText().equals("consuming") ||
+          Tok.getRawText().equals("borrowing") ||
           Tok.isContextualKeyword("isolated") ||
           Tok.isContextualKeyword("_const"))))
       return parseTypeAttributeListPresent(
@@ -1571,10 +1593,9 @@ public:
   ParserResult<Pattern>
   parseOptionalPatternTypeAnnotation(ParserResult<Pattern> P);
   ParserResult<Pattern> parseMatchingPattern(bool isExprBasic);
-  ParserResult<Pattern> parseMatchingPatternAsLetOrVar(bool isLet,
-                                                       SourceLoc VarLoc,
-                                                       bool isExprBasic);
-  
+  ParserResult<Pattern>
+  parseMatchingPatternAsBinding(PatternBindingState newState, SourceLoc VarLoc,
+                                bool isExprBasic);
 
   Pattern *createBindingFromPattern(SourceLoc loc, Identifier name,
                                     VarDecl::Introducer introducer);
@@ -1829,6 +1850,7 @@ public:
   ParserResult<Stmt> parseStmtReturn(SourceLoc tryLoc);
   ParserResult<Stmt> parseStmtYield(SourceLoc tryLoc);
   ParserResult<Stmt> parseStmtThrow(SourceLoc tryLoc);
+  ParserResult<Stmt> parseStmtForget();
   ParserResult<Stmt> parseStmtDefer();
   ParserStatus
   parseStmtConditionElement(SmallVectorImpl<StmtConditionElement> &result,
@@ -2001,10 +2023,12 @@ struct ParsedDeclName {
   }
 
   /// Form a declaration name from this parsed declaration name.
-  DeclName formDeclName(ASTContext &ctx, bool isSubscript = false) const;
+  DeclName formDeclName(ASTContext &ctx, bool isSubscript = false,
+                        bool isCxxClassTemplateSpec = false) const;
 
   /// Form a declaration name from this parsed declaration name.
-  DeclNameRef formDeclNameRef(ASTContext &ctx, bool isSubscript = false) const;
+  DeclNameRef formDeclNameRef(ASTContext &ctx, bool isSubscript = false,
+                              bool isCxxClassTemplateSpec = false) const;
 };
 
 /// To assist debugging parser crashes, tell us the location of the
@@ -2026,7 +2050,8 @@ DeclName formDeclName(ASTContext &ctx,
                       ArrayRef<StringRef> argumentLabels,
                       bool isFunctionName,
                       bool isInitializer,
-                      bool isSubscript = false);
+                      bool isSubscript = false,
+                      bool isCxxClassTemplateSpec = false);
 
 /// Form a Swift declaration name reference from its constituent parts.
 DeclNameRef formDeclNameRef(ASTContext &ctx,
@@ -2034,10 +2059,11 @@ DeclNameRef formDeclNameRef(ASTContext &ctx,
                             ArrayRef<StringRef> argumentLabels,
                             bool isFunctionName,
                             bool isInitializer,
-                            bool isSubscript = false);
+                            bool isSubscript = false,
+                            bool isCxxClassTemplateSpec = false);
 
 /// Whether a given token can be the start of a decl.
-bool isKeywordPossibleDeclStart(const Token &Tok);
+bool isKeywordPossibleDeclStart(const LangOptions &options, const Token &Tok);
 
 } // end namespace swift
 

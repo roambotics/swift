@@ -204,6 +204,12 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
 
   /// C type StoreExtraInhabitantTag function descriminator.
   PointerAuthSchema StoreExtraInhabitantTagFunction;
+
+  /// Relative protocol witness table descriminator.
+  PointerAuthSchema RelativeProtocolWitnessTable;
+
+  /// Type layout string descriminator.
+  PointerAuthSchema TypeLayoutString;
 };
 
 enum class JITDebugArtifact : unsigned {
@@ -245,9 +251,6 @@ public:
   /// Should we spend time verifying that the IR we produce is
   /// well-formed?
   unsigned Verify : 1;
-
-  /// Should we use the legacy pass manager.
-  unsigned LegacyPassManager : 1;
 
   OptimizationMode OptMode;
 
@@ -422,6 +425,9 @@ public:
   /// Collocate metadata functions in their own section.
   unsigned CollocatedMetadataFunctions : 1;
 
+  /// Colocate type descriptors in their own section.
+  unsigned ColocateTypeDescriptors : 1;
+
   /// Use relative (and constant) protocol witness tables.
   unsigned UseRelativeProtocolWitnessTables : 1;
 
@@ -465,7 +471,7 @@ public:
   IRGenOptions()
       : DWARFVersion(2),
         OutputKind(IRGenOutputKind::LLVMAssemblyAfterOptimization),
-        Verify(true), LegacyPassManager(0), OptMode(OptimizationMode::NotSet),
+        Verify(true), OptMode(OptimizationMode::NotSet),
         Sanitizers(OptionSet<SanitizerKind>()),
         SanitizersWithRecoveryInstrumentation(OptionSet<SanitizerKind>()),
         SanitizeAddressUseODRIndicator(false),
@@ -497,6 +503,7 @@ public:
         EmitGenericRODatas(false), NoPreallocatedInstantiationCaches(false),
         DisableReadonlyStaticObjects(false),
         CollocatedMetadataFunctions(false),
+        ColocateTypeDescriptors(true),
         UseRelativeProtocolWitnessTables(false), CmdArgs(),
         SanitizeCoverage(llvm::SanitizerCoverageOptions()),
         TypeInfoFilter(TypeInfoDumpFilter::All) {

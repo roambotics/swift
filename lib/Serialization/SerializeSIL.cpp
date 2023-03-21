@@ -511,16 +511,15 @@ void SILSerializer::writeSILFunction(const SILFunction &F, bool DeclOnly) {
       (unsigned)F.isThunk(), (unsigned)F.isWithoutActuallyEscapingThunk(),
       (unsigned)F.getSpecialPurpose(), (unsigned)F.getInlineStrategy(),
       (unsigned)F.getOptimizationMode(), (unsigned)F.getPerfConstraints(),
-      (unsigned)F.getClassSubclassScope(),
-      (unsigned)F.hasCReferences(), (unsigned)F.getEffectsKind(),
-      (unsigned)numAttrs, (unsigned)F.hasOwnership(),
-      F.isAlwaysWeakImported(), LIST_VER_TUPLE_PIECES(available),
-      (unsigned)F.isDynamicallyReplaceable(),
-      (unsigned)F.isExactSelfClass(),
-      (unsigned)F.isDistributed(),
+      (unsigned)F.getClassSubclassScope(), (unsigned)F.hasCReferences(),
+      (unsigned)F.getEffectsKind(), (unsigned)numAttrs,
+      (unsigned)F.hasOwnership(), F.isAlwaysWeakImported(),
+      LIST_VER_TUPLE_PIECES(available), (unsigned)F.isDynamicallyReplaceable(),
+      (unsigned)F.isExactSelfClass(), (unsigned)F.isDistributed(),
       (unsigned)F.isRuntimeAccessible(),
-      FnID, replacedFunctionID, usedAdHocWitnessFunctionID,
-      genericSigID, clangNodeOwnerID, parentModuleID, SemanticsIDs);
+      (unsigned)F.forceEnableLexicalLifetimes(), FnID, replacedFunctionID,
+      usedAdHocWitnessFunctionID, genericSigID, clangNodeOwnerID,
+      parentModuleID, SemanticsIDs);
 
   F.visitArgEffects(
     [&](int effectIdx, int argumentIndex, bool isDerived) {
@@ -1035,9 +1034,10 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   }
   case SILInstructionKind::AllocBoxInst: {
     const AllocBoxInst *ABI = cast<AllocBoxInst>(&SI);
-    unsigned flags
-      = (ABI->hasDynamicLifetime() ? 1 : 0)
-      | (ABI->emitReflectionMetadata() ? 2 : 0);
+    unsigned flags = 0;
+    flags |= unsigned(ABI->hasDynamicLifetime());
+    flags |= unsigned(ABI->emitReflectionMetadata()) << 1;
+    flags |= unsigned(ABI->getUsesMoveableValueDebugInfo()) << 2;
     writeOneTypeLayout(ABI->getKind(),
                        flags,
                        ABI->getType());
@@ -1080,13 +1080,18 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
     unsigned attr = 0;
     attr |= unsigned(ASI->hasDynamicLifetime());
     attr |= unsigned(ASI->isLexical()) << 1;
-    attr |= unsigned(ASI->getWasMoved()) << 2;
+    attr |= unsigned(ASI->getUsesMoveableValueDebugInfo()) << 2;
     writeOneTypeLayout(ASI->getKind(), attr, ASI->getElementType());
     break;
   }
   case SILInstructionKind::AllocPackInst: {
     const AllocPackInst *API = cast<AllocPackInst>(&SI);
     writeOneTypeLayout(API->getKind(), 0, API->getPackType());
+    break;
+  }
+  case SILInstructionKind::PackLengthInst: {
+    const PackLengthInst *PLI = cast<PackLengthInst>(&SI);
+    writeOneTypeLayout(PLI->getKind(), 0, PLI->getPackType());
     break;
   }
   case SILInstructionKind::ProjectBoxInst: {
@@ -1477,6 +1482,7 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   case SILInstructionKind::ExplicitCopyValueInst:
   case SILInstructionKind::MoveValueInst:
   case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
   case SILInstructionKind::MoveOnlyWrapperToCopyableValueInst:
   case SILInstructionKind::CopyableToMoveOnlyWrapperValueInst:
   case SILInstructionKind::DestroyValueInst:
@@ -1542,6 +1548,8 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
              (unsigned(MVI->isLexical() << 1));
     } else if (auto *I = dyn_cast<MarkMustCheckInst>(&SI)) {
       Attr = unsigned(I->getCheckKind());
+    } else if (auto *I = dyn_cast<MarkUnresolvedReferenceBindingInst>(&SI)) {
+      Attr = unsigned(I->getKind());
     } else if (auto *I = dyn_cast<MoveOnlyWrapperToCopyableValueInst>(&SI)) {
       Attr = I->getForwardingOwnershipKind() == OwnershipKind::Owned ? true
                                                                      : false;
@@ -2485,7 +2493,7 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
       writeKeyPathPatternComponent(component, ListOfValues);
     }
     
-    for (auto &operand : KPI->getAllOperands()) {
+    for (auto &operand : KPI->getPatternOperands()) {
       auto value = operand.get();
       ListOfValues.push_back(addValueRef(value));
       ListOfValues.push_back(S.addTypeRef(value->getType().getASTType()));

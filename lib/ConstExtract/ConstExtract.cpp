@@ -12,6 +12,7 @@
 
 #include "swift/ConstExtract/ConstExtract.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ASTMangler.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticEngine.h"
@@ -47,6 +48,10 @@ public:
       std::vector<NominalTypeDecl *> &ConformanceDecls)
       : Protocols(Protocols), ConformanceTypeDecls(ConformanceDecls) {}
 
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
   PreWalkAction walkToDeclPre(Decl *D) override {
     if (auto *NTD = llvm::dyn_cast<NominalTypeDecl>(D))
       if (!isa<ProtocolDecl>(NTD))
@@ -69,6 +74,10 @@ std::string toFullyQualifiedTypeNameString(const swift::Type &Type) {
   Type.print(OutputStream, Options);
   OutputStream.flush();
   return TypeNameOutput;
+}
+
+std::string toMangledTypeNameString(const swift::Type &Type) {
+  return Mangle::ASTMangler().mangleTypeWithoutPrefix(Type);
 }
 
 } // namespace
@@ -138,6 +147,8 @@ extractFunctionArguments(const ArgumentList *args) {
       if (decl->hasDefaultExpr()) {
         argExpr = decl->getTypeCheckedDefaultExpr();
       }
+    } else if (auto optionalInject = dyn_cast<InjectIntoOptionalExpr>(argExpr)) {
+      argExpr = optionalInject->getSubExpr();
     }
     parameters.push_back({label, type, extractCompileTimeValue(argExpr)});
   }
@@ -294,6 +305,45 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
           placeholderExpr->getOriginalWrappedValue());
     }
 
+    case ExprKind::Coerce: {
+      auto coerceExpr = cast<CoerceExpr>(expr);
+      return extractCompileTimeValue(coerceExpr->getSubExpr());
+    }
+
+    case ExprKind::DotSelf: {
+      auto dotSelfExpr = cast<DotSelfExpr>(expr);
+      return std::make_shared<TypeValue>(dotSelfExpr->getType());
+    }
+
+    case ExprKind::UnderlyingToOpaque: {
+      auto underlyingToOpaque = cast<UnderlyingToOpaqueExpr>(expr);
+      return extractCompileTimeValue(underlyingToOpaque->getSubExpr());
+    }
+
+    case ExprKind::DefaultArgument: {
+      auto defaultArgExpr = cast<DefaultArgumentExpr>(expr);
+      auto *decl = defaultArgExpr->getParamDecl();
+      // If there is a default expr, we should have looked through to it
+      assert(!decl->hasDefaultExpr());
+      switch (decl->getDefaultArgumentKind()) {
+      case DefaultArgumentKind::NilLiteral:
+        return std::make_shared<RawLiteralValue>("nil");
+      case DefaultArgumentKind::EmptyArray:
+        return std::make_shared<ArrayValue>(
+            std::vector<std::shared_ptr<CompileTimeValue>>());
+      case DefaultArgumentKind::EmptyDictionary:
+        return std::make_shared<DictionaryValue>(
+            std::vector<std::shared_ptr<TupleValue>>());
+      default:
+        break;
+      }
+    } break;
+
+    case ExprKind::InjectIntoOptional: {
+      auto injectIntoOptionalExpr = cast<InjectIntoOptionalExpr>(expr);
+      return extractCompileTimeValue(injectIntoOptionalExpr->getSubExpr());
+    }
+
     default: {
       break;
     }
@@ -303,32 +353,40 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
   return std::make_shared<RuntimeValue>();
 }
 
-static std::vector<CustomAttrValue>
-extractCustomAttrValues(VarDecl *propertyDecl) {
-  std::vector<CustomAttrValue> customAttrValues;
+static CustomAttrValue
+extractAttributeValue(const CustomAttr *attr) {
+  std::vector<FunctionParameter> parameters;
+  if (const auto *args = attr->getArgs()) {
+    for (auto arg : *args) {
+      const auto label = arg.getLabel().str().str();
+      auto argExpr = arg.getExpr();
 
-  for (auto *propertyWrapper : propertyDecl->getAttachedPropertyWrappers()) {
-    std::vector<FunctionParameter> parameters;
-
-    if (const auto *args = propertyWrapper->getArgs()) {
-      for (auto arg : *args) {
-        const auto label = arg.getLabel().str().str();
-        auto argExpr = arg.getExpr();
-
-        if (auto defaultArgument = dyn_cast<DefaultArgumentExpr>(argExpr)) {
-          auto *decl = defaultArgument->getParamDecl();
-          if (decl->hasDefaultExpr()) {
-            argExpr = decl->getTypeCheckedDefaultExpr();
-          }
+      if (auto defaultArgument = dyn_cast<DefaultArgumentExpr>(argExpr)) {
+        auto *decl = defaultArgument->getParamDecl();
+        if (decl->hasDefaultExpr()) {
+          argExpr = decl->getTypeCheckedDefaultExpr();
         }
-        parameters.push_back(
-            {label, argExpr->getType(), extractCompileTimeValue(argExpr)});
       }
+      parameters.push_back(
+          {label, argExpr->getType(), extractCompileTimeValue(argExpr)});
     }
-
-    customAttrValues.push_back({propertyWrapper, parameters});
   }
+  return {attr, parameters};
+}
 
+static AttrValueVector
+extractPropertyWrapperAttrValues(VarDecl *propertyDecl) {
+  AttrValueVector customAttrValues;
+  for (auto *propertyWrapper : propertyDecl->getAttachedPropertyWrappers())
+    customAttrValues.push_back(extractAttributeValue(propertyWrapper));
+  return customAttrValues;
+}
+
+static AttrValueVector
+extractRuntimeMetadataAttrValues(VarDecl *propertyDecl) {
+  AttrValueVector customAttrValues;
+  for (auto *runtimeMetadataAttribute : propertyDecl->getRuntimeDiscoverableAttrs())
+    customAttrValues.push_back(extractAttributeValue(runtimeMetadataAttribute));
   return customAttrValues;
 }
 
@@ -336,9 +394,11 @@ static ConstValueTypePropertyInfo
 extractTypePropertyInfo(VarDecl *propertyDecl) {
   if (const auto binding = propertyDecl->getParentPatternBinding()) {
     if (const auto originalInit = binding->getInit(0)) {
-      if (propertyDecl->hasAttachedPropertyWrapper()) {
+      if (propertyDecl->hasAttachedPropertyWrapper() ||
+          propertyDecl->hasRuntimeMetadataAttributes()) {
         return {propertyDecl, extractCompileTimeValue(originalInit),
-                extractCustomAttrValues(propertyDecl)};
+                extractPropertyWrapperAttrValues(propertyDecl),
+                extractRuntimeMetadataAttrValues(propertyDecl)};
       }
 
       return {propertyDecl, extractCompileTimeValue(originalInit)};
@@ -571,6 +631,19 @@ void writeValue(llvm::json::OStream &JSON,
     break;
   }
 
+  case CompileTimeValue::ValueKind::Type: {
+    auto typeValue = cast<TypeValue>(value);
+    Type type = typeValue->getType();
+    JSON.attribute("valueKind", "Type");
+    JSON.attributeObject("value", [&]() {
+      JSON.attribute("type",
+                     toFullyQualifiedTypeNameString(type));
+      JSON.attribute("mangledName",
+                     toMangledTypeNameString(type));
+    });
+    break;
+  }
+
   case CompileTimeValue::ValueKind::Runtime: {
     JSON.attribute("valueKind", "Runtime");
     break;
@@ -578,31 +651,51 @@ void writeValue(llvm::json::OStream &JSON,
   }
 }
 
+void writeAttributeInfo(llvm::json::OStream &JSON,
+                        const CustomAttrValue &AttrVal,
+                        const ASTContext &ctx) {
+  JSON.object([&] {
+    JSON.attribute("type",
+                   toFullyQualifiedTypeNameString(AttrVal.Attr->getType()));
+    writeLocationInformation(JSON, AttrVal.Attr->getLocation(), ctx);
+    JSON.attributeArray("arguments", [&] {
+      for (auto FP : AttrVal.Parameters) {
+        JSON.object([&] {
+          JSON.attribute("label", FP.Label);
+          JSON.attribute("type", toFullyQualifiedTypeNameString(FP.Type));
+          writeValue(JSON, FP.Value);
+        });
+      }
+    });
+  });
+}
+
 void writePropertyWrapperAttributes(
     llvm::json::OStream &JSON,
-    llvm::Optional<std::vector<CustomAttrValue>> PropertyWrappers,
+    llvm::Optional<AttrValueVector> PropertyWrappers,
     const ASTContext &ctx) {
   if (!PropertyWrappers.has_value()) {
     return;
   }
 
   JSON.attributeArray("propertyWrappers", [&] {
-    for (auto PW : PropertyWrappers.value()) {
-      JSON.object([&] {
-        JSON.attribute("type",
-                       toFullyQualifiedTypeNameString(PW.Attr->getType()));
-        writeLocationInformation(JSON, PW.Attr->getLocation(), ctx);
-        JSON.attributeArray("arguments", [&] {
-          for (auto FP : PW.Parameters) {
-            JSON.object([&] {
-              JSON.attribute("label", FP.Label);
-              JSON.attribute("type", toFullyQualifiedTypeNameString(FP.Type));
-              writeValue(JSON, FP.Value);
-            });
-          }
-        });
-      });
-    }
+    for (auto PW : PropertyWrappers.value())
+      writeAttributeInfo(JSON, PW, ctx);
+  });
+}
+
+void writeRuntimeMetadataAttributes(
+    llvm::json::OStream &JSON,
+    llvm::Optional<AttrValueVector> RuntimeMetadataAttributes,
+    const ASTContext &ctx) {
+  if (!RuntimeMetadataAttributes.has_value() ||
+      RuntimeMetadataAttributes.value().empty()) {
+    return;
+  }
+
+  JSON.attributeArray("runtimeMetadataAttributes", [&] {
+    for (auto RMA : RuntimeMetadataAttributes.value())
+      writeAttributeInfo(JSON, RMA, ctx);;
   });
 }
 
@@ -737,6 +830,8 @@ bool writeAsJSONToFile(const std::vector<ConstValueTypeInfo> &ConstValueInfos,
               writeValue(JSON, PropertyInfo.Value);
               writePropertyWrapperAttributes(
                   JSON, PropertyInfo.PropertyWrappers, decl->getASTContext());
+              writeRuntimeMetadataAttributes(
+                  JSON, PropertyInfo.RuntimeMetadataAttributes, decl->getASTContext());
               writeResultBuilderInformation(JSON, TypeDecl, decl);
               writeAttrInformation(JSON, decl->getAttrs());
             });

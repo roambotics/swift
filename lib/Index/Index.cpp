@@ -586,6 +586,11 @@ public:
     assert(Cancelled || Containers.empty());
   }
 
+  /// Walk both the arguments and expansion of the macro, so we index both.Only walk the arguments of a macro, to represent the source as written.
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
   void visitModule(ModuleDecl &Mod);
   void visitDeclContext(DeclContext *DC);
 
@@ -1068,7 +1073,7 @@ private:
 
 void IndexSwiftASTWalker::visitDeclContext(DeclContext *Context) {
   IsModuleFile = false;
-  isSystemModule = Context->getParentModule()->isSystemModule();
+  isSystemModule = Context->getParentModule()->isNonUserModule();
   auto accessor = dyn_cast<AccessorDecl>(Context);
   if (accessor)
     ManuallyVisitedAccessorStack.push_back(accessor);
@@ -1096,7 +1101,7 @@ void IndexSwiftASTWalker::visitModule(ModuleDecl &Mod) {
     walk(*SrcFile);
   } else {
     IsModuleFile = true;
-    isSystemModule = Mod.isSystemModule();
+    isSystemModule = Mod.isNonUserModule();
     if (!handleSourceOrModuleFile(Mod))
       return;
     walk(Mod);
@@ -1173,7 +1178,7 @@ bool IndexSwiftASTWalker::visitImports(
       ModuleName = Declaring->getNameStr();
 
     if (!IdxConsumer.startDependency(ModuleName, Path, IsClangModule,
-                                     Mod->isSystemModule()))
+                                     Mod->isNonUserModule()))
       return false;
     if (!IsClangModule)
       if (!visitImports(*Mod, Visited))

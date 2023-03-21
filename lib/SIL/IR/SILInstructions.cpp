@@ -229,7 +229,7 @@ AllocStackInst::AllocStackInst(SILDebugLocation Loc, SILType elementType,
                                ArrayRef<SILValue> TypeDependentOperands,
                                SILFunction &F, Optional<SILDebugVariable> Var,
                                bool hasDynamicLifetime, bool isLexical,
-                               bool wasMoved)
+                               bool usesMoveableValueDebugInfo)
     : InstructionBase(Loc, elementType.getAddressType()),
       SILDebugVariableSupplement(Var ? Var->DIExpr.getNumElements() : 0,
                                  Var ? Var->Type.has_value() : false,
@@ -240,20 +240,22 @@ AllocStackInst::AllocStackInst(SILDebugLocation Loc, SILType elementType,
       VarInfo(0) {
   sharedUInt8().AllocStackInst.dynamicLifetime = hasDynamicLifetime;
   sharedUInt8().AllocStackInst.lexical = isLexical;
-  sharedUInt8().AllocStackInst.wasMoved = wasMoved;
+  sharedUInt8().AllocStackInst.usesMoveableValueDebugInfo =
+      usesMoveableValueDebugInfo || elementType.isMoveOnly();
   sharedUInt32().AllocStackInst.numOperands = TypeDependentOperands.size();
 
-  // VarInfo must be initialized after `sharedUInt32().AllocStackInst.numOperands`!
-  // Otherwise the trailing object addresses are wrong.
-  VarInfo = TailAllocatedDebugVariable(Var,
-               getTrailingObjects<char>(),
-               getTrailingObjects<SILType>(),
-               getTrailingObjects<SILLocation>(),
-               getTrailingObjects<const SILDebugScope *>(),
-               getTrailingObjects<SILDIExprElement>());
+  // VarInfo must be initialized after
+  // `sharedUInt32().AllocStackInst.numOperands`! Otherwise the trailing object
+  // addresses are wrong.
+  VarInfo = TailAllocatedDebugVariable(
+      Var, getTrailingObjects<char>(), getTrailingObjects<SILType>(),
+      getTrailingObjects<SILLocation>(),
+      getTrailingObjects<const SILDebugScope *>(),
+      getTrailingObjects<SILDIExprElement>());
 
   assert(sharedUInt32().AllocStackInst.numOperands ==
-         TypeDependentOperands.size() && "Truncation");
+             TypeDependentOperands.size() &&
+         "Truncation");
   auto *VD = Loc.getLocation().getAsASTNode<VarDecl>();
   if (Var && VD) {
     VarInfo.setImplicit(VD->isImplicit() || VarInfo.isImplicit());
@@ -373,27 +375,35 @@ bool AllocRefDynamicInst::isDynamicTypeDeinitAndSizeKnownEquivalentToBaseType() 
 AllocBoxInst::AllocBoxInst(SILDebugLocation Loc, CanSILBoxType BoxType,
                            ArrayRef<SILValue> TypeDependentOperands,
                            SILFunction &F, Optional<SILDebugVariable> Var,
-                           bool hasDynamicLifetime,
-                           bool reflection)
+                           bool hasDynamicLifetime, bool reflection,
+                           bool usesMoveableValueDebugInfo)
     : NullaryInstructionWithTypeDependentOperandsBase(
           Loc, TypeDependentOperands, SILType::getPrimitiveObjectType(BoxType)),
-      VarInfo(Var, getTrailingObjects<char>()),
-      HasDynamicLifetime(hasDynamicLifetime),
-      Reflection(reflection) {}
+      VarInfo(Var, getTrailingObjects<char>()) {
+  sharedUInt8().AllocBoxInst.dynamicLifetime = hasDynamicLifetime;
+  sharedUInt8().AllocBoxInst.reflection = reflection;
 
-AllocBoxInst *AllocBoxInst::create(SILDebugLocation Loc,
-                                   CanSILBoxType BoxType,
+  // If we have a noncopyable type, always set uses mvoeable value debug info.
+  usesMoveableValueDebugInfo |=
+      BoxType->getLayout()->getFields()[0].getObjectType().isMoveOnly();
+
+  sharedUInt8().AllocBoxInst.usesMoveableValueDebugInfo =
+      usesMoveableValueDebugInfo;
+}
+
+AllocBoxInst *AllocBoxInst::create(SILDebugLocation Loc, CanSILBoxType BoxType,
                                    SILFunction &F,
                                    Optional<SILDebugVariable> Var,
-                                   bool hasDynamicLifetime,
-                                   bool reflection) {
+                                   bool hasDynamicLifetime, bool reflection,
+                                   bool usesMoveableValueDebugInfo) {
   SmallVector<SILValue, 8> TypeDependentOperands;
   collectTypeDependentOperands(TypeDependentOperands, F, BoxType);
   auto Sz = totalSizeToAlloc<swift::Operand, char>(TypeDependentOperands.size(),
                                                    Var ? Var->Name.size() : 0);
   auto Buf = F.getModule().allocateInst(Sz, alignof(AllocBoxInst));
-  return ::new (Buf) AllocBoxInst(Loc, BoxType, TypeDependentOperands, F, Var,
-                                  hasDynamicLifetime, reflection);
+  return ::new (Buf)
+      AllocBoxInst(Loc, BoxType, TypeDependentOperands, F, Var,
+                   hasDynamicLifetime, reflection, usesMoveableValueDebugInfo);
 }
 
 SILType AllocBoxInst::getAddressType() const {
@@ -404,7 +414,7 @@ SILType AllocBoxInst::getAddressType() const {
 
 DebugValueInst::DebugValueInst(SILDebugLocation DebugLoc, SILValue Operand,
                                SILDebugVariable Var, bool poisonRefs,
-                               bool wasMoved, bool trace)
+                               bool usesMoveableValueDebugInfo, bool trace)
     : UnaryInstructionBase(DebugLoc, Operand),
       SILDebugVariableSupplement(Var.DIExpr.getNumElements(),
                                  Var.Type.has_value(), Var.Loc.has_value(),
@@ -416,8 +426,8 @@ DebugValueInst::DebugValueInst(SILDebugLocation DebugLoc, SILValue Operand,
   if (auto *VD = DebugLoc.getLocation().getAsASTNode<VarDecl>())
     VarInfo.setImplicit(VD->isImplicit() || VarInfo.isImplicit());
   setPoisonRefs(poisonRefs);
-  if (wasMoved)
-    markAsMoved();
+  if (usesMoveableValueDebugInfo || Operand->getType().isMoveOnly())
+    setUsesMoveableValueDebugInfo();
   setTrace(trace);
 }
 
@@ -2267,6 +2277,28 @@ OpenExistentialValueInst::OpenExistentialValueInst(
     : UnaryInstructionBase(debugLoc, operand, selfTy, forwardingOwnershipKind) {
 }
 
+PackLengthInst *PackLengthInst::create(SILFunction &F,
+                                       SILDebugLocation loc,
+                                       CanPackType packType) {
+  auto resultType = SILType::getBuiltinWordType(F.getASTContext());
+
+  // Always reduce the pack shape.
+  packType = packType->getReducedShape();
+
+  // Under current limitations, that should reliably eliminate
+  // any local archetypes from the pack, but there's no real need to
+  // assume that in the SIL representation.
+  SmallVector<SILValue, 8> typeDependentOperands;
+  collectTypeDependentOperands(typeDependentOperands, F, packType);
+
+  size_t size =
+    totalSizeToAlloc<swift::Operand>(typeDependentOperands.size());
+  void *buffer =
+    F.getModule().allocateInst(size, alignof(PackLengthInst));
+  return ::new (buffer)
+      PackLengthInst(loc, typeDependentOperands, resultType, packType);
+}
+
 DynamicPackIndexInst *DynamicPackIndexInst::create(SILFunction &F,
                                                    SILDebugLocation loc,
                                                    SILValue indexOperand,
@@ -2276,7 +2308,7 @@ DynamicPackIndexInst *DynamicPackIndexInst::create(SILFunction &F,
   SmallVector<SILValue, 8> typeDependentOperands;
   collectTypeDependentOperands(typeDependentOperands, F, packType);
 
-  unsigned size =
+  size_t size =
     totalSizeToAlloc<swift::Operand>(1 + typeDependentOperands.size());
   void *buffer =
     F.getModule().allocateInst(size, alignof(DynamicPackIndexInst));
@@ -2299,7 +2331,7 @@ PackPackIndexInst *PackPackIndexInst::create(SILFunction &F,
   SmallVector<SILValue, 8> typeDependentOperands;
   collectTypeDependentOperands(typeDependentOperands, F, packType);
 
-  unsigned size =
+  size_t size =
     totalSizeToAlloc<swift::Operand>(1 + typeDependentOperands.size());
   void *buffer =
     F.getModule().allocateInst(size, alignof(PackPackIndexInst));
@@ -2322,7 +2354,7 @@ ScalarPackIndexInst *ScalarPackIndexInst::create(SILFunction &F,
   SmallVector<SILValue, 8> typeDependentOperands;
   collectTypeDependentOperands(typeDependentOperands, F, packType);
 
-  unsigned size =
+  size_t size =
     totalSizeToAlloc<swift::Operand>(typeDependentOperands.size());
   void *buffer =
     F.getModule().allocateInst(size, alignof(ScalarPackIndexInst));
@@ -2357,7 +2389,6 @@ OpenPackElementInst *OpenPackElementInst::create(
                                      PackType *packSubstitution) {
     collector.collect(packSubstitution->getCanonicalType());
   });
-  collector.collect(env->getOpenedElementShapeClass());
   collector.addTo(typeDependentOperands, F);
 
   SILType type = SILType::getSILTokenType(F.getASTContext());
@@ -2877,24 +2908,30 @@ KeyPathInst::create(SILDebugLocation Loc,
   assert(Args.size() == Pattern->getNumOperands()
          && "number of key path args doesn't match pattern");
 
-  auto totalSize = totalSizeToAlloc<Operand>(Args.size());
+  SmallVector<SILValue, 8> allOperands(Args.begin(), Args.end());
+  collectTypeDependentOperands(allOperands, F, Ty);
+
+  auto totalSize = totalSizeToAlloc<Operand>(allOperands.size());
   void *mem = F.getModule().allocateInst(totalSize, alignof(KeyPathInst));
-  return ::new (mem) KeyPathInst(Loc, Pattern, Subs, Args, Ty);
+  return ::new (mem) KeyPathInst(Loc, Pattern, Subs, allOperands, Args.size(), Ty);
 }
 
 KeyPathInst::KeyPathInst(SILDebugLocation Loc,
                          KeyPathPattern *Pattern,
                          SubstitutionMap Subs,
-                         ArrayRef<SILValue> Args,
+                         ArrayRef<SILValue> allOperands,
+                         unsigned numPatternOperands,
                          SILType Ty)
   : InstructionBase(Loc, Ty),
     Pattern(Pattern),
-    NumOperands(Pattern->getNumOperands()),
+    numPatternOperands(numPatternOperands),
+    numTypeDependentOperands(allOperands.size() - numPatternOperands),
     Substitutions(Subs)
 {
+  assert(allOperands.size() >= numPatternOperands);
   auto *operandsBuf = getTrailingObjects<Operand>();
-  for (unsigned i = 0; i < Args.size(); ++i) {
-    ::new ((void*)&operandsBuf[i]) Operand(this, Args[i]);
+  for (unsigned i = 0; i < allOperands.size(); ++i) {
+    ::new ((void*)&operandsBuf[i]) Operand(this, allOperands[i]);
   }
   
   // Increment the use of any functions referenced from the keypath pattern.
@@ -2905,7 +2942,7 @@ KeyPathInst::KeyPathInst(SILDebugLocation Loc,
 
 MutableArrayRef<Operand>
 KeyPathInst::getAllOperands() {
-  return {getTrailingObjects<Operand>(), NumOperands};
+  return {getTrailingObjects<Operand>(), numPatternOperands + numTypeDependentOperands};
 }
 
 KeyPathInst::~KeyPathInst() {

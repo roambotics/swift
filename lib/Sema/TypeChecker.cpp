@@ -17,6 +17,7 @@
 
 #include "swift/Subsystems.h"
 #include "TypeChecker.h"
+#include "TypeCheckConcurrency.h"
 #include "TypeCheckDecl.h"
 #include "TypeCheckObjC.h"
 #include "TypeCheckType.h"
@@ -258,38 +259,6 @@ void swift::performTypeChecking(SourceFile &SF) {
                                  TypeCheckSourceFileRequest{&SF}, {});
 }
 
-/// If any of the imports in this source file was @preconcurrency but
-/// there were no diagnostics downgraded or suppressed due to that
-/// @preconcurrency, suggest that the attribute be removed.
-static void diagnoseUnnecessaryPreconcurrencyImports(SourceFile &sf) {
-  switch (sf.Kind) {
-  case SourceFileKind::Interface:
-  case SourceFileKind::SIL:
-    return;
-
-  case SourceFileKind::Library:
-  case SourceFileKind::Main:
-  case SourceFileKind::MacroExpansion:
-    break;
-  }
-
-  ASTContext &ctx = sf.getASTContext();
-
-  if (ctx.TypeCheckerOpts.SkipFunctionBodies != FunctionBodySkipping::None)
-    return;
-
-  for (const auto &import : sf.getImports()) {
-    if (import.options.contains(ImportFlags::Preconcurrency) &&
-        import.importLoc.isValid() &&
-        !sf.hasImportUsedPreconcurrency(import)) {
-      ctx.Diags.diagnose(
-          import.importLoc, diag::remove_predates_concurrency_import,
-          import.module.importedModule->getName())
-        .fixItRemove(import.preconcurrencyRange);
-    }
-  }
-}
-
 evaluator::SideEffect
 TypeCheckSourceFileRequest::evaluate(Evaluator &eval, SourceFile *SF) const {
   assert(SF && "Source file cannot be null!");
@@ -344,6 +313,13 @@ TypeCheckSourceFileRequest::evaluate(Evaluator &eval, SourceFile *SF) const {
       CheckInconsistentSPIOnlyImportsRequest{SF},
       {});
 
+  if (!Ctx.LangOpts.isSwiftVersionAtLeast(6)) {
+    evaluateOrDefault(
+      Ctx.evaluator,
+      CheckInconsistentAccessLevelOnImport{SF},
+      {});
+  }
+
   evaluateOrDefault(
       Ctx.evaluator,
       CheckInconsistentWeakLinkedImportsRequest{SF->getParentModule()}, {});
@@ -395,6 +371,10 @@ void swift::loadDerivativeConfigurations(SourceFile &SF) {
   class DerivativeFinder : public ASTWalker {
   public:
     DerivativeFinder() {}
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
 
     PreWalkAction walkToDeclPre(Decl *D) override {
       if (auto *afd = dyn_cast<AbstractFunctionDecl>(D)) {
@@ -474,6 +454,10 @@ namespace {
                             GenericParamList *params)
         : dc(dc), params(params) {}
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
+
     PreWalkAction walkToTypeReprPre(TypeRepr *T) override {
     if (auto *declRefTR = dyn_cast<DeclRefTypeRepr>(T)) {
       if (auto *identBase =
@@ -549,7 +533,7 @@ bool swift::typeCheckASTNodeAtLoc(TypeCheckASTNodeAtLocContext TypeCheckCtx,
 }
 
 bool swift::typeCheckForCodeCompletion(
-    constraints::SolutionApplicationTarget &target, bool needsPrecheck,
+    constraints::SyntacticElementTarget &target, bool needsPrecheck,
     llvm::function_ref<void(const constraints::Solution &)> callback) {
   return TypeChecker::typeCheckForCodeCompletion(target, needsPrecheck,
                                                  callback);

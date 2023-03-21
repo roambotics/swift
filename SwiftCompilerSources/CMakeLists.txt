@@ -75,6 +75,7 @@ function(add_swift_compiler_modules_library name)
   set(swift_compile_options
       "-Xfrontend" "-validate-tbd-against-ir=none"
       "-Xfrontend" "-enable-experimental-cxx-interop"
+      "-Xcc" "-std=c++17"
       "-Xcc" "-UIBOutlet" "-Xcc" "-UIBAction" "-Xcc" "-UIBInspectable")
   if (NOT BOOTSTRAPPING_MODE STREQUAL "HOSTTOOLS")
     list(APPEND swift_compile_options "-Xfrontend" "-disable-implicit-string-processing-module-import")
@@ -176,20 +177,21 @@ function(add_swift_compiler_modules_library name)
     endforeach()
 
     # Compile the module into an object file
-    add_custom_command_target(dep_target OUTPUT ${module_obj_file}
+    add_custom_command_target(dep_target
+      COMMAND ${ALS_SWIFT_EXEC} "-c" "-o" ${module_obj_file}
+        ${sdk_option}
+        "-target" ${target}
+        "-module-name" ${module} "-emit-module"
+        "-emit-module-path" "${build_dir}/${module}.swiftmodule"
+        "-parse-as-library" ${sources}
+        "-wmo" ${swift_compile_options}
+        ${c_include_paths_args}
+        # Generated swift modules.
+        "-I" "${build_dir}"
+      OUTPUT ${module_obj_file}
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       DEPENDS ${sources} ${deps} ${ALS_DEPENDS}
         importedHeaderDependencies
-      COMMAND ${ALS_SWIFT_EXEC} "-c" "-o" ${module_obj_file}
-              ${sdk_option}
-              "-target" ${target}
-              "-module-name" ${module} "-emit-module"
-              "-emit-module-path" "${build_dir}/${module}.swiftmodule"
-              "-parse-as-library" ${sources}
-              "-wmo" ${swift_compile_options}
-              ${c_include_paths_args}
-              # Generated swift modules.
-              "-I" "${build_dir}"
       COMMENT "Building swift module ${module}")
 
     set("${module}_dep_target" ${dep_target})

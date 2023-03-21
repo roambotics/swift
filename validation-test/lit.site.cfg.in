@@ -105,6 +105,9 @@ if "@SWIFT_THREADING_PACKAGE@" != "none":
 if "@SWIFT_ENABLE_REFLECTION@" == "TRUE":
     config.available_features.add("reflection")
 
+if "@SWIFT_ENABLE_OBSERVATION@" == "TRUE":
+    config.available_features.add("observation")
+
 if "@SWIFT_BUILT_STANDALONE@" == "TRUE":
     config.available_features.add('standalone_build')
 
@@ -127,8 +130,6 @@ if "@SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED@" == "TRUE":
     config.available_features.add('distributed')
 if "@SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING@" == "TRUE":
     config.available_features.add('string_processing')
-if "@SWIFT_ENABLE_EXPERIMENTAL_REFLECTION@" == "TRUE":
-    config.available_features.add('reflection')
 if "@SWIFT_STDLIB_ENABLE_DEBUG_PRECONDITIONS_IN_RELEASE@" == "TRUE":
     config.available_features.add('swift_stdlib_debug_preconditions_in_release')
 

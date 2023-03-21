@@ -33,7 +33,7 @@ enum class RefactoringKind : int8_t {
 };
 
 struct RangeConfig {
-  unsigned BufferId;
+  unsigned BufferID;
   unsigned Line;
   unsigned Column;
   unsigned Length;
@@ -136,7 +136,7 @@ void collectAvailableRefactorings(
     llvm::SmallVectorImpl<RefactoringKind> &Kinds,
     llvm::ArrayRef<DiagnosticConsumer *> DiagConsumers);
 
-void collectAvailableRefactorings(const ResolvedCursorInfo &CursorInfo,
+void collectAvailableRefactorings(ResolvedCursorInfoPtr CursorInfo,
                                   llvm::SmallVectorImpl<RefactoringKind> &Kinds,
                                   bool ExcludeRename);
 
@@ -148,9 +148,8 @@ struct RenameRefInfo {
   bool IsArgLabel; ///< Whether Loc is on an arg label, rather than base name.
 };
 
-void collectRenameAvailabilityInfo(
-    const ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
-    llvm::SmallVectorImpl<RenameAvailabilityInfo> &Infos);
+Optional<RenameAvailabilityInfo>
+renameAvailabilityInfo(const ValueDecl *VD, Optional<RenameRefInfo> RefInfo);
 
 } // namespace ide
 } // namespace swift

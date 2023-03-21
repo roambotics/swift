@@ -107,6 +107,9 @@ public:
     bool isImplementationOnly() const {
       return Core.isImplementationOnly();
     }
+    bool isPackageOnly() const {
+      return Core.isPackageOnly();
+    }
 
     bool isHeader() const { return Core.isHeader(); }
     bool isScoped() const { return Core.isScoped(); }
@@ -781,12 +784,18 @@ public:
   StringRef getModuleFilename() const {
     if (!Core->ModuleInterfacePath.empty())
       return Core->ModuleInterfacePath;
-    // FIXME: This seems fragile, maybe store the filename separately ?
-    return Core->ModuleInputBuffer->getBufferIdentifier();
+    return getModuleLoadedFilename();
   }
 
   StringRef getModuleLoadedFilename() const {
+    // FIXME: This seems fragile, maybe store the filename separately?
     return Core->ModuleInputBuffer->getBufferIdentifier();
+  }
+
+  StringRef getModuleSourceFilename() const {
+    if (!Core->CorrespondingInterfacePath.empty())
+      return Core->CorrespondingInterfacePath;
+    return getModuleFilename();
   }
 
   StringRef getTargetTriple() const {

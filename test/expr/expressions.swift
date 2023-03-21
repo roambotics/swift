@@ -36,7 +36,7 @@ func basictest() {
 
   var x4 : Bool = true
   var x5 : Bool =
-        4 // expected-error {{type 'Int' cannot be used as a boolean; test for '!= 0' instead}}
+        4 // expected-error {{cannot convert value of type 'Int' to specified type 'Bool'}}
 
   //var x6 : Float = 4+5
 
@@ -297,7 +297,7 @@ func fib(_ n: Int) -> Int {
 
 // FIXME: Should warn about integer constants being too large <rdar://problem/14070127>
 var
-   il_a: Bool = 4  // expected-error {{type 'Int' cannot be used as a boolean; test for '!= 0' instead}}
+   il_a: Bool = 4  // expected-error {{cannot convert value of type 'Int' to specified type 'Bool'}}
 var il_b: Int8
    = 123123
 var il_c: Int8 = 4  // ok
@@ -749,7 +749,6 @@ func invalidDictionaryLiteral() {
 
 [4].joined(separator: [1])
 // expected-error@-1 {{no exact matches in call to instance method 'joined'}}
-// expected-note@-2 {{found candidate with type '(String) -> String'}}
 // There is one more note here - candidate requires that 'Int' conform to 'Sequence' (requirement specified as 'Self.Element' : 'Sequence') pointing to Sequence extension
 
 [4].joined(separator: [[[1]]])

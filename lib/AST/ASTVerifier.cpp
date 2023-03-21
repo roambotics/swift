@@ -26,6 +26,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Initializer.h"
+#include "swift/AST/MacroDiscriminatorContext.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
@@ -233,7 +234,8 @@ class Verifier : public ASTWalker {
       ClosureDiscriminators;
   DeclContext *CanonicalTopLevelSubcontext = nullptr;
 
-  typedef std::pair<DeclContext *, Identifier> MacroExpansionDiscriminatorKey;
+  typedef std::pair</*MacroDiscriminatorContext*/const void *, Identifier>
+      MacroExpansionDiscriminatorKey;
   llvm::DenseMap<MacroExpansionDiscriminatorKey, SmallBitVector>
       MacroExpansionDiscriminators;
 
@@ -267,6 +269,10 @@ public:
     if (auto SF = dyn_cast<SourceFile>(topDC))
       return Verifier(*SF, DC);
     return Verifier(topDC->getParentModule(), DC);
+  }
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::None;
   }
 
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
@@ -595,6 +601,18 @@ public:
       if (type->hasTypeVariable()) {
         Out << "a type variable escaped the type checker\n";
         abort();
+      }
+
+      // Check for invalid pack expansion shape types.
+      if (auto *expansion = type->getAs<PackExpansionType>()) {
+        auto countType = expansion->getCountType();
+        if (!(countType->is<PackType>() ||
+              countType->is<PackArchetypeType>() ||
+              (countType->is<GenericTypeParamType>() &&
+               countType->castTo<GenericTypeParamType>()->isParameterPack()))) {
+          Out << "non-pack shape type" << countType->getString() << "\n";
+          abort();
+        }
       }
 
       if (!type->hasArchetype())
@@ -945,12 +963,6 @@ public:
       if (D->hasAccess()) {
         PrettyStackTraceDecl debugStack("verifying access", D);
         if (!D->getASTContext().isAccessControlDisabled()) {
-          if (D->getFormalAccessScope().isPackage() &&
-              D->getFormalAccess() < AccessLevel::Package) {
-            Out << "non-package decl has no formal access scope\n";
-            D->dump(Out);
-            abort();
-          }
           if (D->getFormalAccessScope().isPublic() &&
               D->getFormalAccess() < AccessLevel::Public) {
             Out << "non-public decl has no formal access scope\n";
@@ -2410,9 +2422,8 @@ public:
     }
 
     void verifyChecked(MacroExpansionExpr *expansion) {
-      auto dc = getCanonicalDeclContext(expansion->getDeclContext());
       MacroExpansionDiscriminatorKey key{
-        dc,
+        MacroDiscriminatorContext::getParentOf(expansion).getOpaqueValue(),
         expansion->getMacroName().getBaseName().getIdentifier()
       };
       auto &discriminatorSet = MacroExpansionDiscriminators[key];
@@ -2433,9 +2444,8 @@ public:
     }
 
     void verifyChecked(MacroExpansionDecl *expansion) {
-      auto dc = getCanonicalDeclContext(expansion->getDeclContext());
       MacroExpansionDiscriminatorKey key{
-        dc,
+        MacroDiscriminatorContext::getParentOf(expansion).getOpaqueValue(),
         expansion->getMacroName().getBaseName().getIdentifier()
       };
       auto &discriminatorSet = MacroExpansionDiscriminators[key];

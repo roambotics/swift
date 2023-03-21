@@ -27,6 +27,7 @@ namespace swift {
 class ASTContext;
 class TypeRepr;
 class IdentTypeRepr;
+class PackElementTypeRepr;
 class GenericEnvironment;
 class GenericSignature;
 class SILTypeResolutionContext;
@@ -80,6 +81,9 @@ enum class TypeResolutionFlags : uint16_t {
 
   /// Whether this is a resolution based on a pack reference.
   FromPackReference = 1 << 12,
+
+  /// Whether this resolution happens under an explicit ownership specifier.
+  HasOwnership = 1 << 13,
 };
 
 /// Type resolution contexts that require special handling.
@@ -491,10 +495,10 @@ using OpenUnboundGenericTypeFn = llvm::function_ref<Type(UnboundGenericType *)>;
 using HandlePlaceholderTypeReprFn =
     llvm::function_ref<Type(ASTContext &, PlaceholderTypeRepr *)>;
 
-/// A function reference used to replace pack references with opened
-/// element archetypes when resolving a \c PackReferenceTypeRepr.
+/// A function reference used to replace pack elements with opened
+/// element archetypes when resolving a \c PackElementTypeRepr.
 using OpenPackElementFn =
-    llvm::function_ref<Type(Type, PackReferenceTypeRepr *)>;
+    llvm::function_ref<Type(Type, PackElementTypeRepr *)>;
 
 /// Handles the resolution of types within a given declaration context,
 /// which might involve resolving generic parameters to a particular
@@ -506,19 +510,18 @@ class TypeResolution {
   OpenUnboundGenericTypeFn unboundTyOpener;
   HandlePlaceholderTypeReprFn placeholderHandler;
   OpenPackElementFn packElementOpener;
-
-private:
   GenericSignature genericSig;
 
-  TypeResolution(DeclContext *dc, TypeResolutionStage stage,
-                 TypeResolutionOptions options,
+private:
+  TypeResolution(DeclContext *dc, GenericSignature genericSig,
+                 TypeResolutionStage stage, TypeResolutionOptions options,
                  OpenUnboundGenericTypeFn unboundTyOpener,
                  HandlePlaceholderTypeReprFn placeholderHandler,
                  OpenPackElementFn packElementOpener)
       : dc(dc), stage(stage), options(options),
         unboundTyOpener(unboundTyOpener),
         placeholderHandler(placeholderHandler),
-        packElementOpener(packElementOpener) {}
+        packElementOpener(packElementOpener), genericSig(genericSig) {}
 
 public:
   /// Form a type resolution for the structure of a type, which does not
@@ -567,6 +570,8 @@ public:
 
 public:
   TypeResolution withOptions(TypeResolutionOptions opts) const;
+
+  TypeResolution withoutPackElementOpener() const;
 
 public:
   /// Retrieve the ASTContext in which this resolution occurs.

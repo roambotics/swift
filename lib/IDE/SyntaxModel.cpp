@@ -394,6 +394,11 @@ public:
   // FIXME: Remove this
   bool shouldWalkAccessorsTheOldWay() override { return true; }
 
+  /// Only walk the arguments of a macro, to represent the source as written.
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Arguments;
+  }
+
   void visitSourceFile(SourceFile &SrcFile, ArrayRef<SyntaxNode> Tokens);
 
   PreWalkResult<ArgumentList *>
@@ -414,7 +419,7 @@ private:
   static bool findUrlStartingLoc(StringRef Text, unsigned &Start,
                                  std::regex& Regex);
   bool annotateIfConfigConditionIdentifiers(Expr *Cond);
-  bool handleAttrs(const DeclAttributes &Attrs);
+  bool handleAttrs(const OrigDeclAttributes &Attrs);
   bool handleAttrs(const TypeAttributes &Attrs);
 
   using DeclAttributeAndRange = std::pair<const DeclAttribute *, SourceRange>;
@@ -508,7 +513,7 @@ CharSourceRange innerCharSourceRangeFromSourceRange(const SourceManager &SM,
 
 static void setDecl(SyntaxStructureNode &N, Decl *D) {
   N.Dcl = D;
-  N.Attrs = D->getAttrs();
+  N.Attrs = D->getOriginalAttrs();
   N.DocRange = D->getRawComment(/*SerializedOK=*/false).getCharSourceRange();
 }
 
@@ -909,7 +914,7 @@ ASTWalker::PreWalkAction ModelASTWalker::walkToDeclPre(Decl *D) {
   // attached to syntactically).
   if (!isa<EnumElementDecl>(D) &&
       !(isa<VarDecl>(D) && cast<VarDecl>(D)->getParentPatternBinding())) {
-    if (!handleAttrs(D->getAttrs()))
+    if (!handleAttrs(D->getOriginalAttrs()))
       return Action::SkipChildren();
   }
 
@@ -992,7 +997,7 @@ ASTWalker::PreWalkAction ModelASTWalker::walkToDeclPre(Decl *D) {
       passTokenNodesUntil(ArgStart, PassNodesBehavior::ExcludeNodeAtLocation);
     }
     SN.Range = charSourceRangeFromSourceRange(SM, PD->getSourceRange());
-    SN.Attrs = PD->getAttrs();
+    SN.Attrs = PD->getOriginalAttrs();
     SN.TypeRange = charSourceRangeFromSourceRange(SM,
                                       PD->getTypeSourceRangeForDiagnostics());
     pushStructureNode(SN, PD);
@@ -1006,7 +1011,7 @@ ASTWalker::PreWalkAction ModelASTWalker::walkToDeclPre(Decl *D) {
         Contained = VD;
       });
       if (Contained) {
-        if (!handleAttrs(Contained->getAttrs()))
+        if (!handleAttrs(Contained->getOriginalAttrs()))
           return Action::SkipChildren();
         break;
       }
@@ -1078,7 +1083,7 @@ ASTWalker::PreWalkAction ModelASTWalker::walkToDeclPre(Decl *D) {
     // We need to handle the special case where attributes semantically
     // attach to enum element decls while syntactically locate before enum case decl.
     if (auto *element = EnumCaseD->getFirstElement()) {
-      if (!handleAttrs(element->getAttrs()))
+      if (!handleAttrs(element->getOriginalAttrs()))
         return Action::SkipChildren();
     }
     if (pushStructureNode(SN, D)) {
@@ -1200,6 +1205,10 @@ class IdRefWalker : public ASTWalker {
 public:
   IdRefWalker(const FnTy &Fn) : Fn(Fn) {}
 
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
     if (auto DRE = dyn_cast<UnresolvedDeclRefExpr>(E)) {
       if (!DRE->hasName())
@@ -1272,9 +1281,9 @@ bool ModelASTWalker::handleSpecialDeclAttribute(const DeclAttribute *D,
   return false;
 }
 
-bool ModelASTWalker::handleAttrs(const DeclAttributes &Attrs) {
+bool ModelASTWalker::handleAttrs(const OrigDeclAttributes &Attrs) {
   SmallVector<DeclAttributeAndRange, 4> DeclRanges;
-  for (auto At : Attrs) {
+  for (auto *At : Attrs) {
     if (At->getRangeWithAt().isValid())
       DeclRanges.push_back(std::make_pair(At, At->getRangeWithAt()));
   }

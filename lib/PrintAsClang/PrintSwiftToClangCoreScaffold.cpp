@@ -23,16 +23,6 @@
 
 using namespace swift;
 
-static void printKnownCType(Type t, PrimitiveTypeMapping &typeMapping,
-                            raw_ostream &os) {
-  auto info =
-      typeMapping.getKnownCTypeInfo(t->getNominalOrBoundGenericNominal());
-  assert(info.has_value() && "not a known type");
-  os << info->name;
-  if (info->canBeNullable)
-    os << " _Null_unspecified";
-}
-
 static void printKnownStruct(
     PrimitiveTypeMapping &typeMapping, raw_ostream &os, StringRef name,
     const IRABIDetailsProvider::TypeRecordABIRepresentation &typeRecord) {
@@ -40,7 +30,7 @@ static void printKnownStruct(
   os << "struct " << name << " {\n";
   for (const auto &ty : llvm::enumerate(typeRecord.getMembers())) {
     os << "  ";
-    printKnownCType(ty.value(), typeMapping, os);
+    ClangSyntaxPrinter(os).printKnownCType(ty.value(), typeMapping);
     os << " _" << ty.index() << ";\n";
   }
   os << "};\n";
@@ -51,7 +41,8 @@ static void printKnownTypedef(
     const IRABIDetailsProvider::TypeRecordABIRepresentation &typeRecord) {
   assert(typeRecord.getMembers().size() == 1);
   os << "typedef ";
-  printKnownCType(typeRecord.getMembers()[0], typeMapping, os);
+  ClangSyntaxPrinter(os).printKnownCType(typeRecord.getMembers()[0],
+                                         typeMapping);
   os << " " << name << ";\n";
 }
 
@@ -195,7 +186,9 @@ void printPrimitiveGenericTypeTraits(raw_ostream &os, ASTContext &astContext,
        << typeInfo.name << "> = true;\n\n";
 
     os << "template<>\nstruct TypeMetadataTrait<" << typeInfo.name << "> {\n"
-       << "  static inline void * _Nonnull getTypeMetadata() {\n"
+       << "  static ";
+    ClangSyntaxPrinter(os).printInlineForThunk();
+    os << "void * _Nonnull getTypeMetadata() {\n"
        << "    return &" << cxx_synthesis::getCxxImplNamespaceName()
        << "::" << typeMetadataVarName << ";\n"
        << "  }\n};\n\n";
@@ -207,24 +200,27 @@ void swift::printSwiftToClangCoreScaffold(SwiftToClangInteropContext &ctx,
                                           PrimitiveTypeMapping &typeMapping,
                                           raw_ostream &os) {
   ClangSyntaxPrinter printer(os);
-  printer.printNamespace("swift", [&](raw_ostream &) {
-    printer.printNamespace(
-        cxx_synthesis::getCxxImplNamespaceName(), [&](raw_ostream &) {
-          printer.printExternC([&](raw_ostream &os) {
-            printTypeMetadataResponseType(ctx, typeMapping, os);
-            os << "\n";
-            printValueWitnessTable(os);
-            os << "\n";
-            printPrimitiveGenericTypeTraits(os, astContext, typeMapping,
-                                            /*isCForwardDefinition=*/true);
-          });
-          os << "\n";
+  printer.printNamespace(
+      cxx_synthesis::getCxxSwiftNamespaceName(),
+      [&](raw_ostream &) {
+        printer.printNamespace(
+            cxx_synthesis::getCxxImplNamespaceName(), [&](raw_ostream &) {
+              printer.printExternC([&](raw_ostream &os) {
+                printTypeMetadataResponseType(ctx, typeMapping, os);
+                os << "\n";
+                printValueWitnessTable(os);
+                os << "\n";
+                printPrimitiveGenericTypeTraits(os, astContext, typeMapping,
+                                                /*isCForwardDefinition=*/true);
+              });
+              os << "\n";
+            });
+        os << "\n";
+        // C++ only supports inline variables from C++17.
+        ClangSyntaxPrinter(os).printIgnoredCxx17ExtensionDiagnosticBlock([&]() {
+          printPrimitiveGenericTypeTraits(os, astContext, typeMapping,
+                                          /*isCForwardDefinition=*/false);
         });
-    os << "\n";
-    // C++ only supports inline variables from C++17.
-    ClangSyntaxPrinter(os).printIgnoredCxx17ExtensionDiagnosticBlock([&]() {
-      printPrimitiveGenericTypeTraits(os, astContext, typeMapping,
-                                      /*isCForwardDefinition=*/false);
-    });
-  });
+      },
+      ClangSyntaxPrinter::NamespaceTrivia::AttributeSwiftPrivate);
 }

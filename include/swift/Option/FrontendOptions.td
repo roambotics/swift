@@ -308,6 +308,10 @@ def enable_experimental_eager_clang_module_diagnostics :
   Flag<["-"], "enable-experimental-eager-clang-module-diagnostics">,
   HelpText<"Enable experimental eager diagnostics reporting on the importability of all referenced C, C++, and Objective-C libraries">;
 
+def enable_import_objc_forward_declarations :
+  Flag<["-"], "enable-import-objc-forward-declarations">,
+  HelpText<"Attempt to import Objective-C forward declarations">;
+
 def enable_experimental_pairwise_build_block :
   Flag<["-"], "enable-experimental-pairwise-build-block">,
   HelpText<"Enable experimental pairwise 'buildBlock' for result builders">;
@@ -440,6 +444,14 @@ def disable_implicit_concurrency_module_import : Flag<["-"],
 def disable_implicit_string_processing_module_import : Flag<["-"],
   "disable-implicit-string-processing-module-import">,
   HelpText<"Disable the implicit import of the _StringProcessing module.">;
+
+def enable_implicit_backtracing_module_import : Flag<["-"],
+  "enable-implicit-backtracing-module-import">,
+  HelpText<"Enable the implicit import of the _Backtracing module.">;
+
+def disable_implicit_backtracing_module_import : Flag<["-"],
+  "disable-implicit-backtracing-module-import">,
+  HelpText<"Disable the implicit import of the _Backtracing module.">;
 
 def disable_arc_opts : Flag<["-"], "disable-arc-opts">,
   HelpText<"Don't run SIL ARC optimization passes.">;
@@ -1094,6 +1106,12 @@ def clang_header_expose_decls:
   Flags<[FrontendOption, HelpHidden]>,
   MetaVarName<"all-public|has-expose-attr">;
 
+def clang_header_expose_module:
+  Separate<["-"], "clang-header-expose-module">,
+  HelpText<"Allow the compiler to assume that APIs from the specified module are exposed to C/C++/Objective-C in another generated header, so that APIs in the current module that depend on declarations from the specified module can be exposed in the generated header.">,
+  Flags<[FrontendOption, HelpHidden]>,
+  MetaVarName<"<imported-module-name>=<generated-header-name>">;
+
 def weak_link_at_target :
   Flag<["-"], "weak-link-at-target">,
   HelpText<"Weakly link symbols for declarations that were introduced at the "
@@ -1132,6 +1150,13 @@ def disable_collocate_metadata_functions :
   Flag<["-"], "disable-collocate-metadata-functions">,
   HelpText<"Disable collocate metadata functions">;
 
+def enable_colocate_type_descriptors :
+  Flag<["-"], "enable-colocate-type-descriptors">,
+  HelpText<"Enable colocate type descriptors">;
+def disable_colocate_type_descriptors :
+  Flag<["-"], "disable-colocate-type-descriptors">,
+  HelpText<"Disable colocate type descriptors">;
+
 def enable_relative_protocol_witness_tables :
   Flag<["-"], "enable-relative-protocol-witness-tables">,
   HelpText<"Enable relative protocol witness tables">;
@@ -1158,4 +1183,8 @@ def enable_emit_generic_class_ro_t_list :
 def experimental_spi_only_imports :
   Flag<["-"], "experimental-spi-only-imports">,
   HelpText<"Enable use of @_spiOnly imports">;
+
+def enable_ossa_complete_lifetimes :
+  Flag<["-"], "enable-ossa-complete-lifetimes">,
+  HelpText<"Require linear OSSA lifetimes after SILGen">;
 } // end let Flags = [FrontendOption, NoDriverOption, HelpHidden]

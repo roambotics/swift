@@ -83,6 +83,11 @@ bool TypeRepr::findIf(llvm::function_ref<bool(TypeRepr *)> pred) {
     explicit Walker(llvm::function_ref<bool(TypeRepr *)> pred)
         : Pred(pred), FoundIt(false) {}
 
+    /// Walk everything in a macro
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::ArgumentsAndExpansion;
+    }
+
     PreWalkAction walkToTypeReprPre(TypeRepr *ty) override {
       if (Pred(ty)) {
         FoundIt = true;
@@ -218,6 +223,15 @@ void AttributedTypeRepr::printAttrs(ASTPrinter &Printer,
     Printer.printSimpleAttr("@autoclosure") << " ";
   if (hasAttr(TAK_escaping))
     Printer.printSimpleAttr("@escaping") << " ";
+
+  for (auto customAttr : Attrs.getCustomAttrs()) {
+    Printer.callPrintStructurePre(PrintStructureKind::BuiltinAttribute);
+    Printer << "@";
+    customAttr->getTypeRepr()->print(Printer, Options);
+    Printer.printStructurePost(PrintStructureKind::BuiltinAttribute);
+    Printer << " ";
+  }
+
   if (hasAttr(TAK_Sendable))
     Printer.printSimpleAttr("@Sendable") << " ";
   if (hasAttr(TAK_noDerivative))
@@ -473,8 +487,8 @@ void PackExpansionTypeRepr::printImpl(ASTPrinter &Printer,
   printTypeRepr(Pattern, Printer, Opts);
 }
 
-void PackReferenceTypeRepr::printImpl(ASTPrinter &Printer,
-                                      const PrintOptions &Opts) const {
+void PackElementTypeRepr::printImpl(ASTPrinter &Printer,
+                                    const PrintOptions &Opts) const {
   Printer.printKeyword("each", Opts, /*Suffix=*/" ");
   printTypeRepr(PackType, Printer, Opts);
 }
@@ -582,15 +596,11 @@ void SpecifierTypeRepr::printImpl(ASTPrinter &Printer,
 #include "swift/AST/TypeReprNodes.def"
     llvm_unreachable("invalid repr kind");
     break;
-  case TypeReprKind::InOut:
-    Printer.printKeyword("inout", Opts, " ");
+  case TypeReprKind::Ownership: {
+    auto ownershipRepr = cast<OwnershipTypeRepr>(this);
+    Printer.printKeyword(ownershipRepr->getSpecifierSpelling(), Opts, " ");
     break;
-  case TypeReprKind::Shared:
-    Printer.printKeyword("__shared", Opts, " ");
-    break;
-  case TypeReprKind::Owned:
-    Printer.printKeyword("__owned", Opts, " ");
-    break;
+  }
   case TypeReprKind::Isolated:
     Printer.printKeyword("isolated", Opts, " ");
     break;
@@ -599,6 +609,14 @@ void SpecifierTypeRepr::printImpl(ASTPrinter &Printer,
     break;
   }
   printTypeRepr(Base, Printer, Opts);
+}
+
+StringRef OwnershipTypeRepr::getSpecifierSpelling() const {
+  return ParamDecl::getSpecifierSpelling(getSpecifier());
+}
+
+ValueOwnership OwnershipTypeRepr::getValueOwnership() const {
+  return ParamDecl::getValueOwnershipForSpecifier(getSpecifier());
 }
 
 void PlaceholderTypeRepr::printImpl(ASTPrinter &Printer,

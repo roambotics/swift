@@ -154,6 +154,22 @@ bool TypeVariableType::Implementation::isCodeCompletionToken() const {
   return locator && locator->directlyAt<CodeCompletionExpr>();
 }
 
+bool TypeVariableType::Implementation::isOpaqueType() const {
+  if (!locator)
+    return false;
+
+  auto GP = locator->getLastElementAs<LocatorPathElt::GenericParameter>();
+  if (!GP)
+    return false;
+
+  if (auto *GPT = GP->getType()->getAs<GenericTypeParamType>()) {
+    auto *decl = GPT->getDecl();
+    return decl && decl->isOpaqueType();
+  }
+
+  return false;
+}
+
 void *operator new(size_t bytes, ConstraintSystem& cs,
                    size_t alignment) {
   return cs.getAllocator().Allocate(bytes, alignment);
@@ -274,6 +290,10 @@ class FunctionSyntacticDiagnosticWalker : public ASTWalker {
 public:
   FunctionSyntacticDiagnosticWalker(DeclContext *dc) { dcStack.push_back(dc); }
 
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
+  }
+
   PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
     performSyntacticExprDiagnostics(expr, dcStack.back(), /*isExprStmt=*/false);
 
@@ -316,18 +336,18 @@ public:
 } // end anonymous namespace
 
 void constraints::performSyntacticDiagnosticsForTarget(
-    const SolutionApplicationTarget &target,
-    bool isExprStmt, bool disableExprAvailabilityChecking) {
+    const SyntacticElementTarget &target, bool isExprStmt,
+    bool disableExprAvailabilityChecking) {
   auto *dc = target.getDeclContext();
   switch (target.kind) {
-  case SolutionApplicationTarget::Kind::expression: {
+  case SyntacticElementTarget::Kind::expression: {
     // First emit diagnostics for the main expression.
     performSyntacticExprDiagnostics(target.getAsExpr(), dc,
                                     isExprStmt, disableExprAvailabilityChecking);
     return;
   }
 
-  case SolutionApplicationTarget::Kind::forEachStmt: {
+  case SyntacticElementTarget::Kind::forEachStmt: {
     auto *stmt = target.getAsForEachStmt();
 
     // First emit diagnostics for the main expression.
@@ -340,16 +360,16 @@ void constraints::performSyntacticDiagnosticsForTarget(
     return;
   }
 
-  case SolutionApplicationTarget::Kind::function: {
+  case SyntacticElementTarget::Kind::function: {
     FunctionSyntacticDiagnosticWalker walker(dc);
     target.getFunctionBody()->walk(walker);
     return;
   }
-  case SolutionApplicationTarget::Kind::closure:
-  case SolutionApplicationTarget::Kind::stmtCondition:
-  case SolutionApplicationTarget::Kind::caseLabelItem:
-  case SolutionApplicationTarget::Kind::patternBinding:
-  case SolutionApplicationTarget::Kind::uninitializedVar:
+  case SyntacticElementTarget::Kind::closure:
+  case SyntacticElementTarget::Kind::stmtCondition:
+  case SyntacticElementTarget::Kind::caseLabelItem:
+  case SyntacticElementTarget::Kind::patternBinding:
+  case SyntacticElementTarget::Kind::uninitializedVar:
     // Nothing to do for these.
     return;
   }
@@ -360,7 +380,7 @@ void constraints::performSyntacticDiagnosticsForTarget(
 Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
                                       ContextualTypeInfo contextualInfo,
                                       TypeCheckExprOptions options) {
-  SolutionApplicationTarget target(
+  SyntacticElementTarget target(
       expr, dc, contextualInfo.purpose, contextualInfo.getType(),
       options.contains(TypeCheckExprFlags::IsDiscarded));
   auto resultTarget = typeCheckExpression(target, options);
@@ -376,8 +396,8 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
 /// FIXME: In order to remote this function both \c FrontendStatsTracer
 /// and \c PrettyStackTrace* have to be updated to accept `ASTNode`
 // instead of each individual syntactic element types.
-Optional<SolutionApplicationTarget>
-TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
+Optional<SyntacticElementTarget>
+TypeChecker::typeCheckExpression(SyntacticElementTarget &target,
                                  TypeCheckExprOptions options) {
   DeclContext *dc = target.getDeclContext();
   auto &Context = dc->getASTContext();
@@ -388,8 +408,8 @@ TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
   return typeCheckTarget(target, options);
 }
 
-Optional<SolutionApplicationTarget>
-TypeChecker::typeCheckTarget(SolutionApplicationTarget &target,
+Optional<SyntacticElementTarget>
+TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
                              TypeCheckExprOptions options) {
   DeclContext *dc = target.getDeclContext();
   auto &Context = dc->getASTContext();
@@ -486,7 +506,7 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
 
   // First, let's try to type-check default expression using interface
   // type of the parameter, if that succeeds - we are done.
-  SolutionApplicationTarget defaultExprTarget(
+  SyntacticElementTarget defaultExprTarget(
       defaultValue, DC,
       isAutoClosure ? CTP_AutoclosureDefaultParameter : CTP_DefaultParameter,
       paramType, /*isDiscarded=*/false);
@@ -749,13 +769,13 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
                                    PatternBindingDecl *PBD,
                                    unsigned patternNumber,
                                    TypeCheckExprOptions options) {
-  SolutionApplicationTarget target =
-    PBD ? SolutionApplicationTarget::forInitialization(
-            initializer, DC, patternType, PBD, patternNumber,
-            /*bindPatternVarsOneWay=*/false)
-        : SolutionApplicationTarget::forInitialization(
-            initializer, DC, patternType, pattern,
-            /*bindPatternVarsOneWay=*/false);
+  SyntacticElementTarget target =
+      PBD ? SyntacticElementTarget::forInitialization(
+                initializer, DC, patternType, PBD, patternNumber,
+                /*bindPatternVarsOneWay=*/false)
+          : SyntacticElementTarget::forInitialization(
+                initializer, DC, patternType, pattern,
+                /*bindPatternVarsOneWay=*/false);
 
   if (DC->getASTContext().LangOpts.CheckAPIAvailabilityOnly &&
       PBD && !DC->getAsDecl()) {
@@ -867,7 +887,7 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
     return true;
   };
 
-  auto target = SolutionApplicationTarget::forForEachStmt(
+  auto target = SyntacticElementTarget::forForEachStmt(
       stmt, dc, /*bindPatternVarsOneWay=*/false);
   if (!typeCheckTarget(target))
     return failed();
@@ -899,7 +919,7 @@ bool TypeChecker::typeCheckCondition(Expr *&expr, DeclContext *dc) {
   return !resultTy;
 }
 
-/// Find the '~=` operator that can compare an expression inside a pattern to a
+/// Find the `~=` operator that can compare an expression inside a pattern to a
 /// value of a given type.
 bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
                                        Type rhsType) {
@@ -908,86 +928,19 @@ bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
                                   "typecheck-expr-pattern", EP);
   PrettyStackTracePattern stackTrace(Context, "type-checking", EP);
 
-  auto tildeEqualsApplication =
-      synthesizeTildeEqualsOperatorApplication(EP, DC, rhsType);
-
-  if (!tildeEqualsApplication)
-    return true;
-
-  VarDecl *matchVar;
-  Expr *matchCall;
-
-  std::tie(matchVar, matchCall) = *tildeEqualsApplication;
-
-  matchVar->setInterfaceType(rhsType->mapTypeOutOfContext());
-
-  // Result of `~=` should always be a boolean.
-  auto contextualTy = Context.getBoolDecl()->getDeclaredInterfaceType();
-  auto target = SolutionApplicationTarget::forExprPattern(matchCall, DC, EP,
-                                                          contextualTy);
+  EP->getMatchVar()->setInterfaceType(rhsType->mapTypeOutOfContext());
 
   // Check the expression as a condition.
+  auto target = SyntacticElementTarget::forExprPattern(EP);
   auto result = typeCheckExpression(target);
   if (!result)
     return true;
 
-  // Save the synthesized $match variable in the pattern.
-  EP->setMatchVar(matchVar);
   // Save the type-checked expression in the pattern.
   EP->setMatchExpr(result->getAsExpr());
   // Set the type on the pattern.
   EP->setType(rhsType);
   return false;
-}
-
-Optional<std::pair<VarDecl *, BinaryExpr *>>
-TypeChecker::synthesizeTildeEqualsOperatorApplication(ExprPattern *EP,
-                                                      DeclContext *DC,
-                                                      Type enumType) {
-  auto &Context = DC->getASTContext();
-  // Create a 'let' binding to stand in for the RHS value.
-  auto *matchVar =
-      new (Context) VarDecl(/*IsStatic*/ false, VarDecl::Introducer::Let,
-                            EP->getLoc(), Context.Id_PatternMatchVar, DC);
-
-  matchVar->setImplicit();
-
-  // Find '~=' operators for the match.
-  auto matchLookup =
-      lookupUnqualified(DC->getModuleScopeContext(),
-                        DeclNameRef(Context.Id_MatchOperator),
-                        SourceLoc(), defaultUnqualifiedLookupOptions);
-  auto &diags = DC->getASTContext().Diags;
-  if (!matchLookup) {
-    diags.diagnose(EP->getLoc(), diag::no_match_operator);
-    return None;
-  }
-
-  SmallVector<ValueDecl*, 4> choices;
-  for (auto &result : matchLookup) {
-    choices.push_back(result.getValueDecl());
-  }
-
-  if (choices.empty()) {
-    diags.diagnose(EP->getLoc(), diag::no_match_operator);
-    return None;
-  }
-
-  // Build the 'expr ~= var' expression.
-  // FIXME: Compound name locations.
-  auto *matchOp =
-      TypeChecker::buildRefExpr(choices, DC, DeclNameLoc(EP->getLoc()),
-                                /*Implicit=*/true, FunctionRefKind::Compound);
-
-  // Note we use getEndLoc here to have the BinaryExpr source range be the same
-  // as the expr pattern source range.
-  auto *matchVarRef = new (Context) DeclRefExpr(matchVar,
-                                                DeclNameLoc(EP->getEndLoc()),
-                                                /*Implicit=*/true);
-  auto *matchCall = BinaryExpr::create(Context, EP->getSubExpr(), matchOp,
-                                       matchVarRef, /*implicit*/ true);
-
-  return std::make_pair(matchVar, matchCall);
 }
 
 static Type replaceArchetypesWithTypeVariables(ConstraintSystem &cs,
@@ -1142,6 +1095,10 @@ TypeChecker::addImplicitLoadExpr(ASTContext &Context, Expr *expr,
       return Action::Continue(E);
     }
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::ArgumentsAndExpansion;
+    }
+
   private:
     LoadExpr *createLoadExpr(Expr *E) {
       auto objectType = getType(E)->getRValueType();
@@ -1270,6 +1227,10 @@ void OverloadChoice::dump(Type adjustedOpenedType, SourceManager *sm,
   case OverloadChoiceKind::TupleIndex:
     out << "tuple " << getBaseType()->getString(PO) << " index "
         << getTupleIndex();
+    break;
+
+  case OverloadChoiceKind::MaterializePack:
+    out << "materialize pack from tuple " << getBaseType()->getString(PO);
     break;
   }
 }
@@ -1572,6 +1533,11 @@ void ConstraintSystem::print(raw_ostream &out) const {
         out << "tuple " << choice.getBaseType()->getString(PO) << " index "
             << choice.getTupleIndex();
         break;
+
+      case OverloadChoiceKind::MaterializePack:
+        out << "materialize pack from tuple "
+            << choice.getBaseType()->getString(PO);
+        break;
       }
       out << " for ";
       elt.first->dump(&getASTContext().SourceMgr, out);
@@ -1783,9 +1749,9 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
   };
 
   // Check for casts between specific concrete types that cannot succeed.
-  if (auto toElementType = ConstraintSystem::isArrayType(toType)) {
-    if (auto fromElementType = ConstraintSystem::isArrayType(fromType)) {
-      return checkElementCast(*fromElementType, *toElementType,
+  if (auto toElementType = toType->isArrayType()) {
+    if (auto fromElementType = fromType->isArrayType()) {
+      return checkElementCast(fromElementType, toElementType,
                               CheckedCastKind::ArrayDowncast);
     }
   }
@@ -2291,6 +2257,10 @@ void ConstraintSystem::forEachExpr(
     ChildWalker(ConstraintSystem &CS,
                 llvm::function_ref<Expr *(Expr *)> callback)
         : CS(CS), callback(callback) {}
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
 
     PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
       auto *NewE = callback(E);

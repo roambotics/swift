@@ -45,6 +45,9 @@ enum class RestrictedImportKind {
   None // No restriction, i.e. the module is imported publicly.
 };
 
+/// Import that limits the access level of imported entities.
+using ImportAccessLevel = Optional<AttributedImport<ImportedModule>>;
+
 /// A file containing Swift source code.
 ///
 /// This is a .swift or .sil file (or a virtual file, such as the contents of
@@ -143,12 +146,19 @@ private:
   /// The scope map that describes this source file.
   NullablePtr<ASTScope> Scope = nullptr;
 
+   /// The set of parsed decls with opaque return types that have not yet
+   /// been validated.
+   llvm::SetVector<ValueDecl *> UnvalidatedDeclsWithOpaqueReturnTypes;
+  
   /// The set of validated opaque return type decls in the source file.
   llvm::SmallVector<OpaqueTypeDecl *, 4> OpaqueReturnTypes;
   llvm::StringMap<OpaqueTypeDecl *> ValidatedOpaqueReturnTypes;
-  /// The set of parsed decls with opaque return types that have not yet
-  /// been validated.
-  llvm::SetVector<ValueDecl *> UnvalidatedDeclsWithOpaqueReturnTypes;
+  /// The set of opaque type decls that have not yet been validated.
+  ///
+  /// \note This is populated as opaque type decls are created. Validation
+  /// requires mangling the naming decl, which would lead to circularity
+  /// if it were done from OpaqueResultTypeRequest.
+  llvm::SetVector<OpaqueTypeDecl *> UnvalidatedOpaqueReturnTypes;
 
   /// The set of declarations with valid runtime discoverable attributes
   /// located in the source file.
@@ -374,6 +384,10 @@ public:
 
   /// Get the most permissive restriction applied to the imports of \p module.
   RestrictedImportKind getRestrictedImportKind(const ModuleDecl *module) const;
+
+  /// Return the import of \p targetModule from this file with the most
+  /// permissive access level.
+  ImportAccessLevel getImportAccessLevel(const ModuleDecl *targetModule) const;
 
   /// Find all SPI names imported from \p importedModule by this file,
   /// collecting the identifiers in \p spiGroups.
@@ -666,6 +680,10 @@ public:
   /// to something that won't be in the ASTScope tree.
   void addUnvalidatedDeclWithOpaqueResultType(ValueDecl *vd) {
     UnvalidatedDeclsWithOpaqueReturnTypes.insert(vd);
+  }
+
+  void addOpaqueResultTypeDecl(OpaqueTypeDecl *decl) {
+    UnvalidatedOpaqueReturnTypes.insert(decl);
   }
 
   ArrayRef<OpaqueTypeDecl *> getOpaqueReturnTypeDecls();

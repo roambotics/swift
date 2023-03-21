@@ -57,7 +57,7 @@ namespace constraints {
   enum class ConstraintKind : char;
   class ConstraintSystem;
   class Solution;
-  class SolutionApplicationTarget;
+  class SyntacticElementTarget;
   class SolutionResult;
 }
 
@@ -566,7 +566,7 @@ checkGenericArguments(ModuleDecl *module, ArrayRef<Requirement> requirements,
 /// \param module The module to use for conformance lookup.
 /// \param contextSig The generic signature that should be used to map
 /// \p parentTy into context. We pass a generic signature to secure on-demand
-/// computation of the associated generic enviroment.
+/// computation of the associated generic environment.
 ///
 /// \returns \c true on success.
 bool checkContextualRequirements(GenericTypeDecl *decl, Type parentTy,
@@ -604,12 +604,12 @@ Type typeCheckExpression(Expr *&expr, DeclContext *dc,
                          constraints::ContextualTypeInfo contextualInfo = {},
                          TypeCheckExprOptions options = TypeCheckExprOptions());
 
-Optional<constraints::SolutionApplicationTarget>
-typeCheckExpression(constraints::SolutionApplicationTarget &target,
+Optional<constraints::SyntacticElementTarget>
+typeCheckExpression(constraints::SyntacticElementTarget &target,
                     TypeCheckExprOptions options = TypeCheckExprOptions());
 
-Optional<constraints::SolutionApplicationTarget>
-typeCheckTarget(constraints::SolutionApplicationTarget &target,
+Optional<constraints::SyntacticElementTarget>
+typeCheckTarget(constraints::SyntacticElementTarget &target,
                 TypeCheckExprOptions options = TypeCheckExprOptions());
 
 /// Return the type of operator function for specified LHS, or a null
@@ -636,7 +636,7 @@ void filterSolutionsForCodeCompletion(
 /// \returns `true` if target was applicable and it was possible to infer
 /// types for code completion, `false` otherwise.
 bool typeCheckForCodeCompletion(
-    constraints::SolutionApplicationTarget &target, bool needsPrecheck,
+    constraints::SyntacticElementTarget &target, bool needsPrecheck,
     llvm::function_ref<void(const constraints::Solution &)> callback);
 
 /// Check the key-path expression.
@@ -727,12 +727,6 @@ Type typeCheckPattern(ContextualPattern pattern);
 Pattern *coercePatternToType(ContextualPattern pattern, Type type,
                              TypeResolutionOptions options);
 bool typeCheckExprPattern(ExprPattern *EP, DeclContext *DC, Type type);
-
-/// Synthesize ~= operator application used to infer enum members
-/// in `case` patterns.
-Optional<std::pair<VarDecl *, BinaryExpr *>>
-synthesizeTildeEqualsOperatorApplication(ExprPattern *EP, DeclContext *DC,
-                                         Type enumType);
 
 /// Coerce the specified parameter list of a ClosureExpr to the specified
 /// contextual type.
@@ -1517,6 +1511,10 @@ class DiscriminatorFinder : public ASTWalker {
   unsigned NextDiscriminator = 0;
 
 public:
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
+  }
+
   PostWalkResult<Expr *> walkToExprPost(Expr *E) override;
 
   // Get the next available closure discriminator.

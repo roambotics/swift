@@ -469,7 +469,7 @@ func curry<T1, T2, R>(_ f: @escaping (T1, T2) -> R) -> (T1) -> (T2) -> R {
   // NESTED_CLOSURE: Begin completions
   // FIXME: Should be '/TypeRelation[Invalid]: t2[#T2#]'
   // NESTED_CLOSURE: Decl[LocalVar]/Local:               t2; name=t2
-  // NESTED_CLOSURE: Decl[LocalVar]/Local:               t1[#T1#]; name=t1
+  // NESTED_CLOSURE: Decl[LocalVar]/Local:               t1; name=t1
 }
 
 func trailingClosureLocal(x: Int, fn: (Int) -> Void) {
@@ -1231,7 +1231,7 @@ private extension Sequence {
   func SubstitutableBaseTyOfSubscript<T: Comparable>(by keyPath: KeyPath<Element, T>) -> [Element] {
     return sorted { a, b in a[#^GENERICBASE_SUB^#] }
     // GENERICBASE_SUB: Begin completions, 1 item
-    // GENERICBASE_SUB: Pattern/CurrNominal/Flair[ArgLabels]: ['[']{#keyPath: KeyPath<Self.Element, Value>#}[']'][#Value#];
+    // GENERICBASE_SUB: Pattern/CurrNominal/Flair[ArgLabels]/TypeRelation[Convertible]: ['[']{#keyPath: KeyPath<Self.Element, Value>#}[']'][#Value#];
     // GENERICBASE_SUB: End completions
   }
 }

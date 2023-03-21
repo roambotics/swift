@@ -308,6 +308,8 @@ private:
     case Node::Kind::Module:
     case Node::Kind::Tuple:
     case Node::Kind::Pack:
+    case Node::Kind::SILPackDirect:
+    case Node::Kind::SILPackIndirect:
     case Node::Kind::ConstrainedExistential:
     case Node::Kind::ConstrainedExistentialRequirementList:
     case Node::Kind::ConstrainedExistentialSelf:
@@ -354,6 +356,7 @@ private:
     case Node::Kind::ClangType:
     case Node::Kind::ClassMetadataBaseOffset:
     case Node::Kind::CFunctionPointer:
+    case Node::Kind::ConformanceAttachedMacroExpansion:
     case Node::Kind::Constructor:
     case Node::Kind::CoroutineContinuationPrototype:
     case Node::Kind::CurryThunk:
@@ -365,6 +368,7 @@ private:
     case Node::Kind::DefaultAssociatedConformanceAccessor:
     case Node::Kind::DependentAssociatedTypeRef:
     case Node::Kind::DependentGenericSignature:
+    case Node::Kind::DependentGenericParamPackMarker:
     case Node::Kind::DependentGenericParamCount:
     case Node::Kind::DependentGenericConformanceRequirement:
     case Node::Kind::DependentGenericLayoutRequirement:
@@ -474,6 +478,7 @@ private:
     case Node::Kind::OwningMutableAddressor:
     case Node::Kind::PartialApplyForwarder:
     case Node::Kind::PartialApplyObjCForwarder:
+    case Node::Kind::PeerAttachedMacroExpansion:
     case Node::Kind::PostfixOperator:
     case Node::Kind::PredefinedObjCAsyncCompletionHandlerImpl:
     case Node::Kind::PrefixOperator:
@@ -978,6 +983,92 @@ private:
     }
   }
 
+  void printGenericSignature(NodePointer Node, unsigned depth) {
+    Printer << '<';
+
+    unsigned numChildren = Node->getNumChildren();
+
+    unsigned numGenericParams = 0;
+    for (; numGenericParams < numChildren; ++numGenericParams) {
+      if (Node->getChild(numGenericParams)->getKind()
+               != Node::Kind::DependentGenericParamCount) {
+        break;
+      }
+    }
+
+    unsigned firstRequirement = numGenericParams;
+    for (; firstRequirement < numChildren; ++firstRequirement) {
+      auto child = Node->getChild(firstRequirement);
+      if (child->getKind() == Node::Kind::Type)
+        child = child->getChild(0);
+      if (child->getKind() != Node::Kind::DependentGenericParamPackMarker) {
+        break;
+      }
+    }
+
+    auto isGenericParamPack = [&](unsigned depth, unsigned index) {
+      for (unsigned i = numGenericParams; i < firstRequirement; ++i) {
+        auto child = Node->getChild(i);
+        if (child->getKind() != Node::Kind::DependentGenericParamPackMarker)
+          continue;
+        child = child->getChild(0);
+
+        if (child->getKind() != Node::Kind::Type)
+          continue;
+
+        child = child->getChild(0);
+        if (child->getKind() != Node::Kind::DependentGenericParamType)
+          continue;
+
+        if (index == child->getChild(0)->getIndex() &&
+            depth == child->getChild(1)->getIndex()) {
+          return true;
+        }
+      }
+
+      return false;
+    };
+
+    unsigned gpDepth = 0;
+    for (; gpDepth < numGenericParams; ++gpDepth) {
+      if (gpDepth != 0)
+        Printer << "><";
+
+      unsigned count = Node->getChild(gpDepth)->getIndex();
+      for (unsigned index = 0; index < count; ++index) {
+        if (index != 0)
+          Printer << ", ";
+
+        // Limit the number of printed generic parameters. In practice this
+        // it will never be exceeded. The limit is only important for malformed
+        // symbols where count can be really huge.
+        if (index >= 128) {
+          Printer << "...";
+          break;
+        }
+
+        if (isGenericParamPack(gpDepth, index))
+          Printer << "each ";
+
+        // FIXME: Depth won't match when a generic signature applies to a
+        // method in generic type context.
+        Printer << Options.GenericParameterName(gpDepth, index);
+      }
+    }
+
+    if (firstRequirement != numChildren) {
+      if (Options.DisplayWhereClauses) {
+        Printer << " where ";
+        for (unsigned i = firstRequirement; i < numChildren; ++i) {
+          if (i > firstRequirement)
+            Printer << ", ";
+          print(Node->getChild(i), depth + 1);
+        }
+      }
+    }
+    Printer << '>';
+  }
+
   void printFunctionSigSpecializationParams(NodePointer Node, unsigned depth);
 
   void printSpecializationPrefix(NodePointer node, StringRef Description,
@@ -1357,6 +1448,14 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     return printEntity(Node, depth, asPrefixContext, TypePrinting::NoType,
                        /*hasName*/true, "member macro expansion #",
                        (int)Node->getChild(2)->getIndex() + 1);
+  case Node::Kind::PeerAttachedMacroExpansion:
+    return printEntity(Node, depth, asPrefixContext, TypePrinting::NoType,
+                       /*hasName*/true, "peer macro expansion #",
+                       (int)Node->getChild(2)->getIndex() + 1);
+  case Node::Kind::ConformanceAttachedMacroExpansion:
+    return printEntity(Node, depth, asPrefixContext, TypePrinting::NoType,
+                       /*hasName*/true, "conformance macro expansion #",
+                       (int)Node->getChild(2)->getIndex() + 1);
   case Node::Kind::MacroExpansionUniqueName:
     return printEntity(Node, depth, asPrefixContext, TypePrinting::NoType,
                        /*hasName*/true, "unique name #",
@@ -1506,9 +1605,17 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     Printer << "}";
     return nullptr;
   }
+  case Node::Kind::SILPackDirect:
+  case Node::Kind::SILPackIndirect: {
+    Printer << (kind == Node::Kind::SILPackDirect ? "@direct" : "@indirect");
+    Printer << " Pack{";
+    printChildren(Node, depth, ", ");
+    Printer << "}";
+    return nullptr;
+  }
   case Node::Kind::PackExpansion: {
+    Printer << "repeat ";
     print(Node->getChild(0), depth + 1);
-    Printer << "...";
     return nullptr;
   }
   case Node::Kind::ReturnType:
@@ -2614,49 +2721,11 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
       
   case Node::Kind::DependentPseudogenericSignature:
   case Node::Kind::DependentGenericSignature: {
-    Printer << '<';
-    
-    unsigned depth = 0;
-    unsigned numChildren = Node->getNumChildren();
-    for (;
-         depth < numChildren
-           && Node->getChild(depth)->getKind()
-               == Node::Kind::DependentGenericParamCount;
-         ++depth) {
-      if (depth != 0)
-        Printer << "><";
-      
-      unsigned count = Node->getChild(depth)->getIndex();
-      for (unsigned index = 0; index < count; ++index) {
-        if (index != 0)
-          Printer << ", ";
-        // Limit the number of printed generic parameters. In practice this
-        // it will never be exceeded. The limit is only important for malformed
-        // symbols where count can be really huge.
-        if (index >= 128) {
-          Printer << "...";
-          break;
-        }
-        // FIXME: Depth won't match when a generic signature applies to a
-        // method in generic type context.
-        Printer << Options.GenericParameterName(depth, index);
-      }
-    }
-    
-    if (depth != numChildren) {
-      if (Options.DisplayWhereClauses) {
-        Printer << " where ";
-        for (unsigned i = depth; i < numChildren; ++i) {
-          if (i > depth)
-            Printer << ", ";
-          print(Node->getChild(i), depth + 1);
-        }
-      }
-    }
-    Printer << '>';
+    printGenericSignature(Node, depth);
     return nullptr;
   }
   case Node::Kind::DependentGenericParamCount:
+  case Node::Kind::DependentGenericParamPackMarker:
     printer_unreachable("should be printed as a child of a "
                         "DependentGenericSignature");
   case Node::Kind::DependentGenericConformanceRequirement: {
@@ -3338,6 +3407,11 @@ std::string Demangle::keyPathSourceString(const char *MangledName,
       case Node::Kind::Subscript: {
         std::string subscriptText = "subscript(";
         std::vector<std::string> argumentTypeNames;
+        auto getArgumentTypeName = [&argumentTypeNames](size_t i) {
+          if (i < argumentTypeNames.size())
+            return argumentTypeNames[i];
+          return std::string("<unknown>");
+        };
         // Multiple arguments case
         NodePointer argList = matchSequenceOfKinds(
             child, {
@@ -3385,27 +3459,27 @@ std::string Demangle::keyPathSourceString(const char *MangledName,
           if (child->getKind() == Node::Kind::LabelList) {
             size_t numChildren = child->getNumChildren();
             if (numChildren == 0) {
-              subscriptText += unlabelledArg + argumentTypeNames[0];
+              subscriptText += unlabelledArg + getArgumentTypeName(0);
             } else {
               while (idx < numChildren) {
                 Node *argChild = child->getChild(idx);
                 idx += 1;
                 if (argChild->getKind() == Node::Kind::Identifier) {
                   subscriptText += std::string(argChild->getText()) + ": " +
-                                   argumentTypeNames[idx - 1];
+                                   getArgumentTypeName(idx - 1);
                   if (idx != numChildren) {
                     subscriptText += ", ";
                   }
                 } else if (argChild->getKind() ==
                                Node::Kind::FirstElementMarker ||
                            argChild->getKind() == Node::Kind::VariadicMarker) {
-                  subscriptText += unlabelledArg + argumentTypeNames[idx - 1];
+                  subscriptText += unlabelledArg + getArgumentTypeName(idx - 1);
                 }
               }
             }
           }
         } else {
-          subscriptText += unlabelledArg + argumentTypeNames[0];
+          subscriptText += unlabelledArg + getArgumentTypeName(0);
         }
         return subscriptText + ")";
       }

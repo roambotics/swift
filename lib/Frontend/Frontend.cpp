@@ -830,6 +830,8 @@ static bool shouldImportConcurrencyByDefault(const llvm::Triple &target) {
     return true;
   if (target.isOSOpenBSD())
     return true;
+  if (target.isOSFreeBSD())
+    return true;
 #endif
   return false;
 }
@@ -846,6 +848,20 @@ bool CompilerInvocation::shouldImportSwiftStringProcessing() const {
       !getLangOptions().DisableImplicitStringProcessingModuleImport &&
       getFrontendOptions().InputMode !=
         FrontendOptions::ParseInputMode::SwiftModuleInterface;
+}
+
+/// Enable Swift backtracing on a per-target basis
+static bool shouldImportSwiftBacktracingByDefault(const llvm::Triple &target) {
+  if (target.isOSDarwin() || target.isOSWindows() || target.isOSLinux())
+    return true;
+  return false;
+}
+
+bool CompilerInvocation::shouldImportSwiftBacktracing() const {
+  return shouldImportSwiftBacktracingByDefault(getLangOptions().Target) &&
+    !getLangOptions().DisableImplicitBacktracingModuleImport &&
+    getFrontendOptions().InputMode !=
+      FrontendOptions::ParseInputMode::SwiftModuleInterface;
 }
 
 /// Implicitly import the SwiftOnoneSupport module in non-optimized
@@ -912,6 +928,21 @@ bool CompilerInstance::canImportSwiftStringProcessing() const {
   return getASTContext().canImportModule(modulePath);
 }
 
+void CompilerInstance::verifyImplicitBacktracingImport() {
+  if (Invocation.shouldImportSwiftBacktracing() &&
+      !canImportSwiftBacktracing()) {
+    Diagnostics.diagnose(SourceLoc(),
+                         diag::warn_implicit_backtracing_import_failed);
+  }
+}
+
+bool CompilerInstance::canImportSwiftBacktracing() const {
+  ImportPath::Module::Builder builder(
+      getASTContext().getIdentifier(SWIFT_BACKTRACING_NAME));
+  auto modulePath = builder.get();
+  return getASTContext().canImportModule(modulePath);
+}
+
 bool CompilerInstance::canImportCxxShim() const {
   ImportPath::Module::Builder builder(
       getASTContext().getIdentifier(CXX_SHIM_NAME));
@@ -972,6 +1003,19 @@ ImplicitImportInfo CompilerInstance::getImplicitImportInfo() const {
     case ImplicitStdlibKind::Stdlib:
       if (canImportSwiftStringProcessing())
         pushImport(SWIFT_STRING_PROCESSING_NAME);
+      break;
+    }
+  }
+
+  if (Invocation.shouldImportSwiftBacktracing()) {
+    switch (imports.StdlibKind) {
+    case ImplicitStdlibKind::Builtin:
+    case ImplicitStdlibKind::None:
+      break;
+
+    case ImplicitStdlibKind::Stdlib:
+      if (canImportSwiftBacktracing())
+        pushImport(SWIFT_BACKTRACING_NAME);
       break;
     }
   }
@@ -1088,9 +1132,9 @@ ModuleDecl *CompilerInstance::getMainModule() const {
       MainModule->setABIName(getASTContext().getIdentifier(
           Invocation.getFrontendOptions().ModuleABIName));
     }
-    if (!Invocation.getFrontendOptions().PackageName.empty()) {
+    if (!Invocation.getLangOptions().PackageName.empty()) {
       MainModule->setPackageName(getASTContext().getIdentifier(
-          Invocation.getFrontendOptions().PackageName));
+          Invocation.getLangOptions().PackageName));
     }
     if (!Invocation.getFrontendOptions().ExportAsName.empty()) {
       MainModule->setExportAsName(getASTContext().getIdentifier(
@@ -1103,6 +1147,7 @@ ModuleDecl *CompilerInstance::getMainModule() const {
 
     // Register the main module with the AST context.
     Context->addLoadedModule(MainModule);
+    Context->MainModule = MainModule;
 
     // Create and add the module's files.
     SmallVector<FileUnit *, 16> files;
@@ -1125,6 +1170,7 @@ void CompilerInstance::setMainModule(ModuleDecl *newMod) {
   assert(newMod->isMainModule());
   MainModule = newMod;
   Context->addLoadedModule(newMod);
+  Context->MainModule = newMod;
 }
 
 bool CompilerInstance::performParseAndResolveImportsOnly() {
@@ -1229,11 +1275,11 @@ bool CompilerInstance::loadPartialModulesAndImplicitImports(
   bool hadLoadError = false;
   for (auto &PM : PartialModules) {
     assert(PM.ModuleBuffer);
-    auto *file =
-      DefaultSerializedLoader->loadAST(*mod, /*diagLoc*/ SourceLoc(), /*moduleInterfacePath*/ "",
-                     std::move(PM.ModuleBuffer), std::move(PM.ModuleDocBuffer),
-                     std::move(PM.ModuleSourceInfoBuffer),
-                     /*isFramework*/ false);
+    auto *file = DefaultSerializedLoader->loadAST(
+        *mod, /*diagLoc=*/SourceLoc(), /*moduleInterfacePath*/ "",
+        /*moduleInterfaceSourcePath=*/"", std::move(PM.ModuleBuffer),
+        std::move(PM.ModuleDocBuffer), std::move(PM.ModuleSourceInfoBuffer),
+        /*isFramework*/ false);
     if (file) {
       partialModules.push_back(file);
     } else {

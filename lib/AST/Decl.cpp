@@ -367,26 +367,70 @@ StringRef Decl::getDescriptiveKindName(DescriptiveDeclKind K) {
   llvm_unreachable("bad DescriptiveDeclKind");
 }
 
+OrigDeclAttributes Decl::getOriginalAttrs() const {
+  return OrigDeclAttributes(getAttrs(), getModuleContext());
+}
+
 DeclAttributes Decl::getSemanticAttrs() const {
   auto mutableThis = const_cast<Decl *>(this);
-  evaluateOrDefault(getASTContext().evaluator,
-                    ExpandMemberAttributeMacros{mutableThis},
-                    false);
+  (void)evaluateOrDefault(getASTContext().evaluator,
+                          ExpandMemberAttributeMacros{mutableThis},
+                          { });
 
   return getAttrs();
 }
 
+void Decl::visitAuxiliaryDecls(AuxiliaryDeclCallback callback) const {
+  auto &ctx = getASTContext();
+  auto *mutableThis = const_cast<Decl *>(this);
+  SourceManager &sourceMgr = ctx.SourceMgr;
+  auto *moduleDecl = getModuleContext();
+
+  auto peerBuffers =
+      evaluateOrDefault(ctx.evaluator,
+                        ExpandPeerMacroRequest{mutableThis},
+                        {});
+
+  for (auto bufferID : peerBuffers) {
+    auto startLoc = sourceMgr.getLocForBufferStart(bufferID);
+    auto *sourceFile = moduleDecl->getSourceFileContainingLocation(startLoc);
+    for (auto *peer : sourceFile->getTopLevelDecls()) {
+      callback(peer);
+    }
+  }
+
+  if (auto *nominal = dyn_cast<NominalTypeDecl>(mutableThis)) {
+    auto conformanceBuffers =
+        evaluateOrDefault(ctx.evaluator,
+                          ExpandConformanceMacros{nominal},
+                          {});
+    for (auto bufferID : conformanceBuffers) {
+      auto startLoc = sourceMgr.getLocForBufferStart(bufferID);
+      auto *sourceFile = moduleDecl->getSourceFileContainingLocation(startLoc);
+      for (auto *extension : sourceFile->getTopLevelDecls()) {
+        callback(extension);
+      }
+    }
+  }
+
+  else if (auto *med = dyn_cast<MacroExpansionDecl>(mutableThis)) {
+    if (auto bufferID = evaluateOrDefault(
+            ctx.evaluator, ExpandMacroExpansionDeclRequest{med}, {})) {
+      auto startLoc = sourceMgr.getLocForBufferStart(*bufferID);
+      auto *sourceFile = moduleDecl->getSourceFileContainingLocation(startLoc);
+      for (auto *decl : sourceFile->getTopLevelDecls())
+        callback(decl);
+    }
+  }
+
+  // FIXME: fold VarDecl::visitAuxiliaryDecls into this.
+}
+
 void Decl::forEachAttachedMacro(MacroRole role,
                                 MacroCallback macroCallback) const {
-  auto *dc = getDeclContext();
-  auto &ctx = dc->getASTContext();
-
   for (auto customAttrConst : getSemanticAttrs().getAttributes<CustomAttr>()) {
     auto customAttr = const_cast<CustomAttr *>(customAttrConst);
-    auto *macroDecl = evaluateOrDefault(
-        ctx.evaluator,
-        ResolveMacroRequest{customAttr, getAttachedMacroRoles(), dc},
-        nullptr);
+    auto *macroDecl = getResolvedMacro(customAttr);
 
     if (!macroDecl)
       continue;
@@ -398,36 +442,52 @@ void Decl::forEachAttachedMacro(MacroRole role,
   }
 }
 
-unsigned Decl::getAttachedMacroDiscriminator(
-    MacroRole role, const CustomAttr *attr
-) const {
+MacroDecl *Decl::getResolvedMacro(CustomAttr *customAttr) const {
+  auto declRef = evaluateOrDefault(
+      getASTContext().evaluator,
+      ResolveMacroRequest{customAttr, getDeclContext()},
+      ConcreteDeclRef());
+
+  return dyn_cast_or_null<MacroDecl>(declRef.getDecl());
+}
+
+unsigned Decl::getAttachedMacroDiscriminator(DeclBaseName macroName,
+                                             MacroRole role,
+                                             const CustomAttr *attr) const {
   assert(isAttachedMacro(role) && "Not an attached macro role");
 
-  // Member-attribute macros are written on the enclosing declaration,
-  // but apply to the member itself. Adjust the owning declaration accordingly.
-  const Decl *owningDecl = this;
-  if (role == MacroRole::MemberAttribute) {
-    owningDecl = getDeclContext()->getAsDecl();
+  if (role != MacroRole::MemberAttribute) {
+    llvm::SmallDenseMap<Identifier, unsigned> nextDiscriminator;
+    Optional<unsigned> foundDiscriminator;
+
+    forEachAttachedMacro(
+        role, [&](CustomAttr *foundAttr, MacroDecl *foundMacro) {
+          unsigned discriminator =
+              nextDiscriminator[foundMacro->getBaseIdentifier()]++;
+          if (attr == foundAttr)
+            foundDiscriminator = discriminator;
+        });
+
+    if (foundDiscriminator)
+      return *foundDiscriminator;
   }
 
-  llvm::SmallDenseMap<Identifier, unsigned> nextDiscriminator;
-  Optional<unsigned> foundDiscriminator;
-
-  owningDecl->forEachAttachedMacro(
-    role,
-    [&](CustomAttr *foundAttr, MacroDecl *foundMacro) {
-      unsigned discriminator =
-        nextDiscriminator[foundMacro->getBaseIdentifier()]++;
-      if (attr == foundAttr)
-        foundDiscriminator = discriminator;
-    });
-
-  return *foundDiscriminator;
+  // If that failed, conjure up a discriminator.
+  // FIXME: Better discriminator for member attributes - add the member name?
+  ASTContext &ctx = getASTContext();
+  assert(role == MacroRole::MemberAttribute || ctx.Diags.hadAnyError());
+  return ctx.getNextMacroDiscriminator(
+      MacroDiscriminatorContext::getParentOf(getLoc(), getDeclContext()),
+      macroName);
 }
 
 const Decl *Decl::getInnermostDeclWithAvailability() const {
-  if (auto attrAndDecl = getSemanticAvailableRangeAttr())
-    return attrAndDecl.value().second;
+  if (getAttrs().hasAttribute<AvailableAttr>())
+    return this;
+
+  if (auto parent =
+          AvailabilityInference::parentDeclForInferredAvailability(this))
+    return parent->getInnermostDeclWithAvailability();
 
   return nullptr;
 }
@@ -456,6 +516,21 @@ Decl::getBackDeployedBeforeOSVersion(ASTContext &Ctx) const {
   return None;
 }
 
+bool Decl::isBackDeployed(ASTContext &Ctx) const {
+  return getBackDeployedBeforeOSVersion(Ctx) != None;
+}
+
+bool Decl::hasBackDeployedAttr() const {
+  if (getAttrs().hasAttribute<BackDeployedAttr>())
+    return true;
+
+  // Accessors may inherit `@backDeployed`.
+  if (auto *AD = dyn_cast<AccessorDecl>(this))
+    return AD->getStorage()->hasBackDeployedAttr();
+
+  return false;
+}
+
 llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &OS,
                                      StaticSpellingKind SSK) {
   switch (SSK) {
@@ -481,7 +556,9 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &OS,
   switch (SAK) {
   case SelfAccessKind::NonMutating: return OS << "'nonmutating'";
   case SelfAccessKind::Mutating: return OS << "'mutating'";
-  case SelfAccessKind::Consuming: return OS << "'__consuming'";
+  case SelfAccessKind::LegacyConsuming: return OS << "'__consuming'";
+  case SelfAccessKind::Consuming: return OS << "'consuming'";
+  case SelfAccessKind::Borrowing: return OS << "'borrowing'";
   }
   llvm_unreachable("Unknown SelfAccessKind");
 }
@@ -654,7 +731,7 @@ SourceRange Decl::getSourceRangeIncludingAttrs() const {
 
     // Otherwise, include attributes directly attached to the accessor.
     SourceLoc VarLoc = AD->getStorage()->getStartLoc();
-    for (auto Attr : getAttrs()) {
+    for (auto *Attr : getOriginalAttrs()) {
       if (!Attr->getRange().isValid())
         continue;
 
@@ -673,17 +750,21 @@ SourceRange Decl::getSourceRangeIncludingAttrs() const {
   if (auto *PBD = dyn_cast<PatternBindingDecl>(this)) {
     for (auto i : range(PBD->getNumPatternEntries()))
       PBD->getPattern(i)->forEachVariable([&](VarDecl *VD) {
-        for (auto Attr : VD->getAttrs())
+        for (auto *Attr : VD->getOriginalAttrs())
           if (Attr->getRange().isValid())
             Range.widen(Attr->getRangeWithAt());
       });
   }
 
-  for (auto Attr : getAttrs()) {
+  for (auto *Attr : getOriginalAttrs()) {
     if (Attr->getRange().isValid())
       Range.widen(Attr->getRangeWithAt());
   }
   return Range;
+}
+
+bool Decl::isInGeneratedBuffer() const {
+  return getModuleContext()->isInGeneratedBuffer(getStartLoc());
 }
 
 SourceLoc Decl::getLocFromSource() const {
@@ -1343,6 +1424,28 @@ ArrayRef<ValueDecl *> ImportDecl::getDecls() const {
                            ScopedImportLookupRequest{mutableThis}, {});
 }
 
+AccessLevel ImportDecl::getAccessLevel() const {
+  if (auto attr = getAttrs().getAttribute<AccessControlAttr>()) {
+    return attr->getAccess();
+  }
+
+  auto &LangOpts = getASTContext().LangOpts;
+  if (LangOpts.isSwiftVersionAtLeast(6) &&
+      LangOpts.hasFeature(Feature::AccessLevelOnImport)) {
+    // Tentative Swift 6 mode where the default import is internal.
+    return AccessLevel::Internal;
+  } else {
+    return AccessLevel::Public;
+  }
+}
+
+bool ImportDecl::isAccessLevelImplicit() const {
+  if (auto attr = getAttrs().getAttribute<AccessControlAttr>()) {
+    return false;
+  }
+  return true;
+}
+
 void NominalTypeDecl::setConformanceLoader(LazyMemberLoader *lazyLoader,
                                            uint64_t contextData) {
   assert(!Bits.NominalTypeDecl.HasLazyConformances &&
@@ -1822,7 +1925,9 @@ StringRef PatternBindingEntry::getInitStringRepresentation(
 
 SourceRange PatternBindingDecl::getSourceRange() const {
   SourceLoc startLoc = getStartLoc();
-  SourceLoc endLoc = getPatternList().back().getSourceRange().End;
+  SourceLoc endLoc = getPatternList().empty()
+      ? SourceLoc()
+      : getPatternList().back().getSourceRange().End;
   if (startLoc.isValid() != endLoc.isValid()) return SourceRange();
   return { startLoc, endLoc };
 }
@@ -3541,7 +3646,7 @@ SourceLoc ValueDecl::getAttributeInsertionLoc(bool forModifier) const {
 /// Returns true if \p VD needs to be treated as publicly-accessible
 /// at the SIL, LLVM, and machine levels due to being @usableFromInline.
 bool ValueDecl::isUsableFromInline() const {
-  assert(getFormalAccess() <= AccessLevel::Internal);
+  assert(getFormalAccess() < AccessLevel::Public);
 
   if (getAttrs().hasAttribute<UsableFromInlineAttr>() ||
       getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>() ||
@@ -3662,12 +3767,16 @@ static AccessLevel getAdjustedFormalAccess(const ValueDecl *VD,
     return getMaximallyOpenAccessFor(VD);
 
   if (treatUsableFromInlineAsPublic &&
-      access <= AccessLevel::Internal &&
+      access < AccessLevel::Public &&
       VD->isUsableFromInline()) {
     return AccessLevel::Public;
   }
 
   if (useDC) {
+    // If the use site decl context is PackageUnit, just return
+    // the access level that's passed in
+    if (auto usePkg = useDC->getPackageContext())
+      return access;
     // Check whether we need to modify the access level based on
     // @testable/@_private import attributes.
     auto *useSF = dyn_cast<SourceFile>(useDC->getModuleScopeContext());
@@ -3778,13 +3887,11 @@ getAccessScopeForFormalAccess(const ValueDecl *VD,
   while (!resultDC->isModuleScopeContext()) {
     if (isa<TopLevelCodeDecl>(resultDC)) {
       return AccessScope(resultDC->getModuleScopeContext(),
-                         access == AccessLevel::Private
-                             ? AccessLimitKind::Private
-                             : AccessLimitKind::None);
+                         access == AccessLevel::Private);
     }
 
     if (resultDC->isLocalContext() || access == AccessLevel::Private)
-      return AccessScope(resultDC, AccessLimitKind::Private);
+      return AccessScope(resultDC, /*private*/ true);
 
     if (auto enclosingNominal = dyn_cast<GenericTypeDecl>(resultDC)) {
       auto enclosingAccess =
@@ -3815,13 +3922,17 @@ getAccessScopeForFormalAccess(const ValueDecl *VD,
   case AccessLevel::Private:
   case AccessLevel::FilePrivate:
     assert(resultDC->isModuleScopeContext());
-    return AccessScope(resultDC, access == AccessLevel::Private
-                                     ? AccessLimitKind::Private
-                                     : AccessLimitKind::None);
+    return AccessScope(resultDC, access == AccessLevel::Private);
   case AccessLevel::Internal:
     return AccessScope(resultDC->getParentModule());
-  case AccessLevel::Package:
-    return AccessScope::getPackage();
+  case AccessLevel::Package: {
+    auto pkg = resultDC->getPackageContext(/*lookupIfNotCurrent*/ true);
+    if (!pkg) {
+      auto &d = VD->getASTContext().Diags;
+      d.diagnose(VD->getLoc(), diag::access_control_requires_package_name);
+    }
+    return AccessScope(pkg);
+  }
   case AccessLevel::Public:
   case AccessLevel::Open:
     return AccessScope::getPublic();
@@ -3843,7 +3954,34 @@ ValueDecl::getFormalAccessScope(const DeclContext *useDC,
 /// Whenever the enclosing context of \p VD is usable from \p useDC, this
 /// should compute the same result as checkAccess, below, but more slowly.
 ///
-/// See ValueDecl::isAccessibleFrom for a description of \p forConformance.
+/// Here's an example while typechecking a file with the following code.
+///
+/// ```
+/// import OtherModule
+///
+/// // `Foo` is a `public` struct defined in `OtherModule`
+/// public func myFunc(_ arg: OtherModule.Foo) {}
+/// ```
+///
+/// The use site of `Foo`is a function `myFunc`, and its DeclContext (useDC)
+/// is FileUnit. The call \c getAccessScopeForFormalAccess inside this function
+/// to get the access scope of`Foo` returns a public scope based on its `public`
+/// access level, which is a wrapper around a nullptr DeclContext. Note that the
+/// useDC is still non-null (FileUnit) even though the use site itself also has
+/// a `public` acess level.
+///
+/// The `isChildOf` call compares the DeclContext hierarchy of the use site
+/// (useDC) and the decl (VD) site, and returns true in this case, since
+/// FileUnit is a child of nullptr based on the DeclContext hierarchy. The
+/// hierarchy is created when subclasses of DeclContext such as FileUnit or
+/// ModuleDecl are constructed. For example, a top ClassDecl ctor takes FileUnit
+/// as its parent DeclContext and FileUnit ctor takes ModuleDecl as its parent
+/// DeclContext. There's an exception, however, for the case of PackageUnit.
+/// \see PackageUnit for details on how the hierachy between that and ModuleDecl
+///      is created.
+/// \see DeclContext::ASTHierarchy
+/// \see AccessScope::getAccessScopeForFormalAccess
+/// \see ValueDecl::isAccessibleFrom for a description of \p forConformance.
 static bool checkAccessUsingAccessScopes(const DeclContext *useDC,
                                          const ValueDecl *VD,
                                          AccessLevel access,
@@ -3859,10 +3997,6 @@ static bool checkAccessUsingAccessScopes(const DeclContext *useDC,
 
   // useDC is null only when caller wants to skip non-public type checks.
   if (!useDC) return true;
-
-  // Check package access; accessing package decl should not be allowed if package names are different
-  if (accessScope.isPackage())
-    return VD->getDeclContext()->getParentModule()->getPackageName() == useDC->getParentModule()->getPackageName();
 
   // Check SPI access
   if (!VD->isSPI()) return true;
@@ -3939,8 +4073,9 @@ static bool checkAccess(const DeclContext *useDC, const ValueDecl *VD,
       // marked 'public' if the protocol was '@_versioned' (now
       // '@usableFromInline'). Which works at the ABI level, so let's keep
       // supporting that here by explicitly checking for it.
+      auto protoAccess = proto->getFormalAccess();
       if (access == AccessLevel::Public &&
-          proto->getFormalAccess() == AccessLevel::Internal &&
+          (protoAccess == AccessLevel::Internal || protoAccess == AccessLevel::Package) &&
           proto->isUsableFromInline()) {
         return true;
       }
@@ -3978,7 +4113,11 @@ static bool checkAccess(const DeclContext *useDC, const ValueDecl *VD,
     auto *useSF = dyn_cast<SourceFile>(useFile);
     return useSF && useSF->hasTestableOrPrivateImport(access, sourceModule);
   }
-  case AccessLevel::Package:
+  case AccessLevel::Package: {
+    auto srcPkg = sourceDC->getPackageContext(/*lookupIfNotCurrent*/ true);
+    auto usePkg = useDC->getPackageContext(/*lookupIfNotCurrent*/ true);
+    return usePkg->isSamePackageAs(srcPkg);
+  }
   case AccessLevel::Public:
   case AccessLevel::Open:
     return true;
@@ -4486,6 +4625,18 @@ bool NominalTypeDecl::isResilient() const {
   return getModuleContext()->isResilient();
 }
 
+DestructorDecl *NominalTypeDecl::getValueTypeDestructor() {
+  if (!isa<StructDecl>(this) && !isa<EnumDecl>(this)) {
+    return nullptr;
+  }
+  
+  auto found = lookupDirect(DeclBaseName::createDestructor());
+  if (found.size() != 1) {
+    return nullptr;
+  }
+  return cast<DestructorDecl>(found[0]);
+}
+
 static bool isOriginallyDefinedIn(const Decl *D, const ModuleDecl* MD) {
   if (!MD)
     return false;
@@ -4553,8 +4704,12 @@ static Type computeNominalType(NominalTypeDecl *decl, DeclTypeKind kind) {
       // the generic parameter list directly instead of looking
       // at the signature.
       SmallVector<Type, 4> args;
-      for (auto param : decl->getGenericParams()->getParams())
-        args.push_back(param->getDeclaredInterfaceType());
+      for (auto param : decl->getGenericParams()->getParams()) {
+        auto argTy = param->getDeclaredInterfaceType();
+        if (param->isParameterPack())
+          argTy = PackType::getSingletonPackExpansion(argTy);
+        args.push_back(argTy);
+      }
 
       return BoundGenericType::get(decl, ParentTy, args);
     }
@@ -4687,6 +4842,11 @@ bool NominalTypeDecl::isAnyActor() const {
   return isActor() || isDistributedActor();
 }
 
+bool NominalTypeDecl::isMainActor() const {
+  return getName().is("MainActor") &&
+         getParentModule()->getName() == getASTContext().Id_Concurrency;
+}
+
 GenericTypeDecl::GenericTypeDecl(DeclKind K, DeclContext *DC,
                                  Identifier name, SourceLoc nameLoc,
                                  ArrayRef<InheritedEntry> inherited,
@@ -4759,13 +4919,15 @@ Type TypeAliasDecl::getStructuralType() const {
   return ErrorType::get(ctx);
 }
 
-GenericTypeParamDecl::GenericTypeParamDecl(
-    DeclContext *dc, Identifier name, SourceLoc nameLoc, SourceLoc ellipsisLoc,
-    unsigned depth, unsigned index, bool isParameterPack, bool isOpaqueType,
-    TypeRepr *opaqueTypeRepr)
-    : TypeDecl(DeclKind::GenericTypeParam, dc, name, nameLoc, { }) {
-  assert(!(ellipsisLoc && !isParameterPack) &&
-         "Ellipsis always means type parameter pack");
+GenericTypeParamDecl::GenericTypeParamDecl(DeclContext *dc, Identifier name,
+                                           SourceLoc nameLoc, SourceLoc eachLoc,
+                                           unsigned depth, unsigned index,
+                                           bool isParameterPack,
+                                           bool isOpaqueType,
+                                           TypeRepr *opaqueTypeRepr)
+    : TypeDecl(DeclKind::GenericTypeParam, dc, name, nameLoc, {}) {
+  assert(!(eachLoc && !isParameterPack) &&
+         "'each' keyword always means type parameter pack");
 
   Bits.GenericTypeParamDecl.Depth = depth;
   assert(Bits.GenericTypeParamDecl.Depth == depth && "Truncation");
@@ -4777,7 +4939,7 @@ GenericTypeParamDecl::GenericTypeParamDecl(
   if (isOpaqueType)
     *getTrailingObjects<TypeRepr *>() = opaqueTypeRepr;
   if (isParameterPack)
-    *getTrailingObjects<SourceLoc>() = ellipsisLoc;
+    *getTrailingObjects<SourceLoc>() = eachLoc;
 
   auto &ctx = dc->getASTContext();
   RecursiveTypeProperties props = RecursiveTypeProperties::HasTypeParameter;
@@ -4788,7 +4950,7 @@ GenericTypeParamDecl::GenericTypeParamDecl(
 }
 
 GenericTypeParamDecl *GenericTypeParamDecl::create(
-    DeclContext *dc, Identifier name, SourceLoc nameLoc, SourceLoc ellipsisLoc,
+    DeclContext *dc, Identifier name, SourceLoc nameLoc, SourceLoc eachLoc,
     unsigned depth, unsigned index, bool isParameterPack, bool isOpaqueType,
     TypeRepr *opaqueTypeRepr) {
   auto &ctx = dc->getASTContext();
@@ -4796,7 +4958,7 @@ GenericTypeParamDecl *GenericTypeParamDecl::create(
       isOpaqueType ? 1 : 0, isParameterPack ? 1 : 0);
   auto mem = ctx.Allocate(allocSize, alignof(GenericTypeParamDecl));
   return new (mem)
-      GenericTypeParamDecl(dc, name, nameLoc, ellipsisLoc, depth, index,
+      GenericTypeParamDecl(dc, name, nameLoc, eachLoc, depth, index,
                            isParameterPack, isOpaqueType, opaqueTypeRepr);
 }
 
@@ -4810,37 +4972,38 @@ GenericTypeParamDecl *GenericTypeParamDecl::createDeserialized(
 
 GenericTypeParamDecl *
 GenericTypeParamDecl::createParsed(DeclContext *dc, Identifier name,
-                                   SourceLoc nameLoc, SourceLoc ellipsisLoc,
+                                   SourceLoc nameLoc, SourceLoc eachLoc,
                                    unsigned index, bool isParameterPack) {
   // We always create generic type parameters with an invalid depth.
   // Semantic analysis fills in the depth when it processes the generic
   // parameter list.
   return GenericTypeParamDecl::create(
-      dc, name, nameLoc, ellipsisLoc, GenericTypeParamDecl::InvalidDepth, index,
+      dc, name, nameLoc, eachLoc, GenericTypeParamDecl::InvalidDepth, index,
       isParameterPack, /*isOpaqueType*/ false, /*opaqueTypeRepr*/ nullptr);
 }
 
 GenericTypeParamDecl *GenericTypeParamDecl::createImplicit(
     DeclContext *dc, Identifier name, unsigned depth, unsigned index,
     bool isParameterPack, bool isOpaqueType, TypeRepr *opaqueTypeRepr,
-    SourceLoc nameLoc, SourceLoc ellipsisLoc) {
-  auto *param = GenericTypeParamDecl::create(dc, name, nameLoc, ellipsisLoc,
-                                             depth, index, isParameterPack,
+    SourceLoc nameLoc, SourceLoc eachLoc) {
+  auto *param = GenericTypeParamDecl::create(dc, name, nameLoc, eachLoc, depth,
+                                             index, isParameterPack,
                                              isOpaqueType, opaqueTypeRepr);
   param->setImplicit();
   return param;
 }
 
 SourceRange GenericTypeParamDecl::getSourceRange() const {
-  SourceLoc endLoc = getNameLoc();
+  auto startLoc = getNameLoc();
+  auto endLoc = getNameLoc();
 
-  if (auto ellipsisLoc = getEllipsisLoc())
-    endLoc = ellipsisLoc;
+  if (const auto eachLoc = getEachLoc())
+    startLoc = eachLoc;
 
   if (!getInherited().empty())
     endLoc = getInherited().back().getSourceRange().End;
 
-  return SourceRange(getNameLoc(), endLoc);
+  return {startLoc, endLoc};
 }
 
 AssociatedTypeDecl::AssociatedTypeDecl(DeclContext *dc, SourceLoc keywordLoc,
@@ -5083,6 +5246,39 @@ VarDecl *NominalTypeDecl::getGlobalActorInstance() const {
   return evaluateOrDefault(getASTContext().evaluator,
                            GlobalActorInstanceRequest{mutableThis},
                            nullptr);
+}
+
+AbstractFunctionDecl *
+NominalTypeDecl::getExecutorOwnedEnqueueFunction() const {
+  auto &C = getASTContext();
+
+  auto proto = dyn_cast<ProtocolDecl>(this);
+  if (!proto)
+    return nullptr;
+
+  llvm::SmallVector<ValueDecl *, 2> results;
+  lookupQualified(getSelfNominalTypeDecl(),
+                  DeclNameRef(C.Id_enqueue),
+                  NL_ProtocolMembers,
+                  results);
+
+  for (auto candidate: results) {
+    // we're specifically looking for the Executor protocol requirement
+    if (!isa<ProtocolDecl>(candidate->getDeclContext()))
+      continue;
+
+    if (auto *funcDecl = dyn_cast<AbstractFunctionDecl>(candidate)) {
+      if (funcDecl->getParameters()->size() != 1)
+        continue;
+
+      auto params = funcDecl->getParameters();
+      if (params->get(0)->getSpecifier() == ParamSpecifier::LegacyOwned) { // TODO: make this Consuming
+        return funcDecl;
+      }
+    }
+  }
+
+  return nullptr;
 }
 
 ClassDecl::ClassDecl(SourceLoc ClassLoc, Identifier Name, SourceLoc NameLoc,
@@ -6005,10 +6201,10 @@ void AbstractStorageDecl::setAccessors(SourceLoc lbraceLoc,
                                        ArrayRef<AccessorDecl *> accessors,
                                        SourceLoc rbraceLoc) {
   // This method is called after we've already recorded an accessors clause
-  // only on recovery paths and only when that clause was empty.
+  // only on recovery paths and only when that clause was empty, or when a
+  // macro expands to accessors (in which case, we may already have accessors).
   auto record = Accessors.getPointer();
   if (record) {
-    assert(record->getAllAccessors().empty());
     for (auto accessor : accessors) {
       (void) record->addOpaqueAccessor(accessor);
     }
@@ -6183,7 +6379,7 @@ getNameFromObjcAttribute(const ObjCAttr *attr, DeclName preferredName) {
 ObjCSelector
 AbstractStorageDecl::getObjCGetterSelector(Identifier preferredName) const {
   // If the getter has an @objc attribute with a name, use that.
-  if (auto getter = getOpaqueAccessor(AccessorKind::Get)) {
+  if (auto getter = getAccessor(AccessorKind::Get)) {
       if (auto name = getNameFromObjcAttribute(getter->getAttrs().
           getAttribute<ObjCAttr>(), preferredName))
         return *name;
@@ -6213,7 +6409,7 @@ AbstractStorageDecl::getObjCGetterSelector(Identifier preferredName) const {
 ObjCSelector
 AbstractStorageDecl::getObjCSetterSelector(Identifier preferredName) const {
   // If the setter has an @objc attribute with a name, use that.
-  auto setter = getOpaqueAccessor(AccessorKind::Set);
+  auto setter = getAccessor(AccessorKind::Set);
   auto objcAttr = setter ? setter->getAttrs().getAttribute<ObjCAttr>()
                          : nullptr;
   if (auto name = getNameFromObjcAttribute(objcAttr, DeclName(preferredName))) {
@@ -6283,9 +6479,9 @@ Type VarDecl::getType() const {
 /// is a let member in an initializer.
 bool VarDecl::isSettable(const DeclContext *UseDC,
                          const DeclRefExpr *base) const {
-  // Only inout parameters are settable.
+  // Parameters are settable or not depending on their ownership convention.
   if (auto *PD = dyn_cast<ParamDecl>(this))
-    return PD->isInOut();
+    return !PD->isImmutableInFunctionBody();
 
   // If this is a 'var' decl, then we're settable if we have storage or a
   // setter.
@@ -6721,7 +6917,7 @@ bool VarDecl::isLet() const {
   // a high-level request. Once this is done, all callers of the introducer and
   // specifier setters can be removed.
   if (auto *PD = dyn_cast<ParamDecl>(this)) {
-    return PD->isImmutable();
+    return PD->isImmutableInFunctionBody();
   }
   return getIntroducer() == Introducer::Let;
 }
@@ -6745,13 +6941,28 @@ bool VarDecl::isOrdinaryStoredProperty() const {
 }
 
 void ParamDecl::setSpecifier(Specifier specifier) {
-  // FIXME: Revisit this; in particular shouldn't __owned parameters be
-  // ::Let also?
-  setIntroducer(specifier == ParamSpecifier::Default
-                ? VarDecl::Introducer::Let
-                : VarDecl::Introducer::Var);
-  Bits.ParamDecl.Specifier = static_cast<unsigned>(specifier);
-  Bits.ParamDecl.SpecifierComputed = true;
+  VarDecl::Introducer introducer;
+  switch (specifier) {
+  // Unannotated or `borrowing` parameters are locally immutable.
+  // So are parameters using the legacy `__shared` or `__owned` modifiers.
+  case ParamSpecifier::Default:
+  case ParamSpecifier::Borrowing:
+  case ParamSpecifier::LegacyShared:
+  case ParamSpecifier::LegacyOwned:
+    introducer = VarDecl::Introducer::Let;
+    break;
+  
+  // `inout` and `consuming` parameters are locally mutable.
+  case ParamSpecifier::InOut:
+  case ParamSpecifier::Consuming:
+    introducer = VarDecl::Introducer::Var;
+    break;
+  }
+  
+  setIntroducer(introducer);
+  Bits.ParamDecl.OwnershipSpecifier = static_cast<unsigned>(specifier) + 1;
+  assert(getCachedSpecifier() == specifier
+         && "not enough bits in ParamDecl flags for specifier anymore!");
 }
 
 bool ParamDecl::isAnonClosureParam() const {
@@ -6779,6 +6990,24 @@ ParamDecl::Specifier ParamDecl::getSpecifier() const {
   return evaluateOrDefault(ctx.evaluator,
                            ParamSpecifierRequest{mutableThis},
                            ParamDecl::Specifier::Default);
+}
+
+StringRef ParamDecl::getSpecifierSpelling(ParamSpecifier specifier) {
+  switch (specifier) {
+  case ParamSpecifier::Default:
+    return "";
+  case ParamSpecifier::Borrowing:
+    return "borrowing";
+  case ParamSpecifier::Consuming:
+    return "consuming";
+  case ParamSpecifier::InOut:
+    return "inout";
+  case ParamSpecifier::LegacyShared:
+    return "__shared";
+  case ParamSpecifier::LegacyOwned:
+    return "__owned";
+  }
+  llvm_unreachable("invalid ParamSpecifier");
 }
 
 StaticSpellingKind AbstractStorageDecl::getCorrectStaticSpelling() const {
@@ -6812,6 +7041,11 @@ bool VarDecl::hasAttachedPropertyWrapper() const {
     return true;
 
   return false;
+}
+
+/// Whether this property has any attached runtime metadata attributes.
+bool VarDecl::hasRuntimeMetadataAttributes() const {
+  return !getRuntimeDiscoverableAttrs().empty();
 }
 
 bool VarDecl::hasImplicitPropertyWrapper() const {
@@ -7145,7 +7379,7 @@ ParamDecl::ParamDecl(SourceLoc specifierLoc,
       ArgumentNameAndFlags(argumentName, None),
       ParameterNameLoc(parameterNameLoc),
       ArgumentNameLoc(argumentNameLoc), SpecifierLoc(specifierLoc) {
-  Bits.ParamDecl.SpecifierComputed = false;
+  Bits.ParamDecl.OwnershipSpecifier = 0;
   Bits.ParamDecl.defaultArgumentKind =
     static_cast<unsigned>(DefaultArgumentKind::None);
 }
@@ -7354,7 +7588,7 @@ AnyFunctionType::Param ParamDecl::toFunctionParam(Type type) const {
   auto internalLabel = getParameterName();
   auto flags = ParameterTypeFlags::fromParameterType(
       type, isVariadic(), isAutoClosure(), isNonEphemeral(),
-      getValueOwnership(), isIsolated(), /*isNoDerivative*/ false,
+      getSpecifier(), isIsolated(), /*isNoDerivative*/ false,
       isCompileTimeConst());
   return AnyFunctionType::Param(type, label, flags, internalLabel);
 }
@@ -7538,6 +7772,11 @@ swift::findWrappedValuePlaceholder(Expr *init) {
   class Walker : public ASTWalker {
   public:
     PropertyWrapperValuePlaceholderExpr *placeholder = nullptr;
+
+    /// Only walk the arguments of a macro, to represent the source as written.
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
 
     virtual PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
       if (placeholder)
@@ -8109,19 +8348,6 @@ bool AbstractFunctionDecl::isSendable() const {
   return getAttrs().hasAttribute<SendableAttr>();
 }
 
-bool AbstractFunctionDecl::isBackDeployed() const {
-  if (getAttrs().hasAttribute<BackDeployedAttr>())
-    return true;
-
-  // Property and subscript accessors inherit the attribute.
-  if (auto *AD = dyn_cast<AccessorDecl>(this)) {
-    if (AD->getStorage()->getAttrs().hasAttribute<BackDeployedAttr>())
-      return true;
-  }
-
-  return false;
-}
-
 BraceStmt *AbstractFunctionDecl::getBody(bool canSynthesize) const {
   if ((getBodyKind() == BodyKind::Synthesize ||
        getBodyKind() == BodyKind::Unparsed) &&
@@ -8132,8 +8358,15 @@ BraceStmt *AbstractFunctionDecl::getBody(bool canSynthesize) const {
 
   // Don't allow getBody() to trigger parsing of an unparsed body containing the
   // IDE inspection location.
+  // FIXME: We should be properly constructing the range of the the body as a
+  // CharSourceRange but we can't because we don't have access to the lexer
+  // here. Using the end location of the SourceRange works good enough here
+  // because the last token is a '}' and the IDE inspection point is not inside
+  // the closing brace.
   if (getBodyKind() == BodyKind::Unparsed &&
-      ctx.SourceMgr.rangeContainsIDEInspectionTarget(getBodySourceRange())) {
+      ctx.SourceMgr.rangeContainsIDEInspectionTarget(
+          CharSourceRange(ctx.SourceMgr, getBodySourceRange().Start,
+                          getBodySourceRange().End))) {
     return nullptr;
   }
 
@@ -8239,6 +8472,11 @@ AbstractFunctionDecl::getBodyFingerprintIncludingLocalTypeMembers() const {
 
   public:
     HashCombiner(StableHasher &hasher) : hasher(hasher) {}
+
+    /// Only walk the arguments of a macro, to represent the source as written.
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
 
     PreWalkAction walkToDeclPre(Decl *D) override {
       if (D->isImplicit())
@@ -9398,6 +9636,15 @@ bool ClassDecl::isRootDefaultActor(ModuleDecl *M,
   return (!superclass || superclass->isNSObject());
 }
 
+bool ClassDecl::isNonDefaultExplicitDistributedActor() const {
+  return isNonDefaultExplicitDistributedActor(getModuleContext(), ResilienceExpansion::Maximal);
+}
+bool ClassDecl::isNonDefaultExplicitDistributedActor(ModuleDecl *M,
+                                                     ResilienceExpansion expansion) const {
+  return !isDefaultActor(M, expansion) && isExplicitDistributedActor();
+}
+
+
 bool ClassDecl::isNativeNSObjectSubclass() const {
   // @objc actors implicitly inherit from NSObject.
   if (isActor()) {
@@ -9729,6 +9976,15 @@ void swift::simple_display(llvm::raw_ostream &out, AnyFunctionRef fn) {
     out << "closure";
 }
 
+bool ActorIsolation::isMainActor() const {
+  if (isGlobalActor()) {
+    if (auto *nominal = getGlobalActor()->getAnyNominal())
+      return nominal->isMainActor();
+  }
+
+  return false;
+}
+
 bool ActorIsolation::isDistributedActor() const {
   return getKind() == ActorInstance && getActor()->isDistributedActor();
 }
@@ -9743,7 +9999,7 @@ StringRef swift::getMacroRoleString(MacroRole role) {
     return "expression";
 
   case MacroRole::Declaration:
-    return "freestanding";
+    return "declaration";
 
   case MacroRole::Accessor:
     return "accessor";
@@ -9753,6 +10009,12 @@ StringRef swift::getMacroRoleString(MacroRole role) {
 
   case MacroRole::Member:
     return "member";
+
+  case MacroRole::Peer:
+    return "peer";
+
+  case MacroRole::Conformance:
+    return "conformance";
   }
 }
 
@@ -9798,7 +10060,9 @@ static MacroRoles freestandingMacroRoles =
 static MacroRoles attachedMacroRoles = (MacroRoles() |
                                         MacroRole::Accessor |
                                         MacroRole::MemberAttribute |
-                                        MacroRole::Member);
+                                        MacroRole::Member |
+                                        MacroRole::Peer |
+                                        MacroRole::Conformance);
 
 bool swift::isFreestandingMacro(MacroRoles contexts) {
   return bool(contexts & freestandingMacroRoles);
@@ -9816,18 +10080,42 @@ MacroRoles swift::getAttachedMacroRoles() {
   return attachedMacroRoles;
 }
 
+void MissingDecl::forEachMacroExpandedDecl(MacroExpandedDeclCallback callback) {
+  auto macroRef = unexpandedMacro.macroRef;
+  auto *baseDecl = unexpandedMacro.baseDecl;
+  if (!macroRef || !baseDecl)
+    return;
+
+  baseDecl->visitAuxiliaryDecls([&](Decl *auxiliaryDecl) {
+    auto *sf = auxiliaryDecl->getInnermostDeclContext()->getParentSourceFile();
+    // We only visit auxiliary decls that are macro expansions associated with
+    // this macro reference.
+    if (auto *med = macroRef.dyn_cast<MacroExpansionDecl *>()) {
+     if (med != sf->getMacroExpansion().dyn_cast<Decl *>())
+       return;
+    } else if (auto *attr = macroRef.dyn_cast<CustomAttr *>()) {
+     if (attr != sf->getAttachedMacroAttribute())
+       return;
+    } else {
+      return;
+    }
+    if (auto *vd = dyn_cast<ValueDecl>(auxiliaryDecl))
+      callback(vd);
+  });
+}
+
 MacroDecl::MacroDecl(
     SourceLoc macroLoc, DeclName name, SourceLoc nameLoc,
     GenericParamList *genericParams,
     ParameterList *parameterList,
-    SourceLoc arrowOrColonLoc,
+    SourceLoc arrowLoc,
     TypeRepr *resultType,
     Expr *definition,
     DeclContext *parent
 ) : GenericContext(DeclContextKind::MacroDecl, parent, genericParams),
     ValueDecl(DeclKind::Macro, parent, name, nameLoc),
     macroLoc(macroLoc), parameterList(parameterList),
-    arrowOrColonLoc(arrowOrColonLoc),
+    arrowLoc(arrowLoc),
     resultType(resultType),
     definition(definition) {
 
@@ -9849,6 +10137,8 @@ SourceRange MacroDecl::getSourceRange() const {
   SourceLoc endLoc = getNameLoc();
   if (parameterList)
     endLoc = parameterList->getEndLoc();
+  if (resultType.getSourceRange().isValid())
+    endLoc = resultType.getSourceRange().End;
   if (definition)
     endLoc = definition->getEndLoc();
   if (auto trailing = getTrailingWhereClause())
@@ -9867,7 +10157,119 @@ const MacroRoleAttr *MacroDecl::getMacroRoleAttr(MacroRole role) const {
   for (auto attr : getAttrs().getAttributes<MacroRoleAttr>())
     if (attr->getMacroRole() == role)
       return attr;
-  llvm_unreachable("Macro role not declared for this MacroDecl");
+
+  return nullptr;
+}
+
+DeclName MacroDecl::getUniqueNamePlaceholder(ASTContext &ctx) {
+  return ctx.getIdentifier("$");
+}
+
+bool MacroDecl::isUniqueNamePlaceholder(DeclName name) {
+  return name.getBaseName().userFacingName() == "$";
+}
+
+bool MacroDecl::isUniqueMacroName(StringRef name) {
+  // Unique macro names are mangled names, which always start with "$s".
+  if (!name.startswith("$s"))
+    return false;
+
+  // Unique macro names end with fMu<digits>_. Match that.
+
+  // Strip off the trailing _.
+  if (name.back() != '_')
+    return false;
+  name = name.drop_back();
+
+  // Strip off trailing digits. This is the discriminator.
+  while (isdigit(name.back()))
+    name = name.drop_back();
+
+  // Check for fMu.
+  return name.endswith("fMu");
+}
+
+bool MacroDecl::isUniqueMacroName(DeclBaseName name) {
+  return isUniqueMacroName(name.userFacingName());
+}
+
+
+void MacroDecl::getIntroducedNames(MacroRole role, ValueDecl *attachedTo,
+                                   SmallVectorImpl<DeclName> &names) const {
+  ASTContext &ctx = getASTContext();
+  auto *attr = getMacroRoleAttr(role);
+  if (!attr)
+    return;
+
+  for (auto expandedName : attr->getNames()) {
+    switch (expandedName.getKind()) {
+    case MacroIntroducedDeclNameKind::Named: {
+      names.push_back(DeclName(expandedName.getIdentifier()));
+      break;
+    }
+
+    case MacroIntroducedDeclNameKind::Overloaded: {
+      if (!attachedTo)
+        break;
+
+      names.push_back(attachedTo->getBaseName());
+      break;
+    }
+
+    case MacroIntroducedDeclNameKind::Prefixed: {
+      if (!attachedTo)
+        break;
+
+      auto baseName = attachedTo->getBaseName();
+      std::string prefixedName;
+      {
+        llvm::raw_string_ostream out(prefixedName);
+        out << expandedName.getIdentifier();
+        out << baseName.getIdentifier();
+      }
+
+      Identifier nameId = ctx.getIdentifier(prefixedName);
+      names.push_back(DeclName(nameId));
+      break;
+    }
+
+    case MacroIntroducedDeclNameKind::Suffixed: {
+      if (!attachedTo)
+        break;
+
+      auto baseName = attachedTo->getBaseName();
+      std::string suffixedName;
+      {
+        llvm::raw_string_ostream out(suffixedName);
+        out << baseName.getIdentifier();
+        out << expandedName.getIdentifier();
+      }
+
+      Identifier nameId = ctx.getIdentifier(suffixedName);
+      names.push_back(DeclName(nameId));
+      break;
+    }
+
+    case MacroIntroducedDeclNameKind::Arbitrary:
+      names.push_back(MacroDecl::getArbitraryName());
+      break;
+    }
+  }
+
+  // Add the unique name, if the macro can introduce declarations anywhere.
+  switch (role) {
+  case MacroRole::Expression:
+  case MacroRole::Declaration:
+  case MacroRole::Member:
+  case MacroRole::Peer:
+    names.push_back(MacroDecl::getUniqueNamePlaceholder(getASTContext()));
+    break;
+
+  case MacroRole::Accessor:
+  case MacroRole::Conformance:
+  case MacroRole::MemberAttribute:
+    break;
+  }
 }
 
 MacroDefinition MacroDecl::getDefinition() const {
@@ -9884,10 +10286,24 @@ Optional<BuiltinMacroKind> MacroDecl::getBuiltinKind() const {
   return def.getBuiltinKind();
 }
 
+MacroExpansionDecl::MacroExpansionDecl(
+    DeclContext *dc, SourceLoc poundLoc, DeclNameRef macro,
+    DeclNameLoc macroLoc, SourceLoc leftAngleLoc,
+    ArrayRef<TypeRepr *> genericArgs, SourceLoc rightAngleLoc,
+    ArgumentList *args)
+    : Decl(DeclKind::MacroExpansion, dc), PoundLoc(poundLoc),
+      MacroName(macro), MacroNameLoc(macroLoc),
+      LeftAngleLoc(leftAngleLoc), RightAngleLoc(rightAngleLoc),
+      GenericArgs(genericArgs),
+      ArgList(args ? args
+                   : ArgumentList::createImplicit(dc->getASTContext(), {})) {
+  Bits.MacroExpansionDecl.Discriminator = InvalidDiscriminator;
+}
+
 SourceRange MacroExpansionDecl::getSourceRange() const {
   SourceLoc endLoc;
-  if (ArgList)
-    endLoc = ArgList->getEndLoc();
+  if (auto argsEndList = ArgList->getEndLoc())
+    endLoc = argsEndList;
   else if (RightAngleLoc.isValid())
     endLoc = RightAngleLoc;
   else
@@ -9913,11 +10329,21 @@ unsigned MacroExpansionDecl::getDiscriminator() const {
   return getRawDiscriminator();
 }
 
-ArrayRef<Decl *> MacroExpansionDecl::getRewritten() const {
+void MacroExpansionDecl::forEachExpandedExprOrStmt(
+    ExprOrStmtExpansionCallback callback) const {
   auto mutableThis = const_cast<MacroExpansionDecl *>(this);
-  return evaluateOrDefault(
+  auto bufferID = evaluateOrDefault(
       getASTContext().evaluator,
       ExpandMacroExpansionDeclRequest{mutableThis}, {});
+  auto &sourceMgr = getASTContext().SourceMgr;
+  auto *moduleDecl = getModuleContext();
+  if (!bufferID)
+    return;
+  auto startLoc = sourceMgr.getLocForBufferStart(*bufferID);
+  auto *sourceFile = moduleDecl->getSourceFileContainingLocation(startLoc);
+  for (auto node : sourceFile->getTopLevelItems())
+    if (node.is<Expr *>() || node.is<Stmt *>())
+      callback(node);
 }
 
 NominalTypeDecl *
@@ -9974,6 +10400,8 @@ MacroDiscriminatorContext MacroDiscriminatorContext::getParentOf(
   case GeneratedSourceInfo::AccessorMacroExpansion:
   case GeneratedSourceInfo::MemberAttributeMacroExpansion:
   case GeneratedSourceInfo::MemberMacroExpansion:
+  case GeneratedSourceInfo::PeerMacroExpansion:
+  case GeneratedSourceInfo::ConformanceMacroExpansion:
   case GeneratedSourceInfo::PrettyPrinted:
   case GeneratedSourceInfo::ReplacedFunctionBody:
     return origDC;

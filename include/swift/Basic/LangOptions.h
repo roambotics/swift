@@ -331,7 +331,7 @@ namespace swift {
     bool UseMalloc = false;
 
     /// Specifies how strict concurrency checking will be.
-    StrictConcurrency StrictConcurrencyLevel = StrictConcurrency::Targeted;
+    StrictConcurrency StrictConcurrencyLevel = StrictConcurrency::Minimal;
 
     /// Enable experimental concurrency model.
     bool EnableExperimentalConcurrency = false;
@@ -352,6 +352,10 @@ namespace swift {
     /// Disable the implicit import of the _StringProcessing module.
     bool DisableImplicitStringProcessingModuleImport = false;
 
+    /// Disable the implicit import of the _Backtracing module.
+    bool DisableImplicitBacktracingModuleImport =
+        !SWIFT_IMPLICIT_BACKTRACING_IMPORT;
+
     /// Should we check the target OSs of serialized modules to see that they're
     /// new enough?
     bool EnableTargetOSChecking = true;
@@ -366,7 +370,8 @@ namespace swift {
 
     /// Enable early skipping deserialization of decls that are marked as
     /// unsafe to read.
-    bool EnableDeserializationSafety = true;
+    bool EnableDeserializationSafety =
+      ::getenv("SWIFT_ENABLE_DESERIALIZATION_SAFETY");
 
     /// Whether to enable the new operator decl and precedencegroup lookup
     /// behavior. This is a staging flag, and will be removed in the future.
@@ -394,6 +399,9 @@ namespace swift {
 
     /// Access or distribution level of the whole module being parsed.
     LibraryLevel LibraryLevel = LibraryLevel::Other;
+
+    /// The name of the package this module belongs to.
+    std::string PackageName;
 
     /// Warn about cases where Swift 3 would infer @objc but later versions
     /// of Swift do not.
@@ -530,6 +538,9 @@ namespace swift {
 
     /// The model of concurrency to be used.
     ConcurrencyModel ActiveConcurrencyModel = ConcurrencyModel::Standard;
+
+    /// Allows the explicit 'import Builtin' within Swift modules.
+    bool EnableBuiltinModule = false;
 
     bool isConcurrencyModelTaskToThread() const {
       return ActiveConcurrencyModel == ConcurrencyModel::TaskToThread;
@@ -779,6 +790,14 @@ namespace swift {
     /// Disable validating the persistent PCH.
     bool PCHDisableValidation = false;
 
+    /// Don't verify input files for Clang modules if the module has been
+    /// successfully validated or loaded during this build session.
+    bool ValidateModulesOnce = false;
+
+    /// Use the last modification time of this file as the underlying Clang
+    /// build session timestamp.
+    std::string BuildSessionFilePath;
+
     /// \see Mode
     enum class Modes : uint8_t {
       /// Set up Clang for importing modules into Swift and generating IR from
@@ -830,7 +849,7 @@ namespace swift {
 
     /// When building a PCM, rely on the Swift frontend's command-line -Xcc flags
     /// to build the Clang module via Clang frontend directly,
-    /// and completly bypass the Clang driver.
+    /// and completely bypass the Clang driver.
     bool DirectClangCC1ModuleBuild = false;
 
     /// Return a hash code of any components from these options that should

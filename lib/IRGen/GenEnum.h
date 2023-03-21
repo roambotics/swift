@@ -160,8 +160,10 @@ protected:
   /// Constructs a TypeInfo for an enum of the best possible kind for its
   /// layout, FixedEnumTypeInfo or LoadableEnumTypeInfo.
   TypeInfo *getFixedEnumTypeInfo(llvm::StructType *T, Size S, SpareBitVector SB,
-                                 Alignment A, IsPOD_t isPOD,
-                                 IsBitwiseTakable_t isBT);
+                                 Alignment A,
+                                 IsTriviallyDestroyable_t isTriviallyDestroyable,
+                                 IsBitwiseTakable_t isBT,
+                                 IsCopyable_t isCopyable);
   
 public:
   virtual ~EnumImplStrategy() { }
@@ -188,8 +190,8 @@ public:
     return cast<llvm::StructType>(getTypeInfo().getStorageType());
   }
   
-  IsPOD_t isPOD(ResilienceExpansion expansion) const {
-    return getTypeInfo().isPOD(expansion);
+  IsTriviallyDestroyable_t isTriviallyDestroyable(ResilienceExpansion expansion) const {
+    return getTypeInfo().isTriviallyDestroyable(expansion);
   }
   
   /// \group Query enum layout
@@ -419,7 +421,7 @@ public:
   virtual void loadAsTake(IRGenFunction &IGF, Address addr,
                           Explosion &e) const = 0;
   virtual void assign(IRGenFunction &IGF, Explosion &e, Address addr,
-                      bool isOutlined) const = 0;
+                      bool isOutlined, SILType T) const = 0;
   virtual void initialize(IRGenFunction &IGF, Explosion &e, Address addr,
                           bool isOutlined) const = 0;
   virtual void reexplode(IRGenFunction &IGF, Explosion &src,
@@ -427,7 +429,7 @@ public:
   virtual void copy(IRGenFunction &IGF, Explosion &src,
                     Explosion &dest, Atomicity atomicity) const = 0;
   virtual void consume(IRGenFunction &IGF, Explosion &src,
-                       Atomicity atomicity) const = 0;
+                       Atomicity atomicity, SILType T) const = 0;
   virtual void fixLifetime(IRGenFunction &IGF, Explosion &src) const = 0;
   virtual void packIntoEnumPayload(IRGenFunction &IGF,
                                    EnumPayload &payload,
@@ -454,8 +456,10 @@ public:
   virtual void collectMetadataForOutlining(OutliningMetadataCollector &collector,
                                            SILType T) const = 0;
 
-  virtual TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                                SILType T) const = 0;
+  virtual TypeLayoutEntry
+  *buildTypeLayoutEntry(IRGenModule &IGM,
+                        SILType T,
+                        bool useStructLayouts) const = 0;
 
   virtual bool isSingleRetainablePointer(ResilienceExpansion expansion,
                                          ReferenceCounting *rc) const {

@@ -851,6 +851,14 @@ SourceLoc DeclAttributes::getStartLoc(bool forModifiers) const {
   return lastAttr ? lastAttr->getRangeWithAt().Start : SourceLoc();
 }
 
+OrigDeclAttributes::OrigDeclAttributes(DeclAttributes allAttributes, ModuleDecl *mod) {
+  for (auto *attr : allAttributes) {
+    if (!mod->isInGeneratedBuffer(attr->AtLoc)) {
+      attributes.emplace_back(attr);
+    }
+  }
+}
+
 static void printAvailableAttr(const AvailableAttr *Attr, ASTPrinter &Printer,
                                const PrintOptions &Options) {
   if (Attr->isLanguageVersionSpecific())
@@ -925,7 +933,7 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     // will occur while building the Swift module because the overriding decl
     // doesn't override anything.
     // We couldn't skip every `override` keywords because they change the
-    // ABI if the overridden decl is also publically visible.
+    // ABI if the overridden decl is also publicly visible.
     // For public-override-internal case, having `override` doesn't have ABI
     // implication. Thus we can skip them.
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
@@ -1339,6 +1347,14 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
 
   case DAK_MacroRole: {
     auto Attr = cast<MacroRoleAttr>(this);
+
+    if (Options.SuppressingFreestandingExpression &&
+        Attr->getMacroSyntax() == MacroSyntax::Freestanding &&
+        Attr->getMacroRole() == MacroRole::Expression) {
+      Printer.printAttrName("@expression");
+      break;
+    }
+
     switch (Attr->getMacroSyntax()) {
     case MacroSyntax::Freestanding:
       Printer.printAttrName("@freestanding");
@@ -1357,7 +1373,16 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
           [&](MacroIntroducedDeclName name) {
             Printer << getMacroIntroducedDeclNameString(name.getKind());
             if (macroIntroducedNameRequiresArgument(name.getKind())) {
-              Printer << "(" << name.getIdentifier() << ")";
+              StringRef nameText = name.getIdentifier().str();
+              bool shouldEscape = escapeKeywordInContext(
+                  nameText, PrintNameContext::Normal) || nameText == "$";
+              Printer << "(";
+              if (shouldEscape)
+                Printer << "`";
+              Printer << nameText;
+              if (shouldEscape)
+                Printer << "`";
+              Printer << ")";
             }
           },
           [&] {
@@ -2374,19 +2399,6 @@ bool CustomAttr::isArgUnsafe() const {
   }
 
   return isArgUnsafeBit;
-}
-
-bool CustomAttr::isAttachedMacro(const Decl *decl) const {
-  auto &ctx = decl->getASTContext();
-  auto *dc = decl->getInnermostDeclContext();
-
-  auto *macroDecl = evaluateOrDefault(
-      ctx.evaluator,
-      ResolveMacroRequest{const_cast<CustomAttr *>(this),
-                          getAttachedMacroRoles(), dc},
-      nullptr);
-
-  return macroDecl != nullptr;
 }
 
 MacroRoleAttr::MacroRoleAttr(SourceLoc atLoc, SourceRange range,

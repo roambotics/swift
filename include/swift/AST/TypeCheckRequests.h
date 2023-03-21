@@ -49,6 +49,7 @@ struct ExternalMacroDefinition;
 class ClosureExpr;
 class GenericParamList;
 class LabeledStmt;
+class LoadedExecutablePlugin;
 class MacroDefinition;
 class PrecedenceGroupDecl;
 class PropertyWrapperInitializerInfo;
@@ -2133,7 +2134,8 @@ public:
   void cacheResult(bool value) const;
 };
 
-/// Determines the specifier for a parameter (inout, __owned, etc).
+/// Determines the ownership specifier for a parameter
+/// (inout/consuming/borrowing)
 class ParamSpecifierRequest
     : public SimpleRequest<ParamSpecifierRequest,
                            ParamSpecifier(ParamDecl *),
@@ -2216,6 +2218,74 @@ public:
   bool isCached() const { return true; }
   Optional<NamedPattern *> getCachedResult() const;
   void cacheResult(NamedPattern *P) const;
+};
+
+class ExprPatternMatchResult {
+  VarDecl *MatchVar;
+  Expr *MatchExpr;
+
+  friend class ExprPattern;
+
+  // Should only be used as the default value for the request, as the caching
+  // logic assumes the request always produces a non-null result.
+  ExprPatternMatchResult(llvm::NoneType)
+      : MatchVar(nullptr), MatchExpr(nullptr) {}
+
+public:
+  ExprPatternMatchResult(VarDecl *matchVar, Expr *matchExpr)
+      : MatchVar(matchVar), MatchExpr(matchExpr) {
+    // Note the caching logic currently requires the request to produce a
+    // non-null result.
+    assert(matchVar && matchExpr);
+  }
+
+  VarDecl *getMatchVar() const { return MatchVar; }
+  Expr *getMatchExpr() const { return MatchExpr; }
+};
+
+/// Compute the match VarDecl and expression for an ExprPattern, which applies
+/// the \c ~= operator.
+class ExprPatternMatchRequest
+    : public SimpleRequest<ExprPatternMatchRequest,
+                           ExprPatternMatchResult(const ExprPattern *),
+                           RequestFlags::SeparatelyCached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ExprPatternMatchResult evaluate(Evaluator &evaluator,
+                                  const ExprPattern *EP) const;
+
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+  Optional<ExprPatternMatchResult> getCachedResult() const;
+  void cacheResult(ExprPatternMatchResult result) const;
+};
+
+/// Creates a corresponding ExprPattern from the original Expr of an
+/// EnumElementPattern. This needs to be a cached request to ensure we don't
+/// generate multiple ExprPatterns along different constraint solver paths.
+class EnumElementExprPatternRequest
+    : public SimpleRequest<EnumElementExprPatternRequest,
+                           ExprPattern *(const EnumElementPattern *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ExprPattern *evaluate(Evaluator &evaluator,
+                        const EnumElementPattern *EEP) const;
+
+public:
+  // Cached.
+  bool isCached() const { return true; }
 };
 
 class InterfaceTypeRequest :
@@ -3162,6 +3232,9 @@ public:
   ArrayRef<TypeRepr *> getGenericArgs() const;
   ArgumentList *getArgs() const;
 
+  /// Returns the macro roles corresponding to this macro reference.
+  MacroRoles getMacroRoles() const;
+
   friend bool operator==(const UnresolvedMacroReference &lhs,
                          const UnresolvedMacroReference &rhs) {
     return lhs.getOpaqueValue() == rhs.getOpaqueValue();
@@ -3178,8 +3251,8 @@ void simple_display(llvm::raw_ostream &out,
 /// Resolve a given custom attribute to an attached macro declaration.
 class ResolveMacroRequest
     : public SimpleRequest<ResolveMacroRequest,
-                           MacroDecl *(UnresolvedMacroReference, MacroRoles,
-                                       DeclContext *),
+                           ConcreteDeclRef(UnresolvedMacroReference,
+                                           DeclContext *),
                            RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -3187,9 +3260,9 @@ public:
 private:
   friend SimpleRequest;
 
-  MacroDecl *
+  ConcreteDeclRef
   evaluate(Evaluator &evaluator, UnresolvedMacroReference macroRef,
-           MacroRoles roles, DeclContext *dc) const;
+           DeclContext *dc) const;
 
 public:
   bool isCached() const { return true; }
@@ -3349,6 +3422,27 @@ public:
 /// same file are consistently using \c @_spiOnly.
 class CheckInconsistentSPIOnlyImportsRequest
     : public SimpleRequest<CheckInconsistentSPIOnlyImportsRequest,
+                           evaluator::SideEffect(SourceFile *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  evaluator::SideEffect evaluate(Evaluator &evaluator, SourceFile *mod) const;
+
+public:
+  // Cached.
+  bool isCached() const { return true; }
+};
+
+/// Report default imports if other imports of the same target from this
+/// module have an explicitly defined access level. In such a case, all imports
+/// of the target module need an explicit access level or it may be made public
+/// by error. This applies only to pre-Swift 6 mode.
+class CheckInconsistentAccessLevelOnImport
+    : public SimpleRequest<CheckInconsistentAccessLevelOnImport,
                            evaluator::SideEffect(SourceFile *),
                            RequestFlags::Cached> {
 public:
@@ -3810,7 +3904,7 @@ public:
 /// Find the definition of a given macro.
 class ExpandMacroExpansionDeclRequest
     : public SimpleRequest<ExpandMacroExpansionDeclRequest,
-                           ArrayRef<Decl *>(MacroExpansionDecl *),
+                           Optional<unsigned>(MacroExpansionDecl *),
                            RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -3818,8 +3912,48 @@ public:
 private:
   friend SimpleRequest;
 
-  ArrayRef<Decl *> evaluate(Evaluator &evaluator,
-                            MacroExpansionDecl *med) const;
+  Optional<unsigned>
+  evaluate(Evaluator &evaluator, MacroExpansionDecl *med) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
+/// Expand all accessor macros attached to the given declaration.
+///
+/// Produces the set of macro expansion buffer IDs.
+class ExpandAccessorMacros
+    : public SimpleRequest<ExpandAccessorMacros,
+                           ArrayRef<unsigned>(AbstractStorageDecl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  ArrayRef<unsigned> evaluate(
+      Evaluator &evaluator, AbstractStorageDecl *storage) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
+/// Expand all conformance macros attached to the given declaration.
+///
+/// Produces the set of macro expansion buffer IDs.
+class ExpandConformanceMacros
+    : public SimpleRequest<ExpandConformanceMacros,
+                           ArrayRef<unsigned>(NominalTypeDecl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  ArrayRef<unsigned> evaluate(Evaluator &evaluator,
+                              NominalTypeDecl *nominal) const;
 
 public:
   bool isCached() const { return true; }
@@ -3827,9 +3961,11 @@ public:
 
 /// Expand all member attribute macros attached to the given
 /// declaration.
+///
+/// Produces the set of macro expansion buffer IDs.
 class ExpandMemberAttributeMacros
     : public SimpleRequest<ExpandMemberAttributeMacros,
-                           bool(Decl *),
+                           ArrayRef<unsigned>(Decl *),
                            RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -3837,16 +3973,18 @@ public:
 private:
   friend SimpleRequest;
 
-  bool evaluate(Evaluator &evaluator, Decl *decl) const;
+  ArrayRef<unsigned> evaluate(Evaluator &evaluator, Decl *decl) const;
 
 public:
   bool isCached() const { return true; }
 };
 
 /// Expand synthesized member macros attached to the given declaration.
+///
+/// Produces the set of macro expansion buffer IDs.
 class ExpandSynthesizedMemberMacroRequest
     : public SimpleRequest<ExpandSynthesizedMemberMacroRequest,
-                           bool(Decl *),
+                           ArrayRef<unsigned>(Decl *),
                            RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -3854,7 +3992,80 @@ public:
 private:
   friend SimpleRequest;
 
-  bool evaluate(Evaluator &evaluator, Decl *decl) const;
+  ArrayRef<unsigned> evaluate(Evaluator &evaluator, Decl *decl) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
+/// Load a plugin module with the given name.
+///
+///
+class LoadedCompilerPlugin {
+  enum class PluginKind : uint8_t {
+    None,
+    InProcess,
+    Executable,
+  };
+  PluginKind kind;
+  void *ptr;
+
+  LoadedCompilerPlugin(PluginKind kind, void *ptr) : kind(kind), ptr(ptr) {
+    assert(ptr != nullptr || kind == PluginKind::None);
+  }
+
+public:
+  LoadedCompilerPlugin(std::nullptr_t) : kind(PluginKind::None), ptr(nullptr) {}
+
+  static LoadedCompilerPlugin inProcess(void *ptr) {
+    return {PluginKind::InProcess, ptr};
+  }
+  static LoadedCompilerPlugin executable(LoadedExecutablePlugin *ptr) {
+    return {PluginKind::Executable, ptr};
+  }
+
+  void *getAsInProcessPlugin() const {
+    return kind == PluginKind::InProcess ? ptr : nullptr;
+  }
+  LoadedExecutablePlugin *getAsExecutablePlugin() const {
+    return kind == PluginKind::Executable
+               ? static_cast<LoadedExecutablePlugin *>(ptr)
+               : nullptr;
+  }
+};
+
+class CompilerPluginLoadRequest
+    : public SimpleRequest<CompilerPluginLoadRequest,
+                           LoadedCompilerPlugin(ASTContext *, Identifier),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  LoadedCompilerPlugin evaluate(Evaluator &evaluator, ASTContext *ctx,
+                                Identifier moduleName) const;
+
+public:
+  // Source location
+  SourceLoc getNearestLoc() const { return SourceLoc(); }
+
+  bool isCached() const { return true; }
+};
+
+/// Expand peer macros attached to the given declaration.
+class ExpandPeerMacroRequest
+    : public SimpleRequest<ExpandPeerMacroRequest,
+                           ArrayRef<unsigned>(Decl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  ArrayRef<unsigned> evaluate(Evaluator &evaluator, Decl *decl) const;
 
 public:
   bool isCached() const { return true; }
@@ -3863,7 +4074,7 @@ public:
 /// Resolve an external macro given its module and type name.
 class ExternalMacroDefinitionRequest
     : public SimpleRequest<ExternalMacroDefinitionRequest,
-                           ExternalMacroDefinition(
+                           llvm::Optional<ExternalMacroDefinition>(
                                ASTContext *, Identifier, Identifier),
                            RequestFlags::Cached> {
 public:
@@ -3872,9 +4083,9 @@ public:
 private:
   friend SimpleRequest;
 
-  ExternalMacroDefinition evaluate(
-      Evaluator &evaluator, ASTContext *ctx, Identifier moduleName,
-      Identifier typeName
+  llvm::Optional<ExternalMacroDefinition> evaluate(
+      Evaluator &evaluator, ASTContext *ctx,
+      Identifier moduleName, Identifier typeName
   ) const;
 
 public:

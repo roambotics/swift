@@ -662,6 +662,22 @@ static void recordShadowedDeclsAfterTypeMatch(
         }
       }
 
+      // Next, prefer any other module over the _Backtracing module.
+      if (auto spModule = ctx.getLoadedModule(ctx.Id_Backtracing)) {
+        if ((firstModule == spModule) != (secondModule == spModule)) {
+          // If second module is _StringProcessing, then it is shadowed by
+          // first.
+          if (secondModule == spModule) {
+            shadowed.insert(secondDecl);
+            continue;
+          }
+
+          // Otherwise, the first declaration is shadowed by the second.
+          shadowed.insert(firstDecl);
+          break;
+        }
+      }
+
       // The Foundation overlay introduced Data.withUnsafeBytes, which is
       // treated as being ambiguous with SwiftNIO's Data.withUnsafeBytes
       // extension. Apply a special-case name shadowing rule to use the
@@ -1239,6 +1255,7 @@ public:
   }
 
   bool isLazilyCompleteForMacroExpansion(DeclName name) const {
+    assert(!MacroDecl::isUniqueMacroName(name.getBaseName()));
     // If we've already expanded macros for a simple name, we must have expanded
     // all macros that produce names with the same base identifier.
     bool isBaseNameComplete = name.isCompoundName() &&
@@ -1248,6 +1265,7 @@ public:
   }
 
   void markLazilyCompleteForMacroExpansion(DeclName name) {
+    assert(!MacroDecl::isUniqueMacroName(name.getBaseName()));
     LazilyCompleteNamesForMacroExpansion.insert(name);
   }
 
@@ -1505,52 +1523,86 @@ populateLookupTableEntryFromExtensions(ASTContext &ctx,
   }
 }
 
+/// Adjust the given name to make it a proper key for the lazy macro expansion
+/// cache, which maps all uniquely-generated names down to a single placeholder
+/// key.
+static DeclName adjustLazyMacroExpansionNameKey(
+    ASTContext &ctx, DeclName name) {
+  if (MacroDecl::isUniqueMacroName(name.getBaseName()))
+    return MacroDecl::getUniqueNamePlaceholder(ctx);
+
+  return name;
+}
+
 static void
 populateLookupTableEntryFromMacroExpansions(ASTContext &ctx,
                                             MemberLookupTable &table,
                                             DeclName name,
                                             NominalTypeDecl *dc) {
-  auto expandAndPopulate = [&](MacroExpansionDecl *med) {
-    auto expanded = evaluateOrDefault(med->getASTContext().evaluator,
-                                      ExpandMacroExpansionDeclRequest{med},
-                                      nullptr);
-    for (auto *decl : expanded)
-      table.addMember(decl);
-  };
-
+  auto *moduleScopeCtx = dc->getModuleScopeContext();
+  auto *module = dc->getModuleContext();
   for (auto *member : dc->getCurrentMembersWithoutLoading()) {
-    auto *med = dyn_cast<MacroExpansionDecl>(member);
-    if (!med)
-      continue;
-    auto macro = evaluateOrDefault(
-        ctx.evaluator, ResolveMacroRequest{med, MacroRole::Declaration, dc},
-        nullptr);
-    if (!macro)
-      continue;
-    auto *attr = macro->getMacroRoleAttr(MacroRole::Declaration);
-    // If a macro produces arbitrary names, we have to expand it to factor its
-    // expansion results into name lookup.
-    if (attr->hasNameKind(MacroIntroducedDeclNameKind::Arbitrary)) {
-      expandAndPopulate(med);
+    // Collect all macro introduced names, along with its corresponding macro
+    // reference. We need the macro reference to prevent adding auxiliary decls
+    // that weren't introduced by the macro.
+    llvm::SmallSet<DeclName, 4> allIntroducedNames;
+    bool introducesArbitraryNames = false;
+    if (auto *med = dyn_cast<MacroExpansionDecl>(member)) {
+      auto declRef = evaluateOrDefault(
+          ctx.evaluator, ResolveMacroRequest{med, dc},
+          nullptr);
+      if (!declRef)
+        continue;
+      auto *macro = dyn_cast<MacroDecl>(declRef.getDecl());
+      if (macro->getMacroRoleAttr(MacroRole::Declaration)
+          ->hasNameKind(MacroIntroducedDeclNameKind::Arbitrary))
+        introducesArbitraryNames = true;
+      else {
+        SmallVector<DeclName, 4> introducedNames;
+        macro->getIntroducedNames(MacroRole::Declaration, nullptr,
+                                  introducedNames);
+        for (auto name : introducedNames)
+          allIntroducedNames.insert(name);
+      }
+    } else if (auto *vd = dyn_cast<ValueDecl>(member)) {
+      // We intentionally avoid calling `forEachAttachedMacro` in order to avoid
+      // a request cycle.
+      for (auto attrConst : member->getSemanticAttrs().getAttributes<CustomAttr>()) {
+        auto *attr = const_cast<CustomAttr *>(attrConst);
+        UnresolvedMacroReference macroRef(attr);
+        auto macroName = macroRef.getMacroName();
+        UnqualifiedLookupDescriptor lookupDesc{macroName, moduleScopeCtx};
+        auto lookup = evaluateOrDefault(
+            ctx.evaluator, UnqualifiedLookupRequest{lookupDesc}, {});
+        for (auto result : lookup.allResults()) {
+          auto *vd = result.getValueDecl();
+          auto *macro = dyn_cast<MacroDecl>(vd);
+          if (!macro)
+            continue;
+          auto *macroRoleAttr = macro->getMacroRoleAttr(MacroRole::Peer);
+          if (!macroRoleAttr)
+            continue;
+          if (macroRoleAttr->hasNameKind(
+                  MacroIntroducedDeclNameKind::Arbitrary))
+            introducesArbitraryNames = true;
+          else {
+            SmallVector<DeclName, 4> introducedNames;
+            macro->getIntroducedNames(
+                MacroRole::Peer, dyn_cast<ValueDecl>(member), introducedNames);
+            for (auto name : introducedNames)
+              allIntroducedNames.insert(name);
+          }
+        }
+      }
     }
-    // Otherwise, we expand the macro if it has the same decl base name being
-    // looked for.
-    else {
-      auto it = llvm::find_if(attr->getNames(),
-                              [&](const MacroIntroducedDeclName &introName) {
-        // FIXME: The `Named` kind of `MacroIntroducedDeclName` should store a
-        // `DeclName` instead of `Identifier`. This is so that we can compare
-        // base identifiers when the macro specifies a compound name.
-        // Currently only simple names are allowed in a `MacroRoleAttr`.
-        if (!name.isSpecial())
-          return introName.getIdentifier() == name.getBaseIdentifier();
-        else
-          return introName.getIdentifier().str() ==
-              name.getBaseName().userFacingName();
+    // Expand macros based on the name.
+    if (introducesArbitraryNames || allIntroducedNames.contains(name))
+      member->visitAuxiliaryDecls([&](Decl *decl) {
+        auto *sf = module->getSourceFileContainingLocation(decl->getLoc());
+        // Bail out if the auxiliary decl was not produced by a macro.
+        if (!sf || sf->Kind != SourceFileKind::MacroExpansion) return;
+        table.addMember(decl);
       });
-      if (it != attr->getNames().end())
-        expandAndPopulate(med);
-    }
   }
 }
 
@@ -1717,9 +1769,11 @@ DirectLookupRequest::evaluate(Evaluator &evaluator,
     Table.markLazilyComplete(baseName);
   }
 
-  if (!Table.isLazilyCompleteForMacroExpansion(name)) {
-    populateLookupTableEntryFromMacroExpansions(ctx, Table, name, decl);
-    Table.markLazilyCompleteForMacroExpansion(name);
+  DeclName macroExpansionKey = adjustLazyMacroExpansionNameKey(ctx, name);
+  if (!Table.isLazilyCompleteForMacroExpansion(macroExpansionKey)) {
+    populateLookupTableEntryFromMacroExpansions(
+        ctx, Table, macroExpansionKey, decl);
+    Table.markLazilyCompleteForMacroExpansion(macroExpansionKey);
   }
 
   // Look for a declaration with this name.
@@ -2082,9 +2136,9 @@ QualifiedLookupRequest::evaluate(Evaluator &eval, const DeclContext *DC,
 
     // Expand synthesized member macros.
     auto &ctx = current->getASTContext();
-    evaluateOrDefault(ctx.evaluator,
-                      ExpandSynthesizedMemberMacroRequest{current},
-                      false);
+    (void)evaluateOrDefault(ctx.evaluator,
+                            ExpandSynthesizedMemberMacroRequest{current},
+                            false);
 
     // Look for results within the current nominal type and its extensions.
     bool currentIsProtocol = isa<ProtocolDecl>(current);
@@ -2618,8 +2672,8 @@ directReferencesForTypeRepr(Evaluator &evaluator,
                                        allowUsableFromInline);
   }
 
-  case TypeReprKind::PackReference: {
-    auto packReferenceRepr = cast<PackReferenceTypeRepr>(typeRepr);
+  case TypeReprKind::PackElement: {
+    auto packReferenceRepr = cast<PackElementTypeRepr>(typeRepr);
     return directReferencesForTypeRepr(evaluator, ctx,
                                        packReferenceRepr->getPackType(), dc,
                                        allowUsableFromInline);
@@ -2627,13 +2681,11 @@ directReferencesForTypeRepr(Evaluator &evaluator,
 
   case TypeReprKind::Error:
   case TypeReprKind::Function:
-  case TypeReprKind::InOut:
+  case TypeReprKind::Ownership:
   case TypeReprKind::Isolated:
   case TypeReprKind::CompileTimeConst:
   case TypeReprKind::Metatype:
-  case TypeReprKind::Owned:
   case TypeReprKind::Protocol:
-  case TypeReprKind::Shared:
   case TypeReprKind::SILBox:
   case TypeReprKind::Placeholder:
   case TypeReprKind::Pack:
@@ -2873,7 +2925,15 @@ static bool declsAreAssociatedTypes(ArrayRef<TypeDecl *> decls) {
 static bool declsAreProtocols(ArrayRef<TypeDecl *> decls) {
   if (decls.empty())
     return false;
-  return llvm::any_of(decls, [&](const TypeDecl *decl) { return isa<ProtocolDecl>(decl); });;;
+  return llvm::any_of(decls, [&](const TypeDecl *decl) {
+    if (auto *alias = dyn_cast<TypeAliasDecl>(decl)) {
+      auto ty = alias->getUnderlyingType();
+      decl = ty->getNominalOrBoundGenericNominal();
+      if (decl == nullptr || ty->is<ExistentialType>())
+        return false;
+    }
+    return isa<ProtocolDecl>(decl);
+  });;;
 }
 
 bool TypeRepr::isProtocol(DeclContext *dc){
@@ -2882,7 +2942,6 @@ bool TypeRepr::isProtocol(DeclContext *dc){
     return declsAreProtocols(directReferencesForTypeRepr(ctx.evaluator, ctx, ty, dc));
   });
 }
-
 
 static GenericParamList *
 createExtensionGenericParams(ASTContext &ctx,
@@ -2911,6 +2970,11 @@ CollectedOpaqueReprs swift::collectOpaqueReturnTypeReprs(TypeRepr *r, ASTContext
 
   public:
     explicit Walker(CollectedOpaqueReprs &reprs, ASTContext &ctx, DeclContext *d) : Reprs(reprs), Ctx(ctx), dc(d) {}
+
+    /// Walk everything that's available.
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::ArgumentsAndExpansion;
+    }
 
     PreWalkAction walkToTypeReprPre(TypeRepr *repr) override {
 

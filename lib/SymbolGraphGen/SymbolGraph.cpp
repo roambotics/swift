@@ -12,6 +12,7 @@
 
 #include "clang/AST/DeclObjC.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/Comment.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ProtocolConformance.h"
@@ -189,6 +190,15 @@ SymbolGraph::isRequirementOrDefaultImplementation(const ValueDecl *VD) const {
 // MARK: - Symbols (Nodes)
 
 void SymbolGraph::recordNode(Symbol S) {
+  if (Walker.Options.SkipProtocolImplementations && S.getInheritedDecl()) {
+    const auto *DocCommentProvidingDecl =
+      getDocCommentProvidingDecl(S.getLocalSymbolDecl(), /*AllowSerialized=*/true);
+
+    // allow implementation symbols to remain if they have their own comment
+    if (DocCommentProvidingDecl != S.getLocalSymbolDecl())
+      return;
+  }
+
   Nodes.insert(S);
 
   // Record all of the possible relationships (edges) originating
@@ -264,6 +274,7 @@ void SymbolGraph::recordMemberRelationship(Symbol S) {
     case swift::DeclContextKind::SubscriptDecl:
     case swift::DeclContextKind::AbstractFunctionDecl:
     case swift::DeclContextKind::SerializedLocal:
+    case swift::DeclContextKind::Package:
     case swift::DeclContextKind::Module:
     case swift::DeclContextKind::FileUnit:
     case swift::DeclContextKind::MacroDecl:
@@ -294,7 +305,7 @@ bool SymbolGraph::synthesizedMemberIsBestCandidate(const ValueDecl *VD,
 }
 
 void SymbolGraph::recordConformanceSynthesizedMemberRelationships(Symbol S) {
-  if (!Walker.Options.EmitSynthesizedMembers) {
+  if (!Walker.Options.EmitSynthesizedMembers || Walker.Options.SkipProtocolImplementations) {
     return;
   }
   const auto D = S.getLocalSymbolDecl();

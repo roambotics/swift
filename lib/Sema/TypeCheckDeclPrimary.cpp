@@ -438,7 +438,7 @@ static void checkForEmptyOptionSet(const VarDecl *VD) {
 }
 
 template<typename T>
-static void diagnoseDuplicateDecls(const T &decls) {
+static void diagnoseDuplicateDecls(T &&decls) {
   llvm::SmallDenseMap<DeclBaseName, const ValueDecl *> names;
   for (auto *current : decls) {
     if (!current->hasName() || current->isImplicit())
@@ -453,6 +453,14 @@ static void diagnoseDuplicateDecls(const T &decls) {
                           current->getName()), [&]() {
         other->diagnose(diag::invalid_redecl_prev, other->getName());
       });
+
+      // Mark the decl as invalid, unless it's a GenericTypeParamDecl, which is
+      // expected to maintain its type of GenericTypeParamType.
+      // This is needed to avoid emitting a duplicate diagnostic when running
+      // redeclaration checking in the case where the VarDecl is part of the
+      // enclosing context, e.g `let (x, x) = (0, 0)`.
+      if (!isa<GenericTypeParamDecl>(current))
+        current->setInvalid();
     }
   }
 }
@@ -1852,6 +1860,11 @@ public:
   }
 
   void visit(Decl *decl) {
+    // Visit auxiliary decls first.
+    decl->visitAuxiliaryDecls([&](Decl *auxiliaryDecl) {
+      this->visit(auxiliaryDecl);
+    });
+
     if (auto *Stats = getASTContext().Stats)
       ++Stats->getFrontendCounters().NumDeclsTypechecked;
 
@@ -1954,6 +1967,7 @@ public:
       if (target &&
           !ID->getAttrs().hasAttribute<ImplementationOnlyAttr>() &&
           !ID->getAttrs().hasAttribute<SPIOnlyAttr>() &&
+          ID->getAccessLevel() == AccessLevel::Public &&
           target->getLibraryLevel() == LibraryLevel::SPI) {
 
         auto &diags = ID->getASTContext().Diags;
@@ -2007,12 +2021,12 @@ public:
     TypeChecker::checkDeclAttributes(MD);
     checkAccessControl(MD);
 
-    if (!Ctx.LangOpts.hasFeature(Feature::Macros))
-      MD->diagnose(diag::macro_experimental);
     if (!MD->getDeclContext()->isModuleScopeContext())
       MD->diagnose(diag::macro_in_nested, MD->getName());
     if (!MD->getAttrs().hasAttribute<MacroRoleAttr>(/*AllowInvalid*/ true))
       MD->diagnose(diag::macro_without_role, MD->getName());
+
+    TypeChecker::checkParameterList(MD->getParameterList(), MD);
 
     // Check the macro definition.
     switch (auto macroDef = MD->getDefinition()) {
@@ -2031,10 +2045,8 @@ public:
       ExternalMacroDefinitionRequest request{
         &Ctx, external.moduleName, external.macroTypeName
       };
-      auto externalDef = evaluateOrDefault(
-          Ctx.evaluator, request, ExternalMacroDefinition()
-      );
-      if (!externalDef.opaqueHandle) {
+      auto externalDef = evaluateOrDefault(Ctx.evaluator, request, None);
+      if (!externalDef) {
         MD->diagnose(
             diag::external_macro_not_found,
             external.moduleName.str(),
@@ -2051,12 +2063,7 @@ public:
   void visitMacroExpansionDecl(MacroExpansionDecl *MED) {
     // Assign a discriminator.
     (void)MED->getDiscriminator();
-
-    auto rewritten = evaluateOrDefault(
-        Ctx.evaluator, ExpandMacroExpansionDeclRequest{MED}, {});
-
-    for (auto *decl : rewritten)
-      visit(decl);
+    // Expansion already visited as auxiliary decls.
   }
 
   void visitBoundVariable(VarDecl *VD) {
@@ -2584,9 +2591,16 @@ public:
       }
     }
 
+    // -----
+    // NonCopyableChecks
+    //
+
+    if (ED->isObjC() && ED->isMoveOnly()) {
+      ED->diagnose(diag::moveonly_objc_enum_banned);
+    }
     // FIXME(kavon): see if these can be integrated into other parts of Sema
     diagnoseCopyableTypeContainingMoveOnlyType(ED);
-    diagnoseMoveOnlyNominalDeclDoesntConformToProtocols(ED);
+    diagnoseIncompatibleProtocolsForMoveOnlyType(ED);
 
     checkExplicitAvailability(ED);
 
@@ -2645,7 +2659,7 @@ public:
     // are not move only.
     diagnoseCopyableTypeContainingMoveOnlyType(SD);
 
-    diagnoseMoveOnlyNominalDeclDoesntConformToProtocols(SD);
+    diagnoseIncompatibleProtocolsForMoveOnlyType(SD);
   }
 
   /// Check whether the given properties can be @NSManaged in this class.
@@ -2747,21 +2761,53 @@ public:
     }
   }
 
-  void diagnoseMoveOnlyNominalDeclDoesntConformToProtocols(
-      NominalTypeDecl *nomDecl) {
-    if (!nomDecl->isMoveOnly())
-      return;
+  /// check to see if a move-only type can ever conform to the given type.
+  /// \returns true iff a diagnostic was emitted because it was not compatible
+  static bool diagnoseIncompatibleWithMoveOnlyType(SourceLoc loc,
+                                                 NominalTypeDecl *moveonlyType,
+                                                 Type type) {
+    assert(type && "got an empty type?");
+    assert(moveonlyType->isMoveOnly());
 
-    for (auto *prot : nomDecl->getLocalProtocols()) {
+    auto canType = type->getCanonicalType();
+    if (auto prot = canType->getAs<ProtocolType>()) {
       // Permit conformance to marker protocol Sendable.
-      if (prot->isSpecificProtocol(KnownProtocolKind::Sendable)) {
-        assert(prot->isMarkerProtocol());
-        continue;
+      if (prot->getDecl()->isSpecificProtocol(KnownProtocolKind::Sendable)) {
+        assert(prot->getDecl()->isMarkerProtocol());
+        return false;
       }
+    }
 
-      nomDecl->diagnose(diag::moveonly_cannot_conform_to_protocol_with_name,
-                        nomDecl->getDescriptiveKind(),
-                        nomDecl->getBaseName(), prot->getBaseName());
+    auto &ctx = moveonlyType->getASTContext();
+    ctx.Diags.diagnose(loc,
+                       diag::moveonly_cannot_conform_to_type,
+                       moveonlyType->getDescriptiveKind(),
+                       moveonlyType->getBaseName(),
+                       type);
+    return true;
+  }
+
+  static void diagnoseIncompatibleProtocolsForMoveOnlyType(Decl *decl) {
+    if (auto *nomDecl = dyn_cast<NominalTypeDecl>(decl)) {
+      if (!nomDecl->isMoveOnly())
+        return;
+
+      // go over the all protocols directly conformed-to by this nominal
+      for (auto *prot : nomDecl->getLocalProtocols())
+        diagnoseIncompatibleWithMoveOnlyType(nomDecl->getLoc(), nomDecl,
+                                             prot->getDeclaredInterfaceType());
+
+    } else if (auto *extension = dyn_cast<ExtensionDecl>(decl)) {
+      if (auto *nomDecl = extension->getExtendedNominal()) {
+        if (!nomDecl->isMoveOnly())
+          return;
+
+        // go over the all types directly conformed-to by the extension
+        for (auto entry : extension->getInherited()) {
+          diagnoseIncompatibleWithMoveOnlyType(extension->getLoc(), nomDecl,
+                                               entry.getType());
+        }
+      }
     }
   }
 
@@ -2928,17 +2974,8 @@ public:
 
     maybeDiagnoseClassWithoutInitializers(CD);
 
-    diagnoseMoveOnlyNominalDeclDoesntConformToProtocols(CD);
+    diagnoseIncompatibleProtocolsForMoveOnlyType(CD);
 
-    // Ban non-final classes from having move only fields.
-    if (!CD->isFinal()) {
-      for (auto *field : CD->getStoredProperties()) {
-        if (field->getType()->isPureMoveOnly()) {
-          field->diagnose(
-              diag::moveonly_non_final_class_cannot_contain_moveonly_field);
-        }
-      }
-    }
   }
 
   void visitProtocolDecl(ProtocolDecl *PD) {
@@ -3404,11 +3441,7 @@ public:
     if (nominal->isDistributedActor())
       TypeChecker::checkDistributedActor(SF, nominal);
 
-    // If we have a move only type and allow it to extend any protocol, error.
-    if (nominal->isMoveOnly() && ED->getInherited().size()) {
-      ED->diagnose(diag::moveonly_cannot_conform_to_protocol,
-                   nominal->getDescriptiveKind(), nominal->getBaseName());
-    }
+    diagnoseIncompatibleProtocolsForMoveOnlyType(ED);
 
     TypeChecker::checkReflectionMetadataAttributes(ED);
   }
@@ -3577,17 +3610,38 @@ public:
       addDelayedFunction(CD);
     }
 
+    // a move-only / noncopyable type cannot have a failable initializer, since
+    // that would require the ability to wrap one inside an optional
+    if (CD->isFailable()) {
+      if (auto *nom = CD->getDeclContext()->getSelfNominalTypeDecl()) {
+        if (nom->isMoveOnly()) {
+          CD->diagnose(diag::moveonly_failable_init);
+        }
+      }
+    }
+
     checkDefaultArguments(CD->getParameters());
     checkVariadicParameters(CD->getParameters(), CD);
   }
 
   void visitDestructorDecl(DestructorDecl *DD) {
-    // Only check again for destructor decl outside of a class if our dstructor
+    // Only check again for destructor decl outside of a class if our destructor
     // is not marked as invalid.
     if (!DD->isInvalid()) {
       auto *nom = dyn_cast<NominalTypeDecl>(DD->getDeclContext());
       if (!nom || (!isa<ClassDecl>(nom) && !nom->isMoveOnly())) {
-        DD->diagnose(diag::destructor_decl_outside_class);
+        DD->diagnose(diag::destructor_decl_outside_class_or_noncopyable);
+      }
+
+      // If we have a noncopyable type, check if we have an @objc enum with a
+      // deinit and emit a specialized error. We will have technically already
+      // emitted an error since @objc enum cannot be marked noncopyable, but
+      // this at least makes it a bit clearer to the user that the deinit is
+      // also incorrect.
+      if (auto *e = dyn_cast_or_null<EnumDecl>(nom)) {
+        if (e->isObjC()) {
+          DD->diagnose(diag::destructor_decl_on_objc_enum);
+        }
       }
     }
 
@@ -3732,43 +3786,35 @@ void TypeChecker::checkParameterList(ParameterList *params,
   }
 }
 
-ArrayRef<Decl *>
+Optional<unsigned>
 ExpandMacroExpansionDeclRequest::evaluate(Evaluator &evaluator,
                                           MacroExpansionDecl *MED) const {
   auto &ctx = MED->getASTContext();
   auto *dc = MED->getDeclContext();
-  auto foundMacros = TypeChecker::lookupMacros(
-      MED->getDeclContext(), MED->getMacroName(),
-      MED->getLoc(), MacroRole::Declaration);
-  if (foundMacros.empty()) {
-    MED->diagnose(diag::macro_undefined, MED->getMacroName().getBaseIdentifier())
-        .highlight(MED->getMacroNameLoc().getSourceRange());
-    return {};
-  }
+
   // Resolve macro candidates.
-  MacroDecl *macro;
-  if (auto *args = MED->getArgs()) {
-    macro = evaluateOrDefault(
-        ctx.evaluator, ResolveMacroRequest{MED, MacroRole::Declaration, dc},
-        nullptr);
-  }
-  else {
-    if (foundMacros.size() > 1) {
-      MED->diagnose(diag::ambiguous_decl_ref, MED->getMacroName())
-          .highlight(MED->getMacroNameLoc().getSourceRange());
-      for (auto *candidate : foundMacros)
-        candidate->diagnose(diag::found_candidate);
-      return {};
-    }
-    macro = foundMacros.front();
-  }
+  auto macro = evaluateOrDefault(
+      ctx.evaluator, ResolveMacroRequest{MED, dc},
+      ConcreteDeclRef());
   if (!macro)
-    return {};
+    return None;
   MED->setMacroRef(macro);
 
-  // Expand the macro.
-  SmallVector<Decl *, 2> expandedTemporary;
-  if (!expandFreestandingDeclarationMacro(MED, expandedTemporary))
-    return {};
-  return ctx.AllocateCopy(expandedTemporary);
+  auto roles = cast<MacroDecl>(macro.getDecl())->getMacroRoles();
+  // If it's not a declaration macro or a code item macro, it must have been
+  // parsed as an expression macro, and this decl is just its substitute decl.
+  // So there's no thing to be done here.
+  if (!roles.contains(MacroRole::Declaration))
+    return None;
+
+  // Otherwise, we treat it as a declaration macro.
+  assert(roles.contains(MacroRole::Declaration));
+
+  // For now, restrict global freestanding macros in script mode.
+  if (dc->isModuleScopeContext() &&
+      dc->getParentSourceFile()->isScriptMode()) {
+    MED->diagnose(diag::global_freestanding_macro_script);
+  }
+
+  return expandFreestandingMacro(MED);
 }

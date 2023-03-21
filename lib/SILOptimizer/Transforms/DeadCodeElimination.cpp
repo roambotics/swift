@@ -215,7 +215,6 @@ void DCE::markInstructionLive(SILInstruction *Inst) {
 
   LLVM_DEBUG(llvm::dbgs() << "Marking as live: " << *Inst);
 
-  markControllingTerminatorsLive(Inst->getParent());
   Worklist.push_back(Inst);
 }
 
@@ -275,7 +274,13 @@ void DCE::markLive() {
         addReverseDependency(beginAccess, &I);
         break;
       }
-      case SILInstructionKind::DestroyValueInst:
+      case SILInstructionKind::DestroyValueInst: {
+        auto phi = PhiValue(I.getOperand(0));
+        if (phi && phi->isLexical()) {
+          markInstructionLive(&I);
+        }
+        break;
+      }
       case SILInstructionKind::EndBorrowInst:
       case SILInstructionKind::EndLifetimeInst: {
         // The instruction is live only if it's operand value is also live
@@ -450,6 +455,8 @@ void DCE::propagateLiveBlockArgument(SILArgument *Arg) {
 // Given an instruction which is considered live, propagate that liveness
 // back to the instructions that produce values it consumes.
 void DCE::propagateLiveness(SILInstruction *I) {
+  markControllingTerminatorsLive(I->getParent());
+
   if (!isa<TermInst>(I)) {
     for (auto &O : I->getAllOperands())
       markValueLive(O.get());

@@ -793,6 +793,19 @@ DiagnosticBehavior SendableCheckContext::diagnosticBehavior(
   return defaultBehavior;
 }
 
+static bool shouldDiagnosePreconcurrencyImports(SourceFile &sf) {
+  switch (sf.Kind) {
+  case SourceFileKind::Interface:
+  case SourceFileKind::SIL:
+      return false;
+
+  case SourceFileKind::Library:
+  case SourceFileKind::Main:
+  case SourceFileKind::MacroExpansion:
+      return true;
+  }
+}
+
 bool swift::diagnoseSendabilityErrorBasedOn(
     NominalTypeDecl *nominal, SendableCheckContext fromContext,
     llvm::function_ref<bool(DiagnosticBehavior)> diagnose) {
@@ -806,47 +819,68 @@ bool swift::diagnoseSendabilityErrorBasedOn(
 
   bool wasSuppressed = diagnose(behavior);
 
-  bool emittedDiagnostics =
-      behavior != DiagnosticBehavior::Ignore && !wasSuppressed;
+  SourceFile *sourceFile = fromContext.fromDC->getParentSourceFile();
+  if (sourceFile && shouldDiagnosePreconcurrencyImports(*sourceFile)) {
+    bool emittedDiagnostics =
+        behavior != DiagnosticBehavior::Ignore && !wasSuppressed;
 
-  // When the type is explicitly Sendable *or* explicitly non-Sendable, we
-  // assume it has been audited and `@preconcurrency` is not recommended even
-  // though it would actually affect the diagnostic.
-  bool nominalIsImportedAndHasImplicitSendability =
-      nominal &&
-      nominal->getParentModule() != fromContext.fromDC->getParentModule() &&
-      !hasExplicitSendableConformance(nominal);
+    // When the type is explicitly Sendable *or* explicitly non-Sendable, we
+    // assume it has been audited and `@preconcurrency` is not recommended even
+    // though it would actually affect the diagnostic.
+    bool nominalIsImportedAndHasImplicitSendability =
+        nominal &&
+        nominal->getParentModule() != fromContext.fromDC->getParentModule() &&
+        !hasExplicitSendableConformance(nominal);
 
-  if (emittedDiagnostics && nominalIsImportedAndHasImplicitSendability) {
-    // This type was imported from another module; try to find the
-    // corresponding import.
-    Optional<AttributedImport<swift::ImportedModule>> import;
-    SourceFile *sourceFile = fromContext.fromDC->getParentSourceFile();
-    if (sourceFile) {
-      import = findImportFor(nominal, fromContext.fromDC);
-    }
+    if (emittedDiagnostics && nominalIsImportedAndHasImplicitSendability) {
+      // This type was imported from another module; try to find the
+      // corresponding import.
+      Optional<AttributedImport<swift::ImportedModule>> import =
+          findImportFor(nominal, fromContext.fromDC);
 
-    // If we found the import that makes this nominal type visible, remark
-    // that it can be @preconcurrency import.
-    // Only emit this remark once per source file, because it can happen a
-    // lot.
-    if (import && !import->options.contains(ImportFlags::Preconcurrency) &&
-        import->importLoc.isValid() && sourceFile &&
-        !sourceFile->hasImportUsedPreconcurrency(*import)) {
-      SourceLoc importLoc = import->importLoc;
-      ASTContext &ctx = nominal->getASTContext();
+      // If we found the import that makes this nominal type visible, remark
+      // that it can be @preconcurrency import.
+      // Only emit this remark once per source file, because it can happen a
+      // lot.
+      if (import && !import->options.contains(ImportFlags::Preconcurrency) &&
+          import->importLoc.isValid() && sourceFile &&
+          !sourceFile->hasImportUsedPreconcurrency(*import)) {
+        SourceLoc importLoc = import->importLoc;
+        ASTContext &ctx = nominal->getASTContext();
 
-      ctx.Diags.diagnose(
-          importLoc, diag::add_predates_concurrency_import,
-          ctx.LangOpts.isSwiftVersionAtLeast(6),
-          nominal->getParentModule()->getName())
-        .fixItInsert(importLoc, "@preconcurrency ");
+        ctx.Diags
+            .diagnose(importLoc, diag::add_predates_concurrency_import,
+                      ctx.LangOpts.isSwiftVersionAtLeast(6),
+                      nominal->getParentModule()->getName())
+            .fixItInsert(importLoc, "@preconcurrency ");
 
-      sourceFile->setImportUsedPreconcurrency(*import);
+        sourceFile->setImportUsedPreconcurrency(*import);
+      }
     }
   }
 
   return behavior == DiagnosticBehavior::Unspecified && !wasSuppressed;
+}
+
+void swift::diagnoseUnnecessaryPreconcurrencyImports(SourceFile &sf) {
+  if (!shouldDiagnosePreconcurrencyImports(sf))
+    return;
+
+  ASTContext &ctx = sf.getASTContext();
+
+  if (ctx.TypeCheckerOpts.SkipFunctionBodies != FunctionBodySkipping::None)
+    return;
+
+  for (const auto &import : sf.getImports()) {
+    if (import.options.contains(ImportFlags::Preconcurrency) &&
+        import.importLoc.isValid() &&
+        !sf.hasImportUsedPreconcurrency(import)) {
+      ctx.Diags.diagnose(
+          import.importLoc, diag::remove_predates_concurrency_import,
+          import.module.importedModule->getName())
+        .fixItRemove(import.preconcurrencyRange);
+    }
+  }
 }
 
 /// Produce a diagnostic for a single instance of a non-Sendable type where
@@ -1191,15 +1225,82 @@ void swift::diagnoseMissingExplicitSendable(NominalTypeDecl *nominal) {
   }
 }
 
-/// Determine whether this is the main actor type.
-/// FIXME: the diagnostics engine has a copy of this.
-static bool isMainActor(Type type) {
-  if (auto nominal = type->getAnyNominal()) {
-    if (nominal->getName().is("MainActor") &&
-        nominal->getParentModule()->getName() ==
-          nominal->getASTContext().Id_Concurrency)
-      return true;
+void swift::tryDiagnoseExecutorConformance(ASTContext &C,
+                                           const NominalTypeDecl *nominal,
+                                           ProtocolDecl *proto) {
+  assert(proto->isSpecificProtocol(KnownProtocolKind::Executor) ||
+         proto->isSpecificProtocol(KnownProtocolKind::SerialExecutor));
+
+  auto &diags = C.Diags;
+  auto module = nominal->getParentModule();
+  Type nominalTy = nominal->getDeclaredInterfaceType();
+
+  // enqueue(_: UnownedJob)
+  auto enqueueDeclName = DeclName(C, DeclBaseName(C.Id_enqueue), { Identifier() });
+
+  FuncDecl *unownedEnqueueRequirement = nullptr;
+  FuncDecl *moveOnlyEnqueueRequirement = nullptr;
+  for (auto req: proto->getProtocolRequirements()) {
+    auto *funcDecl = dyn_cast<FuncDecl>(req);
+    if (!funcDecl)
+      continue;
+
+    if (funcDecl->getName() != enqueueDeclName)
+      continue;
+
+    // look for the first parameter being a Job or UnownedJob
+    if (funcDecl->getParameters()->size() != 1)
+      continue;
+    if (auto param = funcDecl->getParameters()->front()) {
+      if (param->getType()->isEqual(C.getJobDecl()->getDeclaredInterfaceType())) {
+        assert(moveOnlyEnqueueRequirement == nullptr);
+        moveOnlyEnqueueRequirement = funcDecl;
+      } else if (param->getType()->isEqual(C.getUnownedJobDecl()->getDeclaredInterfaceType())) {
+        assert(unownedEnqueueRequirement == nullptr);
+        unownedEnqueueRequirement = funcDecl;
+      }
+    }
+
+    // if we found both, we're done here and break out of the loop
+    if (unownedEnqueueRequirement && moveOnlyEnqueueRequirement)
+      break; // we're done looking for the requirements
   }
+
+
+  auto conformance = module->lookupConformance(nominalTy, proto);
+  auto concreteConformance = conformance.getConcrete();
+  auto unownedEnqueueWitness = concreteConformance->getWitnessDeclRef(unownedEnqueueRequirement);
+  auto moveOnlyEnqueueWitness = concreteConformance->getWitnessDeclRef(moveOnlyEnqueueRequirement);
+
+  if (auto enqueueUnownedDecl = unownedEnqueueWitness.getDecl()) {
+    // Old UnownedJob based impl is present, warn about it suggesting the new protocol requirement.
+    if (enqueueUnownedDecl->getLoc().isValid()) {
+      diags.diagnose(enqueueUnownedDecl->getLoc(), diag::executor_enqueue_unowned_implementation, nominalTy);
+    }
+  }
+
+  if (auto unownedEnqueueDecl = unownedEnqueueWitness.getDecl()) {
+    if (auto moveOnlyEnqueueDecl = moveOnlyEnqueueWitness.getDecl()) {
+      if (unownedEnqueueDecl && unownedEnqueueDecl->getLoc().isInvalid() &&
+          moveOnlyEnqueueDecl && moveOnlyEnqueueDecl->getLoc().isInvalid()) {
+        // Neither old nor new implementation have been found, but we provide default impls for them
+        // that are mutually recursive, so we must error and suggest implementing the right requirement.
+        auto ownedRequirement = C.getExecutorDecl()->getExecutorOwnedEnqueueFunction();
+        nominal->diagnose(diag::type_does_not_conform, nominalTy, proto->getDeclaredInterfaceType());
+        ownedRequirement->diagnose(diag::no_witnesses,
+                                   getProtocolRequirementKind(ownedRequirement),
+                                   ownedRequirement->getName(),
+                                   proto->getDeclaredInterfaceType(),
+                                   /*AddFixIt=*/true);
+      }
+    }
+  }
+}
+
+/// Determine whether this is the main actor type.
+static bool isMainActor(Type type) {
+  if (auto nominal = type->getAnyNominal())
+    return nominal->isMainActor();
 
   return false;
 }
@@ -1905,6 +2006,10 @@ namespace {
     bool shouldWalkCaptureInitializerExpressions() override { return true; }
 
     bool shouldWalkIntoTapExpression() override { return true; }
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
 
     PreWalkAction walkToDeclPre(Decl *decl) override {
       if (auto func = dyn_cast<AbstractFunctionDecl>(decl)) {

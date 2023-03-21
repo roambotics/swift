@@ -2,6 +2,7 @@
 // RUN: %target-swift-frontend -emit-sil -O -g %s | %FileCheck %s
 
 // REQUIRES: swift_in_compiler
+// XFAIL: OS=linux
 
 // Issue #58660: Specifically-shaped differentiable functions yield "conflicting debug info for argument" assertion failure
 // Ensure that proper location is preserved after sil-mem2reg location-less stores (created during inlining)
@@ -45,7 +46,7 @@ struct MyModel: Differentiable {
   mutating func member4() {
 // CHECK-LABEL: // pullback of MyModel.member4()
 // CHECK-NOT: debug_value %{{.*}} : $MyModel.TangentVector, var, name %{{.*}}, argno 1, implicit, scope
-// CHECK: bb0(%{{.*}} : $(predecessor: _AD__$s4main7MyModelV7member4yyF_bb3__Pred__src_0_wrt_0)):
+// CHECK: bb0(%{{.*}} : $_AD__$s4main7MyModelV7member4yyF_bb3__Pred__src_0_wrt_0):
 // CHECK: debug_value %{{.*}} : $MyModel.TangentVector, var, name "derivative of 'self' in scope at {{.*}} (scope #1)", implicit, scope
     // Must be a differentiable type.
     var localVar: Float = 0

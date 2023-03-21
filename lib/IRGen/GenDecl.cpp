@@ -540,11 +540,6 @@ void IRGenModule::emitSourceFile(SourceFile &SF) {
     #define BACK_DEPLOYMENT_LIB(Version, Filter, LibraryName)         \
       addBackDeployLib(llvm::VersionTuple Version, LibraryName);
     #include "swift/Frontend/BackDeploymentLibs.def"
-
-    if (IRGen.Opts.AutolinkRuntimeCompatibilityBytecodeLayoutsLibrary)
-      this->addLinkLibrary(LinkLibrary("swiftCompatibilityBytecodeLayouts",
-                                       LibraryKind::Library,
-                                       /*forceLoad*/ true));
   }
 }
 
@@ -661,6 +656,14 @@ emitGlobalList(IRGenModule &IGM, ArrayRef<llvm::WeakTrackingVH> handles,
 
 void IRGenModule::emitRuntimeRegistration() {
   // Duck out early if we have nothing to register.
+  // Note that we don't consider `RuntimeResolvableTypes2` here because the
+  // current Swift runtime is unable to handle move-only types at runtime, and
+  // we only use this runtime registration path in JIT mode, so there are no
+  // ABI forward compatibility concerns.
+  //
+  // We should incorporate the types from
+  // `RuntimeResolvableTypes2` into the list of types to register when we do
+  // have runtime support in place.
   if (SwiftProtocols.empty() && ProtocolConformances.empty() &&
       RuntimeResolvableTypes.empty() &&
       (!ObjCInterop || (ObjCProtocols.empty() && ObjCClasses.empty() &&
@@ -898,6 +901,8 @@ IRGenModule::getAddrOfContextDescriptorForParent(DeclContext *parent,
             ConstantReference::Direct};
   }
       
+  case DeclContextKind::Package:
+    assert(false && "package decl context kind should not have been reached");
   case DeclContextKind::FileUnit:
   case DeclContextKind::MacroDecl:
     parent = parent->getParentModule();
@@ -1036,7 +1041,16 @@ void IRGenModule::addObjCClassStub(llvm::Constant *classPtr) {
 
 void IRGenModule::addRuntimeResolvableType(GenericTypeDecl *type) {
   // Collect the nominal type records we emit into a special section.
-  RuntimeResolvableTypes.push_back(type);
+  if (type->isMoveOnly()) {
+    // Older runtimes should not be allowed to discover noncopyable types, since
+    // they will try to expose them dynamically as copyable types. Record
+    // noncopyable type descriptors in a separate vector so that future
+    // noncopyable-type-aware runtimes and reflection libraries can still find
+    // them.
+    RuntimeResolvableTypes2.push_back(type);
+  } else {
+    RuntimeResolvableTypes.push_back(type);
+  }
 
   if (auto nominal = dyn_cast<NominalTypeDecl>(type)) {
     // As soon as the type metadata is available, all the type's conformances
@@ -2434,32 +2448,19 @@ swift::irgen::createLinkerDirectiveVariable(IRGenModule &IGM, StringRef name) {
 }
 
 void swift::irgen::disableAddressSanitizer(IRGenModule &IGM, llvm::GlobalVariable *var) {
-  // Add an operand to llvm.asan.globals denylisting this global variable.
-  llvm::Metadata *metadata[] = {
-    // The global variable to denylist.
-    llvm::ConstantAsMetadata::get(var),
-    
-    // Source location. Optional, unnecessary here.
-    nullptr,
-    
-    // Name. Optional, unnecessary here.
-    nullptr,
-    
-    // Whether the global is dynamically initialized.
-    llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
-      llvm::Type::getInt1Ty(IGM.Module.getContext()), false)),
-    
-    // Whether the global is denylisted.
-    llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
-      llvm::Type::getInt1Ty(IGM.Module.getContext()), true))};
-  
-  auto *globalNode = llvm::MDNode::get(IGM.Module.getContext(), metadata);
-  auto *asanMetadata = IGM.Module.getOrInsertNamedMetadata("llvm.asan.globals");
-  asanMetadata->addOperand(globalNode);
+  llvm::GlobalVariable::SanitizerMetadata Meta;
+  if (var->hasSanitizerMetadata())
+    Meta = var->getSanitizerMetadata();
+  Meta.IsDynInit = false;
+  Meta.NoAddress = true;
+  var->setSanitizerMetadata(Meta);
 }
 
 /// Emit a global declaration.
 void IRGenModule::emitGlobalDecl(Decl *D) {
+  D->visitAuxiliaryDecls([&](Decl *decl) {
+    emitGlobalDecl(decl);
+  });
   switch (D->getKind()) {
   case DeclKind::Extension:
     return emitExtension(cast<ExtensionDecl>(D));
@@ -2545,8 +2546,7 @@ void IRGenModule::emitGlobalDecl(Decl *D) {
     return;
 
   case DeclKind::MacroExpansion:
-    for (auto *rewritten : cast<MacroExpansionDecl>(D)->getRewritten())
-      emitGlobalDecl(rewritten);
+    // Expansion already visited as auxiliary decls.
     return;
   }
 
@@ -3252,10 +3252,33 @@ llvm::Constant *swift::irgen::emitCXXConstructorThunkIfNeeded(
     Args.push_back(arg);
   }
 
-  subIGF.Builder.CreateCall(ctorFnType, ctorAddress, Args);
+  auto *call =
+      emitCXXConstructorCall(subIGF, ctor, ctorFnType, ctorAddress, Args);
+  if (isa<llvm::InvokeInst>(call))
+    IGM.emittedForeignFunctionThunksWithExceptionTraps.insert(thunk);
   subIGF.Builder.CreateRetVoid();
 
   return thunk;
+}
+
+llvm::CallBase *swift::irgen::emitCXXConstructorCall(
+    IRGenFunction &IGF, const clang::CXXConstructorDecl *ctor,
+    llvm::FunctionType *ctorFnType, llvm::Constant *ctorAddress,
+    llvm::ArrayRef<llvm::Value *> args) {
+  bool canThrow = IGF.IGM.isForeignExceptionHandlingEnabled();
+  if (auto *fpt = ctor->getType()->getAs<clang::FunctionProtoType>()) {
+    if (fpt->isNothrow())
+      canThrow = false;
+  }
+  if (!canThrow)
+    return IGF.Builder.CreateCall(ctorFnType, ctorAddress, args);
+  llvm::CallBase *result;
+  IGF.createExceptionTrapScope([&](llvm::BasicBlock *invokeNormalDest,
+                                   llvm::BasicBlock *invokeUnwindDest) {
+    result = IGF.Builder.createInvoke(ctorFnType, ctorAddress, args,
+                                      invokeNormalDest, invokeUnwindDest);
+  });
+  return result;
 }
 
 StackProtectorMode IRGenModule::shouldEmitStackProtector(SILFunction *f) {
@@ -3289,10 +3312,12 @@ llvm::Function *IRGenModule::getAddrOfSILFunction(
   // This might generate new functions, so we should do it before computing
   // the insert-before point.
   llvm::Constant *clangAddr = nullptr;
+  bool isObjCDirect = false;
   if (auto clangDecl = f->getClangDecl()) {
     // If we have an Objective-C Clang declaration, it must be a direct
     // method and we want to generate the IR declaration ourselves.
     if (auto objcDecl = dyn_cast<clang::ObjCMethodDecl>(clangDecl)) {
+      isObjCDirect = true; 
       assert(objcDecl->isDirectMethod());
     } else {
       auto globalDecl = getClangGlobalDeclForFunction(clangDecl);
@@ -3365,7 +3390,7 @@ llvm::Function *IRGenModule::getAddrOfSILFunction(
   }
   auto fpKind = irgen::classifyFunctionPointerKind(f);
   Signature signature =
-      getSignature(f->getLoweredFunctionType(), fpKind);
+      getSignature(f->getLoweredFunctionType(), fpKind, isObjCDirect);
   addLLVMFunctionAttributes(f, signature);
 
   fn = createFunction(*this, link, signature, insertBefore,
@@ -4194,21 +4219,26 @@ llvm::Constant *IRGenModule::emitProtocolConformances(bool asContiguousArray) {
 /// otherwise the descriptors are emitted as individual globals and nullptr is
 /// returned).
 llvm::Constant *IRGenModule::emitTypeMetadataRecords(bool asContiguousArray) {
-  if (RuntimeResolvableTypes.empty())
+  if (RuntimeResolvableTypes.empty()
+      && RuntimeResolvableTypes2.empty())
     return nullptr;
 
   std::string sectionName;
+  std::string section2Name;
   switch (TargetInfo.OutputObjectFormat) {
   case llvm::Triple::MachO:
     sectionName = "__TEXT, __swift5_types, regular";
+    section2Name = "__TEXT, __swift5_types2, regular";
     break;
   case llvm::Triple::ELF:
   case llvm::Triple::Wasm:
     sectionName = "swift5_type_metadata";
+    section2Name = "swift5_type_metadata_2";
     break;
   case llvm::Triple::XCOFF:
   case llvm::Triple::COFF:
     sectionName = ".sw5tymd$B";
+    section2Name = ".sw5tym2$B";
     break;
   case llvm::Triple::DXContainer:
   case llvm::Triple::GOFF:
@@ -4268,39 +4298,50 @@ llvm::Constant *IRGenModule::emitTypeMetadataRecords(bool asContiguousArray) {
   }
 
   // In non-JIT mode, emit the type records as individual globals.
-  for (auto type : RuntimeResolvableTypes) {
-    auto ref = getTypeEntityReference(type);
 
-    std::string recordMangledName;
-    if (auto opaque = dyn_cast<OpaqueTypeDecl>(type)) {
-      recordMangledName =
-          LinkEntity::forOpaqueTypeDescriptorRecord(opaque).mangleAsString();
-    } else if (auto nominal = dyn_cast<NominalTypeDecl>(type)) {
-      recordMangledName =
-          LinkEntity::forNominalTypeDescriptorRecord(nominal).mangleAsString();
-    } else {
-      llvm_unreachable("bad type in RuntimeResolvableTypes");
+  auto generateGlobalTypeList = [&](ArrayRef<GenericTypeDecl *> typesList,
+                                    StringRef section) {
+    if (typesList.empty()) {
+      return;
     }
+                                    
+    for (auto type : typesList) {
+      auto ref = getTypeEntityReference(type);
 
-    auto var = new llvm::GlobalVariable(
-        Module, TypeMetadataRecordTy, /*isConstant*/ true,
-        llvm::GlobalValue::PrivateLinkage, /*initializer*/ nullptr,
-        recordMangledName);
+      std::string recordMangledName;
+      if (auto opaque = dyn_cast<OpaqueTypeDecl>(type)) {
+        recordMangledName =
+            LinkEntity::forOpaqueTypeDescriptorRecord(opaque).mangleAsString();
+      } else if (auto nominal = dyn_cast<NominalTypeDecl>(type)) {
+        recordMangledName =
+            LinkEntity::forNominalTypeDescriptorRecord(nominal).mangleAsString();
+      } else {
+        llvm_unreachable("bad type in RuntimeResolvableTypes");
+      }
 
-    auto record = generateRecord(ref, var, {0});
-    var->setInitializer(record);
+      auto var = new llvm::GlobalVariable(
+          Module, TypeMetadataRecordTy, /*isConstant*/ true,
+          llvm::GlobalValue::PrivateLinkage, /*initializer*/ nullptr,
+          recordMangledName);
 
-    var->setSection(sectionName);
-    var->setAlignment(llvm::MaybeAlign(4));
-    disableAddressSanitizer(*this, var);
-    addUsedGlobal(var);
+      auto record = generateRecord(ref, var, {0});
+      var->setInitializer(record);
 
-    if (IRGen.Opts.ConditionalRuntimeRecords) {
-      // Allow dead-stripping `var` (the type record) when the type (`ref`) is
-      // not referenced.
-      appendLLVMUsedConditionalEntry(var, ref.getValue());
+      var->setSection(section);
+      var->setAlignment(llvm::MaybeAlign(4));
+      disableAddressSanitizer(*this, var);
+      addUsedGlobal(var);
+
+      if (IRGen.Opts.ConditionalRuntimeRecords) {
+        // Allow dead-stripping `var` (the type record) when the type (`ref`) is
+        // not referenced.
+        appendLLVMUsedConditionalEntry(var, ref.getValue());
+      }
     }
-  }
+  };
+
+  generateGlobalTypeList(RuntimeResolvableTypes, sectionName);
+  generateGlobalTypeList(RuntimeResolvableTypes2, section2Name);
 
   return nullptr;
 }
@@ -4940,6 +4981,10 @@ llvm::GlobalValue *IRGenModule::defineTypeMetadata(
     if (isa<ClassDecl>(nominal)) {
       adjustmentIndex = MetadataAdjustmentIndex::Class;
     }
+
+    if (concreteType->is<TupleType>()) {
+      adjustmentIndex = MetadataAdjustmentIndex::NoTypeLayoutString;
+    }
   }
 
   llvm::Constant *indices[] = {
@@ -4982,8 +5027,10 @@ IRGenModule::getAddrOfTypeMetadata(CanType concreteType,
 
   llvm::Type *defaultVarTy;
   unsigned adjustmentIndex;
-
-  if (fullMetadata) {
+  if (concreteType->isAny() || concreteType->isAnyObject() || concreteType->isVoid() || concreteType->is<TupleType>() || concreteType->is<BuiltinType>()) {
+    defaultVarTy = FullExistentialTypeMetadataStructTy;
+    adjustmentIndex = MetadataAdjustmentIndex::NoTypeLayoutString;
+  } else if (fullMetadata) {
     defaultVarTy = FullTypeMetadataStructTy;
     if (concreteType->getClassOrBoundGenericClass() && !foreign) {
       adjustmentIndex = MetadataAdjustmentIndex::Class;
@@ -5440,6 +5487,9 @@ Address IRGenModule::getAddrOfEnumCase(EnumElementDecl *Case,
 
 void IRGenModule::emitNestedTypeDecls(DeclRange members) {
   for (Decl *member : members) {
+    member->visitAuxiliaryDecls([&](Decl *decl) {
+      emitNestedTypeDecls({decl, nullptr});
+    });
     switch (member->getKind()) {
     case DeclKind::Import:
     case DeclKind::TopLevelCode:
@@ -5500,8 +5550,7 @@ void IRGenModule::emitNestedTypeDecls(DeclRange members) {
       emitClassDecl(cast<ClassDecl>(member));
       continue;
     case DeclKind::MacroExpansion:
-      for (auto *decl : cast<MacroExpansionDecl>(member)->getRewritten())
-        emitNestedTypeDecls({decl, nullptr});
+      // Expansion already visited as auxiliary decls.
       continue;
     }
   }
@@ -5675,7 +5724,7 @@ llvm::Constant *IRGenModule::getAddrOfGlobalUTF16String(StringRef utf8) {
 
 /// Can not treat a treat the layout of a class as resilient if the current
 ///    class is defined in an external module and
-///    not publically accessible (e.g private or internal).
+///    not publicly accessible (e.g private or internal).
 /// This would normally not happen except if we compile theClass's module with
 /// enable-testing.
 /// Do we have to use resilient access patterns when working with this
@@ -5951,6 +6000,27 @@ IRGenModule::getOrCreateHelperFunction(StringRef fnName, llvm::Type *resultTy,
   return fn;
 }
 
+void IRGenModule::setColocateTypeDescriptorSection(llvm::GlobalVariable *v) {
+  switch (TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::MachO:
+    if (IRGen.Opts.ColocateTypeDescriptors)
+      v->setSection("__TEXT,__constg_swiftt");
+    else
+      setTrueConstGlobal(v);
+    break;
+  case llvm::Triple::DXContainer:
+  case llvm::Triple::GOFF:
+  case llvm::Triple::SPIRV:
+  case llvm::Triple::UnknownObjectFormat:
+  case llvm::Triple::Wasm:
+  case llvm::Triple::ELF:
+  case llvm::Triple::XCOFF:
+  case llvm::Triple::COFF:
+    setTrueConstGlobal(v);
+    break;
+  }
+
+}
 void IRGenModule::setColocateMetadataSection(llvm::Function *f) {
   if (!IRGen.Opts.CollocatedMetadataFunctions)
     return;

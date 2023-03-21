@@ -91,7 +91,7 @@ SILGenModule::~SILGenModule() {
       f.setLinkage(SILLinkage::PublicExternal);
   }
 
-  M.verify();
+  M.verifyIncompleteOSSA();
 }
 
 static SILDeclRef
@@ -1223,7 +1223,7 @@ void SILGenModule::postEmitFunction(SILDeclRef constant,
   assert(!F->isExternalDeclaration() && "did not emit any function body?!");
   LLVM_DEBUG(llvm::dbgs() << "lowered sil:\n";
              F->print(llvm::dbgs()));
-  F->verify();
+  F->verifyIncompleteOSSA();
 
   emitDifferentiabilityWitnessesForFunction(constant, F);
 }
@@ -1405,7 +1405,7 @@ void SILGenModule::emitAbstractFuncDecl(AbstractFunctionDecl *AFD) {
                            getFunction(thunk, ForDefinition));
   }
 
-  if (AFD->isBackDeployed()) {
+  if (AFD->isBackDeployed(M.getASTContext())) {
     // Emit the fallback function that will be used when the original function
     // is unavailable at runtime.
     auto fallback = SILDeclRef(AFD).asBackDeploymentKind(
@@ -1673,7 +1673,7 @@ SILFunction *SILGenModule::emitLazyGlobalInitializer(StringRef funcName,
   auto dc = binding->getDeclContext();
   SILGenFunction(*this, *f, dc).emitLazyGlobalInitializer(binding, pbdEntry);
   emitLazyConformancesForFunction(f);
-  f->verify();
+  f->verifyIncompleteOSSA();
 
   return f;
 }
@@ -1792,8 +1792,7 @@ void SILGenModule::visitMacroDecl(MacroDecl *d) {
 }
 
 void SILGenModule::visitMacroExpansionDecl(MacroExpansionDecl *d) {
-  // Expanded declaration macros were already added to the parent decl context
-  // for name lookup to work. Nothing to be done here.
+  // Expansion already visited as auxiliary decls.
 }
 
 bool
@@ -2170,7 +2169,7 @@ public:
 
       LLVM_DEBUG(llvm::dbgs() << "lowered toplevel sil:\n";
                  toplevel->print(llvm::dbgs()));
-      toplevel->verify();
+      toplevel->verifyIncompleteOSSA();
       sgm.emitLazyConformancesForFunction(toplevel);
     }
   }
@@ -2188,6 +2187,13 @@ public:
 
     SourceFileScope scope(SGM, sf);
     for (auto *D : sf->getTopLevelDecls()) {
+      // Emit auxiliary decls.
+      D->visitAuxiliaryDecls([&](Decl *auxiliaryDecl) {
+        FrontendStatsTracer StatsTracer(SGM.getASTContext().Stats,
+                                        "SILgen-decl", auxiliaryDecl);
+        SGM.visit(auxiliaryDecl);
+      });
+
       FrontendStatsTracer StatsTracer(SGM.getASTContext().Stats,
                                       "SILgen-decl", D);
       SGM.visit(D);

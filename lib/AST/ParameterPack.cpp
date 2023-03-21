@@ -86,6 +86,14 @@ bool GenericTypeParamType::isParameterPack() const {
          GenericTypeParamType::TYPE_SEQUENCE_BIT;
 }
 
+PackType *TypeBase::getPackSubstitutionAsPackType() {
+  if (auto pack = getAs<PackType>()) {
+    return pack;
+  } else {
+    return PackType::getSingletonPackExpansion(this);
+  }
+}
+
 /// G<{X1, ..., Xn}, {Y1, ..., Yn}>... => {G<X1, Y1>, ..., G<Xn, Yn>}...
 PackExpansionType *PackExpansionType::expand() {
   auto countType = getCountType();
@@ -157,8 +165,17 @@ bool TupleType::containsPackExpansionType() const {
   return false;
 }
 
+bool CanTupleType::containsPackExpansionTypeImpl(CanTupleType tuple) {
+  for (auto eltType : tuple.getElementTypes()) {
+    if (isa<PackExpansionType>(eltType))
+      return true;
+  }
+
+  return false;
+}
+
 /// (W, {X, Y}..., Z) => (W, X, Y, Z)
-TupleType *TupleType::flattenPackTypes() {
+Type TupleType::flattenPackTypes() {
   bool anyChanged = false;
   SmallVector<TupleTypeElt, 4> elts;
 
@@ -192,6 +209,15 @@ TupleType *TupleType::flattenPackTypes() {
 
   if (!anyChanged)
     return this;
+
+  // If pack substitution yields a single-element tuple, the tuple
+  // structure is flattened to produce the element type.
+  if (elts.size() == 1) {
+    auto type = elts.front().getType();
+    if (!type->is<PackExpansionType>() && !type->is<TypeVariableType>()) {
+      return type;
+    }
+  }
 
   return TupleType::get(elts, getASTContext());
 }
@@ -340,6 +366,11 @@ CanType TypeBase::getReducedShape() {
   if (auto *expansionType = getAs<PackExpansionType>())
     return expansionType->getReducedShape();
 
+  if (auto *silPackType = getAs<SILPackType>()) {
+    auto can = cast<SILPackType>(silPackType->getCanonicalType());
+    return can->getReducedShape();
+  }
+
   SmallVector<Type, 2> rootParameterPacks;
   getTypeParameterPacks(rootParameterPacks);
 
@@ -429,10 +460,13 @@ PackType *PackType::get(const ASTContext &C,
   return get(C, wrappedArgs)->flattenPackTypes();
 }
 
-CanPackType PackArchetypeType::getSingletonPackType() {
-  SmallVector<Type, 1> types;
-  types.push_back(PackExpansionType::get(this, getReducedShape()));
-  return CanPackType(PackType::get(getASTContext(), types));
+PackType *PackType::getSingletonPackExpansion(Type param) {
+  assert(param->isParameterPack() || param->is<PackArchetypeType>());
+  return get(param->getASTContext(), {PackExpansionType::get(param, param)});
+}
+
+CanPackType CanPackType::getSingletonPackExpansion(CanType param) {
+  return CanPackType(PackType::getSingletonPackExpansion(param));
 }
 
 bool SILPackType::containsPackExpansionType() const {
@@ -442,4 +476,78 @@ bool SILPackType::containsPackExpansionType() const {
   }
 
   return false;
+}
+
+CanPackType
+CanTupleType::getInducedPackTypeImpl(CanTupleType tuple) {
+  return getInducedPackTypeImpl(tuple, 0, tuple->getNumElements());
+}
+
+CanPackType
+CanTupleType::getInducedPackTypeImpl(CanTupleType tuple, unsigned start, unsigned count) {
+  assert(start + count <= tuple->getNumElements() && "range out of range");
+  auto &ctx = tuple->getASTContext();
+  return CanPackType::get(ctx, tuple.getElementTypes().slice(start, count));
+}
+
+static CanType getApproximateFormalElementType(const ASTContext &ctx,
+                                               CanType loweredEltType) {
+  CanType formalEltType = TupleType::getEmpty(ctx);
+  if (auto expansion = dyn_cast<PackExpansionType>(loweredEltType))
+    formalEltType = CanPackExpansionType::get(formalEltType,
+                                              expansion.getCountType());
+  return formalEltType;
+}
+
+template <class Collection>
+static CanPackType getApproximateFormalPackType(const ASTContext &ctx,
+                                                Collection loweredEltTypes) {
+  // Build an array of formal element types, but be lazy about it:
+  // use the original array unless we see an element type that doesn't
+  // work as a legal format type.
+  Optional<SmallVector<CanType, 4>> formalEltTypes;
+  for (auto i : indices(loweredEltTypes)) {
+    auto loweredEltType = loweredEltTypes[i];
+    bool isLegal = loweredEltType->isLegalFormalType();
+
+    // If the type isn't legal as a formal type, substitute the empty
+    // tuple type (or an invariant expansion of it over the count type).
+    CanType formalEltType = loweredEltType;
+    if (!isLegal) {
+      formalEltType = getApproximateFormalElementType(ctx, loweredEltType);
+    }
+
+    // If we're already building an array, unconditionally append to it.
+    // Otherwise, if the type isn't legal, build the array up to this
+    // point and then append.  Otherwise, we're still being lazy.
+    if (formalEltTypes) {
+      formalEltTypes->push_back(formalEltType);
+    } else if (!isLegal) {
+      formalEltTypes.emplace();
+      formalEltTypes->reserve(loweredEltTypes.size());
+      formalEltTypes->append(loweredEltTypes.begin(),
+                             loweredEltTypes.begin() + i);
+      formalEltTypes->push_back(formalEltType);
+    }
+
+    assert(isLegal || formalEltTypes.hasValue());
+  }
+
+  // Use the array we built if we made one (if we ever saw a non-legal
+  // element type).
+  if (formalEltTypes) {
+    return CanPackType::get(ctx, *formalEltTypes);
+  } else {
+    return CanPackType::get(ctx, loweredEltTypes);
+  }
+}
+
+CanPackType SILPackType::getApproximateFormalPackType() const {
+  return ::getApproximateFormalPackType(getASTContext(), getElementTypes());
+}
+
+CanPackType
+CanTupleType::getInducedApproximateFormalPackTypeImpl(CanTupleType tuple) {
+  return ::getApproximateFormalPackType(tuple->getASTContext(),
+                                        tuple.getElementTypes());
 }

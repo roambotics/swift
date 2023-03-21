@@ -205,6 +205,7 @@ void SILFunction::init(
   this->ExactSelfClass = isExactSelfClass;
   this->IsDistributed = isDistributed;
   this->IsRuntimeAccessible = isRuntimeAccessible;
+  this->ForceEnableLexicalLifetimes = DoNotForceEnableLexicalLifetimes;
   this->stackProtection = false;
   this->Inlined = false;
   this->Zombie = false;
@@ -469,6 +470,16 @@ SILFunction::getLoweredType(AbstractionPattern orig, Type subst) const {
 
 SILType SILFunction::getLoweredType(Type t) const {
   return getModule().Types.getLoweredType(t, TypeExpansionContext(*this));
+}
+
+CanType
+SILFunction::getLoweredRValueType(AbstractionPattern orig, Type subst) const {
+  return getModule().Types.getLoweredRValueType(TypeExpansionContext(*this),
+                                                orig, subst);
+}
+
+CanType SILFunction::getLoweredRValueType(Type t) const {
+  return getModule().Types.getLoweredRValueType(TypeExpansionContext(*this), t);
 }
 
 SILType SILFunction::getLoweredLoadableType(Type t) const {

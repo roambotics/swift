@@ -252,10 +252,10 @@ static void reportSemanticAnnotations(const SourceTextInfo &IFaceInfo,
     bool IsSystem;
     if (Ref.Mod) {
       Kind = SwiftLangSupport::getUIDForModuleRef();
-      IsSystem = Ref.Mod.isSystemModule();
+      IsSystem = Ref.Mod.isNonUserModule();
     } else if (Ref.Dcl) {
       Kind = SwiftLangSupport::getUIDForDecl(Ref.Dcl, /*IsRef=*/true);
-      IsSystem = Ref.Dcl->getModuleContext()->isSystemModule();
+      IsSystem = Ref.Dcl->getModuleContext()->isNonUserModule();
     }
     if (Kind.isInvalid())
       continue;
@@ -290,6 +290,11 @@ static bool getModuleInterfaceInfo(ASTContext &Ctx,
 
   PrintOptions Options = PrintOptions::printModuleInterface(
       Ctx.TypeCheckerOpts.PrintFullConvention);
+  if (Mod->findUnderlyingClangModule()) {
+    // Show unavailable C++ APIs.
+    if (Ctx.LangOpts.EnableCXXInterop)
+      Options.SkipUnavailable = false;
+  }
   ModuleTraversalOptions TraversalOptions = None; // Don't print submodules.
   SmallString<128> Text;
   llvm::raw_svector_ostream OS(Text);
@@ -505,7 +510,7 @@ bool SwiftInterfaceGenContext::matches(StringRef ModuleName,
   if (Invok.getSDKPath() != Impl.Invocation.getSDKPath())
     return false;
 
-  if (Impl.Mod->isSystemModule())
+  if (Impl.Mod->isNonUserModule())
     return true;
 
   const SearchPathOptions &SPOpts = Invok.getSearchPathOptions();
@@ -694,8 +699,26 @@ void SwiftLangSupport::editorOpenInterface(EditorConsumer &Consumer,
                                                       SynthesizedExtensions,
                                                       InterestedUSR);
   if (!IFaceGenRef) {
-    Consumer.handleRequestError(ErrMsg.c_str());
-    return;
+      // Retry to generate a module interface with C++ interop enabled,
+      // if the first attempt failed.
+      bool retryWithCxxEnabled = true;
+      for (const auto &arg: Args) {
+          if (StringRef(arg).startswith("-cxx-interoperability-mode=") ||
+              StringRef(arg).startswith("-enable-experimental-cxx-interop")) {
+              retryWithCxxEnabled = false;
+              break;
+          }
+      }
+      if (retryWithCxxEnabled) {
+          std::vector<const char *> AdjustedArgs(Args.begin(), Args.end());
+          AdjustedArgs.push_back("-cxx-interoperability-mode=swift-5.9");
+          return editorOpenInterface(Consumer, Name, ModuleName, Group, AdjustedArgs,
+                                     SynthesizedExtensions, InterestedUSR);
+      }
+      else {
+          Consumer.handleRequestError(ErrMsg.c_str());
+          return;
+      }
   }
 
   IFaceGenRef->reportEditorInfo(Consumer);

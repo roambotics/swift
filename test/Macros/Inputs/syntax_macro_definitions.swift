@@ -68,6 +68,19 @@ public struct StringifyMacro: ExpressionMacro {
   }
 }
 
+public struct StringifyAndTryMacro: ExpressionMacro {
+  public static func expansion(
+    of macro: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    guard let argument = macro.argumentList.first?.expression else {
+      fatalError("boom")
+    }
+
+    return "(try \(argument), \(StringLiteralExprSyntax(content: argument.description)))"
+  }
+}
+
 struct SimpleDiagnosticMessage: DiagnosticMessage {
   let message: String
   let diagnosticID: MessageID
@@ -214,8 +227,8 @@ public struct DefineBitwidthNumberedStructsMacro: DeclarationMacro {
         """
 
         struct \(raw: prefix) {
-          func \(context.createUniqueName("method"))() { return 0 }
-          func \(context.createUniqueName("method"))() { return 1 }
+          func \(context.makeUniqueName("method"))() { return 0 }
+          func \(context.makeUniqueName("method"))() { return 1 }
         }
         """
       ]
@@ -225,8 +238,8 @@ public struct DefineBitwidthNumberedStructsMacro: DeclarationMacro {
       """
 
       struct \(raw: prefix)\(raw: String(bitwidth)) {
-        func \(context.createUniqueName("method"))() { }
-        func \(context.createUniqueName("method"))() { }
+        func \(context.makeUniqueName("method"))() { }
+        func \(context.makeUniqueName("method"))() { }
       }
       """
     }
@@ -242,15 +255,15 @@ public struct DefineDeclsWithKnownNamesMacro: DeclarationMacro {
       """
 
       struct A {
-        func \(context.createUniqueName("method"))() { }
-        func \(context.createUniqueName("method"))() { }
+        func \(context.makeUniqueName("method"))() { }
+        func \(context.makeUniqueName("method"))() { }
       }
       """,
       """
 
       struct B {
-        func \(context.createUniqueName("method"))() { }
-        func \(context.createUniqueName("method"))() { }
+        func \(context.makeUniqueName("method"))() { }
+        func \(context.makeUniqueName("method"))() { }
       }
       """,
       """
@@ -443,6 +456,8 @@ public struct AddMembers: MemberMacro {
     providingMembersOf decl: some DeclGroupSyntax,
     in context: some MacroExpansionContext
   ) throws -> [DeclSyntax] {
+    let uniqueClassName = context.createUniqueName("uniqueClass")
+
     let storageStruct: DeclSyntax =
       """
       struct Storage {}
@@ -468,7 +483,12 @@ public struct AddMembers: MemberMacro {
 
     let initDecl: DeclSyntax =
       """
-      init() {}
+      init() { _ = \(uniqueClassName)() }
+      """
+
+    let classDecl: DeclSyntax =
+      """
+      class \(uniqueClassName) { }
       """
 
     return [
@@ -477,6 +497,26 @@ public struct AddMembers: MemberMacro {
       instanceMethod,
       staticMethod,
       initDecl,
+      classDecl,
+    ]
+  }
+}
+
+public struct AddArbitraryMembers: MemberMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingMembersOf decl: some DeclGroupSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    guard let identified = decl.asProtocol(IdentifiedDeclSyntax.self) else {
+      return []
+    }
+
+    let parentName = identified.identifier.trimmed
+    return [
+      "struct \(parentName)1 {}",
+      "struct \(parentName)2 {}",
+      "struct \(parentName)3 {}",
     ]
   }
 }
@@ -608,6 +648,246 @@ public enum LeftHandOperandFinderMacro: ExpressionMacro {
     visitor.walk(node)
 
     return node.argumentList.first!.expression
+  }
+}
+
+public struct AddCompletionHandler: PeerMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingPeersOf declaration: some DeclSyntaxProtocol,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    // Only on functions at the moment. We could handle initializers as well
+    // with a bit of work.
+    guard let funcDecl = declaration.as(FunctionDeclSyntax.self) else {
+      throw CustomError.message("@addCompletionHandler only works on functions")
+    }
+
+    // This only makes sense for async functions.
+    if funcDecl.signature.effectSpecifiers?.asyncSpecifier == nil {
+      throw CustomError.message(
+        "@addCompletionHandler requires an async function"
+      )
+    }
+
+    // Form the completion handler parameter.
+    let resultType: TypeSyntax? = funcDecl.signature.output?.returnType.with(\.leadingTrivia, []).with(\.trailingTrivia, [])
+
+    let completionHandlerParam =
+      FunctionParameterSyntax(
+        firstName: .identifier("completionHandler"),
+        colon: .colonToken(trailingTrivia: .space),
+        type: "@escaping (\(resultType ?? "")) -> Void" as TypeSyntax
+      )
+
+    // Add the completion handler parameter to the parameter list.
+    let parameterList = funcDecl.signature.input.parameterList
+    let newParameterList: FunctionParameterListSyntax
+    if let lastParam = parameterList.last {
+      // We need to add a trailing comma to the preceding list.
+      newParameterList = parameterList.removingLast()
+        .appending(
+          lastParam.with(
+            \.trailingComma,
+            .commaToken(trailingTrivia: .space)
+          )
+        )
+        .appending(completionHandlerParam)
+    } else {
+      newParameterList = parameterList.appending(completionHandlerParam)
+    }
+
+    let callArguments: [String] = try parameterList.map { param in
+      guard let argName = param.secondName ?? param.firstName else {
+        throw CustomError.message(
+          "@addCompletionHandler argument must have a name"
+        )
+      }
+
+      if let paramName = param.firstName, paramName.text != "_" {
+        return "\(paramName.text): \(argName.text)"
+      }
+
+      return "\(argName.text)"
+    }
+
+    let call: ExprSyntax =
+      "\(funcDecl.identifier)(\(raw: callArguments.joined(separator: ", ")))"
+
+    // FIXME: We should make CodeBlockSyntax ExpressibleByStringInterpolation,
+    // so that the full body could go here.
+    let newBody: ExprSyntax =
+      """
+
+        Task {
+          completionHandler(await \(call))
+        }
+
+      """
+
+    // Drop the @addCompletionHandler attribute from the new declaration.
+    let newAttributeList = AttributeListSyntax(
+      funcDecl.attributes?.filter {
+        guard case let .attribute(attribute) = $0,
+              let attributeType = attribute.attributeName.as(SimpleTypeIdentifierSyntax.self),
+              let nodeType = node.attributeName.as(SimpleTypeIdentifierSyntax.self)
+        else {
+          return true
+        }
+
+        return attributeType.name.text != nodeType.name.text
+      } ?? []
+    )
+
+    let newFunc =
+      funcDecl
+      .with(
+        \.signature,
+        funcDecl.signature
+          .with(
+            \.effectSpecifiers,
+            funcDecl.signature.effectSpecifiers?.with(\.asyncSpecifier, nil)  // drop async
+          )
+          .with(\.output, nil)  // drop result type
+          .with(
+            \.input,  // add completion handler parameter
+            funcDecl.signature.input.with(\.parameterList, newParameterList)
+              .with(\.trailingTrivia, [])
+          )
+      )
+      .with(
+        \.body,
+        CodeBlockSyntax(
+          leftBrace: .leftBraceToken(leadingTrivia: .space),
+          statements: CodeBlockItemListSyntax(
+            [CodeBlockItemSyntax(item: .expr(newBody))]
+          ),
+          rightBrace: .rightBraceToken(leadingTrivia: .newline)
+        )
+      )
+      .with(\.attributes, newAttributeList)
+      .with(\.leadingTrivia, .newlines(2))
+
+    return [DeclSyntax(newFunc)]
+  }
+}
+
+public struct InvalidMacro: PeerMacro, DeclarationMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingPeersOf declaration: some DeclSyntaxProtocol,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return [
+      "import Swift",
+      "precedencegroup MyPrecedence {}",
+      "@attached(member) macro myMacro()",
+      "extension Int {}",
+      """
+      @main
+      struct MyMain {
+        static func main() {}
+      }
+      """,
+      "typealias Array = Void",
+      "typealias Dictionary = Void",
+      "typealias BooleanLiteralType = Void",
+      "typealias ExtendedGraphemeClusterType = Void",
+      "typealias FloatLiteralType = Void",
+      "typealias IntegerLiteralType = Void",
+      "typealias StringLiteralType = Void",
+      "typealias UnicodeScalarType = Void",
+      "typealias _ColorLiteralType = Void",
+      "typealias _ImageLiteralType = Void",
+      "typealias _FileReferenceLiteralType = Void",
+    ]
+  }
+
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return [
+      "var value: Int"
+    ]
+  }
+}
+
+public struct WrapInType: PeerMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingPeersOf declaration: some DeclSyntaxProtocol,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    guard let funcDecl = declaration.as(FunctionDeclSyntax.self) else {
+      throw CustomError.message("@wrapInType only applies to functions")
+    }
+
+    // Build a new function with the same signature that forwards arguments
+    // to the the original function.
+    let parameterList = funcDecl.signature.input.parameterList
+    let callArguments: [String] = try parameterList.map { param in
+      guard let argName = param.secondName ?? param.firstName else {
+        throw CustomError.message("@wrapInType argument must have a name")
+      }
+
+      if let paramName = param.firstName, paramName.text != "_" {
+        return "\(paramName.text): \(argName.text)"
+      }
+
+      return "\(argName.text)"
+    }
+
+    let call: ExprSyntax =
+      """
+      \(funcDecl.identifier)(\(raw: callArguments.joined(separator: ", ")))
+      """
+
+    // Drop the peer macro attribute from the new declaration.
+    let newAttributeList = AttributeListSyntax(
+      funcDecl.attributes?.filter {
+        guard case let .attribute(attribute) = $0,
+              let attributeType = attribute.attributeName.as(SimpleTypeIdentifierSyntax.self),
+              let nodeType = node.attributeName.as(SimpleTypeIdentifierSyntax.self)
+        else {
+          return true
+        }
+
+        return attributeType.name.text != nodeType.name.text
+      } ?? []
+    )
+
+    let method =
+      funcDecl
+      .with(
+        \.identifier,
+         "\(context.makeUniqueName(funcDecl.identifier.text))"
+      )
+      .with(
+        \.signature,
+        funcDecl.signature
+      )
+      .with(
+        \.body,
+        CodeBlockSyntax(
+          leftBrace: .leftBraceToken(leadingTrivia: .space),
+          statements: CodeBlockItemListSyntax(
+            [CodeBlockItemSyntax(item: .expr(call))]
+          )
+          .with(\.leadingTrivia, [.newlines(1), .spaces(2)]),
+          rightBrace: .rightBraceToken(leadingTrivia: .newline)
+        )
+      )
+      .with(\.attributes, newAttributeList)
+
+    let structType: DeclSyntax =
+      """
+      struct \(context.makeUniqueName(funcDecl.identifier.text)) {
+        \(method)
+      }
+      """
+
+    return [structType]
   }
 }
 
@@ -800,6 +1080,136 @@ public struct NewTypeMacro: MemberMacro {
       "\(access)typealias RawValue = \(rawType)",
       "\(access)var rawValue: RawValue",
       "\(access)init(_ rawValue: RawValue) { self.rawValue = rawValue }",
+    ]
+  }
+}
+
+public struct EmptyMacro: MemberMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingMembersOf decl: some DeclGroupSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return []
+  }
+}
+
+public struct EquatableMacro: ConformanceMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingConformancesOf decl: some DeclGroupSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [(TypeSyntax, GenericWhereClauseSyntax?)] {
+    let protocolName: TypeSyntax = "Equatable"
+    return [(protocolName, nil)]
+  }
+}
+
+public struct HashableMacro: ConformanceMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingConformancesOf decl: some DeclGroupSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [(TypeSyntax, GenericWhereClauseSyntax?)] {
+    let protocolName: TypeSyntax = "Hashable"
+    return [(protocolName, nil)]
+  }
+}
+
+public struct DelegatedConformanceMacro: ConformanceMacro, MemberMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingConformancesOf decl: some DeclGroupSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [(TypeSyntax, GenericWhereClauseSyntax?)] {
+    let protocolName: TypeSyntax = "P"
+    let conformance: DeclSyntax =
+      """
+      extension Placeholder where Element: P {}
+      """
+
+    guard let extensionDecl = conformance.as(ExtensionDeclSyntax.self) else {
+      return []
+    }
+
+    return [(protocolName, extensionDecl.genericWhereClause)]
+  }
+
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingMembersOf decl: some DeclGroupSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    let requirement: DeclSyntax =
+      """
+      static func requirement() where Element : P {
+        Element.requirement()
+      }
+      """
+
+    return [requirement]
+  }
+}
+
+public struct ExtendableEnum: MemberMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingMembersOf declaration: some DeclGroupSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    let unknownDecl: DeclSyntax =
+    """
+    func unknown() -> Int { 34 } // or something like: `case unknown`
+    """
+    return [unknownDecl]
+  }
+}
+
+public struct DefineStructWithUnqualifiedLookupMacro: DeclarationMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return ["""
+    struct StructWithUnqualifiedLookup {
+      let hello = 1
+
+      func foo() -> Int {
+        hello + world // looks up "world" in the parent scope
+      }
+    }
+    """]
+  }
+}
+
+public struct DefineAnonymousTypesMacro: DeclarationMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    guard let body = node.trailingClosure else {
+      throw CustomError.message("#anonymousTypes macro requires a trailing closure")
+    }
+    return [
+      """
+
+      class \(context.createUniqueName("name")) {
+        func hello() -> String {
+          \(body.statements)
+        }
+      }
+      """,
+      """
+
+      enum \(context.createUniqueName("name")) {
+        case apple
+        case banana
+
+        func hello() -> String {
+          \(body.statements)
+        }
+      }
+      """
     ]
   }
 }

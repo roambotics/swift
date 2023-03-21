@@ -104,7 +104,7 @@ struct NestedStructWithClosureMember1 {
 struct StructWithClosureMemberAndLocal {
   var c = {
     var x = 0
-    #^DELAYED_10?check=WITH_GLOBAL_DECLS_AND_LOCAL1;xfail=https://github.com/apple/swift/issues/58273^#
+    #^DELAYED_10?check=WITH_GLOBAL_DECLS_AND_LOCAL1^#
   }
 }
 
@@ -416,3 +416,96 @@ func testClosureInPatternBindingInit() {
   // CLOSURE_IN_PATTERN_BINDING: End completion
 
 }
+
+func testSwitchInClosure() {
+  func executeClosure(closure: () -> Void) {}
+
+  struct Boredom {
+    static func doNothing() {}
+  }
+
+  enum MyEnum {
+    case first
+    case second
+  }
+
+  let item: MyEnum? = nil
+  executeClosure(closure: {
+    switch item {
+    case .#^SWITCH_IN_CLOSURE^#first:
+      break
+    case .second:
+      Boredom.doNothing()
+    }
+  })
+
+// SWITCH_IN_CLOSURE: Begin completions
+// SWITCH_IN_CLOSURE-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: first[#MyEnum#];
+// SWITCH_IN_CLOSURE-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: second[#MyEnum#];
+// SWITCH_IN_CLOSURE: End completions
+}
+
+func testSwitchWithAssociatedValueInClosure() {
+  func executeClosure(closure: () -> Void) {}
+
+  struct Boredom {
+    static func doNothing() {}
+  }
+
+  enum MyEnum {
+    case first(String)
+  }
+
+  let item: MyEnum? = nil
+  executeClosure(closure: {
+    switch item {
+    case .#^SWITCH_WITH_ASSOC_IN_CLOSURE^#first(_):
+      break
+    }
+  })
+
+// SWITCH_WITH_ASSOC_IN_CLOSURE: Begin completions
+// SWITCH_WITH_ASSOC_IN_CLOSURE-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: first({#String#})[#MyEnum#];
+// SWITCH_WITH_ASSOC_IN_CLOSURE: End completions
+}
+
+func testCompleteInMatchOfAssociatedValueInSwitchCase() {
+  func testSwitchWithAssociatedValueInClosure() {
+  func executeClosure(closure: () -> Void) {}
+
+  struct Boredom {
+    static func doNothing() {}
+  }
+
+  enum MyEnum {
+    case first(Bool, String)
+  }
+
+  let item: MyEnum? = nil
+  let str = "hi"
+  executeClosure(closure: {
+    switch item {
+    case .first(true, #^IN_ASSOC_OF_CASE_IN_CLOSURE^#str):
+      break
+    }
+  })
+
+// IN_ASSOC_OF_CASE_IN_CLOSURE: Begin completions
+// IN_ASSOC_OF_CASE_IN_CLOSURE-DAG: Decl[LocalVar]/Local:               str[#String#]; name=str
+// IN_ASSOC_OF_CASE_IN_CLOSURE: End completions
+}
+
+}
+
+func testReferenceToVariableDefinedInClosure() {
+  func takeClosure(_ x: () -> Void) {}
+
+  takeClosure {
+    let item = "\(1)"
+    #^VARIABLE_DEFINED_IN_CLOSURE^#
+  }
+  // VARIABLE_DEFINED_IN_CLOSURE: Begin completions
+  // VARIABLE_DEFINED_IN_CLOSURE: Decl[LocalVar]/Local:               item[#String#]; name=item
+  // VARIABLE_DEFINED_IN_CLOSURE: End completions
+}
+

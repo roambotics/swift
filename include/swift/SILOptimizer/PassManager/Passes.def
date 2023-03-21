@@ -439,9 +439,11 @@ PASS(BugReducerTester, "bug-reducer-tester",
 PASS(AssemblyVisionRemarkGenerator, "assembly-vision-remark-generator",
      "Emit assembly vision remarks that provide source level guidance of where runtime calls ended up")
 PASS(MoveOnlyObjectChecker, "sil-move-only-object-checker",
-     "Pass that enforces move only invariants on raw SIL for objects")
+     "Utility pass that enforces move only invariants on raw SIL for objects for testing purposes")
 PASS(MoveOnlyAddressChecker, "sil-move-only-address-checker",
-     "Pass that enforces move only invariants on raw SIL for addresses")
+     "Utility pass that enforces move only invariants on raw SIL for addresses for testing purposes")
+PASS(MoveOnlyChecker, "sil-move-only-checker",
+     "Pass that enforces move only invariants on raw SIL for addresses and objects")
 PASS(ConsumeOperatorCopyableValuesChecker, "sil-consume-operator-copyable-values-checker",
      "Pass that performs checking of the consume operator for copyable values")
 PASS(TrivialMoveOnlyTypeEliminator, "sil-trivial-move-only-type-eliminator",
@@ -466,6 +468,8 @@ PASS(MoveOnlyBorrowToDestructureTransform,
      "used to convert borrow+projection to destructures. Once this has run, the move "
      "only object checker runs and ensures that the destructures do not create "
      "any move only errors with respect to non-borrow+projection uses")
+PASS(ReferenceBindingTransform, "sil-reference-binding-transform",
+     "Check/transform reference bindings")
 PASS(PruneVTables, "prune-vtables",
      "Mark class methods that do not require vtable dispatch")
 PASS_RANGE(AllPasses, AADumper, PruneVTables)

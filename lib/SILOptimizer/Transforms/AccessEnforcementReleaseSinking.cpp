@@ -153,6 +153,7 @@ static bool isBarrier(SILInstruction *inst) {
     case BuiltinValueKind::CreateTaskGroupWithFlags:
     case BuiltinValueKind::DestroyTaskGroup:
     case BuiltinValueKind::StackAlloc:
+    case BuiltinValueKind::UnprotectedStackAlloc:
     case BuiltinValueKind::StackDealloc:
     case BuiltinValueKind::AssumeAlignment:
       return false;
@@ -189,6 +190,7 @@ static bool isBarrier(SILInstruction *inst) {
     case BuiltinValueKind::InitializeDefaultActor:
     case BuiltinValueKind::DestroyDefaultActor:
     case BuiltinValueKind::InitializeDistributedRemoteActor:
+    case BuiltinValueKind::InitializeNonDefaultDistributedActor:
     case BuiltinValueKind::BuildOrdinarySerialExecutorRef:
     case BuiltinValueKind::BuildDefaultActorExecutorRef:
     case BuiltinValueKind::BuildMainActorExecutorRef:

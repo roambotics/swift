@@ -102,13 +102,21 @@ static AvailableAttr *createAvailableAttr(PlatformKind Platform,
                                           StringRef Rename,
                                           ValueDecl *RenameDecl,
                                           ASTContext &Context) {
-
   llvm::VersionTuple Introduced =
       Inferred.Introduced.value_or(llvm::VersionTuple());
   llvm::VersionTuple Deprecated =
       Inferred.Deprecated.value_or(llvm::VersionTuple());
   llvm::VersionTuple Obsoleted =
       Inferred.Obsoleted.value_or(llvm::VersionTuple());
+
+  // If a decl is unavailable then it cannot have any introduced, deprecated, or
+  // obsoleted version.
+  if (Inferred.PlatformAgnostic ==
+      PlatformAgnosticAvailabilityKind::Unavailable) {
+    Introduced = llvm::VersionTuple();
+    Deprecated = llvm::VersionTuple();
+    Obsoleted = llvm::VersionTuple();
+  }
 
   return new (Context)
       AvailableAttr(SourceLoc(), SourceRange(), Platform,
@@ -135,26 +143,54 @@ void AvailabilityInference::applyInferredAvailableAttrs(
   // a per-platform basis.
   std::map<PlatformKind, InferredAvailability> Inferred;
   for (const Decl *D : InferredFromDecls) {
-    for (const DeclAttribute *Attr : D->getAttrs()) {
-      auto *AvAttr = dyn_cast<AvailableAttr>(Attr);
-      if (!AvAttr || AvAttr->isInvalid())
-        continue;
+    do {
+      for (const DeclAttribute *Attr : D->getAttrs()) {
+        auto *AvAttr = dyn_cast<AvailableAttr>(Attr);
+        if (!AvAttr || AvAttr->isInvalid())
+          continue;
 
-      mergeWithInferredAvailability(AvAttr, Inferred[AvAttr->Platform]);
+        mergeWithInferredAvailability(AvAttr, Inferred[AvAttr->Platform]);
 
-      if (Message.empty() && !AvAttr->Message.empty())
-        Message = AvAttr->Message;
+        if (Message.empty() && !AvAttr->Message.empty())
+          Message = AvAttr->Message;
 
-      if (Rename.empty() && !AvAttr->Rename.empty()) {
-        Rename = AvAttr->Rename;
-        RenameDecl = AvAttr->RenameDecl;
+        if (Rename.empty() && !AvAttr->Rename.empty()) {
+          Rename = AvAttr->Rename;
+          RenameDecl = AvAttr->RenameDecl;
+        }
       }
+
+      // Walk up the enclosing declaration hierarchy to make sure we aren't
+      // missing any inherited attributes.
+      D = AvailabilityInference::parentDeclForInferredAvailability(D);
+    } while (D);
+  }
+
+  DeclAttributes &Attrs = ToDecl->getAttrs();
+
+  // Some kinds of platform agnostic availability supersede any platform
+  // specific availability.
+  auto InferredAgnostic = Inferred.find(PlatformKind::none);
+  if (InferredAgnostic != Inferred.end()) {
+    switch (InferredAgnostic->second.PlatformAgnostic) {
+    case PlatformAgnosticAvailabilityKind::Deprecated:
+    case PlatformAgnosticAvailabilityKind::UnavailableInSwift:
+    case PlatformAgnosticAvailabilityKind::Unavailable:
+      Attrs.add(createAvailableAttr(PlatformKind::none,
+                                    InferredAgnostic->second, Message, Rename,
+                                    RenameDecl, Context));
+      return;
+
+    case PlatformAgnosticAvailabilityKind::None:
+    case PlatformAgnosticAvailabilityKind::SwiftVersionSpecific:
+    case PlatformAgnosticAvailabilityKind::PackageDescriptionVersionSpecific:
+    case PlatformAgnosticAvailabilityKind::NoAsync:
+      break;
     }
   }
 
   // Create an availability attribute for each observed platform and add
   // to ToDecl.
-  DeclAttributes &Attrs = ToDecl->getAttrs();
   for (auto &Pair : Inferred) {
     auto *Attr = createAvailableAttr(Pair.first, Pair.second, Message,
                                      Rename, RenameDecl, Context);
@@ -165,7 +201,8 @@ void AvailabilityInference::applyInferredAvailableAttrs(
 
 /// Returns the decl that should be considered the parent decl of the given decl
 /// when looking for inherited availability annotations.
-static Decl *parentDeclForAvailability(const Decl *D) {
+const Decl *
+AvailabilityInference::parentDeclForInferredAvailability(const Decl *D) {
   if (auto *AD = dyn_cast<AccessorDecl>(D))
     return AD->getStorage();
 
@@ -230,7 +267,8 @@ SemanticAvailableRangeAttrRequest::evaluate(Evaluator &evaluator,
           decl, decl->getASTContext()))
     return std::make_pair(attr, decl);
 
-  if (auto *parent = parentDeclForAvailability(decl))
+  if (auto *parent =
+          AvailabilityInference::parentDeclForInferredAvailability(decl))
     return parent->getSemanticAvailableRangeAttr();
 
   return None;
@@ -262,7 +300,8 @@ SemanticUnavailableAttrRequest::evaluate(Evaluator &evaluator,
   if (auto attr = decl->getAttrs().getUnavailable(decl->getASTContext()))
     return std::make_pair(attr, decl);
 
-  if (auto *parent = parentDeclForAvailability(decl))
+  if (auto *parent =
+          AvailabilityInference::parentDeclForInferredAvailability(decl))
     return parent->getSemanticUnavailableAttr();
 
   return None;
@@ -635,10 +674,10 @@ AvailabilityContext ASTContext::getSwiftFutureAvailability() {
         VersionRange::allGTE(llvm::VersionTuple(99, 99, 0)));
   } else if (target.isiOS()) {
     return AvailabilityContext(
-        VersionRange::allGTE(llvm::VersionTuple(99, 0, 0)));
+        VersionRange::allGTE(llvm::VersionTuple(99, 99, 0)));
   } else if (target.isWatchOS()) {
     return AvailabilityContext(
-        VersionRange::allGTE(llvm::VersionTuple(9, 99, 0)));
+        VersionRange::allGTE(llvm::VersionTuple(99, 99, 0)));
   } else {
     return AvailabilityContext::alwaysAvailable();
   }

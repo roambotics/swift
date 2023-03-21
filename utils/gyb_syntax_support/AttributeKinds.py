@@ -378,7 +378,7 @@ DECL_ATTR_KINDS = [
                         ABIStableToAdd, ABIStableToRemove, APIStableToAdd, APIStableToRemove,  # noqa: E501
                         code=64),
     SimpleDeclAttribute('discardableResult', 'DiscardableResult',
-                        OnFunc, OnAccessor, OnConstructor,
+                        OnFunc, OnAccessor, OnConstructor, OnMacro,
                         LongAttribute,
                         ABIStableToAdd, ABIStableToRemove, APIStableToAdd, APIStableToRemove,  # noqa: E501
                         code=65),
@@ -616,6 +616,12 @@ DECL_ATTR_KINDS = [
                         OnFunc, OnParam, OnVar, OnNominalType,
                         code=117),
 
+    SimpleDeclAttribute('_lexicalLifetimes', 'LexicalLifetimes',
+                        UserInaccessible,
+                        ABIStableToAdd, ABIStableToRemove,
+                        APIStableToAdd, APIStableToRemove,
+                        OnFunc, code=36),
+
     SimpleDeclAttribute('_noEagerMove', 'NoEagerMove',
                         UserInaccessible,
                         ABIStableToAdd, ABIStableToRemove,
@@ -655,7 +661,7 @@ DECL_ATTR_KINDS = [
     SimpleDeclAttribute('preconcurrency', 'Preconcurrency',
                         OnFunc, OnConstructor, OnProtocol, OnGenericType, OnVar, OnSubscript,  # noqa: E501
                         OnEnumElement, OnImport,
-                        ABIBreakingToAdd, ABIBreakingToRemove, APIBreakingToAdd, APIBreakingToRemove,  # noqa: E501
+                        ABIStableToAdd, ABIBreakingToRemove, APIBreakingToAdd, APIBreakingToRemove,  # noqa: E501
                         code=125),
 
     DeclAttribute('_unavailableFromAsync', 'UnavailableFromAsync',
@@ -782,7 +788,7 @@ DECL_MODIFIER_KINDS = [
                                   DeclModifier,
                                   ABIStableToAdd, ABIStableToRemove, APIStableToAdd, APIStableToRemove,  # noqa: E501
                                   code=25),
-    ContextualSimpleDeclAttribute('__consuming', 'Consuming',
+    ContextualSimpleDeclAttribute('__consuming', 'LegacyConsuming',
                                   OnFunc, OnAccessor,
                                   DeclModifier,
                                   UserInaccessible,
@@ -815,7 +821,7 @@ DECL_MODIFIER_KINDS = [
                                   code=44),
     DeclAttribute('private', 'AccessControl',
                   OnFunc, OnAccessor, OnExtension, OnGenericType, OnVar, OnSubscript,
-                  OnConstructor, OnMacro,
+                  OnConstructor, OnMacro, OnImport,
                   DeclModifier,
                   NotSerialized,
                   ABIStableToAdd, ABIStableToRemove, APIStableToAdd, APIStableToRemove,
@@ -894,6 +900,23 @@ DECL_MODIFIER_KINDS = [
                                   ABIBreakingToAdd, ABIBreakingToRemove,
                                   APIBreakingToAdd, APIBreakingToRemove,
                                   code=130),
+
+    ContextualSimpleDeclAttribute('consuming', 'Consuming',
+                                  OnFunc, OnAccessor,
+                                  DeclModifier,
+                                  UserInaccessible,
+                                  NotSerialized,
+                                  ABIBreakingToAdd, ABIBreakingToRemove,
+                                  APIStableToAdd, APIStableToRemove,
+                                  code=140),
+    ContextualSimpleDeclAttribute('borrowing', 'Borrowing',
+                                  OnFunc, OnAccessor,
+                                  DeclModifier,
+                                  UserInaccessible,
+                                  NotSerialized,
+                                  ABIBreakingToAdd, ABIBreakingToRemove,
+                                  APIStableToAdd, APIStableToRemove,
+                                  code=141),
     DeclAttribute('attached', 'MacroRole',
                   OnMacro, AllowMultipleAttributes,
                   ABIStableToAdd, ABIStableToRemove, APIStableToAdd, APIBreakingToRemove,  # noqa: E501

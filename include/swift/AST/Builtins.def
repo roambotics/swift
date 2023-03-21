@@ -629,6 +629,10 @@ BUILTIN_MISC_OPERATION(DeallocRaw, "deallocRaw", "", Special)
 /// is not known at compile time, MaximumAlignment is assumed.
 BUILTIN_MISC_OPERATION(StackAlloc, "stackAlloc", "", Special)
 
+/// Like `stackAlloc`, but doesn't set the `[stack_protection]` flag on its
+/// containing function.
+BUILTIN_MISC_OPERATION(UnprotectedStackAlloc, "unprotectedStackAlloc", "", Special)
+
 /// StackDealloc has type (Builtin.RawPointer) -> ()
 ///
 /// Parameters: address.
@@ -770,7 +774,11 @@ BUILTIN_MISC_OPERATION(InitializeDefaultActor, "initializeDefaultActor", "", Spe
 /// Destroy the default-actor instance in a default actor object.
 BUILTIN_MISC_OPERATION(DestroyDefaultActor, "destroyDefaultActor", "", Special)
 
-/// Allocate a "proxy" for a distributed remote actor.  TODO(distributed) change the name of this to create throughout.
+/// Initialize the extra storage state of a non-default distributed actor object.
+BUILTIN_MISC_OPERATION(InitializeNonDefaultDistributedActor,
+                       "initializeNonDefaultDistributedActor", "", Special)
+
+/// Allocate a "proxy" for a distributed remote actor.
 BUILTIN_MISC_OPERATION(InitializeDistributedRemoteActor,
                        "initializeDistributedRemoteActor", "", Special)
 

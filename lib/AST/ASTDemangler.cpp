@@ -38,36 +38,39 @@
 using namespace swift;
 
 Type swift::Demangle::getTypeForMangling(ASTContext &ctx,
-                                         StringRef mangling) {
+                                         StringRef mangling,
+                                         GenericSignature genericSig) {
   Demangle::Context Dem;
   auto node = Dem.demangleSymbolAsNode(mangling);
   if (!node)
     return Type();
 
-  ASTBuilder builder(ctx);
+  ASTBuilder builder(ctx, genericSig);
   return builder.decodeMangledType(node);
 }
 
 TypeDecl *swift::Demangle::getTypeDeclForMangling(ASTContext &ctx,
-                                                  StringRef mangling) {
+                                                  StringRef mangling,
+                                                  GenericSignature genericSig) {
   Demangle::Context Dem;
   auto node = Dem.demangleSymbolAsNode(mangling);
   if (!node)
     return nullptr;
 
-  ASTBuilder builder(ctx);
+  ASTBuilder builder(ctx, genericSig);
   return builder.createTypeDecl(node);
 }
 
 TypeDecl *swift::Demangle::getTypeDeclForUSR(ASTContext &ctx,
-                                             StringRef usr) {
+                                             StringRef usr,
+                                             GenericSignature genericSig) {
   if (!usr.startswith("s:"))
     return nullptr;
 
   std::string mangling(usr);
   mangling.replace(0, 2, MANGLING_PREFIX_STR);
 
-  return getTypeDeclForMangling(ctx, mangling);
+  return getTypeDeclForMangling(ctx, mangling, genericSig);
 }
 
 Type ASTBuilder::decodeMangledType(NodePointer node, bool forRequirement) {
@@ -341,6 +344,25 @@ Type ASTBuilder::createTupleType(ArrayRef<Type> eltTypes, StringRef labels) {
   return TupleType::get(elements, Ctx);
 }
 
+Type ASTBuilder::createPackType(ArrayRef<Type> eltTypes) {
+  return PackType::get(Ctx, eltTypes);
+}
+
+Type ASTBuilder::createSILPackType(ArrayRef<Type> eltTypes,
+                                   bool isElementAddress) {
+  auto extInfo = SILPackType::ExtInfo(isElementAddress);
+
+  SmallVector<CanType, 4> elements;
+  for (auto eltType : eltTypes)
+    elements.push_back(eltType->getCanonicalType());
+
+  return SILPackType::get(Ctx, extInfo, elements);
+}
+
+Type ASTBuilder::createPackExpansionType(Type patternType, Type countType) {
+  return PackExpansionType::get(patternType, countType);
+}
+
 Type ASTBuilder::createFunctionType(
     ArrayRef<Demangle::FunctionParam<Type>> params,
     Type output, FunctionTypeFlags flags,
@@ -358,9 +380,10 @@ Type ASTBuilder::createFunctionType(
 
     auto label = Ctx.getIdentifier(param.getLabel());
     auto flags = param.getFlags();
-    auto ownership = flags.getValueOwnership();
+    auto ownership =
+      ParamDecl::getParameterSpecifierForValueOwnership(flags.getValueOwnership());
     auto parameterFlags = ParameterTypeFlags()
-                              .withValueOwnership(ownership)
+                              .withOwnershipSpecifier(ownership)
                               .withVariadic(flags.isVariadic())
                               .withAutoClosure(flags.isAutoClosure())
                               .withNoDerivative(flags.isNoDerivative());
@@ -683,7 +706,23 @@ Type ASTBuilder::createMetatypeType(Type instance,
 
 Type ASTBuilder::createGenericTypeParameterType(unsigned depth,
                                                 unsigned index) {
-  return GenericTypeParamType::get(/*isParameterPack*/ false, depth, index, Ctx);
+  // If we have a generic signature, find the parameter with the matching
+  // depth and index and return it, to get the correct value for the
+  // isParameterPack() bit.
+  if (GenericSig) {
+    for (auto paramTy : GenericSig.getGenericParams()) {
+      if (paramTy->getDepth() == depth && paramTy->getIndex() == index) {
+        return paramTy;
+      }
+    }
+
+    return Type();
+  }
+
+  // Otherwise, just assume we're not working with variadic generics.
+  // FIXME: Should we always require a generic signature in this case?
+  return GenericTypeParamType::get(/*isParameterPack*/ false,
+                                   depth, index, Ctx);
 }
 
 Type ASTBuilder::createDependentMemberType(StringRef member,
@@ -973,6 +1012,9 @@ LayoutConstraint ASTBuilder::getLayoutConstraintWithSizeAlign(
 CanGenericSignature ASTBuilder::demangleGenericSignature(
     NominalTypeDecl *nominalDecl,
     NodePointer node) {
+  llvm::SaveAndRestore<GenericSignature> savedSignature(
+      GenericSig, nominalDecl->getGenericSignature());
+
   SmallVector<Requirement, 2> requirements;
 
   decodeRequirement<BuiltType, BuiltRequirement, BuiltLayoutConstraint,

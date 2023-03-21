@@ -501,7 +501,19 @@ void BindingSet::finalize(
 
         if (TransitiveProtocols.has_value()) {
           for (auto *constraint : *TransitiveProtocols) {
-            auto protocolTy = constraint->getSecondType();
+            Type protocolTy = constraint->getSecondType();
+
+            // The Copyable protocol can't have members, yet will be a
+            // constraint of basically all type variables, so don't suggest it.
+            //
+            // NOTE: worth considering for all marker protocols, but keep in
+            // mind that you're allowed to extend them with members!
+            if (auto p = protocolTy->getAs<ProtocolType>()) {
+              if (ProtocolDecl *decl = p->getDecl())
+                if (decl->isSpecificProtocol(KnownProtocolKind::Copyable))
+                  continue;
+            }
+
             addBinding({protocolTy, AllowedBindingKind::Exact, constraint});
           }
         }
@@ -1071,6 +1083,61 @@ bool BindingSet::favoredOverConjunction(Constraint *conjunction) const {
     if (forClosureResult() || forGenericParameter())
       return false;
   }
+
+  auto *locator = conjunction->getLocator();
+  if (locator->directlyAt<ClosureExpr>()) {
+    auto *closure = castToExpr<ClosureExpr>(locator->getAnchor());
+
+    if (auto transform = CS.getAppliedResultBuilderTransform(closure)) {
+      // Conjunctions that represent closures with result builder transformed
+      // bodies could be attempted right after their resolution if they meet
+      // all of the following criteria:
+      //
+      // - Builder type doesn't have any unresolved generic parameters;
+      // - Closure doesn't have any parameters;
+      // - The contextual result type is either concrete or opaque type.
+      auto contextualType = transform->contextualType;
+      if (!(contextualType && contextualType->is<FunctionType>()))
+        return true;
+
+      auto *contextualFnType =
+          CS.simplifyType(contextualType)->castTo<FunctionType>();
+      {
+        auto resultType = contextualFnType->getResult();
+        if (resultType->hasTypeVariable()) {
+          auto *typeVar = resultType->getAs<TypeVariableType>();
+          // If contextual result type is represented by an opaque type,
+          // it's a strong indication that body is self-contained, otherwise
+          // closure might rely on external types flowing into the body for
+          // disambiguation of `build{Partial}Block` or `buildFinalResult`
+          // calls.
+          if (!(typeVar && typeVar->getImpl().isOpaqueType()))
+            return true;
+        }
+      }
+
+      // If some of the closure parameters are unresolved, the conjunction
+      // has to be delayed to give them a chance to be inferred.
+      if (llvm::any_of(contextualFnType->getParams(), [](const auto &param) {
+            return param.getPlainType()->hasTypeVariable();
+          }))
+        return true;
+
+      // Check whether conjunction has any unresolved type variables
+      // besides the variable that represents the closure.
+      //
+      // Conjunction could refer to declarations from outer context
+      // (i.e. a variable declared in the outer closure) or generic
+      // parameters of the builder type), if any of such references
+      // are not yet inferred the conjunction has to be delayed.
+      auto *closureType = CS.getType(closure)->castTo<TypeVariableType>();
+      return llvm::any_of(
+          conjunction->getTypeVariables(), [&](TypeVariableType *typeVar) {
+            return !(typeVar == closureType || CS.getFixedType(typeVar));
+          });
+    }
+  }
+
   return true;
 }
 
@@ -1427,7 +1494,14 @@ void PotentialBindings::infer(Constraint *constraint) {
       packType = packType->mapTypeOutOfContext();
       auto *elementEnv = CS.getPackElementEnvironment(constraint->getLocator(),
                                                       shapeClass);
+
+      // Without an opened element environment, we cannot derive the
+      // element binding.
+      if (!elementEnv)
+        break;
+
       auto elementType = elementEnv->mapPackTypeIntoElementContext(packType);
+      assert(!elementType->is<PackType>());
       addPotentialBinding({elementType, AllowedBindingKind::Exact, constraint});
 
       break;
@@ -1857,12 +1931,15 @@ void BindingSet::dump(llvm::raw_ostream &out, unsigned indent) const {
 
   if (!Defaults.empty()) {
     out << " [defaults: ";
-    for (const auto &entry : Defaults) {
-      auto *constraint = entry.second;
-      auto defaultBinding =
-          PrintableBinding::exact(constraint->getSecondType());
-      defaultBinding.print(out, PO);
-    }
+    interleave(
+        Defaults,
+        [&](const auto &entry) {
+          auto *constraint = entry.second;
+          auto defaultBinding =
+              PrintableBinding::exact(constraint->getSecondType());
+          defaultBinding.print(out, PO);
+        },
+        [&] { out << ", "; });
     out << "]";
   }
   

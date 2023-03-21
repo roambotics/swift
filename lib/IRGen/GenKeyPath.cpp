@@ -365,7 +365,7 @@ getWitnessTableForComputedComponent(IRGenModule &IGM,
       ? genericEnv->mapTypeIntoContext(IGM.getSILModule(), component.LoweredType)
       : component.LoweredType;
     auto &ti = IGM.getTypeInfo(ty);
-    isTrivial &= ti.isPOD(ResilienceExpansion::Minimal);
+    isTrivial &= ti.isTriviallyDestroyable(ResilienceExpansion::Minimal);
   }
   
   llvm::Constant *destroy = nullptr;
@@ -896,12 +896,12 @@ emitKeyPathComponent(IRGenModule &IGM,
                 return None;
               })->getCanonicalType();
 
-              if (reqt.isMetadata()) {
+              if (reqt.isAnyMetadata()) {
                 // Type requirement.
                 externalSubArgs.push_back(emitMetadataTypeRefForKeyPath(
                     IGM, substType, componentCanSig));
               } else {
-                assert(reqt.isWitnessTable());
+                assert(reqt.isAnyWitnessTable());
 
                 // Protocol requirement.
                 auto conformance = subs.lookupConformance(

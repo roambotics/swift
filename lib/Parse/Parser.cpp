@@ -126,9 +126,9 @@ bool IDEInspectionSecondPassRequest::evaluate(
   auto BufferID = Ctx.SourceMgr.getIDEInspectionTargetBufferID();
   Parser TheParser(BufferID, *SF, nullptr, parserState);
 
-  std::unique_ptr<IDEInspectionCallbacks> IDECallbacks(
-      Factory->createIDEInspectionCallbacks(TheParser));
-  TheParser.setIDECallbacks(IDECallbacks.get());
+  auto Callbacks = Factory->createCallbacks(TheParser);
+  TheParser.setCodeCompletionCallbacks(Callbacks.CompletionCallbacks.get());
+  TheParser.setDoneParsingCallback(Callbacks.DoneParsingCallback.get());
 
   TheParser.performIDEInspectionSecondPassImpl(*state);
   return true;
@@ -203,7 +203,7 @@ void Parser::performIDEInspectionSecondPassImpl(
   assert(!State->hasIDEInspectionDelayedDeclState() &&
          "Second pass should not set any code completion info");
 
-  IDECallbacks->doneParsing(DC->getParentSourceFile());
+  DoneParsingCallback->doneParsing(DC->getParentSourceFile());
 
   State->restoreIDEInspectionDelayedDeclState(info);
 }
@@ -504,8 +504,8 @@ Parser::~Parser() {
 bool Parser::isInSILMode() const { return SF.Kind == SourceFileKind::SIL; }
 
 bool Parser::isDelayedParsingEnabled() const {
-  // Do not delay parsing during code completion's second pass.
-  if (IDECallbacks)
+  // Do not delay parsing during IDE inspection's second pass.
+  if (DoneParsingCallback)
     return false;
 
   return SF.hasDelayedBodyParsing();
@@ -747,7 +747,9 @@ void Parser::skipListUntilDeclRBrace(SourceLoc startLoc, tok T1, tok T2) {
       
       // Could have encountered something like `_ var:` 
       // or `let foo:` or `var:`
-      if (Tok.isAny(tok::kw_var, tok::kw_let)) {
+      if (Tok.isAny(tok::kw_var, tok::kw_let) ||
+          (Context.LangOpts.hasFeature(Feature::ReferenceBindings) &&
+           Tok.isAny(tok::kw_inout))) {
         if (possibleDeclStartsLine && !hasDelimiter) {
           break;
         }
@@ -1331,14 +1333,17 @@ ParsedDeclName swift::parseDeclName(StringRef name) {
   return result;
 }
 
-DeclName ParsedDeclName::formDeclName(ASTContext &ctx, bool isSubscript) const {
-  return formDeclNameRef(ctx, isSubscript).getFullName();
+DeclName ParsedDeclName::formDeclName(ASTContext &ctx, bool isSubscript,
+                                      bool isCxxClassTemplateSpec) const {
+  return formDeclNameRef(ctx, isSubscript, isCxxClassTemplateSpec).getFullName();
 }
 
 DeclNameRef ParsedDeclName::formDeclNameRef(ASTContext &ctx,
-                                            bool isSubscript) const {
+                                            bool isSubscript,
+                                            bool isCxxClassTemplateSpec) const {
   return swift::formDeclNameRef(ctx, BaseName, ArgumentLabels, IsFunctionName,
-                                /*IsInitializer=*/true, isSubscript);
+                                /*IsInitializer=*/true, isSubscript,
+                                isCxxClassTemplateSpec);
 }
 
 DeclName swift::formDeclName(ASTContext &ctx,
@@ -1346,9 +1351,11 @@ DeclName swift::formDeclName(ASTContext &ctx,
                              ArrayRef<StringRef> argumentLabels,
                              bool isFunctionName,
                              bool isInitializer,
-                             bool isSubscript) {
+                             bool isSubscript,
+                             bool isCxxClassTemplateSpec) {
   return formDeclNameRef(ctx, baseName, argumentLabels, isFunctionName,
-                         isInitializer, isSubscript).getFullName();
+                         isInitializer, isSubscript,
+                         isCxxClassTemplateSpec).getFullName();
 }
 
 DeclNameRef swift::formDeclNameRef(ASTContext &ctx,
@@ -1356,11 +1363,14 @@ DeclNameRef swift::formDeclNameRef(ASTContext &ctx,
                                    ArrayRef<StringRef> argumentLabels,
                                    bool isFunctionName,
                                    bool isInitializer,
-                                   bool isSubscript) {
+                                   bool isSubscript,
+                                   bool isCxxClassTemplateSpec) {
   // We cannot import when the base name is not an identifier.
   if (baseName.empty())
     return DeclNameRef();
-  if (!Lexer::isIdentifier(baseName) && !Lexer::isOperator(baseName))
+
+  if (!Lexer::isIdentifier(baseName) && !Lexer::isOperator(baseName) &&
+      !isCxxClassTemplateSpec)
     return DeclNameRef();
 
   // Get the identifier for the base name. Special-case `init`.

@@ -210,6 +210,14 @@ public:
   /// The order of the results is not guaranteed to be meaningful.
   virtual void getTopLevelDecls(SmallVectorImpl<Decl*> &results) const {}
 
+  /// Finds all top-level decls in this file with their auxiliary decls such as
+  /// macro expansions.
+  ///
+  /// This does a simple local lookup, not recursively looking through imports.
+  /// The order of the results is not guaranteed to be meaningful.
+  void getTopLevelDeclsWithAuxiliaryDecls(
+      SmallVectorImpl<Decl*> &results) const;
+
   virtual void
   getExportedPrespecializations(SmallVectorImpl<Decl *> &results) const {}
 
@@ -411,6 +419,14 @@ public:
   /// swiftmodule file or a pcm in the cache. Returns an empty string if not
   /// applicable.
   virtual StringRef getLoadedFilename() const { return StringRef(); }
+
+  /// Returns the path of the file for the module represented by this
+  /// \c FileUnit, or an empty string if there is none. For modules either
+  /// built by or adjacent to a module interface, returns the module
+  /// interface instead.
+  virtual StringRef getSourceFilename() const {
+    return getModuleDefiningPath();
+  }
 
   virtual StringRef getFilenameForPrivateDecl(const ValueDecl *decl) const {
     return StringRef();

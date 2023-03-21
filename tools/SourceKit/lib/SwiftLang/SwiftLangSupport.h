@@ -22,6 +22,7 @@
 #include "SourceKit/Support/Tracing.h"
 #include "SwiftInterfaceGenContext.h"
 #include "swift/AST/DiagnosticConsumer.h"
+#include "swift/AST/PluginRegistry.h"
 #include "swift/Basic/ThreadSafeRefCounted.h"
 #include "swift/IDE/CancellableResult.h"
 #include "swift/IDE/Indenting.h"
@@ -637,7 +638,6 @@ public:
                      ArrayRef<const char *> Args,
                      Optional<VFSOptions> vfsOptions,
                      SourceKitCancellationToken CancellationToken,
-                     bool VerifySolverBasedCursorInfo,
                      std::function<void(const RequestResult<CursorInfoData> &)>
                          Receiver) override;
 
@@ -673,6 +673,12 @@ public:
       std::function<void(const RequestResult<RelatedIdentsInfo> &)> Receiver)
       override;
 
+  void findActiveRegionsInFile(
+      StringRef Filename, ArrayRef<const char *> Args,
+      SourceKitCancellationToken CancellationToken,
+      std::function<void(const RequestResult<ActiveRegionsInfo> &)> Receiver)
+      override;
+
   void syntacticRename(llvm::MemoryBuffer *InputBuf,
                        ArrayRef<RenameLocations> RenameLocations,
                        ArrayRef<const char*> Args,
@@ -702,7 +708,7 @@ public:
       std::function<void(const RequestResult<VariableTypesInFile> &)> Receiver)
       override;
 
-  void semanticRefactoring(StringRef Filename, SemanticRefactoringInfo Info,
+  void semanticRefactoring(StringRef PrimaryFile, SemanticRefactoringInfo Info,
                            ArrayRef<const char *> Args,
                            SourceKitCancellationToken CancellationToken,
                            CategorizedEditsReceiver Receiver) override;

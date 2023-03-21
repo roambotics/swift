@@ -1340,9 +1340,9 @@ public:
                                        TypeDecl *Decl);
 
   /// Create a \c TypeExpr for a member \c TypeDecl of the given parent
-  /// \c DeclRefTypeRepr.
-  static TypeExpr *createForMemberDecl(DeclRefTypeRepr *ParentTR,
-                                       DeclNameLoc NameLoc, TypeDecl *Decl);
+  /// \c TypeRepr.
+  static TypeExpr *createForMemberDecl(TypeRepr *ParentTR, DeclNameLoc NameLoc,
+                                       TypeDecl *Decl);
 
   /// Create a \c TypeExpr from an \c DeclRefTypeRepr with the given arguments
   /// applied at the specified location.
@@ -3647,6 +3647,47 @@ public:
 
   static bool classof(const Expr *E) {
     return E->getKind() == ExprKind::PackExpansion;
+  }
+};
+
+/// An expression to materialize a pack from a tuple containing a pack
+/// expansion, spelled \c tuple.element.
+///
+/// These nodes are created by CSApply and should only appear in a
+/// type-checked AST in the context of a \c PackExpansionExpr .
+class MaterializePackExpr final : public Expr {
+  /// The expression from which to materialize a pack.
+  Expr *FromExpr;
+
+  /// The source location of \c .element
+  SourceLoc ElementLoc;
+
+  MaterializePackExpr(Expr *fromExpr, SourceLoc elementLoc,
+                      Type type, bool implicit)
+      : Expr(ExprKind::MaterializePack, implicit, type),
+        FromExpr(fromExpr), ElementLoc(elementLoc) {}
+
+public:
+  static MaterializePackExpr *create(ASTContext &ctx, Expr *fromExpr,
+                                     SourceLoc elementLoc, Type type,
+                                     bool implicit = false);
+
+  Expr *getFromExpr() const { return FromExpr; }
+
+  void setFromExpr(Expr *fromExpr) {
+    FromExpr = fromExpr;
+  }
+
+  SourceLoc getStartLoc() const {
+    return FromExpr->getStartLoc();
+  }
+
+  SourceLoc getEndLoc() const {
+    return ElementLoc;
+  }
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::MaterializePack;
   }
 };
 
@@ -6156,6 +6197,7 @@ private:
   ArgumentList *ArgList;
   Expr *Rewritten;
   MacroRoles Roles;
+  MacroExpansionDecl *SubstituteDecl;
 
   /// The referenced macro.
   ConcreteDeclRef macroRef;
@@ -6178,7 +6220,7 @@ public:
         MacroName(macroName), MacroNameLoc(macroNameLoc),
         LeftAngleLoc(leftAngleLoc), RightAngleLoc(rightAngleLoc),
         GenericArgs(genericArgs),
-        Rewritten(nullptr), Roles(roles) {
+        Rewritten(nullptr), Roles(roles), SubstituteDecl(nullptr) {
     Bits.MacroExpansionExpr.Discriminator = InvalidDiscriminator;
 
     // Macro expansions always have an argument list. If one is not provided, create
@@ -6234,6 +6276,10 @@ public:
   }
 
   SourceRange getSourceRange() const;
+
+  MacroExpansionDecl *createSubstituteDecl() const;
+  MacroExpansionDecl *getSubstituteDecl() const;
+  void setSubstituteDecl(MacroExpansionDecl *decl);
 
   static bool classof(const Expr *E) {
     return E->getKind() == ExprKind::MacroExpansion;

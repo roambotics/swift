@@ -68,6 +68,10 @@
 
 #include "swift/AST/Type.h"
 #include "swift/Basic/TaggedUnion.h"
+#include "swift/SIL/MemAccessUtils.h"
+#include "swift/SIL/OSSALifetimeCompletion.h"
+#include "swift/SIL/OwnershipLiveness.h"
+#include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/PrunedLiveness.h"
 #include "swift/SIL/SILArgumentArrayRef.h"
 #include "swift/SIL/SILBasicBlock.h"
@@ -264,6 +268,22 @@ struct TestSpecificationTest : UnitTest {
   }
 };
 
+// Arguments:
+// - value: the value to check for escaping
+// Dumps:
+// - the value
+// - whether it has a pointer escape
+struct OwnershipUtilsHasPointerEscape : UnitTest {
+  OwnershipUtilsHasPointerEscape(UnitTestRunner *pass) : UnitTest(pass) {}
+  void invoke(Arguments &arguments) override {
+    auto value = arguments.takeValue();
+    auto has = hasPointerEscape(value);
+    value->print(llvm::errs());
+    auto *boolString = has ? "true" : "false";
+    llvm::errs() << boolString << "\n";
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // MARK: OSSA Lifetime Unit Tests
 //===----------------------------------------------------------------------===//
@@ -432,6 +452,22 @@ struct IsDeinitBarrierTest : UnitTest {
   }
 };
 
+// Arguments:
+// - value
+// Dumps:
+// - value
+// - whether it's lexical
+struct IsLexicalTest : UnitTest {
+  IsLexicalTest(UnitTestRunner *pass) : UnitTest(pass) {}
+  void invoke(Arguments &arguments) override {
+    auto value = arguments.takeValue();
+    auto isLexical = value->isLexical();
+    value->dump();
+    auto *boolString = isLexical ? "true" : "false";
+    llvm::errs() << boolString << "\n";
+  }
+};
+
 struct ShrinkBorrowScopeTest : UnitTest {
   ShrinkBorrowScopeTest(UnitTestRunner *pass) : UnitTest(pass) {}
   void invoke(Arguments &arguments) override {
@@ -510,6 +546,92 @@ struct FindBorrowIntroducers : UnitTest {
       def->dump();
       return true;
     });
+  }
+};
+
+// Arguments:
+// - SILValue: value
+// Dumps:
+// - function
+// - the computed pruned liveness
+// - the liveness boundary
+struct LinearLivenessTest : UnitTest {
+  LinearLivenessTest(UnitTestRunner *pass) : UnitTest(pass) {}
+  void invoke(Arguments &arguments) override {
+    SILValue value = arguments.takeValue();
+    getFunction()->dump();
+    llvm::dbgs() << "Linear liveness: " << value;
+    LinearLiveness liveness(value);
+    liveness.compute();
+    liveness.print(llvm::outs());
+
+    PrunedLivenessBoundary boundary;
+    liveness.getLiveness().computeBoundary(boundary);
+    boundary.print(llvm::outs());
+  }
+};
+
+// Arguments:
+// - SILValue: value
+// Dumps:
+// - function
+// - the computed pruned liveness
+// - the liveness boundary
+struct InteriorLivenessTest : UnitTest {
+  InteriorLivenessTest(UnitTestRunner *pass) : UnitTest(pass) {}
+  void invoke(Arguments &arguments) override {
+    SILValue value = arguments.takeValue();
+    getFunction()->dump();
+    llvm::dbgs() << "Interior liveness: " << value;
+    auto *dominanceAnalysis = getAnalysis<DominanceAnalysis>();
+    DominanceInfo *domTree = dominanceAnalysis->get(getFunction());
+    InteriorLiveness liveness(value);
+    auto handleInnerScope = [](SILValue innerBorrow) {
+      llvm::outs() << "Inner scope: " << innerBorrow;
+    };
+    liveness.compute(domTree, handleInnerScope);
+    liveness.print(llvm::outs());
+
+    PrunedLivenessBoundary boundary;
+    liveness.getLiveness().computeBoundary(boundary);
+    boundary.print(llvm::outs());
+  }
+};
+
+// Arguments:
+// - SILValue: value
+// Dumps:
+// - function
+// - the computed pruned liveness
+// - the liveness boundary
+struct ExtendedLinearLivenessTest : UnitTest {
+  ExtendedLinearLivenessTest(UnitTestRunner *pass) : UnitTest(pass) {}
+  void invoke(Arguments &arguments) override {
+    SILValue value = arguments.takeValue();
+    getFunction()->dump();
+    llvm::dbgs() << "Extended liveness: " << value;
+    ExtendedLinearLiveness liveness(value);
+    liveness.compute();
+    liveness.print(llvm::outs());
+
+    PrunedLivenessBoundary boundary;
+    liveness.getLiveness().computeBoundary(boundary);
+    boundary.print(llvm::outs());
+  }
+};
+
+// Arguments:
+// - SILValue: value
+// Dumps:
+// - function
+struct OSSALifetimeCompletionTest : UnitTest {
+  OSSALifetimeCompletionTest(UnitTestRunner *pass) : UnitTest(pass) {}
+  void invoke(Arguments &arguments) override {
+    SILValue value = arguments.takeValue();
+    llvm::dbgs() << "OSSA lifetime completion: " << value;
+    OSSALifetimeCompletion completion(getFunction(), /*domInfo*/nullptr);
+    completion.completeOSSALifetime(value);
+    getFunction()->dump();    
   }
 };
 
@@ -621,6 +743,44 @@ struct SimplifyCFGTryJumpThreading : UnitTest {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// MARK: AccessPath Unit Tests
+//===----------------------------------------------------------------------===//
+
+struct AccessUseTestVisitor : public AccessUseVisitor {
+  AccessUseTestVisitor()
+    : AccessUseVisitor(AccessUseType::Overlapping,
+                       NestedAccessType::IgnoreAccessBegin) {}
+
+  bool visitUse(Operand *op, AccessUseType useTy) override {
+    switch (useTy) {
+    case AccessUseType::Exact:
+      llvm::errs() << "Exact Use: ";
+      break;
+    case AccessUseType::Inner:
+      llvm::errs() << "Inner Use: ";
+      break;
+    case AccessUseType::Overlapping:
+      llvm::errs() << "Overlapping Use ";
+      break;
+    }
+    llvm::errs() << *op->getUser();
+    return true;
+  }
+};
+
+struct AccessPathBaseTest : UnitTest {
+  AccessPathBaseTest(UnitTestRunner *pass) : UnitTest(pass) {}
+  void invoke(Arguments &arguments) override {
+    auto value = arguments.takeValue();
+    getFunction()->dump();
+    llvm::outs() << "Access path base: " << value;
+    auto accessPathWithBase = AccessPathWithBase::compute(value);
+    AccessUseTestVisitor visitor;
+    visitAccessPathBaseUses(visitor, accessPathWithBase, getFunction());
+  }
+};
+
 /// [new_tests] Add the new UnitTest subclass above this line. 
 
 //===----------------------------------------------------------------------===//
@@ -637,15 +797,22 @@ void UnitTestRunner::withTest(StringRef name, Doit doit) {
   }
 
     // Alphabetical mapping from string to unit test subclass.
+    ADD_UNIT_TEST_SUBCLASS("accesspath-base", AccessPathBaseTest)
     ADD_UNIT_TEST_SUBCLASS("canonicalize-ossa-lifetime", CanonicalizeOSSALifetimeTest)
     ADD_UNIT_TEST_SUBCLASS("canonicalize-borrow-scope",
                            CanonicalizeBorrowScopeTest)
     ADD_UNIT_TEST_SUBCLASS("dump-function", DumpFunction)
+    ADD_UNIT_TEST_SUBCLASS("extended-liveness", ExtendedLinearLivenessTest)
     ADD_UNIT_TEST_SUBCLASS("find-borrow-introducers", FindBorrowIntroducers)
     ADD_UNIT_TEST_SUBCLASS("find-enclosing-defs", FindEnclosingDefsTest)
     ADD_UNIT_TEST_SUBCLASS("function-get-self-argument-index", FunctionGetSelfArgumentIndex)
+    ADD_UNIT_TEST_SUBCLASS("has-pointer-escape", OwnershipUtilsHasPointerEscape)
+    ADD_UNIT_TEST_SUBCLASS("interior-liveness", InteriorLivenessTest)
     ADD_UNIT_TEST_SUBCLASS("is-deinit-barrier", IsDeinitBarrierTest)
+    ADD_UNIT_TEST_SUBCLASS("is-lexical", IsLexicalTest)
+    ADD_UNIT_TEST_SUBCLASS("linear-liveness", LinearLivenessTest)
     ADD_UNIT_TEST_SUBCLASS("multidef-liveness", MultiDefLivenessTest)
+    ADD_UNIT_TEST_SUBCLASS("ossa-lifetime-completion", OSSALifetimeCompletionTest)
     ADD_UNIT_TEST_SUBCLASS("pruned-liveness-boundary-with-list-of-last-users-insertion-points", PrunedLivenessBoundaryWithListOfLastUsersInsertionPointsTest)
     ADD_UNIT_TEST_SUBCLASS("shrink-borrow-scope", ShrinkBorrowScopeTest)
 

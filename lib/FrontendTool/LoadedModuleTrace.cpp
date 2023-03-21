@@ -15,6 +15,7 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/PluginRegistry.h"
 #include "swift/Basic/FileTypes.h"
 #include "swift/Basic/JSONSerialization.h"
 #include "swift/Frontend/FrontendOptions.h"
@@ -113,7 +114,8 @@ static void getImmediateImports(
         ModuleDecl::ImportFilterKind::Exported,
         ModuleDecl::ImportFilterKind::Default,
         ModuleDecl::ImportFilterKind::ImplementationOnly,
-        ModuleDecl::ImportFilterKind::SPIAccessControl,
+        ModuleDecl::ImportFilterKind::PackageOnly,
+        ModuleDecl::ImportFilterKind::SPIOnly,
         ModuleDecl::ImportFilterKind::ShadowedByCrossImportOverlay}) {
   SmallVector<ImportedModule, 8> importList;
   module->getImportedModules(importList, importFilter);
@@ -762,6 +764,11 @@ bool swift::emitLoadedModuleTraceIfNeeded(ModuleDecl *mainModule,
     pathToModuleDecl.insert(
         std::make_pair(loadedDecl->getModuleFilename(), loadedDecl));
   }
+
+  // Add compiler plugin libraries as dependencies.
+  auto *pluginRegistry = ctxt.getPluginRegistry();
+  for (auto &pluginEntry : pluginRegistry->getLoadedLibraryPlugins())
+    depTracker->addDependency(pluginEntry.getKey(), /*IsSystem*/ false);
 
   std::vector<SwiftModuleTraceInfo> swiftModules;
   computeSwiftModuleTraceInfo(ctxt, abiDependencies, pathToModuleDecl,

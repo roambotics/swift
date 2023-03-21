@@ -131,6 +131,7 @@ function(handle_swift_sources
         list(APPEND swift_compile_flags "${_lto_flag_out}")
       endif()
     endif()
+    list(APPEND swift_compile_flags "-color-diagnostics")
     _compile_swift_files(
         dependency_target
         module_dependency_target
@@ -294,8 +295,8 @@ function(_add_target_variant_swift_compile_flags
     list(APPEND result "-D" "SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING")
   endif()
 
-  if(SWIFT_ENABLE_EXPERIMENTAL_REFLECTION)
-    list(APPEND result "-D" "SWIFT_ENABLE_EXPERIMENTAL_REFLECTION")
+  if(SWIFT_ENABLE_EXPERIMENTAL_OBSERVATION)
+    list(APPEND result "-D" "SWIFT_ENABLE_EXPERIMENTAL_OBSERVATION")
   endif()
 
   if(SWIFT_STDLIB_OS_VERSIONING)

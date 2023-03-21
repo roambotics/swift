@@ -188,6 +188,10 @@ public:
     return SearchPathOpts.getFrameworkSearchPaths();
   }
 
+  void setVFSOverlays(const std::vector<std::string> &Overlays) {
+    SearchPathOpts.VFSOverlayFiles = Overlays;
+  }
+
   void setCompilerPluginLibraryPaths(const std::vector<std::string> &Paths) {
     SearchPathOpts.setCompilerPluginLibraryPaths(Paths);
   }
@@ -375,6 +379,10 @@ public:
   /// Whether the Swift String Processing support library should be implicitly
   /// imported.
   bool shouldImportSwiftStringProcessing() const;
+
+  /// Whether the Swift Backtracing support library should be implicitly
+  /// imported.
+  bool shouldImportSwiftBacktracing() const;
 
   /// Performs input setup common to these tools:
   /// sil-opt, sil-func-extractor, sil-llvm-gen, and sil-nm.
@@ -570,6 +578,14 @@ public:
   /// Whether the Swift String Processing support library can be imported
   /// i.e. if it can be found.
   bool canImportSwiftStringProcessing() const;
+
+  /// Verify that if an implicit import of the `Backtracing` module if
+  /// expected, it can actually be imported. Emit a warning, otherwise.
+  void verifyImplicitBacktracingImport();
+
+  /// Whether the Swift Backtracing support library can be imported
+  /// i.e. if it can be found.
+  bool canImportSwiftBacktracing() const;
 
   /// Whether the CxxShim library can be imported
   /// i.e. if it can be found.

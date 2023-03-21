@@ -224,11 +224,6 @@ protected:
       llvm::function_ref<void(GenericTypeParamType *, Type)> substitution =
           [](GenericTypeParamType *, Type) {});
 
-  bool isArrayType(Type type) const {
-    auto &cs = getConstraintSystem();
-    return bool(cs.isArrayType(type));
-  }
-
   bool conformsToKnownProtocol(Type type, KnownProtocolKind protocol) const;
 };
 
@@ -1255,7 +1250,18 @@ private:
   /// overload to be present, but a class marked as `@dynamicCallable`
   /// defines only `dynamicallyCall(withArguments:)` variant.
   bool diagnoseForDynamicCallable() const;
-  
+
+  /// Diagnose methods that return unsafe projections and suggest fixits.
+  /// For example, if Swift cannot find "vector::data" because it is unsafe, try
+  /// to diagnose this and tell the user why we did not import "vector::data".
+  ///
+  /// Provides fixits for:
+  /// at -> subscript
+  /// begin, end -> makeIterator
+  /// front, back -> first, last
+  void diagnoseUnsafeCxxMethod(SourceLoc loc, ASTNode anchor, Type baseType,
+                               DeclName name) const;
+
   /// Tailored diagnostics for collection literal with unresolved member expression
   /// that defaults the element type. e.g. _ = [.e]
   bool diagnoseInLiteralCollectionContext() const;
@@ -1832,6 +1838,19 @@ public:
   bool diagnoseAsError() override;
 };
 
+/// Diagnose \c each applied to an expression that is not a pack type.
+class InvalidPackElement final : public FailureDiagnostic {
+  Type packElementType;
+
+public:
+  InvalidPackElement(const Solution &solution, Type packElementType,
+                     ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator),
+        packElementType(packElementType) {}
+
+  bool diagnoseAsError() override;
+};
+
 /// Diagnose a contextual mismatch between expected collection element type
 /// and the one provided (e.g. source of the assignment or argument to a call)
 /// e.g.:
@@ -2157,6 +2176,8 @@ public:
         UseConditionalCast(useConditionalCast) {}
 
   ASTNode getAnchor() const override;
+
+  SourceLoc getLoc() const override;
 
   bool diagnoseAsError() override;
 };

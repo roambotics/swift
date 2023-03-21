@@ -921,10 +921,10 @@ static void swift_taskGroup_initializeWithFlagsImpl(size_t rawGroupFlags,
   assert(record->getKind() == swift::TaskStatusRecordKind::TaskGroup);
 
   // ok, now that the group actually is initialized: attach it to the task
-  addStatusRecord(record, [&](ActiveTaskStatus parentStatus) {
+  addStatusRecordToSelf(record, [&](ActiveTaskStatus oldStatus, ActiveTaskStatus& newStatus) {
     // If the task has already been cancelled, reflect that immediately in
     // the group's status.
-    if (parentStatus.isCancelled()) {
+    if (oldStatus.isCancelled()) {
       impl->statusCancel();
     }
     return true;
@@ -985,7 +985,7 @@ void AccumulatingTaskGroup::destroy() {
   assert(this->isEmpty() && "Attempted to destroy non-empty task group!");
 
   // First, remove the group from the task and deallocate the record
-  removeStatusRecord(getTaskRecord());
+  removeStatusRecordFromSelf(getTaskRecord());
 
   // No need to drain our queue here, as by the time we call destroy,
   // all tasks inside the group must have been awaited on already.
@@ -1008,7 +1008,7 @@ void DiscardingTaskGroup::destroy() {
   assert(this->isEmpty() && "Attempted to destroy non-empty task group!");
 
   // First, remove the group from the task and deallocate the record
-  removeStatusRecord(getTaskRecord());
+  removeStatusRecordFromSelf(getTaskRecord());
 
   // No need to drain our queue here, as by the time we call destroy,
   // all tasks inside the group must have been awaited on already.
@@ -1585,7 +1585,7 @@ reevaluate_if_taskgroup_has_results:;
     auto newStatus = TaskGroupStatus{assumedStatus};
     if (status.compare_exchange_strong(
         assumedStatus, newStatus.completingPendingReadyWaiting(this).status,
-        /*success*/ std::memory_order_relaxed,
+        /*success*/ std::memory_order_release,
         /*failure*/ std::memory_order_acquire)) {
 
       // We're going back to running the task, so if we suspended before,
@@ -1656,7 +1656,7 @@ reevaluate_if_taskgroup_has_results:;
   while (true) {
     if (!hasSuspended) {
       hasSuspended = true;
-      waitingTask->flagAsSuspended();
+      waitingTask->flagAsSuspendedOnTaskGroup(asAbstract(this));
     }
     // Put the waiting task at the beginning of the wait queue.
     SWIFT_TASK_GROUP_DEBUG_LOG(this, "WATCH OUT, SET WAITER ONTO waitQueue.head = %p", waitQueue.load(std::memory_order_relaxed));
@@ -1811,7 +1811,7 @@ void TaskGroupBase::waitAll(SwiftError* bodyError, AsyncTask *waitingTask,
   while (true) {
     if (!hasSuspended) {
       hasSuspended = true;
-      waitingTask->flagAsSuspended();
+      waitingTask->flagAsSuspendedOnTaskGroup(asAbstract(this));
     }
     // Put the waiting task at the beginning of the wait queue.
     if (waitQueue.compare_exchange_strong(

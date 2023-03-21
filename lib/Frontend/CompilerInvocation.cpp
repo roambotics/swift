@@ -429,6 +429,20 @@ static void SaveModuleInterfaceArgs(ModuleInterfaceOptions &Opts,
   }
 }
 
+enum class CxxCompatMode {
+  invalid,
+  enabled,
+  off
+};
+
+static CxxCompatMode validateCxxInteropCompatibilityMode(StringRef mode) {
+  if (mode == "off")
+    return CxxCompatMode::off;
+  if (mode == "swift-5.9")
+    return CxxCompatMode::enabled;
+  return CxxCompatMode::invalid;
+}
+
 static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
                           DiagnosticEngine &Diags,
                           const FrontendOptions &FrontendOpts) {
@@ -486,6 +500,11 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
 
   Opts.DisableImplicitStringProcessingModuleImport |=
     Args.hasArg(OPT_disable_implicit_string_processing_module_import);
+
+  Opts.DisableImplicitBacktracingModuleImport =
+    Args.hasFlag(OPT_disable_implicit_backtracing_module_import,
+                 OPT_enable_implicit_backtracing_module_import,
+                 true);
 
   if (Args.hasArg(OPT_enable_experimental_async_top_level))
     Diags.diagnose(SourceLoc(), diag::warn_flag_deprecated,
@@ -739,6 +758,14 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     }
   }
 
+  if (const Arg *A = Args.getLastArg(OPT_package_name)) {
+    auto pkgName = A->getValue();
+    if (!Lexer::isIdentifier(pkgName))
+      Diags.diagnose(SourceLoc(), diag::error_bad_package_name, pkgName);
+    else
+      Opts.PackageName = pkgName;
+  }
+
   if (const Arg *A = Args.getLastArg(OPT_require_explicit_availability_EQ)) {
     StringRef diagLevel = A->getValue();
     if (diagLevel == "warn") {
@@ -794,8 +821,8 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   } else if (Args.hasArg(OPT_warn_concurrency)) {
     Opts.StrictConcurrencyLevel = StrictConcurrency::Complete;
   } else {
-    // Default to "limited" checking in Swift 5.x.
-    Opts.StrictConcurrencyLevel = StrictConcurrency::Targeted;
+    // Default to minimal checking in Swift 5.x.
+    Opts.StrictConcurrencyLevel = StrictConcurrency::Minimal;
   }
 
   Opts.WarnImplicitOverrides =
@@ -884,7 +911,26 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     Opts.ClangTarget = llvm::Triple(A->getValue());
   }
 
-  Opts.EnableCXXInterop |= Args.hasArg(OPT_enable_experimental_cxx_interop);
+  if (Arg *A = Args.getLastArg(OPT_cxx_interoperability_mode)) {
+    if (Args.hasArg(OPT_enable_experimental_cxx_interop)) {
+      Diags.diagnose(SourceLoc(), diag::dont_enable_interop_and_compat);
+    }
+    
+    auto interopCompatMode = validateCxxInteropCompatibilityMode(A->getValue());
+    Opts.EnableCXXInterop |= (interopCompatMode == CxxCompatMode::enabled);
+
+    if (interopCompatMode == CxxCompatMode::invalid) {
+      Diags.diagnose(SourceLoc(), diag::invalid_interop_compat_mode);
+      Diags.diagnose(SourceLoc(), diag::swift_will_maintain_compat);
+    }
+  }
+  
+  if (Args.hasArg(OPT_enable_experimental_cxx_interop)) {
+    Diags.diagnose(SourceLoc(), diag::enable_interop_flag_deprecated);
+    Diags.diagnose(SourceLoc(), diag::swift_will_maintain_compat);
+    Opts.EnableCXXInterop |= true;
+  }
+
   Opts.EnableObjCInterop =
       Args.hasFlag(OPT_enable_objc_interop, OPT_disable_objc_interop,
                    Target.isOSDarwin());
@@ -1105,6 +1151,8 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
             .Default(ConcurrencyModel::Standard);
   }
 
+  Opts.EnableBuiltinModule = Args.hasArg(OPT_enable_builtin_module);
+
   return HadError || UnsupportedOS || UnsupportedArch;
 }
 
@@ -1218,10 +1266,21 @@ static bool ParseTypeCheckerArgs(TypeCheckerOptions &Opts, ArgList &Args,
   return HadError;
 }
 
+static bool ValidateModulesOnceOptions(const ClangImporterOptions &Opts,
+                                       DiagnosticEngine &Diags) {
+  if (Opts.ValidateModulesOnce && Opts.BuildSessionFilePath.empty()) {
+    Diags.diagnose(SourceLoc(), diag::error_clang_validate_once_requires_session_file);
+    return true;
+  }
+  return false;
+}
+
 static bool ParseClangImporterArgs(ClangImporterOptions &Opts,
                                    ArgList &Args,
                                    DiagnosticEngine &Diags,
-                                   StringRef workingDirectory) {
+                                   StringRef workingDirectory,
+                                   const LangOptions &LangOpts,
+                                   const FrontendOptions &FrontendOpts) {
   using namespace options;
 
   if (const Arg *a = Args.getLastArg(OPT_tools_directory)) {
@@ -1289,6 +1348,15 @@ static bool ParseClangImporterArgs(ClangImporterOptions &Opts,
 
   Opts.DumpClangDiagnostics |= Args.hasArg(OPT_dump_clang_diagnostics);
 
+  // When the repl is invoked directly (ie. `lldb --repl="..."`) the action
+  // type seems to be NoneAction.
+  if (FrontendOpts.RequestedAction != FrontendOptions::ActionType::REPL &&
+      FrontendOpts.RequestedAction != FrontendOptions::ActionType::NoneAction &&
+      (Args.hasArg(OPT_enable_import_objc_forward_declarations) ||
+       LangOpts.isSwiftVersionAtLeast(6))) {
+    Opts.ImportForwardDeclarations = true;
+  }
+
   if (Args.hasArg(OPT_embed_bitcode))
     Opts.Mode = ClangImporterOptions::Modes::EmbedBitcode;
   else if (Args.hasArg(OPT_emit_pcm) || Args.hasArg(OPT_dump_pcm))
@@ -1311,6 +1379,12 @@ static bool ParseClangImporterArgs(ClangImporterOptions &Opts,
     Opts.PrecompiledHeaderOutputDir = A->getValue();
     Opts.PCHDisableValidation |= Args.hasArg(OPT_pch_disable_validation);
   }
+
+  Opts.ValidateModulesOnce |= Args.hasArg(OPT_validate_clang_modules_once);
+  if (auto *A = Args.getLastArg(OPT_clang_build_session_file))
+    Opts.BuildSessionFilePath = A->getValue();
+  if (ValidateModulesOnceOptions(Opts, Diags))
+    return true;
 
   if (Args.hasFlag(options::OPT_warnings_as_errors,
                    options::OPT_no_warnings_as_errors, false))
@@ -1337,6 +1411,7 @@ static void ParseSymbolGraphArgs(symbolgraphgen::SymbolGraphOptions &Opts,
   Opts.Target = LangOpts.Target;
 
   Opts.SkipInheritedDocs = Args.hasArg(OPT_skip_inherited_docs);
+  Opts.SkipProtocolImplementations = Args.hasArg(OPT_skip_protocol_implementations);
   Opts.IncludeSPISymbols = Args.hasArg(OPT_include_spi_symbols);
   Opts.EmitExtensionBlockSymbols =
       Args.hasFlag(OPT_emit_extension_block_symbols,
@@ -1413,6 +1488,20 @@ static bool ParseSearchPathArgs(SearchPathOptions &Opts,
   }
   Opts.setFrameworkSearchPaths(FrameworkSearchPaths);
 
+  for (const Arg *A : Args.filtered(OPT_plugin_path)) {
+    Opts.PluginSearchPaths.push_back(resolveSearchPath(A->getValue()));
+  }
+
+  for (const Arg *A : Args.filtered(OPT_external_plugin_path)) {
+    // '<plugin directory>#<plugin server executable path>'.
+    // FIXME: '#' can be used in the paths.
+    StringRef dylibPath;
+    StringRef serverPath;
+    std::tie(dylibPath, serverPath) = StringRef(A->getValue()).split('#');
+    Opts.ExternalPluginSearchPaths.push_back(
+        {resolveSearchPath(dylibPath), resolveSearchPath(serverPath)});
+  }
+
   for (const Arg *A : Args.filtered(OPT_L)) {
     Opts.LibrarySearchPaths.push_back(resolveSearchPath(A->getValue()));
   }
@@ -1423,6 +1512,15 @@ static bool ParseSearchPathArgs(SearchPathOptions &Opts,
 
   if (const Arg *A = Args.getLastArg(OPT_sdk))
     Opts.setSDKPath(A->getValue());
+
+  if (const Arg *A = Args.getLastArg(OPT_windows_sdk_root))
+    Opts.setWinSDKRoot(A->getValue());
+  if (const Arg *A = Args.getLastArg(OPT_windows_sdk_version))
+    Opts.setWinSDKVersion(A->getValue());
+  if (const Arg *A = Args.getLastArg(OPT_visualc_tools_root))
+    Opts.setVCToolsRoot(A->getValue());
+  if (const Arg *A = Args.getLastArg(OPT_visualc_tools_version))
+    Opts.setVCToolsVersion(A->getValue());
 
   if (const Arg *A = Args.getLastArg(OPT_resource_dir))
     Opts.RuntimeResourcePath = A->getValue();
@@ -1470,6 +1568,15 @@ static bool ParseSearchPathArgs(SearchPathOptions &Opts,
   }
   Opts.setCompilerPluginLibraryPaths(CompilerPluginLibraryPaths);
 
+  std::vector<std::string> CompilerPluginExecutablePaths(
+      Opts.getCompilerPluginExecutablePaths());
+  for (const Arg *A : Args.filtered(OPT_load_plugin_executable)) {
+    // NOTE: The value has '#<module names>' after the path.
+    // But resolveSearchPath() works as long as the value starts with a path.
+    CompilerPluginExecutablePaths.push_back(resolveSearchPath(A->getValue()));
+  }
+  Opts.setCompilerPluginExecutablePaths(CompilerPluginExecutablePaths);
+
   return false;
 }
 
@@ -1501,9 +1608,6 @@ static bool ParseDiagnosticArgs(DiagnosticOptions &Opts, ArgList &Args,
       Opts.PrintedFormattingStyle = DiagnosticOptions::FormattingStyle::LLVM;
     } else if (contents == "swift") {
       Opts.PrintedFormattingStyle = DiagnosticOptions::FormattingStyle::Swift;
-    } else if (contents == "swift-syntax") {
-      Opts.PrintedFormattingStyle =
-          DiagnosticOptions::FormattingStyle::SwiftSyntax;
     } else {
       Diags.diagnose(SourceLoc(), diag::error_unsupported_option_argument,
                      arg->getOption().getPrefixedName(), arg->getValue());
@@ -1805,16 +1909,6 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
     return true;
   }
 
-  if (Args.hasArg(OPT_enable_experimental_move_only) &&
-      !enableLexicalLifetimesFlag.value_or(true)) {
-    // Error if move-only is enabled and lexical lifetimes--on which it
-    // depends--has been disabled.
-    Diags.diagnose(SourceLoc(), diag::error_invalid_arg_combination,
-                   "enable-experimental-move-only",
-                   "enable-lexical-lifetimes=false");
-    return true;
-  }
-
   // Unless overridden below, enabling copy propagation means enabling lexical
   // lifetimes.
   if (Opts.CopyPropagation == CopyPropagationOption::On) {
@@ -1979,6 +2073,8 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
   if (const Arg *A = Args.getLastArg(options::OPT_enforce_exclusivity_EQ)) {
     parseExclusivityEnforcementOptions(A, Opts, Diags);
   }
+
+  Opts.OSSACompleteLifetimes |= Args.hasArg(OPT_enable_ossa_complete_lifetimes);
 
   return false;
 }
@@ -2525,10 +2621,9 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
                    OPT_disable_emit_generic_class_ro_t_list,
                    Opts.EmitGenericRODatas);
 
-  Opts.LegacyPassManager =
-      Args.hasFlag(OPT_disable_new_llvm_pass_manager,
-                   OPT_enable_new_llvm_pass_manager,
-                   Opts.LegacyPassManager);
+  Opts.ColocateTypeDescriptors = Args.hasFlag(OPT_enable_colocate_type_descriptors,
+                                              OPT_disable_colocate_type_descriptors,
+                                              Opts.ColocateTypeDescriptors);
   Opts.CollocatedMetadataFunctions =
       Args.hasFlag(OPT_enable_collocate_metadata_functions,
                    OPT_disable_collocate_metadata_functions,
@@ -2680,7 +2775,7 @@ bool CompilerInvocation::parseArgs(
   }
 
   if (ParseClangImporterArgs(ClangImporterOpts, ParsedArgs, Diags,
-                             workingDirectory)) {
+                             workingDirectory, LangOpts, FrontendOpts)) {
     return true;
   }
 

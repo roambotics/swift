@@ -94,6 +94,7 @@ CONSTANT_OWNERSHIP_INST(Owned, ObjCMetatypeToObject)
 CONSTANT_OWNERSHIP_INST(None, AddressToPointer)
 CONSTANT_OWNERSHIP_INST(None, AllocStack)
 CONSTANT_OWNERSHIP_INST(None, AllocPack)
+CONSTANT_OWNERSHIP_INST(None, PackLength)
 CONSTANT_OWNERSHIP_INST(None, BeginAccess)
 CONSTANT_OWNERSHIP_INST(None, BindMemory)
 CONSTANT_OWNERSHIP_INST(None, RebindMemory)
@@ -144,7 +145,7 @@ CONSTANT_OWNERSHIP_INST(None, UncheckedTrivialBitCast)
 CONSTANT_OWNERSHIP_INST(None, ValueMetatype)
 CONSTANT_OWNERSHIP_INST(None, WitnessMethod)
 CONSTANT_OWNERSHIP_INST(None, StoreBorrow)
-CONSTANT_OWNERSHIP_INST(None, ConvertEscapeToNoEscape)
+CONSTANT_OWNERSHIP_INST(Owned, ConvertEscapeToNoEscape)
 CONSTANT_OWNERSHIP_INST(Unowned, InitBlockStorageHeader)
 CONSTANT_OWNERSHIP_INST(None, DifferentiabilityWitnessFunction)
 // TODO: It would be great to get rid of these.
@@ -279,6 +280,7 @@ FORWARDING_OWNERSHIP_INST(InitExistentialRef)
 FORWARDING_OWNERSHIP_INST(DifferentiableFunction)
 FORWARDING_OWNERSHIP_INST(LinearFunction)
 FORWARDING_OWNERSHIP_INST(MarkMustCheck)
+FORWARDING_OWNERSHIP_INST(MarkUnresolvedReferenceBinding)
 FORWARDING_OWNERSHIP_INST(MoveOnlyWrapperToCopyableValue)
 FORWARDING_OWNERSHIP_INST(CopyableToMoveOnlyWrapperValue)
 #undef FORWARDING_OWNERSHIP_INST
@@ -354,7 +356,11 @@ ValueOwnershipKind ValueOwnershipKindClassifier::visitLoadInst(LoadInst *LI) {
 
 ValueOwnershipKind
 ValueOwnershipKindClassifier::visitPartialApplyInst(PartialApplyInst *PA) {
-  if (PA->isOnStack())
+  // partial_apply instructions are modeled as creating an owned value during
+  // OSSA, to track borrows of their captures, and so that they can themselves
+  // be borrowed during calls, but they become trivial once ownership is
+  // lowered away.
+  if (PA->isOnStack() && !PA->getFunction()->hasOwnership())
     return OwnershipKind::None;
   return OwnershipKind::Owned;
 }
@@ -497,6 +503,7 @@ CONSTANT_OWNERSHIP_BUILTIN(None, AllocRaw)
 CONSTANT_OWNERSHIP_BUILTIN(None, AssertConf)
 CONSTANT_OWNERSHIP_BUILTIN(None, UToSCheckedTrunc)
 CONSTANT_OWNERSHIP_BUILTIN(None, StackAlloc)
+CONSTANT_OWNERSHIP_BUILTIN(None, UnprotectedStackAlloc)
 CONSTANT_OWNERSHIP_BUILTIN(None, StackDealloc)
 CONSTANT_OWNERSHIP_BUILTIN(None, SToSCheckedTrunc)
 CONSTANT_OWNERSHIP_BUILTIN(None, SToUCheckedTrunc)
@@ -551,6 +558,7 @@ CONSTANT_OWNERSHIP_BUILTIN(None, ConvertTaskToJob)
 CONSTANT_OWNERSHIP_BUILTIN(None, InitializeDefaultActor)
 CONSTANT_OWNERSHIP_BUILTIN(None, DestroyDefaultActor)
 CONSTANT_OWNERSHIP_BUILTIN(None, InitializeDistributedRemoteActor)
+CONSTANT_OWNERSHIP_BUILTIN(None, InitializeNonDefaultDistributedActor)
 CONSTANT_OWNERSHIP_BUILTIN(Owned, AutoDiffCreateLinearMapContext)
 CONSTANT_OWNERSHIP_BUILTIN(None, AutoDiffProjectTopLevelSubcontext)
 CONSTANT_OWNERSHIP_BUILTIN(None, AutoDiffAllocateSubcontext)

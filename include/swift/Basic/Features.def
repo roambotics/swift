@@ -82,6 +82,7 @@ LANGUAGE_FEATURE(BuiltinBuildMainExecutor, 0, "MainActor executor building built
 LANGUAGE_FEATURE(BuiltinCreateAsyncTaskInGroup, 0, "MainActor executor building builtin", true)
 LANGUAGE_FEATURE(BuiltinCopy, 0, "Builtin.copy()", true)
 LANGUAGE_FEATURE(BuiltinStackAlloc, 0, "Builtin.stackAlloc", true)
+LANGUAGE_FEATURE(BuiltinUnprotectedStackAlloc, 0, "Builtin.unprotectedStackAlloc", true)
 LANGUAGE_FEATURE(BuiltinTaskRunInline, 0, "Builtin.taskRunInline", true)
 LANGUAGE_FEATURE(BuiltinUnprotectedAddressOf, 0, "Builtin.unprotectedAddressOf", true)
 SUPPRESSIBLE_LANGUAGE_FEATURE(SpecializeAttributeWithAvailability, 0, "@_specialize attribute with availability", true)
@@ -92,9 +93,11 @@ SUPPRESSIBLE_LANGUAGE_FEATURE(PrimaryAssociatedTypes2, 346, "Primary associated 
 SUPPRESSIBLE_LANGUAGE_FEATURE(UnavailableFromAsync, 0, "@_unavailableFromAsync", true)
 SUPPRESSIBLE_LANGUAGE_FEATURE(NoAsyncAvailability, 340, "@available(*, noasync)", true)
 LANGUAGE_FEATURE(BuiltinIntLiteralAccessors, 368, "Builtin.IntLiteral accessors", true)
-LANGUAGE_FEATURE(
-    FreestandingExpressionMacros, 0, "@freestanding(expression) macros",
-    langOpts.hasFeature(Feature::Macros))
+LANGUAGE_FEATURE(Macros, 0, "Macros", true)
+SUPPRESSIBLE_LANGUAGE_FEATURE(
+    FreestandingExpressionMacros, 382, "Expression macros",
+    true)
+LANGUAGE_FEATURE(AttachedMacros, 389, "Attached macros", true)
 
 UPCOMING_FEATURE(ConciseMagicFile, 274, 6)
 UPCOMING_FEATURE(ForwardTrailingClosures, 286, 6)
@@ -106,6 +109,7 @@ EXPERIMENTAL_FEATURE(VariadicGenerics, false)
 EXPERIMENTAL_FEATURE(NamedOpaqueTypes, false)
 EXPERIMENTAL_FEATURE(FlowSensitiveConcurrencyCaptures, false)
 EXPERIMENTAL_FEATURE(MoveOnly, true)
+EXPERIMENTAL_FEATURE(FreestandingMacros, true)
 
 // FIXME: MoveOnlyClasses is not intended to be in production,
 // but our tests currently rely on it, and we want to run those
@@ -115,7 +119,13 @@ EXPERIMENTAL_FEATURE(MoveOnlyClasses, true)
 EXPERIMENTAL_FEATURE(OneWayClosureParameters, false)
 EXPERIMENTAL_FEATURE(TypeWitnessSystemInference, false)
 EXPERIMENTAL_FEATURE(LayoutPrespecialization, true)
+
 EXPERIMENTAL_FEATURE(ModuleInterfaceExportAs, true)
+EXPERIMENTAL_FEATURE(AccessLevelOnImport, true)
+
+/// Whether to enable experimental layout string value witnesses
+EXPERIMENTAL_FEATURE(LayoutStringValueWitnesses, true)
+EXPERIMENTAL_FEATURE(LayoutStringValueWitnessesInstantiation, true)
 
 /// Whether to enable experimental differentiable programming features:
 /// `@differentiable` declaration attribute, etc.
@@ -154,9 +164,6 @@ EXPERIMENTAL_FEATURE(ImplicitSome, false)
 /// corresponding syntax tree.
 EXPERIMENTAL_FEATURE(ParserASTGen, false)
 
-/// Enable the experimental macros feature.
-EXPERIMENTAL_FEATURE(Macros, true)
-
 /// Parse using the Swift (swift-syntax) parser and use ASTGen to generate the
 /// corresponding syntax tree.
 EXPERIMENTAL_FEATURE(BuiltinMacros, false)
@@ -169,6 +176,12 @@ EXPERIMENTAL_FEATURE(RuntimeDiscoverableAttrs, false)
 /// Swift types and C++ methods as symbolic functions with blank
 /// signatures.
 EXPERIMENTAL_FEATURE(ImportSymbolicCXXDecls, false)
+
+/// Generate bindings for functions that 'throw' in the C++ section of the generated Clang header.
+EXPERIMENTAL_FEATURE(GenerateBindingsForThrowingFunctionsInCXX, false)
+
+/// Enable reference bindings.
+EXPERIMENTAL_FEATURE(ReferenceBindings, false)
 
 #undef EXPERIMENTAL_FEATURE
 #undef UPCOMING_FEATURE

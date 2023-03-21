@@ -618,74 +618,86 @@ static void addModuleDependencies(ArrayRef<ImportedModule> imports,
       case FileUnitKind::DWARFModule:
       case FileUnitKind::ClangModule: {
         auto *LFU = cast<LoadedFile>(FU);
-        if (auto F = fileMgr.getFile(LFU->getFilename())) {
-          // Use module real name for unit writer in case module aliasing
-          // is used. For example, if a file being indexed has `import Foo`
-          // and `-module-alias Foo=Bar` is passed, treat Foo as an alias
-          // and Bar as the real module name as its dependency.
-          StringRef moduleName = mod->getRealName().str();
-          bool withoutUnitName = true;
-          if (FU->getKind() == FileUnitKind::ClangModule) {
-            auto clangModUnit = cast<ClangModuleUnit>(LFU);
-            bool shouldIndexModule = indexClangModules &&
-                (!clangModUnit->isSystemModule() || indexSystemModules);
-            withoutUnitName = !shouldIndexModule;
-            if (auto clangMod = clangModUnit->getUnderlyingClangModule()) {
-              moduleName = clangMod->getTopLevelModuleName();
-              // FIXME: clang's -Rremarks do not seem to go through Swift's
-              // diagnostic emitter.
-              if (shouldIndexModule)
-                clang::index::emitIndexDataForModuleFile(clangMod,
-                                                         clangCI, unitWriter);
-              // Emit the symbolic interface file in addition to index data.
-              if (indexClangModules)
-                emitSymbolicInterfaceForClangModule(clangModUnit, mod, clangMod,
-                                                    indexStorePath, clangCI,
-                                                    diags);
-            }
-          } else {
-            // Serialized AST file.
-            // Only index distributed system modules, and the stdlib.
-            // We don't officially support binary swift modules, so normally
-            // the index data for user modules would get generated while
-            // building them.
-            bool isDistributedModule = mod->isSDKModule() ||
-                      mod->getASTContext().SearchPathOpts.getSDKPath().empty();
-            if (mod->isSystemModule() && indexSystemModules &&
-                (isDistributedModule || mod->isStdlibModule()) &&
-                (!skipStdlib || !mod->isStdlibModule())) {
-              emitDataForSwiftSerializedModule(mod, indexStorePath,
-                                               indexClangModules,
-                                               indexSystemModules, skipStdlib,
-                                               includeLocals, targetTriple,
-                                               clangCI, diags,
-                                               unitWriter,
-                                               pathRemapper,
-                                               initialFile);
-              withoutUnitName = false;
-            }
 
-            // If this is a cross-import overlay, make sure we use the name of
-            // the underlying module instead.
-            if (auto *declaring = mod->getDeclaringModuleIfCrossImportOverlay())
-              moduleName = declaring->getNameStr();
-
-            // Emit symbolic interface files for any re-exported Clang modules
-            // from this Swift module.
-            if (mod->getASTContext().LangOpts.EnableCXXInterop) {
-              SmallVector<ImportedModule, 4> imports;
-              mod->getImportedModules(imports,
-                                      ModuleDecl::ImportFilterKind::Exported);
-              if (indexClangModules)
-                emitTransitiveClangSymbolicInterfacesForSwiftModuleImports(
-                    imports, indexStorePath, clangCI, diags);
-            }
-          }
-          clang::index::writer::OpaqueModule opaqMod =
-              moduleNameScratch.createString(moduleName);
-          unitWriter.addASTFileDependency(*F, mod->isSystemModule(), opaqMod,
-                                          withoutUnitName);
+        // This should really be returned from emitting index data, rather
+        // than guessing which is used for the output file here.
+        StringRef modulePath;
+        if (FU->getKind() == FileUnitKind::ClangModule) {
+          modulePath = LFU->getFilename();
+        } else {
+          modulePath = LFU->getSourceFilename();
         }
+
+        auto F = fileMgr.getFile(modulePath);
+        if (!F)
+          break;
+
+        // Use module real name for unit writer in case module aliasing
+        // is used. For example, if a file being indexed has `import Foo`
+        // and `-module-alias Foo=Bar` is passed, treat Foo as an alias
+        // and Bar as the real module name as its dependency.
+        StringRef moduleName = mod->getRealName().str();
+        bool withoutUnitName = true;
+        if (FU->getKind() == FileUnitKind::ClangModule) {
+          auto clangModUnit = cast<ClangModuleUnit>(LFU);
+          bool shouldIndexModule =
+              indexClangModules &&
+              (!mod->isNonUserModule() || indexSystemModules);
+          withoutUnitName = !shouldIndexModule;
+          if (auto clangMod = clangModUnit->getUnderlyingClangModule()) {
+            moduleName = clangMod->getTopLevelModuleName();
+            // FIXME: clang's -Rremarks do not seem to go through Swift's
+            // diagnostic emitter.
+            if (shouldIndexModule)
+              clang::index::emitIndexDataForModuleFile(clangMod,
+                                                       clangCI, unitWriter);
+            // Emit the symbolic interface file in addition to index data.
+            if (indexClangModules)
+              emitSymbolicInterfaceForClangModule(clangModUnit, mod, clangMod,
+                                                  indexStorePath, clangCI,
+                                                  diags);
+          }
+        } else {
+          // Serialized AST file.
+          // Only index distributed system modules, and the stdlib.
+          // We don't officially support binary swift modules, so normally
+          // the index data for user modules would get generated while
+          // building them.
+          if (mod->isNonUserModule() && indexSystemModules &&
+              (!skipStdlib || !mod->isStdlibModule())) {
+            emitDataForSwiftSerializedModule(mod, indexStorePath,
+                                             indexClangModules,
+                                             indexSystemModules, skipStdlib,
+                                             includeLocals, targetTriple,
+                                             clangCI, diags,
+                                             unitWriter,
+                                             pathRemapper,
+                                             initialFile);
+            withoutUnitName = false;
+          }
+
+          // If this is a cross-import overlay, make sure we use the name of
+          // the underlying module instead.
+          if (auto *declaring = mod->getDeclaringModuleIfCrossImportOverlay())
+            moduleName = declaring->getNameStr();
+
+
+          // Emit symbolic interface files for any re-exported Clang modules
+          // from this Swift module.
+          if (mod->getASTContext().LangOpts.EnableCXXInterop) {
+            SmallVector<ImportedModule, 4> imports;
+            mod->getImportedModules(imports,
+                                    ModuleDecl::ImportFilterKind::Exported);
+            if (indexClangModules)
+              emitTransitiveClangSymbolicInterfacesForSwiftModuleImports(
+                  imports, indexStorePath, clangCI, diags);
+          }
+        }
+        clang::index::writer::OpaqueModule opaqMod =
+            moduleNameScratch.createString(moduleName);
+        unitWriter.addASTFileDependency(*F, mod->isNonUserModule(), opaqMod,
+                                        withoutUnitName);
+
         break;
       }
       }
@@ -707,7 +719,7 @@ emitDataForSwiftSerializedModule(ModuleDecl *module,
                                  IndexUnitWriter &parentUnitWriter,
                                  const PathRemapper &pathRemapper,
                                  SourceFile *initialFile) {
-  StringRef filename = module->getModuleFilename();
+  StringRef filename = module->getModuleSourceFilename();
   std::string moduleName = module->getNameStr().str();
 
   // If this is a cross-import overlay, make sure we use the name of the
@@ -716,8 +728,9 @@ emitDataForSwiftSerializedModule(ModuleDecl *module,
     moduleName = declaring->getNameStr().str();
 
   std::string error;
-  auto isUptodateOpt = parentUnitWriter.isUnitUpToDateForOutputFile(/*FilePath=*/filename,
-                                                                /*TimeCompareFilePath=*/filename, error);
+  auto isUptodateOpt = parentUnitWriter.isUnitUpToDateForOutputFile(
+      /*FilePath=*/filename,
+      /*TimeCompareFilePath=*/filename, error);
   if (!isUptodateOpt.has_value()) {
     diags.diagnose(SourceLoc(), diag::error_index_failed_status_check, error);
     return true;
@@ -818,31 +831,28 @@ emitDataForSwiftSerializedModule(ModuleDecl *module,
   }
 
   auto &fileMgr = clangCI.getFileManager();
-  bool isSystem = module->isSystemModule();
+  bool isSystem = module->isNonUserModule();
   // FIXME: Get real values for the following.
   StringRef swiftVersion;
   StringRef sysrootPath = clangCI.getHeaderSearchOpts().Sysroot;
-  std::string indexUnitToken = module->getModuleFilename().str();
   // For indexing serialized modules 'debug compilation' is irrelevant, so
   // set it to true by default.
   bool isDebugCompilation = true;
   auto clangRemapper = pathRemapper.asClangPathRemapper();
 
-  IndexUnitWriter unitWriter(fileMgr, indexStorePath,
-    "swift", swiftVersion, indexUnitToken, moduleName,
-    /*MainFile=*/nullptr, isSystem, /*IsModuleUnit=*/true,
-    isDebugCompilation, targetTriple, sysrootPath,
-    clangRemapper, getModuleInfoFromOpaqueModule);
+  IndexUnitWriter unitWriter(
+      fileMgr, indexStorePath, "swift", swiftVersion, filename, moduleName,
+      /*MainFile=*/nullptr, isSystem, /*IsModuleUnit=*/true, isDebugCompilation,
+      targetTriple, sysrootPath, clangRemapper, getModuleInfoFromOpaqueModule);
 
   auto FE = fileMgr.getFile(filename);
-  bool isSystemModule = module->isSystemModule();
   for (auto &pair : records) {
     std::string &recordFile = pair.first;
     std::string &groupName = pair.second;
     if (recordFile.empty())
       continue;
     clang::index::writer::OpaqueModule mod = &groupName;
-    unitWriter.addRecordFile(recordFile, *FE, isSystemModule, mod);
+    unitWriter.addRecordFile(recordFile, *FE, isSystem, mod);
   }
 
   SmallVector<ImportedModule, 8> imports;
@@ -874,7 +884,7 @@ recordSourceFileUnit(SourceFile *primarySourceFile, StringRef indexUnitToken,
                      DiagnosticEngine &diags) {
   auto &fileMgr = clangCI.getFileManager();
   auto *module = primarySourceFile->getParentModule();
-  bool isSystem = module->isSystemModule();
+  bool isSystem = module->isNonUserModule();
   auto mainFile = fileMgr.getFile(primarySourceFile->getFilename());
   auto clangRemapper = pathRemapper.asClangPathRemapper();
   // FIXME: Get real values for the following.
@@ -907,7 +917,7 @@ recordSourceFileUnit(SourceFile *primarySourceFile, StringRef indexUnitToken,
                      auto file = fileMgr.getFile(filename);
                      unitWriter.addRecordFile(
                          recordFile, file ? *file : nullptr,
-                         module->isSystemModule(), /*Module=*/nullptr);
+                         module->isNonUserModule(), /*Module=*/nullptr);
                    });
 
   std::string error;

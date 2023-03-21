@@ -193,7 +193,7 @@ TreatArrayLiteralAsDictionary *
 TreatArrayLiteralAsDictionary::attempt(ConstraintSystem &cs, Type dictionaryTy,
                                        Type arrayTy,
                                        ConstraintLocator *locator) {
-  if (!cs.isArrayType(arrayTy))
+  if (!arrayTy->isArrayType())
     return nullptr;
 
   // Determine the ArrayExpr from the locator.
@@ -732,10 +732,31 @@ AllowFunctionTypeMismatch::create(ConstraintSystem &cs, Type lhs, Type rhs,
       AllowFunctionTypeMismatch(cs, lhs, rhs, locator, index);
 }
 
+bool GenericArgumentsMismatch::coalesceAndDiagnose(
+    const Solution &solution, ArrayRef<ConstraintFix *> secondaryFixes,
+    bool asNote) const {
+  std::set<unsigned> scratch(getMismatches().begin(), getMismatches().end());
+
+  for (auto *fix : secondaryFixes) {
+    auto *genericArgsFix = fix->castTo<GenericArgumentsMismatch>();
+    for (auto mismatchIdx : genericArgsFix->getMismatches())
+      scratch.insert(mismatchIdx);
+  }
+
+  SmallVector<unsigned> mismatches(scratch.begin(), scratch.end());
+  return diagnose(solution, mismatches, asNote);
+}
+
 bool GenericArgumentsMismatch::diagnose(const Solution &solution,
                                         bool asNote) const {
+  return diagnose(solution, getMismatches(), asNote);
+}
+
+bool GenericArgumentsMismatch::diagnose(const Solution &solution,
+                                        ArrayRef<unsigned> mismatches,
+                                        bool asNote) const {
   GenericArgumentsMismatchFailure failure(solution, getFromType(), getToType(),
-                                          getMismatches(), getLocator());
+                                          mismatches, getLocator());
   return failure.diagnose(asNote);
 }
 
@@ -1366,6 +1387,20 @@ bool MustBeCopyable::diagnoseForAmbiguity(CommonFixesArray commonFixes) const {
   return diagnose(*commonFixes.front().first);
 }
 
+bool AllowInvalidPackElement::diagnose(const Solution &solution,
+                                       bool asNote) const {
+  InvalidPackElement failure(solution, packElementType, getLocator());
+  return failure.diagnose(asNote);
+}
+
+AllowInvalidPackElement *
+AllowInvalidPackElement::create(ConstraintSystem &cs,
+                                Type packElementType,
+                                ConstraintLocator *locator) {
+  return new (cs.getAllocator())
+      AllowInvalidPackElement(cs, packElementType, locator);
+}
+
 bool CollectionElementContextualMismatch::diagnose(const Solution &solution,
                                                    bool asNote) const {
   CollectionElementContextualFailure failure(
@@ -1676,7 +1711,7 @@ ExpandArrayIntoVarargs::attempt(ConstraintSystem &cs, Type argType,
   if (!(argLoc && argLoc->getParameterFlags().isVariadic()))
     return nullptr;
 
-  auto elementType = cs.isArrayType(argType);
+  auto elementType = argType->isArrayType();
   if (!elementType)
     return nullptr;
 
@@ -1684,7 +1719,7 @@ ExpandArrayIntoVarargs::attempt(ConstraintSystem &cs, Type argType,
   options |= ConstraintSystem::TypeMatchFlags::TMF_ApplyingFix;
   options |= ConstraintSystem::TypeMatchFlags::TMF_GenerateConstraints;
 
-  auto result = cs.matchTypes(*elementType, paramType, ConstraintKind::Subtype,
+  auto result = cs.matchTypes(elementType, paramType, ConstraintKind::Subtype,
                               options, builder);
 
   if (result.isFailure())

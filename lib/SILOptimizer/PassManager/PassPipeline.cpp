@@ -115,8 +115,8 @@ static void addDefiniteInitialization(SILPassPipelinePlan &P) {
 // should be in the -Onone pass pipeline and the prepare optimizations pipeline.
 static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("Mandatory Diagnostic Passes + Enabling Optimization Passes");
-  P.addSILGenCleanup();
   P.addDiagnoseInvalidEscapingCaptures();
+  P.addReferenceBindingTransform();
   P.addDiagnoseStaticExclusivity();
   P.addNestedSemanticFunctionCheck();
   P.addCapturePromotion();
@@ -154,14 +154,8 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   // resolution of nonescaping closure lifetimes to correctly check the use
   // of move-only values as captures in nonescaping closures as borrows.
 
-  // Check noImplicitCopy and move only types for objects
-  //
-  // NOTE: It is important that this is run /before/ move only address checker
-  // since if the address checker emits an error, it will cleanup copy_value of
-  // move only objects meaning that we could lose object level diagnostics.
-  P.addMoveOnlyObjectChecker();
-  // Check noImplicitCopy and move only types for addresses.
-  P.addMoveOnlyAddressChecker();
+  // Check noImplicitCopy and move only types for objects and addresses.
+  P.addMoveOnlyChecker();
   // Convert last destroy_value to deinits.
   P.addMoveOnlyDeinitInsertion();
   // Lower move only wrapped trivial types.
@@ -241,12 +235,21 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
 }
 
 SILPassPipelinePlan
-SILPassPipelinePlan::getDiagnosticPassPipeline(const SILOptions &Options) {
+SILPassPipelinePlan::getSILGenPassPipeline(const SILOptions &Options) {
   SILPassPipelinePlan P(Options);
+  P.startPipeline("SILGen Passes");
+
+  P.addSILGenCleanup();
 
   if (SILViewSILGenCFG) {
     addCFGPrinterPipeline(P, "SIL View SILGen CFG");
   }
+  return P;
+}
+
+SILPassPipelinePlan
+SILPassPipelinePlan::getDiagnosticPassPipeline(const SILOptions &Options) {
+  SILPassPipelinePlan P(Options);
 
   // If we are asked do debug serialization, instead of running all diagnostic
   // passes, just run mandatory inlining with dead transparent function cleanup
@@ -591,6 +594,7 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
   P.addTempRValueOpt();
   // Cleanup after SILGen: remove unneeded borrows/copies.
   if (P.getOptions().CopyPropagation == CopyPropagationOption::On) {
+    P.addComputeSideEffects();
     P.addCopyPropagation();
   }
   P.addSemanticARCOpts();

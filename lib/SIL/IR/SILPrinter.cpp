@@ -186,6 +186,8 @@ static void printFullContext(const DeclContext *Context, raw_ostream &Buffer) {
   if (!Context)
     return;
   switch (Context->getContextKind()) {
+  case swift::DeclContextKind::Package:
+    return;
   case DeclContextKind::Module:
     if (Context == cast<ModuleDecl>(Context)->getASTContext().TheBuiltinModule)
       Buffer << cast<ModuleDecl>(Context)->getName() << ".";
@@ -1391,8 +1393,8 @@ public:
       *this << "[dynamic_lifetime] ";
     if (AVI->isLexical())
       *this << "[lexical] ";
-    if (AVI->getWasMoved())
-      *this << "[moved] ";
+    if (AVI->getUsesMoveableValueDebugInfo() && !AVI->getType().isMoveOnly())
+      *this << "[moveable_value_debuginfo] ";
     *this << AVI->getElementType();
     printDebugVar(AVI->getVarInfo(),
                   &AVI->getModule().getASTContext().SourceMgr);
@@ -1432,6 +1434,12 @@ public:
     if (ABI->emitReflectionMetadata()) {
       *this << "[reflection] ";
     }
+
+    if (ABI->getUsesMoveableValueDebugInfo() &&
+        !ABI->getAddressType().isMoveOnly()) {
+      *this << "[moveable_value_debuginfo] ";
+    }
+
     *this << ABI->getType();
     printDebugVar(ABI->getVarInfo(),
                   &ABI->getModule().getASTContext().SourceMgr);
@@ -1762,8 +1770,9 @@ public:
   void visitDebugValueInst(DebugValueInst *DVI) {
     if (DVI->poisonRefs())
       *this << "[poison] ";
-    if (DVI->getWasMoved())
-      *this << "[moved] ";
+    if (DVI->getUsesMoveableValueDebugInfo() &&
+        !DVI->getOperand()->getType().isMoveOnly())
+      *this << "[moveable_value_debuginfo] ";
     if (DVI->hasTrace())
       *this << "[trace] ";
     *this << getIDAndType(DVI->getOperand());
@@ -1992,11 +2001,27 @@ public:
     switch (I->getCheckKind()) {
     case CheckKind::Invalid:
       llvm_unreachable("Invalid?!");
-    case CheckKind::NoImplicitCopy:
-      *this << "[no_implicit_copy] ";
+    case CheckKind::ConsumableAndAssignable:
+      *this << "[consumable_and_assignable] ";
       break;
-    case CheckKind::NoCopy:
-      *this << "[no_copy] ";
+    case CheckKind::NoConsumeOrAssign:
+      *this << "[no_consume_or_assign] ";
+      break;
+    case CheckKind::AssignableButNotConsumable:
+      *this << "[assignable_but_not_consumable] ";
+      break;
+    }
+    *this << getIDAndType(I->getOperand());
+  }
+
+  void visitMarkUnresolvedReferenceBindingInst(
+      MarkUnresolvedReferenceBindingInst *I) {
+    using Kind = MarkUnresolvedReferenceBindingInst::Kind;
+    switch (I->getKind()) {
+    case Kind::Invalid:
+      llvm_unreachable("Invalid?!");
+    case Kind::InOut:
+      *this << "[inout] ";
       break;
     }
     *this << getIDAndType(I->getOperand());
@@ -2271,6 +2296,9 @@ public:
   void visitDeallocExistentialBoxInst(DeallocExistentialBoxInst *DEI) {
     *this << getIDAndType(DEI->getOperand()) << ", $" << DEI->getConcreteType();
   }
+  void visitPackLengthInst(PackLengthInst *PLI) {
+    *this << "$" << PLI->getPackType();
+  }
   void visitDynamicPackIndexInst(DynamicPackIndexInst *DPII) {
     *this << Ctx.getID(DPII->getOperand()) << " of $"
           << DPII->getIndexedPackType();
@@ -2291,7 +2319,13 @@ public:
           << " of " << subs.getGenericSignature()
           << " at ";
     printSubstitutions(subs);
-    *this << ", shape $" << env->getOpenedElementShapeClass()
+    // The shape class in the opened environment is a canonical interface
+    // type, which won't resolve in the generic signature we just printed.
+    // Map it back to the sugared generic parameter.
+    auto sugaredShapeClass =
+      subs.getGenericSignature()->getSugaredType(
+        env->getOpenedElementShapeClass());
+    *this << ", shape $" << sugaredShapeClass
           << ", uuid \"" << env->getOpenedElementUUID() << "\"";
   }
   void visitPackElementGetInst(PackElementGetInst *I) {
@@ -2667,10 +2701,10 @@ public:
       *this << ' ';
       printSubstitutions(KPI->getSubstitutions());
     }
-    if (!KPI->getAllOperands().empty()) {
+    if (!KPI->getPatternOperands().empty()) {
       *this << " (";
       
-      interleave(KPI->getAllOperands(),
+      interleave(KPI->getPatternOperands(),
         [&](const Operand &operand) {
           *this << Ctx.getID(operand.get());
         }, [&]{
@@ -3087,6 +3121,9 @@ void SILFunction::print(SILPrintContext &PrintCtx) const {
   }
   if (isRuntimeAccessible()) {
     OS << "[runtime_accessible] ";
+  }
+  if (forceEnableLexicalLifetimes()) {
+    OS << "[lexical_lifetimes] ";
   }
 
   if (isExactSelfClass()) {
@@ -4096,7 +4133,9 @@ void SILSpecializeAttr::print(llvm::raw_ostream &OS) const {
           } else {
             Requirement ReqWithDecls(req.getKind(), FirstTy,
                                      req.getLayoutConstraint());
-            ReqWithDecls.print(OS, SubPrinter);
+            auto SubPrinterCopy = SubPrinter;
+            SubPrinterCopy.PrintClassLayoutName = erased;
+            ReqWithDecls.print(OS, SubPrinterCopy);
           }
         },
         [&] { OS << ", "; });

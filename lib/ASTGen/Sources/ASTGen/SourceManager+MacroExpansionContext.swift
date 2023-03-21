@@ -42,7 +42,7 @@ extension SourceManager {
 extension String {
   /// Retrieve the base name of a string that represents a path, removing the
   /// directory.
-  fileprivate var basename: String {
+  var basename: String {
     guard let lastSlash = lastIndex(of: "/") else {
       return self
     }
@@ -53,7 +53,7 @@ extension String {
 
 extension SourceManager.MacroExpansionContext: MacroExpansionContext {
   /// Generate a unique name for use in the macro.
-  public func createUniqueName(_ providedName: String) -> TokenSyntax {
+  public func makeUniqueName(_ providedName: String) -> TokenSyntax {
     // If provided with an empty name, substitute in something.
     let name = providedName.isEmpty ? "__local" : providedName
 

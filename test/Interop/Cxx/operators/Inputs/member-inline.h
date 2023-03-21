@@ -22,6 +22,8 @@ struct LoadableIntWrapper {
     return value + x * y;
   }
 
+  operator int() const { return value; }
+
   LoadableIntWrapper &operator++() {
     value++;
     return *this;
@@ -48,6 +50,7 @@ struct LoadableBoolWrapper {
   LoadableBoolWrapper operator!() {
     return LoadableBoolWrapper{.value = !value};
   }
+  operator bool() const { return value; }
 };
 
 template<class T>
@@ -392,6 +395,23 @@ private:
   int value = 456;
 public:
   int operator*() const { return value; }
+};
+
+struct AmbiguousOperatorStar {
+private:
+  int value = 567;
+public:
+  int &operator*() { return value; }
+  const int &operator*() const { return value; }
+};
+
+struct AmbiguousOperatorStar2 {
+private:
+  int value = 678;
+public:
+  int &operator*() & { return value; }
+  const int &operator*() const & { return value; }
+  const int &&operator*() const && { return static_cast<const int &&>(value); }
 };
 
 #endif

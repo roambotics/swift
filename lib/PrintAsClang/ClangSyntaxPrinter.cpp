@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ClangSyntaxPrinter.h"
+#include "PrimitiveTypeMapping.h"
 #include "swift/ABI/MetadataValues.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
@@ -141,7 +142,7 @@ void ClangSyntaxPrinter::printModuleNamespaceStart(
     const ModuleDecl &moduleContext) const {
   os << "namespace ";
   printBaseName(&moduleContext);
-  os << " __attribute__((swift_private))";
+  os << " SWIFT_PRIVATE_ATTR";
   printSymbolUSRAttribute(&moduleContext);
   os << " {\n";
 }
@@ -154,7 +155,7 @@ void ClangSyntaxPrinter::printNamespace(
   os << "namespace ";
   namePrinter(os);
   if (trivia == NamespaceTrivia::AttributeSwiftPrivate)
-    os << " __attribute__((swift_private))";
+    os << " SWIFT_PRIVATE_ATTR";
   if (moduleContext)
     printSymbolUSRAttribute(moduleContext);
   os << " {\n\n";
@@ -193,9 +194,11 @@ void ClangSyntaxPrinter::printSwiftImplQualifier() const {
 }
 
 void ClangSyntaxPrinter::printInlineForThunk() const {
-  // FIXME: make a macro and add 'nodebug', and
-  // migrate all other 'inline' uses.
-  os << "inline __attribute__((always_inline)) ";
+  os << "SWIFT_INLINE_THUNK ";
+}
+
+void ClangSyntaxPrinter::printInlineForHelperFunction() const {
+  os << "SWIFT_INLINE_PRIVATE_HELPER ";
 }
 
 void ClangSyntaxPrinter::printNullability(
@@ -347,7 +350,8 @@ void ClangSyntaxPrinter::printGenericSignatureParams(
 
 void ClangSyntaxPrinter::printGenericRequirementInstantiantion(
     const GenericRequirement &requirement) {
-  assert(requirement.isMetadata() && "protocol requirements not supported yet!");
+  assert(requirement.isAnyMetadata() &&
+         "protocol requirements not supported yet!");
   auto *gtpt = requirement.getTypeParameter()->getAs<GenericTypeParamType>();
   assert(gtpt && "unexpected generic param type");
   os << "swift::TypeMetadataTrait<";
@@ -423,4 +427,31 @@ void ClangSyntaxPrinter::printSymbolUSRAttribute(const ValueDecl *D) const {
   if (result.empty())
     return;
   os << " SWIFT_SYMBOL(\"" << result << "\")";
+}
+
+void ClangSyntaxPrinter::printKnownCType(
+    Type t, PrimitiveTypeMapping &typeMapping) const {
+  auto info =
+      typeMapping.getKnownCTypeInfo(t->getNominalOrBoundGenericNominal());
+  assert(info.has_value() && "not a known type");
+  os << info->name;
+  if (info->canBeNullable)
+    os << " _Null_unspecified";
+}
+
+void ClangSyntaxPrinter::printSwiftMangledNameForDebugger(
+    const NominalTypeDecl *typeDecl) {
+  printIgnoredCxx17ExtensionDiagnosticBlock([&]() {
+
+  os << "#pragma clang diagnostic push\n";
+  os << "#pragma clang diagnostic ignored \"-Wreserved-identifier\"\n";
+    auto mangled_name = mangler.mangleTypeForDebugger(
+        typeDecl->getDeclaredInterfaceType(), nullptr);
+    if (!mangled_name.empty()) {
+      os << "  typedef char " << mangled_name << ";\n";
+      os << "  static inline constexpr " << mangled_name
+         << " __swift_mangled_name = 0;\n";
+    }
+  });
+  os << "#pragma clang diagnostic pop\n";
 }

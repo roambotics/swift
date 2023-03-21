@@ -439,17 +439,31 @@ public:
         ElementTypes, ElementCountOperands));
   }
 
+  /// Helper function that calls \p createAllocBox after constructing a
+  /// SILBoxType for \p fieldType.
+  AllocBoxInst *createAllocBox(SILLocation loc, SILType fieldType,
+                               Optional<SILDebugVariable> Var = None,
+                               bool hasDynamicLifetime = false,
+                               bool reflection = false,
+                               bool usesMoveableValueDebugInfo = false) {
+    return createAllocBox(loc, SILBoxType::get(fieldType.getASTType()), Var,
+                          hasDynamicLifetime, reflection,
+                          usesMoveableValueDebugInfo);
+  }
+
   AllocBoxInst *createAllocBox(SILLocation Loc, CanSILBoxType BoxType,
                                Optional<SILDebugVariable> Var = None,
                                bool hasDynamicLifetime = false,
-                               bool reflection = false) {
+                               bool reflection = false,
+                               bool usesMoveableValueDebugInfo = false) {
     llvm::SmallString<4> Name;
     Loc.markAsPrologue();
     assert((!dyn_cast_or_null<VarDecl>(Loc.getAsASTNode<Decl>()) || Var) &&
            "location is a VarDecl, but SILDebugVariable is empty");
     return insert(AllocBoxInst::create(getSILDebugLocation(Loc), BoxType, *F,
                                        substituteAnonymousArgs(Name, Var, Loc),
-                                       hasDynamicLifetime, reflection));
+                                       hasDynamicLifetime, reflection,
+                                       usesMoveableValueDebugInfo));
   }
 
   AllocExistentialBoxInst *
@@ -1268,6 +1282,7 @@ public:
   }
 
   CopyValueInst *createCopyValue(SILLocation Loc, SILValue operand) {
+    assert(getFunction().hasOwnership());
     assert(!operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api. Use instead "
            "emitCopyValueOperation");
@@ -1286,6 +1301,7 @@ public:
 
   DestroyValueInst *createDestroyValue(SILLocation Loc, SILValue operand,
                                        bool poisonRefs = false) {
+    assert(getFunction().hasOwnership());
     assert(isLoadableOrOpaque(operand->getType()));
     assert(!operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api. Use instead "
@@ -1296,6 +1312,7 @@ public:
 
   MoveValueInst *createMoveValue(SILLocation loc, SILValue operand,
                                  bool isLexical = false) {
+    assert(getFunction().hasOwnership());
     assert(!operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api. Use instead "
            "emitMoveValueOperation");
@@ -1315,6 +1332,13 @@ public:
                           MarkMustCheckInst::CheckKind kind) {
     return insert(new (getModule())
                       MarkMustCheckInst(getSILDebugLocation(loc), src, kind));
+  }
+
+  MarkUnresolvedReferenceBindingInst *createMarkUnresolvedReferenceBindingInst(
+      SILLocation loc, SILValue src,
+      MarkUnresolvedReferenceBindingInst::Kind kind) {
+    return insert(new (getModule()) MarkUnresolvedReferenceBindingInst(
+        getSILDebugLocation(loc), src, kind));
   }
 
   CopyableToMoveOnlyWrapperValueInst *
@@ -1655,6 +1679,9 @@ public:
                                                SILValue Operand,
                                                unsigned FieldNo,
                                                SILType ResultTy) {
+    assert(!Operand->getType().castTo<TupleType>().containsPackExpansionType()
+           && "tuples with pack expansions must be indexed with "
+              "tuple_pack_element_addr");
     return insert(new (getModule()) TupleElementAddrInst(
         getSILDebugLocation(Loc), Operand, FieldNo, ResultTy));
   }
@@ -1776,6 +1803,24 @@ public:
 
   void emitDestructureAddressOperation(SILLocation loc, SILValue operand,
                                        SmallVectorImpl<SILValue> &result);
+
+  void emitDestructureAddressOperation(
+      SILLocation loc, SILValue operand,
+      function_ref<void(unsigned, SILValue)> result);
+
+  void emitDestructureOperation(SILLocation loc, SILValue operand,
+                                SmallVectorImpl<SILValue> &result) {
+    if (operand->getType().isAddress())
+      return emitDestructureAddressOperation(loc, operand, result);
+    return emitDestructureValueOperation(loc, operand, result);
+  }
+
+  void emitDestructureOperation(SILLocation loc, SILValue operand,
+                                function_ref<void(unsigned, SILValue)> result) {
+    if (operand->getType().isAddress())
+      return emitDestructureAddressOperation(loc, operand, result);
+    return emitDestructureValueOperation(loc, operand, result);
+  }
 
   ClassMethodInst *createClassMethod(SILLocation Loc, SILValue Operand,
                                      SILDeclRef Member, SILType MethodTy) {
@@ -1926,6 +1971,13 @@ public:
   createDeinitExistentialValue(SILLocation Loc, SILValue Existential) {
     return insert(new (getModule()) DeinitExistentialValueInst(
         getSILDebugLocation(Loc), Existential));
+  }
+
+  PackLengthInst *
+  createPackLength(SILLocation loc, CanPackType packType) {
+    return insert(PackLengthInst::create(getFunction(),
+                              getSILDebugLocation(loc),
+                              packType));
   }
 
   DynamicPackIndexInst *
@@ -2735,7 +2787,7 @@ public:
       SILLocation Loc, NormalDifferentiableFunctionTypeComponent Extractee,
       SILValue Function, Optional<SILType> ExtracteeType = None) {
     return createDifferentiableFunctionExtract(
-        Loc, Extractee, Function, Function->getOwnershipKind(), ExtracteeType);
+        Loc, Extractee, Function, OwnershipKind::Guaranteed, ExtracteeType);
   }
 
   DifferentiableFunctionExtractInst *createDifferentiableFunctionExtract(

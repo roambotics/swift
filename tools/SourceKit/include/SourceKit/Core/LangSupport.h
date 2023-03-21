@@ -586,17 +586,16 @@ struct CursorInfoData {
   // will be empty). Clients can potentially use this to show a diagnostic
   // message to the user in lieu of using the empty response.
   StringRef InternalDiagnostic;
-  llvm::ArrayRef<CursorSymbolInfo> Symbols;
+  llvm::SmallVector<CursorSymbolInfo, 1> Symbols;
   /// All available actions on the code under cursor.
-  llvm::ArrayRef<RefactoringInfo> AvailableActions;
+  llvm::SmallVector<RefactoringInfo, 8> AvailableActions;
   /// Whether the ASTContext was reused for this cursor info.
   bool DidReuseAST = false;
+  /// An allocator that can be used to allocate data that is referenced by this
+  /// \c CursorInfoData.
+  llvm::BumpPtrAllocator Allocator;
 
-  /// If \p ForSolverBasedCursorInfoVerification is \c true, fields that are
-  /// acceptable to differ between the AST-based and the solver-based result,
-  /// will be excluded.
-  void print(llvm::raw_ostream &OS, std::string Indentation,
-             bool ForSolverBasedCursorInfoVerification = false) const {
+  void print(llvm::raw_ostream &OS, std::string Indentation) const {
     OS << Indentation << "CursorInfoData" << '\n';
     OS << Indentation << "  Symbols:" << '\n';
     for (auto Symbol : Symbols) {
@@ -606,9 +605,7 @@ struct CursorInfoData {
     for (auto AvailableAction : AvailableActions) {
       AvailableAction.print(OS, Indentation + "    ");
     }
-    if (!ForSolverBasedCursorInfoVerification) {
-      OS << Indentation << "DidReuseAST: " << DidReuseAST << '\n';
-    }
+    OS << Indentation << "DidReuseAST: " << DidReuseAST << '\n';
   }
 
   SWIFT_DEBUG_DUMP { print(llvm::errs(), ""); }
@@ -643,6 +640,10 @@ enum class SemanticRefactoringKind {
 
 struct SemanticRefactoringInfo {
   SemanticRefactoringKind Kind;
+  // The name of the source file to start the refactoring in. Empty if it is
+  // the primary file (in which case the primary file from the AST is used).
+  // This must match the buffer identifier stored in the source manager.
+  StringRef SourceFile;
   unsigned Line;
   unsigned Column;
   unsigned Length;
@@ -652,6 +653,20 @@ struct SemanticRefactoringInfo {
 struct RelatedIdentsInfo {
   /// (Offset,Length) pairs.
   ArrayRef<std::pair<unsigned, unsigned>> Ranges;
+};
+
+/// Represent one branch of an if config.
+/// Either `#if`, `#else` or `#elseif`.
+struct IfConfigInfo {
+  unsigned Offset;
+  bool IsActive;
+
+  IfConfigInfo(unsigned Offset, bool IsActive)
+      : Offset(Offset), IsActive(IsActive) {}
+};
+
+struct ActiveRegionsInfo {
+  ArrayRef<IfConfigInfo> Configs;
 };
 
 /// Filled out by LangSupport::findInterfaceDocument().
@@ -714,10 +729,16 @@ struct NoteRegion {
 };
 
 struct Edit {
+  /// If the edit is outside of the originally request source file, the path
+  /// to the file it is editing.
+  std::string Path;
   unsigned StartLine;
   unsigned StartColumn;
   unsigned EndLine;
   unsigned EndColumn;
+  /// If the edit is actually a file (which could be generated/from an
+  /// expansion), the name (or path) of that buffer.
+  std::string BufferName;
   std::string NewText;
   SmallVector<NoteRegion, 2> RegionsWithNote;
 };
@@ -965,7 +986,6 @@ public:
       bool SymbolGraph, bool CancelOnSubsequentRequest,
       ArrayRef<const char *> Args, Optional<VFSOptions> vfsOptions,
       SourceKitCancellationToken CancellationToken,
-      bool VerifySolverBasedCursorInfo,
       std::function<void(const RequestResult<CursorInfoData> &)> Receiver) = 0;
 
   virtual void
@@ -1000,6 +1020,12 @@ public:
       std::function<void(const RequestResult<RelatedIdentsInfo> &)>
           Receiver) = 0;
 
+  virtual void findActiveRegionsInFile(
+      StringRef Filename, ArrayRef<const char *> Args,
+      SourceKitCancellationToken CancellationToken,
+      std::function<void(const RequestResult<ActiveRegionsInfo> &)>
+          Receiver) = 0;
+
   virtual llvm::Optional<std::pair<unsigned, unsigned>>
       findUSRRange(StringRef DocumentName, StringRef USR) = 0;
 
@@ -1026,7 +1052,7 @@ public:
                         SourceKitCancellationToken CancellationToken,
                         CategorizedRenameRangesReceiver Receiver) = 0;
 
-  virtual void semanticRefactoring(StringRef Filename,
+  virtual void semanticRefactoring(StringRef PrimaryFile,
                                    SemanticRefactoringInfo Info,
                                    ArrayRef<const char *> Args,
                                    SourceKitCancellationToken CancellationToken,

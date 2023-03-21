@@ -467,6 +467,12 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   // running the relevant diagnostic.
   SINGLE_VALUE_INST(MarkMustCheckInst, mark_must_check,
                     SingleValueInstruction, None, DoesNotRelease)
+  // A canary value inserted by a SIL generating frontend to signal to the
+  // reference binding transform to check/transform a specific value.  Valid
+  // only in Raw SIL. The relevant checkers should remove the instruction after
+  // successfully running the relevant diagnostic.
+  SINGLE_VALUE_INST(MarkUnresolvedReferenceBindingInst, mark_unresolved_reference_binding,
+                    SingleValueInstruction, None, DoesNotRelease)
   // Convert a $T to $@moveOnly T. This is the method that one uses to convert a
   // trivial value to a non-trivial move only value. Ownership is fixed at construction by
   // frontend to express specific semantics: guaranteed for guaranteed function arguments
@@ -606,6 +612,18 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   // Variadic generics
   SINGLE_VALUE_INST(OpenPackElementInst, open_pack_element,
                     SingleValueInstruction, None, DoesNotRelease)
+  SINGLE_VALUE_INST(PackLengthInst, pack_length,
+                    SingleValueInstruction, None, DoesNotRelease)
+
+  // Variadic pack indexing
+  ABSTRACT_SINGLE_VALUE_INST(AnyPackIndexInst, SingleValueInstruction)
+    SINGLE_VALUE_INST(DynamicPackIndexInst, dynamic_pack_index,
+                      AnyPackIndexInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST(PackPackIndexInst, pack_pack_index,
+                      AnyPackIndexInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST(ScalarPackIndexInst, scalar_pack_index,
+                      AnyPackIndexInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST_RANGE(AnyPackIndexInst, DynamicPackIndexInst, ScalarPackIndexInst)
 
   // Blocks
   SINGLE_VALUE_INST(ProjectBlockStorageInst, project_block_storage,
@@ -648,16 +666,6 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   // object; is there a more specific effect?
   SINGLE_VALUE_INST(KeyPathInst, keypath,
                     SingleValueInstruction, MayHaveSideEffects, DoesNotRelease)
-
-  // Variadic pack indexing
-  ABSTRACT_SINGLE_VALUE_INST(AnyPackIndexInst, SingleValueInstruction)
-    SINGLE_VALUE_INST(DynamicPackIndexInst, dynamic_pack_index,
-                      AnyPackIndexInst, None, DoesNotRelease)
-    SINGLE_VALUE_INST(PackPackIndexInst, pack_pack_index,
-                      AnyPackIndexInst, None, DoesNotRelease)
-    SINGLE_VALUE_INST(ScalarPackIndexInst, scalar_pack_index,
-                      AnyPackIndexInst, None, DoesNotRelease)
-    SINGLE_VALUE_INST_RANGE(AnyPackIndexInst, DynamicPackIndexInst, ScalarPackIndexInst)
 
   // BindMemory and RebindMemory have no physical side effect. Semantically they
   // write to their affected memory region because any reads or writes accessing

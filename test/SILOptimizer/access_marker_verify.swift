@@ -563,7 +563,7 @@ enum OptionalWithMap<Wrapped> {
     }
   }
 }
-// CHECK-LABEL: sil hidden [ossa] @$s20access_marker_verify15OptionalWithMapO3mapyqd__Sgqd__xKXEKlF : $@convention(method) <Wrapped><U> (@noescape @callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> (@out τ_0_1, @error any Error) for <Wrapped, U>, @in_guaranteed OptionalWithMap<Wrapped>) -> (@out Optional<U>, @error any Error)
+// CHECK-LABEL: sil hidden [ossa] @$s20access_marker_verify15OptionalWithMapO3mapyqd__Sgqd__xKXEKlF :
 // CHECK: [[STK:%.]] = alloc_stack $OptionalWithMap<Wrapped>
 // CHECK-NOT: begin_access
 // CHECK: copy_addr %2 to [init] [[STK]] : $*OptionalWithMap<Wrapped>
@@ -780,7 +780,9 @@ class C : Abstractable {
 // CHECK-NEXT:   [[THUNK:%.*]] = function_ref @$sSiIegd_SiIegr_TR
 // CHECK-NEXT:   [[THUNKED_OLD_FN:%.*]] = partial_apply [callee_guaranteed] [[THUNK]]([[OLD_FN]])
 // CHECK-NEXT:   [[CONVERTED_OLD_FN:%.*]] = convert_function [[THUNKED_OLD_FN]]
-// CHECK-NEXT:   store [[CONVERTED_OLD_FN]] to [init] [[TEMP]] :
+// CHECK-NEXT:   [[TEMP_ACCESS:%.*]] = begin_access [modify] [unsafe] [[TEMP]] :
+// CHECK-NEXT:   store [[CONVERTED_OLD_FN]] to [init] [[TEMP_ACCESS]] :
+// CHECK-NEXT:   end_access [[TEMP_ACCESS]]
 // CHECK-NEXT:   yield [[TEMP]] : {{.*}}, resume bb1, unwind bb2
 
 // CHECK:      bb1:

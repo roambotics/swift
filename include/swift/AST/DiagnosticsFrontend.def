@@ -172,6 +172,8 @@ WARNING(warn_implicit_concurrency_import_failed,none,
         "unable to perform implicit import of \"_Concurrency\" module: no such module found", ())
 REMARK(warn_implicit_string_processing_import_failed,none,
        "unable to perform implicit import of \"_StringProcessing\" module: no such module found", ())
+REMARK(warn_implicit_backtracing_import_failed,none,
+       "unable to perform implicit import of \"_Backtracing\" module: no such module found", ())
 
 ERROR(error_module_name_required,none, "-module-name is required", ())
 ERROR(error_bad_module_name,none,
@@ -189,9 +191,6 @@ ERROR(error_bad_export_as_name,none,
 
 ERROR(error_bad_package_name,none,
       "package name \"%0\" is not a valid identifier",
-      (StringRef))
-ERROR(error_stdlib_package_name,none,
-      "package name \"%0\" is reserved for the standard library",
       (StringRef))
 ERROR(error_stdlib_not_found,Fatal,
       "unable to load standard library for target '%0'", (StringRef))
@@ -219,6 +218,10 @@ ERROR(error_mode_requires_an_input_file,none,
       "this mode requires at least one input file", ())
 ERROR(error_mode_requires_one_sil_multi_sib,none,
       "this mode requires .sil for primary-file and only .sib for other inputs",
+      ())
+
+ERROR(error_clang_validate_once_requires_session_file,none,
+      "'-validate-clang-modules-once' also requires a '-clang-build-session-file' argument",
       ())
 
 ERROR(error_no_output_filename_specified,none,
@@ -431,6 +434,11 @@ REMARK(rebuilding_module_from_interface,none,
 NOTE(sdk_version_pbm_version,none,
      "SDK build version is '%0'; prebuilt modules were "
      "built using SDK build version: '%1'", (StringRef, StringRef))
+NOTE(compiled_module_ignored_reason,none,
+     "compiled module '%0' was ignored because %select{%error"
+     "|it belongs to a framework in the SDK"
+     "|loading from module interfaces is preferred}1",
+     (StringRef, unsigned))
 NOTE(out_of_date_module_here,none,
      "%select{compiled|cached|forwarding|prebuilt}0 module is out of date: '%1'",
      (unsigned, StringRef))
@@ -502,6 +510,21 @@ REMARK(warning_in_access_notes_file,none,
 
 WARNING(compiler_plugin_not_loaded,none,
         "compiler plugin not loaded: %0; loader error: %1", (StringRef, StringRef))
+        
+ERROR(dont_enable_interop_and_compat,none,
+      "do not pass both -enable-experimental-cxx-interop and "
+      "-cxx-interoperability-mode. Remove -enable-experimental-cxx-interop.", ())
+      
+ERROR(invalid_interop_compat_mode,none,
+      "invalid option passed to -cxx-interoperability-mode. Please select either "
+      "'off' or 'swift-5.9'.", ())
+NOTE(swift_will_maintain_compat,none,
+     "Swift will maintain source compatibility for imported APIs based on the "
+     "selected compatibility mode, so updating the Swift compiler will not "
+     "change how APIs are imported.", ())
+WARNING(enable_interop_flag_deprecated,none,
+        "the -enable-experimental-cxx-interop flag is deprecated. Please pass "
+        "'-cxx-interoperability-mode=' instead.", ())
 
 #define UNDEFINE_DIAGNOSTIC_MACROS
 #include "DefineDiagnosticMacros.h"

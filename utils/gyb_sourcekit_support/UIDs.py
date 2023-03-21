@@ -50,6 +50,7 @@ UID_KEYS = [
     KEY('Length', 'key.length'),
     KEY('SourceFile', 'key.sourcefile'),
     KEY('SourceText', 'key.sourcetext'),
+    KEY('PrimaryFile', 'key.primary_file'),
     KEY('EnableSyntaxMap', 'key.enablesyntaxmap'),
     KEY('EnableStructure', 'key.enablesubstructure'),
     KEY('ID', 'key.id'),
@@ -83,6 +84,7 @@ UID_KEYS = [
     KEY('BodyLength', 'key.bodylength'),
     KEY('DocOffset', 'key.docoffset'),
     KEY('DocLength', 'key.doclength'),
+    KEY('IsActive', 'key.is_active'),
     KEY('IsLocal', 'key.is_local'),
     KEY('InheritedTypes', 'key.inheritedtypes'),
     KEY('Attributes', 'key.attributes'),
@@ -189,7 +191,6 @@ UID_KEYS = [
     KEY('OptimizeForIDE', 'key.optimize_for_ide'),
     KEY('RequiredBystanders', 'key.required_bystanders'),
     KEY('ReusingASTContext', 'key.reusingastcontext'),
-    KEY('VerifySolverBasedCursorInfo', 'key.verifysolverbasedcursorinfo'),
     KEY('CompletionMaxASTContextReuseCount',
         'key.completion_max_astcontext_reuse_count'),
     KEY('CompletionCheckDependencyInterval',
@@ -203,6 +204,7 @@ UID_KEYS = [
     # in this time. For cancellation testing purposes.
     KEY('SimulateLongRequest', 'key.simulate_long_request'),
     KEY('IsSynthesized', 'key.is_synthesized'),
+    KEY('BufferName', 'key.buffer_name')
 ]
 
 
@@ -225,6 +227,7 @@ UID_REQUESTS = [
     REQUEST('CodeCompleteSetCustom', 'source.request.codecomplete.setcustom'),
     REQUEST('TypeContextInfo', 'source.request.typecontextinfo'),
     REQUEST('ConformingMethodList', 'source.request.conformingmethods'),
+    REQUEST('ActiveRegions', 'source.request.activeregions'),
     REQUEST('CursorInfo', 'source.request.cursorinfo'),
     REQUEST('RangeInfo', 'source.request.rangeinfo'),
     REQUEST('RelatedIdents', 'source.request.relatedidents'),

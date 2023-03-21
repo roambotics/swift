@@ -102,7 +102,7 @@ class OpaqueArchetypeTypeInfo
   : public ResilientTypeInfo<OpaqueArchetypeTypeInfo>
 {
   OpaqueArchetypeTypeInfo(llvm::Type *type, IsABIAccessible_t abiAccessible)
-      : ResilientTypeInfo(type, abiAccessible) {}
+      : ResilientTypeInfo(type, IsCopyable, abiAccessible) {}
 
 public:
   static const OpaqueArchetypeTypeInfo *
@@ -116,8 +116,10 @@ public:
     collector.collectTypeMetadataForLayout(T);
   }
 
-  TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
-                                        SILType T) const override {
+  TypeLayoutEntry
+  *buildTypeLayoutEntry(IRGenModule &IGM,
+                        SILType T,
+                        bool useStructLayouts) const override {
     return IGM.typeLayoutCache.getOrCreateArchetypeEntry(T.getObjectType());
   }
 };
@@ -440,13 +442,13 @@ withOpaqueTypeGenericArgs(IRGenFunction &IGF,
         [&](GenericRequirement reqt) {
           auto ty = reqt.getTypeParameter().subst(archetype->getSubstitutions())
                         ->getReducedType(opaqueDecl->getGenericSignature());
-          if (reqt.isWitnessTable()) {
+          if (reqt.isAnyWitnessTable()) {
             auto ref =
                 ProtocolConformanceRef(reqt.getProtocol())
                     .subst(reqt.getTypeParameter(), archetype->getSubstitutions());
             args.push_back(emitWitnessTableRef(IGF, ty, ref));
           } else {
-            assert(reqt.isMetadata());
+            assert(reqt.isAnyMetadata());
             args.push_back(IGF.emitAbstractTypeMetadataRef(ty));
           }
           types.push_back(args.back()->getType());

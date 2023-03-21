@@ -70,8 +70,7 @@ static void printToolVersionAndFlagsComment(raw_ostream &out,
            moduleName << "=" << moduleName;
 
     ModuleDecl::ImportFilter filter = {ModuleDecl::ImportFilterKind::Default,
-                           ModuleDecl::ImportFilterKind::Exported,
-                           ModuleDecl::ImportFilterKind::SPIAccessControl};
+                                       ModuleDecl::ImportFilterKind::Exported};
     if (Opts.PrintPrivateInterfaceContent)
       filter |= ModuleDecl::ImportFilterKind::SPIOnly;
 
@@ -228,8 +227,7 @@ static void printImports(raw_ostream &out,
   // it's not obvious what higher-level optimization would be factored out here.
   ModuleDecl::ImportFilter allImportFilter = {
       ModuleDecl::ImportFilterKind::Exported,
-      ModuleDecl::ImportFilterKind::Default,
-      ModuleDecl::ImportFilterKind::SPIAccessControl};
+      ModuleDecl::ImportFilterKind::Default};
 
   // With -experimental-spi-imports:
   // When printing the private swiftinterface file, print implementation-only
@@ -293,8 +291,14 @@ static void printImports(raw_ostream &out,
 
   for (auto import : allImports) {
     auto importedModule = import.importedModule;
-    if (importedModule->isOnoneSupportModule() ||
-        importedModule->isBuiltinModule()) {
+    if (importedModule->isOnoneSupportModule()) {
+      continue;
+    }
+
+    // Unless '-enable-builtin-module' was passed, do not print 'import Builtin'
+    // in the interface. '-parse-stdlib' still implicitly imports it however...
+    if (importedModule->isBuiltinModule() &&
+        !M->getASTContext().LangOpts.EnableBuiltinModule) {
       continue;
     }
 
@@ -325,7 +329,7 @@ static void printImports(raw_ostream &out,
       // compatible swiftinterfaces and we can live without
       // checking the generate code for a while.
       if (spiOnlyImportSet.count(import))
-        out << "/*@_spiOnly*/ ";
+        out << "@_spiOnly ";
 
       // List of imported SPI groups for local use.
       for (auto spiName : spis)

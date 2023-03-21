@@ -603,6 +603,7 @@ DeclContextID Serializer::addDeclContextRef(const DeclContext *DC) {
   assert(DC && "cannot reference a null DeclContext");
 
   switch (DC->getContextKind()) {
+  case DeclContextKind::Package:
   case DeclContextKind::Module:
   case DeclContextKind::FileUnit: // Skip up to the module
     return DeclContextID();
@@ -620,10 +621,6 @@ DeclContextID Serializer::addDeclContextRef(const DeclContext *DC) {
 DeclID Serializer::addDeclRef(const Decl *D, bool allowTypeAliasXRef) {
   assert((!D || !isDeclXRef(D) || isa<ValueDecl>(D) || isa<OperatorDecl>(D) ||
           isa<PrecedenceGroupDecl>(D)) &&
-         "cannot cross-reference this decl");
-
-  assert((!D || !isDeclXRef(D) ||
-          !D->getAttrs().hasAttribute<ForbidSerializingReferenceAttr>()) &&
          "cannot cross-reference this decl");
 
   assert((!D || allowTypeAliasXRef || !isa<TypeAliasDecl>(D) ||
@@ -1011,7 +1008,7 @@ void Serializer::writeHeader(const SerializationOptions &options) {
     static const char* forcedDebugRevision =
       ::getenv("SWIFT_DEBUG_FORCE_SWIFTMODULE_REVISION");
     auto revision = forcedDebugRevision ?
-      forcedDebugRevision : version::getCurrentCompilerTag();
+      forcedDebugRevision : version::getCurrentCompilerSerializationTag();
     Revision.emit(ScratchRecord, revision);
 
     IsOSSA.emit(ScratchRecord, options.IsOSSA);
@@ -1214,7 +1211,7 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
                         {ModuleDecl::ImportFilterKind::Exported,
                          ModuleDecl::ImportFilterKind::Default,
                          ModuleDecl::ImportFilterKind::ImplementationOnly,
-                         ModuleDecl::ImportFilterKind::SPIAccessControl});
+                         ModuleDecl::ImportFilterKind::PackageOnly});
   ImportedModule::removeDuplicates(allImports);
 
   // Collect the public and private imports as a subset so that we can
@@ -1223,8 +1220,8 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
       getImportsAsSet(M, ModuleDecl::ImportFilterKind::Exported);
   ImportSet privateImportSet =
       getImportsAsSet(M, ModuleDecl::ImportFilterKind::Default);
-  ImportSet spiImportSet =
-      getImportsAsSet(M, ModuleDecl::ImportFilterKind::SPIAccessControl);
+  ImportSet packageOnlyImportSet =
+      getImportsAsSet(M, ModuleDecl::ImportFilterKind::PackageOnly);
 
   auto clangImporter =
     static_cast<ClangImporter *>(M->getASTContext().getClangModuleLoader());
@@ -1270,8 +1267,10 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
     // form here.
     if (publicImportSet.count(import))
       stableImportControl = ImportControl::Exported;
-    else if (privateImportSet.count(import) || spiImportSet.count(import))
+    else if (privateImportSet.count(import))
       stableImportControl = ImportControl::Normal;
+    else if (packageOnlyImportSet.count(import))
+      stableImportControl = ImportControl::PackageOnly;
     else
       stableImportControl = ImportControl::ImplementationOnly;
 
@@ -1830,7 +1829,6 @@ static bool shouldSerializeMember(Decl *D) {
     if (D->getASTContext().LangOpts.AllowModuleWithCompilerErrors)
       return false;
     llvm_unreachable("decl should never be a member");
-
   case DeclKind::Missing:
     llvm_unreachable("attempting to serialize a missing decl");
 
@@ -1934,6 +1932,8 @@ void Serializer::writeCrossReference(const DeclContext *DC, uint32_t pathLen) {
   case DeclContextKind::MacroDecl:
     llvm_unreachable("cannot cross-reference this context");
 
+  case DeclContextKind::Package:
+    llvm_unreachable("should only cross-reference something within a module");
   case DeclContextKind::Module:
     llvm_unreachable("should only cross-reference something within a file");
 
@@ -2216,8 +2216,12 @@ getStableSelfAccessKind(swift::SelfAccessKind MM) {
     return serialization::SelfAccessKind::NonMutating;
   case swift::SelfAccessKind::Mutating:
     return serialization::SelfAccessKind::Mutating;
+  case swift::SelfAccessKind::LegacyConsuming:
+    return serialization::SelfAccessKind::LegacyConsuming;
   case swift::SelfAccessKind::Consuming:
     return serialization::SelfAccessKind::Consuming;
+  case swift::SelfAccessKind::Borrowing:
+    return serialization::SelfAccessKind::Borrowing;
   }
 
   llvm_unreachable("Unhandled StaticSpellingKind in switch.");
@@ -2233,10 +2237,12 @@ static uint8_t getRawStableMacroRole(swift::MacroRole context) {
   CASE(Accessor)
   CASE(MemberAttribute)
   CASE(Member)
+  CASE(Peer)
+  CASE(Conformance)
   }
 #undef CASE
   llvm_unreachable("bad result declaration macro kind");
-  }
+}
 
 static uint8_t getRawStableMacroIntroducedDeclNameKind(
     swift::MacroIntroducedDeclNameKind kind) {
@@ -2424,10 +2430,14 @@ static uint8_t getRawStableParamDeclSpecifier(swift::ParamDecl::Specifier sf) {
     return uint8_t(serialization::ParamDeclSpecifier::Default);
   case swift::ParamDecl::Specifier::InOut:
     return uint8_t(serialization::ParamDeclSpecifier::InOut);
-  case swift::ParamDecl::Specifier::Shared:
-    return uint8_t(serialization::ParamDeclSpecifier::Shared);
-  case swift::ParamDecl::Specifier::Owned:
-    return uint8_t(serialization::ParamDeclSpecifier::Owned);
+  case swift::ParamDecl::Specifier::Borrowing:
+    return uint8_t(serialization::ParamDeclSpecifier::Borrowing);
+  case swift::ParamDecl::Specifier::Consuming:
+    return uint8_t(serialization::ParamDeclSpecifier::Consuming);
+  case swift::ParamDecl::Specifier::LegacyShared:
+    return uint8_t(serialization::ParamDeclSpecifier::LegacyShared);
+  case swift::ParamDecl::Specifier::LegacyOwned:
+    return uint8_t(serialization::ParamDeclSpecifier::LegacyOwned);
   }
   llvm_unreachable("bad param decl specifier kind");
 }
@@ -2438,6 +2448,8 @@ static uint8_t getRawStableVarDeclIntroducer(swift::VarDecl::Introducer intr) {
     return uint8_t(serialization::VarDeclIntroducer::Let);
   case swift::VarDecl::Introducer::Var:
     return uint8_t(serialization::VarDeclIntroducer::Var);
+  case swift::VarDecl::Introducer::InOut:
+    return uint8_t(serialization::VarDeclIntroducer::InOut);
   }
   llvm_unreachable("bad variable decl introducer kind");
 }
@@ -2866,7 +2878,7 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       auto theAttr = cast<CustomAttr>(DA);
 
       // Macro attributes are not serialized.
-      if (theAttr->isAttachedMacro(D))
+      if (D->getResolvedMacro(const_cast<CustomAttr *>(theAttr)))
         return;
 
       auto typeID = S.addTypeRef(theAttr->getType());
@@ -4771,18 +4783,6 @@ getRawStableReferenceOwnership(swift::ReferenceOwnership ownership) {
   }
   llvm_unreachable("bad ownership kind");
 }
-/// Translate from the AST ownership enum to the Serialization enum
-/// values, which are guaranteed to be stable.
-static uint8_t getRawStableValueOwnership(swift::ValueOwnership ownership) {
-  switch (ownership) {
-  SIMPLE_CASE(ValueOwnership, Default)
-  SIMPLE_CASE(ValueOwnership, InOut)
-  SIMPLE_CASE(ValueOwnership, Shared)
-  SIMPLE_CASE(ValueOwnership, Owned)
-  }
-  llvm_unreachable("bad ownership kind");
-}
-
 /// Translate from the AST ParameterConvention enum to the
 /// Serialization enum values, which are guaranteed to be stable.
 static uint8_t getRawStableParameterConvention(swift::ParameterConvention pc) {
@@ -4968,7 +4968,7 @@ public:
   void visitPackType(const PackType *packTy) {
     using namespace decls_block;
     unsigned abbrCode = S.DeclTypeAbbrCodes[PackTypeLayout::Code];
-    TupleTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode);
+    PackTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode);
 
     abbrCode = S.DeclTypeAbbrCodes[PackTypeEltLayout::Code];
     for (auto elt : packTy->getElementTypes()) {
@@ -5139,7 +5139,7 @@ public:
     for (auto &param : fnTy->getParams()) {
       auto paramFlags = param.getParameterFlags();
       auto rawOwnership =
-          getRawStableValueOwnership(paramFlags.getValueOwnership());
+          getRawStableParamDeclSpecifier(paramFlags.getOwnershipSpecifier());
       FunctionParamLayout::emitRecord(
           S.Out, S.ScratchRecord, abbrCode,
           S.addDeclBaseNameRef(param.getLabel()),
@@ -6129,11 +6129,12 @@ void Serializer::writeAST(ModuleOrSourceFile DC) {
 
     // FIXME: Switch to a visitor interface?
     SmallVector<Decl *, 32> fileDecls;
-    nextFile->getTopLevelDecls(fileDecls);
+    nextFile->getTopLevelDeclsWithAuxiliaryDecls(fileDecls);
 
     for (auto D : fileDecls) {
       if (isa<ImportDecl>(D) || isa<IfConfigDecl>(D) ||
-          isa<PoundDiagnosticDecl>(D) || isa<TopLevelCodeDecl>(D)) {
+          isa<PoundDiagnosticDecl>(D) || isa<TopLevelCodeDecl>(D) ||
+          isa<MacroExpansionDecl>(D)) {
         continue;
       }
 

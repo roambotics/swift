@@ -59,30 +59,109 @@ static void diagnose(ASTContext &context, SILInstruction *inst, Diag<T...> diag,
   context.Diags.diagnose(loc.getSourceLoc(), diag, std::forward<U>(args)...);
 }
 
-static StringRef getVariableNameForValue(MarkMustCheckInst *mmci) {
-  if (auto *allocInst = dyn_cast<AllocationInst>(mmci->getOperand())) {
-    DebugVarCarryingInst debugVar(allocInst);
-    if (auto varInfo = debugVar.getVarInfo()) {
-      return varInfo->Name;
-    } else {
-      if (auto *decl = debugVar.getDecl()) {
-        return decl->getBaseName().userFacingName();
-      }
+template <typename... T, typename... U>
+static void diagnose(ASTContext &context, SourceLoc loc, Diag<T...> diag,
+                     U &&...args) {
+  // If for testing reasons we want to return that we emitted an error but not
+  // emit the actual error itself, return early.
+  if (SilentlyEmitDiagnostics)
+    return;
+
+  context.Diags.diagnose(loc, diag, std::forward<U>(args)...);
+}
+
+/// Helper function that actually implements getVariableNameForValue. Do not
+/// call it directly! Call the unary variants instead.
+static void getVariableNameForValue(SILValue value2,
+                                    SILValue searchValue,
+                                    SmallString<64> &resultingString) {
+  // Before we do anything, lets see if we have an exact debug_value on our
+  // mmci. In such a case, we can end early and are done.
+  if (auto *use = getSingleDebugUse(value2)) {
+    if (auto debugVar = DebugVarCarryingInst(use->getUser())) {
+      assert(debugVar.getKind() == DebugVarCarryingInst::Kind::DebugValue);
+      resultingString += debugVar.getName();
+      return;
     }
   }
 
-  if (auto *use = getSingleDebugUse(mmci)) {
-    DebugVarCarryingInst debugVar(use->getUser());
-    if (auto varInfo = debugVar.getVarInfo()) {
-      return varInfo->Name;
-    } else {
-      if (auto *decl = debugVar.getDecl()) {
-        return decl->getBaseName().userFacingName();
+  // Otherwise, we need to look at our mark_must_check's operand.
+  StackList<llvm::PointerUnion<SILInstruction *, SILValue>> variableNamePath(
+      value2->getFunction());
+  while (true) {
+    if (auto *allocInst = dyn_cast<AllocationInst>(searchValue)) {
+      variableNamePath.push_back(allocInst);
+      break;
+    }
+
+    if (auto *globalAddrInst = dyn_cast<GlobalAddrInst>(searchValue)) {
+      variableNamePath.push_back(globalAddrInst);
+      break;
+    }
+
+    if (auto *rei = dyn_cast<RefElementAddrInst>(searchValue)) {
+      variableNamePath.push_back(rei);
+      searchValue = rei->getOperand();
+      continue;
+    }
+
+    if (auto *fArg = dyn_cast<SILFunctionArgument>(searchValue)) {
+      variableNamePath.push_back({fArg});
+      break;
+    }
+
+    // If we do not do an exact match, see if we can find a debug_var inst. If
+    // we do, we always break since we have a root value.
+    if (auto *use = getSingleDebugUse(searchValue)) {
+      if (auto debugVar = DebugVarCarryingInst(use->getUser())) {
+        assert(debugVar.getKind() == DebugVarCarryingInst::Kind::DebugValue);
+        variableNamePath.push_back(use->getUser());
+        break;
       }
     }
+
+    // Otherwise, try to see if we have a single value instruction we can look
+    // through.
+    if (isa<BeginBorrowInst>(searchValue) || isa<LoadInst>(searchValue) ||
+        isa<LoadBorrowInst>(searchValue) || isa<BeginAccessInst>(searchValue) ||
+        isa<MarkMustCheckInst>(searchValue) ||
+        isa<ProjectBoxInst>(searchValue) || isa<CopyValueInst>(searchValue)) {
+      searchValue = cast<SingleValueInstruction>(searchValue)->getOperand(0);
+      continue;
+    }
+
+    // If we do not pattern match successfully, just set resulting string to
+    // unknown and return early.
+    resultingString += "unknown";
+    return;
   }
 
-  return "unknown";
+  // Walk backwards, constructing our string.
+  while (true) {
+    auto next = variableNamePath.pop_back_val();
+
+    if (auto *inst = next.dyn_cast<SILInstruction *>()) {
+      if (auto i = DebugVarCarryingInst(inst)) {
+        resultingString += i.getName();
+      } else if (auto i = VarDeclCarryingInst(inst)) {
+        resultingString += i.getName();
+      }
+    } else {
+      auto value = next.get<SILValue>();
+      if (auto *fArg = dyn_cast<SILFunctionArgument>(value))
+        resultingString += fArg->getDecl()->getBaseName().userFacingName();
+    }
+
+    if (variableNamePath.empty())
+      return;
+
+    resultingString += '.';
+  }
+}
+
+static void getVariableNameForValue(MarkMustCheckInst *mmci,
+                                    SmallString<64> &resultingString) {
+  return getVariableNameForValue(mmci, mmci->getOperand(), resultingString);
 }
 
 //===----------------------------------------------------------------------===//
@@ -95,14 +174,20 @@ void DiagnosticEmitter::emitCheckerDoesntUnderstandDiagnostic(
   // that copy propagation did not understand. Emit a we did not understand
   // error.
   if (markedValue->getType().isMoveOnlyWrapped()) {
-    diagnose(fn->getASTContext(), markedValue,
-             diag::sil_moveonlychecker_not_understand_no_implicit_copy);
+    diagnose(
+        fn->getASTContext(), markedValue,
+        diag::sil_moveonlychecker_not_understand_consumable_and_assignable);
   } else {
     diagnose(fn->getASTContext(), markedValue,
              diag::sil_moveonlychecker_not_understand_moveonly);
   }
   registerDiagnosticEmitted(markedValue);
   emittedCheckerDoesntUnderstandDiagnostic = true;
+}
+
+void DiagnosticEmitter::emitCheckedMissedCopyError(SILInstruction *copyInst) {
+  diagnose(copyInst->getFunction()->getASTContext(), copyInst,
+           diag::sil_moveonlychecker_missed_copy);
 }
 
 //===----------------------------------------------------------------------===//
@@ -112,7 +197,8 @@ void DiagnosticEmitter::emitCheckerDoesntUnderstandDiagnostic(
 void DiagnosticEmitter::emitObjectGuaranteedDiagnostic(
     MarkMustCheckInst *markedValue) {
   auto &astContext = fn->getASTContext();
-  StringRef varName = getVariableNameForValue(markedValue);
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
 
   // See if we have any closure capture uses and emit a better diagnostic.
   if (getCanonicalizer().hasPartialApplyConsumingUse()) {
@@ -126,6 +212,8 @@ void DiagnosticEmitter::emitObjectGuaranteedDiagnostic(
   // If we do not have any non-partial apply consuming uses... just exit early.
   if (!getCanonicalizer().hasNonPartialApplyConsumingUse())
     return;
+
+  registerDiagnosticEmitted(markedValue);
 
   // Check if this value is closure captured. In such a case, emit a special
   // error.
@@ -146,13 +234,15 @@ void DiagnosticEmitter::emitObjectGuaranteedDiagnostic(
            diag::sil_moveonlychecker_guaranteed_value_consumed, varName);
 
   emitObjectDiagnosticsForGuaranteedUses(true /*ignore partial apply uses*/);
-  registerDiagnosticEmitted(markedValue);
 }
 
 void DiagnosticEmitter::emitObjectOwnedDiagnostic(
     MarkMustCheckInst *markedValue) {
+  registerDiagnosticEmitted(markedValue);
+
   auto &astContext = fn->getASTContext();
-  StringRef varName = getVariableNameForValue(markedValue);
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
 
   // Ok we know that we are going to emit an error. Lets use a little more
   // compile time to emit a nice error.
@@ -269,8 +359,6 @@ void DiagnosticEmitter::emitObjectOwnedDiagnostic(
       }
     }
   }
-
-  registerDiagnosticEmitted(markedValue);
 }
 
 void DiagnosticEmitter::emitObjectDiagnosticsForGuaranteedUses(
@@ -322,7 +410,8 @@ void DiagnosticEmitter::emitAddressExclusivityHazardDiagnostic(
   registerDiagnosticEmitted(markedValue);
 
   auto &astContext = markedValue->getFunction()->getASTContext();
-  StringRef varName = getVariableNameForValue(markedValue);
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
 
   LLVM_DEBUG(llvm::dbgs() << "Emitting error for exclusivity!\n");
   LLVM_DEBUG(llvm::dbgs() << "    Mark: " << *markedValue);
@@ -344,7 +433,8 @@ void DiagnosticEmitter::emitAddressDiagnostic(MarkMustCheckInst *markedValue,
   registerDiagnosticEmitted(markedValue);
 
   auto &astContext = markedValue->getFunction()->getASTContext();
-  StringRef varName = getVariableNameForValue(markedValue);
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
 
   LLVM_DEBUG(llvm::dbgs() << "Emitting error!\n");
   LLVM_DEBUG(llvm::dbgs() << "    Mark: " << *markedValue);
@@ -433,7 +523,8 @@ void DiagnosticEmitter::emitInOutEndOfFunctionDiagnostic(
          "Expected markedValue to be on an inout");
 
   auto &astContext = markedValue->getFunction()->getASTContext();
-  StringRef varName = getVariableNameForValue(markedValue);
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
 
   LLVM_DEBUG(llvm::dbgs() << "Emitting inout error error!\n");
   LLVM_DEBUG(llvm::dbgs() << "    Mark: " << *markedValue);
@@ -467,7 +558,8 @@ void DiagnosticEmitter::emitAddressDiagnosticNoCopy(
     return;
 
   auto &astContext = markedValue->getFunction()->getASTContext();
-  StringRef varName = getVariableNameForValue(markedValue);
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
 
   LLVM_DEBUG(llvm::dbgs() << "Emitting no copy error!\n");
   LLVM_DEBUG(llvm::dbgs() << "    Mark: " << *markedValue);
@@ -490,7 +582,8 @@ void DiagnosticEmitter::emitObjectDestructureNeededWithinBorrowBoundary(
     return;
 
   auto &astContext = markedValue->getFunction()->getASTContext();
-  StringRef varName = getVariableNameForValue(markedValue);
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
 
   LLVM_DEBUG(llvm::dbgs() << "Emitting destructure can't be created error!\n");
   LLVM_DEBUG(llvm::dbgs() << "    Mark: " << *markedValue);
@@ -530,7 +623,8 @@ void DiagnosticEmitter::emitObjectInstConsumesValueTwice(
                           << secondUse->getOperandNumber() << '\n');
 
   auto &astContext = markedValue->getModule().getASTContext();
-  StringRef varName = getVariableNameForValue(markedValue);
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
   diagnose(astContext, markedValue,
            diag::sil_moveonlychecker_owned_value_consumed_more_than_once,
            varName);
@@ -555,11 +649,110 @@ void DiagnosticEmitter::emitObjectInstConsumesAndUsesValue(
                           << nonConsumingUse->getOperandNumber() << '\n');
 
   auto &astContext = markedValue->getModule().getASTContext();
-  StringRef varName = getVariableNameForValue(markedValue);
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
   diagnose(astContext, markedValue,
            diag::sil_moveonlychecker_owned_value_consumed_and_used_at_same_time,
            varName);
   diagnose(astContext, consumingUse->getUser(),
            diag::sil_moveonlychecker_consuming_and_non_consuming_uses_here);
   registerDiagnosticEmitted(markedValue);
+}
+
+void DiagnosticEmitter::emitAddressEscapingClosureCaptureLoadedAndConsumed(
+    MarkMustCheckInst *markedValue) {
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
+
+  SILValue operand = stripAccessMarkers(markedValue->getOperand());
+
+  using DiagType =
+      decltype(diag::
+                   sil_moveonlychecker_notconsumable_but_assignable_was_consumed_classfield_let);
+  Optional<DiagType> diag;
+
+  if (markedValue->getCheckKind() ==
+      MarkMustCheckInst::CheckKind::NoConsumeOrAssign) {
+    // We only use no consume or assign if we have a promoted let box.
+    diag = diag::
+        sil_moveonlychecker_notconsumable_but_assignable_was_consumed_classfield_let;
+  } else if (auto *reai = dyn_cast<RefElementAddrInst>(operand)) {
+    auto *field = reai->getField();
+    if (field->isLet()) {
+      diag = diag::
+          sil_moveonlychecker_notconsumable_but_assignable_was_consumed_classfield_let;
+    } else {
+      diag = diag::
+          sil_moveonlychecker_notconsumable_but_assignable_was_consumed_classfield_var;
+    }
+  } else if (auto *globalAddr = dyn_cast<GlobalAddrInst>(operand)) {
+    auto inst = VarDeclCarryingInst(globalAddr);
+    if (auto *decl = inst.getDecl()) {
+      if (decl->isLet()) {
+        diag = diag::
+            sil_moveonlychecker_notconsumable_but_assignable_was_consumed_global_let;
+      } else {
+        diag = diag::
+            sil_moveonlychecker_notconsumable_but_assignable_was_consumed_global_var;
+      }
+    }
+  } else if (auto *pbi = dyn_cast<ProjectBoxInst>(operand)) {
+    auto boxType = pbi->getOperand()->getType().castTo<SILBoxType>();
+    if (boxType->getLayout()->isMutable()) {
+      diag = diag::
+          sil_moveonlychecker_notconsumable_but_assignable_was_consumed_escaping_var;
+    } else {
+      diag = diag::sil_moveonlychecker_let_capture_consumed;
+    }
+  } else if (auto *fArg = dyn_cast<SILFunctionArgument>(operand)) {
+    if (auto boxType = fArg->getType().getAs<SILBoxType>()) {
+      if (boxType->getLayout()->isMutable()) {
+        diag = diag::
+            sil_moveonlychecker_notconsumable_but_assignable_was_consumed_escaping_var;
+      } else {
+        diag = diag::sil_moveonlychecker_let_capture_consumed;
+      }
+    } else if (fArg->getType().isAddress() &&
+               markedValue->getCheckKind() ==
+                   MarkMustCheckInst::CheckKind::AssignableButNotConsumable) {
+      diag = diag::
+          sil_moveonlychecker_notconsumable_but_assignable_was_consumed_escaping_var;
+    }
+  }
+
+  if (!diag) {
+    llvm::errs() << "Unknown address assignable but not consumable case!\n";
+    llvm::errs() << "MarkMustCheckInst: " << *markedValue;
+    llvm::report_fatal_error("error!");
+  }
+
+  diagnose(markedValue->getModule().getASTContext(), markedValue, *diag,
+           varName);
+  registerDiagnosticEmitted(markedValue);
+}
+
+void DiagnosticEmitter::emitPromotedBoxArgumentError(
+    MarkMustCheckInst *markedValue, SILFunctionArgument *arg) {
+  auto &astContext = fn->getASTContext();
+  SmallString<64> varName;
+  getVariableNameForValue(markedValue, varName);
+
+  registerDiagnosticEmitted(markedValue);
+
+  auto diag = diag::sil_moveonlychecker_let_capture_consumed;
+  if (markedValue->getCheckKind() ==
+      MarkMustCheckInst::CheckKind::AssignableButNotConsumable)
+    diag = diag::
+        sil_moveonlychecker_notconsumable_but_assignable_was_consumed_escaping_var;
+
+  diagnose(astContext, arg->getDecl()->getLoc(), diag, varName);
+
+  // Now for each consuming use that needs a copy...
+  for (auto *user : getCanonicalizer().consumingUsesNeedingCopy) {
+    diagnose(astContext, user, diag::sil_moveonlychecker_consuming_use_here);
+  }
+
+  for (auto *user : getCanonicalizer().consumingBoundaryUsers) {
+    diagnose(astContext, user, diag::sil_moveonlychecker_consuming_use_here);
+  }
 }

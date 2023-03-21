@@ -47,7 +47,7 @@ ParserResult<Expr> Parser::parseExprImpl(Diag<> Message,
   // Only do this if we're parsing a pattern, to improve QoI on malformed
   // expressions followed by (e.g.) let/var decls.
   //
-  if (InVarOrLetPattern && isOnlyStartOfMatchingPattern()) {
+  if (InBindingPattern && isOnlyStartOfMatchingPattern()) {
     ParserResult<Pattern> pattern = parseMatchingPattern(/*isExprBasic*/false);
     if (pattern.hasCodeCompletion())
       return makeParserCodeCompletionResult<Expr>();
@@ -55,7 +55,7 @@ ParserResult<Expr> Parser::parseExprImpl(Diag<> Message,
       return nullptr;
     return makeParserResult(new (Context) UnresolvedPatternExpr(pattern.get()));
   }
-  
+
   return parseExprSequence(Message, isExprBasic,
                                 /*forConditionalDirective*/false);
 }
@@ -132,7 +132,7 @@ ParserResult<Expr> Parser::parseExprArrow() {
   status |= parseEffectsSpecifiers(SourceLoc(),
                                    asyncLoc, /*reasync=*/nullptr,
                                    throwsLoc, /*rethrows=*/nullptr);
-  if (status.hasCodeCompletion() && !IDECallbacks) {
+  if (status.hasCodeCompletion() && !CodeCompletionCallbacks) {
     // Trigger delayed parsing, no need to continue.
     return status;
   }
@@ -190,8 +190,8 @@ ParserResult<Expr> Parser::parseExprSequence(Diag<> Message,
       parseExprSequenceElement(Message, isExprBasic);
     SequenceStatus |= Primary;
 
-    if (SequenceStatus.hasCodeCompletion() && IDECallbacks)
-      IDECallbacks->setLeadingSequenceExprs(SequencedExprs);
+    if (SequenceStatus.hasCodeCompletion() && CodeCompletionCallbacks)
+      CodeCompletionCallbacks->setLeadingSequenceExprs(SequencedExprs);
 
     if (Primary.isNull()) {
       if (SequenceStatus.hasCodeCompletion()) {
@@ -220,9 +220,11 @@ parse_operator:
       // this, because then we can produce a fixit to rewrite the && into a ,
       // if we're in a stmt-condition.
       if (Tok.getText() == "&&" &&
-          peekToken().isAny(tok::pound_available, tok::pound_unavailable,
-                            tok::pound__hasSymbol, tok::kw_let, tok::kw_var,
-                            tok::kw_case))
+          (peekToken().isAny(tok::pound_available, tok::pound_unavailable,
+                             tok::pound__hasSymbol, tok::kw_let, tok::kw_var,
+                             tok::kw_case) ||
+           (Context.LangOpts.hasFeature(Feature::ReferenceBindings) &&
+            peekToken().isAny(tok::kw_inout))))
         goto done;
       
       // Parse the operator.
@@ -275,7 +277,7 @@ parse_operator:
       // pattern, then an assignment doesn't make sense.  In a "if let"
       // statement the equals is the start of the condition, so don't parse it
       // as a binary operator.
-      if (InVarOrLetPattern)
+      if (InBindingPattern)
         goto done;
       SourceLoc equalsLoc = consumeToken();
       auto *assign = new (Context) AssignExpr(equalsLoc);
@@ -406,10 +408,27 @@ ParserResult<Expr> Parser::parseExprSequenceElement(Diag<> message,
    return sub;
   }
 
+  if (Tok.isContextualKeyword("consume")
+      && peekToken().isAny(tok::identifier, tok::kw_self)
+      && !peekToken().isAtStartOfLine()) {
+    Tok.setKind(tok::contextual_keyword);
+
+    SourceLoc consumeLoc = consumeToken();
+    ParserResult<Expr> sub =
+        parseExprSequenceElement(diag::expected_expr_after_move, isExprBasic);
+    if (!sub.hasCodeCompletion() && !sub.isNull()) {
+      sub = makeParserResult(new (Context) MoveExpr(consumeLoc, sub.get()));
+    }
+    return sub;
+  }
+
   if (Context.LangOpts.hasFeature(Feature::MoveOnly)) {
     if (Tok.isContextualKeyword("_move")) {
       Tok.setKind(tok::contextual_keyword);
       SourceLoc awaitLoc = consumeToken();
+      diagnose(Tok, diag::move_consume_final_spelling)
+        .fixItReplace(awaitLoc, "consume");
+
       ParserResult<Expr> sub =
           parseExprSequenceElement(diag::expected_expr_after_move, isExprBasic);
       if (!sub.hasCodeCompletion() && !sub.isNull()) {
@@ -680,8 +699,8 @@ ParserResult<Expr> Parser::parseExprKeyPath() {
         CodeCompletionExpr(pathResult.getPtrOrNull(), Tok.getLoc());
     auto *keypath = KeyPathExpr::createParsed(
         Context, backslashLoc, rootResult.getPtrOrNull(), CC, hasLeadingDot);
-    if (IDECallbacks)
-      IDECallbacks->completeExprKeyPath(keypath, DotLoc);
+    if (this->CodeCompletionCallbacks)
+      this->CodeCompletionCallbacks->completeExprKeyPath(keypath, DotLoc);
     consumeToken(tok::code_complete);
     return makeParserCodeCompletionResult(keypath);
   }
@@ -715,8 +734,8 @@ ParserResult<Expr> Parser::parseExprKeyPathObjC() {
           Context, keywordLoc, lParenLoc, components, Tok.getLoc());
     }
 
-    if (IDECallbacks)
-      IDECallbacks->completeExprKeyPath(expr, DotLoc);
+    if (this->CodeCompletionCallbacks)
+      this->CodeCompletionCallbacks->completeExprKeyPath(expr, DotLoc);
 
     // Eat the code completion token because we handled it.
     consumeToken(tok::code_complete);
@@ -836,8 +855,8 @@ ParserResult<Expr> Parser::parseExprSelector() {
   }
 
   // Parse the subexpression.
-  IDEInspectionCallbacks::InObjCSelectorExprRAII
-    InObjCSelectorExpr(IDECallbacks, selectorContext);
+  CodeCompletionCallbacks::InObjCSelectorExprRAII InObjCSelectorExpr(
+      CodeCompletionCallbacks, selectorContext);
   ParserResult<Expr> subExpr =
     parseExpr(selectorKind == ObjCSelectorExpr::Method
                 ? diag::expr_selector_expected_method_expr
@@ -1175,6 +1194,7 @@ Parser::parseExprPostfixSuffix(ParserResult<Expr> Result, bool isExprBasic,
       //   [.foo(), <HERE> .bar()]
       // '.bar()' is probably not a part of the inserting element. Moreover,
       // having suffixes doesn't help type inference in any way.
+
       return Result;
     }
 
@@ -1228,8 +1248,8 @@ Parser::parseExprPostfixSuffix(ParserResult<Expr> Result, bool isExprBasic,
         assert(!InSwiftKeyPath);
         auto CCExpr = new (Context) CodeCompletionExpr(Result.get(),
                                                        Tok.getLoc());
-        if (IDECallbacks) {
-          IDECallbacks->completeDotExpr(CCExpr, /*DotLoc=*/TokLoc);
+        if (CodeCompletionCallbacks) {
+          CodeCompletionCallbacks->completeDotExpr(CCExpr, /*DotLoc=*/TokLoc);
         }
         consumeToken(tok::code_complete);
 
@@ -1432,7 +1452,9 @@ Parser::parseExprPostfixSuffix(ParserResult<Expr> Result, bool isExprBasic,
       assert(activeElements.size() == 1 && activeElements[0].is<Expr *>());
       auto expr = activeElements[0].get<Expr *>();
       ParserStatus status(ICD);
-      if (SourceMgr.rangeContainsIDEInspectionTarget(expr->getSourceRange()) &&
+      auto charRange = Lexer::getCharSourceRangeFromSourceRange(
+          SourceMgr, expr->getSourceRange());
+      if (SourceMgr.rangeContainsIDEInspectionTarget(charRange) &&
           L->isCodeCompletion())
         status.setHasCodeCompletion();
       hasBindOptional |= exprsWithBindOptional.contains(expr);
@@ -1450,9 +1472,9 @@ Parser::parseExprPostfixSuffix(ParserResult<Expr> Result, bool isExprBasic,
         return Result;
       }
 
-      if (IDECallbacks && Result.isNonNull()) {
+      if (CodeCompletionCallbacks && Result.isNonNull()) {
         bool hasSpace = Tok.getLoc() != getEndOfPreviousLoc();
-        IDECallbacks->completePostfixExpr(Result.get(), hasSpace);
+        CodeCompletionCallbacks->completePostfixExpr(Result.get(), hasSpace);
       }
       // Eat the code completion token because we handled it.
       consumeToken(tok::code_complete);
@@ -1631,18 +1653,18 @@ ParserResult<Expr> Parser::parseExprPrimary(Diag<> ID, bool isExprBasic) {
     // Parse and return this as an UnresolvedPatternExpr around a binding.  This
     // will be resolved (or rejected) by sema when the overall refutable pattern
     // it transformed from an expression into a pattern.
-    if ((InVarOrLetPattern == IVOLP_ImplicitlyImmutable ||
-         InVarOrLetPattern == IVOLP_InVar ||
-         InVarOrLetPattern == IVOLP_InLet) &&
+    if ((InBindingPattern == PatternBindingState::ImplicitlyImmutable ||
+         InBindingPattern.getIntroducer().hasValue()) &&
         // If we have "case let x." or "case let x(", we parse x as a normal
         // name, not a binding, because it is the start of an enum pattern or
         // call pattern.
         peekToken().isNot(tok::period, tok::period_prefix, tok::l_paren)) {
       Identifier name;
       SourceLoc loc = consumeIdentifier(name, /*diagnoseDollarPrefix=*/false);
-      auto introducer = (InVarOrLetPattern != IVOLP_InVar
-                         ? VarDecl::Introducer::Let
-                         : VarDecl::Introducer::Var);
+      // If we have an inout/let/var, set that as our introducer. otherwise
+      // default to Let.
+      auto introducer =
+          InBindingPattern.getIntroducer().getValueOr(VarDecl::Introducer::Let);
       auto pattern = createBindingFromPattern(loc, name, introducer);
       return makeParserResult(new (Context) UnresolvedPatternExpr(pattern));
     }
@@ -1726,8 +1748,8 @@ ParserResult<Expr> Parser::parseExprPrimary(Diag<> ID, bool isExprBasic) {
       auto CCE = new (Context) CodeCompletionExpr(Tok.getLoc());
       auto Result = makeParserResult(CCE);
       Result.setHasCodeCompletionAndIsError();
-      if (IDECallbacks) {
-        IDECallbacks->completeUnresolvedMember(CCE, DotLoc);
+      if (CodeCompletionCallbacks) {
+        CodeCompletionCallbacks->completeUnresolvedMember(CCE, DotLoc);
       }
       consumeToken();
       return Result;
@@ -1794,13 +1816,14 @@ ParserResult<Expr> Parser::parseExprPrimary(Diag<> ID, bool isExprBasic) {
     auto Result =
         makeParserResult(new (Context) CodeCompletionExpr(Tok.getLoc()));
     Result.setHasCodeCompletionAndIsError();
-    if (IDECallbacks &&
+    if (CodeCompletionCallbacks &&
         // We cannot code complete anything after var/let.
-        (!InVarOrLetPattern || InVarOrLetPattern == IVOLP_InMatchingPattern)) {
+        (!InBindingPattern ||
+         InBindingPattern == PatternBindingState::InMatchingPattern)) {
       if (InPoundIfEnvironment) {
-        IDECallbacks->completePlatformCondition();
+        CodeCompletionCallbacks->completePlatformCondition();
       } else {
-        IDECallbacks->completePostfixExprBeginning(
+        CodeCompletionCallbacks->completePostfixExprBeginning(
             cast<CodeCompletionExpr>(Result.get()));
       }
     }
@@ -2542,8 +2565,9 @@ ParserStatus Parser::parseClosureSignatureIfPresent(
           initializer = initializerResult.get();
         } else {
           auto CCE = new (Context) CodeCompletionExpr(Tok.getLoc());
-          if (IDECallbacks)
-            IDECallbacks->completePostfixExprBeginning(CCE);
+          if (CodeCompletionCallbacks) {
+            CodeCompletionCallbacks->completePostfixExprBeginning(CCE);
+          }
           name = Identifier();
           initializer = CCE;
           consumeToken();
@@ -2782,8 +2806,8 @@ ParserResult<Expr> Parser::parseExprClosure() {
   ParserStatus Status;
   // We may be parsing this closure expr in a matching pattern context.  If so,
   // reset our state to not be in a pattern for any recursive pattern parses.
-  llvm::SaveAndRestore<decltype(InVarOrLetPattern)>
-  T(InVarOrLetPattern, IVOLP_NotInVarOrLet);
+  llvm::SaveAndRestore<decltype(InBindingPattern)> T(
+      InBindingPattern, PatternBindingState::NotInBinding);
 
   // Reset async attribute in parser context.
   llvm::SaveAndRestore<bool> AsyncAttr(InPatternWithAsyncAttribute, false);
@@ -2825,7 +2849,9 @@ ParserResult<Expr> Parser::parseExprClosure() {
   SmallVector<ASTNode, 4> bodyElements;
   Status |= parseBraceItems(bodyElements, BraceItemListKind::Brace);
 
-  if (SourceMgr.rangeContainsIDEInspectionTarget({leftBrace, PreviousLoc})) {
+  if (SourceMgr.rangeContainsIDEInspectionTarget(
+          Lexer::getCharSourceRangeFromSourceRange(SourceMgr,
+                                                   {leftBrace, PreviousLoc}))) {
     // Ignore 'IDEInspectionDelayedDeclState' inside closures.
     // Completions inside functions body inside closures at top level should
     // be considered top-level completions.
@@ -3110,8 +3136,9 @@ ParserStatus Parser::parseExprList(tok leftTok, tok rightTok,
     } else if (isArgumentList && Tok.is(tok::code_complete)) {
       // Handle call arguments specially because it may need argument labels.
       auto CCExpr = new (Context) CodeCompletionExpr(Tok.getLoc());
-      if (IDECallbacks)
-        IDECallbacks->completeCallArg(CCExpr, PreviousLoc == leftLoc);
+      if (this->CodeCompletionCallbacks)
+        this->CodeCompletionCallbacks->completeCallArg(CCExpr,
+                                                       PreviousLoc == leftLoc);
       consumeIf(tok::code_complete);
       SubExpr = CCExpr;
       Status.setHasCodeCompletionAndIsError();
@@ -3211,15 +3238,16 @@ Parser::parseTrailingClosures(bool isExprBasic, SourceRange calleeRange,
       // If the current completion mode doesn't support trailing closure
       // completion, leave the token here and let "postfix completion" to
       // handle it.
-      if (IDECallbacks &&
-          !IDECallbacks->canPerformCompleteLabeledTrailingClosure())
+      if (CodeCompletionCallbacks &&
+          !CodeCompletionCallbacks->canPerformCompleteLabeledTrailingClosure())
         break;
 
       // foo() {} <token>
       auto CCExpr = new (Context) CodeCompletionExpr(Tok.getLoc());
-      if (IDECallbacks)
-        IDECallbacks->completeLabeledTrailingClosure(CCExpr,
-                                                     Tok.isAtStartOfLine());
+      if (CodeCompletionCallbacks) {
+        CodeCompletionCallbacks->completeLabeledTrailingClosure(
+            CCExpr, Tok.isAtStartOfLine());
+      }
       consumeToken(tok::code_complete);
       result.setHasCodeCompletionAndIsError();
       closures.emplace_back(SourceLoc(), Identifier(), CCExpr);
@@ -3297,8 +3325,9 @@ Parser::parseExprPoundCodeCompletion(Optional<StmtKind> ParentKind) {
   consumeToken(); // '#' token.
   auto CodeCompletionPos = consumeToken();
   auto Expr = new (Context) CodeCompletionExpr(CodeCompletionPos);
-  if (IDECallbacks)
-    IDECallbacks->completeAfterPoundExpr(Expr, ParentKind);
+  if (CodeCompletionCallbacks) {
+    CodeCompletionCallbacks->completeAfterPoundExpr(Expr, ParentKind);
+  }
   return makeParserCodeCompletionResult(Expr);
 }
 
@@ -3313,7 +3342,7 @@ Parser::parseExprCallSuffix(ParserResult<Expr> fn, bool isExprBasic) {
 
   // If there is a code completion token right after the '(', do a special case
   // callback.
-  if (peekToken().is(tok::code_complete) && IDECallbacks) {
+  if (peekToken().is(tok::code_complete) && CodeCompletionCallbacks) {
     auto lParenLoc = consumeToken(tok::l_paren);
     auto CCE = new (Context) CodeCompletionExpr(Tok.getLoc());
     auto rParenLoc = Tok.getLoc();
@@ -3322,7 +3351,7 @@ Parser::parseExprCallSuffix(ParserResult<Expr> fn, bool isExprBasic) {
         /*trailingClosureIdx*/ None);
     auto Result = makeParserResult(
         fn, CallExpr::create(Context, fn.get(), argList, /*implicit*/ false));
-    IDECallbacks->completePostfixExprParen(fn.get(), CCE);
+    CodeCompletionCallbacks->completePostfixExprParen(fn.get(), CCE);
     // Eat the code completion token because we handled it.
     consumeToken(tok::code_complete);
     Result.setHasCodeCompletionAndIsError();
@@ -3386,7 +3415,9 @@ ParserResult<Expr> Parser::parseExprMacroExpansion(bool isExprBasic) {
       new (Context) MacroExpansionExpr(
           CurDeclContext, poundLoc, macroNameRef, macroNameLoc, leftAngleLoc,
           Context.AllocateCopy(genericArgs), rightAngleLoc, argList,
-          MacroRole::Expression));
+          CurDeclContext->isTypeContext()
+              ? MacroRole::Declaration
+              : getFreestandingMacroRoles()));
 }
 
 /// parseExprCollection - Parse a collection literal expression.
@@ -3648,8 +3679,8 @@ Parser::parsePlatformVersionConstraintSpec() {
   SourceLoc PlatformLoc;
   if (Tok.is(tok::code_complete)) {
     consumeToken();
-    if (IDECallbacks) {
-      IDECallbacks->completePoundAvailablePlatform();
+    if (CodeCompletionCallbacks) {
+      CodeCompletionCallbacks->completePoundAvailablePlatform();
     }
     return makeParserCodeCompletionStatus();
   }

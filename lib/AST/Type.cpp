@@ -250,6 +250,7 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::BuiltinJob:
   case TypeKind::BuiltinExecutor:
   case TypeKind::BuiltinDefaultActorStorage:
+  case TypeKind::BuiltinNonDefaultDistributedActorStorage:
   case TypeKind::BuiltinPackIndex:
   case TypeKind::BuiltinUnsafeValueBuffer:
   case TypeKind::BuiltinVector:
@@ -646,6 +647,21 @@ void TypeBase::getTypeVariables(
   }
 }
 
+static bool isLegalSILType(CanType type);
+
+static bool isLegalSILTypeOrPackExpansion(CanType type) {
+  // Pack expansions aren't legal in arbitrary positions in SIL;
+  // for example, we should never see a function parameter or result
+  // of pack-expansion type.  But they're allowed within SILPackTypes
+  // and SIL TupleTypes as long as their pattern types are legal.
+  // The count type should always be an AST type.
+  if (auto packExpansionType = dyn_cast<PackExpansionType>(type)) {
+    return isLegalSILType(packExpansionType.getPatternType());
+  }
+
+  return isLegalSILType(type);
+}
+
 static bool isLegalSILType(CanType type) {
   // L-values and inouts are not legal.
   if (!type->isMaterializable()) return false;
@@ -660,19 +676,13 @@ static bool isLegalSILType(CanType type) {
   // Tuples are legal if all their elements are legal.
   if (auto tupleType = dyn_cast<TupleType>(type)) {
     for (auto eltType : tupleType.getElementTypes()) {
-      if (!isLegalSILType(eltType)) return false;
+      if (!isLegalSILTypeOrPackExpansion(eltType)) return false;
     }
     return true;
   }
 
   // Packs must be lowered.
   if (isa<PackType>(type)) return false;
-
-  // Pack expansions are legal if all their pattern and count types are legal.
-  if (auto packExpansionType = dyn_cast<PackExpansionType>(type)) {
-    return (isLegalSILType(packExpansionType.getPatternType()) &&
-            isLegalSILType(packExpansionType.getCountType()));
-  }
 
   // Optionals are legal if their object type is legal.
   if (auto objectType = type.getOptionalObjectType()) {
@@ -718,6 +728,11 @@ static bool isLegalFormalType(CanType type) {
   // Optionals are legal if their object type is legal.
   if (auto objectType = type.getOptionalObjectType()) {
     return isLegalFormalType(objectType);
+  }
+
+  // Expansions are legal if their pattern type is legal.
+  if (auto expansionType = dyn_cast<PackExpansionType>(type)) {
+    return isLegalFormalType(expansionType.getPatternType());
   }
 
   return true;
@@ -812,6 +827,14 @@ Type TypeBase::wrapInOptionalType() const {
 
 CanType CanType::wrapInOptionalTypeImpl(CanType type) {
   return type->wrapInOptionalType()->getCanonicalType();
+}
+
+Type TypeBase::isArrayType() {
+  if (auto boundStruct = getAs<BoundGenericStructType>()) {
+    if (boundStruct->getDecl() == getASTContext().getArrayDecl())
+      return boundStruct->getGenericArgs()[0];
+  }
+  return Type();
 }
 
 Type TypeBase::getAnyPointerElementType(PointerTypeKind &PTK) {
@@ -3555,9 +3578,14 @@ bool ArchetypeType::requiresClass() const {
 Type ArchetypeType::getNestedType(AssociatedTypeDecl *assocType) {
   Type interfaceType = getInterfaceType();
   Type memberInterfaceType =
-      DependentMemberType::get(interfaceType, assocType->getName());
-  return getGenericEnvironment()->getOrCreateArchetypeFromInterfaceType(
-      memberInterfaceType);
+      DependentMemberType::get(interfaceType, assocType);
+  auto genericSig = getGenericEnvironment()->getGenericSignature();
+  if (genericSig->isValidTypeParameter(memberInterfaceType)) {
+    return getGenericEnvironment()->getOrCreateArchetypeFromInterfaceType(
+        memberInterfaceType);
+  }
+
+  return Type();
 }
 
 Type ArchetypeType::getNestedTypeByName(Identifier name) {
@@ -4378,23 +4406,8 @@ static Type getMemberForBaseType(LookupConformanceFn lookupConformances,
     return DependentMemberType::get(baseType, name);
   };
 
-  // If we don't have a substituted base type, fail.
-  if (!substBase) return failed();
-
   if (auto *selfType = substBase->getAs<DynamicSelfType>())
     substBase = selfType->getSelfType();
-
-  // If the parent is an archetype, extract the child archetype with the
-  // given name.
-  if (auto archetypeParent = substBase->getAs<ArchetypeType>()) {
-    if (Type memberArchetypeByName = archetypeParent->getNestedTypeByName(name))
-      return memberArchetypeByName;
-
-    // If looking for an associated type and the archetype is constrained to a
-    // class, continue to the default associated type lookup
-    if (!assocType || !archetypeParent->getSuperclass())
-      return failed();
-  }
 
   // If the parent is a type variable or a member rooted in a type variable,
   // or if the parent is a type parameter, we're done. Also handle
@@ -4404,53 +4417,63 @@ static Type getMemberForBaseType(LookupConformanceFn lookupConformances,
       substBase->is<UnresolvedType>())
     return getDependentMemberType(substBase);
 
-  // Retrieve the member type with the given name.
+  // All remaining cases require an associated type declaration and not just
+  // the name of a member type.
+  if (!assocType)
+    return failed();
 
-  // If we know the associated type, look in the witness table.
-  if (assocType) {
-    auto proto = assocType->getProtocol();
-    ProtocolConformanceRef conformance =
-        lookupConformances(origBase->getCanonicalType(), substBase, proto);
+  // If the parent is an archetype, extract the child archetype with the
+  // given name.
+  if (auto archetypeParent = substBase->getAs<ArchetypeType>()) {
+    if (Type memberArchetypeByName = archetypeParent->getNestedType(assocType))
+      return memberArchetypeByName;
 
-    if (conformance.isInvalid())
+    // If looking for an associated type and the archetype is constrained to a
+    // class, continue to the default associated type lookup
+    if (!assocType || !archetypeParent->getSuperclass())
       return failed();
-
-    Type witnessTy;
-
-    // Retrieve the type witness.
-    if (conformance.isPack()) {
-      auto *packConformance = conformance.getPack();
-
-      witnessTy = packConformance->getAssociatedType(
-          assocType->getDeclaredInterfaceType());
-    } else if (conformance.isConcrete()) {
-      auto witness =
-          conformance.getConcrete()->getTypeWitnessAndDecl(assocType, options);
-
-      witnessTy = witness.getWitnessType();
-      if (!witnessTy || witnessTy->hasError())
-        return failed();
-
-      // This is a hacky feature allowing code completion to migrate to
-      // using Type::subst() without changing output.
-      if (options & SubstFlags::DesugarMemberTypes) {
-        if (auto *aliasType = dyn_cast<TypeAliasType>(witnessTy.getPointer()))
-          witnessTy = aliasType->getSinglyDesugaredType();
-
-        // Another hack. If the type witness is a opaque result type. They can
-        // only be referred using the name of the associated type.
-        if (witnessTy->is<OpaqueTypeArchetypeType>())
-          witnessTy = witness.getWitnessDecl()->getDeclaredInterfaceType();
-      }
-    }
-
-    if (!witnessTy || witnessTy->is<ErrorType>())
-      return failed();
-
-    return witnessTy;
   }
 
-  return failed();
+  auto proto = assocType->getProtocol();
+  ProtocolConformanceRef conformance =
+      lookupConformances(origBase->getCanonicalType(), substBase, proto);
+
+  if (conformance.isInvalid())
+    return failed();
+
+  Type witnessTy;
+
+  // Retrieve the type witness.
+  if (conformance.isPack()) {
+    auto *packConformance = conformance.getPack();
+
+    witnessTy = packConformance->getAssociatedType(
+        assocType->getDeclaredInterfaceType());
+  } else if (conformance.isConcrete()) {
+    auto witness =
+        conformance.getConcrete()->getTypeWitnessAndDecl(assocType, options);
+
+    witnessTy = witness.getWitnessType();
+    if (!witnessTy || witnessTy->hasError())
+      return failed();
+
+    // This is a hacky feature allowing code completion to migrate to
+    // using Type::subst() without changing output.
+    if (options & SubstFlags::DesugarMemberTypes) {
+      if (auto *aliasType = dyn_cast<TypeAliasType>(witnessTy.getPointer()))
+        witnessTy = aliasType->getSinglyDesugaredType();
+
+      // Another hack. If the type witness is a opaque result type. They can
+      // only be referred using the name of the associated type.
+      if (witnessTy->is<OpaqueTypeArchetypeType>())
+        witnessTy = witness.getWitnessDecl()->getDeclaredInterfaceType();
+    }
+  }
+
+  if (!witnessTy || witnessTy->is<ErrorType>())
+    return failed();
+
+  return witnessTy;
 }
 
 ProtocolConformanceRef LookUpConformanceInModule::
@@ -4480,6 +4503,24 @@ operator()(CanType dependentType, Type conformingReplacementType,
 ProtocolConformanceRef MakeAbstractConformanceForGenericType::
 operator()(CanType dependentType, Type conformingReplacementType,
            ProtocolDecl *conformedProtocol) const {
+  // The places that use this can also produce conformance packs, generally
+  // just for singleton pack expansions.
+  if (auto conformingPack = conformingReplacementType->getAs<PackType>()) {
+    SmallVector<ProtocolConformanceRef, 4> conformances;
+    for (auto conformingPackElt : conformingPack->getElementTypes()) {
+      // Look through pack expansions; there's no equivalent conformance
+      // expansion right now.
+      auto expansion = conformingPackElt->getAs<PackExpansionType>();
+      if (expansion) conformingPackElt = expansion->getPatternType();
+
+      auto conformance =
+        (*this)(dependentType, conformingPackElt, conformedProtocol);
+      conformances.push_back(conformance);
+    }
+    return ProtocolConformanceRef(
+        PackConformance::get(conformingPack, conformedProtocol, conformances));
+  }
+
   assert((conformingReplacementType->is<ErrorType>() ||
           conformingReplacementType->is<SubstitutableType>() ||
           conformingReplacementType->is<DependentMemberType>() ||
@@ -4643,7 +4684,18 @@ static Type substType(Type derivedType,
                              boxTy->getLayout(),
                              newSubMap);
     }
-    
+
+    if (auto packExpansionTy = dyn_cast<PackExpansionType>(type)) {
+      auto patternTy = substType(packExpansionTy->getPatternType(),
+                                 substitutions, lookupConformances, options);
+      auto countTy = substType(packExpansionTy->getCountType(),
+                               substitutions, lookupConformances, options);
+      if (auto *archetypeTy = countTy->getAs<PackArchetypeType>())
+        countTy = archetypeTy->getReducedShape();
+
+      return Type(PackExpansionType::get(patternTy, countTy)->expand());
+    }
+
     if (auto silFnTy = dyn_cast<SILFunctionType>(type)) {
       if (silFnTy->isPolymorphic())
         return None;
@@ -4681,9 +4733,6 @@ static Type substType(Type derivedType,
     if (auto depMemTy = dyn_cast<DependentMemberType>(type)) {
       auto newBase = substType(depMemTy->getBase(),
                                substitutions, lookupConformances, options);
-      if (!newBase)
-        return Type();
-      
       return getMemberForBaseType(lookupConformances,
                                   depMemTy->getBase(), newBase,
                                   depMemTy->getAssocType(),
@@ -4947,6 +4996,9 @@ TypeBase::getContextSubstitutions(const DeclContext *dc,
       substTy = ErrorType::get(baseTy->getASTContext());
     else if (genericEnv)
       substTy = genericEnv->mapTypeIntoContext(gp);
+
+    if (gp->isParameterPack() && !substTy->hasError())
+      substTy = PackType::getSingletonPackExpansion(substTy);
 
     auto result = substitutions.insert(
       {gp->getCanonicalType()->castTo<GenericTypeParamType>(),
@@ -5259,28 +5311,16 @@ case TypeKind::Id:
   case TypeKind::SILFunction: {
     auto fnTy = cast<SILFunctionType>(base);
     bool changed = false;
-    auto hasTypeErasedGenericClassType = [](Type ty) -> bool {
-      return ty.findIf([](Type subType) -> bool {
-        if (subType->isTypeErasedGenericClassType())
-          return true;
-        else
-          return false;
-      });
-    };
     auto updateSubs = [&](SubstitutionMap &subs) -> bool {
-      // This interface isn't suitable for updating the substitution map in a
-      // substituted SILFunctionType.
-      // TODO(SILFunctionType): Is it suitable for any SILFunctionType??
+      // This interface isn't suitable for doing most transformations on
+      // a substituted SILFunctionType, but it's too hard to come up with
+      // an assertion that meaningfully captures what restrictions are in
+      // place.  Generally the restriction that you can't naively substitute
+      // a SILFunctionType using AST mechanisms will have to be good enough.
       SmallVector<Type, 4> newReplacements;
       for (Type type : subs.getReplacementTypes()) {
         auto transformed =
             type.transformWithPosition(TypePosition::Invariant, fn);
-        assert((type->isEqual(transformed) ||
-                (type->hasTypeParameter() && transformed->hasTypeParameter()) ||
-                (hasTypeErasedGenericClassType(type) &&
-                 hasTypeErasedGenericClassType(transformed))) &&
-               "Substituted SILFunctionType can't be transformed into a "
-               "concrete type");
         newReplacements.push_back(transformed->getCanonicalType());
         if (!type->isEqual(transformed))
           changed = true;
@@ -6147,6 +6187,7 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::BuiltinJob:
   case TypeKind::BuiltinExecutor:
   case TypeKind::BuiltinDefaultActorStorage:
+  case TypeKind::BuiltinNonDefaultDistributedActorStorage:
   case TypeKind::BuiltinPackIndex:
   case TypeKind::BuiltinUnsafeValueBuffer:
   case TypeKind::BuiltinVector:

@@ -83,6 +83,44 @@ bool swift::hasPointerEscape(BorrowedValue value) {
   return false;
 }
 
+bool swift::hasPointerEscape(SILValue original) {
+  if (auto borrowedValue = BorrowedValue(original)) {
+    return hasPointerEscape(borrowedValue);
+  }
+  assert(original->getOwnershipKind() == OwnershipKind::Owned);
+
+  ValueWorklist worklist(original->getFunction());
+  worklist.push(original);
+  if (auto *phi = SILArgument::asPhi(original)) {
+    phi->visitTransitiveIncomingPhiOperands([&](auto *phi, auto *operand) {
+      worklist.pushIfNotVisited(operand->get());
+      return true;
+    });
+  }
+  while (auto value = worklist.popAndForget()) {
+    for (auto use : value->getUses()) {
+      switch (use->getOperandOwnership()) {
+      case OperandOwnership::PointerEscape:
+      case OperandOwnership::ForwardingUnowned:
+        return true;
+      case OperandOwnership::ForwardingConsume: {
+        auto *branch = dyn_cast<BranchInst>(use->getUser());
+        if (!branch) {
+          // Non-phi forwarding consumes end the lifetime of an owned value.
+          break;
+        }
+        auto *phi = branch->getDestBB()->getArgument(use->getOperandNumber());
+        worklist.pushIfNotVisited(phi);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+  }
+  return false;
+}
+
 bool swift::canOpcodeForwardInnerGuaranteedValues(SILValue value) {
   // If we have an argument from a transforming terminator, we can forward
   // guaranteed.
@@ -537,6 +575,12 @@ void BorrowingOperandKind::print(llvm::raw_ostream &os) const {
   case Kind::Yield:
     os << "Yield";
     return;
+  case Kind::PartialApplyStack:
+    os << "PartialApply [stack]";
+    return;
+  case Kind::BeginAsyncLet:
+    os << "BeginAsyncLet";
+    return;
   }
   llvm_unreachable("Covered switch isn't covered?!");
 }
@@ -565,7 +609,9 @@ bool BorrowingOperand::hasEmptyRequiredEndingUses() const {
   case BorrowingOperandKind::Invalid:
     llvm_unreachable("Using invalid case");
   case BorrowingOperandKind::BeginBorrow:
-  case BorrowingOperandKind::BeginApply: {
+  case BorrowingOperandKind::BeginApply:
+  case BorrowingOperandKind::BeginAsyncLet:
+  case BorrowingOperandKind::PartialApplyStack: {
     return op->getUser()->hasUsesOfAnyResult();
   }
   case BorrowingOperandKind::Branch: {
@@ -611,6 +657,31 @@ bool BorrowingOperand::visitScopeEndingUses(
     }
     return !deadApply;
   }
+  case BorrowingOperandKind::PartialApplyStack: {
+    auto user = cast<PartialApplyInst>(op->getUser());
+    assert(user->isOnStack() && "escaping closures can't borrow");
+    // The closure's borrow lifetimes end when the closure itself ends its
+    // lifetime. That may happen transitively through conversions that forward
+    // ownership of the closure.
+    return user->visitOnStackLifetimeEnds(func);
+  }
+  case BorrowingOperandKind::BeginAsyncLet: {
+    auto user = cast<BuiltinInst>(op->getUser());
+    // The async let ends its borrow when the task is ended.
+    bool dead = true;
+    for (auto *use : user->getUses()) {
+      dead = false;
+      auto builtinUser = dyn_cast<BuiltinInst>(use->getUser());
+      if (!builtinUser
+          || builtinUser->getBuiltinKind() != BuiltinValueKind::EndAsyncLetLifetime)
+        continue;
+
+      if (!func(use)) {
+        return false;
+      }
+    }
+    return !dead;
+  }
   // These are instantaneous borrow scopes so there aren't any special end
   // scope instructions.
   case BorrowingOperandKind::Apply:
@@ -654,6 +725,8 @@ bool BorrowingOperand::visitBorrowIntroducingUserResults(
   case BorrowingOperandKind::TryApply:
   case BorrowingOperandKind::BeginApply:
   case BorrowingOperandKind::Yield:
+  case BorrowingOperandKind::PartialApplyStack:
+  case BorrowingOperandKind::BeginAsyncLet:
     llvm_unreachable("Never has borrow introducer results!");
   case BorrowingOperandKind::BeginBorrow: {
     auto value = BorrowedValue(cast<BeginBorrowInst>(op->getUser()));
@@ -678,6 +751,8 @@ BorrowedValue BorrowingOperand::getBorrowIntroducingUserResult() {
   case BorrowingOperandKind::TryApply:
   case BorrowingOperandKind::BeginApply:
   case BorrowingOperandKind::Yield:
+  case BorrowingOperandKind::PartialApplyStack:
+  case BorrowingOperandKind::BeginAsyncLet:
     return BorrowedValue();
 
   case BorrowingOperandKind::BeginBorrow:
@@ -1033,7 +1108,8 @@ swift::findTransitiveUsesForAddress(SILValue projectedAddress,
         isa<SwitchEnumAddrInst>(user) || isa<CheckedCastAddrBranchInst>(user) ||
         isa<SelectEnumAddrInst>(user) || isa<InjectEnumAddrInst>(user) ||
         isa<IsUniqueInst>(user) || isa<ValueMetatypeInst>(user) ||
-        isa<DebugValueInst>(user) || isa<EndBorrowInst>(user)) {
+        isa<DebugValueInst>(user) || isa<EndBorrowInst>(user) ||
+        isa<ExplicitCopyAddrInst>(user)) {
       leafUse(op);
       continue;
     }
@@ -1779,8 +1855,6 @@ bool swift::visitForwardedGuaranteedOperands(
       || isa<OwnershipForwardingMultipleValueInstruction>(inst)
       || isa<MoveOnlyWrapperToCopyableValueInst>(inst)
       || isa<CopyableToMoveOnlyWrapperValueInst>(inst)) {
-    assert(inst->getNumRealOperands() == 1
-           && "forwarding instructions must have a single real operand");
     assert(!isa<SingleValueInstruction>(inst)
            || !BorrowedValue(cast<SingleValueInstruction>(inst))
                   && "forwarded operand cannot begin a borrow scope");
@@ -2306,4 +2380,67 @@ bool swift::isNestedLexicalBeginBorrow(BeginBorrowInst *bbi) {
     }
     return false;
   });
+}
+
+bool swift::isRedundantMoveValue(MoveValueInst *mvi) {
+  // Check whether the moved-from value's lifetime and the moved-to value's
+  // lifetime have the same (1) ownership, (2) lexicality, and (3) escaping.
+  //
+  // Along the way, also check for cases where they have different values for
+  // those characteristics but it doesn't matter because of how limited the uses
+  // of the original value are (for now, whether the move is the only use).
+
+  auto original = mvi->getOperand();
+
+  // (1) Ownership matches?
+  // (The new value always has owned ownership.)
+  if (original->getOwnershipKind() != OwnershipKind::Owned) {
+    return false;
+  }
+
+  // (2) Lexicality matches?
+  if (mvi->isLexical() != original->isLexical()) {
+    return false;
+  }
+
+  // The move doesn't alter constraints: ownership and lexicality match.
+
+  auto *singleUser =
+      original->getSingleUse() ? original->getSingleUse()->getUser() : nullptr;
+  if (mvi == singleUser && !SILArgument::asPhi(original)) {
+    assert(!hasPointerEscape(original));
+    // The moved-from value's only use is the move_value, and the moved-from
+    // value isn't a phi.  So, it doesn't escape.  (A phi's incoming values
+    // might escape.)
+    //
+    // Still, no optimization is enabled by separating the two lifetimes.
+    // The moved-from value's lifetime could not be shrunk regardless of whether
+    // the moved-to value escapes.
+    return true;
+  }
+
+  auto moveHasEscape = hasPointerEscape(mvi);
+  auto originalHasEscape = hasPointerEscape(original);
+
+  // (3) Escaping matches?  (Expensive check, saved for last.)
+  if (moveHasEscape != originalHasEscape) {
+    if (!originalHasEscape) {
+      auto *singleConsumingUser =
+          original->getSingleConsumingUse()
+              ? original->getSingleConsumingUse()->getUser()
+              : nullptr;
+      if (mvi == singleConsumingUser) {
+        // The moved-from value's only consuming use is the move_value and it
+        // doesn't escape.
+        //
+        // Although the moved-to value escapes, no optimization is enabled by
+        // separating the two lifetimes.  The moved-from value's lifetime
+        // already couldn't be shrunk.
+        return true;
+      }
+    }
+    return false;
+  }
+
+  return true;
 }

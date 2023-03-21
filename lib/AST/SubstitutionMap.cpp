@@ -164,10 +164,12 @@ bool SubstitutionMap::isCanonical() const {
   return true;
 }
 
-SubstitutionMap SubstitutionMap::getCanonical() const {
+SubstitutionMap SubstitutionMap::getCanonical(bool canonicalizeSignature) const {
   if (empty()) return *this;
 
-  auto canonicalSig = getGenericSignature().getCanonicalSignature();
+  auto sig = getGenericSignature();
+  if (canonicalizeSignature) sig = sig.getCanonicalSignature();
+
   SmallVector<Type, 4> replacementTypes;
   for (Type replacementType : getReplacementTypesBuffer()) {
     if (replacementType)
@@ -181,11 +183,10 @@ SubstitutionMap SubstitutionMap::getCanonical() const {
     conformances.push_back(conf.getCanonicalConformanceRef());
   }
 
-  return SubstitutionMap::get(canonicalSig,
+  return SubstitutionMap::get(sig,
                               ArrayRef<Type>(replacementTypes),
                               ArrayRef<ProtocolConformanceRef>(conformances));
 }
-
 
 SubstitutionMap SubstitutionMap::get(GenericSignature genericSig,
                                      SubstitutionMap substitutions) {
@@ -225,6 +226,11 @@ SubstitutionMap SubstitutionMap::get(GenericSignature genericSig,
 
     // Record the replacement.
     Type replacement = Type(gp).subst(subs, lookupConformance);
+
+    assert((!replacement || replacement->hasError() ||
+            gp->isParameterPack() == replacement->is<PackType>()) &&
+           "replacement for pack parameter must be a pack type");
+
     replacementTypes.push_back(replacement);
   });
 
@@ -452,6 +458,8 @@ SubstitutionMap SubstitutionMap::subst(TypeSubstitutionFn subs,
       continue;
     }
     newSubs.push_back(type.subst(subs, conformances, options));
+    assert(type->is<PackType>() == newSubs.back()->is<PackType>() &&
+           "substitution changed the pack-ness of a replacement type");
   }
 
   SmallVector<ProtocolConformanceRef, 4> newConformances;

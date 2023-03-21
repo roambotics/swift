@@ -27,18 +27,22 @@ class Preprocessor;
 class Sema;
 class TargetInfo;
 class Type;
+class SourceLocation;
 } // namespace clang
 
 namespace swift {
 
 class ConcreteDeclRef;
 class Decl;
+class FuncDecl;
 class VarDecl;
 class DeclContext;
 class EffectiveClangContext;
 class SwiftLookupTable;
 class ValueDecl;
 class VisibleDeclConsumer;
+
+void dumpSwiftLookupTable(SwiftLookupTable *table);
 
 /// Represents the different namespaces for types in C.
 ///
@@ -265,6 +269,8 @@ public:
 
   virtual bool isCXXMethodMutating(const clang::CXXMethodDecl *method) = 0;
 
+  virtual bool isUnsafeCXXMethod(const FuncDecl *func) = 0;
+
   virtual Type importFunctionReturnType(const clang::FunctionDecl *clangDecl,
                                         DeclContext *dc) = 0;
 
@@ -286,6 +292,11 @@ public:
   /// Determine the effective Clang context for the given Swift nominal type.
   virtual EffectiveClangContext getEffectiveClangContext(
       const NominalTypeDecl *nominal) = 0;
+
+  virtual const clang::TypedefType *
+  getTypeDefForCXXCFOptionsDefinition(const clang::Decl *candidateDecl) = 0;
+
+  virtual SourceLoc importSourceLocation(clang::SourceLocation loc) = 0;
 };
 
 /// Describes a C++ template instantiation error.

@@ -188,6 +188,7 @@ import StringEnum
 import StringInterpolation
 import StringMatch
 import StringRemoveDupes
+import StringRepeating
 import StringReplaceSubrange
 import StringSplitting
 import StringSwitch
@@ -199,6 +200,7 @@ import SuperChars
 import TwoSum
 import TypeFlood
 import UTF8Decode
+import UTF16Decode
 import Walsh
 import WordCount
 import XorLoop
@@ -378,6 +380,7 @@ register(StringEnum.benchmarks)
 register(StringInterpolation.benchmarks)
 register(StringMatch.benchmarks)
 register(StringRemoveDupes.benchmarks)
+register(StringRepeating.benchmarks)
 register(StringReplaceSubrange.benchmarks)
 
 if #available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *) {
@@ -393,6 +396,7 @@ register(SuperChars.benchmarks)
 register(TwoSum.benchmarks)
 register(TypeFlood.benchmarks)
 register(UTF8Decode.benchmarks)
+register(UTF16Decode.benchmarks)
 register(Walsh.benchmarks)
 register(WordCount.benchmarks)
 register(XorLoop.benchmarks)

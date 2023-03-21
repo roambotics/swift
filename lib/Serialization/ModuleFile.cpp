@@ -209,6 +209,10 @@ Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
       continue;
     }
 
+    if (dependency.isPackageOnly() &&
+        ctx.LangOpts.PackageName != this->getModulePackageName())
+      continue;
+
     ImportPath::Builder builder(ctx, dependency.Core.RawPath,
                                 /*separator=*/'\0');
     for (const auto &elem : builder) {
@@ -356,9 +360,9 @@ ModuleFile::getModuleName(ASTContext &Ctx, StringRef modulePath,
   std::shared_ptr<const ModuleFileSharedCore> loadedModuleFile;
   bool isFramework = false;
   serialization::ValidationInfo loadInfo = ModuleFileSharedCore::load(
-      modulePath.str(), std::move(newBuf), nullptr, nullptr,
-      /*isFramework*/ isFramework, Ctx.SILOpts.EnableOSSAModules, Ctx.LangOpts.SDKName,
-      Ctx.SearchPathOpts.DeserializedPathRecoverer,
+      "", "", std::move(newBuf), nullptr, nullptr,
+      /*isFramework=*/isFramework, Ctx.SILOpts.EnableOSSAModules,
+      Ctx.LangOpts.SDKName, Ctx.SearchPathOpts.DeserializedPathRecoverer,
       loadedModuleFile);
   Name = loadedModuleFile->Name.str();
   return std::move(moduleBuf.get());

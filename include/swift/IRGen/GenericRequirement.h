@@ -55,20 +55,10 @@ private:
   CanType type;
   ProtocolDecl *proto;
 
+public:
   GenericRequirement(Kind kind, CanType type, ProtocolDecl *proto)
     : kind(kind), type(type), proto(proto) {}
 
-  static bool isPack(CanType ty) {
-    if (auto gp = dyn_cast<GenericTypeParamType>(ty))
-      return gp->isParameterPack();
-    if (auto dm = dyn_cast<DependentMemberType>(ty))
-      if (auto gp =
-              dyn_cast<GenericTypeParamType>(dm->getBase()->getCanonicalType()))
-        return gp->isParameterPack();
-    return false;
-  }
-
-public:
   Kind getKind() const {
     return kind;
   }
@@ -86,35 +76,46 @@ public:
   }
 
   static GenericRequirement forShape(CanType type) {
-    assert(type->isParameterPack());
+    assert(!isa<PackType>(type));
+    assert(type->isParameterPack() || isa<PackArchetypeType>(type));
     return GenericRequirement(Kind::Shape, type, nullptr);
   }
 
   bool isMetadata() const {
     return kind == Kind::Metadata;
   }
-
-  static GenericRequirement forMetadata(CanType type, bool isPack) {
-    auto kind = isPack ? Kind::MetadataPack : Kind::Metadata;
-    return GenericRequirement(kind, type, nullptr);
+  bool isMetadataPack() const {
+    return kind == Kind::MetadataPack;
+  }
+  bool isAnyMetadata() const {
+    return kind == Kind::Metadata || kind == Kind::MetadataPack;
   }
 
   static GenericRequirement forMetadata(CanType type) {
-    return forMetadata(type, isPack(type));
+    assert(!isa<PackType>(type));
+    auto kind = ((type->isParameterPack() ||
+                  isa<PackArchetypeType>(type))
+                 ? Kind::MetadataPack : Kind::Metadata);
+    return GenericRequirement(kind, type, nullptr);
   }
 
   bool isWitnessTable() const {
     return kind == Kind::WitnessTable;
   }
-
-  static GenericRequirement forWitnessTable(CanType type, ProtocolDecl *proto,
-                                            bool isPack) {
-    auto kind = isPack ? Kind::WitnessTablePack : Kind::WitnessTable;
-    return GenericRequirement(kind, type, proto);
+  bool isWitnessTablePack() const {
+    return kind == Kind::WitnessTablePack;
+  }
+  bool isAnyWitnessTable() const {
+    return kind == Kind::WitnessTable || kind == Kind::WitnessTablePack;
   }
 
   static GenericRequirement forWitnessTable(CanType type, ProtocolDecl *proto) {
-    return forWitnessTable(type, proto, isPack(type));
+    assert(!isa<PackType>(type));
+    auto kind = ((type->isParameterPack() ||
+                  isa<PackArchetypeType>(type))
+                 ? Kind::WitnessTablePack
+                 : Kind::WitnessTable);
+    return GenericRequirement(kind, type, proto);
   }
 
   static llvm::Type *typeForKind(irgen::IRGenModule &IGM,
@@ -152,12 +153,14 @@ template <> struct DenseMapInfo<swift::GenericRequirement> {
   using GenericRequirement = swift::GenericRequirement;
   using CanTypeInfo = llvm::DenseMapInfo<swift::CanType>;
   static GenericRequirement getEmptyKey() {
-    return GenericRequirement::forMetadata(CanTypeInfo::getEmptyKey(),
-                                           /*isPack=*/false);
+    return GenericRequirement(GenericRequirement::Kind::Metadata,
+                              CanTypeInfo::getEmptyKey(),
+                              nullptr);
   }
   static GenericRequirement getTombstoneKey() {
-    return GenericRequirement::forMetadata(CanTypeInfo::getTombstoneKey(),
-                                           /*isPack=*/false);
+    return GenericRequirement(GenericRequirement::Kind::Metadata,
+                              CanTypeInfo::getTombstoneKey(),
+                              nullptr);
   }
   static llvm::hash_code getHashValue(GenericRequirement req) {
     return hash_combine(CanTypeInfo::getHashValue(req.getTypeParameter()),

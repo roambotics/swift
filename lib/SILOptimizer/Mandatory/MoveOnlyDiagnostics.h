@@ -19,7 +19,7 @@
 #ifndef SWIFT_SILOPTIMIZER_MANDATORY_MOVEONLYDIAGNOSTICS_H
 #define SWIFT_SILOPTIMIZER_MANDATORY_MOVEONLYDIAGNOSTICS_H
 
-#include "MoveOnlyObjectChecker.h"
+#include "MoveOnlyObjectCheckerUtils.h"
 #include "swift/Basic/NullablePtr.h"
 #include "swift/SIL/FieldSensitivePrunedLiveness.h"
 #include "swift/SIL/SILInstruction.h"
@@ -53,8 +53,9 @@ class DiagnosticEmitter {
   bool emittedCheckerDoesntUnderstandDiagnostic = false;
 
 public:
-  void init(SILFunction *inputFn, OSSACanonicalizer *inputCanonicalizer) {
-    fn = inputFn;
+  DiagnosticEmitter(SILFunction *inputFn) : fn(inputFn) {}
+
+  void initCanonicalizer(OSSACanonicalizer *inputCanonicalizer) {
     canonicalizer = inputCanonicalizer;
   }
 
@@ -71,11 +72,13 @@ public:
     return emittedCheckerDoesntUnderstandDiagnostic;
   }
 
+  /// Used at the end of the MoveOnlyAddressChecker to tell the user in a nice
+  /// way to file a bug.
+  void emitCheckedMissedCopyError(SILInstruction *copyInst);
+
   void emitCheckerDoesntUnderstandDiagnostic(MarkMustCheckInst *markedValue);
   void emitObjectGuaranteedDiagnostic(MarkMustCheckInst *markedValue);
   void emitObjectOwnedDiagnostic(MarkMustCheckInst *markedValue);
-
-  bool emittedAnyDiagnostics() const { return valuesWithDiagnostics.size(); }
 
   bool emittedDiagnosticForValue(MarkMustCheckInst *markedValue) const {
     return valuesWithDiagnostics.count(markedValue);
@@ -102,6 +105,11 @@ public:
   void emitObjectInstConsumesAndUsesValue(MarkMustCheckInst *markedValue,
                                           Operand *consumingUse,
                                           Operand *nonConsumingUse);
+
+  void emitAddressEscapingClosureCaptureLoadedAndConsumed(
+      MarkMustCheckInst *markedValue);
+  void emitPromotedBoxArgumentError(MarkMustCheckInst *markedValue,
+                                    SILFunctionArgument *arg);
 
 private:
   /// Emit diagnostics for the final consuming uses and consuming uses needing

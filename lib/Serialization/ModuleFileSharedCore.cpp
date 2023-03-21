@@ -356,7 +356,7 @@ static ValidationInfo validateControlBlock(
       // Disable this restriction for compiler testing by setting this
       // env var to any value.
       static const char* ignoreRevision =
-        ::getenv("SWIFT_DEBUG_IGNORE_SWIFTMODULE_REVISION");
+        ::getenv("SWIFT_IGNORE_SWIFTMODULE_REVISION");
       if (ignoreRevision)
         break;
 
@@ -370,12 +370,20 @@ static ValidationInfo validateControlBlock(
       if (forcedDebugRevision ||
           (requiresRevisionMatch && version::isCurrentCompilerTagged())) {
         StringRef compilerRevision = forcedDebugRevision ?
-          forcedDebugRevision : version::getCurrentCompilerTag();
+          forcedDebugRevision : version::getCurrentCompilerSerializationTag();
         if (moduleRevision != compilerRevision) {
-          result.status = Status::RevisionIncompatible;
+          // The module versions are mismatching, record it and diagnose later.
+          result.problematicRevision = moduleRevision;
 
-          // We can't trust this module format at this point.
-          return result;
+          // Reject the module only it still mismatches without the last digit.
+          StringRef compilerRevisionHead = compilerRevision.rsplit('.').first;
+          StringRef moduleRevisionHead = moduleRevision.rsplit('.').first;
+          if (moduleRevisionHead != compilerRevisionHead) {
+            result.status = Status::RevisionIncompatible;
+
+            // We can't trust the module format at this point.
+            return result;
+          }
         }
       }
       break;
@@ -484,7 +492,7 @@ static bool validateInputBlock(
 
 bool serialization::isSerializedAST(StringRef data) {
   StringRef signatureStr(reinterpret_cast<const char *>(SWIFTMODULE_SIGNATURE),
-                         llvm::array_lengthof(SWIFTMODULE_SIGNATURE));
+                         std::size(SWIFTMODULE_SIGNATURE));
   return data.startswith(signatureStr);
 }
 
@@ -536,7 +544,7 @@ ValidationInfo serialization::validateSerializedAST(
           requiresOSSAModules, requiresRevisionMatch,
           requiredSDK,
           extendedInfo, localObfuscator);
-      if (result.status == Status::Malformed)
+      if (result.status != Status::Valid)
         return result;
     } else if ((dependencies || searchPaths) &&
                result.status == Status::Valid &&
@@ -1013,6 +1021,8 @@ getActualImportControl(unsigned rawValue) {
     return ModuleDecl::ImportFilterKind::Exported;
   case static_cast<unsigned>(serialization::ImportControl::ImplementationOnly):
     return ModuleDecl::ImportFilterKind::ImplementationOnly;
+  case static_cast<unsigned>(serialization::ImportControl::PackageOnly):
+    return ModuleDecl::ImportFilterKind::PackageOnly;
   default:
     return None;
   }

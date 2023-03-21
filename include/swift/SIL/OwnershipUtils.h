@@ -122,6 +122,12 @@ inline bool isForwardingConsume(SILValue value) {
 
 bool hasPointerEscape(BorrowedValue value);
 
+/// Whether the specified OSSA-lifetime introducer has a pointer escape.
+///
+/// precondition: \p value introduces an OSSA-lifetime, either a BorrowedValue
+/// can be constructed from it or it's an owned value
+bool hasPointerEscape(SILValue value);
+
 /// Find leaf "use points" of \p guaranteedValue that determine its lifetime
 /// requirement. Return true if no PointerEscape use was found.
 ///
@@ -275,9 +281,6 @@ public:
   SILValue getSingleForwardedValue() const;
 };
 
-/// Returns true if the instruction is a 'reborrow'.
-bool isReborrowInstruction(const SILInstruction *inst);
-
 class BorrowingOperandKind {
 public:
   enum Kind : uint8_t {
@@ -288,6 +291,8 @@ public:
     Apply,
     TryApply,
     Yield,
+    PartialApplyStack,
+    BeginAsyncLet,
   };
 
 private:
@@ -298,8 +303,8 @@ public:
 
   operator Kind() const { return value; }
 
-  static BorrowingOperandKind get(SILInstructionKind kind) {
-    switch (kind) {
+  static BorrowingOperandKind get(SILInstruction *i) {
+    switch (i->getKind()) {
     default:
       return Kind::Invalid;
     case SILInstructionKind::BeginBorrowInst:
@@ -314,6 +319,15 @@ public:
       return Kind::TryApply;
     case SILInstructionKind::YieldInst:
       return Kind::Yield;
+    case SILInstructionKind::PartialApplyInst:
+      return Kind::PartialApplyStack;
+    case SILInstructionKind::BuiltinInst: {
+      auto bi = cast<BuiltinInst>(i);
+      if (bi->getBuiltinKind() == BuiltinValueKind::StartAsyncLetWithLocalBuffer) {
+        return Kind::BeginAsyncLet;
+      }
+      return Kind::Invalid;
+    }
     }
   }
 
@@ -341,7 +355,7 @@ struct BorrowingOperand {
   BorrowingOperandKind kind;
 
   BorrowingOperand(Operand *op)
-      : op(op), kind(BorrowingOperandKind::get(op->getUser()->getKind())) {
+      : op(op), kind(BorrowingOperandKind::get(op->getUser())) {
     auto ownership = op->getOperandOwnership();
     if (ownership != OperandOwnership::Borrow
         && ownership != OperandOwnership::Reborrow) {
@@ -408,6 +422,8 @@ struct BorrowingOperand {
     case BorrowingOperandKind::Apply:
     case BorrowingOperandKind::TryApply:
     case BorrowingOperandKind::Yield:
+    case BorrowingOperandKind::PartialApplyStack:
+    case BorrowingOperandKind::BeginAsyncLet:
       return false;
     case BorrowingOperandKind::Branch:
       return true;
@@ -438,6 +454,8 @@ struct BorrowingOperand {
     case BorrowingOperandKind::Apply:
     case BorrowingOperandKind::TryApply:
     case BorrowingOperandKind::Yield:
+    case BorrowingOperandKind::PartialApplyStack:
+    case BorrowingOperandKind::BeginAsyncLet:
       return false;
     }
     llvm_unreachable("Covered switch isn't covered?!");
@@ -1328,6 +1346,21 @@ void visitTransitiveEndBorrows(
 /// - the value is a guaranteed argument to the function
 /// - the value is itself a begin_borrow [lexical]
 bool isNestedLexicalBeginBorrow(BeginBorrowInst *bbi);
+
+/// Whether specified move_value is redundant.
+///
+/// A move_value is redundant if it doesn't
+/// - alter constraints (lexicality, ownership)
+/// - enable optimizations (e.g, separate smaller scopes within which a value
+///   escapes)
+///
+/// For example, if the lifetimes that a move_value separates both have the
+/// same characteristics with respect to
+/// - ownership
+/// - lexicality
+/// - escaping
+/// then the move_value is redundant.
+bool isRedundantMoveValue(MoveValueInst *mvi);
 
 } // namespace swift
 

@@ -86,6 +86,9 @@ ImportPaths("I", llvm::cl::desc("add a directory to the import search path"));
 static llvm::cl::list<std::string>
 FrameworkPaths("F", llvm::cl::desc("add a directory to the framework search path"));
 
+static llvm::cl::list<std::string>
+VFSOverlays("vfsoverlay", llvm::cl::desc("add a VFS overlay"));
+
 static llvm::cl::opt<std::string>
 ModuleName("module-name", llvm::cl::desc("The name of the module if processing"
                                          " a module. Necessary for processing "
@@ -104,6 +107,10 @@ static llvm::cl::opt<bool> DisableSILOwnershipVerifier(
 
 static llvm::cl::opt<bool>
 EnableSILOpaqueValues("enable-sil-opaque-values",
+                      llvm::cl::desc("Compile the module with sil-opaque-values enabled."));
+
+static llvm::cl::opt<bool>
+EnableOSSACompleteLifetimes("enable-ossa-complete-lifetimes",
                       llvm::cl::desc("Compile the module with sil-opaque-values enabled."));
 
 static llvm::cl::opt<bool>
@@ -542,6 +549,9 @@ int main(int argc, char **argv) {
     FramePaths.push_back({path, /*isSystem=*/false});
   }
   Invocation.setFrameworkSearchPaths(FramePaths);
+
+  Invocation.setVFSOverlays(VFSOverlays);
+
   // Set the SDK path and target if given.
   if (SDKPath.getNumOccurrences() == 0) {
     const char *SDKROOT = getenv("SDKROOT");
@@ -653,6 +663,7 @@ int main(int argc, char **argv) {
   SILOpts.IgnoreAlwaysInline = IgnoreAlwaysInline;
   SILOpts.EnableOSSAModules = EnableOSSAModules;
   SILOpts.EnableSILOpaqueValues = EnableSILOpaqueValues;
+  SILOpts.OSSACompleteLifetimes = EnableOSSACompleteLifetimes;
 
   if (CopyPropagationState) {
     SILOpts.CopyPropagation = *CopyPropagationState;

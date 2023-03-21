@@ -1254,6 +1254,8 @@ struct AccessPathWithBase {
     return AccessBase(base, accessPath.getStorage().getKind());
   }
 
+  bool isValid() const { return base && accessPath.isValid(); }
+
   bool operator==(AccessPathWithBase other) const {
     return accessPath == other.accessPath && base == other.base;
   }
@@ -1396,6 +1398,12 @@ bool visitAccessStorageUses(AccessUseVisitor &visitor, AccessStorage storage,
 /// visitor's visitUse method returns true.
 bool visitAccessPathUses(AccessUseVisitor &visitor, AccessPath accessPath,
                          SILFunction *function);
+
+/// Similar to visitAccessPathUses, but the visitor is restricted to a specific
+/// access base, such as a particular ref_element_addr.
+bool visitAccessPathBaseUses(AccessUseVisitor &visitor,
+                             AccessPathWithBase accessPathWithBase,
+                             SILFunction *function);
 
 } // end namespace swift
 
@@ -1624,6 +1632,7 @@ inline bool isAccessStorageIdentityCast(SingleValueInstruction *svi) {
   // Simply pass-thru the incoming address.
   case SILInstructionKind::MarkUninitializedInst:
   case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
   case SILInstructionKind::MarkDependenceInst:
   case SILInstructionKind::CopyValueInst:
     return true;

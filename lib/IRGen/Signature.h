@@ -53,6 +53,8 @@ class TypeInfo;
 class ForeignFunctionInfo {
 public:
   const clang::CodeGen::CGFunctionInfo *ClangInfo = nullptr;
+  /// True if the foreign function can throw an Objective-C / C++ exception.
+  bool canThrow = false;
 };
 
 /// An encapsulation of the extra lowering information we might want to
@@ -201,7 +203,8 @@ public:
   /// IRGenModule::getSignature(CanSILFunctionType), which is what
   /// clients should generally be using.
   static Signature getUncached(IRGenModule &IGM, CanSILFunctionType formalType,
-                               FunctionPointerKind kind);
+                               FunctionPointerKind kind,
+                               bool forStaticCall = false);
 
   static SignatureExpansionABIDetails
   getUncachedABIDetails(IRGenModule &IGM, CanSILFunctionType formalType,

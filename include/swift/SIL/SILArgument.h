@@ -178,7 +178,7 @@ public:
   /// Note: this peeks through any projections or cast implied by the
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
-  bool getSingleTerminatorOperands(
+  [[nodiscard]] bool getSingleTerminatorOperands(
       SmallVectorImpl<SILValue> &returnedSingleTermOperands) const;
 
   /// Returns true if we were able to find single terminator operand values for
@@ -188,7 +188,7 @@ public:
   /// Note: this peeks through any projections or cast implied by the
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
-  bool getSingleTerminatorOperands(
+  [[nodiscard]] bool getSingleTerminatorOperands(
       SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
           &returnedSingleTermOperands) const;
 
@@ -241,6 +241,9 @@ public:
   /// result.
   bool isPhi() const;
 
+  /// Whether any of the values incoming to this phi are lexical.
+  bool isLexical() const;
+
   /// Return true if this block argument is a terminator result.
   bool isTerminatorResult() const { return !isPhi(); }
 
@@ -291,7 +294,7 @@ public:
   ///
   /// Returns false when called on a non-phi and when the visitor returns false.
   bool visitTransitiveIncomingPhiOperands(
-      function_ref<bool(SILPhiArgument *, Operand *)> visitor);
+      function_ref<bool(SILPhiArgument *, Operand *)> visitor) const;
 
   /// Returns true if we were able to find a single terminator operand value for
   /// each predecessor of this arguments basic block. The found values are
@@ -300,7 +303,7 @@ public:
   /// Note: this peeks through any projections or cast implied by the
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
-  bool getSingleTerminatorOperands(
+  [[nodiscard]] bool getSingleTerminatorOperands(
       SmallVectorImpl<SILValue> &returnedSingleTermOperands) const;
 
   /// Returns true if we were able to find single terminator operand values for
@@ -310,7 +313,7 @@ public:
   /// Note: this peeks through any projections or cast implied by the
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
-  bool getSingleTerminatorOperands(
+  [[nodiscard]] bool getSingleTerminatorOperands(
       SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
           &returnedSingleTermOperands) const;
 

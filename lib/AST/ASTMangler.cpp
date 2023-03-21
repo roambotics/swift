@@ -484,12 +484,19 @@ void ASTMangler::beginManglingWithAutoDiffOriginalFunction(
     appendOperator(attr->Name);
     return;
   }
+
+  auto beginManglingClangDecl = [&](const clang::NamedDecl *decl) {
+    beginManglingWithoutPrefix();
+    appendOperator(decl->getName());
+  };
+
   // For imported Clang declarations, use the Clang name in order to match how
   // DifferentiationMangler handles these.
-  auto clangDecl = getClangDeclForMangling(afd);
-  if (clangDecl) {
-    beginManglingWithoutPrefix();
-    appendOperator(clangDecl->getName());
+  if (auto clangDecl = getClangDeclForMangling(afd)) {
+    beginManglingClangDecl(clangDecl);
+    return;
+  } else if (auto typedefType = getTypeDefForCXXCFOptionsDefinition(afd)) {
+    beginManglingClangDecl(typedefType->getDecl());
     return;
   }
   beginMangling();
@@ -1210,6 +1217,8 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
       return appendOperator("Be");
     case TypeKind::BuiltinDefaultActorStorage:
       return appendOperator("BD");
+    case TypeKind::BuiltinNonDefaultDistributedActorStorage:
+      return appendOperator("Bd");
     case TypeKind::BuiltinPackIndex:
       return appendOperator("BP");
     case TypeKind::BuiltinRawPointer:
@@ -2168,7 +2177,13 @@ ASTMangler::getSpecialManglingContext(const ValueDecl *decl,
     if (auto *clangDecl = cast_or_null<clang::NamedDecl>(decl->getClangDecl())){
       bool hasNameForLinkage;
       if (auto *tagDecl = dyn_cast<clang::TagDecl>(clangDecl))
-        hasNameForLinkage = tagDecl->hasNameForLinkage();
+        // Clang does not always populate the fields that determine if a tag
+        // decl has a linkage name. This is particularly the case for the
+        // C++ definition of CF_OPTIONS in the sdk. However, we use the
+        // name of the backing typedef as a linkage name, despite
+        // the enum itself not having one.
+        hasNameForLinkage =
+            tagDecl->hasNameForLinkage() || isCXXCFOptionsDefinition(decl);
       else
         hasNameForLinkage = !clangDecl->getDeclName().isEmpty();
       if (hasNameForLinkage) {
@@ -2275,6 +2290,8 @@ static Optional<VarDecl*> findFirstVariable(PatternBindingDecl *binding) {
 
 void ASTMangler::appendContext(const DeclContext *ctx, StringRef useModuleName) {
   switch (ctx->getContextKind()) {
+  case DeclContextKind::Package:
+    return;
   case DeclContextKind::Module:
     return appendModule(cast<ModuleDecl>(ctx), useModuleName);
 
@@ -2506,11 +2523,26 @@ void ASTMangler::appendProtocolName(const ProtocolDecl *protocol,
     appendDeclName(protocol);
 }
 
-const clang::NamedDecl *ASTMangler::getClangDeclForMangling(const ValueDecl *vd) {
-  auto namedDecl =  dyn_cast_or_null<clang::NamedDecl>(vd->getClangDecl());
+bool ASTMangler::isCXXCFOptionsDefinition(const ValueDecl *decl) {
+  return getTypeDefForCXXCFOptionsDefinition(decl);
+}
+
+const clang::TypedefType *
+ASTMangler::getTypeDefForCXXCFOptionsDefinition(const ValueDecl *decl) {
+  const clang::Decl *clangDecl = decl->getClangDecl();
+  if (!clangDecl)
+    return nullptr;
+
+  const auto &clangModuleLoader = decl->getASTContext().getClangModuleLoader();
+  return clangModuleLoader->getTypeDefForCXXCFOptionsDefinition(clangDecl);
+}
+
+const clang::NamedDecl *
+ASTMangler::getClangDeclForMangling(const ValueDecl *vd) {
+  auto namedDecl = dyn_cast_or_null<clang::NamedDecl>(vd->getClangDecl());
   if (!namedDecl)
     return nullptr;
-  
+
   // Use an anonymous enum's enclosing typedef for the mangled name, if
   // present. This matches C++'s rules for linkage names of tag declarations.
   if (namedDecl->getDeclName().isEmpty())
@@ -2572,8 +2604,20 @@ void ASTMangler::appendAnyGenericType(const GenericTypeDecl *decl) {
   auto tryAppendClangName = [this, decl]() -> bool {
     auto *nominal = dyn_cast<NominalTypeDecl>(decl);
     auto namedDecl = getClangDeclForMangling(decl);
-    if (!namedDecl)
+    if (!namedDecl) {
+      if (auto typedefType = getTypeDefForCXXCFOptionsDefinition(decl)) {
+        // To make sure the C++ definition of CF_OPTIONS mangles the
+        // same way as the Objective-C definition, we mangle using the
+        // name of the backing typedef, but pretend as if it was an enum.
+        // See CFAvailability.h to understand how the definitions differ
+        // in C++ and Objective-C
+        appendIdentifier(typedefType->getDecl()->getName());
+        appendOperator("V");
+        return true;
+      }
+
       return false;
+    }
 
     // Mangle ObjC classes using their runtime names.
     auto interface = dyn_cast<clang::ObjCInterfaceDecl>(namedDecl);
@@ -2791,10 +2835,64 @@ void ASTMangler::appendFunctionSignature(AnyFunctionType *fn,
   }
 }
 
+static ParamSpecifier
+getDefaultOwnership(const ValueDecl *forDecl) {
+  // `consuming` is the default ownership for initializers and setters.
+  // Everything else defaults to borrowing.
+  if (!forDecl) {
+    return ParamSpecifier::Borrowing;
+  }
+  auto forFuncDecl = dyn_cast<AbstractFunctionDecl>(forDecl);
+  if (!forFuncDecl) {
+    return ParamSpecifier::Borrowing;
+  }
+  
+  if (isa<ConstructorDecl>(forFuncDecl)) {
+    return ParamSpecifier::Consuming;
+  } else if (auto accessor = dyn_cast<AccessorDecl>(forFuncDecl)) {
+    switch (accessor->getAccessorKind()) {
+    case AccessorKind::Modify:
+    case AccessorKind::Set:
+      return ParamSpecifier::Consuming;
+    default:
+      return ParamSpecifier::Borrowing;
+    }
+  }
+  
+  return ParamSpecifier::Borrowing;
+}
+
+static ParameterTypeFlags
+getParameterFlagsForMangling(ParameterTypeFlags flags,
+                             ParamSpecifier defaultSpecifier) {
+  switch (auto specifier = flags.getOwnershipSpecifier()) {
+  // If no parameter specifier was provided, mangle as-is, because we are by
+  // definition using the default convention.
+  case ParamSpecifier::Default:
+  // If the legacy `__shared` or `__owned` modifier was provided, mangle as-is,
+  // because we need to maintain compatibility with their existing behavior.
+  case ParamSpecifier::LegacyShared:
+  case ParamSpecifier::LegacyOwned:
+  // `inout` should already be specified in the flags.
+  case ParamSpecifier::InOut:
+    return flags;
+  
+  case ParamSpecifier::Consuming:
+  case ParamSpecifier::Borrowing:
+    // Only mangle the ownership if it diverges from the default.
+    if (specifier == defaultSpecifier) {
+      flags = flags.withOwnershipSpecifier(ParamSpecifier::Default);
+    }
+    return flags;
+  }
+}
+
 void ASTMangler::appendFunctionInputType(
     ArrayRef<AnyFunctionType::Param> params,
     GenericSignature sig,
     const ValueDecl *forDecl) {
+  auto defaultSpecifier = getDefaultOwnership(forDecl);
+  
   switch (params.size()) {
   case 0:
     appendOperator("y");
@@ -2808,8 +2906,14 @@ void ASTMangler::appendFunctionInputType(
     // the parameter list as a single type.
     if (!param.hasLabel() && !param.isVariadic() &&
         !isa<TupleType>(type.getPointer())) {
-      appendTypeListElement(Identifier(), type, param.getParameterFlags(),
-                            sig, forDecl);
+      // Note that we pass `nullptr` as the `forDecl` argument, since the type
+      // of the input is no longer directly the type of the declaration, so we
+      // don't want it to pick up contextual behavior, such as default ownership,
+      // from the top-level declaration type.
+      appendTypeListElement(Identifier(), type,
+                        getParameterFlagsForMangling(param.getParameterFlags(),
+                                                     defaultSpecifier),
+                        sig, nullptr);
       break;
     }
 
@@ -2821,8 +2925,14 @@ void ASTMangler::appendFunctionInputType(
   default:
     bool isFirstParam = true;
     for (auto &param : params) {
+      // Note that we pass `nullptr` as the `forDecl` argument, since the type
+      // of the input is no longer directly the type of the declaration, so we
+      // don't want it to pick up contextual behavior, such as default ownership,
+      // from the top-level declaration type.
       appendTypeListElement(Identifier(), param.getPlainType(),
-                            param.getParameterFlags(), sig, forDecl);
+                        getParameterFlagsForMangling(param.getParameterFlags(),
+                                                     defaultSpecifier),
+                        sig, nullptr);
       appendListSeparator(isFirstParam);
     }
     appendOperator("t");
@@ -2979,7 +3089,7 @@ void ASTMangler::appendRequirement(const Requirement &reqt,
     if (tryMangleTypeSubstitution(DT, sig)) {
       switch (reqt.getKind()) {
         case RequirementKind::SameShape:
-          llvm_unreachable("Same-shape requirement not supported here");
+          llvm_unreachable("Same-shape requirement with dependent member type?");
         case RequirementKind::Conformance:
           return appendOperator("RQ");
         case RequirementKind::Layout:
@@ -3038,12 +3148,18 @@ void ASTMangler::appendRequirement(const Requirement &reqt,
 
 void ASTMangler::appendGenericSignatureParts(
                                      GenericSignature sig,
-                                     ArrayRef<CanTypeWrapper<GenericTypeParamType>> params,
+                                     ArrayRef<CanGenericTypeParamType> params,
                                      unsigned initialParamDepth,
                                      ArrayRef<Requirement> requirements) {
   // Mangle the requirements.
   for (const Requirement &reqt : requirements) {
     appendRequirement(reqt, sig);
+  }
+
+  // Mangle which generic parameters are pack parameters.
+  for (auto param : params) {
+    if (param->isParameterPack())
+      appendOpWithGenericParamIndex("Rv", param);
   }
 
   if (params.size() == 1 && params[0]->getDepth() == initialParamDepth)
@@ -3090,9 +3206,13 @@ void ASTMangler::appendGenericSignatureParts(
 
 /// Determine whether an associated type reference into the given set of
 /// protocols is unambiguous.
-static bool associatedTypeRefIsUnambiguous(ArrayRef<ProtocolDecl *> protocols) {
+static bool associatedTypeRefIsUnambiguous(GenericSignature sig, Type t) {
+  // FIXME: This should be an assertion.
+  if (!sig->isValidTypeParameter(t))
+    return false;
+
   unsigned numProtocols = 0;
-  for (auto proto : protocols) {
+  for (auto proto : sig->getRequiredProtocols(t)) {
     // Skip marker protocols, which cannot have associated types.
     if (proto->isMarkerProtocol())
       continue;
@@ -3112,7 +3232,7 @@ ASTMangler::dropProtocolFromAssociatedType(DependentMemberType *dmt,
   auto baseTy = dmt->getBase();
   bool unambiguous =
       (!dmt->getAssocType() ||
-       associatedTypeRefIsUnambiguous(sig->getRequiredProtocols(baseTy)));
+       associatedTypeRefIsUnambiguous(sig, baseTy));
 
   if (auto *baseDMT = baseTy->getAs<DependentMemberType>())
     baseTy = dropProtocolFromAssociatedType(baseDMT, sig);
@@ -3149,7 +3269,7 @@ void ASTMangler::appendAssociatedTypeName(DependentMemberType *dmt,
     // associated type name by protocol.
     if (!OptimizeProtocolNames || !sig ||
         !associatedTypeRefIsUnambiguous(
-            sig->getRequiredProtocols(dmt->getBase()))) {
+            sig, dmt->getBase())) {
       appendAnyGenericType(assocTy->getProtocol());
     }
     return;
@@ -3764,12 +3884,15 @@ void ASTMangler::appendMacroExpansionContext(
     outerExpansionDC = expansion->getDeclContext();
     discriminator = expansion->getDiscriminator();
     role = MacroRole::Declaration;
+    baseName = expansion->getMacroName().getBaseName();
     break;
   }
 
   case GeneratedSourceInfo::AccessorMacroExpansion:
   case GeneratedSourceInfo::MemberAttributeMacroExpansion:
-  case GeneratedSourceInfo::MemberMacroExpansion: {
+  case GeneratedSourceInfo::MemberMacroExpansion:
+  case GeneratedSourceInfo::PeerMacroExpansion:
+  case GeneratedSourceInfo::ConformanceMacroExpansion: {
     auto decl = ASTNode::getFromOpaqueValue(generatedSourceInfo->astNode)
       .get<Decl *>();
     auto attr = generatedSourceInfo->attachedMacroCustomAttr;
@@ -3787,13 +3910,28 @@ void ASTMangler::appendMacroExpansionContext(
       role = MacroRole::Member;
       break;
 
+    case GeneratedSourceInfo::PeerMacroExpansion:
+      role = MacroRole::Peer;
+      break;
+
+    case GeneratedSourceInfo::ConformanceMacroExpansion:
+      role = MacroRole::Conformance;
+      break;
+
     default:
       llvm_unreachable("Unhandled macro role");
     }
 
     outerExpansionLoc = decl->getLoc();
     outerExpansionDC = decl->getDeclContext();
-    discriminator = decl->getAttachedMacroDiscriminator(role, attr);
+
+    if (auto *macroDecl = decl->getResolvedMacro(attr))
+      baseName = macroDecl->getBaseName();
+    else
+      baseName = ctx.getIdentifier("__unknown_macro__");
+
+    discriminator = decl->getAttachedMacroDiscriminator(baseName, role, attr);
+
     break;
   }
 
@@ -3835,6 +3973,14 @@ void ASTMangler::appendMacroExpansionOperator(
   case MacroRole::Member:
     appendOperator("fMm", Index(discriminator));
     break;
+
+  case MacroRole::Peer:
+    appendOperator("fMp", Index(discriminator));
+    break;
+
+  case MacroRole::Conformance:
+    appendOperator("fMc", Index(discriminator));
+    break;
   }
 }
 
@@ -3864,29 +4010,31 @@ std::string ASTMangler::mangleAttachedMacroExpansion(
     const Decl *decl, CustomAttr *attr, MacroRole role) {
   beginMangling();
 
-  DeclContext *macroDeclContext = decl->getDeclContext();
-  if (role == MacroRole::MemberAttribute) {
-    appendContextOf(cast<ValueDecl>(decl));
-    macroDeclContext = decl->getDeclContext()->getParent();
-  } else if (auto valueDecl = dyn_cast<ValueDecl>(decl)) {
-    appendAnyDecl(valueDecl);
+  const Decl *attachedTo = decl;
+  if (auto valueDecl = dyn_cast<ValueDecl>(decl)) {
+    if (role != MacroRole::MemberAttribute) {
+      appendAnyDecl(valueDecl);
+    } else {
+      // Appending the member would result in a cycle since `VarDecl` appends
+      // its type, which would then loop back around to getting the attributes
+      // again. We'll instead add a discriminator for each member.
+      appendContextOf(valueDecl);
+      attachedTo = decl->getDeclContext()->getAsDecl();
+    }
   } else {
     appendContext(decl->getDeclContext(), "");
   }
 
-  StringRef macroName;
-  auto *macroDecl = evaluateOrDefault(
-      decl->getASTContext().evaluator,
-      ResolveMacroRequest{attr, role, macroDeclContext},
-      nullptr);
-  if (macroDecl)
-    macroName = macroDecl->getName().getBaseName().userFacingName();
-  else
-    macroName = "__unknown_macro__";
+  DeclBaseName macroName;
+  if (auto *macroDecl = attachedTo->getResolvedMacro(attr)) {
+    macroName = macroDecl->getName().getBaseName();
+  } else {
+    macroName = decl->getASTContext().getIdentifier("__unknown_macro__");
+  }
 
   appendMacroExpansionOperator(
-      macroName, role,
-      decl->getAttachedMacroDiscriminator(role, attr));
+      macroName.userFacingName(), role,
+      decl->getAttachedMacroDiscriminator(macroName, role, attr));
   return finalize();
 }
 

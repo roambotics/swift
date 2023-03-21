@@ -178,6 +178,15 @@ def no_strict_implicit_module_context :
   Flags<[FrontendOption, HelpHidden]>,
   HelpText<"Disable the strict forwarding of compilation context to downstream implicit module dependencies">;
 
+def validate_clang_modules_once :
+  Flag<["-"], "validate-clang-modules-once">,
+  Flags<[FrontendOption]>,
+  HelpText<"Don't verify input files for Clang modules if the module has been successfully validated or loaded during this build session">;
+
+def clang_build_session_file : Separate<["-"], "clang-build-session-file">,
+  Flags<[FrontendOption, ArgumentIsPath]>,
+  HelpText<"Use the last modification time of <file> as the underlying Clang build session timestamp">;
+
 def disallow_forwarding_driver :
   Flag<["-"], "disallow-use-new-driver">, Flags<[]>,
   HelpText<"Disable using new swift-driver">;
@@ -214,6 +223,25 @@ def version : Flag<["-", "--"], "version">, Flags<[FrontendOption]>,
 def parseable_output : Flag<["-"], "parseable-output">,
   Flags<[NoInteractiveOption, DoesNotAffectIncrementalBuild]>,
   HelpText<"Emit textual output in a parseable format">;
+
+// Windows Options
+
+def windows_sdk_root : Separate<["-"], "windows-sdk-root">,
+  Flags<[ArgumentIsPath, FrontendOption, SwiftAPIExtractOption,
+         SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"Windows SDK Root">, MetaVarName<"<root>">;
+def windows_sdk_version : Separate<["-"], "windows-sdk-version">,
+  Flags<[ArgumentIsPath, FrontendOption, SwiftAPIExtractOption,
+         SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"Windows SDK Version">, MetaVarName<"<version>">;
+def visualc_tools_root : Separate<["-"], "visualc-tools-root">,
+  Flags<[ArgumentIsPath, FrontendOption, SwiftAPIExtractOption,
+         SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"VisualC++ Tools Root">, MetaVarName<"<root>">;
+def visualc_tools_version : Separate<["-"], "visualc-tools-version">,
+  Flags<[ArgumentIsPath, FrontendOption, SwiftAPIExtractOption,
+         SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"VisualC++ ToolSet Version">, MetaVarName<"<version>">;
 
 // Standard Options
 def _DASH_DASH : Option<["--"], "", KIND_REMAINING_ARGS>,
@@ -270,6 +298,15 @@ def I : JoinedOrSeparate<["-"], "I">,
   HelpText<"Add directory to the import search path">;
 def I_EQ : Joined<["-"], "I=">, Flags<[FrontendOption, ArgumentIsPath]>,
   Alias<I>;
+
+def plugin_path : Separate<["-"], "plugin-path">,
+  Flags<[FrontendOption, ArgumentIsPath, SwiftAPIExtractOption, SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"Add directory to the plugin search path">;
+
+def external_plugin_path : Separate<["-"], "external-plugin-path">,
+  Flags<[FrontendOption, ArgumentIsPath, SwiftAPIExtractOption, SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"Add directory to the plugin search path with a plugin server executable">,
+  MetaVarName<"<path>#<plugin-server-path>">;
 
 def import_underlying_module : Flag<["-"], "import-underlying-module">,
   Flags<[FrontendOption, NoInteractiveOption]>,
@@ -650,18 +687,19 @@ def enable_experimental_concise_pound_file : Flag<["-"],
 
 def enable_experimental_cxx_interop :
   Flag<["-"], "enable-experimental-cxx-interop">,
-  Flags<[FrontendOption, HelpHidden, ModuleInterfaceOption]>,
+  Flags<[NoDriverOption, FrontendOption, HelpHidden, ModuleInterfaceOption]>,
   HelpText<"Enable experimental C++ interop code generation and config directives">;
+
+def cxx_interoperability_mode :
+  Joined<["-"], "cxx-interoperability-mode=">,
+  Flags<[FrontendOption, ModuleInterfaceOption]>,
+  HelpText<"Enables C++ interoperability; requires compatbility version to be "
+  "specified.">;
 
 def experimental_c_foreign_reference_types :
   Flag<["-"], "experimental-c-foreign-reference-types">,
   Flags<[FrontendOption, HelpHidden, ModuleInterfaceOption]>,
   HelpText<"Enable experimental C foreign references types (with reference coutning).">;
-
-def enable_experimental_cxx_interop_in_clang_header :
-  Flag<["-"], "enable-experimental-cxx-interop-in-clang-header">,
-  Flags<[FrontendOption, NoDriverOption, HelpHidden]>,
-  HelpText<"Enable experimental Swift to C++ interop code generation in generated Clang header">;
 
 def experimental_cxx_stdlib :
   Separate<["-"], "experimental-cxx-stdlib">,
@@ -808,11 +846,14 @@ def L_EQ : Joined<["-"], "L=">, Group<linker_option_Group>,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild, ArgumentIsPath]>,
   Alias<L>;
 
+// Accept but ignore these flags.  They were once used to control
+// linking of arclite, which is no longer used on Darwin.
 def link_objc_runtime : Flag<["-"], "link-objc-runtime">,
-  Flags<[DoesNotAffectIncrementalBuild]>;
+  Flags<[DoesNotAffectIncrementalBuild]>,
+  HelpText<"Deprecated">;
 def no_link_objc_runtime : Flag<["-"], "no-link-objc-runtime">,
   Flags<[HelpHidden, DoesNotAffectIncrementalBuild]>,
-  HelpText<"Don't link in additions to the Objective-C runtime">;
+  HelpText<"Deprecated">;
 
 def static_stdlib: Flag<["-"], "static-stdlib">,
   Flags<[DoesNotAffectIncrementalBuild]>,
@@ -1039,6 +1080,10 @@ def parse_sil : Flag<["-"], "parse-sil">,
 def parse_stdlib : Flag<["-"], "parse-stdlib">,
   Flags<[FrontendOption, HelpHidden, ModuleInterfaceOption]>,
   HelpText<"Parse the input file(s) as the Swift standard library">;
+
+def enable_builtin_module : Flag<["-"], "enable-builtin-module">,
+  Flags<[FrontendOption, ModuleInterfaceOption]>,
+  HelpText<"Enables the explicit import of the Builtin module">;
 
 def modes_Group : OptionGroup<"<mode options>">, HelpText<"MODES">;
 
@@ -1444,6 +1489,11 @@ def include_spi_symbols : Flag<["-"], "include-spi-symbols">,
          NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
   HelpText<"Add symbols with SPI information to the symbol graph">;
 
+def skip_protocol_implementations : Flag<["-"], "skip-protocol-implementations">,
+  Flags<[SwiftSymbolGraphExtractOption, FrontendOption,
+         NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
+  HelpText<"Skip emitting symbols that are implementations of protocol requirements or inherited from protocl extensions">;
+
 // swift-api-digester-only options
 def dump_sdk: Flag<["-", "--"], "dump-sdk">,
   Flags<[NoDriverOption, SwiftAPIDigesterOption]>,
@@ -1536,6 +1586,10 @@ def disable_os_checks: Flag<["-", "--"], "disable-os-checks">,
 def disable_remove_deprecated_check: Flag<["-", "--"], "disable-remove-deprecated-check">,
   Flags<[NoDriverOption, SwiftAPIDigesterOption]>,
   HelpText<"Skip diagnosing removal of deprecated symbols">;
+
+def enable_remove_deprecated_check: Flag<["-", "--"], "enable-remove-deprecated-check">,
+  Flags<[NoDriverOption, SwiftAPIDigesterOption]>,
+  HelpText<"Diagnosing removal of deprecated symbols">;
 
 def print_module: Flag<["-", "--"], "print-module">,
   Flags<[NoDriverOption, SwiftAPIDigesterOption]>,
@@ -1748,5 +1802,12 @@ def load_plugin_library:
   HelpText<"Path to a dynamic library containing compiler plugins such as "
            "macros">,
   MetaVarName<"<path>">;
+
+def load_plugin_executable:
+  Separate<["-"], "load-plugin-executable">,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild, ArgumentIsPath]>,
+  HelpText<"Path to an executable compiler plugins and providing module names "
+           "such as macros">,
+  MetaVarName<"<path>#<module-names>">;
 
 include "FrontendOptions.td"

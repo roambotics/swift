@@ -993,6 +993,10 @@ namespace {
 
     bool shouldWalkCaptureInitializerExpressions() override { return true; }
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
+
     VarDecl *getImplicitSelfDeclForSuperContext(SourceLoc Loc) ;
 
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
@@ -1387,8 +1391,9 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
 
   // Qualified type lookup with a module base is represented as a DeclRefExpr
   // and not a TypeExpr.
-  if (auto *DRE = dyn_cast<DeclRefExpr>(UDE->getBase())) {
-    if (auto *TD = dyn_cast<TypeDecl>(DRE->getDecl())) {
+  auto handleNestedTypeLookup = [&](
+      TypeDecl *TD, DeclNameLoc ParentNameLoc
+    ) -> TypeExpr * {
       // See if the type has a member type with this name.
       auto Result = TypeChecker::lookupMemberType(
           DC, TD->getDeclaredInterfaceType(), Name,
@@ -1398,9 +1403,42 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
       // a non-type member, so leave the expression as-is.
       if (Result.size() == 1) {
         return TypeExpr::createForMemberDecl(
-            DRE->getNameLoc(), TD, UDE->getNameLoc(), Result.front().Member);
+            ParentNameLoc, TD, UDE->getNameLoc(), Result.front().Member);
       }
+
+      return nullptr;
+  };
+
+  if (auto *DRE = dyn_cast<DeclRefExpr>(UDE->getBase())) {
+    if (auto *TD = dyn_cast<TypeDecl>(DRE->getDecl()))
+      return handleNestedTypeLookup(TD, DRE->getNameLoc());
+
+    return nullptr;
+  }
+
+  // Determine whether there is exactly one type declaration, where all
+  // other declarations are macros.
+  if (auto *ODRE = dyn_cast<OverloadedDeclRefExpr>(UDE->getBase())) {
+    TypeDecl *FoundTD = nullptr;
+    for (auto *D : ODRE->getDecls()) {
+      if (auto *TD = dyn_cast<TypeDecl>(D)) {
+        if (FoundTD)
+          return nullptr;
+
+        FoundTD = TD;
+        continue;
+      }
+
+        // Ignore macros; they can't have any nesting.
+      if (isa<MacroDecl>(D))
+        continue;
+
+      // Anything else prevents folding.
+      return nullptr;
     }
+
+    if (FoundTD)
+      return handleNestedTypeLookup(FoundTD, ODRE->getNameLoc());
 
     return nullptr;
   }
@@ -1429,33 +1467,36 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
   }
 
   // Fold 'T.U' into a nested type.
-  if (auto *DeclRefTR = dyn_cast<DeclRefTypeRepr>(InnerTypeRepr)) {
-    // Resolve the TypeRepr to get the base type for the lookup.
-    const auto BaseTy = TypeResolution::resolveContextualType(
-        InnerTypeRepr, DC, TypeResolverContext::InExpression,
-        [](auto unboundTy) {
-          // FIXME: Don't let unbound generic types escape type resolution.
-          // For now, just return the unbound generic type.
-          return unboundTy;
-        },
-        // FIXME: Don't let placeholder types escape type resolution.
-        // For now, just return the placeholder type.
-        PlaceholderType::get,
-        // TypeExpr pack elements are opened in CSGen.
-        /*packElementOpener*/ nullptr);
 
-    if (BaseTy->mayHaveMembers()) {
-      // See if there is a member type with this name.
-      auto Result =
-          TypeChecker::lookupMemberType(DC, BaseTy, Name,
-                                        defaultMemberLookupOptions);
+  // Resolve the TypeRepr to get the base type for the lookup.
+  TypeResolutionOptions options(TypeResolverContext::InExpression);
+  // Pre-check always allows pack references during TypeExpr folding.
+  // CSGen will diagnose cases that appear outside of pack expansion
+  // expressions.
+  options |= TypeResolutionFlags::AllowPackReferences;
+  const auto BaseTy = TypeResolution::resolveContextualType(
+      InnerTypeRepr, DC, options,
+      [](auto unboundTy) {
+        // FIXME: Don't let unbound generic types escape type resolution.
+        // For now, just return the unbound generic type.
+        return unboundTy;
+      },
+      // FIXME: Don't let placeholder types escape type resolution.
+      // For now, just return the placeholder type.
+      PlaceholderType::get,
+      // TypeExpr pack elements are opened in CSGen.
+      /*packElementOpener*/ nullptr);
 
-      // If there is no nested type with this name, we have a lookup of
-      // a non-type member, so leave the expression as-is.
-      if (Result.size() == 1) {
-        return TypeExpr::createForMemberDecl(DeclRefTR, UDE->getNameLoc(),
-                                             Result.front().Member);
-      }
+  if (BaseTy->mayHaveMembers()) {
+    // See if there is a member type with this name.
+    auto Result = TypeChecker::lookupMemberType(DC, BaseTy, Name,
+                                                defaultMemberLookupOptions);
+
+    // If there is no nested type with this name, we have a lookup of
+    // a non-type member, so leave the expression as-is.
+    if (Result.size() == 1) {
+      return TypeExpr::createForMemberDecl(InnerTypeRepr, UDE->getNameLoc(),
+                                           Result.front().Member);
     }
   }
 
@@ -1487,6 +1528,7 @@ bool PreCheckExpression::exprLooksLikeAType(Expr *expr) {
       isa<ParenExpr>(expr) ||
       isa<ArrowExpr>(expr) ||
       isa<PackExpansionExpr>(expr) ||
+      isa<PackElementExpr>(expr) ||
       isa<TupleExpr>(expr) ||
       (isa<ArrayExpr>(expr) &&
        cast<ArrayExpr>(expr)->getElements().size() == 1) ||
@@ -1538,6 +1580,10 @@ bool PreCheckExpression::correctInterpolationIfStrange(
 
   public:
     StrangeInterpolationRewriter(ASTContext &Ctx) : Context(Ctx) {}
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
 
     virtual PreWalkAction walkToDeclPre(Decl *D) override {
       // We don't want to look inside decls.
@@ -1984,6 +2030,15 @@ TypeExpr *PreCheckExpression::simplifyTypeExpr(Expr *E) {
     }
   }
 
+  // Fold a PackElementExpr into a TypeExpr when the element is a TypeExpr
+  if (auto *element = dyn_cast<PackElementExpr>(E)) {
+    if (auto *refExpr = dyn_cast<TypeExpr>(element->getPackRefExpr())) {
+      auto *repr = new (Ctx) PackElementTypeRepr(element->getStartLoc(),
+                                                 refExpr->getTypeRepr());
+      return new (Ctx) TypeExpr(repr);
+    }
+  }
+
   return nullptr;
 }
 
@@ -2204,7 +2259,7 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
              : nullptr;
 }
 
-bool ConstraintSystem::preCheckTarget(SolutionApplicationTarget &target,
+bool ConstraintSystem::preCheckTarget(SyntacticElementTarget &target,
                                       bool replaceInvalidRefsWithErrors,
                                       bool leaveClosureBodiesUnchecked) {
   auto *DC = target.getDeclContext();

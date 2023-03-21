@@ -26,18 +26,39 @@ struct MyPropertyWrapper {
   var wrappedValue: String
 }
 
+@propertyWrapper
+struct MyGenericPropertyWrapper<T> {
+  var wrappedValue: T
+}
+
+
 @resultBuilder
 struct MyResultBuilder {
-  static func buildBlock(_ components: Int) -> Int {
-    return components.first!
+  static func buildBlock(_ component: Int) -> Int {
+    return component
   }
 }
+
+@resultBuilder
+struct MyGenericResultBuilder<T> {
+  static func buildBlock(_ components: Int) -> T {
+    fatalError()
+  }
+}
+
 
 @globalActor
 actor MyGlobalActor {
   static let shared = MyGlobalActor()
 }
 
+@globalActor
+actor MyGenericGlobalActor<T> {
+  static let shared = MyGenricGlobalActor<T>()
+}
+
+@attached(member)
+macro MyMacro() = #externalMacro(module: "Macros", type: "MyMacro")
 
 @available(#^AVAILABILITY1^#)
 
@@ -98,6 +119,7 @@ actor MyGlobalActor {
 // KEYWORD2-DAG:              Decl[Struct]/CurrModule:            MyPropertyWrapper[#MyPropertyWrapper#]; name=MyPropertyWrapper
 // KEYWORD2-DAG:              Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyResultBuilder[#MyResultBuilder#]; name=MyResultBuilder
 // KEYWORD2-DAG:              Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGlobalActor[#MyGlobalActor#]; name=MyGlobalActor
+// KEYWORD2-DAG:              Decl[Macro]/CurrModule: MyMacro[#Void#]; name=MyMacro
 // KEYWORD2:                  End completions
 
 @#^KEYWORD3^# class C {}
@@ -119,6 +141,7 @@ actor MyGlobalActor {
 // KEYWORD3-NEXT:             Keyword/None:                       globalActor[#Class Attribute#]; name=globalActor
 // KEYWORD3-NEXT:             Keyword/None:                       preconcurrency[#Class Attribute#]; name=preconcurrency
 // KEYWORD3-NEXT:             Keyword/None:                       runtimeMetadata[#Class Attribute#]; name=runtimeMetadata
+// KEYWORD3-NEXT:             Decl[Macro]/CurrModule: MyMacro[#Void#]; name=MyMacro
 // KEYWORD3-NEXT:             End completions
 
 @#^KEYWORD3_2^#IB class C2 {}
@@ -138,6 +161,7 @@ actor MyGlobalActor {
 // KEYWORD4-NEXT:             Keyword/None:                       globalActor[#Enum Attribute#]; name=globalActor
 // KEYWORD4-NEXT:             Keyword/None:                       preconcurrency[#Enum Attribute#]; name=preconcurrency
 // KEYWORD4-NEXT:             Keyword/None:                       runtimeMetadata[#Enum Attribute#]; name=runtimeMetadata
+// KEYWORD4-NEXT:             Decl[Macro]/CurrModule: MyMacro[#Void#]; name=MyMacro
 // KEYWORD4-NEXT:             End completions
 
 @#^KEYWORD5^# struct S{}
@@ -153,6 +177,7 @@ actor MyGlobalActor {
 // KEYWORD5-NEXT:             Keyword/None:                       globalActor[#Struct Attribute#]; name=globalActor
 // KEYWORD5-NEXT:             Keyword/None:                       preconcurrency[#Struct Attribute#]; name=preconcurrency
 // KEYWORD5-NEXT:             Keyword/None:                       runtimeMetadata[#Struct Attribute#]; name=runtimeMetadata
+// KEYWORD5-NEXT:             Decl[Macro]/CurrModule: MyMacro[#Void#]; name=MyMacro
 // KEYWORD5-NEXT:             End completions
 
 @#^ON_GLOBALVAR^# var globalVar
@@ -176,8 +201,11 @@ actor MyGlobalActor {
 // ON_GLOBALVAR-NOT: Keyword
 // ON_GLOBALVAR-DAG: Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
 // ON_GLOBALVAR-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyPropertyWrapper[#MyPropertyWrapper#]; name=MyPropertyWrapper
+// ON_GLOBALVAR-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyGenericPropertyWrapper[#MyGenericPropertyWrapper#]; name=MyGenericPropertyWrapper
 // ON_GLOBALVAR-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyResultBuilder[#MyResultBuilder#]; name=MyResultBuilder
+// ON_GLOBALVAR-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyGenericResultBuilder[#MyGenericResultBuilder#]; name=MyGenericResultBuilder
 // ON_GLOBALVAR-DAG: Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGlobalActor[#MyGlobalActor#]; name=MyGlobalActor
+// ON_GLOBALVAR-DAG: Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGenericGlobalActor[#MyGenericGlobalActor#]; name=MyGenericGlobalActor
 // ON_GLOBALVAR: End completions
 
 struct _S {
@@ -214,8 +242,11 @@ struct _S {
 // ON_PROPERTY-NOT: Keyword
 // ON_PROPERTY-DAG: Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
 // ON_PROPERTY-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyPropertyWrapper[#MyPropertyWrapper#]; name=MyPropertyWrapper
+// ON_PROPERTY-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyGenericPropertyWrapper[#MyGenericPropertyWrapper#]; name=MyGenericPropertyWrapper
 // ON_PROPERTY-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyResultBuilder[#MyResultBuilder#]; name=MyResultBuilder
+// ON_PROPERTY-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyGenericResultBuilder[#MyGenericResultBuilder#]; name=MyGenericResultBuilder
 // ON_PROPERTY-DAG: Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGlobalActor[#MyGlobalActor#]; name=MyGlobalActor
+// ON_PROPERTY-DAG: Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGenericGlobalActor[#MyGenericGlobalActor#]; name=MyGenericGlobalActor
 // ON_PROPERTY-NOT: Decl[PrecedenceGroup]
 // ON_PROPERTY: End completions
 
@@ -243,8 +274,11 @@ struct _S {
 // ON_METHOD-NOT: Keyword
 // ON_METHOD-DAG: Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
 // ON_METHOD-DAG: Decl[Struct]/CurrModule:            MyPropertyWrapper[#MyPropertyWrapper#]; name=MyPropertyWrapper
+// ON_METHOD-DAG: Decl[Struct]/CurrModule:            MyGenericPropertyWrapper[#MyGenericPropertyWrapper#]; name=MyGenericPropertyWrapper
 // ON_METHOD-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyResultBuilder[#MyResultBuilder#]; name=MyResultBuilder
+// ON_METHOD-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyGenericResultBuilder[#MyGenericResultBuilder#]; name=MyGenericResultBuilder
 // ON_METHOD-DAG: Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGlobalActor[#MyGlobalActor#]; name=MyGlobalActor
+// ON_METHOD-DAG: Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGenericGlobalActor[#MyGenericGlobalActor#]; name=MyGenericGlobalActor
 
 
 // ON_METHOD: End completions
@@ -316,8 +350,11 @@ struct _S {
 // ON_MEMBER_LAST-NOT: Keyword
 // ON_MEMBER_LAST-DAG: Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
 // ON_MEMBER_LAST-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyPropertyWrapper[#MyPropertyWrapper#]; name=MyPropertyWrapper
+// ON_MEMBER_LAST-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyGenericPropertyWrapper[#MyGenericPropertyWrapper#]; name=MyGenericPropertyWrapper
 // ON_MEMBER_LAST-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyResultBuilder[#MyResultBuilder#]; name=MyResultBuilder
+// ON_MEMBER_LAST-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyGenericResultBuilder[#MyGenericResultBuilder#]; name=MyGenericResultBuilder
 // ON_MEMBER_LAST-DAG: Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGlobalActor[#MyGlobalActor#]; name=MyGlobalActor
+// ON_MEMBER_LAST-DAG: Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGenericGlobalActor[#MyGenericGlobalActor#]; name=MyGenericGlobalActor
 // ON_MEMBER_LAST-NOT: Decl[PrecedenceGroup]
 // ON_MEMBER_LAST: End completions
 }
@@ -386,7 +423,10 @@ func dummy2() {}
 // KEYWORD_LAST-DAG: Keyword/None:                       attached[#Declaration Attribute#]; name=attached
 // KEYWORD_LAST-NOT: Keyword
 // KEYWORD_LAST-DAG: Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
+// KEYWORD_LAST-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyGenericPropertyWrapper[#MyGenericPropertyWrapper#]; name=MyGenericPropertyWrapper
 // KEYWORD_LAST-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyPropertyWrapper[#MyPropertyWrapper#]; name=MyPropertyWrapper
+// KEYWORD_LAST-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyGenericResultBuilder[#MyGenericResultBuilder#]; name=MyGenericResultBuilder
 // KEYWORD_LAST-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: MyResultBuilder[#MyResultBuilder#]; name=MyResultBuilder
+// KEYWORD_LAST-DAG: Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGenericGlobalActor[#MyGenericGlobalActor#]; name=MyGenericGlobalActor
 // KEYWORD_LAST-DAG: Decl[Actor]/CurrModule/TypeRelation[Convertible]: MyGlobalActor[#MyGlobalActor#]; name=MyGlobalActor
 // KEYWORD_LAST:                  End completions

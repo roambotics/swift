@@ -66,6 +66,10 @@ class ModuleFileSharedCore {
   /// Empty if this module didn't come from an interface file.
   StringRef ModuleInterfacePath;
 
+  /// The module interface path if this module is adjacent to such an interface
+  /// or it was itself compiled from an interface. Empty otherwise.
+  StringRef CorrespondingInterfacePath;
+
   /// The Swift compatibility version in use when this module was built.
   version::Version CompatibilityVersion;
 
@@ -145,6 +149,9 @@ public:
     }
     bool isImplementationOnly() const {
       return getImportControl() == ImportFilterKind::ImplementationOnly;
+    }
+    bool isPackageOnly() const {
+      return getImportControl() == ImportFilterKind::PackageOnly;
     }
 
     bool isHeader() const { return IsHeader; }
@@ -516,12 +523,12 @@ public:
   /// \returns Whether the module was successfully loaded, or what went wrong
   ///          if it was not.
   static serialization::ValidationInfo
-  load(StringRef moduleInterfacePath,
+  load(StringRef moduleInterfacePath, StringRef moduleInterfaceSourcePath,
        std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
        std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
        std::unique_ptr<llvm::MemoryBuffer> moduleSourceInfoInputBuffer,
-       bool isFramework, bool requiresOSSAModules,
-       StringRef requiredSDK, PathObfuscator &pathRecoverer,
+       bool isFramework, bool requiresOSSAModules, StringRef requiredSDK,
+       PathObfuscator &pathRecoverer,
        std::shared_ptr<const ModuleFileSharedCore> &theModule) {
     serialization::ValidationInfo info;
     auto *core = new ModuleFileSharedCore(
@@ -532,6 +539,11 @@ public:
       ArrayRef<char> path;
       core->allocateBuffer(path, moduleInterfacePath);
       core->ModuleInterfacePath = StringRef(path.data(), path.size());
+    }
+    if (!moduleInterfaceSourcePath.empty()) {
+      ArrayRef<char> path;
+      core->allocateBuffer(path, moduleInterfaceSourcePath);
+      core->CorrespondingInterfacePath = StringRef(path.data(), path.size());
     }
     theModule.reset(core);
     return info;
@@ -546,6 +558,10 @@ public:
   /// The name of the module.
   StringRef getName() const {
     return Name;
+  }
+
+  StringRef getModulePackageName() const {
+    return ModulePackageName;
   }
 
   /// Returns the list of modules this module depends on.

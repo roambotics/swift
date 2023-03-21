@@ -141,6 +141,10 @@ public:
       PreWalkAction walkToParameterListPre(ParameterList *PL) override {
         return Action::SkipChildren();
       }
+
+      MacroWalking getMacroWalkingBehavior() const override {
+        return MacroWalking::ArgumentsAndExpansion;
+      }
     };
 
     expr->walk(ClosureFinder(*this, parent));
@@ -258,6 +262,8 @@ ASTSourceFileScope::ASTSourceFileScope(SourceFile *SF,
     case MacroRole::Declaration:
     case MacroRole::Accessor:
     case MacroRole::MemberAttribute:
+    case MacroRole::Peer:
+    case MacroRole::Conformance:
       parentLoc = expansion.getStartLoc();
       break;
     case MacroRole::Member: {
@@ -480,6 +486,12 @@ public:
   ASTScopeImpl *visitThrowStmt(ThrowStmt *ts, ASTScopeImpl *p,
                                ScopeCreator &scopeCreator) {
     visitExpr(ts->getSubExpr(), p, scopeCreator);
+    return p;
+  }
+
+  ASTScopeImpl *visitForgetStmt(ForgetStmt *fs, ASTScopeImpl *p,
+                               ScopeCreator &scopeCreator) {
+    visitExpr(fs->getSubExpr(), p, scopeCreator);
     return p;
   }
 

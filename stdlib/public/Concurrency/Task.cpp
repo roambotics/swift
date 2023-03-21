@@ -117,7 +117,6 @@ FutureFragment::Status AsyncTask::waitFuture(AsyncTask *waitingTask,
   // NOTE: this acquire synchronizes with `completeFuture`.
   auto queueHead = fragment->waitQueue.load(std::memory_order_acquire);
   bool contextInitialized = false;
-  auto escalatedPriority = JobPriority::Unspecified;
   while (true) {
     switch (queueHead.getStatus()) {
     case Status::Error:
@@ -147,48 +146,7 @@ FutureFragment::Status AsyncTask::waitFuture(AsyncTask *waitingTask,
       context->successResultPointer = result;
       context->ResumeParent = resumeFn;
       context->Parent = callerContext;
-      waitingTask->flagAsSuspended();
-    }
-
-    // Escalate the blocking task to the priority of the waiting task.
-    // FIXME: Also record that the waiting task is now waiting on the
-    // blocking task so that escalators of the waiting task can propagate
-    // the escalation to the blocking task.
-    //
-    // Recording this dependency is tricky because we need escalators
-    // to be able to escalate without worrying about the blocking task
-    // concurrently finishing, resuming the escalated task, and being
-    // invalidated.  So we're not doing that yet.  In the meantime, we
-    // do the best-effort alternative of escalating the blocking task
-    // as a one-time deal to the current priority of the waiting task.
-    // If the waiting task is escalated after this point, the priority
-    // will not be escalated, but that's inevitable in the absence of
-    // propagation during escalation.
-    //
-    // We have to do the escalation before we successfully enqueue the
-    // waiting task on the blocking task's wait queue, because as soon as
-    // we do, this thread is no longer blocking the resumption of the
-    // waiting task, and so both the blocking task (which is retained
-    // during the wait only from the waiting task's perspective) and the
-    // waiting task (which can simply terminate) must be treat as
-    // invalidated from this thread's perspective.
-    //
-    // When we do fix this bug to record the dependency, we will have to
-    // do it before this escalation of the blocking task so that there
-    // isn't a race where an escalation of the waiting task can fail
-    // to propagate to the blocking task.  The correct priority to
-    // escalate to is the priority we observe when we successfully record
-    // the dependency; any later escalations will automatically propagate.
-    //
-    // If the blocking task finishes while we're doing this escalation,
-    // the escalation will be innocuous.  The wasted effort is acceptable;
-    // programmers should be encouraged to give tasks that will block
-    // other tasks the correct priority to begin with.
-    auto waitingStatus =
-      waitingTask->_private()._status().load(std::memory_order_relaxed);
-    if (waitingStatus.getStoredPriority() > escalatedPriority) {
-      swift_task_escalate(this, waitingStatus.getStoredPriority());
-      escalatedPriority = waitingStatus.getStoredPriority();
+      waitingTask->flagAsSuspendedOnTask(this);
     }
 
 #if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
@@ -233,10 +191,9 @@ FutureFragment::Status AsyncTask::waitFuture(AsyncTask *waitingTask,
 void NullaryContinuationJob::process(Job *_job) {
   auto *job = cast<NullaryContinuationJob>(_job);
 
-  auto *task = job->Task;
   auto *continuation = job->Continuation;
 
-  _swift_task_dealloc_specific(task, job);
+  delete job;
 
   auto *context =
     static_cast<ContinuationAsyncContext*>(continuation->ResumeContext);
@@ -330,7 +287,7 @@ static void destroyJob(SWIFT_CONTEXT HeapObject *obj) {
 }
 
 AsyncTask::~AsyncTask() {
-  flagAsCompleted();
+  flagAsDestroyed();
 
   // For a future, destroy the result.
   if (isFuture()) {
@@ -372,7 +329,7 @@ static void destroyTask(SWIFT_CONTEXT HeapObject *obj) {
   // the task-local allocator.  There's actually nothing else to clean up
   // here.
 
-  SWIFT_TASK_DEBUG_LOG("destroy task %p", task);
+  SWIFT_TASK_DEBUG_LOG("Destroyed task %p", task);
   free(task);
 }
 
@@ -402,6 +359,9 @@ static const unsigned long dispatchSwiftObjectType = 1;
 FullMetadata<DispatchClassMetadata> swift::jobHeapMetadata = {
   {
     {
+      /*type layout*/ nullptr,
+    },
+    {
       &destroyJob
     },
     {
@@ -418,6 +378,9 @@ FullMetadata<DispatchClassMetadata> swift::jobHeapMetadata = {
 /// Heap metadata for an asynchronous task.
 static FullMetadata<DispatchClassMetadata> taskHeapMetadata = {
   {
+    {
+      /*type layout*/ nullptr
+    },
     {
       &destroyTask
     },
@@ -592,18 +555,20 @@ const void *AsyncTask::getResumeFunctionForLogging() {
   return __ptrauth_swift_runtime_function_entry_strip(result);
 }
 
-JobPriority swift::swift_task_currentPriority(AsyncTask *task)
-{
+JobPriority swift::swift_task_currentPriority(AsyncTask *task) {
   // This is racey but this is to be used in an API is inherently racey anyways.
   auto oldStatus = task->_private()._status().load(std::memory_order_relaxed);
   return oldStatus.getStoredPriority();
 }
 
-JobPriority swift::swift_task_basePriority(AsyncTask *task)
-{
+JobPriority swift::swift_task_basePriority(AsyncTask *task) {
   JobPriority pri = task->_private().BasePriority;
   SWIFT_TASK_DEBUG_LOG("Task %p has base priority = %zu", task, pri);
   return pri;
+}
+
+JobPriority swift::swift_concurrency_jobPriority(Job *job) {
+  return job->getPriority();
 }
 
 static inline bool isUnspecified(JobPriority priority) {
@@ -1231,10 +1196,13 @@ size_t swift::swift_task_getJobFlags(AsyncTask *task) {
   return task->Flags.getOpaqueValue();
 }
 
+// This function exists primarily for the purpose of the concurrency runtime
+// unit tests and does not serve a functional purpose.
 SWIFT_CC(swift)
 static AsyncTask *swift_task_suspendImpl() {
-  auto task = _swift_task_clearCurrent();
-  task->flagAsSuspended();
+  auto task = swift_task_getCurrent();
+  task->flagAsSuspendedOnContinuation(nullptr);
+  _swift_task_clearCurrent();
   return task;
 }
 
@@ -1322,9 +1290,10 @@ static AsyncTask *swift_continuation_initImpl(ContinuationAsyncContext *context,
 
   // A preawait immediately suspends the task.
   if (flags.isPreawaited()) {
-    task = _swift_task_clearCurrent();
+    task = swift_task_getCurrent();
     assert(task && "initializing a continuation with no current task");
-    task->flagAsSuspended();
+    task->flagAsSuspendedOnContinuation(context);
+    _swift_task_clearCurrent();
   } else {
     task = swift_task_getCurrent();
     assert(task && "initializing a continuation with no current task");
@@ -1381,8 +1350,8 @@ static void swift_continuation_awaitImpl(ContinuationAsyncContext *context) {
 
   context->Cond = &Cond;
 #else /* SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL */
-  // Flag the task as suspended.
-  task->flagAsSuspended();
+  // Flag the task as suspended on the continuation.
+  task->flagAsSuspendedOnContinuation(context);
 #endif /* SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL */
 
 #if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
@@ -1533,8 +1502,8 @@ swift_task_addCancellationHandlerImpl(
 
   bool fireHandlerNow = false;
 
-  addStatusRecord(record, [&](ActiveTaskStatus parentStatus) {
-    if (parentStatus.isCancelled()) {
+  addStatusRecordToSelf(record, [&](ActiveTaskStatus oldStatus, ActiveTaskStatus& newStatus) {
+    if (oldStatus.isCancelled()) {
       fireHandlerNow = true;
       // We don't fire the cancellation handler here since this function needs
       // to be idempotent
@@ -1551,7 +1520,7 @@ swift_task_addCancellationHandlerImpl(
 SWIFT_CC(swift)
 static void swift_task_removeCancellationHandlerImpl(
     CancellationNotificationStatusRecord *record) {
-  removeStatusRecord(record);
+  removeStatusRecordFromSelf(record);
   swift_task_dealloc(record);
 }
 
@@ -1560,12 +1529,8 @@ static NullaryContinuationJob*
 swift_task_createNullaryContinuationJobImpl(
     size_t priority,
     AsyncTask *continuation) {
-  void *allocation =
-      swift_task_alloc(sizeof(NullaryContinuationJob));
-  auto *job =
-      ::new (allocation) NullaryContinuationJob(
-        swift_task_getCurrent(), static_cast<JobPriority>(priority),
-        continuation);
+  auto *job = new NullaryContinuationJob(swift_task_getCurrent(),
+        static_cast<JobPriority>(priority), continuation);
 
   return job;
 }
@@ -1624,5 +1589,60 @@ static void swift_task_asyncMainDrainQueueImpl() {
 #endif
 }
 
+SWIFT_CC(swift)
+void (*swift::swift_task_asyncMainDrainQueue_hook)(
+    swift_task_asyncMainDrainQueue_original original,
+    swift_task_asyncMainDrainQueue_override compatOverride) = nullptr;
+
+SWIFT_CC(swift)
+static void swift_task_startOnMainActorImpl(AsyncTask* task) {
+  AsyncTask * originalTask = _swift_task_clearCurrent();
+  ExecutorRef mainExecutor = swift_task_getMainExecutor();
+  if (swift_task_getCurrentExecutor() != swift_task_getMainExecutor())
+    swift_Concurrency_fatalError(0, "Not on the main executor");
+  swift_retain(task);
+  swift_job_run(task, mainExecutor);
+  _swift_task_setCurrent(originalTask);
+}
+
 #define OVERRIDE_TASK COMPATIBILITY_OVERRIDE
+
+#ifdef SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT
+/// The original COMPATIBILITY_OVERRIDE defined in CompatibilityOverride.h
+/// returns the result of the impl function and override function. This results
+/// in a warning emitted for noreturn functions. Overriding the override macro
+/// to not return.
+#define HOOKED_OVERRIDE_TASK_NORETURN(name, attrs, ccAttrs, namespace,         \
+                                      typedArgs, namedArgs)                    \
+  attrs ccAttrs void namespace swift_##name COMPATIBILITY_PAREN(typedArgs) {   \
+    static Override_##name Override;                                           \
+    static swift_once_t Predicate;                                             \
+    swift_once(                                                                \
+        &Predicate, [](void *) { Override = getOverride_##name(); }, nullptr); \
+    if (swift_##name##_hook) {                                                 \
+      swift_##name##_hook(COMPATIBILITY_UNPAREN_WITH_COMMA(namedArgs)          \
+                              swift_##name##Impl,                              \
+                          Override);                                           \
+      abort();                                                                 \
+    }                                                                          \
+    if (Override != nullptr)                                                   \
+      Override(COMPATIBILITY_UNPAREN_WITH_COMMA(namedArgs)                     \
+                   swift_##name##Impl);                                        \
+    swift_##name##Impl COMPATIBILITY_PAREN(namedArgs);                         \
+  }
+
+#else // ifndef SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT
+// Call directly through to the original implementation when we don't support
+// overrides.
+#define HOOKED_OVERRIDE_TASK_NORETURN(name, attrs, ccAttrs, namespace,         \
+                                      typedArgs, namedArgs)                    \
+  attrs ccAttrs void namespace swift_##name COMPATIBILITY_PAREN(typedArgs) {   \
+    if (swift_##name##_hook) {                                                 \
+      swift_##name##_hook(swift_##name##Impl, nullptr);                        \
+      abort();                                                                 \
+    }                                                                          \
+    swift_##name##Impl COMPATIBILITY_PAREN(namedArgs);                         \
+  }
+#endif // #else SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT
+
 #include COMPATIBILITY_OVERRIDE_INCLUDE_PATH

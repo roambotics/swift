@@ -32,8 +32,9 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/Type.h"
-#include "swift/AST/Types.h"
 #include "swift/AST/TypeVisitor.h"
+#include "swift/AST/Types.h"
+#include "swift/ClangImporter/ClangImporterRequests.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Parse/Token.h"
 #include "swift/Strings.h"
@@ -920,8 +921,6 @@ namespace {
     ImportResult Visit##KIND##Type(const clang::KIND##Type *type) {            \
       if (type->isSugared())                                                   \
         return Visit(type->desugar());                                         \
-      if (type->isDependentType())                                             \
-        return Impl.SwiftContext.getAnyExistentialType();                      \
       return Type();                                                           \
     }
     MAYBE_SUGAR_TYPE(TypeOfExpr)
@@ -1271,8 +1270,8 @@ static bool canBridgeTypes(ImportTypeKind importKind) {
   case ImportTypeKind::Variable:
   case ImportTypeKind::AuditedVariable:
   case ImportTypeKind::Enum:
-    return false;
   case ImportTypeKind::RecordField:
+    return false;
   case ImportTypeKind::Result:
   case ImportTypeKind::AuditedResult:
   case ImportTypeKind::Parameter:
@@ -1604,6 +1603,10 @@ static ImportedType adjustTypeForConcreteImport(
       // structs, at which point we should really be checking the lifetime
       // qualifiers.
       case clang::Qualifiers::OCL_Strong:
+        if (!impl.SwiftContext.LangOpts.EnableCXXInterop) {
+          return {Type(), false};
+        }
+        break;
       case clang::Qualifiers::OCL_Weak:
         return {Type(), false};
       case clang::Qualifiers::OCL_Autoreleasing:
@@ -2134,7 +2137,21 @@ ImportedType ClangImporter::Implementation::importFunctionReturnType(
         assert(clangEnum.value()->getIntegerType()->getCanonicalTypeInternal() ==
                typedefType->getCanonicalTypeInternal());
         if (auto swiftEnum = importDecl(*clangEnum, CurrentVersion)) {
-          return {cast<NominalTypeDecl>(swiftEnum)->getDeclaredType(), false};
+          return {cast<TypeDecl>(swiftEnum)->getDeclaredInterfaceType(), false};
+        }
+      }
+    }
+  }
+
+  // Import the underlying result type.
+  if (clangDecl) {
+    if (auto recordType = returnType->getAsCXXRecordDecl()) {
+      if (auto *vd = evaluateOrDefault(
+              SwiftContext.evaluator,
+              CxxRecordAsSwiftType({recordType, SwiftContext}), nullptr)) {
+        if (auto *cd = dyn_cast<ClassDecl>(vd)) {
+          Type t = ClassType::get(cd, Type(), SwiftContext);
+          return ImportedType(t, /*implicitlyUnwraps=*/false);
         }
       }
     }
@@ -2200,7 +2217,8 @@ ImportedType ClangImporter::Implementation::importFunctionParamsAndReturnType(
         assert(clangEnum.value()->getIntegerType()->getCanonicalTypeInternal() ==
                typedefType->getCanonicalTypeInternal());
         if (auto swiftEnum = importDecl(*clangEnum, CurrentVersion)) {
-          importedType = {cast<NominalTypeDecl>(swiftEnum)->getDeclaredType(), false};
+          importedType = {cast<TypeDecl>(swiftEnum)->getDeclaredInterfaceType(),
+                          false};
         }
       }
     }
@@ -2301,7 +2319,7 @@ ClangImporter::Implementation::importParameterType(
                    ->getCanonicalTypeInternal() ==
                typedefType->getCanonicalTypeInternal());
         if (auto swiftEnum = importDecl(*clangEnum, CurrentVersion)) {
-          swiftParamTy = cast<NominalTypeDecl>(swiftEnum)->getDeclaredType();
+          swiftParamTy = cast<TypeDecl>(swiftEnum)->getDeclaredInterfaceType();
         }
       }
     }
@@ -2353,6 +2371,21 @@ ClangImporter::Implementation::importParameterType(
 
     isParamTypeImplicitlyUnwrapped =
         optionalityOfParam == OTK_ImplicitlyUnwrappedOptional;
+  }
+
+  if (!swiftParamTy) {
+    if (auto recordType = paramTy->getAsCXXRecordDecl()) {
+
+      if (auto *vd = evaluateOrDefault(
+              SwiftContext.evaluator,
+              CxxRecordAsSwiftType({recordType, SwiftContext}), nullptr)) {
+
+        if (auto *cd = dyn_cast<ClassDecl>(vd)) {
+
+          swiftParamTy = ClassType::get(cd, Type(), SwiftContext);
+        }
+      }
+    }
   }
 
   if (!swiftParamTy) {
@@ -2588,7 +2621,11 @@ ArgumentAttrs ClangImporter::Implementation::inferDefaultArgument(
       // behave like a C enum in the presence of C++.
       auto enumName = typedefType->getDecl()->getName();
       ArgumentAttrs argumentAttrs(DefaultArgumentKind::None, true, enumName);
-      for (auto word : llvm::reverse(camel_case::getWords(enumName))) {
+      auto camelCaseWords = camel_case::getWords(enumName);
+      for (auto it = camelCaseWords.rbegin(); it != camelCaseWords.rend();
+           ++it) {
+        auto word = *it;
+        auto next = std::next(it);
         if (camel_case::sameWordIgnoreFirstCase(word, "options")) {
           argumentAttrs.argumentKind = DefaultArgumentKind::EmptyArray;
           return argumentAttrs;
@@ -2599,13 +2636,17 @@ ArgumentAttrs ClangImporter::Implementation::inferDefaultArgument(
           return argumentAttrs;
         if (camel_case::sameWordIgnoreFirstCase(word, "action"))
           return argumentAttrs;
-        if (camel_case::sameWordIgnoreFirstCase(word, "controlevents"))
+        if (camel_case::sameWordIgnoreFirstCase(word, "events") &&
+            next != camelCaseWords.rend() &&
+            camel_case::sameWordIgnoreFirstCase(*next, "control"))
           return argumentAttrs;
         if (camel_case::sameWordIgnoreFirstCase(word, "state"))
           return argumentAttrs;
         if (camel_case::sameWordIgnoreFirstCase(word, "unit"))
           return argumentAttrs;
-        if (camel_case::sameWordIgnoreFirstCase(word, "scrollposition"))
+        if (camel_case::sameWordIgnoreFirstCase(word, "position") &&
+            next != camelCaseWords.rend() &&
+            camel_case::sameWordIgnoreFirstCase(*next, "scroll"))
           return argumentAttrs;
         if (camel_case::sameWordIgnoreFirstCase(word, "edge"))
           return argumentAttrs;
@@ -2892,7 +2933,8 @@ ImportedType ClangImporter::Implementation::importMethodParamsAndReturnType(
         assert(clangEnum.value()->getIntegerType()->getCanonicalTypeInternal() ==
                typedefType->getCanonicalTypeInternal());
         if (auto swiftEnum = importDecl(*clangEnum, CurrentVersion)) {
-          importedType = {cast<NominalTypeDecl>(swiftEnum)->getDeclaredType(), false};
+          importedType = {cast<TypeDecl>(swiftEnum)->getDeclaredInterfaceType(),
+                          false};
         }
       }
     }
@@ -3247,38 +3289,7 @@ bool ClangImporter::Implementation::canImportFoundationModule() {
 
 Type ClangImporter::Implementation::getNamedSwiftType(ModuleDecl *module,
                                                       StringRef name) {
-  if (!module)
-    return Type();
-
-  // Look for the type.
-  Identifier identifier = SwiftContext.getIdentifier(name);
-  SmallVector<ValueDecl *, 2> results;
-
-  // Check if the lookup we're about to perform a lookup within is
-  // a Clang module.
-  for (auto *file : module->getFiles()) {
-    if (auto clangUnit = dyn_cast<ClangModuleUnit>(file)) {
-      // If we have an overlay, look in the overlay. Otherwise, skip
-      // the lookup to avoid infinite recursion.
-      if (auto module = clangUnit->getOverlayModule())
-        module->lookupValue(identifier, NLKind::UnqualifiedLookup, results);
-    } else {
-      file->lookupValue(identifier, NLKind::UnqualifiedLookup, results);
-    }
-  }
-
-  if (results.size() != 1)
-    return Type();
-
-  auto decl = dyn_cast<TypeDecl>(results.front());
-  if (!decl)
-    return Type();
-
-  assert(!decl->hasClangNode() && "picked up the original type?");
-
-  if (auto *nominalDecl = dyn_cast<NominalTypeDecl>(decl))
-    return nominalDecl->getDeclaredType();
-  return decl->getDeclaredInterfaceType();
+  return SwiftContext.getNamedSwiftType(module, name);
 }
 
 Type ClangImporter::Implementation::getNamedSwiftType(StringRef moduleName,

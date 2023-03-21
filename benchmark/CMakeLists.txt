@@ -187,6 +187,7 @@ set(SWIFT_BENCH_MODULES
     single-source/StringInterpolation
     single-source/StringMatch
     single-source/StringRemoveDupes
+    single-source/StringRepeating
     single-source/StringReplaceSubrange
     single-source/StringSplitting
     single-source/StringSwitch
@@ -198,6 +199,7 @@ set(SWIFT_BENCH_MODULES
     single-source/TwoSum
     single-source/TypeFlood
     single-source/UTF8Decode
+    single-source/UTF16Decode
     single-source/Walsh
     single-source/WordCount
     single-source/XorLoop

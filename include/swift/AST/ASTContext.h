@@ -79,6 +79,7 @@ namespace swift {
   class DifferentiableAttr;
   class ExtensionDecl;
   struct ExternalSourceLocs;
+  class LoadedExecutablePlugin;
   class ForeignRepresentationInfo;
   class FuncDecl;
   class GenericContext;
@@ -91,6 +92,7 @@ namespace swift {
   class ModuleDependencyInfo;
   class PatternBindingDecl;
   class PatternBindingInitializer;
+  class PluginRegistry;
   class SourceFile;
   class SourceLoc;
   class Type;
@@ -101,6 +103,7 @@ namespace swift {
   class Identifier;
   class InheritedNameSet;
   class ModuleDecl;
+  class PackageUnit;
   class ModuleDependenciesCache;
   class ModuleLoader;
   class NominalTypeDecl;
@@ -352,6 +355,9 @@ public:
       std::tuple<Decl *, IndexSubset *, AutoDiffDerivativeFunctionKind>,
       llvm::SmallPtrSet<DerivativeAttr *, 1>>
       DerivativeAttrs;
+
+  /// The Swift module currently being compiled.
+  ModuleDecl *MainModule = nullptr;
 
 private:
   /// The current generation number, which reflects the number of
@@ -691,6 +697,9 @@ public:
   /// where clauses etc.
   FuncDecl *getMakeInvocationEncoderOnDistributedActorSystem(
       AbstractFunctionDecl *thunk) const;
+
+  /// Indicates whether move-only / noncopyable types are supported.
+  bool supportsMoveOnlyTypes() const;
 
   // Retrieve the declaration of
   // DistributedInvocationEncoder.recordGenericSubstitution(_:).
@@ -1376,7 +1385,7 @@ public:
   /// This drops the parameter pack bit from each generic parameter,
   /// and converts same-element requirements to same-type requirements.
   CanGenericSignature getOpenedElementSignature(CanGenericSignature baseGenericSig,
-                                                CanType shapeClass);
+                                                CanGenericTypeParamType shapeClass);
 
   GenericSignature getOverrideGenericSignature(const ValueDecl *base,
                                                const ValueDecl *derived);
@@ -1455,6 +1464,35 @@ public:
   /// Finds the address of the given symbol. If `libraryHandleHint` is non-null,
   /// search within the library.
   void *getAddressOfSymbol(const char *name, void *libraryHandleHint = nullptr);
+  
+  Type getNamedSwiftType(ModuleDecl *module, StringRef name);
+
+  /// Lookup an executable plugin that is declared to handle \p moduleName
+  /// module by '-load-plugin-executable'.
+  /// The path is valid within the VFS, use `FS.getRealPath()` for the
+  /// underlying path.
+  Optional<StringRef> lookupExecutablePluginByModuleName(Identifier moduleName);
+
+  /// Look for dynamic libraries in paths from `-external-plugin-path` and
+  /// return a pair of `(library path, plugin server executable)` if found.
+  /// These paths are valid within the VFS, use `FS.getRealPath()` for their
+  /// underlying path.
+  Optional<std::pair<std::string, std::string>>
+  lookupExternalLibraryPluginByModuleName(Identifier moduleName);
+
+  /// Launch the specified executable plugin path resolving the path with the
+  /// current VFS. If it fails to load the plugin, a diagnostic is emitted, and
+  /// returns a nullptr.
+  /// NOTE: This method is idempotent. If the plugin is already loaded, the same
+  /// instance is simply returned.
+  LoadedExecutablePlugin *loadExecutablePlugin(StringRef path);
+
+  /// Get the plugin registry this ASTContext is using.
+  PluginRegistry *getPluginRegistry() const;
+
+  /// Set the plugin registory this ASTContext should use.
+  /// This should be called before any plugin is loaded.
+  void setPluginRegistry(PluginRegistry *newValue);
 
 private:
   friend Decl;

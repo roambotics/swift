@@ -99,6 +99,7 @@ SHOULD_NEVER_VISIT_INST(AllocExistentialBox)
 SHOULD_NEVER_VISIT_INST(AllocGlobal)
 SHOULD_NEVER_VISIT_INST(AllocStack)
 SHOULD_NEVER_VISIT_INST(AllocPack)
+SHOULD_NEVER_VISIT_INST(PackLength)
 SHOULD_NEVER_VISIT_INST(DifferentiabilityWitnessFunction)
 SHOULD_NEVER_VISIT_INST(FloatLiteral)
 SHOULD_NEVER_VISIT_INST(FunctionRef)
@@ -366,6 +367,7 @@ FORWARDING_OWNERSHIP(InitExistentialRef)
 FORWARDING_OWNERSHIP(DifferentiableFunction)
 FORWARDING_OWNERSHIP(LinearFunction)
 FORWARDING_OWNERSHIP(MarkMustCheck)
+FORWARDING_OWNERSHIP(MarkUnresolvedReferenceBinding)
 FORWARDING_OWNERSHIP(MoveOnlyWrapperToCopyableValue)
 FORWARDING_OWNERSHIP(CopyableToMoveOnlyWrapperValue)
 #undef FORWARDING_OWNERSHIP
@@ -548,9 +550,21 @@ OperandOwnershipClassifier::visitTryApplyInst(TryApplyInst *i) {
 
 OperandOwnership
 OperandOwnershipClassifier::visitPartialApplyInst(PartialApplyInst *i) {
-  // partial_apply [stack] does not take ownership of its operands.
+  // partial_apply [stack] borrows its operands.
   if (i->isOnStack()) {
-    return OperandOwnership::InstantaneousUse;
+    auto operandTy = getValue()->getType();
+    // Trivial values we can treat as trivial uses.
+    if (operandTy.isTrivial(*i->getFunction())) {
+      return OperandOwnership::TrivialUse;
+    }
+    
+    // Borrowing of address operands is ultimately handled by the move-only
+    // address checker and/or exclusivity checker rather than by value ownership.
+    if (operandTy.isAddress()) {
+      return OperandOwnership::TrivialUse;
+    }
+  
+    return OperandOwnership::Borrow;
   }
   // All non-trivial types should be captured.
   return OperandOwnership::ForwardingConsume;
@@ -782,6 +796,7 @@ BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, SRem)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, GenericSRem)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, SSubOver)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, StackAlloc)
+BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, UnprotectedStackAlloc)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, StackDealloc)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, SToSCheckedTrunc)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, SToUCheckedTrunc)
@@ -831,14 +846,25 @@ OperandOwnership OperandOwnershipBuiltinClassifier::visitCopy(BuiltinInst *bi,
   }
 }
 BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, StartAsyncLet)
-BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, EndAsyncLet)
-BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, StartAsyncLetWithLocalBuffer)
-BUILTIN_OPERAND_OWNERSHIP(DestroyingConsume, EndAsyncLetLifetime)
+BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, EndAsyncLet)
+BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, EndAsyncLetLifetime)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, CreateTaskGroup)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, CreateTaskGroupWithFlags)
 BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, DestroyTaskGroup)
 
 BUILTIN_OPERAND_OWNERSHIP(ForwardingConsume, COWBufferForReading)
+
+OperandOwnership
+OperandOwnershipBuiltinClassifier
+::visitStartAsyncLetWithLocalBuffer(BuiltinInst *bi, StringRef attr) {
+  if (&op == &bi->getOperandRef(0)) {
+    // The result buffer pointer is a trivial use.
+    return OperandOwnership::TrivialUse;
+  }
+  
+  // The closure is borrowed while the async let task is executing.
+  return OperandOwnership::Borrow;
+}
 
 const int PARAMETER_INDEX_CREATE_ASYNC_TASK_FUTURE_FUNCTION = 2;
 const int PARAMETER_INDEX_CREATE_ASYNC_TASK_GROUP_FUTURE_FUNCTION = 3;
@@ -898,13 +924,14 @@ visitResumeThrowingContinuationThrowing(BuiltinInst *bi, StringRef attr) {
   return OperandOwnership::TrivialUse;
 }
 
-BUILTIN_OPERAND_OWNERSHIP(TrivialUse, TaskRunInline)
+BUILTIN_OPERAND_OWNERSHIP(InstantaneousUse, TaskRunInline)
 
 BUILTIN_OPERAND_OWNERSHIP(InteriorPointer, CancelAsyncTask)
 BUILTIN_OPERAND_OWNERSHIP(InteriorPointer, InitializeDefaultActor)
 BUILTIN_OPERAND_OWNERSHIP(InteriorPointer, DestroyDefaultActor)
 
 BUILTIN_OPERAND_OWNERSHIP(InteriorPointer, InitializeDistributedRemoteActor)
+BUILTIN_OPERAND_OWNERSHIP(InteriorPointer, InitializeNonDefaultDistributedActor)
 
 BUILTIN_OPERAND_OWNERSHIP(PointerEscape, AutoDiffAllocateSubcontext)
 BUILTIN_OPERAND_OWNERSHIP(PointerEscape, AutoDiffProjectTopLevelSubcontext)

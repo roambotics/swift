@@ -125,25 +125,24 @@ computeMallocTypeSummary(const HeapMetadata *heapMetadata) {
   auto *classMetadata = heapMetadata->getClassObject();
   auto *typeDesc = heapMetadata->getTypeContextDescriptor();
 
-  malloc_type_summary_t summary = {};
+  // Pruned metadata or unclassified
+  if (!classMetadata || !typeDesc)
+    return {.type_kind = MALLOC_TYPE_KIND_SWIFT};
 
   // Objc
-  if (classMetadata && classMetadata->isPureObjC()) {
-    summary.type_kind = MALLOC_TYPE_KIND_OBJC;
-    return summary;
-  }
+  if (classMetadata->isPureObjC())
+    return {.type_kind = MALLOC_TYPE_KIND_OBJC};
 
-  // Runtime internal and unclassified
-  if (!typeDesc) {
-    summary.type_kind = MALLOC_TYPE_KIND_CXX;
-    return summary;
-  }
+  malloc_type_summary_t summary = {.type_kind = MALLOC_TYPE_KIND_SWIFT};
+  summary.layout_semantics.reference_count =
+      (classMetadata->getFlags() & ClassFlags::UsesSwiftRefcounting);
 
-  // Swift
-  summary.type_kind = MALLOC_TYPE_KIND_SWIFT;
+  auto *fieldDesc = typeDesc->Fields.get();
+  if (!fieldDesc)
+    return summary;
 
   bool isGenericData = true;
-  for (auto &field : *typeDesc->Fields.get()) {
+  for (auto &field : *fieldDesc) {
     if (field.isIndirectCase()) {
       isGenericData = false;
       if (field.isVar())
@@ -152,12 +151,7 @@ computeMallocTypeSummary(const HeapMetadata *heapMetadata) {
         summary.layout_semantics.immutable_pointer = true;
     }
   }
-
-  if (classMetadata->Flags & ClassFlags::UsesSwiftRefcounting) {
-    summary.layout_semantics.reference_count = true;
-  } else {
-    summary.layout_semantics.generic_data = isGenericData;
-  }
+  summary.layout_semantics.generic_data = isGenericData;
 
   return summary;
 
@@ -338,7 +332,8 @@ public:
   FullMetadata<GenericBoxHeapMetadata> Data;
 
   BoxCacheEntry(const Metadata *type)
-    : Data{HeapMetadataHeader{{destroyGenericBox}, {/*vwtable*/ nullptr}},
+    : Data{HeapMetadataHeader{ {/*type layout*/nullptr}, {destroyGenericBox},
+                               {/*vwtable*/ nullptr}},
            GenericBoxHeapMetadata{MetadataKind::HeapGenericLocalVariable,
                                   GenericBoxHeapMetadata::getHeaderOffset(type),
                                   type}} {

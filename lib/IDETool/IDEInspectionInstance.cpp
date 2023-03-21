@@ -346,8 +346,9 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
         newBufferID,
         GeneratedSourceInfo{
           GeneratedSourceInfo::ReplacedFunctionBody,
-          AFD->getOriginalBodySourceRange(),
-          newBodyRange,
+          Lexer::getCharSourceRangeFromSourceRange(
+              SM, AFD->getOriginalBodySourceRange()),
+          Lexer::getCharSourceRangeFromSourceRange(SM, newBodyRange),
           AFD,
           nullptr
         }
@@ -826,13 +827,13 @@ void swift::ide::IDEInspectionInstance::cursorInfo(
         : ReusingASTContext(ReusingASTContext),
           CancellationFlag(CancellationFlag), Callback(Callback) {}
 
-    void handleResults(const ResolvedCursorInfo &result) override {
+    void handleResults(std::vector<ResolvedCursorInfoPtr> result) override {
       HandleResultsCalled = true;
       if (CancellationFlag &&
           CancellationFlag->load(std::memory_order_relaxed)) {
         Callback(ResultType::cancelled());
       } else {
-        Callback(ResultType::success({&result, ReusingASTContext}));
+        Callback(ResultType::success({result, ReusingASTContext}));
       }
     }
   };
@@ -851,8 +852,8 @@ void swift::ide::IDEInspectionInstance::cursorInfo(
                   ide::makeCursorInfoCallbacksFactory(Consumer, RequestedLoc));
 
               if (!Result.DidFindIDEInspectionTarget) {
-                return DeliverTransformed(ResultType::success(
-                    {/*Results=*/nullptr, Result.DidReuseAST}));
+                return DeliverTransformed(
+                    ResultType::success({/*Results=*/{}, Result.DidReuseAST}));
               }
 
               performIDEInspectionSecondPass(
@@ -862,8 +863,8 @@ void swift::ide::IDEInspectionInstance::cursorInfo(
                 // pass, we didn't receive any results. To make sure Callback
                 // gets called exactly once, call it manually with no results
                 // here.
-                DeliverTransformed(ResultType::success(
-                    {/*Results=*/nullptr, Result.DidReuseAST}));
+                DeliverTransformed(
+                    ResultType::success({/*Results=*/{}, Result.DidReuseAST}));
               }
             },
             Callback);

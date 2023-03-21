@@ -173,6 +173,13 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
 
     switch (generatedInfo->kind) {
     case GeneratedSourceInfo::FreestandingDeclMacroExpansion:
+      if (parser.CurDeclContext->isTypeContext()) {
+        parser.parseExpandedMemberList(items);
+      } else {
+        parser.parseTopLevelItems(items);
+      }
+      break;
+
     case GeneratedSourceInfo::ExpressionMacroExpansion:
     case GeneratedSourceInfo::ReplacedFunctionBody:
     case GeneratedSourceInfo::PrettyPrinted: {
@@ -196,6 +203,20 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
 
     case GeneratedSourceInfo::MemberAttributeMacroExpansion: {
       parser.parseExpandedAttributeList(items);
+      break;
+    }
+
+    case GeneratedSourceInfo::PeerMacroExpansion: {
+      if (parser.CurDeclContext->isTypeContext()) {
+        parser.parseExpandedMemberList(items);
+      } else {
+        parser.parseTopLevelItems(items);
+      }
+      break;
+    }
+
+    case GeneratedSourceInfo::ConformanceMacroExpansion: {
+      parser.parseTopLevelItems(items);
       break;
     }
     }

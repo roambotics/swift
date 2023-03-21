@@ -112,15 +112,26 @@ CaptureKind TypeConverter::getDeclCaptureKind(CapturedValue capture,
   assert(var->hasStorage() &&
          "should not have attempted to directly capture this variable");
 
+  auto &lowering = getTypeLowering(
+      var->getType(), TypeExpansionContext::noOpaqueTypeArchetypesSubstitution(
+                          expansion.getResilienceExpansion()));
+
+  // If this is a noncopyable 'let' constant that is not a shared paramdecl or
+  // used by a noescape capture, then we know it is boxed and want to pass it in
+  // its boxed form so we can obey Swift's capture reference semantics.
+  if (!var->supportsMutation() && lowering.getLoweredType().isPureMoveOnly() &&
+      !capture.isNoEscape()) {
+      auto *param = dyn_cast<ParamDecl>(var);
+      if (!param || param->getValueOwnership() != ValueOwnership::Shared) {
+        return CaptureKind::ImmutableBox;
+      }
+  }
+
   // If this is a non-address-only stored 'let' constant, we can capture it
   // by value.  If it is address-only, then we can't load it, so capture it
   // by its address (like a var) instead.
-  if (!var->supportsMutation() &&
-      !getTypeLowering(var->getType(),
-                       TypeExpansionContext::noOpaqueTypeArchetypesSubstitution(
-                           expansion.getResilienceExpansion()))
-           .isAddressOnly())
-    return CaptureKind::Constant;
+  if (!var->supportsMutation() && !lowering.isAddressOnly())
+      return CaptureKind::Constant;
 
   // In-out parameters are captured by address.
   if (auto *param = dyn_cast<ParamDecl>(var)) {
@@ -320,11 +331,13 @@ namespace {
     RetTy visitPackExpansionType(CanPackExpansionType type,
                                  AbstractionPattern origType,
                                  IsTypeExpansionSensitive_t isSensitive) {
-      return asImpl().handleAddressOnly(type, {IsNotTrivial, IsFixedABI,
-                                               IsAddressOnly, IsNotResilient,
-                                               isSensitive,
-                                               DoesNotHaveRawPointer,
-                                               IsLexical});
+      RecursiveProperties props;
+      props.setAddressOnly();
+      props.addSubobject(classifyType(origType.getPackExpansionPatternType(),
+                                      type.getPatternType(),
+                                      TC, Expansion));
+      props = mergeIsTypeExpansionSensitive(isSensitive, props);
+      return asImpl().handleAddressOnly(type, props);
     }
 
     RetTy visitBuiltinRawPointerType(CanBuiltinRawPointerType type,
@@ -348,6 +361,17 @@ namespace {
 
     RetTy visitBuiltinDefaultActorStorageType(
                                          CanBuiltinDefaultActorStorageType type,
+                                         AbstractionPattern origType,
+                                         IsTypeExpansionSensitive_t isSensitive) {
+      return asImpl().handleAddressOnly(type, {IsNotTrivial, IsFixedABI,
+                                               IsAddressOnly, IsNotResilient,
+                                               isSensitive,
+                                               DoesNotHaveRawPointer,
+                                               IsLexical});
+    }
+
+    RetTy visitBuiltinNonDefaultDistributedActorStorageType(
+                                         CanBuiltinNonDefaultDistributedActorStorageType type,
                                          AbstractionPattern origType,
                                          IsTypeExpansionSensitive_t isSensitive) {
       return asImpl().handleAddressOnly(type, {IsNotTrivial, IsFixedABI,
@@ -396,14 +420,19 @@ namespace {
       case DifferentiabilityKind::NonDifferentiable:
         break;
       }
-      // Only escaping closures are references.
-      bool isSwiftEscaping = type->getExtInfo().isNoEscape() &&
-                             type->getExtInfo().getRepresentation() ==
-                                 SILFunctionType::Representation::Thick;
-      if (type->getExtInfo().hasContext() && !isSwiftEscaping)
+      if (type->getExtInfo().hasContext()) {
+        // Nonescaping closures ultimately become trivial, but we give them
+        // ownership semantics to do borrow checking on their captures, so we
+        // lower them as reference types. Passes will eliminate ownership
+        // operations on them.
+        //
+        // TODO: Nonescaping closures should also be move-only to ensure we
+        // eliminate copies.
         return asImpl().handleReference(
             type, getReferenceRecursiveProperties(isSensitive));
-      // No escaping closures are trivial types.
+      }
+      
+      // Contextless function references are trivial types.
       return asImpl().handleTrivial(type,
                                     getTrivialRecursiveProperties(isSensitive));
     }
@@ -2177,11 +2206,7 @@ namespace {
     TypeLowering *visitPackType(CanPackType packType,
                                 AbstractionPattern origType,
                                 IsTypeExpansionSensitive_t isSensitive) {
-      RecursiveProperties properties;
-      properties.setAddressOnly();
-      properties = mergeIsTypeExpansionSensitive(isSensitive, properties);
-
-      return handleAddressOnly(packType, properties);
+      llvm_unreachable("shouldn't get here with an unlowered type");
     }
 
     TypeLowering *visitSILPackType(CanSILPackType packType,
@@ -2189,6 +2214,12 @@ namespace {
                                    IsTypeExpansionSensitive_t isSensitive) {
       RecursiveProperties properties;
       properties.setAddressOnly();
+      for (auto i : indices(packType.getElementTypes())) {
+        auto &eltLowering =
+          TC.getTypeLowering(packType->getSILElementType(i),
+                             Expansion);
+        properties.addSubobject(eltLowering.getRecursiveProperties());
+      }
       properties = mergeIsTypeExpansionSensitive(isSensitive, properties);
 
       return handleAddressOnly(packType, properties);
@@ -2199,6 +2230,11 @@ namespace {
                                          IsTypeExpansionSensitive_t isSensitive) {
       RecursiveProperties properties;
       properties.setAddressOnly();
+      auto &patternLowering =
+        TC.getTypeLowering(origType.getPackExpansionPatternType(),
+                           packExpansionType.getPatternType(),
+                           Expansion);
+      properties.addSubobject(patternLowering.getRecursiveProperties());
       properties = mergeIsTypeExpansionSensitive(isSensitive, properties);
 
       return handleAddressOnly(packExpansionType, properties);
@@ -2498,24 +2534,21 @@ static CanTupleType computeLoweredTupleType(TypeConverter &tc,
                                             TypeExpansionContext context,
                                             AbstractionPattern origType,
                                             CanTupleType substType) {
-  assert(origType.matchesTuple(substType));
+  if (substType->getNumElements() == 0) return substType;
 
-  // Does the lowered tuple type differ from the substituted type in
-  // any interesting way?
   bool changed = false;
   SmallVector<TupleTypeElt, 4> loweredElts;
   loweredElts.reserve(substType->getNumElements());
 
-  for (auto i : indices(substType->getElementTypes())) {
-    auto origEltType = origType.getTupleElementType(i);
-    auto substEltType = substType.getElementType(i);
-
-    CanType loweredTy =
-        tc.getLoweredRValueType(context, origEltType, substEltType);
-    changed = (changed || substEltType != loweredTy);
-
-    loweredElts.push_back(substType->getElement(i).getWithType(loweredTy));
-  }
+  origType.forEachExpandedTupleElement(substType,
+                                       [&](AbstractionPattern origEltType,
+                                           CanType substEltType,
+                                           const TupleTypeElt &elt) {
+    auto loweredTy =
+      tc.getLoweredRValueType(context, origEltType, substEltType);
+    if (loweredTy != substEltType) changed = true;
+    loweredElts.push_back(elt.getWithType(loweredTy));
+  });
 
   if (!changed) return substType;
 
@@ -2978,12 +3011,8 @@ TypeConverter::computeLoweredRValueType(TypeExpansionContext forExpansion,
           substPatternType);
       changed |= (loweredSubstPatternType != substPatternType);
 
-      CanType substCountType = substPackExpansionType.getCountType();
-      CanType loweredSubstCountType = TC.getLoweredRValueType(
-          forExpansion,
-          origType.getPackExpansionCountType(),
-          substCountType);
-      changed |= (loweredSubstCountType != substCountType);
+      // Count types are AST types and are not lowered.
+      CanType loweredSubstCountType = substPackExpansionType.getCountType();
 
       if (!changed)
         return substPackExpansionType;
@@ -3298,7 +3327,7 @@ static CanAnyFunctionType getPropertyWrapperBackingInitializerInterfaceType(
 
   AnyFunctionType::Param param(
       inputType, Identifier(),
-      ParameterTypeFlags().withValueOwnership(ValueOwnership::Owned));
+      ParameterTypeFlags().withOwnershipSpecifier(ParamSpecifier::LegacyOwned));
   // FIXME: Verify ExtInfo state is correct, not working by accident.
   CanAnyFunctionType::ExtInfo info;
   return CanAnyFunctionType::get(getCanonicalSignatureOrNull(sig), {param},
