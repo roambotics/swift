@@ -17,6 +17,7 @@
 #include "swift/Basic/SourceLoc.h"
 #include "clang/Basic/FileManager.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/None.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/Support/SourceMgr.h"
 #include <map>
@@ -52,6 +53,9 @@ public:
 
     /// The expansion of an attached conformance macro.
     ConformanceMacroExpansion,
+
+    /// The expansion of an attached extension macro.
+    ExtensionMacroExpansion,
 
     /// A new function body that is replacing an existing function body.
     ReplacedFunctionBody,
@@ -130,7 +134,8 @@ private:
   std::map<const char *, VirtualFile> VirtualFiles;
   mutable std::pair<const char *, const VirtualFile*> CachedVFile = {nullptr, nullptr};
 
-  Optional<unsigned> findBufferContainingLocInternal(SourceLoc Loc) const;
+  llvm::Optional<unsigned> findBufferContainingLocInternal(SourceLoc Loc) const;
+
 public:
   SourceManager(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS =
                     llvm::vfs::getRealFileSystem())
@@ -191,8 +196,12 @@ public:
   /// Set the generated source information associated with a given buffer.
   void setGeneratedSourceInfo(unsigned bufferID, GeneratedSourceInfo);
 
+  /// Checks whether the given buffer has generated source information.
+  bool hasGeneratedSourceInfo(unsigned bufferID);
+
   /// Retrieve the generated source information for the given buffer.
-  Optional<GeneratedSourceInfo> getGeneratedSourceInfo(unsigned bufferID) const;
+  llvm::Optional<GeneratedSourceInfo>
+  getGeneratedSourceInfo(unsigned bufferID) const;
 
   /// Record the starting source location of a regex literal.
   void recordRegexLiteralStartLoc(SourceLoc loc) {
@@ -280,7 +289,8 @@ public:
 
   /// Returns a buffer ID for a previously added buffer with the given
   /// buffer identifier, or None if there is no such buffer.
-  Optional<unsigned> getIDForBufferIdentifier(StringRef BufIdentifier) const;
+  llvm::Optional<unsigned>
+  getIDForBufferIdentifier(StringRef BufIdentifier) const;
 
   /// Returns the identifier for the buffer with the given ID.
   ///
@@ -371,7 +381,7 @@ public:
   StringRef getEntireTextForBuffer(unsigned BufferID) const;
 
   StringRef extractText(CharSourceRange Range,
-                        Optional<unsigned> BufferID = None) const;
+                        llvm::Optional<unsigned> BufferID = llvm::None) const;
 
   llvm::SMDiagnostic GetMessage(SourceLoc Loc, llvm::SourceMgr::DiagKind Kind,
                                 const Twine &Msg,
@@ -399,8 +409,6 @@ public:
     return Offset.has_value() ? getLocForOffset(BufferId, Offset.value()) :
                                SourceLoc();
   }
-
-  std::string getLineString(unsigned BufferID, unsigned LineNumber);
 
   /// Retrieve the buffer ID for \p Path, loading if necessary.
   unsigned getExternalSourceBufferID(StringRef Path);

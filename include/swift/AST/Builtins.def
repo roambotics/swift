@@ -538,6 +538,11 @@ BUILTIN_SIL_OPERATION(WithUnsafeThrowingContinuation, "withUnsafeThrowingContinu
 /// Force the current task to be rescheduled on the specified actor.
 BUILTIN_SIL_OPERATION(HopToActor, "hopToActor", None)
 
+/// packLength: <each T>(_: repeat each T) -> Int
+///
+/// Returns the number of items in a pack.
+BUILTIN_SIL_OPERATION(PackLength, "packLength", Special)
+
 #undef BUILTIN_SIL_OPERATION
 
 // BUILTIN_RUNTIME_CALL - A call into a runtime function.
@@ -985,19 +990,24 @@ BUILTIN_MISC_OPERATION_WITH_SILGEN(CreateAsyncTaskInGroup,
 /// is a pure value and therefore we can consider it as readnone).
 BUILTIN_MISC_OPERATION_WITH_SILGEN(GlobalStringTablePointer, "globalStringTablePointer", "n", Special)
 
-// autoDiffCreateLinearMapContext: (Builtin.Word) -> Builtin.NativeObject
-BUILTIN_MISC_OPERATION_WITH_SILGEN(AutoDiffCreateLinearMapContext, "autoDiffCreateLinearMapContext", "n", Special)
+// autoDiffCreateLinearMapContextWithType: (T.Type) -> Builtin.NativeObject
+BUILTIN_MISC_OPERATION_WITH_SILGEN(AutoDiffCreateLinearMapContextWithType, "autoDiffCreateLinearMapContextWithType", "", Special)
 
 // autoDiffProjectTopLevelSubcontext: (Builtin.NativeObject) -> Builtin.RawPointer
 BUILTIN_MISC_OPERATION_WITH_SILGEN(AutoDiffProjectTopLevelSubcontext, "autoDiffProjectTopLevelSubcontext", "n", Special)
 
-// autoDiffAllocateSubcontext: (Builtin.NativeObject, Builtin.Word) -> Builtin.RawPointer
-BUILTIN_MISC_OPERATION_WITH_SILGEN(AutoDiffAllocateSubcontext, "autoDiffAllocateSubcontext", "", Special)
+// autoDiffAllocateSubcontextWithType: (Builtin.NativeObject, T.Type) -> Builtin.RawPointer
+BUILTIN_MISC_OPERATION_WITH_SILGEN(AutoDiffAllocateSubcontextWithType, "autoDiffAllocateSubcontextWithType", "", Special)
 
 /// Build a Builtin.Executor value from an "ordinary" serial executor
 /// reference.
 BUILTIN_MISC_OPERATION_WITH_SILGEN(BuildOrdinarySerialExecutorRef,
                                    "buildOrdinarySerialExecutorRef", "n", Special)
+
+/// Build a Builtin.Executor value from an "complex equality" serial executor
+/// reference.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(BuildComplexEqualitySerialExecutorRef,
+                                   "buildComplexEqualitySerialExecutorRef", "n", Special)
 
 /// Build a Builtin.Executor value from a default actor reference.
 BUILTIN_MISC_OPERATION_WITH_SILGEN(BuildDefaultActorExecutorRef,

@@ -98,6 +98,12 @@ static void printToolVersionAndFlagsComment(raw_ostream &out,
     out << "// " SWIFT_MODULE_FLAGS_IGNORABLE_KEY ": "
         << Opts.IgnorableFlags << "\n";
   }
+
+  auto hasPrivateIgnorableFlags = Opts.PrintPrivateInterfaceContent && !Opts.IgnorablePrivateFlags.empty();
+  if (hasPrivateIgnorableFlags) {
+    out << "// " SWIFT_MODULE_FLAGS_IGNORABLE_PRIVATE_KEY ": "
+        << Opts.IgnorablePrivateFlags << "\n";
+  }
 }
 
 std::string
@@ -114,6 +120,10 @@ llvm::Regex swift::getSwiftInterfaceFormatVersionRegex() {
 llvm::Regex swift::getSwiftInterfaceCompilerVersionRegex() {
   return llvm::Regex("^// " SWIFT_COMPILER_VERSION_KEY
                      ": (.+)$", llvm::Regex::Newline);
+}
+
+llvm::Regex swift::getSwiftInterfaceCompilerToolsVersionRegex() {
+  return llvm::Regex("Swift version ([0-9\\.]+)", llvm::Regex::Newline);
 }
 
 // MARK(https://github.com/apple/swift/issues/43510): Module name shadowing warnings
@@ -171,7 +181,7 @@ diagnoseIfModuleImportsShadowingDecl(ModuleInterfaceOptions const &Opts,
   SmallVector<ValueDecl *, 4> decls;
   lookupInModule(importedModule, importingModule->getName(), decls,
                  NLKind::UnqualifiedLookup, ResolutionKind::TypesOnly,
-                 importedModule,
+                 importedModule, SourceLoc(),
                  NL_UnqualifiedDefault | NL_IncludeUsableFromInline);
   for (auto decl : decls)
     diagnoseDeclShadowsModule(Opts, cast<TypeDecl>(decl), importingModule,
@@ -295,10 +305,12 @@ static void printImports(raw_ostream &out,
       continue;
     }
 
-    // Unless '-enable-builtin-module' was passed, do not print 'import Builtin'
-    // in the interface. '-parse-stdlib' still implicitly imports it however...
+    // Unless '-enable-builtin-module' /
+    // '-enable-experimental-feature BuiltinModule' was passed, do not print
+    // 'import Builtin' in the interface. '-parse-stdlib' still implicitly
+    // imports it however...
     if (importedModule->isBuiltinModule() &&
-        !M->getASTContext().LangOpts.EnableBuiltinModule) {
+        !M->getASTContext().LangOpts.hasFeature(Feature::BuiltinModule)) {
       continue;
     }
 
@@ -334,6 +346,10 @@ static void printImports(raw_ostream &out,
       // List of imported SPI groups for local use.
       for (auto spiName : spis)
         out << "@_spi(" << spiName << ") ";
+    }
+
+    if (M->getASTContext().LangOpts.isSwiftVersionAtLeast(6)) {
+      out << "public ";
     }
 
     out << "import ";
@@ -413,7 +429,8 @@ class InheritedProtocolCollector {
 
   /// Helper to extract the `@available` attributes on a decl.
   static AvailableAttrList
-  getAvailabilityAttrs(const Decl *D, Optional<AvailableAttrList> &cache) {
+  getAvailabilityAttrs(const Decl *D,
+                       llvm::Optional<AvailableAttrList> &cache) {
     if (cache.has_value())
       return cache.value();
 
@@ -466,12 +483,12 @@ class InheritedProtocolCollector {
   /// If \p skipExtra is true then avoid recording any extra protocols to
   /// print, such as synthesized conformances or conformances to non-public
   /// protocols.
-  void recordProtocols(ArrayRef<InheritedEntry> directlyInherited,
-                       const Decl *D, bool skipExtra = false) {
-    Optional<AvailableAttrList> availableAttrs;
+  void recordProtocols(InheritedTypes directlyInherited, const Decl *D,
+                       bool skipExtra = false) {
+    llvm::Optional<AvailableAttrList> availableAttrs;
 
-    for (InheritedEntry inherited : directlyInherited) {
-      Type inheritedTy = inherited.getType();
+    for (int i : directlyInherited.getIndices()) {
+      Type inheritedTy = directlyInherited.getResolvedType(i);
       if (!inheritedTy || !inheritedTy->isExistentialType())
         continue;
 
@@ -479,6 +496,7 @@ class InheritedProtocolCollector {
       if (!canPrintNormally && skipExtra)
         continue;
 
+      auto inherited = directlyInherited.getEntry(i);
       ExistentialLayout layout = inheritedTy->getExistentialLayout();
       for (ProtocolDecl *protoDecl : layout.getProtocols()) {
         if (canPrintNormally)
@@ -513,8 +531,9 @@ class InheritedProtocolCollector {
   /// For each type directly inherited by \p extension, record any protocols
   /// that we would have printed in ConditionalConformanceProtocols.
   void recordConditionalConformances(const ExtensionDecl *extension) {
-    for (TypeLoc inherited : extension->getInherited()) {
-      Type inheritedTy = inherited.getType();
+    auto inheritedTypes = extension->getInherited();
+    for (unsigned i : inheritedTypes.getIndices()) {
+      Type inheritedTy = inheritedTypes.getResolvedType(i);
       if (!inheritedTy || !inheritedTy->isExistentialType())
         continue;
 
@@ -538,7 +557,7 @@ public:
   ///
   /// \sa recordProtocols
   static void collectProtocols(PerTypeMap &map, const Decl *D) {
-    ArrayRef<InheritedEntry> directlyInherited;
+    InheritedTypes directlyInherited = InheritedTypes(D);
     const NominalTypeDecl *nominal;
     const IterableDeclContext *memberContext;
 
@@ -552,7 +571,6 @@ public:
       return true;
     };
     if ((nominal = dyn_cast<NominalTypeDecl>(D))) {
-      directlyInherited = nominal->getInherited();
       memberContext = nominal;
 
     } else if (auto *extension = dyn_cast<ExtensionDecl>(D)) {
@@ -560,7 +578,6 @@ public:
         return;
       }
       nominal = extension->getExtendedNominal();
-      directlyInherited = extension->getInherited();
       memberContext = extension;
     } else {
       return;

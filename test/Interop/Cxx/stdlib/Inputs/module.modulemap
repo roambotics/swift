@@ -3,11 +3,6 @@ module StdVector {
   requires cplusplus
 }
 
-module StdString {
-  header "std-string.h"
-  requires cplusplus
-}
-
 module StdMap {
   header "std-map.h"
   requires cplusplus
@@ -26,4 +21,10 @@ module StdSet {
 module StdPair {
   header "std-pair.h"
   requires cplusplus
+}
+
+module MsvcUseVecIt {
+  header "msvc-std-vector-it.h"
+  requires cplusplus
+  export *
 }

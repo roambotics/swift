@@ -177,10 +177,6 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
     arguments.push_back("-aarch64-use-tbi");
   }
 
-  if (output.getPrimaryOutputType() == file_types::TY_SwiftModuleFile) {
-    arguments.push_back("-warn-on-potentially-unavailable-enum-case");
-  }
-
   // Enable or disable ObjC interop appropriately for the platform
   if (Triple.isOSDarwin()) {
     arguments.push_back("-enable-objc-interop");
@@ -236,8 +232,6 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   inputArgs.AddAllArgs(arguments, options::OPT_I);
   inputArgs.AddAllArgs(arguments, options::OPT_F, options::OPT_Fsystem);
   inputArgs.AddAllArgs(arguments, options::OPT_vfsoverlay);
-  inputArgs.AddAllArgs(arguments, options::OPT_plugin_path);
-  inputArgs.AddAllArgs(arguments, options::OPT_external_plugin_path);
 
   inputArgs.AddLastArg(arguments, options::OPT_AssertConfig);
   inputArgs.AddLastArg(arguments, options::OPT_autolink_force_load);
@@ -325,8 +319,6 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   inputArgs.AddLastArg(arguments, options::OPT_enable_bare_slash_regex);
   inputArgs.AddLastArg(arguments, options::OPT_enable_experimental_cxx_interop);
   inputArgs.AddLastArg(arguments, options::OPT_cxx_interoperability_mode);
-  inputArgs.AddLastArg(arguments, options::OPT_load_plugin_library);
-  inputArgs.AddLastArg(arguments, options::OPT_load_plugin_executable);
   inputArgs.AddLastArg(arguments, options::OPT_enable_builtin_module);
 
   // Pass on any build config options
@@ -376,9 +368,24 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
     inputArgs.AddAllArgs(arguments, options::OPT_file_compilation_dir);
   }
 
+  // Specify default plugin search path options after explicitly specified
+  // options.
+  inputArgs.AddAllArgs(arguments, options::OPT_plugin_search_Group);
+  addPlatformSpecificPluginFrontendArgs(OI, output, inputArgs, arguments);
+
+  addPluginArguments(inputArgs, arguments);
+
   // Pass through any subsystem flags.
   inputArgs.AddAllArgs(arguments, options::OPT_Xllvm);
   inputArgs.AddAllArgs(arguments, options::OPT_Xcc);
+}
+
+void ToolChain::addPlatformSpecificPluginFrontendArgs(
+    const OutputInfo &OI,
+    const CommandOutput &output,
+    const llvm::opt::ArgList &inputArgs,
+    llvm::opt::ArgStringList &arguments) const {
+  // Overridden where necessary.
 }
 
 static void addRuntimeLibraryFlags(const OutputInfo &OI,
@@ -727,6 +734,9 @@ const char *ToolChain::JobContext::computeFrontendModeForCompile() const {
   case file_types::TY_IndexUnitOutputPath:
   case file_types::TY_SwiftABIDescriptor:
   case file_types::TY_ConstValues:
+  case file_types::TY_SwiftFixIt:
+  case file_types::TY_ModuleSemanticInfo:
+  case file_types::TY_CachedDiagnostics:
     llvm_unreachable("Output type can never be primary output.");
   case file_types::TY_INVALID:
     llvm_unreachable("Invalid type ID");
@@ -988,6 +998,9 @@ ToolChain::constructInvocation(const BackendJobAction &job,
     case file_types::TY_IndexUnitOutputPath:
     case file_types::TY_SwiftABIDescriptor:
     case file_types::TY_ConstValues:
+    case file_types::TY_SwiftFixIt:
+    case file_types::TY_ModuleSemanticInfo:
+    case file_types::TY_CachedDiagnostics:
       llvm_unreachable("Output type can never be primary output.");
     case file_types::TY_INVALID:
       llvm_unreachable("Invalid type ID");
@@ -1420,9 +1433,10 @@ void ToolChain::getClangLibraryPath(const ArgList &Args,
   getResourceDirPath(LibPath, Args, /*Shared=*/true);
   // Remove platform name.
   llvm::sys::path::remove_filename(LibPath);
-  llvm::sys::path::append(LibPath, "clang", "lib",
-                          T.isOSDarwin() ? "darwin"
-                                         : getPlatformNameForTriple(T));
+  StringRef platformName = "darwin";
+  if (!T.isOSDarwin())
+    platformName = T.isAndroid() ? "linux" : getPlatformNameForTriple(T);
+  llvm::sys::path::append(LibPath, "clang", "lib", platformName);
 }
 
 /// Get the runtime library link path, which is platform-specific and found
@@ -1480,7 +1494,8 @@ void ToolChain::getRuntimeLibraryPaths(SmallVectorImpl<std::string> &runtimeLibP
   if (!scratchPath.empty())
     runtimeLibPaths.push_back(std::string(scratchPath.str()));
 
-  if (!SDKPath.empty()) {
+  // Only Darwin places libraries directly in /sdk/usr/lib/swift/.
+  if (Triple.isOSDarwin() && !SDKPath.empty()) {
     if (!scratchPath.empty()) {
       // If we added the secondary resource dir, we also need the iOSSupport
       // directory.

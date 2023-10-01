@@ -85,19 +85,11 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
   }
 
   // Check the availability of the opaque type runtime support.
-  if (!ctx.LangOpts.DisableAvailabilityChecking) {
-    auto runningOS =
-      TypeChecker::overApproximateAvailabilityAtLocation(
-        repr->getLoc(),
-        originatingDecl->getInnermostDeclContext());
-    auto availability = ctx.getOpaqueTypeAvailability();
-    if (!runningOS.isContainedIn(availability)) {
-      TypeChecker::diagnosePotentialOpaqueTypeUnavailability(
-        repr->getSourceRange(),
-        originatingDecl->getInnermostDeclContext(),
-        UnavailabilityReason::requiresVersionRange(availability.getOSVersion()));
-    }
-  }
+  TypeChecker::checkAvailability(
+      repr->getSourceRange(),
+      ctx.getOpaqueTypeAvailability(),
+      diag::availability_opaque_types_only_version_newer,
+      originatingDecl->getInnermostDeclContext());
 
   // Create a generic signature for the opaque environment. This is the outer
   // generic signature with an added generic parameters representing the opaque
@@ -136,8 +128,8 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
       return nullptr;
     }
   } else {
-    opaqueReprs = collectOpaqueReturnTypeReprs(repr, ctx, dc);
-    
+    opaqueReprs = collectOpaqueTypeReprs(repr, ctx, dc);
+
     if (opaqueReprs.empty()) {
       return nullptr;
     }
@@ -221,7 +213,6 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
   auto opaqueDecl = OpaqueTypeDecl::get(
       originatingDecl, genericParams, parentDC, interfaceSignature,
       opaqueReprs);
-  opaqueDecl->copyFormalAccessFrom(originatingDecl);
   if (auto originatingSig = originatingDC->getGenericSignatureOfContext()) {
     opaqueDecl->setGenericSignature(originatingSig);
   } else {
@@ -308,9 +299,7 @@ void TypeChecker::checkProtocolSelfRequirements(ValueDecl *decl) {
           req.getFirstType()->is<GenericTypeParamType>())
         continue;
 
-      ctx.Diags.diagnose(decl,
-                         diag::requirement_restricts_self,
-                         decl->getDescriptiveKind(), decl->getName(),
+      ctx.Diags.diagnose(decl, diag::requirement_restricts_self, decl,
                          req.getFirstType().getString(),
                          static_cast<unsigned>(req.getKind()),
                          req.getSecondType().getString());
@@ -352,6 +341,25 @@ void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
         ReferencedGenericParams.insert(ty->getCanonicalType());
         return Action::SkipChildren;
       }
+
+      // Skip the count type, which is always a generic parameter;
+      // we don't consider it a reference because it only binds the
+      // shape and not the metadata.
+      if (auto *expansionTy = ty->getAs<PackExpansionType>()) {
+        expansionTy->getPatternType().walk(*this);
+        return Action::SkipChildren;
+      }
+
+      // Don't walk into generic type alias substitutions. This does
+      // not constrain `T`:
+      //
+      //   typealias Foo<T> = Int
+      //   func foo<T>(_: Foo<T>) {}
+      if (auto *aliasTy = dyn_cast<TypeAliasType>(ty.getPointer())) {
+        Type(aliasTy->getSinglyDesugaredType()).walk(*this);
+        return Action::SkipChildren;
+      }
+
       return Action::Continue;
     }
 
@@ -498,14 +506,72 @@ void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
   }
 }
 
+/// Ensure we don't re-declare any generic parameters in the current scope,
+/// or shadow a generic parameter from an outer scope.
+void TypeChecker::checkShadowedGenericParams(GenericContext *dc) {
+  // Collect all outer generic parameters for lookup.
+  llvm::SmallDenseMap<Identifier, GenericTypeParamDecl *, 4> genericParamDecls;
+  for (auto *parentDC = dc->getParent(); parentDC != nullptr;
+       parentDC = parentDC->getParentForLookup()) {
+    if (auto *extensionDecl = dyn_cast<ExtensionDecl>(parentDC)) {
+      parentDC = extensionDecl->getExtendedNominal();
+
+      // This can happen with invalid code.
+      if (parentDC == nullptr)
+        return;
+    }
+    if (auto *parentDecl = parentDC->getAsDecl()) {
+      if (auto *parentGeneric = parentDecl->getAsGenericContext()) {
+        if (auto *genericParamList = parentGeneric->getGenericParams()) {
+          for (auto *genericParamDecl : genericParamList->getParams()) {
+            if (genericParamDecl->isOpaqueType())
+              continue;
+            genericParamDecls[genericParamDecl->getName()] = genericParamDecl;
+          }
+        }
+      }
+    }
+  }
+
+  for (auto *genericParamDecl : dc->getGenericParams()->getParams()) {
+    if (genericParamDecl->isOpaqueType() || genericParamDecl->isImplicit())
+      continue;
+
+    auto found = genericParamDecls.find(genericParamDecl->getName());
+    if (found != genericParamDecls.end()) {
+      auto *existingParamDecl = found->second;
+
+      if (existingParamDecl->getDeclContext() == dc) {
+        genericParamDecl->diagnose(diag::invalid_redecl, genericParamDecl);
+      } else {
+        genericParamDecl->diagnose(
+            diag::shadowed_generic_param,
+            genericParamDecl).warnUntilSwiftVersion(6);
+      }
+
+      if (existingParamDecl->getLoc()) {
+        existingParamDecl->diagnose(diag::invalid_redecl_prev,
+                                    existingParamDecl);
+      }
+
+      continue;
+    }
+
+    genericParamDecls[genericParamDecl->getName()] = genericParamDecl;
+  }
+}
+
 ///
 /// Generic types
 ///
 
-/// Collect additional requirements into \p sameTypeReqs.
+/// Collect additional requirements into \p extraReqs.
 static void collectAdditionalExtensionRequirements(
-    Type type, SmallVectorImpl<Requirement> &sameTypeReqs) {
+    Type type, SmallVectorImpl<Requirement> &extraReqs) {
   if (type->is<ErrorType>())
+    return;
+
+  if (type->is<TupleType>())
     return;
 
   // Find the nominal type declaration and its parent type.
@@ -521,7 +587,7 @@ static void collectAdditionalExtensionRequirements(
 
     paramProtoTy->getRequirements(
         protoTy->getDecl()->getSelfInterfaceType(),
-        sameTypeReqs);
+        extraReqs);
   }
 
   Type parentType = type->getNominalParent();
@@ -529,7 +595,7 @@ static void collectAdditionalExtensionRequirements(
 
   // Visit the parent type, if there is one.
   if (parentType) {
-    collectAdditionalExtensionRequirements(parentType, sameTypeReqs);
+    collectAdditionalExtensionRequirements(parentType, extraReqs);
   }
 
   // Find the nominal type.
@@ -538,6 +604,8 @@ static void collectAdditionalExtensionRequirements(
   if (!nominal) {
     type = typealias->getUnderlyingType();
     nominal = type->getNominalOrBoundGenericNominal();
+    if (!nominal && type->is<TupleType>())
+      nominal = type->getASTContext().getBuiltinTupleDecl();
   }
 
   // If we have a bound generic type, add same-type requirements for each of
@@ -548,8 +616,8 @@ static void collectAdditionalExtensionRequirements(
       auto *gp = genericParams->getParams()[gpIndex];
       auto gpType = gp->getDeclaredInterfaceType();
 
-      sameTypeReqs.emplace_back(RequirementKind::SameType, gpType,
-                                currentBoundType->getGenericArgs()[gpIndex]);
+      extraReqs.emplace_back(RequirementKind::SameType, gpType,
+                             currentBoundType->getGenericArgs()[gpIndex]);
     }
   }
 
@@ -557,7 +625,7 @@ static void collectAdditionalExtensionRequirements(
   // generic signature.
   if (typealias && TypeChecker::isPassThroughTypealias(typealias, nominal)) {
     for (auto req : typealias->getGenericSignature().getRequirements())
-      sameTypeReqs.push_back(req);
+      extraReqs.push_back(req);
   }
 }
 
@@ -632,7 +700,7 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
 
   GenericSignature parentSig;
   SmallVector<TypeLoc, 2> inferenceSources;
-  SmallVector<Requirement, 2> sameTypeReqs;
+  SmallVector<Requirement, 2> extraReqs;
   if (auto VD = dyn_cast<ValueDecl>(GC->getAsDecl())) {
     parentSig = GC->getParentForLookup()->getGenericSignatureOfContext();
 
@@ -706,13 +774,23 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
       }
     }
   } else if (auto *ext = dyn_cast<ExtensionDecl>(GC)) {
-    parentSig = ext->getExtendedNominal()->getGenericSignatureOfContext();
-    genericParams = nullptr;
+    collectAdditionalExtensionRequirements(ext->getExtendedType(), extraReqs);
 
-    collectAdditionalExtensionRequirements(ext->getExtendedType(), sameTypeReqs);
+    auto *extendedNominal = ext->getExtendedNominal();
+
+    if (isa<BuiltinTupleDecl>(extendedNominal)) {
+      genericParams = ext->getGenericParams();
+    } else {
+      parentSig = extendedNominal->getGenericSignatureOfContext();
+      genericParams = nullptr;
+    }
 
     // Re-use the signature of the type being extended by default.
-    if (sameTypeReqs.empty() && !ext->getTrailingWhereClause()) {
+    // For tuple extensions, always build a new signature to get
+    // the right sugared types, since we don't want to expose the
+    // name of the generic parameter of BuiltinTupleDecl itself.
+    if (extraReqs.empty() && !ext->getTrailingWhereClause() &&
+        !isa<BuiltinTupleDecl>(extendedNominal)) {
       return parentSig;
     }
 
@@ -725,7 +803,7 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
   auto request = InferredGenericSignatureRequest{
       parentSig.getPointer(),
       genericParams, WhereClauseOwner(GC),
-      sameTypeReqs, inferenceSources,
+      extraReqs, inferenceSources,
       allowConcreteGenericParams};
   auto sig = evaluateOrDefault(ctx.evaluator, request,
                                GenericSignatureWithError()).getPointer();
@@ -771,7 +849,7 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
 /// substitutions that will have been applied to these types.
 /// These are used to produce the "parameter = argument" bindings in the test.
 static std::string gatherGenericParamBindingsText(
-    ArrayRef<Type> types, TypeArrayView<GenericTypeParamType> genericParams,
+    ArrayRef<Type> types, ArrayRef<GenericTypeParamType *> genericParams,
     TypeSubstitutionFn substitutions) {
   llvm::SmallPtrSet<GenericTypeParamType *, 2> knownGenericParams;
   for (auto type : types) {
@@ -790,6 +868,7 @@ static std::string gatherGenericParamBindingsText(
 
   SmallString<128> result;
   llvm::raw_svector_ostream OS(result);
+  auto options = PrintOptions::forDiagnosticArguments();
 
   for (auto gp : genericParams) {
     auto canonGP = gp->getCanonicalType()->castTo<GenericTypeParamType>();
@@ -811,19 +890,7 @@ static std::string gatherGenericParamBindingsText(
     if (!type)
       return "";
 
-    if (auto *packType = type->getAs<PackType>()) {
-      bool first = true;
-      for (auto eltType : packType->getElementTypes()) {
-        if (first)
-          first = false;
-        else
-          OS << ", ";
-
-        OS << eltType;
-      }
-    } else {
-      OS << type.getString();
-    }
+    type->print(OS, options);
   }
 
   OS << "]";
@@ -833,7 +900,7 @@ static std::string gatherGenericParamBindingsText(
 void TypeChecker::diagnoseRequirementFailure(
     const CheckGenericArgumentsResult::RequirementFailureInfo &reqFailureInfo,
     SourceLoc errorLoc, SourceLoc noteLoc, Type targetTy,
-    TypeArrayView<GenericTypeParamType> genericParams,
+    ArrayRef<GenericTypeParamType *> genericParams,
     TypeSubstitutionFn substitutions, ModuleDecl *module) {
   assert(errorLoc.isValid() && noteLoc.isValid());
 
@@ -1013,6 +1080,35 @@ CheckGenericArgumentsResult::Kind TypeChecker::checkGenericArguments(
   return CheckGenericArgumentsResult::Success;
 }
 
+CheckGenericArgumentsResult::Kind TypeChecker::checkGenericArguments(
+    ArrayRef<Requirement> requirements) {
+  SmallVector<Requirement, 4> worklist(requirements.begin(), requirements.end());
+
+  bool hadSubstFailure = false;
+
+  while (!worklist.empty()) {
+    auto req = worklist.pop_back_val();
+    switch (req.checkRequirement(worklist, /*allowMissing=*/true)) {
+    case CheckRequirementResult::Success:
+    case CheckRequirementResult::ConditionalConformance:
+    case CheckRequirementResult::PackRequirement:
+      break;
+
+    case CheckRequirementResult::RequirementFailure:
+      return CheckGenericArgumentsResult::RequirementFailure;
+
+    case CheckRequirementResult::SubstitutionFailure:
+      hadSubstFailure = true;
+      break;
+    }
+  }
+
+  if (hadSubstFailure)
+    return CheckGenericArgumentsResult::SubstitutionFailure;
+
+  return CheckGenericArgumentsResult::Success;
+}
+
 Requirement
 RequirementRequest::evaluate(Evaluator &evaluator,
                              WhereClauseOwner owner,
@@ -1028,10 +1124,11 @@ RequirementRequest::evaluate(Evaluator &evaluator,
     context = TypeResolverContext::GenericRequirement;
   }
   auto options = TypeResolutionOptions(context);
-  options |= TypeResolutionFlags::AllowPackReferences;
+  if (reqRepr.isExpansionPattern())
+    options |= TypeResolutionFlags::AllowPackReferences;
   if (owner.dc->isInSpecializeExtensionContext())
     options |= TypeResolutionFlags::AllowUsableFromInline;
-  Optional<TypeResolution> resolution;
+  llvm::Optional<TypeResolution> resolution;
   switch (stage) {
   case TypeResolutionStage::Structural:
     resolution = TypeResolution::forStructural(owner.dc, options,

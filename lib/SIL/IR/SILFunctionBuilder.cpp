@@ -13,9 +13,10 @@
 #include "swift/SIL/SILFunctionBuilder.h"
 #include "swift/AST/AttrKind.h"
 #include "swift/AST/Availability.h"
-#include "swift/AST/DiagnosticsParse.h"
-#include "swift/AST/DistributedDecl.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/DiagnosticsParse.h"
+#include "swift/AST/DiagnosticsSIL.h"
+#include "swift/AST/DistributedDecl.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/SemanticAttrs.h"
 
@@ -31,7 +32,7 @@ SILFunction *SILFunctionBuilder::getOrCreateFunction(
   if (auto fn = mod.lookUpFunction(name)) {
     assert(fn->getLoweredFunctionType() == type);
     assert(stripExternalFromLinkage(fn->getLinkage()) ==
-           stripExternalFromLinkage(linkage));
+           stripExternalFromLinkage(linkage) || mod.getOptions().EmbeddedSwift);
     return fn;
   }
 
@@ -60,6 +61,8 @@ void SILFunctionBuilder::addFunctionAttributes(
   if (auto *A = Attrs.getAttribute(DAK_EmitAssemblyVisionRemarks))
     F->addSemanticsAttr(semantics::FORCE_EMIT_OPT_REMARK_PREFIX);
 
+  auto *attributedFuncDecl = constant.getAbstractFunctionDecl();
+
   // Propagate @_specialize.
   for (auto *A : Attrs.getAttributes<SpecializeAttr>()) {
     auto *SA = cast<SpecializeAttr>(A);
@@ -69,7 +72,7 @@ void SILFunctionBuilder::addFunctionAttributes(
             : SILSpecializeAttr::SpecializationKind::Partial;
     assert(!constant.isNull());
     SILFunction *targetFunction = nullptr;
-    auto *attributedFuncDecl = constant.getDecl();
+    auto *attributedFuncDecl = constant.getAbstractFunctionDecl();
     auto *targetFunctionDecl = SA->getTargetFunctionDecl(attributedFuncDecl);
     // Filter out _spi.
     auto spiGroups = SA->getSPIGroups();
@@ -88,36 +91,90 @@ void SILFunctionBuilder::addFunctionAttributes(
     auto availability =
       AvailabilityInference::annotatedAvailableRangeForAttr(SA,
          M.getSwiftModule()->getASTContext());
+    auto specializedSignature = SA->getSpecializedSignature(attributedFuncDecl);
     if (targetFunctionDecl) {
       SILDeclRef declRef(targetFunctionDecl, constant.kind, false);
       targetFunction = getOrCreateDeclaration(targetFunctionDecl, declRef);
       F->addSpecializeAttr(SILSpecializeAttr::create(
-          M, SA->getSpecializedSignature(), SA->getTypeErasedParams(),
+          M, specializedSignature, SA->getTypeErasedParams(),
           SA->isExported(), kind, targetFunction, spiGroupIdent,
           attributedFuncDecl->getModuleContext(), availability));
     } else {
       F->addSpecializeAttr(SILSpecializeAttr::create(
-          M, SA->getSpecializedSignature(), SA->getTypeErasedParams(),
+          M, specializedSignature, SA->getTypeErasedParams(),
           SA->isExported(), kind, nullptr, spiGroupIdent,
           attributedFuncDecl->getModuleContext(), availability));
     }
   }
 
+  EffectsAttr const *writeNoneEffect = nullptr;
+  EffectsAttr const *releaseNoneEffect = nullptr;
   llvm::SmallVector<const EffectsAttr *, 8> customEffects;
   if (constant) {
     for (auto *attr : Attrs.getAttributes<EffectsAttr>()) {
       auto *effectsAttr = cast<EffectsAttr>(attr);
-      if (effectsAttr->getKind() == EffectsKind::Custom) {
+      switch (effectsAttr->getKind()) {
+      case EffectsKind::Custom:
         customEffects.push_back(effectsAttr);
-      } else {
-        if (F->getEffectsKind() != EffectsKind::Unspecified &&
-            F->getEffectsKind() != effectsAttr->getKind()) {
-          mod.getASTContext().Diags.diagnose(effectsAttr->getLocation(),
-              diag::warning_in_effects_attribute, "mismatching function effects");
-        } else {
-          F->setEffectsKind(effectsAttr->getKind());
-        }
+        // Proceed to the next attribute, don't set the effects kind based on
+        // this attribute.
+        continue;
+      case EffectsKind::ReadNone:
+      case EffectsKind::ReadOnly:
+        writeNoneEffect = effectsAttr;
+        break;
+      case EffectsKind::ReleaseNone:
+        releaseNoneEffect = effectsAttr;
+        break;
+      default:
+        break;
       }
+      if (effectsAttr->getKind() == EffectsKind::Custom)
+        continue;
+      if (F->getEffectsKind() != EffectsKind::Unspecified) {
+        // If multiple known effects are specified, the most restrictive one
+        // is used.
+        F->setEffectsKind(
+            std::min(effectsAttr->getKind(), F->getEffectsKind()));
+      } else {
+        F->setEffectsKind(effectsAttr->getKind());
+      }
+    }
+  }
+
+  if (writeNoneEffect && !releaseNoneEffect) {
+    auto constantType = mod.Types.getConstantFunctionType(
+        TypeExpansionContext::minimal(), constant);
+    SILFunctionConventions fnConv(constantType, mod);
+
+    auto selfIndex = fnConv.getSILArgIndexOfSelf();
+    for (auto index : indices(fnConv.getParameters())) {
+      auto param = fnConv.getParameters()[index];
+      if (!param.isConsumed())
+        continue;
+      if (index == selfIndex) {
+        mod.getASTContext().Diags.diagnose(
+            writeNoneEffect->getLocation(),
+            diag::
+                error_attr_effects_consume_requires_explicit_releasenone_self);
+      } else {
+        auto *pd = attributedFuncDecl->getParameters()->get(index);
+        mod.getASTContext().Diags.diagnose(
+            writeNoneEffect->getLocation(),
+            diag::error_attr_effects_consume_requires_explicit_releasenone,
+            pd->getName());
+        mod.getASTContext().Diags.diagnose(
+            pd->getNameLoc(),
+            diag::note_attr_effects_consume_requires_explicit_releasenone,
+            pd->getName());
+      }
+      mod.getASTContext()
+          .Diags
+          .diagnose(
+              writeNoneEffect->getLocation(),
+              diag::fixit_attr_effects_consume_requires_explicit_releasenone)
+          .fixItInsertAfter(writeNoneEffect->getRange().End,
+                            " @_effects(releasenone)");
     }
   }
 
@@ -129,7 +186,7 @@ void SILFunctionBuilder::addFunctionAttributes(
         // Give up on tuples. Their elements are added as individual
         // arguments. It destroys the 1-1 relation ship between parameters
         // and arguments.
-        if (isa<TupleType>(CanType(pd->getType())))
+        if (pd->getInterfaceType()->is<TupleType>())
           break;
         // First try the "local" parameter name. If there is none, use the
         // API name. E.g. `foo(apiName localName: Type) {}`
@@ -160,6 +217,27 @@ void SILFunctionBuilder::addFunctionAttributes(
   // @_silgen_name and @_cdecl functions may be called from C code somewhere.
   if (Attrs.hasAttribute<SILGenNameAttr>() || Attrs.hasAttribute<CDeclAttr>())
     F->setHasCReferences(true);
+
+  for (auto *EA : Attrs.getAttributes<ExposeAttr>()) {
+    bool shouldExportDecl = true;
+    if (Attrs.hasAttribute<CDeclAttr>()) {
+      // If the function is marked with @cdecl, expose only C compatible
+      // thunk function.
+      shouldExportDecl = constant.isNativeToForeignThunk();
+    }
+    if (EA->getExposureKind() == ExposureKind::Wasm && shouldExportDecl) {
+      // A wasm-level exported function must be retained if it appears in a
+      // compilation unit.
+      F->setMarkedAsUsed(true);
+      if (EA->Name.empty())
+        F->setWasmExportName(F->getName());
+      else
+        F->setWasmExportName(EA->Name);
+    }
+  }
+
+  if (Attrs.hasAttribute<UsedAttr>())
+    F->setMarkedAsUsed(true);
 
   if (Attrs.hasAttribute<NoLocksAttr>()) {
     F->setPerfConstraints(PerformanceConstraints::NoLocks);
@@ -194,6 +272,12 @@ void SILFunctionBuilder::addFunctionAttributes(
   if (constant.isNull())
     return;
   auto *decl = constant.getDecl();
+
+  // Don't add section for addressor functions (where decl is a global)
+  if (isa<FuncDecl>(decl)) {
+    if (auto *SA = Attrs.getAttribute<SectionAttr>())
+      F->setSection(SA->Name);
+  }
 
   // Only emit replacements for the objc entry point of objc methods.
   // There is one exception: @_dynamicReplacement(for:) of @objc methods in
@@ -302,14 +386,12 @@ SILFunction *SILFunctionBuilder::getOrCreateFunction(
   }
 
   IsRuntimeAccessible_t isRuntimeAccessible = IsNotRuntimeAccessible;
-  if (constant.isRuntimeAccessibleFunction())
-    isRuntimeAccessible = IsRuntimeAccessible;
 
-  auto *F = SILFunction::create(mod, linkage, name, constantType, nullptr, None,
-                                IsNotBare, IsTrans, IsSer, entryCount, IsDyn,
-                                IsDistributed, isRuntimeAccessible,
-                                IsNotExactSelfClass, IsNotThunk,
-                                constant.getSubclassScope(), inlineStrategy);
+  auto *F = SILFunction::create(
+      mod, linkage, name, constantType, nullptr, llvm::None, IsNotBare, IsTrans,
+      IsSer, entryCount, IsDyn, IsDistributed, isRuntimeAccessible,
+      IsNotExactSelfClass, IsNotThunk, constant.getSubclassScope(),
+      inlineStrategy);
   F->setDebugScope(new (mod) SILDebugScope(loc, F));
 
   if (constant.isGlobal())
@@ -369,7 +451,7 @@ SILFunction *SILFunctionBuilder::getOrCreateSharedFunction(
 
 SILFunction *SILFunctionBuilder::createFunction(
     SILLinkage linkage, StringRef name, CanSILFunctionType loweredType,
-    GenericEnvironment *genericEnv, Optional<SILLocation> loc,
+    GenericEnvironment *genericEnv, llvm::Optional<SILLocation> loc,
     IsBare_t isBareSILFunction, IsTransparent_t isTrans,
     IsSerialized_t isSerialized, IsDynamicallyReplaceable_t isDynamic,
     IsDistributed_t isDistributed, IsRuntimeAccessible_t isRuntimeAccessible,

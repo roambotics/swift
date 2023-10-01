@@ -215,6 +215,50 @@ bool FrontendOptions::doesActionPerformEndOfPipelineActions(ActionType action) {
   llvm_unreachable("Unknown ActionType");
 }
 
+bool FrontendOptions::supportCompilationCaching(ActionType action) {
+  // TODO: need to audit this list to make sure everything marked as true are
+  // all supported and tested.
+  switch (action) {
+  case ActionType::NoneAction:
+  case ActionType::PrintVersion:
+  case ActionType::PrintFeature:
+  case ActionType::DumpPCM:
+  case ActionType::REPL:
+  case ActionType::Parse:
+  case ActionType::DumpParse:
+  case ActionType::DumpInterfaceHash:
+  case ActionType::EmitImportedModules:
+  case ActionType::ScanDependencies:
+  case ActionType::ResolveImports:
+  case ActionType::Typecheck:
+  case ActionType::DumpAST:
+  case ActionType::PrintAST:
+  case ActionType::PrintASTDecl:
+  case ActionType::DumpScopeMaps:
+  case ActionType::DumpTypeRefinementContexts:
+  case ActionType::MergeModules:
+  case ActionType::Immediate:
+  case ActionType::DumpTypeInfo:
+    return false;
+  case ActionType::TypecheckModuleFromInterface:
+  case ActionType::CompileModuleFromInterface:
+  case ActionType::EmitPCH:
+  case ActionType::EmitPCM:
+  case ActionType::EmitAssembly:
+  case ActionType::EmitIRGen:
+  case ActionType::EmitIR:
+  case ActionType::EmitBC:
+  case ActionType::EmitObject:
+  case ActionType::EmitSILGen:
+  case ActionType::EmitSIL:
+  case ActionType::EmitModuleOnly:
+  case ActionType::EmitSIBGen:
+  case ActionType::EmitSIB:
+    return true;
+  }
+  llvm_unreachable("Unknown ActionType");
+}
+
 void FrontendOptions::forAllOutputPaths(
     const InputFile &input, llvm::function_ref<void(StringRef)> fn) const {
   if (RequestedAction != FrontendOptions::ActionType::EmitModuleOnly &&
@@ -661,7 +705,6 @@ bool FrontendOptions::canActionEmitInterface(ActionType action) {
   switch (action) {
   case ActionType::NoneAction:
   case ActionType::Parse:
-  case ActionType::ResolveImports:
   case ActionType::DumpParse:
   case ActionType::DumpInterfaceHash:
   case ActionType::DumpAST:
@@ -683,6 +726,7 @@ bool FrontendOptions::canActionEmitInterface(ActionType action) {
   case ActionType::ScanDependencies:
   case ActionType::PrintFeature:
     return false;
+  case ActionType::ResolveImports:
   case ActionType::Typecheck:
   case ActionType::MergeModules:
   case ActionType::EmitModuleOnly:
@@ -725,7 +769,6 @@ bool FrontendOptions::doesActionProduceOutput(ActionType action) {
   case ActionType::EmitImportedModules:
   case ActionType::MergeModules:
   case ActionType::CompileModuleFromInterface:
-  case ActionType::TypecheckModuleFromInterface:
   case ActionType::DumpTypeInfo:
   case ActionType::EmitPCM:
   case ActionType::DumpPCM:
@@ -733,6 +776,7 @@ bool FrontendOptions::doesActionProduceOutput(ActionType action) {
   case ActionType::PrintFeature:
     return true;
 
+  case ActionType::TypecheckModuleFromInterface:
   case ActionType::NoneAction:
   case ActionType::Immediate:
   case ActionType::REPL:
@@ -756,12 +800,12 @@ bool FrontendOptions::doesActionProduceTextualOutput(ActionType action) {
   case ActionType::Immediate:
   case ActionType::REPL:
   case ActionType::EmitPCM:
+  case ActionType::TypecheckModuleFromInterface:
     return false;
 
   case ActionType::Parse:
   case ActionType::ResolveImports:
   case ActionType::Typecheck:
-  case ActionType::TypecheckModuleFromInterface:
   case ActionType::DumpParse:
   case ActionType::DumpInterfaceHash:
   case ActionType::DumpAST:
@@ -883,4 +927,9 @@ FrontendOptions::getPrimarySpecificPathsForPrimary(StringRef filename) const {
 bool FrontendOptions::shouldTrackSystemDependencies() const {
   return IntermoduleDependencyTracking ==
          IntermoduleDepTrackingMode::IncludeSystem;
+}
+
+bool FrontendOptions::isTypeCheckAction() const {
+  return RequestedAction == FrontendOptions::ActionType::Typecheck ||
+  RequestedAction == FrontendOptions::ActionType::TypecheckModuleFromInterface;
 }

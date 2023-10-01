@@ -36,11 +36,23 @@ struct NoProjection<T> {
 // expected-note@+1 {{property wrapper type 'NoProjection<String>' does not support initialization from a projected value}}
 func takesNoProjectionWrapper(@NoProjection value: String) {}
 
+// expected-note@+1 {{property wrapper type 'NoProjection<String>' does not support initialization from a projected value}}
+func takesNoProjectionWrapperWithDefault(_: Int? = nil, @NoProjection value: String) {}
+
+// expected-note@+1 {{property wrapper type 'NoProjection<String>' does not support initialization from a projected value}}
+func takesNoProjectionWrapperWithVariadic(_: Int..., @NoProjection value: String) {}
+
 func testNoProjection(message: String) {
   takesNoProjectionWrapper(value: message) // okay
 
   // expected-error@+1 {{cannot use property wrapper projection argument}}
   takesNoProjectionWrapper($value: message)
+
+  // expected-error@+1 {{cannot use property wrapper projection argument}}
+  takesNoProjectionWrapperWithDefault($value: message)
+
+  // expected-error@+1 {{cannot use property wrapper projection argument}}
+  takesNoProjectionWrapperWithVariadic(1, 2, 3, $value: message)
 
   // expected-error@+2 {{cannot use property wrapper projection parameter}}
   // expected-note@+1 {{property wrapper type 'NoProjection<Int>' does not support initialization from a projected value}}
@@ -259,7 +271,7 @@ func testInvalidWrapperInference() {
   S<Int>.test({ $value in })
 
   func testGenericClosure<T>(_ closure: T) {}
-  // expected-error@+1 {{unable to infer type of a closure parameter '$value' in the current context}}
+  // expected-error@+1 {{cannot infer type of closure parameter '$value' without a type annotation}}
   testGenericClosure { $value in }
   testGenericClosure { ($value: ProjectionWrapper<Int>) in } // okay
 

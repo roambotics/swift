@@ -1,8 +1,166 @@
 # CHANGELOG
 
-_**Note:** This is in reverse chronological order, so newer entries are added to the top._
+> **Note**\
+> This is in reverse chronological order, so newer entries are added to the top.
+
+## Swift 5.9.2
+
+* [SE-0407][]:
+
+  Member macros can specify a list of protocols via the `conformances` argument to the macro role. The macro implementation will be provided with those protocols that are listed but have not already been implemented by the type to which the member macro is attached, in the same manner as extension macros.
+
+  ```swift
+  @attached(member, conformances: Decodable, Encodable, names: named(init(from:), encode(to:)))
+  @attached(extension, conformances: Decodable, Encodable, names: named(init(from:), encode(to:)))
+  macro Codable() = #externalMacro(module: "MyMacros", type: "CodableMacro")
+  ```
 
 ## Swift 5.9
+
+### 2023-09-18 (Xcode 15.0)
+
+* [SE-0382][], [SE-0389][], [SE-0394][], [SE-0397][]:
+
+  Swift 5.9 includes a new macro system that can be used to eliminate boilerplate and provide new forms of expressive APIs. Macros are declared with the new `macro` introducer:
+
+  ```swift
+  @freestanding(expression)
+  macro assert(_ condition: Bool) = #externalMacro(module: "PowerAssertMacros", type: "AssertMacro")
+  ```
+
+  Macros have parameter and result types, like functions, but are defined as separate programs that operate on syntax trees (using [swift-syntax][]) and produce new syntax trees that are incorporated into the program. Freestanding macros, indicated with the `@freestanding` attribute, are expanded in source code with a leading `#`:
+
+  ```swift
+  #assert(x + y == z) // expands to check the result of x + y == z and report failure if it's false
+  ```
+
+  Macros can also be marked as `@attached`, in which case they will be meaning that they will be expanded using custom attribute syntax. For example:
+
+  ```swift
+  @attached(peer, names: overloaded)
+  macro AddCompletionHandler() = #externalMacro(
+    module: "ConcurrencyHelperMacros",
+    type: "AddCompletionHandlerMacro"
+  )
+  
+  @AddCompletionHandler
+  func fetchAvatar(from url: URL) throws -> Image { ... }
+  
+  // expands to...
+  func fetchAvatar(from url: URL, completionHandler: @escaping (Result<Image, Error>) -> Void) {
+    Task.detached {
+      do {
+        let result = try await fetchAvatar(from: url)
+        completionHandler(.success(result))
+      } catch {
+        completionHandler(.failure(error))
+      }
+    }
+  }
+  ```
+
+  Macros are implemented in separate programs, which are executed by the Swift compiler. The Swift Package Manager's manifest provides a new `macro` target type to describe macros:
+
+  ```swift
+  import PackageDescription
+  import CompilerPluginSupport
+  
+  let package = Package(
+      name: "ConcurrencyHelpers",
+      dependencies: [
+          .package(url: "https://github.com/apple/swift-syntax", from: "509.0.0"),
+      ],
+      targets: [
+          .macro(name: "ConcurrencyHelperMacros",
+                 dependencies: [
+                     .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+                     .product(name: "SwiftCompilerPlugin", package: "swift-syntax")
+                 ]),
+          .target(name: "ConcurrencyHelpers", dependencies: ["ConcurrencyHelperMacros"]),
+          .testTarget(name: "ConcurrencyHelperMacroTests", dependencies: ["ConcurrencyHelperMacros"]),
+      ]
+  )
+  ```
+
+* [SE-0380][]:
+
+  `if` and `switch` statements may now be used as expressions to:
+
+  * Return values from functions, properties, and closures (either with
+    implicit or explicit `return`)
+  * Throw errors using `throw`
+  * Assign values to variables
+  * Declare variables
+
+  Each branch of the `if` or `switch` must be a single expression, the value
+  of which becomes the value of the overall expression when that branch is
+  chosen.
+
+  ```swift
+  let bullet =
+    if isRoot && (count == 0 || !willExpand) { "" }
+    else if count == 0 { "- " }
+    else if maxDepth <= 0 { "▹ " }
+    else { "▿ " }
+  ```
+
+  ```swift
+  public static func width(_ x: Unicode.Scalar) -> Int {
+    switch x.value {
+      case 0..<0x80: 1
+      case 0x80..<0x0800: 2
+      case 0x0800..<0x1_0000: 3
+      default: 4
+    }
+  }
+  ```
+
+* [#64927][]:
+
+  Swift 5.9 introduces warnings that catch conversions from an inout
+  argument in the caller to an `UnsafeRawPointer` in the callee
+  whenever the original type contains an object reference.
+
+  ```swift
+  func inspectString(string: inout String) {
+    readBytes(&string)
+    // warning: forming an 'UnsafeRawPointer' to an inout variable of type String
+    // exposes the internal representation rather than the string contents.
+  }
+  ```
+
+  ```swift
+  func inspectData(data: inout Data) {
+    readBytes(&data)
+    // warning: forming an 'UnsafeRawPointer' to a variable of type 'T';
+    // this is likely incorrect because 'T' may contain an object reference.
+  }
+  ```
+
+  Please see the "Workarounds for common cases" section link in github
+  issue #64927.
+
+* Marking stored properties as unavailable with `@available` has been banned,
+  closing an unintentional soundness hole that had allowed arbitrary
+  unavailable code to run and unavailable type metadata to be used at runtime:
+  
+  ```swift
+  @available(*, unavailable)
+  struct Unavailable {
+    init() {
+      print("Unavailable.init()")
+    }
+  }
+
+  struct S {
+    @available(*, unavailable)
+    var x = Unavailable()
+  }
+
+  _ = S() // prints "Unavailable.init()"
+  ```
+  
+  Marking `deinit` as unavailable has also been banned for similar reasons.
 
 * [SE-0366][]:
 
@@ -31,7 +189,7 @@ _**Note:** This is in reverse chronological order, so newer entries are added to
   access to a value provided by the caller, or by `consuming` a value that the
   callee is allowed to take ownership of:
 
-  ```
+  ```swift
   struct HealthyFoods {
     var values: [String] = []
 
@@ -44,6 +202,8 @@ _**Note:** This is in reverse chronological order, so newer entries are added to
   ```
 
 ## Swift 5.8
+
+### 2023-03-30 (Xcode 14.3)
 
 * [SE-0376][]:
 
@@ -269,10 +429,10 @@ _**Note:** This is in reverse chronological order, so newer entries are added to
   New types representing time and clocks were introduced. This includes a protocol `Clock` defining clocks which allow for defining a concept of now and a way to wake up after a given instant. Additionally a new protocol `InstantProtocol` for defining instants in time was added. Furthermore a new protocol `DurationProtocol` was added to define an elapsed duration between two given `InstantProtocol` types. Most commonly the `Clock` types for general use are the `SuspendingClock` and `ContinuousClock` which represent the most fundamental clocks for the system. The `SuspendingClock` type does not progress while the machine is suspended whereas the `ContinuousClock` progresses no matter the state of the machine. 
 
   ```swift
-    func delayedHello() async throws {
-      try await Task.sleep(until: .now + .milliseconds(123), clock: .continuous)
-      print("hello delayed world")
-    }
+  func delayedHello() async throws {
+    try await Task.sleep(until: .now + .milliseconds(123), clock: .continuous)
+    print("hello delayed world")
+  }
   ```
 
   `Clock` also has methods to measure the elapsed duration of the execution of work. In the case of the `SuspendingClock` and `ContinuousClock` this measures with high resolution and is suitable for benchmarks.
@@ -294,17 +454,17 @@ _**Note:** This is in reverse chronological order, so newer entries are added to
   `any` type having the same constraints as the associated type. For example:
 
   ```swift
-    protocol Surface {...}
-    
-    protocol Solid {
-      associatedtype SurfaceType: Surface
-      func boundary() -> SurfaceType
-    }
-    
-    let solid: any Solid = ...
-    
-    // Type of 'boundary' is 'any Surface'
-    let boundary = solid.boundary()
+  protocol Surface {...}
+  
+  protocol Solid {
+    associatedtype SurfaceType: Surface
+    func boundary() -> SurfaceType
+  }
+  
+  let solid: any Solid = ...
+  
+  // Type of 'boundary' is 'any Surface'
+  let boundary = solid.boundary()
   ```
 
   Protocol methods that take an associated type or `Self` cannot be used with `any`,
@@ -317,21 +477,21 @@ _**Note:** This is in reverse chronological order, so newer entries are added to
   Protocols can now declare a list of one or more _primary associated types_, which enable writing same-type requirements on those associated types using angle bracket syntax:
 
   ```swift
-    protocol Graph<Vertex, Edge> {
-      associatedtype Vertex
-      associatedtype Edge
-    }
+  protocol Graph<Vertex, Edge> {
+    associatedtype Vertex
+    associatedtype Edge
+  }
   ```
 
   You can now write a protocol name followed by type arguments in angle brackets, like
   `Graph<Int, String>`, anywhere that a protocol conformance requirement may appear:
 
   ```swift
-    func shortestPath<V, E>(_: some Graph<V, E>, from: V, to: V) -> [E]
+  func shortestPath<V, E>(_: some Graph<V, E>, from: V, to: V) -> [E]
 
-    extension Graph<Int, String> {...}
+  extension Graph<Int, String> {...}
 
-    func build() -> some Graph<Int, String> {}
+  func build() -> some Graph<Int, String> {}
   ```
 
   A protocol name followed by angle brackets is shorthand for a conformance requirement,
@@ -339,10 +499,10 @@ _**Note:** This is in reverse chronological order, so newer entries are added to
   The first two examples above are equivalent to the following:
 
   ```swift
-    func shortestPath<V, E, G>(_: G, from: V, to: V) -> [E]
-      where G: Graph, G.Vertex == V, G.Edge == E
+  func shortestPath<V, E, G>(_: G, from: V, to: V) -> [E]
+    where G: Graph, G.Vertex == V, G.Edge == E
 
-    extension Graph where Vertex == Int, Edge == String {...}
+  extension Graph where Vertex == Int, Edge == String {...}
   ```
 
   The `build()` function returning `some Graph<Int, String>` can't be written using a
@@ -9682,7 +9842,13 @@ using the `.dynamicType` member to retrieve the type of an expression should mig
 [SE-0370]: <https://github.com/apple/swift-evolution/blob/main/proposals/0370-pointer-family-initialization-improvements.md>
 [SE-0376]: <https://github.com/apple/swift-evolution/blob/main/proposals/0376-function-back-deployment.md>
 [SE-0377]: <https://github.com/apple/swift-evolution/blob/main/proposals/0377-parameter-ownership-modifiers.md>
-
+[SE-0380]: <https://github.com/apple/swift-evolution/blob/main/proposals/0380-if-switch-expressions.md>
+[SE-0382]: https://github.com/apple/swift-evolution/blob/main/proposals/0382-expression-macros.md
+[SE-0389]: https://github.com/apple/swift-evolution/blob/main/proposals/0389-attached-macros.md
+[SE-0394]: https://github.com/apple/swift-evolution/blob/main/proposals/0394-swiftpm-expression-macros.md
+[SE-0397]: https://github.com/apple/swift-evolution/blob/main/proposals/0397-freestanding-declaration-macros.md
+[SE-0407]: https://github.com/apple/swift-evolution/blob/main/proposals/0407-member-macro-conformances.md
+[#64927]: <https://github.com/apple/swift/issues/64927>
 [#42697]: <https://github.com/apple/swift/issues/42697>
 [#42728]: <https://github.com/apple/swift/issues/42728>
 [#43036]: <https://github.com/apple/swift/issues/43036>
@@ -9723,3 +9889,4 @@ using the `.dynamicType` member to retrieve the type of an expression should mig
 [#57081]: <https://github.com/apple/swift/issues/57081>
 [#57225]: <https://github.com/apple/swift/issues/57225>
 [#56139]: <https://github.com/apple/swift/issues/56139>
+[swift-syntax]: https://github.com/apple/swift-syntax

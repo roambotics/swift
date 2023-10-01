@@ -43,7 +43,13 @@ extension String {
   /// Retrieve the base name of a string that represents a path, removing the
   /// directory.
   var basename: String {
-    guard let lastSlash = lastIndex(of: "/") else {
+    guard let lastSlash = lastIndex(where: {
+#if os(iOS) || os(macOS) || os(tvOS) || os(watchOS) || os(Android) || os(Linux)
+        ["/"].contains($0)
+#else
+        ["/", "\\"].contains($0)
+#endif
+    }) else {
       return self
     }
 
@@ -88,7 +94,7 @@ extension SourceManager.MacroExpansionContext: MacroExpansionContext {
     of node: Node,
     at position: PositionInSyntaxNode,
     filePathMode: SourceLocationFilePathMode
-  ) -> SourceLocation? {
+  ) -> AbstractSourceLocation? {
     guard let (sourceFile, rootPosition) = sourceManager.rootSourceFile(of: node),
         let exportedSourceFile =
             sourceManager.exportedSourceFilesBySyntax[sourceFile]?.pointee
@@ -127,6 +133,6 @@ extension SourceManager.MacroExpansionContext: MacroExpansionContext {
 
     // Do the location lookup.
     let converter = SourceLocationConverter(file: fileName, tree: sourceFile)
-    return converter.location(for: rootPosition.advanced(by: offsetWithinSyntaxNode))
+    return AbstractSourceLocation(converter.location(for: rootPosition.advanced(by: offsetWithinSyntaxNode)))
   }
 }

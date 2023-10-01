@@ -60,6 +60,7 @@ class alignas(1 << TypeReprAlignInBits) TypeRepr
   void operator=(const TypeRepr&) = delete;
 
 protected:
+  // clang-format off
   union { uint64_t OpaqueBits;
 
   SWIFT_INLINE_BITFIELD_BASE(TypeRepr, bitmax(NumTypeReprKindBits,8)+1+1,
@@ -108,6 +109,7 @@ protected:
   );
 
   } Bits;
+  // clang-format on
 
   TypeRepr(TypeReprKind K) {
     Bits.OpaqueBits = 0;
@@ -125,7 +127,7 @@ public:
   }
 
   /// Is this type representation a protocol?
-  bool isProtocol(DeclContext *dc);
+  bool isProtocolOrProtocolComposition(DeclContext *dc);
 
   /// Is this type representation known to be invalid?
   bool isInvalid() const { return Bits.TypeRepr.Invalid; }
@@ -187,6 +189,7 @@ public:
   void print(raw_ostream &OS, const PrintOptions &Opts = PrintOptions()) const;
   void print(ASTPrinter &Printer, const PrintOptions &Opts) const;
   SWIFT_DEBUG_DUMP;
+  void dump(raw_ostream &OS, unsigned indent = 0) const;
 };
 
 /// A TypeRepr for a type with a syntax error.  Can be used both as a
@@ -496,13 +499,16 @@ class FunctionTypeRepr : public TypeRepr {
 
   TupleTypeRepr *ArgsTy;
   TypeRepr *RetTy;
+  TypeRepr *ThrownTy;
   SourceLoc AsyncLoc;
   SourceLoc ThrowsLoc;
   SourceLoc ArrowLoc;
 
 public:
   FunctionTypeRepr(GenericParamList *genericParams, TupleTypeRepr *argsTy,
-                   SourceLoc asyncLoc, SourceLoc throwsLoc, SourceLoc arrowLoc,
+                   SourceLoc asyncLoc, SourceLoc throwsLoc, 
+                   TypeRepr *thrownTy,
+                   SourceLoc arrowLoc,
                    TypeRepr *retTy,
                    GenericParamList *patternGenericParams = nullptr,
                    ArrayRef<TypeRepr *> patternSubs = {},
@@ -512,7 +518,7 @@ public:
       InvocationSubs(invocationSubs),
       PatternGenericParams(patternGenericParams),
       PatternSubs(patternSubs),
-      ArgsTy(argsTy), RetTy(retTy),
+      ArgsTy(argsTy), RetTy(retTy), ThrownTy(thrownTy),
       AsyncLoc(asyncLoc), ThrowsLoc(throwsLoc), ArrowLoc(arrowLoc) {
   }
 
@@ -542,6 +548,7 @@ public:
   }
 
   TupleTypeRepr *getArgsTypeRepr() const { return ArgsTy; }
+  TypeRepr *getThrownTypeRepr() const { return ThrownTy; }
   TypeRepr *getResultTypeRepr() const { return RetTy; }
   bool isAsync() const { return AsyncLoc.isValid(); }
   bool isThrowing() const { return ThrowsLoc.isValid(); }
@@ -1174,6 +1181,33 @@ private:
   friend class TypeRepr;
 };
 
+/// A TypeRepr for uses of 'Self' in the type of a declaration.
+class SelfTypeRepr : public TypeRepr {
+  Type Ty;
+  SourceLoc Loc;
+
+public:
+  SelfTypeRepr(Type Ty, SourceLoc Loc)
+    : TypeRepr(TypeReprKind::Self), Ty(Ty), Loc(Loc) {}
+
+  /// Retrieve the location.
+  SourceLoc getLoc() const { return Loc; }
+
+  /// Retrieve the fixed type.
+  Type getType() const { return Ty; }
+
+  static bool classof(const TypeRepr *T) {
+    return T->getKind() == TypeReprKind::Self;
+  }
+  static bool classof(const SelfTypeRepr *T) { return true; }
+
+private:
+  SourceLoc getStartLocImpl() const { return Loc; }
+  SourceLoc getEndLocImpl() const { return Loc; }
+  void printImpl(ASTPrinter &Printer, const PrintOptions &Opts) const;
+  friend class TypeRepr;
+};
+
 class SILBoxTypeReprField {
   SourceLoc VarOrLetLoc;
   llvm::PointerIntPair<TypeRepr*, 1, bool> FieldTypeAndMutable;
@@ -1287,6 +1321,34 @@ private:
   SourceLoc getStartLocImpl() const { return AnyLoc; }
   SourceLoc getEndLocImpl() const { return Constraint->getEndLoc(); }
   SourceLoc getLocImpl() const { return AnyLoc; }
+  void printImpl(ASTPrinter &Printer, const PrintOptions &Opts) const;
+  friend class TypeRepr;
+};
+
+/// A type repr represeting the inverse of some constraint. For example,
+///    ~Copyable
+/// where `Copyable` is the constraint type.
+class InverseTypeRepr : public TypeRepr {
+  TypeRepr *Constraint;
+  SourceLoc TildeLoc;
+
+public:
+  InverseTypeRepr(SourceLoc tildeLoc, TypeRepr *constraint)
+      : TypeRepr(TypeReprKind::Inverse), Constraint(constraint),
+        TildeLoc(tildeLoc) {}
+
+  TypeRepr *getConstraint() const { return Constraint; }
+  SourceLoc getTildeLoc() const { return TildeLoc; }
+
+  static bool classof(const TypeRepr *T) {
+    return T->getKind() == TypeReprKind::Inverse;
+  }
+  static bool classof(const InverseTypeRepr *T) { return true; }
+
+private:
+  SourceLoc getStartLocImpl() const { return TildeLoc; }
+  SourceLoc getEndLocImpl() const { return Constraint->getEndLoc(); }
+  SourceLoc getLocImpl() const { return TildeLoc; }
   void printImpl(ASTPrinter &Printer, const PrintOptions &Opts) const;
   friend class TypeRepr;
 };
@@ -1429,11 +1491,13 @@ inline bool TypeRepr::isSimple() const {
   case TypeReprKind::Dictionary:
   case TypeReprKind::Optional:
   case TypeReprKind::ImplicitlyUnwrappedOptional:
+  case TypeReprKind::Inverse:
   case TypeReprKind::Vararg:
   case TypeReprKind::PackExpansion:
   case TypeReprKind::Pack:
   case TypeReprKind::Tuple:
   case TypeReprKind::Fixed:
+  case TypeReprKind::Self:
   case TypeReprKind::Array:
   case TypeReprKind::SILBox:
   case TypeReprKind::Isolated:

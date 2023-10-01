@@ -21,20 +21,22 @@
 public struct LibType {}
 
 // RUN: %target-swift-frontend -typecheck %t/OneFile_AllExplicit.swift -I %t \
-// RUN:   -enable-experimental-feature AccessLevelOnImport -verify
+// RUN:   -enable-experimental-feature AccessLevelOnImport -verify \
+// RUN:   -package-name package
 //--- OneFile_AllExplicit.swift
-public import Lib
-package import Lib
+public import Lib // expected-warning {{public import of 'Lib' was not used in public declarations or inlinable code}}
+package import Lib // expected-warning {{package import of 'Lib' was not used in package declarations}}
 internal import Lib
 fileprivate import Lib
 private import Lib
 
 // RUN: %target-swift-frontend -typecheck %t/ManyFiles_AllExplicit_File?.swift -I %t \
-// RUN:   -enable-experimental-feature AccessLevelOnImport -verify
+// RUN:   -enable-experimental-feature AccessLevelOnImport -verify \
+// RUN:   -package-name package
 //--- ManyFiles_AllExplicit_FileA.swift
-public import Lib
+public import Lib // expected-warning {{public import of 'Lib' was not used in public declarations or inlinable code}}
 //--- ManyFiles_AllExplicit_FileB.swift
-package import Lib
+package import Lib // expected-warning {{package import of 'Lib' was not used in package declarations}}
 //--- ManyFiles_AllExplicit_FileC.swift
 internal import Lib
 //--- ManyFiles_AllExplicit_FileD.swift

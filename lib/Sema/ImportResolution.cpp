@@ -138,6 +138,7 @@ private:
   void validateResilience(NullablePtr<ModuleDecl> topLevelModule,
                           SourceFile &SF);
   void validateAllowableClient(ModuleDecl *topLevelModule, SourceFile &SF);
+  void validateInterfaceWithPackageName(ModuleDecl *topLevelModule, SourceFile &SF);
 
   /// Diagnoses an inability to import \p modulePath in this situation and, if
   /// \p attrs is provided and has an \p attrKind, invalidates the attribute and
@@ -324,6 +325,15 @@ void ImportResolver::bindImport(UnboundImport &&I) {
     return;
   }
 
+  // Load more dependencies for testable imports.
+  if (I.import.options.contains(ImportFlags::Testable)) {
+    SourceLoc diagLoc;
+    if (ID) diagLoc = ID.get()->getStartLoc();
+
+    for (auto file: M->getFiles())
+      file->loadDependenciesForTestable(diagLoc);
+  }
+
   auto topLevelModule = I.getTopLevelModule(M, SF);
 
   I.validateOptions(topLevelModule, SF);
@@ -365,11 +375,13 @@ ImportResolver::getModule(ImportPath::Module modulePath) {
 
   // The Builtin module cannot be explicitly imported unless:
   // 1. We're in a .sil file
-  // 2. '-enable-builtin-module' was passed.
+  // 2. '-enable-builtin-module'/'-enable-experimental-feature BuiltinModule'
+  //    was passed.
   //
   // FIXME: Eventually, it would be nice to separate '-parse-stdlib' from
   // implicitly importing Builtin, but we're not there yet.
-  if (SF.Kind == SourceFileKind::SIL || ctx.LangOpts.EnableBuiltinModule) {
+  if (SF.Kind == SourceFileKind::SIL ||
+      ctx.LangOpts.hasFeature(Feature::BuiltinModule)) {
     if (moduleID.Item == ctx.TheBuiltinModule->getName()) {
       return ctx.TheBuiltinModule;
     }
@@ -558,7 +570,7 @@ UnboundImport::UnboundImport(ImportDecl *ID)
 
   import.accessLevel = ID->getAccessLevel();
   if (auto attr = ID->getAttrs().getAttribute<AccessControlAttr>()) {
-    import.accessLevelLoc = attr->getLocation();
+    import.accessLevelRange = attr->getLocation();
   }
 
   if (ID->getAttrs().hasAttribute<SPIOnlyAttr>())
@@ -641,8 +653,8 @@ void UnboundImport::validateOptions(NullablePtr<ModuleDecl> topLevelModule,
     validateTestable(top);
     validatePrivate(top);
     validateAllowableClient(top, SF);
+    validateInterfaceWithPackageName(top, SF);
   }
-
   validateResilience(topLevelModule, SF);
 }
 
@@ -745,27 +757,60 @@ void UnboundImport::validateAllowableClient(ModuleDecl *importee,
   }
 }
 
+void UnboundImport::validateInterfaceWithPackageName(ModuleDecl *topLevelModule,
+                                        SourceFile &SF) {
+  assert(topLevelModule);
+
+  // If current source file is interface, don't throw an error
+  if (SF.Kind == SourceFileKind::Interface)
+    return;
+
+  // If source file is .swift or non-interface, show diags when importing an interface file
+  ASTContext &ctx = topLevelModule->getASTContext();
+  if (!topLevelModule->getPackageName().empty() &&
+      topLevelModule->getPackageName().str() == ctx.LangOpts.PackageName &&
+      topLevelModule->isBuiltFromInterface()) {
+      ctx.Diags.diagnose(import.module.getModulePath().front().Loc,
+                         diag::in_package_module_not_compiled_from_source,
+                         topLevelModule->getBaseIdentifier(),
+                         ctx.LangOpts.PackageName,
+                         topLevelModule->getModuleSourceFilename()
+                         );
+  }
+}
+
 void UnboundImport::validateResilience(NullablePtr<ModuleDecl> topLevelModule,
                                        SourceFile &SF) {
-  if (import.options.contains(ImportFlags::ImplementationOnly) ||
-      import.accessLevel < AccessLevel::Public)
-    return;
+  ASTContext &ctx = SF.getASTContext();
 
   // Per getTopLevelModule(), we'll only get nullptr here for non-Swift modules,
   // so these two really mean the same thing.
   if (!topLevelModule || topLevelModule.get()->isNonSwiftModule())
     return;
 
-  ASTContext &ctx = SF.getASTContext();
-
   // If the module we're validating is the builtin one, then just return because
   // this module is essentially a header only import and does not concern
   // itself with resiliency. This can occur when one has passed
   // '-enable-builtin-module' and is explicitly importing the Builtin module in
   // their sources.
-  if (topLevelModule.get() == ctx.TheBuiltinModule) {
+  if (topLevelModule.get() == ctx.TheBuiltinModule)
     return;
+
+  // @_implementationOnly is only supported when used from modules built with
+  // library-evolution. Otherwise it can lead to runtime crashes from a lack
+  // of memory layout information when building clients unaware of the
+  // dependency. The missing information is provided at run time by resilient
+  // modules.
+  if (import.options.contains(ImportFlags::ImplementationOnly) &&
+      !SF.getParentModule()->isResilient() && topLevelModule) {
+    ctx.Diags.diagnose(import.importLoc,
+                       diag::implementation_only_requires_library_evolution,
+                       SF.getParentModule()->getName());
   }
+
+  if (import.options.contains(ImportFlags::ImplementationOnly) ||
+      import.accessLevel < AccessLevel::Public)
+    return;
 
   if (!SF.getParentModule()->isResilient() ||
       topLevelModule.get()->isResilient())
@@ -777,9 +822,9 @@ void UnboundImport::validateResilience(NullablePtr<ModuleDecl> topLevelModule,
                                      SF.getParentModule()->getName());
 
   if (ctx.LangOpts.hasFeature(Feature::AccessLevelOnImport)) {
-    SourceLoc attrLoc = import.accessLevelLoc;
-    if (attrLoc.isValid())
-      inFlight.fixItReplace(attrLoc, "internal");
+    SourceRange attrRange = import.accessLevelRange;
+    if (attrRange.isValid())
+      inFlight.fixItReplace(attrRange, "internal");
     else
       inFlight.fixItInsert(import.importLoc, "internal ");
   } else {
@@ -1101,7 +1146,7 @@ ScopedImportLookupRequest::evaluate(Evaluator &evaluator,
   lookupInModule(topLevelModule, accessPath.front().Item, decls,
                  NLKind::QualifiedLookup, ResolutionKind::Overloadable,
                  import->getDeclContext()->getModuleScopeContext(),
-                 NL_QualifiedDefault);
+                 import->getLoc(), NL_QualifiedDefault);
 
   auto importLoc = import->getLoc();
   if (decls.empty()) {
@@ -1112,7 +1157,7 @@ ScopedImportLookupRequest::evaluate(Evaluator &evaluator,
     return ArrayRef<ValueDecl *>();
   }
 
-  Optional<ImportKind> actualKind = ImportDecl::findBestImportKind(decls);
+  llvm::Optional<ImportKind> actualKind = ImportDecl::findBestImportKind(decls);
   if (!actualKind.has_value()) {
     // FIXME: print entire module name?
     ctx.Diags.diagnose(importLoc, diag::ambiguous_decl_in_module,
@@ -1121,7 +1166,7 @@ ScopedImportLookupRequest::evaluate(Evaluator &evaluator,
       ctx.Diags.diagnose(next, diag::found_candidate);
 
   } else if (!isCompatibleImportKind(importKind, *actualKind)) {
-    Optional<InFlightDiagnostic> emittedDiag;
+    llvm::Optional<InFlightDiagnostic> emittedDiag;
     if (*actualKind == ImportKind::Type && isNominalImportKind(importKind)) {
       assert(decls.size() == 1 &&
              "if we start suggesting ImportKind::Type for, e.g., a mix of "
@@ -1147,7 +1192,7 @@ ScopedImportLookupRequest::evaluate(Evaluator &evaluator,
 
     if (decls.size() == 1)
       ctx.Diags.diagnose(decls.front(), diag::decl_declared_here,
-                         decls.front()->getName());
+                         decls.front());
   }
   return ctx.AllocateCopy(decls);
 }

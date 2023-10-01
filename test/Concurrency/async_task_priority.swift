@@ -1,4 +1,5 @@
 // RUN: %empty-directory(%t)
+
 // RUN: %target-build-swift %s -Xfrontend -disable-availability-checking -parse-as-library -o %t/async_task_priority
 // RUN: %target-codesign %t/async_task_priority
 // RUN: %target-run %t/async_task_priority
@@ -17,6 +18,9 @@
 // UNSUPPORTED: DARWIN_SIMULATOR=watchos
 // UNSUPPORTED: DARWIN_SIMULATOR=ios
 // UNSUPPORTED: DARWIN_SIMULATOR=tvos
+
+// rdar://107390341 - Temporarily disable for arm64e
+// UNSUPPORTED: CPU=arm64e
 
 import Darwin
 @preconcurrency import Dispatch

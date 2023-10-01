@@ -36,6 +36,7 @@
 #include "swift/IRGen/ValueWitness.h"
 #include "swift/SIL/RuntimeEffect.h"
 #include "swift/SIL/SILFunction.h"
+#include "swift/SIL/SILModule.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
@@ -326,6 +327,10 @@ private:
   /// The queue of lazy witness tables to emit.
   llvm::SmallVector<SILWitnessTable *, 4> LazyWitnessTables;
 
+  llvm::SmallVector<CanType, 4> LazySpecializedClassMetadata;
+
+  llvm::SmallPtrSet<TypeBase *, 4> LazilyEmittedSpecializedClassMetadata;
+
   llvm::SmallVector<ClassDecl *, 4> ClassesForEagerInitialization;
 
   llvm::SmallVector<ClassDecl *, 4> ObjCActorsNeedingSuperclassSwizzle;
@@ -455,6 +460,7 @@ public:
   }
 
   void noteLazyReemissionOfNominalTypeDescriptor(NominalTypeDecl *decl) {
+    assert(decl->isAvailableDuringLowering());
     LazilyReemittedTypeContextDescriptors.insert(decl);
   }
 
@@ -464,10 +470,13 @@ public:
   }
 
   void noteUseOfMetadataAccessor(NominalTypeDecl *decl) {
+    assert(decl->isAvailableDuringLowering());
     if (LazyMetadataAccessors.count(decl) == 0) {
       LazyMetadataAccessors.insert(decl);
     }
   }
+
+  void noteUseOfSpecializedClassMetadata(CanType classType);
 
   void noteUseOfTypeMetadata(NominalTypeDecl *type) {
     noteUseOfTypeGlobals(type, true, RequireMetadata);
@@ -776,8 +785,6 @@ public:
   llvm::PointerType *ContinuationAsyncContextPtrTy;
   llvm::StructType *ClassMetadataBaseOffsetTy;
   llvm::StructType *DifferentiabilityWitnessTy; // { i8*, i8* }
-
-  llvm::StructType *RuntimeDiscoverableAttributeTy; // { i32, i32*, i32 }
 
   llvm::GlobalVariable *TheTrivialPropertyDescriptor = nullptr;
 
@@ -1418,7 +1425,7 @@ private:
   llvm::Constant *ObjCEmptyCachePtr = nullptr;
   llvm::Constant *ObjCEmptyVTablePtr = nullptr;
   llvm::Constant *ObjCISAMaskPtr = nullptr;
-  Optional<llvm::InlineAsm*> ObjCRetainAutoreleasedReturnValueMarker;
+  llvm::Optional<llvm::InlineAsm *> ObjCRetainAutoreleasedReturnValueMarker;
   llvm::DenseMap<Identifier, ClassDecl*> SwiftRootClasses;
   llvm::AttributeList AllocAttrs;
 
@@ -1432,13 +1439,13 @@ private:                                                                       \
   llvm::Constant *Id##Fn = nullptr;
 #include "swift/Runtime/RuntimeFunctions.def"
 
-  Optional<FunctionPointer> FixedClassInitializationFn;
+  llvm::Optional<FunctionPointer> FixedClassInitializationFn;
 
   llvm::Constant *FixLifetimeFn = nullptr;
 
-  mutable Optional<SpareBitVector> HeapPointerSpareBits;
-  
-//--- Generic ---------------------------------------------------------------
+  mutable llvm::Optional<SpareBitVector> HeapPointerSpareBits;
+
+  //--- Generic ---------------------------------------------------------------
 public:
   llvm::Constant *getFixLifetimeFn();
 
@@ -1504,15 +1511,10 @@ public:
   void emitSILWitnessTable(SILWitnessTable *wt);
   void emitSILProperty(SILProperty *prop);
   void emitSILDifferentiabilityWitness(SILDifferentiabilityWitness *dw);
-  void emitSILStaticInitializers();
   llvm::Constant *emitFixedTypeLayout(CanType t, const FixedTypeInfo &ti);
   void emitProtocolConformance(const ConformanceDescription &record);
   void emitNestedTypeDecls(DeclRange members);
   void emitClangDecl(const clang::Decl *decl);
-  /// Emit runtime discoverable attribute metadata section for the given set
-  /// of source files.
-  void
-  emitRuntimeDiscoverableAttributes(TinyPtrVector<FileUnit *> &filesToEmit);
 
   void finalizeClangCodeGen();
   void finishEmitAfterTopLevel();
@@ -1571,10 +1573,9 @@ public:
   llvm::Constant *
   getAddrOfEffectiveValueWitnessTable(CanType concreteType,
                                       ConstantInit init = ConstantInit());
-  Optional<llvm::Function*> getAddrOfIVarInitDestroy(ClassDecl *cd,
-                                                     bool isDestroyer,
-                                                     bool isForeign,
-                                                     ForDefinition_t forDefinition);
+  llvm::Optional<llvm::Function *>
+  getAddrOfIVarInitDestroy(ClassDecl *cd, bool isDestroyer, bool isForeign,
+                           ForDefinition_t forDefinition);
 
   void setVCallVisibility(llvm::GlobalVariable *var,
                           llvm::GlobalObject::VCallVisibility visibility,
@@ -1718,6 +1719,9 @@ public:
   Address getAddrOfSILGlobalVariable(SILGlobalVariable *var,
                                      const TypeInfo &ti,
                                      ForDefinition_t forDefinition);
+  llvm::Constant *getGlobalInitValue(SILGlobalVariable *var,
+                                     llvm::Type *storageType,
+                                     Alignment alignment);
   llvm::Function *getAddrOfWitnessTableLazyAccessFunction(
                                                const NormalProtocolConformance *C,
                                                CanType conformingType,
@@ -1825,6 +1829,9 @@ public:
   llvm::Function *getForeignExceptionHandlingPersonalityFunc();
 
   bool isForeignExceptionHandlingEnabled() const;
+
+  /// Returns true if the given Clang function does not throw exceptions.
+  bool isCxxNoThrow(clang::FunctionDecl *fd, bool defaultNoThrow = false);
 
 private:
   llvm::Constant *

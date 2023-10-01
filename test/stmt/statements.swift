@@ -271,7 +271,7 @@ func RepeatWhileStmt1() {
 }
 
 func RepeatWhileStmt2() {
-  repeat // expected-error {{expected '{' after 'repeat'}} expected-error {{expected 'while' after body of 'repeat' statement}}
+  repeat // expected-error@+1 {{expected expression}}
 }
 
 func RepeatWhileStmt4() {
@@ -302,7 +302,7 @@ func breakContinue(_ x : Int) -> Int {
 Outer:
   for _ in 0...1000 {
 
-  Switch: // expected-error {{switch must be exhaustive}} expected-note{{do you want to add a default clause?}}
+  Switch: // expected-error {{switch must be exhaustive}} expected-note{{add a default clause}}
   switch x {
     case 42: break Outer
     case 97: continue Outer

@@ -138,7 +138,8 @@ irgen::getTypeAndGenericSignatureForManglingOutlineFunction(SILType type) {
 void TypeInfo::callOutlinedCopy(IRGenFunction &IGF, Address dest, Address src,
                                 SILType T, IsInitialization_t isInit,
                                 IsTake_t isTake) const {
-  if (!IGF.IGM.getOptions().UseTypeLayoutValueHandling) {
+  if (!T.hasLocalArchetype() &&
+      !IGF.IGM.getOptions().UseTypeLayoutValueHandling) {
     OutliningMetadataCollector collector(IGF);
     if (T.hasArchetype()) {
       collectMetadataForOutlining(collector, T);
@@ -211,6 +212,10 @@ bool isTypeMetadataForLayoutAccessible(SILModule &M, SILType type);
 
 static bool canUseValueWitnessForValueOp(IRGenModule &IGM, SILType T) {
   if (!IGM.getSILModule().isTypeMetadataForLayoutAccessible(T))
+    return false;
+
+  // No value witness tables in embedded Swift.
+  if (IGM.Context.LangOpts.hasFeature(Feature::Embedded))
     return false;
 
   // It is not a good code size trade-off to instantiate a metatype for
@@ -340,7 +345,8 @@ void TypeInfo::callOutlinedDestroy(IRGenFunction &IGF,
   if (IGF.IGM.getTypeLowering(T).isTrivial())
     return;
 
-  if (!IGF.IGM.getOptions().UseTypeLayoutValueHandling) {
+  if (!T.hasLocalArchetype() &&
+      !IGF.IGM.getOptions().UseTypeLayoutValueHandling) {
     OutliningMetadataCollector collector(IGF);
     if (T.hasArchetype()) {
       collectMetadataForOutlining(collector, T);

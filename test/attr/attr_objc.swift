@@ -364,7 +364,7 @@ protocol subject_containerObjCProtocol1 {
 @objc // access-note-move{{subject_containerObjCProtocol2}}
 protocol subject_containerObjCProtocol2 {
   init(a: Int)
-  // expected-note@-1 {{'init' previously declared here}}
+  // expected-note@-1 {{'init(a:)' previously declared here}}
 
   @objc // FIXME: Access notes can't distinguish between init(a:) overloads
   init(a: Double)
@@ -757,7 +757,7 @@ class infer_instanceFunc1 {
   // expected-note@-2 {{non-'@objc' enums cannot be represented in Objective-C}}
 
   func func12(a: PlainProtocol) {}
-// CHECK-LABEL: {{^}} func func12(a: PlainProtocol) {
+// CHECK-LABEL: {{^}} func func12(a: any PlainProtocol) {
 
   @objc // bad-access-note-move{{infer_instanceFunc1.func12_(a:)}}
   func func12_(a: PlainProtocol) {}
@@ -771,7 +771,7 @@ class infer_instanceFunc1 {
   func func13_(a: Class_ObjC1) {} // no-error
 
   func func14(a: Protocol_Class1) {}
-// CHECK-LABEL: {{^}} func func14(a: Protocol_Class1) {
+// CHECK-LABEL: {{^}} func func14(a: any Protocol_Class1) {
 
   @objc // bad-access-note-move{{infer_instanceFunc1.func14_(a:)}}
   func func14_(a: Protocol_Class1) {}
@@ -779,7 +779,7 @@ class infer_instanceFunc1 {
   // expected-note@-2 {{protocol-constrained type containing protocol 'Protocol_Class1' cannot be represented in Objective-C}}
 
   func func15(a: Protocol_ObjC1) {}
-// CHECK-LABEL: @objc func func15(a: Protocol_ObjC1) {
+// CHECK-LABEL: @objc func func15(a: any Protocol_ObjC1) {
   @objc // access-note-move{{infer_instanceFunc1.func15_(a:)}}
   func func15_(a: Protocol_ObjC1) {} // no-error
 
@@ -940,7 +940,7 @@ class infer_instanceVar1 {
 
   var (instanceVar2, instanceVar3): (Int, PlainProtocol)
   // CHECK: @objc var instanceVar2: Int
-  // CHECK: {{^}}  var instanceVar3: PlainProtocol
+  // CHECK: {{^}}  var instanceVar3: any PlainProtocol
 
   @objc // bad-access-note-move{{infer_instanceVar1.instanceVar1_}}
   var (instanceVar1_, instanceVar2_): (Int, PlainProtocol)
@@ -1093,7 +1093,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{non-'@objc' enums cannot be represented in Objective-C}}
 
   var var_PlainProtocol: PlainProtocol
-// CHECK-LABEL: {{^}}  var var_PlainProtocol: PlainProtocol
+// CHECK-LABEL: {{^}}  var var_PlainProtocol: any PlainProtocol
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_PlainProtocol_}}
   var var_PlainProtocol_: PlainProtocol
@@ -1107,7 +1107,7 @@ class infer_instanceVar1 {
   var var_ClassObjC_: Class_ObjC1 // no-error
 
   var var_ProtocolClass: Protocol_Class1
-// CHECK-LABEL: {{^}}  var var_ProtocolClass: Protocol_Class1
+// CHECK-LABEL: {{^}}  var var_ProtocolClass: any Protocol_Class1
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_ProtocolClass_}}
   var var_ProtocolClass_: Protocol_Class1
@@ -1115,7 +1115,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{protocol-constrained type containing protocol 'Protocol_Class1' cannot be represented in Objective-C}}
 
   var var_ProtocolObjC: Protocol_ObjC1
-// CHECK-LABEL: @objc var var_ProtocolObjC: Protocol_ObjC1
+// CHECK-LABEL: @objc var var_ProtocolObjC: any Protocol_ObjC1
 
   @objc // access-note-move{{infer_instanceVar1.var_ProtocolObjC_}}
   var var_ProtocolObjC_: Protocol_ObjC1 // no-error
@@ -1143,7 +1143,7 @@ class infer_instanceVar1 {
   // access-note-adjust{{@objc}} expected-error@-1 {{property cannot be marked @objc because its type cannot be represented in Objective-C}}
 
   var var_PlainExistentialMetatype: PlainProtocol.Type
-// CHECK-LABEL: {{^}}  var var_PlainExistentialMetatype: PlainProtocol.Type
+// CHECK-LABEL: {{^}}  var var_PlainExistentialMetatype: any PlainProtocol.Type
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_PlainExistentialMetatype_}}
   var var_PlainExistentialMetatype_: PlainProtocol.Type
@@ -1156,20 +1156,20 @@ class infer_instanceVar1 {
   var var_ClassObjCMetatype_: Class_ObjC1.Type // no-error
 
   var var_ProtocolClassMetatype: Protocol_Class1.Type
-// CHECK-LABEL: {{^}}  var var_ProtocolClassMetatype: Protocol_Class1.Type
+// CHECK-LABEL: {{^}}  var var_ProtocolClassMetatype: any Protocol_Class1.Type
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_ProtocolClassMetatype_}}
   var var_ProtocolClassMetatype_: Protocol_Class1.Type
   // access-note-adjust{{@objc}} expected-error@-1 {{property cannot be marked @objc because its type cannot be represented in Objective-C}}
 
   var var_ProtocolObjCMetatype1: Protocol_ObjC1.Type
-// CHECK-LABEL: @objc var var_ProtocolObjCMetatype1: Protocol_ObjC1.Type
+// CHECK-LABEL: @objc var var_ProtocolObjCMetatype1: any Protocol_ObjC1.Type
 
   @objc // access-note-move{{infer_instanceVar1.var_ProtocolObjCMetatype1_}}
   var var_ProtocolObjCMetatype1_: Protocol_ObjC1.Type // no-error
 
   var var_ProtocolObjCMetatype2: Protocol_ObjC2.Type
-// CHECK-LABEL: @objc var var_ProtocolObjCMetatype2: Protocol_ObjC2.Type
+// CHECK-LABEL: @objc var var_ProtocolObjCMetatype2: any Protocol_ObjC2.Type
 
   @objc // access-note-move{{infer_instanceVar1.var_ProtocolObjCMetatype2_}}
   var var_ProtocolObjCMetatype2_: Protocol_ObjC2.Type // no-error
@@ -1177,7 +1177,7 @@ class infer_instanceVar1 {
   var var_AnyObject1: AnyObject
   var var_AnyObject2: AnyObject.Type
 // CHECK-LABEL: @objc var var_AnyObject1: AnyObject
-// CHECK-LABEL: @objc var var_AnyObject2: AnyObject.Type
+// CHECK-LABEL: @objc var var_AnyObject2: any AnyObject.Type
 
   var var_Existential0: Any
 // CHECK-LABEL: @objc var var_Existential0: Any
@@ -1186,7 +1186,7 @@ class infer_instanceVar1 {
   var var_Existential0_: Any
 
   var var_Existential1: PlainProtocol
-  // CHECK-LABEL: {{^}}  var var_Existential1: PlainProtocol
+  // CHECK-LABEL: {{^}}  var var_Existential1: any PlainProtocol
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_Existential1_}}
   var var_Existential1_: PlainProtocol
@@ -1194,7 +1194,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{protocol-constrained type containing protocol 'PlainProtocol' cannot be represented in Objective-C}}
 
   var var_Existential2: PlainProtocol & PlainProtocol
-// CHECK-LABEL: {{^}}  var var_Existential2: PlainProtocol
+// CHECK-LABEL: {{^}}  var var_Existential2: any PlainProtocol
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_Existential2_}}
   var var_Existential2_: PlainProtocol & PlainProtocol
@@ -1202,7 +1202,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{protocol-constrained type containing protocol 'PlainProtocol' cannot be represented in Objective-C}}
 
   var var_Existential3: PlainProtocol & Protocol_Class1
-// CHECK-LABEL: {{^}}  var var_Existential3: PlainProtocol & Protocol_Class1
+// CHECK-LABEL: {{^}}  var var_Existential3: any PlainProtocol & Protocol_Class1
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_Existential3_}}
   var var_Existential3_: PlainProtocol & Protocol_Class1
@@ -1210,7 +1210,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{protocol-constrained type containing protocol 'PlainProtocol' cannot be represented in Objective-C}}
 
   var var_Existential4: PlainProtocol & Protocol_ObjC1
-// CHECK-LABEL: {{^}}  var var_Existential4: PlainProtocol & Protocol_ObjC1
+// CHECK-LABEL: {{^}}  var var_Existential4: any PlainProtocol & Protocol_ObjC1
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_Existential4_}}
   var var_Existential4_: PlainProtocol & Protocol_ObjC1
@@ -1218,7 +1218,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{protocol-constrained type containing protocol 'PlainProtocol' cannot be represented in Objective-C}}
 
   var var_Existential5: Protocol_Class1
-  // CHECK-LABEL: {{^}}  var var_Existential5: Protocol_Class1
+  // CHECK-LABEL: {{^}}  var var_Existential5: any Protocol_Class1
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_Existential5_}}
   var var_Existential5_: Protocol_Class1
@@ -1226,7 +1226,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{protocol-constrained type containing protocol 'Protocol_Class1' cannot be represented in Objective-C}}
 
   var var_Existential6: Protocol_Class1 & Protocol_Class2
-// CHECK-LABEL: {{^}}  var var_Existential6: Protocol_Class1 & Protocol_Class2
+// CHECK-LABEL: {{^}}  var var_Existential6: any Protocol_Class1 & Protocol_Class2
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_Existential6_}}
   var var_Existential6_: Protocol_Class1 & Protocol_Class2
@@ -1234,7 +1234,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{protocol-constrained type containing protocol 'Protocol_Class1' cannot be represented in Objective-C}}
 
   var var_Existential7: Protocol_Class1 & Protocol_ObjC1
-// CHECK-LABEL: {{^}}  var var_Existential7: Protocol_Class1 & Protocol_ObjC1
+// CHECK-LABEL: {{^}}  var var_Existential7: any Protocol_Class1 & Protocol_ObjC1
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_Existential7_}}
   var var_Existential7_: Protocol_Class1 & Protocol_ObjC1
@@ -1242,13 +1242,13 @@ class infer_instanceVar1 {
   // expected-note@-2 {{protocol-constrained type containing protocol 'Protocol_Class1' cannot be represented in Objective-C}}
 
   var var_Existential8: Protocol_ObjC1
-// CHECK-LABEL: @objc var var_Existential8: Protocol_ObjC1
+// CHECK-LABEL: @objc var var_Existential8: any Protocol_ObjC1
 
   @objc // access-note-move{{infer_instanceVar1.var_Existential8_}}
   var var_Existential8_: Protocol_ObjC1 // no-error
 
   var var_Existential9: Protocol_ObjC1 & Protocol_ObjC2
-// CHECK-LABEL: @objc var var_Existential9: Protocol_ObjC1 & Protocol_ObjC2
+// CHECK-LABEL: @objc var var_Existential9: any Protocol_ObjC1 & Protocol_ObjC2
 
   @objc // access-note-move{{infer_instanceVar1.var_Existential9_}}
   var var_Existential9_: Protocol_ObjC1 & Protocol_ObjC2 // no-error
@@ -1264,16 +1264,16 @@ class infer_instanceVar1 {
   var var_ExistentialMetatype7: (Protocol_Class1 & Protocol_ObjC1).Type
   var var_ExistentialMetatype8: Protocol_ObjC1.Type
   var var_ExistentialMetatype9: (Protocol_ObjC1 & Protocol_ObjC2).Type
-// CHECK-LABEL: {{^}}  var var_ExistentialMetatype0: Any.Type
-// CHECK-LABEL: {{^}}  var var_ExistentialMetatype1: PlainProtocol.Type
-// CHECK-LABEL: {{^}}  var var_ExistentialMetatype2: (PlainProtocol).Type
-// CHECK-LABEL: {{^}}  var var_ExistentialMetatype3: (PlainProtocol & Protocol_Class1).Type
-// CHECK-LABEL: {{^}}  var var_ExistentialMetatype4: (PlainProtocol & Protocol_ObjC1).Type
-// CHECK-LABEL: {{^}}  var var_ExistentialMetatype5: (Protocol_Class1).Type
-// CHECK-LABEL: {{^}}  var var_ExistentialMetatype6: (Protocol_Class1 & Protocol_Class2).Type
-// CHECK-LABEL: {{^}}  var var_ExistentialMetatype7: (Protocol_Class1 & Protocol_ObjC1).Type
-// CHECK-LABEL: @objc var var_ExistentialMetatype8: Protocol_ObjC1.Type
-// CHECK-LABEL: @objc var var_ExistentialMetatype9: (Protocol_ObjC1 & Protocol_ObjC2).Type
+// CHECK-LABEL: {{^}}  var var_ExistentialMetatype0: any Any.Type
+// CHECK-LABEL: {{^}}  var var_ExistentialMetatype1: any PlainProtocol.Type
+// CHECK-LABEL: {{^}}  var var_ExistentialMetatype2: any (PlainProtocol).Type
+// CHECK-LABEL: {{^}}  var var_ExistentialMetatype3: any (PlainProtocol & Protocol_Class1).Type
+// CHECK-LABEL: {{^}}  var var_ExistentialMetatype4: any (PlainProtocol & Protocol_ObjC1).Type
+// CHECK-LABEL: {{^}}  var var_ExistentialMetatype5: any (Protocol_Class1).Type
+// CHECK-LABEL: {{^}}  var var_ExistentialMetatype6: any (Protocol_Class1 & Protocol_Class2).Type
+// CHECK-LABEL: {{^}}  var var_ExistentialMetatype7: any (Protocol_Class1 & Protocol_ObjC1).Type
+// CHECK-LABEL: @objc var var_ExistentialMetatype8: any Protocol_ObjC1.Type
+// CHECK-LABEL: @objc var var_ExistentialMetatype9: any (Protocol_ObjC1 & Protocol_ObjC2).Type
 
 
   var var_UnsafeMutablePointer1: UnsafeMutablePointer<Int>
@@ -1302,9 +1302,9 @@ class infer_instanceVar1 {
 // CHECK-LABEL: {{^}}  var var_UnsafeMutablePointer8: UnsafeMutablePointer<PlainClass>
 // CHECK-LABEL: {{^}}  var var_UnsafeMutablePointer9: UnsafeMutablePointer<PlainStruct>
 // CHECK-LABEL: {{^}}  var var_UnsafeMutablePointer10: UnsafeMutablePointer<PlainEnum>
-// CHECK-LABEL: {{^}}  var var_UnsafeMutablePointer11: UnsafeMutablePointer<PlainProtocol>
+// CHECK-LABEL: {{^}}  var var_UnsafeMutablePointer11: UnsafeMutablePointer<any PlainProtocol>
 // CHECK-LABEL: @objc var var_UnsafeMutablePointer12: UnsafeMutablePointer<AnyObject>
-// CHECK-LABEL: var var_UnsafeMutablePointer13: UnsafeMutablePointer<AnyObject.Type>
+// CHECK-LABEL: var var_UnsafeMutablePointer13: UnsafeMutablePointer<any AnyObject.Type>
 // CHECK-LABEL: {{^}} @objc var var_UnsafeMutablePointer100: UnsafeMutableRawPointer
 // CHECK-LABEL: {{^}} @objc var var_UnsafeMutablePointer101: UnsafeMutableRawPointer
 // CHECK-LABEL: {{^}}  var var_UnsafeMutablePointer102: UnsafeMutablePointer<(Int, Int)>
@@ -1325,16 +1325,16 @@ class infer_instanceVar1 {
   var var_Optional14: UnsafeMutablePointer<Class_ObjC1>?
 
 // CHECK-LABEL: @objc @_hasInitialValue var var_Optional1: Class_ObjC1?
-// CHECK-LABEL: @objc @_hasInitialValue var var_Optional2: Protocol_ObjC1?
+// CHECK-LABEL: @objc @_hasInitialValue var var_Optional2: (any Protocol_ObjC1)?
 // CHECK-LABEL: @objc @_hasInitialValue var var_Optional3: Class_ObjC1.Type?
-// CHECK-LABEL: @objc @_hasInitialValue var var_Optional4: Protocol_ObjC1.Type?
+// CHECK-LABEL: @objc @_hasInitialValue var var_Optional4: (any Protocol_ObjC1.Type)?
 // CHECK-LABEL: @objc @_hasInitialValue var var_Optional5: AnyObject?
-// CHECK-LABEL: @objc @_hasInitialValue var var_Optional6: AnyObject.Type?
+// CHECK-LABEL: @objc @_hasInitialValue var var_Optional6: (any AnyObject.Type)?
 // CHECK-LABEL: @objc @_hasInitialValue var var_Optional7: String?
-// CHECK-LABEL: @objc @_hasInitialValue var var_Optional8: Protocol_ObjC1?
-// CHECK-LABEL: @objc @_hasInitialValue var var_Optional9: Protocol_ObjC1.Type?
-// CHECK-LABEL: @objc @_hasInitialValue var var_Optional10: (Protocol_ObjC1 & Protocol_ObjC2)?
-// CHECK-LABEL: @objc @_hasInitialValue var var_Optional11: (Protocol_ObjC1 & Protocol_ObjC2).Type?
+// CHECK-LABEL: @objc @_hasInitialValue var var_Optional8: (any Protocol_ObjC1)?
+// CHECK-LABEL: @objc @_hasInitialValue var var_Optional9: (any Protocol_ObjC1.Type)?
+// CHECK-LABEL: @objc @_hasInitialValue var var_Optional10: (any Protocol_ObjC1 & Protocol_ObjC2)?
+// CHECK-LABEL: @objc @_hasInitialValue var var_Optional11: (any (Protocol_ObjC1 & Protocol_ObjC2).Type)?
 // CHECK-LABEL: @objc @_hasInitialValue var var_Optional12: OpaquePointer?
 // CHECK-LABEL: @objc @_hasInitialValue var var_Optional13: UnsafeMutablePointer<Int>?
 // CHECK-LABEL: @objc @_hasInitialValue var var_Optional14: UnsafeMutablePointer<Class_ObjC1>?
@@ -1351,14 +1351,14 @@ class infer_instanceVar1 {
   var var_ImplicitlyUnwrappedOptional9: (Protocol_ObjC1 & Protocol_ObjC2)!
 
 // CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional1: Class_ObjC1!
-// CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional2: Protocol_ObjC1!
+// CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional2: (any Protocol_ObjC1)!
 // CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional3: Class_ObjC1.Type!
-// CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional4: Protocol_ObjC1.Type!
+// CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional4: (any Protocol_ObjC1.Type)!
 // CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional5: AnyObject!
-// CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional6: AnyObject.Type!
+// CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional6: (any AnyObject.Type)!
 // CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional7: String!
-// CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional8: Protocol_ObjC1!
-// CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional9: (Protocol_ObjC1 & Protocol_ObjC2)!
+// CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional8: (any Protocol_ObjC1)!
+// CHECK-LABEL: @objc @_hasInitialValue var var_ImplicitlyUnwrappedOptional9: (any Protocol_ObjC1 & Protocol_ObjC2)!
 
   var var_Optional_fail1: PlainClass?
   var var_Optional_fail2: PlainClass.Type?
@@ -1400,10 +1400,10 @@ class infer_instanceVar1 {
   weak var var_Weak8: (Protocol_ObjC1 & Protocol_ObjC2)?
 
 // CHECK-LABEL: @objc @_hasInitialValue weak var var_Weak1: @sil_weak Class_ObjC1?
-// CHECK-LABEL: @objc @_hasInitialValue weak var var_Weak2: @sil_weak Protocol_ObjC1?
+// CHECK-LABEL: @objc @_hasInitialValue weak var var_Weak2: @sil_weak (any Protocol_ObjC1)?
 // CHECK-LABEL: @objc @_hasInitialValue weak var var_Weak5: @sil_weak AnyObject?
-// CHECK-LABEL: @objc @_hasInitialValue weak var var_Weak7: @sil_weak Protocol_ObjC1?
-// CHECK-LABEL: @objc @_hasInitialValue weak var var_Weak8: @sil_weak (Protocol_ObjC1 & Protocol_ObjC2)?
+// CHECK-LABEL: @objc @_hasInitialValue weak var var_Weak7: @sil_weak (any Protocol_ObjC1)?
+// CHECK-LABEL: @objc @_hasInitialValue weak var var_Weak8: @sil_weak (any Protocol_ObjC1 & Protocol_ObjC2)?
 
   weak var var_Weak_fail1: PlainClass?
   weak var var_Weak_bad2: PlainStruct?
@@ -1427,10 +1427,10 @@ class infer_instanceVar1 {
   unowned var var_Unowned8: Protocol_ObjC1 & Protocol_ObjC2
 
 // CHECK-LABEL: @objc unowned var var_Unowned1: @sil_unowned Class_ObjC1
-// CHECK-LABEL: @objc unowned var var_Unowned2: @sil_unowned Protocol_ObjC1
+// CHECK-LABEL: @objc unowned var var_Unowned2: @sil_unowned any Protocol_ObjC1
 // CHECK-LABEL: @objc unowned var var_Unowned5: @sil_unowned AnyObject
-// CHECK-LABEL: @objc unowned var var_Unowned7: @sil_unowned Protocol_ObjC1
-// CHECK-LABEL: @objc unowned var var_Unowned8: @sil_unowned Protocol_ObjC1 & Protocol_ObjC2
+// CHECK-LABEL: @objc unowned var var_Unowned7: @sil_unowned any Protocol_ObjC1
+// CHECK-LABEL: @objc unowned var var_Unowned8: @sil_unowned any Protocol_ObjC1 & Protocol_ObjC2
 
 
   unowned var var_Unowned_fail1: PlainClass
@@ -1477,16 +1477,16 @@ class infer_instanceVar1 {
 // CHECK-LABEL: {{^}}  var var_FunctionType11: (PlainEnum) -> ()
 
   var var_FunctionType12: (PlainProtocol) -> ()
-// CHECK-LABEL: {{^}}  var var_FunctionType12: (PlainProtocol) -> ()
+// CHECK-LABEL: {{^}}  var var_FunctionType12: (any PlainProtocol) -> ()
 
   var var_FunctionType13: (Class_ObjC1) -> ()
 // CHECK-LABEL: {{^}}  @objc var var_FunctionType13: (Class_ObjC1) -> ()
 
   var var_FunctionType14: (Protocol_Class1) -> ()
-// CHECK-LABEL: {{^}}  var var_FunctionType14: (Protocol_Class1) -> ()
+// CHECK-LABEL: {{^}}  var var_FunctionType14: (any Protocol_Class1) -> ()
 
   var var_FunctionType15: (Protocol_ObjC1) -> ()
-// CHECK-LABEL: {{^}}  @objc var var_FunctionType15: (Protocol_ObjC1) -> ()
+// CHECK-LABEL: {{^}}  @objc var var_FunctionType15: (any Protocol_ObjC1) -> ()
 
   var var_FunctionType16: (AnyObject) -> ()
 // CHECK-LABEL: {{^}}  @objc var var_FunctionType16: (AnyObject) -> ()
@@ -1567,7 +1567,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{Swift structs cannot be represented in Objective-C}}
 
   var var_ArrayType5: [Protocol_ObjC1]
-  // CHECK-LABEL: {{^}}  @objc var var_ArrayType5: [Protocol_ObjC1]
+  // CHECK-LABEL: {{^}}  @objc var var_ArrayType5: [any Protocol_ObjC1]
 
   @objc // access-note-move{{infer_instanceVar1.var_ArrayType5_}}
   var var_ArrayType5_: [Protocol_ObjC1] // no-error
@@ -1587,7 +1587,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{Swift structs cannot be represented in Objective-C}}
 
   var var_ArrayType8: [PlainProtocol]
-  // CHECK-LABEL: {{^}}  var var_ArrayType8: [PlainProtocol]
+  // CHECK-LABEL: {{^}}  var var_ArrayType8: [any PlainProtocol]
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_ArrayType8_}}
   var var_ArrayType8_: [PlainProtocol]
@@ -1595,7 +1595,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{Swift structs cannot be represented in Objective-C}}
 
   var var_ArrayType9: [Protocol_ObjC1 & PlainProtocol]
-  // CHECK-LABEL: {{^}}  var var_ArrayType9: [PlainProtocol & Protocol_ObjC1]
+  // CHECK-LABEL: {{^}}  var var_ArrayType9: [any PlainProtocol & Protocol_ObjC1]
 
   @objc // bad-access-note-move{{infer_instanceVar1.var_ArrayType9_}}
   var var_ArrayType9_: [Protocol_ObjC1 & PlainProtocol]
@@ -1603,7 +1603,7 @@ class infer_instanceVar1 {
   // expected-note@-2 {{Swift structs cannot be represented in Objective-C}}
 
   var var_ArrayType10: [Protocol_ObjC1 & Protocol_ObjC2]
-  // CHECK-LABEL: {{^}}  @objc var var_ArrayType10: [Protocol_ObjC1 & Protocol_ObjC2]
+  // CHECK-LABEL: {{^}}  @objc var var_ArrayType10: [any Protocol_ObjC1 & Protocol_ObjC2]
 
   @objc // access-note-move{{infer_instanceVar1.var_ArrayType10_}}
   var var_ArrayType10_: [Protocol_ObjC1 & Protocol_ObjC2]
@@ -2104,7 +2104,7 @@ class Super {
   var foo: Int { get { return 3 } } // expected-note 2{{overridden declaration is here}}
 
   @objc // access-note-move{{Super.process(i:)}}
-  func process(i: Int) -> Int { } // expected-note {{overriding '@objc' method 'process(i:)' here}}
+  func process(i: Int) -> Int { } // expected-note {{overriding '@objc' instance method 'process(i:)' here}}
 }
 
 class Sub1 : Super {
@@ -2310,7 +2310,7 @@ class ClassThrows1 {
   // access-note-adjust{{@objc}} expected-error@-1{{method cannot be marked @objc because the type of the parameter cannot be represented in Objective-C}}
   // expected-note@-2{{protocol-constrained type containing 'Error' cannot be represented in Objective-C}}
 
-  // CHECK: {{^}} func fooWithErrorProtocolComposition2(x: Error & Protocol_ObjC1)
+  // CHECK: {{^}} func fooWithErrorProtocolComposition2(x: any Error & Protocol_ObjC1)
   func fooWithErrorProtocolComposition2(x: Error & Protocol_ObjC1) { }
 }
 
@@ -2319,11 +2319,13 @@ class ClassThrows1 {
 @objc // access-note-move{{ImplicitClassThrows1}}
 class ImplicitClassThrows1 {
   // CHECK: @objc func methodReturnsVoid() throws
-  // CHECK-DUMP: func_decl{{.*}}"methodReturnsVoid()"{{.*}}foreign_error=ZeroResult,unowned,param=0,paramtype=Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>,resulttype=ObjCBool
+  // CHECK-DUMP-LABEL: func_decl{{.*}}"methodReturnsVoid()"
+  // CHECK-DUMP: (foreign_error_convention kind=ZeroResult unowned param=0 paramtype="Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>" resulttype="ObjCBool")
   func methodReturnsVoid() throws { }
 
   // CHECK: @objc func methodReturnsObjCClass() throws -> Class_ObjC1
-  // CHECK-DUMP: func_decl{{.*}}"methodReturnsObjCClass()" {{.*}}foreign_error=NilResult,unowned,param=0,paramtype=Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>
+  // CHECK-DUMP-LABEL: func_decl{{.*}}"methodReturnsObjCClass()" 
+  // CHECK-DUMP: (foreign_error_convention kind=NilResult unowned param=0 paramtype="Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>")
   func methodReturnsObjCClass() throws -> Class_ObjC1 {
     return Class_ObjC1()
   }
@@ -2338,11 +2340,13 @@ class ImplicitClassThrows1 {
   func methodReturnsOptionalObjCClass() throws -> Class_ObjC1? { return nil }
 
   // CHECK: @objc func methodWithTrailingClosures(_ s: String, fn1: @escaping ((Int) -> Int), fn2: @escaping (Int) -> Int, fn3: @escaping (Int) -> Int)
-  // CHECK-DUMP: func_decl{{.*}}"methodWithTrailingClosures(_:fn1:fn2:fn3:)"{{.*}}foreign_error=ZeroResult,unowned,param=1,paramtype=Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>,resulttype=ObjCBool
+  // CHECK-DUMP-LABEL: func_decl{{.*}}"methodWithTrailingClosures(_:fn1:fn2:fn3:)"
+  // CHECK-DUMP:  (foreign_error_convention kind=ZeroResult unowned param=1 paramtype="Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>" resulttype="ObjCBool")
   func methodWithTrailingClosures(_ s: String, fn1: (@escaping (Int) -> Int), fn2: @escaping (Int) -> Int, fn3: @escaping (Int) -> Int) throws { }
 
   // CHECK: @objc init(degrees: Double) throws
-  // CHECK-DUMP: constructor_decl{{.*}}"init(degrees:)"{{.*}}foreign_error=NilResult,unowned,param=1,paramtype=Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>
+  // CHECK-DUMP-LABEL: constructor_decl{{.*}}"init(degrees:)"
+  // CHECK-DUMP:  (foreign_error_convention kind=NilResult unowned param=1 paramtype="Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>")
   init(degrees: Double) throws { }
 
   // CHECK: {{^}} func methodReturnsBridgedValueType() throws -> NSRange
@@ -2354,7 +2358,7 @@ class ImplicitClassThrows1 {
   }
   // access-note-adjust{{@objc}} expected-error@-3{{throwing method cannot be marked @objc because it returns a value of type 'NSRange' (aka '_NSRange'); return 'Void' or a type that bridges to an Objective-C class}}
 
-  // CHECK: {{^}} @objc func methodReturnsError() throws -> Error
+  // CHECK: {{^}} @objc func methodReturnsError() throws -> any Error
   func methodReturnsError() throws -> Error { return ErrorEnum.failed }
 
   // CHECK: @objc func methodReturnStaticBridged() throws -> ((Int) -> (Int) -> Int)
@@ -2369,7 +2373,8 @@ class ImplicitClassThrows1 {
 @objc // access-note-move{{SubclassImplicitClassThrows1}}
 class SubclassImplicitClassThrows1 : ImplicitClassThrows1 {
   // CHECK: @objc override func methodWithTrailingClosures(_ s: String, fn1: @escaping ((Int) -> Int), fn2: @escaping ((Int) -> Int), fn3: @escaping ((Int) -> Int))
-  // CHECK-DUMP: func_decl{{.*}}"methodWithTrailingClosures(_:fn1:fn2:fn3:)"{{.*}}foreign_error=ZeroResult,unowned,param=1,paramtype=Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>,resulttype=ObjCBool
+  // CHECK-DUMP-LABEL: func_decl{{.*}}"methodWithTrailingClosures(_:fn1:fn2:fn3:)"
+  // CHECK-DUMP: (foreign_error_convention kind=ZeroResult unowned param=1 paramtype="Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>" resulttype="ObjCBool")
   override func methodWithTrailingClosures(_ s: String, fn1: (@escaping (Int) -> Int), fn2: (@escaping (Int) -> Int), fn3: (@escaping (Int) -> Int)) throws { }
 }
 
@@ -2418,20 +2423,24 @@ class ThrowsObjCName {
   @objc(method7) // bad-access-note-move{{ThrowsObjCName.method7(x:)}} expected-error{{'@objc' method name provides names for 0 arguments, but method has 2 parameters (including the error parameter)}}
   func method7(x: Int) throws { }
 
-  // CHECK-DUMP: func_decl{{.*}}"method8(_:fn1:fn2:)"{{.*}}foreign_error=ZeroResult,unowned,param=2,paramtype=Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>,resulttype=ObjCBool
+  // CHECK-DUMP-LABEL: func_decl{{.*}}"method8(_:fn1:fn2:)"
+  // CHECK-DUMP:  (foreign_error_convention kind=ZeroResult unowned param=2 paramtype="Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>" resulttype="ObjCBool")
   @objc(method8:fn1:error:fn2:) // access-note-move{{ThrowsObjCName.method8(_:fn1:fn2:)}}
   func method8(_ s: String, fn1: (@escaping (Int) -> Int), fn2: @escaping (Int) -> Int) throws { }
 
-  // CHECK-DUMP: func_decl{{.*}}"method9(_:fn1:fn2:)"{{.*}}foreign_error=ZeroResult,unowned,param=0,paramtype=Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>,resulttype=ObjCBool
+  // CHECK-DUMP-LABEL: func_decl{{.*}}"method9(_:fn1:fn2:)"
+  // CHECK-DUMP:  (foreign_error_convention kind=ZeroResult unowned param=0 paramtype="Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>" resulttype="ObjCBool")
   @objc(method9AndReturnError:s:fn1:fn2:) // access-note-move{{ThrowsObjCName.method9(_:fn1:fn2:)}}
   func method9(_ s: String, fn1: (@escaping (Int) -> Int), fn2: @escaping (Int) -> Int) throws { }
 }
 
 class SubclassThrowsObjCName : ThrowsObjCName {
-  // CHECK-DUMP: func_decl{{.*}}"method8(_:fn1:fn2:)"{{.*}}foreign_error=ZeroResult,unowned,param=2,paramtype=Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>,resulttype=ObjCBool
+  // CHECK-DUMP-LABEL: func_decl{{.*}}"method8(_:fn1:fn2:)"
+  // CHECK-DUMP:  (foreign_error_convention kind=ZeroResult unowned param=2 paramtype="Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>" resulttype="ObjCBool")
   override func method8(_ s: String, fn1: (@escaping (Int) -> Int), fn2: @escaping (Int) -> Int) throws { }
 
-  // CHECK-DUMP: func_decl{{.*}}"method9(_:fn1:fn2:)"{{.*}}foreign_error=ZeroResult,unowned,param=0,paramtype=Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>,resulttype=ObjCBool
+  // CHECK-DUMP-LABEL: func_decl{{.*}}"method9(_:fn1:fn2:)"
+  // CHECK-DUMP:  (foreign_error_convention kind=ZeroResult unowned param=0 paramtype="Optional<AutoreleasingUnsafeMutablePointer<Optional<NSError>>>" resulttype="ObjCBool")
   override func method9(_ s: String, fn1: (@escaping (Int) -> Int), fn2: @escaping (Int) -> Int) throws { }
 }
 

@@ -30,6 +30,7 @@
 #include "../CompatibilityOverride/CompatibilityOverride.h"
 #include "ImageInspection.h"
 #include "Private.h"
+#include "Tracing.h"
 
 #include <new>
 #include <vector>
@@ -332,8 +333,7 @@ ProtocolConformanceDescriptor::getWitnessTable(const Metadata *type) const {
     auto error = _checkGenericRequirements(
         getConditionalRequirements(), conditionalArgs,
         [&substitutions](unsigned depth, unsigned index) {
-          // FIXME: Variadic generics
-          return substitutions.getMetadata(depth, index).getMetadataOrNull();
+          return substitutions.getMetadata(depth, index).Ptr;
         },
         [&substitutions](const Metadata *type, unsigned index) {
           return substitutions.getWitnessTable(type, index);
@@ -1089,6 +1089,9 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
     }
   };
 
+  auto traceState =
+      runtime::trace::protocol_conformance_scan_begin(type, protocol);
+
   auto snapshot = C.SectionsToScan.snapshot();
   if (C.scanSectionsBackwards) {
     for (auto &section : llvm::reverse(snapshot))
@@ -1125,6 +1128,8 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
   }
   noteFinalMetadataState(superclassIterator.state);
 
+  traceState.end(foundWitness);
+
   // If it's for a superclass or if we didn't find anything, then add an
   // authoritative entry for this type.
   if (foundType != type)
@@ -1142,8 +1147,8 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
 }
 
 static const WitnessTable *
-swift_conformsToProtocolImpl(const Metadata *const type,
-                             const ProtocolDescriptor *protocol) {
+swift_conformsToProtocolCommonImpl(const Metadata *const type,
+                                   const ProtocolDescriptor *protocol) {
   const WitnessTable *table;
   bool hasUninstantiatedSuperclass;
 
@@ -1168,15 +1173,37 @@ swift_conformsToProtocolImpl(const Metadata *const type,
   return table;
 }
 
+static const WitnessTable *
+swift_conformsToProtocol2Impl(const Metadata *const type,
+                              const ProtocolDescriptor *protocol) {
+  protocol = swift_auth_data_non_address(
+      protocol, SpecialPointerAuthDiscriminators::ProtocolDescriptor);
+  return swift_conformsToProtocolCommonImpl(type, protocol);
+}
+
+static const WitnessTable *
+swift_conformsToProtocolImpl(const Metadata *const type,
+                             const void *protocol) {
+  // This call takes `protocol` without a ptrauth signature. We declare
+  // it as `void *` to avoid the implicit ptrauth we get from the
+  // ptrauth_struct attribute. The static_cast implicitly signs the
+  // pointer when we call through to the implementation in
+  // swift_conformsToProtocolCommon.
+  return swift_conformsToProtocolCommonImpl(
+      type, static_cast<const ProtocolDescriptor *>(protocol));
+}
+
 const ContextDescriptor *
 swift::_searchConformancesByMangledTypeName(Demangle::NodePointer node) {
+  auto traceState = runtime::trace::protocol_conformance_scan_begin(node);
+
   auto &C = Conformances.get();
 
   for (auto &section : C.SectionsToScan.snapshot()) {
     for (const auto &record : section) {
       if (auto ntd = record->getTypeDescriptor()) {
         if (_contextDescriptorMatchesMangling(ntd, node))
-          return ntd;
+          return traceState.end(ntd);
       }
     }
   }
@@ -1447,7 +1474,7 @@ checkGenericPackRequirement(const GenericRequirementDescriptor &req,
         const char *protoName =
             req.getProtocol() ? req.getProtocol().getName() : "<null>";
         return TYPE_LOOKUP_ERROR_FMT(
-            "subject type %.*s does not conform to protocol %s at pack index %lu",
+            "subject type %.*s does not conform to protocol %s at pack index %zu",
             (int)req.getParam().size(), req.getParam().data(), protoName, i);
       }
 
@@ -1478,7 +1505,7 @@ checkGenericPackRequirement(const GenericRequirementDescriptor &req,
 
     if (subjectType.getNumElements() != constraintType.getNumElements()) {
       return TYPE_LOOKUP_ERROR_FMT(
-            "mismatched pack lengths in same-type pack requirement %.*s: %lu vs %lu",
+            "mismatched pack lengths in same-type pack requirement %.*s: %zu vs %zu",
             (int)req.getParam().size(), req.getParam().data(),
             subjectType.getNumElements(), constraintType.getNumElements());
     }
@@ -1489,7 +1516,7 @@ checkGenericPackRequirement(const GenericRequirementDescriptor &req,
 
       if (subjectElt != constraintElt) {
         return TYPE_LOOKUP_ERROR_FMT(
-            "subject type %.*s does not match %.*s at pack index %lu",
+            "subject type %.*s does not match %.*s at pack index %zu",
             (int)req.getParam().size(),
             req.getParam().data(), (int)req.getMangledTypeName().size(),
             req.getMangledTypeName().data(), i);
@@ -1524,7 +1551,7 @@ checkGenericPackRequirement(const GenericRequirementDescriptor &req,
 
       if (!isSubclassOrExistential(elt, baseType))
       return TYPE_LOOKUP_ERROR_FMT(
-          "%.*s is not subclass of %.*s at pack index %lu",
+          "%.*s is not subclass of %.*s at pack index %zu",
           (int)req.getParam().size(),
           req.getParam().data(), (int)req.getMangledTypeName().size(),
           req.getMangledTypeName().data(), i);
@@ -1540,7 +1567,7 @@ checkGenericPackRequirement(const GenericRequirementDescriptor &req,
 
   case GenericRequirementKind::SameShape: {
     auto result = swift::getTypePackByMangledName(
-        req.getParam(), extraArguments.data(),
+        req.getMangledTypeName(), extraArguments.data(),
         substGenericParam, substWitnessTable);
     if (result.getError())
       return *result.getError();
@@ -1549,7 +1576,7 @@ checkGenericPackRequirement(const GenericRequirementDescriptor &req,
 
     if (subjectType.getNumElements() != otherType.getNumElements()) {
       return TYPE_LOOKUP_ERROR_FMT("same-shape requirement unsatisfied; "
-                                   "%lu != %lu",
+                                   "%zu != %zu",
                                    subjectType.getNumElements(),
                                    otherType.getNumElements() );
     }

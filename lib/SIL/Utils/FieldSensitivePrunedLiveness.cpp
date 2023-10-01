@@ -22,6 +22,7 @@
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/ScopedAddressUtils.h"
+#include "swift/SIL/Test.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
@@ -69,6 +70,16 @@ TypeSubElementCount::TypeSubElementCount(SILType type, SILModule &mod,
       numElements += TypeSubElementCount(
           type.getFieldType(fieldDecl, mod, context), mod, context);
     number = numElements;
+
+    if (type.isValueTypeWithDeinit()) {
+      // 'self' has its own liveness represented as an additional field at the
+      // end of the structure.
+      ++number;
+    }
+    // If we do not have any elements, just set our size to 1.
+    if (number == 0)
+      number = 1;
+
     return;
   }
 
@@ -97,7 +108,7 @@ TypeSubElementCount::TypeSubElementCount(SILType type, SILModule &mod,
 //                           MARK: SubElementNumber
 //===----------------------------------------------------------------------===//
 
-Optional<SubElementOffset>
+llvm::Optional<SubElementOffset>
 SubElementOffset::computeForAddress(SILValue projectionDerivedFromRoot,
                                     SILValue rootAddress) {
   unsigned finalSubElementOffset = 0;
@@ -115,6 +126,17 @@ SubElementOffset::computeForAddress(SILValue projectionDerivedFromRoot,
 
     if (auto *bai = dyn_cast<BeginAccessInst>(projectionDerivedFromRoot)) {
       projectionDerivedFromRoot = bai->getSource();
+      continue;
+    }
+
+    if (auto *sbi = dyn_cast<StoreBorrowInst>(projectionDerivedFromRoot)) {
+      projectionDerivedFromRoot = sbi->getDest();
+      continue;
+    }
+
+    if (auto *m = dyn_cast<MoveOnlyWrapperToCopyableAddrInst>(
+            projectionDerivedFromRoot)) {
+      projectionDerivedFromRoot = m->getOperand();
       continue;
     }
 
@@ -180,11 +202,11 @@ SubElementOffset::computeForAddress(SILValue projectionDerivedFromRoot,
     // really do not want to abort. Instead, our caller can choose to abort if
     // they get back a None. This ensures that we do not abort in cases where we
     // just want to emit to the user a "I do not understand" error.
-    return None;
+    return llvm::None;
   }
 }
 
-Optional<SubElementOffset>
+llvm::Optional<SubElementOffset>
 SubElementOffset::computeForValue(SILValue projectionDerivedFromRoot,
                                   SILValue rootAddress) {
   unsigned finalSubElementOffset = 0;
@@ -294,7 +316,7 @@ SubElementOffset::computeForValue(SILValue projectionDerivedFromRoot,
     // really do not want to abort. Instead, our caller can choose to abort if
     // they get back a None. This ensures that we do not abort in cases where we
     // just want to emit to the user a "I do not understand" error.
-    return None;
+    return llvm::None;
   }
 }
 
@@ -338,6 +360,10 @@ void TypeTreeLeafTypeRange::constructFilteredProjections(
           builder.createStructElementAddr(insertPt->getLoc(), value, varDecl);
       callback(newValue, TypeTreeLeafTypeRange(start, next));
       start = next;
+    }
+    if (type.isValueTypeWithDeinit()) {
+      // 'self' has its own liveness
+      ++start;
     }
     assert(start == endEltOffset);
     return;
@@ -454,6 +480,29 @@ void TypeTreeLeafTypeRange::constructProjectionsForNeededElements(
   }
 }
 
+void TypeTreeLeafTypeRange::visitContiguousRanges(
+    SmallBitVector const &bits,
+    llvm::function_ref<void(TypeTreeLeafTypeRange)> callback) {
+  if (bits.size() == 0)
+    return;
+
+  llvm::Optional<unsigned> current = llvm::None;
+  for (unsigned bit = 0, size = bits.size(); bit < size; ++bit) {
+    auto isSet = bits.test(bit);
+    if (current) {
+      if (!isSet) {
+        callback(TypeTreeLeafTypeRange(*current, bit));
+        current = llvm::None;
+      }
+    } else if (isSet) {
+      current = bit;
+    }
+  }
+  if (current) {
+    callback(TypeTreeLeafTypeRange(*current, bits.size()));
+  }
+}
+
 //===----------------------------------------------------------------------===//
 //                    MARK: FieldSensitivePrunedLiveBlocks
 //===----------------------------------------------------------------------===//
@@ -494,6 +543,7 @@ void FieldSensitivePrunedLiveBlocks::computeScalarUseBlockLiveness(
 /// Terminators are not live out of the block.
 void FieldSensitivePrunedLiveBlocks::updateForUse(
     SILInstruction *user, unsigned startBitNo, unsigned endBitNo,
+    SmallBitVector const &useBeforeDefBits,
     SmallVectorImpl<IsLive> &resultingLivenessInfo) {
   assert(isInitialized());
   resultingLivenessInfo.clear();
@@ -502,19 +552,24 @@ void FieldSensitivePrunedLiveBlocks::updateForUse(
 
   auto *bb = user->getParent();
   getBlockLiveness(bb, startBitNo, endBitNo, resultingLivenessInfo);
+  assert(resultingLivenessInfo.size() == (endBitNo - startBitNo));
 
-  for (auto pair : llvm::enumerate(resultingLivenessInfo)) {
-    unsigned index = pair.index();
+  for (unsigned index : indices(resultingLivenessInfo)) {
     unsigned specificBitNo = startBitNo + index;
-    switch (pair.value()) {
+    auto isUseBeforeDef = useBeforeDefBits.test(specificBitNo);
+    switch (resultingLivenessInfo[index]) {
     case LiveOut:
     case LiveWithin:
-      continue;
+      if (!isUseBeforeDef) {
+        continue;
+      } else {
+        LLVM_FALLTHROUGH;
+      }
     case Dead: {
       // This use block has not yet been marked live. Mark it and its
       // predecessor blocks live.
       computeScalarUseBlockLiveness(bb, specificBitNo);
-      resultingLivenessInfo.push_back(getBlockLiveness(bb, specificBitNo));
+      resultingLivenessInfo[index] = getBlockLiveness(bb, specificBitNo);
       continue;
     }
     }
@@ -532,6 +587,7 @@ FieldSensitivePrunedLiveBlocks::getStringRef(IsLive isLive) const {
   case LiveOut:
     return "LiveOut";
   }
+  llvm_unreachable("Covered switch?!");
 }
 
 void FieldSensitivePrunedLiveBlocks::print(llvm::raw_ostream &OS) const {
@@ -552,18 +608,168 @@ void FieldSensitivePrunedLiveBlocks::print(llvm::raw_ostream &OS) const {
 void FieldSensitivePrunedLiveBlocks::dump() const { print(llvm::dbgs()); }
 
 //===----------------------------------------------------------------------===//
+//                   FieldSensitivePrunedLivenessBoundary
+//===----------------------------------------------------------------------===//
+
+void FieldSensitivePrunedLivenessBoundary::print(llvm::raw_ostream &OS) const {
+  for (auto pair : lastUsers) {
+    auto *user = pair.first;
+    auto bits = pair.second;
+    OS << "last user: " << *user 
+       << "\tat " << bits << "\n";
+  }
+  for (auto pair : boundaryEdges) {
+    auto *block = pair.first;
+    auto bits = pair.second;
+    OS << "boundary edge: ";
+    block->printAsOperand(OS);
+    OS << "\n" << "\tat " << bits << "\n";
+  }
+  if (!deadDefs.empty()) {
+    for (auto pair : deadDefs) {
+      auto *deadDef = pair.first;
+      auto bits = pair.second;
+      OS << "dead def: " << *deadDef 
+         << "\tat " << bits << "\n";
+    }
+  }
+}
+
+void FieldSensitivePrunedLivenessBoundary::dump() const {
+  print(llvm::dbgs());
+}
+
+//===----------------------------------------------------------------------===//
 //                        MARK: FieldSensitiveLiveness
 //===----------------------------------------------------------------------===//
 
-void FieldSensitivePrunedLiveness::updateForUse(SILInstruction *user,
-                                                TypeTreeLeafTypeRange range,
-                                                bool lifetimeEnding) {
+void FieldSensitivePrunedLiveness::updateForUse(
+    SILInstruction *user, TypeTreeLeafTypeRange range, bool lifetimeEnding,
+    SmallBitVector const &useBeforeDefBits) {
   SmallVector<FieldSensitivePrunedLiveBlocks::IsLive, 8> resultingLiveness;
   liveBlocks.updateForUse(user, range.startEltOffset, range.endEltOffset,
-                          resultingLiveness);
+                          useBeforeDefBits, resultingLiveness);
 
   addInterestingUser(user, range, lifetimeEnding);
 }
+
+void FieldSensitivePrunedLiveness::updateForUse(
+    SILInstruction *user, SmallBitVector const &bits, bool lifetimeEnding,
+    SmallBitVector const &useBeforeDefBits) {
+  for (auto bit : bits.set_bits()) {
+    liveBlocks.updateForUse(user, bit, useBeforeDefBits.test(bit));
+  }
+
+  addInterestingUser(user, bits, lifetimeEnding);
+}
+
+void FieldSensitivePrunedLiveness::extendToNonUse(
+    SILInstruction *user, TypeTreeLeafTypeRange range,
+    SmallBitVector const &useBeforeDefBits) {
+  SmallVector<FieldSensitivePrunedLiveBlocks::IsLive, 8> resultingLiveness;
+  liveBlocks.updateForUse(user, range.startEltOffset, range.endEltOffset,
+                          useBeforeDefBits, resultingLiveness);
+
+  extendToNonUse(user, range);
+}
+
+void FieldSensitivePrunedLiveness::extendToNonUse(
+    SILInstruction *user, SmallBitVector const &bits,
+    SmallBitVector const &useBeforeDefBits) {
+  for (auto bit : bits.set_bits()) {
+    liveBlocks.updateForUse(user, bit, useBeforeDefBits.test(bit));
+  }
+
+  extendToNonUse(user, bits);
+}
+
+void FieldSensitivePrunedLiveness::print(llvm::raw_ostream &os) const {
+  liveBlocks.print(os);
+  for (auto &userAndInterest : users) {
+    for (size_t bit = 0, size = userAndInterest.second.liveBits.size();
+         bit < size; ++bit) {
+      auto isLive = userAndInterest.second.liveBits.test(bit);
+      auto isConsuming = userAndInterest.second.consumingBits.test(bit);
+      if (!isLive && !isConsuming) {
+        continue;
+      } else if (!isLive && isConsuming) {
+        os << "non-user: ";
+      } else if (isLive && isConsuming) {
+        os << "lifetime-ending user: ";
+      } else if (isLive && !isConsuming) {
+        os << "regular user: ";
+      }
+      os << *userAndInterest.first << "\tat " << bit << "\n";
+    }
+  }
+}
+
+namespace swift::test {
+// Arguments:
+// - SILValue: def whose pruned liveness will be calculated
+// - the string "uses:"
+// - variadic list of live-range user instructions
+// Dumps:
+// -
+static FunctionTest FieldSensitiveSSAUseLivenessTest(
+    "fs_ssa_use_liveness", [](auto &function, auto &arguments, auto &test) {
+      auto value = arguments.takeValue();
+      auto begin = (unsigned)arguments.takeUInt();
+      auto end = (unsigned)arguments.takeUInt();
+
+      SmallVector<SILBasicBlock *, 8> discoveredBlocks;
+      FieldSensitiveSSAPrunedLiveRange liveness(&function, &discoveredBlocks);
+      liveness.init(value);
+      liveness.initializeDef(value, TypeTreeLeafTypeRange(begin, end));
+
+      auto argument = arguments.takeArgument();
+      if (cast<StringArgument>(argument).getValue() != "uses:") {
+        llvm::report_fatal_error(
+            "test specification expects the 'uses:' label\n");
+      }
+      while (arguments.hasUntaken()) {
+        auto *inst = arguments.takeInstruction();
+        auto kindString = arguments.takeString();
+        enum Kind {
+          NonUse,
+          Ending,
+          NonEnding,
+        };
+        auto kind = llvm::StringSwitch<llvm::Optional<Kind>>(kindString)
+                        .Case("non-use", Kind::NonUse)
+                        .Case("ending", Kind::Ending)
+                        .Case("non-ending", Kind::NonEnding)
+                        .Default(llvm::None);
+        if (!kind.has_value()) {
+          llvm::errs() << "Unknown kind: " << kindString << "\n";
+          llvm::report_fatal_error("Bad user kind.  Value must be one of "
+                                   "'non-use', 'ending', 'non-ending'");
+        }
+        auto begin = (unsigned)arguments.takeUInt();
+        auto end = (unsigned)arguments.takeUInt();
+        switch (kind.value()) {
+        case Kind::NonUse:
+          liveness.extendToNonUse(inst, TypeTreeLeafTypeRange(begin, end));
+          break;
+        case Kind::Ending:
+          liveness.updateForUse(inst, TypeTreeLeafTypeRange(begin, end),
+                                /*lifetimeEnding*/ true);
+          break;
+        case Kind::NonEnding:
+          liveness.updateForUse(inst, TypeTreeLeafTypeRange(begin, end),
+                                /*lifetimeEnding*/ false);
+          break;
+        }
+      }
+
+      liveness.print(llvm::outs());
+
+      FieldSensitivePrunedLivenessBoundary boundary(1);
+      liveness.computeBoundary(boundary);
+      boundary.print(llvm::outs());
+    });
+
+} // end namespace swift::test
 
 //===----------------------------------------------------------------------===//
 //                    MARK: FieldSensitivePrunedLiveRange
@@ -661,9 +867,7 @@ bool FieldSensitivePrunedLiveRange<LivenessWithDefs>::isWithinBoundary(
         // If we are not live and have an interesting user that maps to our bit,
         // mark this bit as being live again.
         if (!isLive) {
-          auto interestingUser = isInterestingUser(&blockInst);
-          bool isInteresting =
-              interestingUser.first && interestingUser.second->contains(bit);
+          bool isInteresting = isInterestingUser(&blockInst, bit);
           PRUNED_LIVENESS_LOG(llvm::dbgs()
                      << "        Inst was dead... Is InterestingUser: "
                      << (isInteresting ? "true" : "false") << '\n');
@@ -746,38 +950,145 @@ void FieldSensitivePrunedLiveRange<LivenessWithDefs>::computeBoundary(
   }
 }
 
+namespace swift::test {
+// Arguments:
+// - value: entity whose fields' livenesses are being computed
+// - string: "defs:"
+// - variadic list of triples consisting of
+//   - value: a live-range defining value
+//   - int: the beginning of the range of fields defined by the value
+//   - int: the end of the range of the fields defined by the value
+// - the string "uses:"
+// - variadic list of quadruples consisting of
+//   - instruction: a live-range user
+//   - bool: whether the user is lifetime-ending
+//   - int: the beginning of the range of fields used by the instruction
+//   - int: the end of the range of fields used by the instruction
+// Dumps:
+// - the liveness result and boundary
+//
+// Computes liveness for the specified def nodes by considering the
+// specified uses. The actual uses of the def nodes are ignored.
+//
+// This is useful for testing non-ssa liveness, for example, of memory
+// locations. In that case, the def nodes may be stores and the uses may be
+// destroy_addrs.
+static FunctionTest FieldSensitiveMultiDefUseLiveRangeTest(
+    "fieldsensitive-multidefuse-liverange",
+    [](auto &function, auto &arguments, auto &test) {
+      SmallVector<SILBasicBlock *, 8> discoveredBlocks;
+      auto value = arguments.takeValue();
+      FieldSensitiveMultiDefPrunedLiveRange liveness(&function, value,
+                                                     &discoveredBlocks);
+
+      llvm::outs() << "FieldSensitive MultiDef lifetime analysis:\n";
+      if (arguments.takeString() != "defs:") {
+        llvm::report_fatal_error(
+            "test specification expects the 'defs:' label\n");
+      }
+      while (true) {
+        auto argument = arguments.takeArgument();
+        if (isa<StringArgument>(argument)) {
+          if (cast<StringArgument>(argument).getValue() != "uses:") {
+            llvm::report_fatal_error(
+                "test specification expects the 'uses:' label\n");
+          }
+          break;
+        }
+        auto begin = arguments.takeUInt();
+        auto end = arguments.takeUInt();
+        TypeTreeLeafTypeRange range(begin, end);
+        if (isa<InstructionArgument>(argument)) {
+          auto *instruction = cast<InstructionArgument>(argument).getValue();
+          llvm::outs() << "  def in range [" << begin << ", " << end
+                       << ") instruction: " << *instruction;
+          liveness.initializeDef(instruction, range);
+          continue;
+        }
+        if (isa<ValueArgument>(argument)) {
+          SILValue value = cast<ValueArgument>(argument).getValue();
+          llvm::outs() << "  def in range [" << begin << ", " << end
+                       << ") value: " << value;
+          liveness.initializeDef(value, range);
+          continue;
+        }
+        llvm::report_fatal_error(
+            "test specification expects the 'uses:' label\n");
+      }
+      liveness.finishedInitializationOfDefs();
+      while (arguments.hasUntaken()) {
+        auto *inst = arguments.takeInstruction();
+        auto lifetimeEnding = arguments.takeBool();
+        auto begin = arguments.takeUInt();
+        auto end = arguments.takeUInt();
+        TypeTreeLeafTypeRange range(begin, end);
+        liveness.updateForUse(inst, range, lifetimeEnding);
+      }
+      liveness.print(llvm::errs());
+
+      FieldSensitivePrunedLivenessBoundary boundary(
+          liveness.getNumSubElements());
+      liveness.computeBoundary(boundary);
+      boundary.print(llvm::errs());
+    });
+} // end namespace swift::test
+
+bool FieldSensitiveMultiDefPrunedLiveRange::isUserBeforeDef(
+    SILInstruction *user, unsigned element) const {
+  auto *block = user->getParent();
+  if (!isDefBlock(block, element))
+    return false;
+
+  if (llvm::any_of(block->getArguments(), [this, element](SILArgument *arg) {
+        return isDef(arg, element);
+      })) {
+    return false;
+  }
+
+  auto *current = user;
+  while (true) {
+    // If user is also a def, then the use is considered before the def.
+    current = current->getPreviousInstruction();
+    if (!current)
+      return true;
+
+    if (isDef(current, element))
+      return false;
+  }
+}
+
 template <typename LivenessWithDefs>
 void FieldSensitivePrunedLiveRange<LivenessWithDefs>::updateForUse(
     SILInstruction *user, TypeTreeLeafTypeRange range, bool lifetimeEnding) {
-  PRUNED_LIVENESS_LOG(
-      llvm::dbgs()
-      << "Begin FieldSensitivePrunedLiveRange<LivenessWithDefs>::updateForUse "
-         "for: "
-      << *user);
-  PRUNED_LIVENESS_LOG(
-      llvm::dbgs() << "Looking for def instruction earlier in the block!\n");
+  SmallBitVector useBeforeDefBits(getNumSubElements());
+  asImpl().isUserBeforeDef(user, range.getRange(), useBeforeDefBits);
+  FieldSensitivePrunedLiveness::updateForUse(user, range, lifetimeEnding,
+                                             useBeforeDefBits);
+}
 
-  auto *parentBlock = user->getParent();
-  for (auto ii = std::next(user->getReverseIterator()),
-            ie = parentBlock->rend();
-       ii != ie; ++ii) {
-    // If we find the def, just mark this instruction as being an interesting
-    // instruction.
-    if (asImpl().isDef(&*ii, range)) {
-      PRUNED_LIVENESS_LOG(llvm::dbgs() << "    Found def: " << *ii);
-      PRUNED_LIVENESS_LOG(llvm::dbgs()
-                 << "    Marking inst as interesting user and returning!\n");
-      addInterestingUser(user, range, lifetimeEnding);
-      return;
-    }
-  }
+template <typename LivenessWithDefs>
+void FieldSensitivePrunedLiveRange<LivenessWithDefs>::updateForUse(
+    SILInstruction *user, SmallBitVector const &bits, bool lifetimeEnding) {
+  SmallBitVector useBeforeDefBits(getNumSubElements());
+  asImpl().isUserBeforeDef(user, bits.set_bits(), useBeforeDefBits);
+  FieldSensitivePrunedLiveness::updateForUse(user, bits, lifetimeEnding,
+                                             useBeforeDefBits);
+}
 
-  // Otherwise, just delegate to our parent class's update for use. This will
-  // update liveness for our predecessor blocks and add this instruction as an
-  // interesting user.
-  PRUNED_LIVENESS_LOG(llvm::dbgs() << "No defs found! Delegating to "
-                             "FieldSensitivePrunedLiveness::updateForUse.\n");
-  FieldSensitivePrunedLiveness::updateForUse(user, range, lifetimeEnding);
+template <typename LivenessWithDefs>
+void FieldSensitivePrunedLiveRange<LivenessWithDefs>::extendToNonUse(
+    SILInstruction *user, TypeTreeLeafTypeRange range) {
+  SmallBitVector useBeforeDefBits(getNumSubElements());
+  asImpl().isUserBeforeDef(user, range.getRange(), useBeforeDefBits);
+  FieldSensitivePrunedLiveness::extendToNonUse(user, range, useBeforeDefBits);
+}
+
+template <typename LivenessWithDefs>
+void FieldSensitivePrunedLiveRange<LivenessWithDefs>::extendToNonUse(
+    SILInstruction *user, SmallBitVector const &bits) {
+  SmallBitVector useBeforeDefBits(getNumSubElements());
+  asImpl().isUserBeforeDef(user, bits.set_bits(), useBeforeDefBits);
+  FieldSensitivePrunedLiveness::extendToNonUse(user, bits, useBeforeDefBits);
 }
 
 //===----------------------------------------------------------------------===//
@@ -794,8 +1105,7 @@ void findBoundaryInNonDefBlock(SILBasicBlock *block, unsigned bitNo,
   PRUNED_LIVENESS_LOG(llvm::dbgs() << "Looking for boundary in non-def block\n");
   for (SILInstruction &inst : llvm::reverse(*block)) {
     PRUNED_LIVENESS_LOG(llvm::dbgs() << "Visiting: " << inst);
-    auto interestingUser = liveness.isInterestingUser(&inst);
-    if (interestingUser.first && interestingUser.second->contains(bitNo)) {
+    if (liveness.isInterestingUser(&inst, bitNo)) {
       PRUNED_LIVENESS_LOG(llvm::dbgs() << "    Is interesting user for this bit!\n");
       boundary.getLastUserBits(&inst).set(bitNo);
       return;
@@ -825,8 +1135,7 @@ void findBoundaryInSSADefBlock(SILNode *ssaDef, unsigned bitNo,
       boundary.getDeadDefsBits(cast<SILNode>(&inst)).set(bitNo);
       return;
     }
-    auto interestingUser = liveness.isInterestingUser(&inst);
-    if (interestingUser.first && interestingUser.second->contains(bitNo)) {
+    if (liveness.isInterestingUser(&inst, bitNo)) {
       PRUNED_LIVENESS_LOG(llvm::dbgs() << "    Found interesting user: " << inst);
       boundary.getLastUserBits(&inst).set(bitNo);
       return;
@@ -961,8 +1270,7 @@ void FieldSensitiveMultiDefPrunedLiveRange::findBoundariesInBlock(
     PRUNED_LIVENESS_LOG(llvm::dbgs()
                << "    Checking if this inst is also a last user...\n");
     if (!isLive) {
-      auto interestingUser = isInterestingUser(&inst);
-      if (interestingUser.first && interestingUser.second->contains(bitNo)) {
+      if (isInterestingUser(&inst, bitNo)) {
         PRUNED_LIVENESS_LOG(
             llvm::dbgs()
             << "        Was interesting user! Moving from dead -> live!\n");
@@ -1012,7 +1320,107 @@ void FieldSensitiveMultiDefPrunedLiveRange::findBoundariesInBlock(
                << "    Live at beginning of block! No dead args!\n");
   }
 
-  assert((isLiveOut ||
-          prevCount < boundary.getNumLastUsersAndDeadDefs(bitNo)) &&
-         "findBoundariesInBlock must be called on a live block");
+  assert(
+      (isLiveOut || prevCount < boundary.getNumLastUsersAndDeadDefs(bitNo)) &&
+      "findBoundariesInBlock must be called on a live block");
+}
+
+bool FieldSensitiveMultiDefPrunedLiveRange::findEarlierConsumingUse(
+    SILInstruction *inst, unsigned index,
+    llvm::function_ref<bool(SILInstruction *)> callback) const {
+  PRUNED_LIVENESS_LOG(
+      llvm::dbgs()
+      << "Performing single block search for consuming use for bit: " << index
+      << "!\n");
+
+  // Walk our block back from inst looking for defs or a consuming use. If we
+  // see a def, return true. If we see a use, we keep processing if the callback
+  // returns true... and return false early if the callback returns false.
+  for (auto ii = std::next(inst->getReverseIterator()),
+            ie = inst->getParent()->rend();
+       ii != ie; ++ii) {
+    PRUNED_LIVENESS_LOG(llvm::dbgs() << "Visiting: " << *ii);
+    // If we have a def, then we are automatically done.
+    if (isDef(&*ii, index)) {
+      PRUNED_LIVENESS_LOG(llvm::dbgs() << "    Is Def! Returning true!\n");
+      return true;
+    }
+
+    // If we have a consuming use, emit the error.
+    if (isInterestingUser(&*ii, index) ==
+        IsInterestingUser::LifetimeEndingUse) {
+      PRUNED_LIVENESS_LOG(llvm::dbgs() << "    Is Lifetime Ending Use!\n");
+      if (!callback(&*ii)) {
+        PRUNED_LIVENESS_LOG(llvm::dbgs()
+                            << "    Callback returned false... exiting!\n");
+        return false;
+      }
+      PRUNED_LIVENESS_LOG(llvm::dbgs()
+                          << "    Callback returned true... continuing!\n");
+    }
+
+    // Otherwise, keep going.
+  }
+
+  // Then check our argument defs.
+  for (auto *arg : inst->getParent()->getArguments()) {
+    PRUNED_LIVENESS_LOG(llvm::dbgs() << "Visiting arg: " << *arg);
+    if (isDef(arg, index)) {
+      PRUNED_LIVENESS_LOG(llvm::dbgs() << "    Found def. Returning true!\n");
+      return true;
+    }
+  }
+
+  PRUNED_LIVENESS_LOG(llvm::dbgs() << "Finished single block. Didn't find "
+                                      "anything... Performing interprocedural");
+
+  // Ok, we now know that we need to look further back.
+  BasicBlockWorklist worklist(inst->getFunction());
+  for (auto *predBlock : inst->getParent()->getPredecessorBlocks()) {
+    worklist.pushIfNotVisited(predBlock);
+  }
+
+  while (auto *next = worklist.pop()) {
+    PRUNED_LIVENESS_LOG(llvm::dbgs()
+                        << "Checking block bb" << next->getDebugID() << '\n');
+    for (auto ii = next->rbegin(), ie = next->rend(); ii != ie; ++ii) {
+      PRUNED_LIVENESS_LOG(llvm::dbgs() << "Visiting: " << *ii);
+      // If we have a def, then we are automatically done.
+      if (isDef(&*ii, index)) {
+        PRUNED_LIVENESS_LOG(llvm::dbgs() << "    Is Def! Returning true!\n");
+        return true;
+      }
+
+      // If we have a consuming use, emit the error.
+      if (isInterestingUser(&*ii, index) ==
+          IsInterestingUser::LifetimeEndingUse) {
+        PRUNED_LIVENESS_LOG(llvm::dbgs() << "    Is Lifetime Ending Use!\n");
+        if (!callback(&*ii)) {
+          PRUNED_LIVENESS_LOG(llvm::dbgs()
+                              << "    Callback returned false... exiting!\n");
+          return false;
+        }
+        PRUNED_LIVENESS_LOG(llvm::dbgs()
+                            << "    Callback returned true... continuing!\n");
+      }
+
+      // Otherwise, keep going.
+    }
+
+    for (auto *arg : next->getArguments()) {
+      PRUNED_LIVENESS_LOG(llvm::dbgs() << "Visiting arg: " << *arg);
+      if (isDef(arg, index)) {
+        PRUNED_LIVENESS_LOG(llvm::dbgs() << "    Found def. Returning true!\n");
+        return true;
+      }
+    }
+
+    PRUNED_LIVENESS_LOG(llvm::dbgs()
+                        << "Didn't find anything... visiting predecessors!\n");
+    for (auto *predBlock : next->getPredecessorBlocks()) {
+      worklist.pushIfNotVisited(predBlock);
+    }
+  }
+
+  return true;
 }

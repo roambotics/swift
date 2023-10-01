@@ -33,7 +33,6 @@ class ActorIsolation;
 class AnyFunctionType;
 class ASTContext;
 class ClassDecl;
-class ClosureActorIsolation;
 class ClosureExpr;
 class ConcreteDeclRef;
 class CustomAttr;
@@ -236,15 +235,27 @@ public:
   /// of a member access or a parameter passed to a function.
   static ActorReferenceResult forReference(
       ConcreteDeclRef declRef, SourceLoc declRefLoc, const DeclContext *fromDC,
-      Optional<VarRefUseEnv> useKind = None,
-      Optional<ReferencedActor> actorInstance = None,
-      Optional<ActorIsolation> knownDeclIsolation = None,
-      Optional<ActorIsolation> knownContextIsolation = None,
-      llvm::function_ref<ClosureActorIsolation(AbstractClosureExpr *)>
+      llvm::Optional<VarRefUseEnv> useKind = llvm::None,
+      llvm::Optional<ReferencedActor> actorInstance = llvm::None,
+      llvm::Optional<ActorIsolation> knownDeclIsolation = llvm::None,
+      llvm::Optional<ActorIsolation> knownContextIsolation = llvm::None,
+      llvm::function_ref<ActorIsolation(AbstractClosureExpr *)>
           getClosureActorIsolation = __AbstractClosureExpr_getActorIsolation);
 
   operator Kind() const { return kind; }
 };
+
+/// Individual options used with \c FunctionCheckOptions
+enum class FunctionCheckKind {
+  /// Check params
+  Params = 1 << 0,
+  /// Check results
+  Results = 1 << 1,
+};
+
+/// Specifies whether checks applied to function types should apply to
+/// their parameters, their results, both, or neither.
+using FunctionCheckOptions = OptionSet<FunctionCheckKind>;
 
 /// Diagnose the presence of any non-sendable types when referencing a
 /// given declaration from a particular declaration context.
@@ -254,23 +265,39 @@ public:
 /// concurrency domain, whether in/out of an actor or in/or of a concurrent
 /// function or closure.
 ///
+/// \param base The base expression of the reference, which must be 'Sendable'
+/// in order to cross actor isolation boundaries.
+///
 /// \param declRef The declaration being referenced from another concurrency
 /// domain, including the substitutions so that (e.g.) we can consider the
 /// specific types at the use site.
 ///
 /// \param fromDC The context from which the reference occurs.
 ///
-/// \param loc The location at which the reference occurs, which will be
+/// \param refLoc The location at which the reference occurs, which will be
 /// used when emitting diagnostics.
 ///
 /// \param refKind Describes what kind of reference is being made, which is
 /// used to tailor the diagnostic.
 ///
+/// \param funcCheckOptions Describes whether function types in this reference
+/// should be checked for sendability of their results, params, or both
+///
+/// \param diagnoseLoc Provides an alternative source location to `refLoc`
+/// to be used for reporting the top level diagnostic while auxiliary
+/// warnings and diagnostics are reported at `refLoc`.
+///
 /// \returns true if an problem was detected, false otherwise.
 bool diagnoseNonSendableTypesInReference(
-    ConcreteDeclRef declRef, const DeclContext *fromDC, SourceLoc loc,
+    Expr *base, ConcreteDeclRef declRef,
+    const DeclContext *fromDC, SourceLoc refLoc,
     SendableCheckReason refKind,
-    Optional<ActorIsolation> knownIsolation = None);
+    llvm::Optional<ActorIsolation> knownIsolation = llvm::None,
+    FunctionCheckOptions funcCheckOptions =
+        (FunctionCheckOptions() |
+         FunctionCheckKind::Params |
+         FunctionCheckKind::Results),
+    SourceLoc diagnoseLoc = SourceLoc());
 
 /// Produce a diagnostic for a missing conformance to Sendable.
 void diagnoseMissingSendableConformance(
@@ -282,6 +309,9 @@ void diagnoseMissingExplicitSendable(NominalTypeDecl *nominal);
 
 /// Warn about deprecated `Executor.enqueue` implementations.
 void tryDiagnoseExecutorConformance(ASTContext &C, const NominalTypeDecl *nominal, ProtocolDecl *proto);
+
+// Get a concrete reference to a declaration
+ConcreteDeclRef getDeclRefInContext(ValueDecl *value);
 
 /// How the Sendable check should be performed.
 enum class SendableCheck {
@@ -317,12 +347,12 @@ static inline bool isImplicitSendableCheck(SendableCheck check) {
 /// Describes the context in which a \c Sendable check occurs.
 struct SendableCheckContext {
   const DeclContext * const fromDC;
-  const Optional<SendableCheck> conformanceCheck;
+  const llvm::Optional<SendableCheck> conformanceCheck;
 
   SendableCheckContext(
-      const DeclContext * fromDC,
-      Optional<SendableCheck> conformanceCheck = None
-  ) : fromDC(fromDC), conformanceCheck(conformanceCheck) { }
+      const DeclContext *fromDC,
+      llvm::Optional<SendableCheck> conformanceCheck = llvm::None)
+      : fromDC(fromDC), conformanceCheck(conformanceCheck) {}
 
   /// Determine the default diagnostic behavior for a missing/unavailable
   /// Sendable conformance in this context.
@@ -362,6 +392,37 @@ namespace detail {
 /// Diagnose any non-Sendable types that occur within the given type, using
 /// the given diagnostic.
 ///
+/// \param typeLoc is the source location of the type being diagnosed
+///
+/// \param diagnoseLoc is the source location at which the main diagnostic should
+/// be reported, which can differ from typeLoc
+///
+/// \returns \c true if any errors were produced, \c false if no diagnostics or
+/// only warnings and notes were produced.
+template<typename ...DiagArgs>
+bool diagnoseNonSendableTypes(
+    Type type, SendableCheckContext fromContext,
+    SourceLoc typeLoc, SourceLoc diagnoseLoc,
+    Diag<Type, DiagArgs...> diag,
+    typename detail::Identity<DiagArgs>::type ...diagArgs) {
+
+    ASTContext &ctx = fromContext.fromDC->getASTContext();
+    return diagnoseNonSendableTypes(
+        type, fromContext, typeLoc, [&](Type specificType,
+                                        DiagnosticBehavior behavior) {
+
+          if (behavior != DiagnosticBehavior::Ignore) {
+            ctx.Diags.diagnose(diagnoseLoc, diag, type, diagArgs...)
+                .limitBehavior(behavior);
+          }
+
+          return false;
+        });
+}
+
+/// Diagnose any non-Sendable types that occur within the given type, using
+/// the given diagnostic.
+///
 /// \returns \c true if any errors were produced, \c false if no diagnostics or
 /// only warnings and notes were produced.
 template<typename ...DiagArgs>
@@ -369,17 +430,9 @@ bool diagnoseNonSendableTypes(
     Type type, SendableCheckContext fromContext, SourceLoc loc,
     Diag<Type, DiagArgs...> diag,
     typename detail::Identity<DiagArgs>::type ...diagArgs) {
-  ASTContext &ctx = fromContext.fromDC->getASTContext();
-  return diagnoseNonSendableTypes(
-      type, fromContext, loc, [&](Type specificType,
-      DiagnosticBehavior behavior) {
-    if (behavior != DiagnosticBehavior::Ignore) {
-      ctx.Diags.diagnose(loc, diag, type, diagArgs...)
-        .limitBehavior(behavior);
-    }
 
-    return false;
-  });
+    return diagnoseNonSendableTypes(type, fromContext, loc, loc, diag,
+                             std::forward<decltype(diagArgs)>(diagArgs)...);
 }
 
 /// Diagnose this sendability error with behavior based on the import of
@@ -409,10 +462,10 @@ void diagnoseUnnecessaryPreconcurrencyImports(SourceFile &sf);
 
 /// Given a set of custom attributes, pick out the global actor attributes
 /// and perform any necessary resolution and diagnostics, returning the
-/// global actor attribute and type it refers to (or \c None).
-Optional<std::pair<CustomAttr *, NominalTypeDecl *>>
-checkGlobalActorAttributes(
-    SourceLoc loc, DeclContext *dc, ArrayRef<CustomAttr *> attrs);
+/// global actor attribute and type it refers to (or \c llvm::None).
+llvm::Optional<std::pair<CustomAttr *, NominalTypeDecl *>>
+checkGlobalActorAttributes(SourceLoc loc, DeclContext *dc,
+                           ArrayRef<CustomAttr *> attrs);
 
 /// Get the explicit global actor specified for a closure.
 Type getExplicitGlobalActor(ClosureExpr *closure);
@@ -445,7 +498,8 @@ enum class DispatchQueueOperation {
 
 /// Determine whether the given name is that of a DispatchQueue operation that
 /// takes a closure to be executed on the queue.
-Optional<DispatchQueueOperation> isDispatchQueueOperationName(StringRef name);
+llvm::Optional<DispatchQueueOperation>
+isDispatchQueueOperationName(StringRef name);
 
 /// Check the correctness of the given Sendable conformance.
 ///
@@ -480,13 +534,19 @@ VarDecl *getReferencedParamOrCapture(
 /// \param fromDC The context where we are performing the access.
 bool isAccessibleAcrossActors(
     ValueDecl *value, const ActorIsolation &isolation,
-    const DeclContext *fromDC, Optional<ReferencedActor> actorInstance = None);
+    const DeclContext *fromDC,
+    llvm::Optional<ReferencedActor> actorInstance = llvm::None);
 
 /// Check whether given variable references to a potentially
 /// isolated actor.
 bool isPotentiallyIsolatedActor(
     VarDecl *var, llvm::function_ref<bool(ParamDecl *)> isIsolated =
                       [](ParamDecl *P) { return P->isIsolated(); });
+
+/// Check whether the given ApplyExpr makes an unsatisfied isolation jump
+/// and if so, emit diagnostics for any nonsendable arguments to the apply
+bool diagnoseApplyArgSendability(
+    swift::ApplyExpr *apply, const DeclContext *declContext);
 
 } // end namespace swift
 

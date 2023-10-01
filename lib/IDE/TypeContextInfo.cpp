@@ -45,8 +45,9 @@ public:
 
   void completeCallArg(CodeCompletionExpr *E, bool isFirst) override;
   void completeReturnStmt(CodeCompletionExpr *E) override;
+  void completeThenStmt(CodeCompletionExpr *E) override;
   void completeYieldStmt(CodeCompletionExpr *E,
-                         Optional<unsigned> yieldIndex) override;
+                         llvm::Optional<unsigned> yieldIndex) override;
 
   void completeUnresolvedMember(CodeCompletionExpr *E,
                                 SourceLoc DotLoc) override;
@@ -73,8 +74,12 @@ void ContextInfoCallbacks::completeReturnStmt(CodeCompletionExpr *E) {
   CurDeclContext = P.CurDeclContext;
   ParsedExpr = E;
 }
-void ContextInfoCallbacks::completeYieldStmt(CodeCompletionExpr *E,
-                                             Optional<unsigned> yieldIndex) {
+void ContextInfoCallbacks::completeThenStmt(CodeCompletionExpr *E) {
+  CurDeclContext = P.CurDeclContext;
+  ParsedExpr = E;
+}
+void ContextInfoCallbacks::completeYieldStmt(
+    CodeCompletionExpr *E, llvm::Optional<unsigned> yieldIndex) {
   CurDeclContext = P.CurDeclContext;
   ParsedExpr = E;
 }
@@ -194,7 +199,8 @@ void ContextInfoCallbacks::getImplicitMembers(
 
   } LocalConsumer(CurDeclContext, T, Result);
 
-  lookupVisibleMemberDecls(LocalConsumer, MetatypeType::get(T), CurDeclContext,
+  lookupVisibleMemberDecls(LocalConsumer, MetatypeType::get(T),
+                           Loc, CurDeclContext,
                            /*includeInstanceMembers=*/false,
                            /*includeDerivedRequirements*/false,
                            /*includeProtocolExtensionMembers*/true);

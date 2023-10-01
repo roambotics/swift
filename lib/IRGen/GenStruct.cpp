@@ -234,11 +234,11 @@ namespace {
       return fieldInfo.getStructIndex();
     }
 
-    Optional<unsigned> getFieldIndexIfNotEmpty(IRGenModule &IGM,
-                                               VarDecl *field) const {
+    llvm::Optional<unsigned> getFieldIndexIfNotEmpty(IRGenModule &IGM,
+                                                     VarDecl *field) const {
       auto &fieldInfo = getFieldInfo(field);
       if (fieldInfo.isEmpty())
-        return None;
+        return llvm::None;
       return fieldInfo.getStructIndex();
     }
 
@@ -416,7 +416,8 @@ namespace {
       //   return fields[0];
       // }
 
-      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(fields, T, getBestKnownAlignment().getValue());
+      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(
+          fields, T, getBestKnownAlignment().getValue(), *this);
     }
 
     void initializeFromParams(IRGenFunction &IGF, Explosion &params,
@@ -436,10 +437,10 @@ namespace {
     }
 
     llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const {
-      return None;
+      return llvm::None;
     }
     llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF, SILType T) const {
-      return None;
+      return llvm::None;
     }
     MemberAccessStrategy
     getNonFixedFieldAccessStrategy(IRGenModule &IGM, SILType T,
@@ -533,9 +534,11 @@ namespace {
       destroy(IGF, src, T, isOutlined);
     }
 
-    llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const { return None; }
+    llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const {
+      return llvm::None;
+    }
     llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF, SILType T) const {
-      return None;
+      return llvm::None;
     }
     MemberAccessStrategy
     getNonFixedFieldAccessStrategy(IRGenModule &IGM, SILType T,
@@ -610,7 +613,7 @@ namespace {
           /*callee=*/ParameterConvention::Direct_Unowned,
           /*params*/ {ptrParam},
           /*yields*/ {}, /*results*/ {result},
-          /*error*/ None,
+          /*error*/ llvm::None,
           /*pattern subs*/ SubstitutionMap(),
           /*invocation subs*/ SubstitutionMap(), IGF.IGM.Context);
     }
@@ -720,11 +723,8 @@ namespace {
       }
       bool canThrow = false;
       if (IGF.IGM.isForeignExceptionHandlingEnabled()) {
-        if (auto *fpt =
-                destructor->getType()->getAs<clang::FunctionProtoType>()) {
-          if (!fpt->isNothrow())
-            canThrow = true;
-        }
+        if (!IGF.IGM.isCxxNoThrow(destructor, /*defaultNoThrow=*/true))
+          canThrow = true;
       }
       if (canThrow) {
         IGF.createExceptionTrapScope([&](llvm::BasicBlock *invokeNormalDest,
@@ -765,7 +765,8 @@ namespace {
         return fields[0];
       }
 
-      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(fields, T, getBestKnownAlignment().getValue());
+      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(
+          fields, T, getBestKnownAlignment().getValue(), *this);
     }
 
     void initializeFromParams(IRGenFunction &IGF, Explosion &params,
@@ -852,9 +853,11 @@ namespace {
                                                          isOutlined);
     }
 
-    llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const { return None; }
+    llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const {
+      return llvm::None;
+    }
     llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF, SILType T) const {
-      return None;
+      return llvm::None;
     }
     MemberAccessStrategy
     getNonFixedFieldAccessStrategy(IRGenModule &IGM, SILType T,
@@ -916,12 +919,13 @@ namespace {
             field.getTypeInfo().buildTypeLayoutEntry(IGM, fieldTy, useStructLayouts));
       }
 
-      if (fields.size() == 1 && isFixedSize() &&
-          getBestKnownAlignment() == *fields[0]->fixedAlignment(IGM)) {
-        return fields[0];
-      }
+      // if (fields.size() == 1 && isFixedSize() &&
+      //     getBestKnownAlignment() == *fields[0]->fixedAlignment(IGM)) {
+      //   return fields[0];
+      // }
 
-      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(fields, T, getBestKnownAlignment().getValue());
+      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(
+          fields, T, getBestKnownAlignment().getValue(), *this);
     }
 
     void initializeFromParams(IRGenFunction &IGF, Explosion &params,
@@ -930,10 +934,10 @@ namespace {
       LoadableStructTypeInfo::initialize(IGF, params, addr, isOutlined);
     }
     llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const {
-      return None;
+      return llvm::None;
     }
     llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF, SILType T) const {
-      return None;
+      return llvm::None;
     }
     MemberAccessStrategy
     getNonFixedFieldAccessStrategy(IRGenModule &IGM, SILType T,
@@ -986,6 +990,35 @@ namespace {
         return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
       }
 
+      auto decl = T.getASTType()->getStructOrBoundGenericStruct();
+      auto rawLayout = decl->getAttrs().getAttribute<RawLayoutAttr>();
+
+      // If we have a raw layout struct who is fixed size, it means the
+      // layout of the struct is fully concrete.
+      if (rawLayout) {
+        // Defer to this fixed type info for type layout if the raw layout
+        // specifies size and alignment.
+        if (rawLayout->getSizeAndAlignment()) {
+          return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
+        }
+
+        auto likeType = rawLayout->getResolvedLikeType(decl)->getCanonicalType();
+        SILType loweredLikeType = IGM.getLoweredType(likeType);
+
+        // The given struct type T that we're building is fully concrete, but
+        // our like type is still in terms of the potential archetype of the
+        // type.
+        auto subs = T.getASTType()->getContextSubstitutionMap(
+          IGM.getSwiftModule(), decl);
+
+        loweredLikeType = loweredLikeType.subst(IGM.getSILModule(), subs);
+
+        // Array like raw layouts are still handled correctly even though the
+        // type layout entry is only that of the like type.
+        return IGM.getTypeInfo(loweredLikeType)
+            .buildTypeLayoutEntry(IGM, loweredLikeType, useStructLayouts);
+      }
+
       std::vector<TypeLayoutEntry *> fields;
       for (auto &field : getFields()) {
         auto fieldTy = field.getType(IGM, T);
@@ -999,14 +1032,15 @@ namespace {
       //   return fields[0];
       // }
 
-      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(fields, T, getBestKnownAlignment().getValue());
+      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(
+          fields, T, getBestKnownAlignment().getValue(), *this);
     }
 
     llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const {
-      return None;
+      return llvm::None;
     }
     llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF, SILType T) const {
-      return None;
+      return llvm::None;
     }
     MemberAccessStrategy
     getNonFixedFieldAccessStrategy(IRGenModule &IGM, SILType T,
@@ -1077,6 +1111,35 @@ namespace {
         return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
       }
 
+      auto decl = T.getASTType()->getStructOrBoundGenericStruct();
+      auto rawLayout = decl->getAttrs().getAttribute<RawLayoutAttr>();
+
+      // If we have a raw layout struct who is non-fixed size, it means the
+      // layout of the struct is dependent on the archetype of the thing it's
+      // like.
+      if (rawLayout) {
+        // Note: We don't have to handle the size and alignment case here for
+        // raw layout because those are always fixed, so only dependent layouts
+        // will be non-fixed.
+
+        auto likeType = rawLayout->getResolvedLikeType(decl)->getCanonicalType();
+        SILType loweredLikeType = IGM.getLoweredType(likeType);
+
+        // The given struct type T that we're building may be in a generic
+        // environment that is different than that which was built our
+        // resolved rawLayout like type. Map our like type into the given
+        // environment.
+        auto subs = T.getASTType()->getContextSubstitutionMap(
+          IGM.getSwiftModule(), decl);
+
+        loweredLikeType = loweredLikeType.subst(IGM.getSILModule(), subs);
+
+        // Array like raw layouts are still handled correctly even though the
+        // type layout entry is only that of the like type.
+        return IGM.getTypeInfo(loweredLikeType)
+            .buildTypeLayoutEntry(IGM, loweredLikeType, useStructLayouts);
+      }
+
       std::vector<TypeLayoutEntry *> fields;
       for (auto &field : getFields()) {
         auto fieldTy = field.getType(IGM, T);
@@ -1090,7 +1153,8 @@ namespace {
       //   return fields[0];
       // }
 
-      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(fields, T, getBestKnownAlignment().getValue());
+      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(
+          fields, T, getBestKnownAlignment().getValue(), *this);
     }
 
     // We have an indirect schema.
@@ -1238,8 +1302,7 @@ namespace {
     }
 
     StructLayout performLayout(ArrayRef<const TypeInfo *> fieldTypes) {
-      return StructLayout(IGM, TheStruct->getAnyNominal(),
-                          LayoutKind::NonHeapObject,
+      return StructLayout(IGM, TheStruct, LayoutKind::NonHeapObject,
                           LayoutStrategy::Optimal, fieldTypes, StructTy);
     }
   };
@@ -1550,9 +1613,9 @@ irgen::getPhysicalStructMemberAccessStrategy(IRGenModule &IGM,
   FOR_STRUCT_IMPL(IGM, baseType, getFieldAccessStrategy, baseType, field);
 }
 
-Optional<unsigned> irgen::getPhysicalStructFieldIndex(IRGenModule &IGM,
-                                                      SILType baseType,
-                                                      VarDecl *field) {
+llvm::Optional<unsigned> irgen::getPhysicalStructFieldIndex(IRGenModule &IGM,
+                                                            SILType baseType,
+                                                            VarDecl *field) {
   FOR_STRUCT_IMPL(IGM, baseType, getFieldIndexIfNotEmpty, field);
 }
 
@@ -1563,7 +1626,8 @@ const TypeInfo *irgen::getPhysicalStructFieldTypeInfo(IRGenModule &IGM,
 }
 
 void IRGenModule::emitStructDecl(StructDecl *st) {
-  if (!IRGen.hasLazyMetadata(st)) {
+  if (!IRGen.hasLazyMetadata(st) &&
+      !st->getASTContext().LangOpts.hasFeature(Feature::Embedded)) {
     emitStructMetadata(*this, st);
     emitFieldDescriptor(st);
   }
@@ -1572,6 +1636,9 @@ void IRGenModule::emitStructDecl(StructDecl *st) {
 }
 
 void IRGenModule::maybeEmitOpaqueTypeDecl(OpaqueTypeDecl *opaque) {
+  if (!opaque->isAvailableDuringLowering())
+    return;
+
   if (IRGen.Opts.EnableAnonymousContextMangledNames) {
     // If we're emitting anonymous context mangled names for debuggability,
     // then emit all opaque type descriptors and make them runtime-discoverable

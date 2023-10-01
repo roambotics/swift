@@ -585,7 +585,7 @@ Expr *TypeChecker::buildCheckedRefExpr(VarDecl *value, DeclContext *UseDC,
                                        DeclNameLoc loc, bool Implicit) {
   auto type = constraints::ConstraintSystem::getUnopenedTypeOfReference(
       value, Type(), UseDC,
-      [&](VarDecl *var) -> Type { return value->getType(); });
+      [&](VarDecl *var) -> Type { return value->getTypeInContext(); });
   auto semantics = value->getAccessSemanticsFromContext(UseDC,
                                                        /*isAccessOnSelf*/false);
   return new (value->getASTContext())
@@ -615,9 +615,11 @@ static Type lookupDefaultLiteralType(const DeclContext *dc,
                                      StringRef name) {
   auto &ctx = dc->getASTContext();
   DeclNameRef nameRef(ctx.getIdentifier(name));
-  auto lookup = TypeChecker::lookupUnqualified(dc->getModuleScopeContext(),
-                                               nameRef, SourceLoc(),
-                                               defaultUnqualifiedLookupOptions);
+  auto lookup = TypeChecker::lookupUnqualified(
+      dc->getModuleScopeContext(),
+      nameRef, SourceLoc(),
+      defaultUnqualifiedLookupOptions | NameLookupFlags::ExcludeMacroExpansions
+  );
   TypeDecl *TD = lookup.getSingleTypeResult();
   if (!TD)
     return Type();
@@ -630,7 +632,7 @@ static Type lookupDefaultLiteralType(const DeclContext *dc,
   return cast<TypeAliasDecl>(TD)->getDeclaredInterfaceType();
 }
 
-static Optional<KnownProtocolKind>
+static llvm::Optional<KnownProtocolKind>
 getKnownProtocolKindIfAny(const ProtocolDecl *protocol) {
 #define EXPRESSIBLE_BY_LITERAL_PROTOCOL_WITH_NAME(Id, _, __, ___)              \
   if (protocol == TypeChecker::getProtocol(protocol->getASTContext(),          \
@@ -640,7 +642,7 @@ getKnownProtocolKindIfAny(const ProtocolDecl *protocol) {
 #include "swift/AST/KnownProtocols.def"
 #undef EXPRESSIBLE_BY_LITERAL_PROTOCOL_WITH_NAME
 
-  return None;
+  return llvm::None;
 }
 
 Type TypeChecker::getDefaultType(ProtocolDecl *protocol, DeclContext *dc) {

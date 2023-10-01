@@ -41,8 +41,6 @@ class raw_ostream;
 namespace swift {
 
 using llvm::ArrayRef;
-using llvm::Optional;
-using llvm::None;
 
 class DiagnosticEngine;
 class Evaluator;
@@ -304,6 +302,12 @@ public:
     cache.insert<Request>(request, std::move(output));
   }
 
+  template<typename Request,
+           typename std::enable_if<!Request::hasExternalCache>::type* = nullptr>
+  bool hasCachedResult(const Request &request) {
+    return cache.find_as(request) != cache.end<Request>();
+  }
+
   /// Do not introduce new callers of this function.
   template<typename Request,
            typename std::enable_if<!Request::hasExternalCache>::type* = nullptr>
@@ -337,6 +341,10 @@ private:
   /// request to the \c activeRequests stack.
   bool checkDependency(const ActiveRequest &request);
 
+  /// Note that we have finished this request, popping it from the
+  /// \c activeRequests stack.
+  void finishedRequest(const ActiveRequest &request);
+
   /// Produce the result of the request without caching.
   template<typename Request>
   llvm::Expected<typename Request::OutputType>
@@ -366,8 +374,7 @@ private:
 
     // Make sure we remove this from the set of active requests once we're
     // done.
-    assert(activeRequests.back() == activeReq);
-    activeRequests.pop_back();
+    finishedRequest(activeReq);
 
     return std::move(result);
   }

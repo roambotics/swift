@@ -72,7 +72,11 @@
 // CHECK:  }
 // CHECK-NEXT:  SWIFT_INLINE_THUNK String(const String &other) noexcept {
 // CHECK:  }
-// CHECK-NEXT:  SWIFT_INLINE_THUNK String(String &&) noexcept { abort(); }
+// CHECK-NEXT:  SWIFT_INLINE_THUNK String &operator =(const String &other) noexcept {
+// CHECK:  }
+// CHECK-NEXT:  SWIFT_INLINE_THUNK String &operator =(String &&other) = delete;
+// CHECK-NEXT:  SWIFT_INLINE_PRIVATE_HELPER String(String &&) noexcept {
+// CHECK: }
 // CHECK-NEXT:  static SWIFT_INLINE_THUNK String init() SWIFT_SYMBOL({{.*}});
 // CHECK:  SWIFT_INLINE_THUNK void append(const String& other)
 // CHECK:  SWIFT_INLINE_THUNK UTF8View getUtf8() const SWIFT_SYMBOL({{.*}});
@@ -90,21 +94,26 @@
 // CHECK-EMPTY:
 // CHECK-NEXT:  #endif
 // CHECK-NEXT: #define SWIFT_CXX_INTEROP_STRING_MIXIN
+
+// CHECK-NEXT: #pragma clang diagnostic push
+// CHECK-NEXT: #pragma clang diagnostic ignored "-Wnon-modular-include-in-framework-module"
+// CHECK-NEXT: // Allow user to find the header using additional include paths
+// CHECK-NEXT: #if __has_include(<swiftToCxx/_SwiftStdlibCxxOverlay.h>)
+// CHECK-NEXT: #include <swiftToCxx/_SwiftStdlibCxxOverlay.h>
 // CHECK-NEXT: // Look for the C++ interop support header relative to clang's resource dir:
-// CHECK-NEXT: //  '<toolchain>/usr/lib/clang/<version>/include/../../../swift/swiftToCxx'.
-// CHECK-NEXT: #if __has_include(<../../../swift/swiftToCxx/_SwiftStdlibCxxOverlay.h>)
+// CHECK-NEXT: // '<toolchain>/usr/lib/clang/<version>/include/../../../swift/swiftToCxx'.
+// CHECK-NEXT: #elif __has_include(<../../../swift/swiftToCxx/_SwiftStdlibCxxOverlay.h>)
 // CHECK-NEXT: #include <../../../swift/swiftToCxx/_SwiftStdlibCxxOverlay.h>
 // CHECK-NEXT: #elif __has_include(<../../../../../lib/swift/swiftToCxx/_SwiftStdlibCxxOverlay.h>)
-// CHECK-NEXT: //  '<toolchain>/usr/local/lib/clang/<version>/include/../../../../../lib/swift/swiftToCxx'.
+// CHECK-NEXT: // '<toolchain>/usr/local/lib/clang/<version>/include/../../../../../lib/swift/swiftToCxx'.
 // CHECK-NEXT: #include <../../../../../lib/swift/swiftToCxx/_SwiftStdlibCxxOverlay.h>
-// CHECK-NEXT: // Alternatively, allow user to find the header using additional include path into '<toolchain>/lib/swift'.
-// CHECK-NEXT: #elif __has_include(<swiftToCxx/_SwiftStdlibCxxOverlay.h>)
-// CHECK-NEXT: #include <swiftToCxx/_SwiftStdlibCxxOverlay.h>
 // CHECK-NEXT: #endif
+// CHECK-NEXT: #pragma clang diagnostic pop
 // CHECK-NEXT: private:
 
 // CHECK: class SWIFT_SYMBOL({{.*}}) UTF8View final {
-// CHECK:  SWIFT_INLINE_THUNK UTF8View(UTF8View &&) noexcept { abort(); }
+// CHECK: SWIFT_INLINE_PRIVATE_HELPER UTF8View(UTF8View &&) noexcept {
+// CHECK: }
 // CHECK-NEXT: SWIFT_INLINE_THUNK String_Index getStartIndex() const SWIFT_SYMBOL({{.*}});
 // CHECK-NEXT:   SWIFT_INLINE_THUNK String_Index getEndIndex() const SWIFT_SYMBOL({{.*}});
 // CHECK:   SWIFT_INLINE_THUNK swift::Optional<String_Index> indexOffsetByLimitedBy(const String_Index& i, swift::Int n, const String_Index& limit) const SWIFT_SYMBOL({{.*}});
@@ -114,14 +123,24 @@
 // CHECK:   SWIFT_INLINE_THUNK swift::Int getCount() const SWIFT_SYMBOL({{.*}});
 // CHECK-NEXT: private:
 
-// CHECK: #if __has_include(<../../../swift/swiftToCxx/_SwiftStdlibCxxOverlay.h>)
+// CHECK: class AnyKeyPath { } SWIFT_UNAVAILABLE_MSG("class 'AnyKeyPath' is not yet exposed to C++");
+// CHECK: class Comparable { } SWIFT_UNAVAILABLE_MSG("protocol 'Comparable' can not yet be represented in C++");
+// CHECK: class FloatingPointSign { } SWIFT_UNAVAILABLE_MSG("enum 'FloatingPointSign' is not yet exposed to C++");
+// CHECK: // Unavailable in C++: Swift global function 'abs(_:)'.
+
+// CHECK: #pragma clang diagnostic push
+// CHECK: #pragma clang diagnostic ignored "-Wnon-modular-include-in-framework-module"
+// CHECK-NEXT: // Allow user to find the header using additional include paths
+// CHECK-NEXT: #if __has_include(<swiftToCxx/_SwiftStdlibCxxOverlay.h>)
+// CHECK-NEXT: #include <swiftToCxx/_SwiftStdlibCxxOverlay.h>
+// CHECK-NEXT: // Look for the C++ interop support header relative to clang's resource dir:
+// CHECK-NEXT: // '<toolchain>/usr/lib/clang/<version>/include/../../../swift/swiftToCxx'.
+// CHECK-NEXT: #elif __has_include(<../../../swift/swiftToCxx/_SwiftStdlibCxxOverlay.h>)
 // CHECK-NEXT: #include <../../../swift/swiftToCxx/_SwiftStdlibCxxOverlay.h>
 // CHECK-NEXT: #elif __has_include(<../../../../../lib/swift/swiftToCxx/_SwiftStdlibCxxOverlay.h>)
-// CHECK-NEXT: //  '<toolchain>/usr/local/lib/clang/<version>/include/../../../../../lib/swift/swiftToCxx'.
+// CHECK-NEXT: // '<toolchain>/usr/local/lib/clang/<version>/include/../../../../../lib/swift/swiftToCxx'.
 // CHECK-NEXT: #include <../../../../../lib/swift/swiftToCxx/_SwiftStdlibCxxOverlay.h>
-// CHECK-NEXT: // Alternatively, allow user to find the header using additional include path into '<toolchain>/lib/swift'.
-// CHECK-NEXT: #elif __has_include(<swiftToCxx/_SwiftStdlibCxxOverlay.h>)
-// CHECK-NEXT: #include <swiftToCxx/_SwiftStdlibCxxOverlay.h>
 // CHECK-NEXT: #endif
+// CHECK-NEXTZ: #pragma clang diagnostic pop
 
 // CHECK: } // namespace swift

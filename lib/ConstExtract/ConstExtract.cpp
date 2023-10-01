@@ -71,13 +71,25 @@ std::string toFullyQualifiedTypeNameString(const swift::Type &Type) {
   Options.AlwaysDesugarArraySliceTypes = true;
   Options.AlwaysDesugarDictionaryTypes = true;
   Options.AlwaysDesugarOptionalTypes = true;
+  Options.PrintTypeAliasUnderlyingType = true;
+  Options.OpaqueReturnTypePrinting =
+    PrintOptions::OpaqueReturnTypePrintingMode::WithOpaqueKeyword;
   Type.print(OutputStream, Options);
   OutputStream.flush();
   return TypeNameOutput;
 }
 
+std::string toFullyQualifiedProtocolNameString(const swift::ProtocolDecl &Protocol) {
+  // Protocols cannot be nested in other declarations, so the only fully-qualified
+  // context is the declaring module name.
+  return Protocol.getParentModule()->getNameStr().str() + "." + Protocol.getNameStr().str();
+}
+
 std::string toMangledTypeNameString(const swift::Type &Type) {
-  return Mangle::ASTMangler().mangleTypeWithoutPrefix(Type);
+  auto PrintingType = Type;
+  if (Type->hasArchetype())
+    PrintingType = Type->mapTypeOutOfContext();
+  return Mangle::ASTMangler().mangleTypeWithoutPrefix(PrintingType->getCanonicalType());
 }
 
 } // namespace
@@ -184,7 +196,7 @@ static llvm::Optional<std::string> extractRawLiteral(Expr *expr) {
       break;
     }
   }
-  return None;
+  return llvm::None;
 }
 
 static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
@@ -234,17 +246,17 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
           auto elementExpr = std::get<0>(pair);
           auto elementName = std::get<1>(pair);
 
-          Optional<std::string> label =
+          llvm::Optional<std::string> label =
               elementName.empty()
-                  ? Optional<std::string>()
-                  : Optional<std::string>(elementName.str().str());
+                  ? llvm::None
+                  : llvm::Optional<std::string>(elementName.str().str());
 
           elements.push_back({label, elementExpr->getType(),
                               extractCompileTimeValue(elementExpr)});
         }
       } else {
         for (auto elementExpr : tupleExpr->getElements()) {
-          elements.push_back({Optional<std::string>(), elementExpr->getType(),
+          elements.push_back({llvm::None, elementExpr->getType(),
                               extractCompileTimeValue(elementExpr)});
         }
       }
@@ -283,7 +295,7 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
         auto declRefExpr = cast<DeclRefExpr>(fn);
         auto caseName =
             declRefExpr->getDecl()->getName().getBaseIdentifier().str().str();
-        return std::make_shared<EnumValue>(caseName, None);
+        return std::make_shared<EnumValue>(caseName, llvm::None);
       }
 
       break;
@@ -312,7 +324,11 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
 
     case ExprKind::DotSelf: {
       auto dotSelfExpr = cast<DotSelfExpr>(expr);
-      return std::make_shared<TypeValue>(dotSelfExpr->getType());
+      auto dotSelfMetaType = dotSelfExpr->getType()->getAs<AnyMetatypeType>();
+      if (dotSelfMetaType)
+        return std::make_shared<TypeValue>(dotSelfMetaType->getInstanceType());
+      else
+        break;
     }
 
     case ExprKind::UnderlyingToOpaque: {
@@ -382,23 +398,13 @@ extractPropertyWrapperAttrValues(VarDecl *propertyDecl) {
   return customAttrValues;
 }
 
-static AttrValueVector
-extractRuntimeMetadataAttrValues(VarDecl *propertyDecl) {
-  AttrValueVector customAttrValues;
-  for (auto *runtimeMetadataAttribute : propertyDecl->getRuntimeDiscoverableAttrs())
-    customAttrValues.push_back(extractAttributeValue(runtimeMetadataAttribute));
-  return customAttrValues;
-}
-
 static ConstValueTypePropertyInfo
 extractTypePropertyInfo(VarDecl *propertyDecl) {
   if (const auto binding = propertyDecl->getParentPatternBinding()) {
     if (const auto originalInit = binding->getInit(0)) {
-      if (propertyDecl->hasAttachedPropertyWrapper() ||
-          propertyDecl->hasRuntimeMetadataAttributes()) {
+      if (propertyDecl->hasAttachedPropertyWrapper()) {
         return {propertyDecl, extractCompileTimeValue(originalInit),
-                extractPropertyWrapperAttrValues(propertyDecl),
-                extractRuntimeMetadataAttrValues(propertyDecl)};
+                extractPropertyWrapperAttrValues(propertyDecl)};
       }
 
       return {propertyDecl, extractCompileTimeValue(originalInit)};
@@ -431,18 +437,18 @@ extractEnumCases(NominalTypeDecl *Decl) {
         std::vector<EnumElementParameterValue> Parameters;
         if (const ParameterList *Params = EED->getParameterList()) {
           for (const ParamDecl *Parameter : Params->getArray()) {
-            Optional<std::string> Label =
+            llvm::Optional<std::string> Label =
                 Parameter->getParameterName().empty()
-                    ? Optional<std::string>()
-                    : Optional<std::string>(
+                    ? llvm::None
+                    : llvm::Optional<std::string>(
                           Parameter->getParameterName().str().str());
 
-            Parameters.push_back({Label, Parameter->getType()});
+            Parameters.push_back({Label, Parameter->getInterfaceType()});
           }
         }
 
         if (Parameters.empty()) {
-          Elements.push_back({Name, RawValue, None});
+          Elements.push_back({Name, RawValue, llvm::None});
         } else {
           Elements.push_back({Name, RawValue, Parameters});
         }
@@ -451,7 +457,7 @@ extractEnumCases(NominalTypeDecl *Decl) {
     return Elements;
   }
 
-  return None;
+  return llvm::None;
 }
 
 ConstValueTypeInfo
@@ -684,21 +690,6 @@ void writePropertyWrapperAttributes(
   });
 }
 
-void writeRuntimeMetadataAttributes(
-    llvm::json::OStream &JSON,
-    llvm::Optional<AttrValueVector> RuntimeMetadataAttributes,
-    const ASTContext &ctx) {
-  if (!RuntimeMetadataAttributes.has_value() ||
-      RuntimeMetadataAttributes.value().empty()) {
-    return;
-  }
-
-  JSON.attributeArray("runtimeMetadataAttributes", [&] {
-    for (auto RMA : RuntimeMetadataAttributes.value())
-      writeAttributeInfo(JSON, RMA, ctx);;
-  });
-}
-
 void writeEnumCases(
     llvm::json::OStream &JSON,
     llvm::Optional<std::vector<EnumElementDeclValue>> EnumElements) {
@@ -799,46 +790,138 @@ void writeAttrInformation(llvm::json::OStream &JSON,
   });
 }
 
+void writeSubstitutedOpaqueTypeAliasDetails(
+    llvm::json::OStream &JSON, const OpaqueTypeArchetypeType &OpaqueTy) {
+  auto Signature = OpaqueTy.getDecl()->getOpaqueInterfaceGenericSignature();
+
+  JSON.attributeArray("opaqueTypeProtocolRequirements", [&] {
+    for (const auto Requirement : Signature.getRequirements()) {
+      // Ignore requirements whose subject type is that of the owner decl
+      if (!Requirement.getFirstType()->isEqual(OpaqueTy.getInterfaceType()))
+        continue;
+      if (Requirement.getKind() == RequirementKind::Conformance)
+        JSON.value(
+            toFullyQualifiedProtocolNameString(*Requirement.getProtocolDecl()));
+    }
+  });
+
+  JSON.attributeArray("opaqueTypeSameTypeRequirements", [&] {
+    for (const auto Requirement : Signature.getRequirements()) {
+      if (Requirement.getKind() == RequirementKind::SameType) {
+        auto TypeAliasType = Requirement.getFirstType();
+        auto TypeWitness = Requirement.getSecondType();
+        JSON.object([&] {
+          auto TypeAliasName = toFullyQualifiedTypeNameString(TypeAliasType);
+          if (auto DependentMemberTy =
+                  TypeAliasType->getAs<DependentMemberType>())
+            if (const auto *Assoc = DependentMemberTy->getAssocType())
+              TypeAliasName =
+                  toFullyQualifiedProtocolNameString(*Assoc->getProtocol()) +
+                  "." + DependentMemberTy->getName().str().str();
+          JSON.attribute("typeAliasName", TypeAliasName);
+          JSON.attribute("substitutedTypeName",
+                         toFullyQualifiedTypeNameString(TypeWitness));
+          JSON.attribute("substitutedMangledTypeName",
+                         toMangledTypeNameString(TypeWitness));
+        });
+      }
+    }
+  });
+}
+
+void writeAssociatedTypeAliases(llvm::json::OStream &JSON,
+                                const NominalTypeDecl &NomTypeDecl) {
+  JSON.attributeArray("associatedTypeAliases", [&] {
+    for (auto &Conformance : NomTypeDecl.getAllConformances()) {
+      Conformance->forEachTypeWitness(
+          [&](AssociatedTypeDecl *assoc, Type type, TypeDecl *typeDecl) {
+            JSON.object([&] {
+              JSON.attribute("typeAliasName", assoc->getName().str().str());
+              JSON.attribute("substitutedTypeName",
+                             toFullyQualifiedTypeNameString(type));
+              JSON.attribute("substitutedMangledTypeName",
+                             toMangledTypeNameString(type));
+              if (auto OpaqueTy = dyn_cast<OpaqueTypeArchetypeType>(type)) {
+                writeSubstitutedOpaqueTypeAliasDetails(JSON, *OpaqueTy);
+              }
+            });
+            return false;
+          });
+    }
+  });
+}
+
+void writeProperties(llvm::json::OStream &JSON,
+                     const ConstValueTypeInfo &TypeInfo,
+                     const NominalTypeDecl &NomTypeDecl) {
+  JSON.attributeArray("properties", [&] {
+    for (const auto &PropertyInfo : TypeInfo.Properties) {
+      JSON.object([&] {
+        const auto *decl = PropertyInfo.VarDecl;
+        JSON.attribute("label", decl->getName().str().str());
+        JSON.attribute("type", toFullyQualifiedTypeNameString(
+            decl->getInterfaceType()));
+        JSON.attribute("mangledTypeName", "n/a - deprecated");
+        JSON.attribute("isStatic", decl->isStatic() ? "true" : "false");
+        JSON.attribute("isComputed", !decl->hasStorage() ? "true" : "false");
+        writeLocationInformation(JSON, decl->getLoc(),
+                                 decl->getDeclContext()->getASTContext());
+        writeValue(JSON, PropertyInfo.Value);
+        writePropertyWrapperAttributes(JSON, PropertyInfo.PropertyWrappers,
+                                       decl->getASTContext());
+        writeResultBuilderInformation(JSON, &NomTypeDecl, decl);
+        writeAttrInformation(JSON, decl->getAttrs());
+      });
+    }
+  });
+}
+
+void writeConformances(llvm::json::OStream &JSON,
+                       const NominalTypeDecl &NomTypeDecl) {
+  JSON.attributeArray("conformances", [&] {
+    for (auto &Protocol : NomTypeDecl.getAllProtocols()) {
+      JSON.value(toFullyQualifiedProtocolNameString(*Protocol));
+    }
+  });
+}
+
+void writeTypeName(llvm::json::OStream &JSON, const TypeDecl &TypeDecl) {
+  JSON.attribute("typeName",
+                 toFullyQualifiedTypeNameString(
+                                 TypeDecl.getDeclaredInterfaceType()));
+  JSON.attribute("mangledTypeName",
+                 toMangledTypeNameString(TypeDecl.getDeclaredInterfaceType()));
+}
+
+void writeNominalTypeKind(llvm::json::OStream &JSON,
+                          const NominalTypeDecl &NomTypeDecl) {
+  JSON.attribute(
+      "kind",
+      NomTypeDecl.getDescriptiveKindName(NomTypeDecl.getDescriptiveKind())
+          .str());
+}
+
 bool writeAsJSONToFile(const std::vector<ConstValueTypeInfo> &ConstValueInfos,
-                       llvm::raw_fd_ostream &OS) {
+                       llvm::raw_ostream &OS) {
   llvm::json::OStream JSON(OS, 2);
   JSON.array([&] {
     for (const auto &TypeInfo : ConstValueInfos) {
+      assert(isa<NominalTypeDecl>(TypeInfo.TypeDecl) &&
+             "Expected Nominal Type Decl for a conformance");
+      const auto *NomTypeDecl = cast<NominalTypeDecl>(TypeInfo.TypeDecl);
+      const auto SourceLoc =
+          extractNearestSourceLoc(NomTypeDecl->getInnermostDeclContext());
+      const auto &Ctx = NomTypeDecl->getInnermostDeclContext()->getASTContext();
+
       JSON.object([&] {
-        const auto *TypeDecl = TypeInfo.TypeDecl;
-        JSON.attribute("typeName", toFullyQualifiedTypeNameString(
-                                       TypeDecl->getDeclaredInterfaceType()));
-        JSON.attribute(
-            "kind",
-            TypeDecl->getDescriptiveKindName(TypeDecl->getDescriptiveKind())
-                .str());
-        writeLocationInformation(
-            JSON, extractNearestSourceLoc(TypeDecl->getInnermostDeclContext()),
-            TypeDecl->getInnermostDeclContext()->getASTContext());
-        JSON.attributeArray("properties", [&] {
-          for (const auto &PropertyInfo : TypeInfo.Properties) {
-            JSON.object([&] {
-              const auto *decl = PropertyInfo.VarDecl;
-              JSON.attribute("label", decl->getName().str().str());
-              JSON.attribute("type",
-                             toFullyQualifiedTypeNameString(decl->getType()));
-              JSON.attribute("isStatic", decl->isStatic() ? "true" : "false");
-              JSON.attribute("isComputed",
-                             !decl->hasStorage() ? "true" : "false");
-              writeLocationInformation(JSON, decl->getLoc(),
-                                       decl->getDeclContext()->getASTContext());
-              writeValue(JSON, PropertyInfo.Value);
-              writePropertyWrapperAttributes(
-                  JSON, PropertyInfo.PropertyWrappers, decl->getASTContext());
-              writeRuntimeMetadataAttributes(
-                  JSON, PropertyInfo.RuntimeMetadataAttributes, decl->getASTContext());
-              writeResultBuilderInformation(JSON, TypeDecl, decl);
-              writeAttrInformation(JSON, decl->getAttrs());
-            });
-          }
-        });
+        writeTypeName(JSON, *NomTypeDecl);
+        writeNominalTypeKind(JSON, *NomTypeDecl);
+        writeLocationInformation(JSON, SourceLoc, Ctx);
+        writeConformances(JSON, *NomTypeDecl);
+        writeAssociatedTypeAliases(JSON, *NomTypeDecl);
+        writeProperties(JSON, TypeInfo, *NomTypeDecl);
         writeEnumCases(JSON, TypeInfo.EnumElements);
-        writeAttrInformation(JSON, TypeDecl->getAttrs());
+        writeAttrInformation(JSON, NomTypeDecl->getAttrs());
       });
     }
   });

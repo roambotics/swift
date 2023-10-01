@@ -32,6 +32,7 @@ namespace swift {
 namespace Lowering {
   class TypeConverter;
   class SILGenFunction;
+  class CalleeTypeInfo;
 
 /// An enum to indicate whether a protocol method requirement is satisfied by
 /// a free function, as for an operator requirement.
@@ -51,10 +52,6 @@ public:
   
   /// The Swift module we are visiting.
   ModuleDecl *SwiftModule;
-  
-  /// TopLevelSGF - The SILGenFunction used to visit top-level code, or null if
-  /// the current source file is not a script source file.
-  SILGenFunction /*nullable*/ *TopLevelSGF;
 
   /// Mapping from SILDeclRefs to emitted SILFunctions.
   llvm::DenseMap<SILDeclRef, SILFunction*> emittedFunctions;
@@ -75,9 +72,6 @@ public:
   llvm::DenseMap<VarDecl *, std::pair<SILGlobalVariable *,
                                       SILFunction *>> delayedGlobals;
 
-  /// The most recent declaration we considered for emission.
-  SILDeclRef lastEmittedFunction;
-
   /// Bookkeeping to ensure that useConformancesFrom{ObjectiveC,}Type() is
   /// only called once for each unique type, as an optimization.
   llvm::DenseSet<TypeBase *> usedConformancesFromTypes;
@@ -91,53 +85,59 @@ public:
 
   size_t anonymousSymbolCounter = 0;
 
-  Optional<SILDeclRef> StringToNSStringFn;
-  Optional<SILDeclRef> NSStringToStringFn;
-  Optional<SILDeclRef> ArrayToNSArrayFn;
-  Optional<SILDeclRef> NSArrayToArrayFn;
-  Optional<SILDeclRef> DictionaryToNSDictionaryFn;
-  Optional<SILDeclRef> NSDictionaryToDictionaryFn;
-  Optional<SILDeclRef> SetToNSSetFn;
-  Optional<SILDeclRef> NSSetToSetFn;
-  Optional<SILDeclRef> BoolToObjCBoolFn;
-  Optional<SILDeclRef> ObjCBoolToBoolFn;
-  Optional<SILDeclRef> BoolToDarwinBooleanFn;
-  Optional<SILDeclRef> DarwinBooleanToBoolFn;
-  Optional<SILDeclRef> NSErrorToErrorFn;
-  Optional<SILDeclRef> ErrorToNSErrorFn;
-  Optional<SILDeclRef> BoolToWindowsBoolFn;
-  Optional<SILDeclRef> WindowsBoolToBoolFn;
+  llvm::Optional<SILDeclRef> StringToNSStringFn;
+  llvm::Optional<SILDeclRef> NSStringToStringFn;
+  llvm::Optional<SILDeclRef> ArrayToNSArrayFn;
+  llvm::Optional<SILDeclRef> NSArrayToArrayFn;
+  llvm::Optional<SILDeclRef> DictionaryToNSDictionaryFn;
+  llvm::Optional<SILDeclRef> NSDictionaryToDictionaryFn;
+  llvm::Optional<SILDeclRef> SetToNSSetFn;
+  llvm::Optional<SILDeclRef> NSSetToSetFn;
+  llvm::Optional<SILDeclRef> BoolToObjCBoolFn;
+  llvm::Optional<SILDeclRef> ObjCBoolToBoolFn;
+  llvm::Optional<SILDeclRef> BoolToDarwinBooleanFn;
+  llvm::Optional<SILDeclRef> DarwinBooleanToBoolFn;
+  llvm::Optional<SILDeclRef> NSErrorToErrorFn;
+  llvm::Optional<SILDeclRef> ErrorToNSErrorFn;
+  llvm::Optional<SILDeclRef> BoolToWindowsBoolFn;
+  llvm::Optional<SILDeclRef> WindowsBoolToBoolFn;
 
-  Optional<ProtocolDecl*> PointerProtocol;
+  llvm::Optional<ProtocolDecl *> PointerProtocol;
 
-  Optional<ProtocolDecl*> ObjectiveCBridgeable;
-  Optional<FuncDecl*> BridgeToObjectiveCRequirement;
-  Optional<FuncDecl*> UnconditionallyBridgeFromObjectiveCRequirement;
-  Optional<AssociatedTypeDecl*> BridgedObjectiveCType;
+  llvm::Optional<ProtocolDecl *> ObjectiveCBridgeable;
+  llvm::Optional<FuncDecl *> BridgeToObjectiveCRequirement;
+  llvm::Optional<FuncDecl *> UnconditionallyBridgeFromObjectiveCRequirement;
+  llvm::Optional<AssociatedTypeDecl *> BridgedObjectiveCType;
 
-  Optional<ProtocolDecl*> BridgedStoredNSError;
-  Optional<VarDecl*> NSErrorRequirement;
+  llvm::Optional<ProtocolDecl *> BridgedStoredNSError;
+  llvm::Optional<VarDecl *> NSErrorRequirement;
 
-  Optional<ProtocolConformance *> NSErrorConformanceToError;
+  llvm::Optional<ProtocolConformance *> NSErrorConformanceToError;
 
-  Optional<FuncDecl*> AsyncLetStart;
-  Optional<FuncDecl*> AsyncLetGet;
-  Optional<FuncDecl*> AsyncLetGetThrowing;
-  Optional<FuncDecl*> EndAsyncLet;
+  llvm::Optional<FuncDecl *> AsyncLetStart;
+  llvm::Optional<FuncDecl *> AsyncLetGet;
+  llvm::Optional<FuncDecl *> AsyncLetGetThrowing;
+  llvm::Optional<FuncDecl *> EndAsyncLet;
 
-  Optional<FuncDecl*> TaskFutureGet;
-  Optional<FuncDecl*> TaskFutureGetThrowing;
+  llvm::Optional<FuncDecl *> TaskFutureGet;
+  llvm::Optional<FuncDecl *> TaskFutureGetThrowing;
 
-  Optional<FuncDecl*> RunTaskForBridgedAsyncMethod;
-  Optional<FuncDecl*> ResumeUnsafeContinuation;
-  Optional<FuncDecl*> ResumeUnsafeThrowingContinuation;
-  Optional<FuncDecl*> ResumeUnsafeThrowingContinuationWithError;
-  Optional<FuncDecl*> CheckExpectedExecutor;
+  llvm::Optional<FuncDecl *> RunTaskForBridgedAsyncMethod;
+  llvm::Optional<FuncDecl *> ResumeUnsafeContinuation;
+  llvm::Optional<FuncDecl *> ResumeUnsafeThrowingContinuation;
+  llvm::Optional<FuncDecl *> ResumeUnsafeThrowingContinuationWithError;
+  llvm::Optional<FuncDecl *> CheckExpectedExecutor;
 
-  Optional<FuncDecl *> AsyncMainDrainQueue;
-  Optional<FuncDecl *> GetMainExecutor;
-  Optional<FuncDecl *> SwiftJobRun;
-  Optional<FuncDecl *> ExitFunc;
+  llvm::Optional<FuncDecl*> CreateCheckedContinuation;
+  llvm::Optional<FuncDecl*> CreateCheckedThrowingContinuation;
+  llvm::Optional<FuncDecl*> ResumeCheckedContinuation;
+  llvm::Optional<FuncDecl*> ResumeCheckedThrowingContinuation;
+  llvm::Optional<FuncDecl*> ResumeCheckedThrowingContinuationWithError;
+
+  llvm::Optional<FuncDecl *> AsyncMainDrainQueue;
+  llvm::Optional<FuncDecl *> GetMainExecutor;
+  llvm::Optional<FuncDecl *> SwiftJobRun;
+  llvm::Optional<FuncDecl *> ExitFunc;
 
 public:
   SILGenModule(SILModule &M, ModuleDecl *SM);
@@ -170,9 +170,8 @@ public:
   /// Emit a vtable thunk for a derived method if its natural abstraction level
   /// diverges from the overridden base method. If no thunking is needed,
   /// returns a static reference to the derived method.
-  Optional<SILVTable::Entry> emitVTableMethod(ClassDecl *theClass,
-                                              SILDeclRef derived,
-                                              SILDeclRef base);
+  llvm::Optional<SILVTable::Entry>
+  emitVTableMethod(ClassDecl *theClass, SILDeclRef derived, SILDeclRef base);
 
   /// True if a function has been emitted for a given SILDeclRef.
   bool hasFunction(SILDeclRef constant);
@@ -190,10 +189,9 @@ public:
   /// implementation function for an ObjC API that was imported
   /// as `async` in Swift.
   SILFunction *getOrCreateForeignAsyncCompletionHandlerImplFunction(
-      CanSILFunctionType blockType, CanType continuationTy,
-      AbstractionPattern origFormalType, CanGenericSignature sig,
-      ForeignAsyncConvention convention,
-      Optional<ForeignErrorConvention> foreignError);
+      CanSILFunctionType blockType, CanType blockStorageType,
+      CanType continuationType, AbstractionPattern origFormalType,
+      CanGenericSignature sig, CalleeTypeInfo &calleeInfo);
 
   /// Determine whether the given class has any instance variables that
   /// need to be destroyed.
@@ -266,6 +264,8 @@ public:
   // Visitors for top-level forms
   //===--------------------------------------------------------------------===//
 
+  void visit(Decl *D);
+
   // These are either not allowed at global scope or don't require
   // code emission.
   void visitImportDecl(ImportDecl *d) {}
@@ -287,7 +287,7 @@ public:
 
   void visitFuncDecl(FuncDecl *fd);
   void visitPatternBindingDecl(PatternBindingDecl *vd);
-  void visitTopLevelCodeDecl(TopLevelCodeDecl *td);
+  void visitTopLevelCodeDecl(TopLevelCodeDecl *td) {}
   void visitIfConfigDecl(IfConfigDecl *icd);
   void visitPoundDiagnosticDecl(PoundDiagnosticDecl *PDD);
   void visitNominalTypeDecl(NominalTypeDecl *ntd);
@@ -297,6 +297,9 @@ public:
   void visitMissingDecl(MissingDecl *d);
   void visitMacroDecl(MacroDecl *d);
   void visitMacroExpansionDecl(MacroExpansionDecl *d);
+
+  void emitEntryPoint(SourceFile *SF);
+  void emitEntryPoint(SourceFile *SF, SILFunction *TopLevel);
 
   void emitAbstractFuncDecl(AbstractFunctionDecl *AFD);
 
@@ -308,6 +311,10 @@ public:
 
   /// Emits the function definition for a given SILDeclRef.
   void emitFunctionDefinition(SILDeclRef constant, SILFunction *f);
+
+  /// Emit a function now, if it's externally usable or has been referenced in
+  /// the current TU, or remember how to emit it later if not.
+  void emitOrDelayFunction(SILDeclRef constant);
 
   /// Generates code for the given closure expression and adds the
   /// SILFunction to the current SILModule under the name SILDeclRef(ce).
@@ -349,6 +356,11 @@ public:
 
   /// Emits a thunk from an actor function to a potentially distributed call.
   void emitDistributedThunk(SILDeclRef thunk);
+
+  /// Returns true if the given declaration must be referenced through a
+  /// back deployment thunk in a context with the given resilience expansion.
+  bool requiresBackDeploymentThunk(ValueDecl *decl,
+                                   ResilienceExpansion expansion);
 
   /// Emits a thunk that calls either the original function if it is available
   /// or otherwise calls a fallback variant of the function that was emitted
@@ -457,6 +469,9 @@ public:
                                     SILFunction *jvp, SILFunction *vjp,
                                     const DeclAttribute *diffAttr);
 
+  /// Emit a deinit table for a noncopyable type.
+  void emitNonCopyableTypeDeinitTable(NominalTypeDecl *decl);
+
   /// Known functions for bridging.
   SILDeclRef getStringToNSStringFn();
   SILDeclRef getNSStringToStringFn();
@@ -542,6 +557,17 @@ public:
   /// Retrieve the _Concurrency._checkExpectedExecutor intrinsic.
   FuncDecl *getCheckExpectedExecutor();
 
+  /// Retrieve the _Concurrency._createCheckedContinuation intrinsic.
+  FuncDecl *getCreateCheckedContinuation();
+  /// Retrieve the _Concurrency._createCheckedThrowingContinuation intrinsic.
+  FuncDecl *getCreateCheckedThrowingContinuation();
+  /// Retrieve the _Concurrency._resumeCheckedContinuation intrinsic.
+  FuncDecl *getResumeCheckedContinuation();
+  /// Retrieve the _Concurrency._resumeCheckedThrowingContinuation intrinsic.
+  FuncDecl *getResumeCheckedThrowingContinuation();
+  /// Retrieve the _Concurrency._resumeCheckedThrowingContinuationWithError intrinsic.
+  FuncDecl *getResumeCheckedThrowingContinuationWithError();
+
   /// Retrieve the _Concurrency._asyncMainDrainQueue intrinsic.
   FuncDecl *getAsyncMainDrainQueue();
   /// Retrieve the _Concurrency._getMainExecutor intrinsic.
@@ -593,11 +619,6 @@ public:
   /// mentioned by the given type.
   void useConformancesFromObjectiveCType(CanType type);
 
-  /// Emit a `mark_function_escape` instruction for top-level code when a
-  /// function or closure at top level refers to script globals.
-  void emitMarkFunctionEscapeForTopLevelCodeGlobals(SILLocation loc,
-                                                    CaptureInfo captureInfo);
-
   /// Map the substitutions for the original declaration to substitutions for
   /// the overridden declaration.
   static SubstitutionMap mapSubstitutionsForWitnessOverride(
@@ -609,6 +630,9 @@ public:
   void tryEmitPropertyDescriptor(AbstractStorageDecl *decl);
 
 private:
+  /// The most recent declaration we considered for emission.
+  SILDeclRef lastEmittedFunction;
+
   /// Emit the deallocator for a class that uses the objc allocator.
   void emitObjCAllocatorDestructor(ClassDecl *cd, DestructorDecl *dd);
 };

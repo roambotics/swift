@@ -8,12 +8,20 @@
 
 swift_compiler_sources(Optimizer
   AssumeSingleThreaded.swift
+  AsyncDemotion.swift
   CleanupDebugSteps.swift
   ComputeEscapeEffects.swift
   ComputeSideEffects.swift
+  DeadStoreElimination.swift
+  InitializeStaticGlobals.swift
+  LetPropertyLowering.swift
+  ObjectOutliner.swift
   ObjCBridgingOptimization.swift
   MergeCondFails.swift
+  NamedReturnValueOptimization.swift
+  RedundantLoadElimination.swift
   ReleaseDevirtualizer.swift
   SimplificationPasses.swift
   StackPromotion.swift
+  StripObjectHeaders.swift
 )

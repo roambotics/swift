@@ -1,13 +1,7 @@
-// RUN: %target-run-simple-swift(-enable-experimental-feature VariadicGenerics -Xfrontend -disable-concrete-type-metadata-mangled-name-accessors)
-// RUN: %target-run-simple-swift(-enable-experimental-feature VariadicGenerics)
-
-// FIXME: Fix the optimizer
-// REQUIRES: swift_test_mode_optimize_none
+// RUN: %target-run-simple-swift(-Xfrontend -disable-concrete-type-metadata-mangled-name-accessors -Xfrontend -disable-availability-checking)
+// RUN: %target-run-simple-swift(-Xfrontend -disable-availability-checking)
 
 // REQUIRES: executable_test
-
-// Because of -enable-experimental-feature VariadicGenerics
-// REQUIRES: asserts
 
 // UNSUPPORTED: use_os_stdlib
 // UNSUPPORTED: back_deployment_runtime
@@ -24,6 +18,22 @@ public struct Outer<each U> {
   public struct Inner<each V> {}
 
   public struct InnerSameShape<each V> where (repeat (each U, each V)): Any {}
+}
+
+func makeMetatype<each T>(_: repeat (each T).Type) -> Any.Type {
+  return Outer<repeat each T>.self
+}
+
+func blackHole<T>(_: T) {}
+
+types.test("OuterRepeated") {
+  // Instantiate a type containing type parameters to avoid caching
+  blackHole(makeMetatype())
+  blackHole(makeMetatype())
+  blackHole(makeMetatype(Int.self))
+  blackHole(makeMetatype(Int.self))
+  blackHole(makeMetatype(String.self, Substring.self))
+  blackHole(makeMetatype(String.self, Substring.self))
 }
 
 types.test("Outer") {
@@ -91,7 +101,7 @@ types.test("LayoutReq") {
 }
 
 public struct OuterSeq<each T: Sequence> {
-  public struct InnerSeq<each U: Sequence> where each T.Element == each U.Element {}
+  public struct InnerSeq<each U: Sequence> where repeat (each T).Element == (each U).Element {}
 }
 
 types.test("SameTypeReq") {

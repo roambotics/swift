@@ -95,9 +95,10 @@ class MoveOnlyAddressCheckerTesterPass : public SILFunctionTransform {
     auto *poa = getAnalysis<PostOrderAnalysis>();
 
     DiagnosticEmitter diagnosticEmitter(fn);
-    SmallSetVector<MarkMustCheckInst *, 32> moveIntroducersToProcess;
-    searchForCandidateAddressMarkMustChecks(fn, moveIntroducersToProcess,
-                                            diagnosticEmitter);
+    SmallSetVector<MarkUnresolvedNonCopyableValueInst *, 32>
+        moveIntroducersToProcess;
+    searchForCandidateAddressMarkUnresolvedNonCopyableValueInsts(
+        fn, moveIntroducersToProcess, diagnosticEmitter);
 
     LLVM_DEBUG(llvm::dbgs()
                << "Emitting diagnostic when checking for mark must check inst: "
@@ -105,7 +106,6 @@ class MoveOnlyAddressCheckerTesterPass : public SILFunctionTransform {
                << '\n');
 
     bool madeChange = false;
-    unsigned diagCount = 0;
     if (moveIntroducersToProcess.empty()) {
       LLVM_DEBUG(llvm::dbgs() << "No move introducers found?!\n");
     } else {
@@ -113,12 +113,11 @@ class MoveOnlyAddressCheckerTesterPass : public SILFunctionTransform {
       MoveOnlyAddressChecker checker{getFunction(), diagnosticEmitter,
                                      allocator, domTree, poa};
       madeChange = checker.check(moveIntroducersToProcess);
-      diagCount = checker.diagnosticEmitter.getDiagnosticCount();
     }
 
     // If we did not emit any diagnostics, emit a diagnostic if we missed any
     // copies.
-    if (!diagCount) {
+    if (!diagnosticEmitter.emittedDiagnostic()) {
       emitCheckerMissedCopyOfNonCopyableTypeErrors(getFunction(),
                                                    diagnosticEmitter);
     }

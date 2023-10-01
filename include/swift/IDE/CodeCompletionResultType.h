@@ -28,8 +28,12 @@ enum class CustomAttributeKind : uint8_t {
   ResultBuilder = 1 << 1,
   /// A type that can be used as a global actor.
   GlobalActor = 1 << 2,
-  /// A macro can be used as a custom attribute.
-  Macro = 1 << 3,
+  /// A macro that can be used on variables or subscripts.
+  VarMacro = 1 << 3,
+  /// A macro that can be used on any type context.
+  ContextMacro = 1 << 4,
+  /// A macro that can be used on any declaration.
+  DeclMacro = 1 << 5,
 };
 
 /// The expected contextual type(s) for code-completion.
@@ -68,6 +72,23 @@ public:
         PossibleTypes.push_back(T);
       }
     }
+  }
+
+  /// Form a union of this expected type context with \p Other.
+  ///
+  /// Any possible type from either type context will be considered a possible
+  /// type in the merged type context.
+  void merge(const ExpectedTypeContext &Other) {
+    PossibleTypes.append(Other.PossibleTypes);
+
+    // We can't merge ideal types. If they are different, setting to a null type
+    // is the best thing we can do.
+    if (!IdealType || !Other.IdealType || !IdealType->isEqual(Other.IdealType)) {
+      IdealType = Type();
+    }
+    IsImplicitSingleExpressionReturn |= Other.IsImplicitSingleExpressionReturn;
+    PreferNonVoid &= Other.PreferNonVoid;
+    ExpectedCustomAttributeKinds |= Other.ExpectedCustomAttributeKinds;
   }
 
   Type getIdealType() const { return IdealType; }

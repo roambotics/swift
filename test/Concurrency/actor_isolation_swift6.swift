@@ -1,4 +1,6 @@
-// RUN: %target-typecheck-verify-swift -disable-availability-checking -warn-concurrency -swift-version 6
+// RUN: %target-swift-frontend -disable-availability-checking -warn-concurrency -swift-version 6 -emit-sil -o /dev/null -verify %s
+// RUN: %target-swift-frontend -disable-availability-checking -warn-concurrency -swift-version 6 -emit-sil -o /dev/null -verify -enable-experimental-feature SendNonSendable %s
+
 // REQUIRES: concurrency
 // REQUIRES: asserts
 
@@ -60,6 +62,7 @@ func checkIsolationValueType(_ formance: InferredFromConformance,
 
   // these do need await, regardless of reference or value type
   _ = await (formance as any MainCounter).counter
+  // expected-warning@-1 {{non-sendable type 'any MainCounter' passed in implicitly asynchronous call to main actor-isolated property 'counter' cannot cross actor boundary}}
   _ = await ext[1]
   _ = await formance.ticker
   _ = await ext.polygon

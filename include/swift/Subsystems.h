@@ -17,10 +17,13 @@
 #ifndef SWIFT_SUBSYSTEMS_H
 #define SWIFT_SUBSYSTEMS_H
 
+#include "swift/AST/TBDGenRequests.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/OptionSet.h"
 #include "swift/Basic/PrimarySpecificPaths.h"
 #include "swift/Basic/Version.h"
+#include "swift/Frontend/Frontend.h"
+#include "swift/SIL/SILDeclRef.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -35,6 +38,9 @@ namespace llvm {
   class Module;
   class TargetOptions;
   class TargetMachine;
+  namespace vfs {
+    class OutputBackend;
+  }
 }
 
 namespace swift {
@@ -182,6 +188,14 @@ namespace swift {
                      const SILOptions &options,
                      const IRGenOptions *irgenOptions = nullptr);
 
+  /// Turn the given module into SIL IR.
+  ///
+  /// The module must contain source files. The optimizer will assume that the
+  /// SIL of all files in the module is present in the SILModule.
+  std::unique_ptr<SILModule>
+  performASTLowering(CompilerInstance &CI,
+                     llvm::SmallVector<SymbolSource, 1> Sources);
+
   /// Turn a source file into SIL IR.
   std::unique_ptr<SILModule>
   performASTLowering(FileUnit &SF, Lowering::TypeConverter &TC,
@@ -276,6 +290,7 @@ namespace swift {
   /// \param Module LLVM module to code gen, required.
   /// \param TargetMachine target of code gen, required.
   /// \param OutputFilename Filename for output.
+  /// \param Backend OutputBackend for writing output.
   bool performLLVM(const IRGenOptions &Opts,
                    DiagnosticEngine &Diags,
                    llvm::sys::Mutex *DiagMutex,
@@ -283,6 +298,7 @@ namespace swift {
                    llvm::Module *Module,
                    llvm::TargetMachine *TargetMachine,
                    StringRef OutputFilename,
+                   llvm::vfs::OutputBackend &Backend,
                    UnifiedStatsReporter *Stats);
 
   /// Dump YAML describing all fixed-size types imported from the given module.

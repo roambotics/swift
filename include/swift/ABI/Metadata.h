@@ -56,18 +56,33 @@ template <typename Runtime> struct TargetOpaqueMetadata;
 template <typename Runtime> struct TargetValueMetadata;
 template <typename Runtime> struct TargetForeignClassMetadata;
 template <typename Runtime> struct TargetForeignReferenceTypeMetadata;
-template <typename Runtime> struct TargetContextDescriptor;
-template <typename Runtime> class TargetTypeContextDescriptor;
-template <typename Runtime> class TargetClassDescriptor;
-template <typename Runtime> class TargetValueTypeDescriptor;
-template <typename Runtime> class TargetEnumDescriptor;
-template <typename Runtime> class TargetStructDescriptor;
+template <typename Runtime>
+struct swift_ptrauth_struct_context_descriptor(ContextDescriptor)
+    TargetContextDescriptor;
+template <typename Runtime>
+class swift_ptrauth_struct_context_descriptor(TypeContextDescriptor)
+    TargetTypeContextDescriptor;
+template <typename Runtime>
+class swift_ptrauth_struct_context_descriptor(ClassDescriptor)
+    TargetClassDescriptor;
+template <typename Runtime>
+class swift_ptrauth_struct_context_descriptor(ValueTypeDescriptor)
+    TargetValueTypeDescriptor;
+template <typename Runtime>
+class swift_ptrauth_struct_context_descriptor(EnumDescriptor)
+    TargetEnumDescriptor;
+template <typename Runtime>
+class swift_ptrauth_struct_context_descriptor(StructDescriptor)
+    TargetStructDescriptor;
 template <typename Runtime> struct TargetGenericMetadataPattern;
 template <typename Runtime> struct TargetProtocolConformanceDescriptor;
 
 struct HeapObject;
 class WeakReference;
 struct UnownedReference;
+
+using HeapObjectDestroyer =
+  SWIFT_CC(swift) void(SWIFT_CONTEXT HeapObject *);
 
 /// The result of requesting type metadata.  Generally the return value of
 /// a function.
@@ -309,12 +324,8 @@ public:
 
   const uint8_t *getLayoutString() const {
     assert(hasLayoutString());
-    if (isAnyClass()) {
-      return asFullMetadata(
-                 reinterpret_cast<const TargetAnyClassMetadata<Runtime> *>(
-                     this))
-          ->layoutString;
-    }
+    // Classes should not have layout strings
+    assert(!isAnyClass());
     return asFullMetadata(this)->layoutString;
   }
 
@@ -502,9 +513,6 @@ struct TargetOpaqueMetadata {
   TargetMetadata<Runtime> base;
 };
 
-using HeapObjectDestroyer =
-  SWIFT_CC(swift) void(SWIFT_CONTEXT HeapObject *);
-
 /// The prefix on a heap metadata.
 template <typename Runtime>
 struct TargetHeapMetadataHeaderPrefix {
@@ -549,6 +557,14 @@ struct TargetHeapMetadata : TargetMetadata<Runtime> {
     : TargetMetadata<Runtime>(kind) {}
   constexpr TargetHeapMetadata(TargetAnyClassMetadataObjCInterop<Runtime> *isa)
     : TargetMetadata<Runtime>(isa) {}
+
+  HeapObjectDestroyer *getHeapObjectDestroyer() const {
+    return asFullMetadata(this)->destroy;
+  }
+
+  void setHeapObjectDestroyer(HeapObjectDestroyer *destroy) {
+    asFullMetadata(this)->destroy = destroy;
+  }
 };
 using HeapMetadata = TargetHeapMetadata<InProcess>;
 
@@ -1632,7 +1648,9 @@ TargetTupleTypeMetadata<Runtime>::getOffsetToNumElements() -> StoredSize {
   return offsetof(TargetTupleTypeMetadata<Runtime>, NumElements);
 }
 
-template <typename Runtime> struct TargetProtocolDescriptor;
+template <typename Runtime>
+struct swift_ptrauth_struct_context_descriptor(ProtocolDescriptor)
+    TargetProtocolDescriptor;
 
 /// A protocol requirement descriptor. This describes a single protocol
 /// requirement in a protocol descriptor. The index of the requirement in
@@ -1660,7 +1678,9 @@ struct TargetProtocolRequirement {
 
 using ProtocolRequirement = TargetProtocolRequirement<InProcess>;
 
-template<typename Runtime> struct TargetProtocolDescriptor;
+template <typename Runtime>
+struct swift_ptrauth_struct_context_descriptor(ProtocolDescriptor)
+    TargetProtocolDescriptor;
 using ProtocolDescriptor = TargetProtocolDescriptor<InProcess>;
 
 template<template <typename Runtime> class ObjCInteropKind, unsigned PointerSize>
@@ -2596,6 +2616,7 @@ struct TargetProtocolConformanceDescriptor final
              TargetProtocolConformanceDescriptor<Runtime>,
              TargetRelativeContextPointer<Runtime>,
              TargetGenericRequirementDescriptor<Runtime>,
+             GenericPackShapeDescriptor,
              TargetResilientWitnessesHeader<Runtime>,
              TargetResilientWitness<Runtime>,
              TargetGenericWitnessTable<Runtime>> {
@@ -2604,6 +2625,7 @@ struct TargetProtocolConformanceDescriptor final
                              TargetProtocolConformanceDescriptor<Runtime>,
                              TargetRelativeContextPointer<Runtime>,
                              TargetGenericRequirementDescriptor<Runtime>,
+                             GenericPackShapeDescriptor,
                              TargetResilientWitnessesHeader<Runtime>,
                              TargetResilientWitness<Runtime>,
                              TargetGenericWitnessTable<Runtime>>;
@@ -2695,10 +2717,17 @@ public:
 
   /// Retrieve the conditional requirements that must also be
   /// satisfied
-  llvm::ArrayRef<GenericRequirementDescriptor>
+  llvm::ArrayRef<TargetGenericRequirementDescriptor<Runtime>>
   getConditionalRequirements() const {
-    return {this->template getTrailingObjects<GenericRequirementDescriptor>(),
+    return {this->template getTrailingObjects<TargetGenericRequirementDescriptor<Runtime>>(),
             Flags.getNumConditionalRequirements()};
+  }
+
+  /// Retrieve the pack shape descriptors for the conditional pack requirements.
+  llvm::ArrayRef<GenericPackShapeDescriptor>
+  getConditionalPackShapeDescriptors() const {
+    return {this->template getTrailingObjects<GenericPackShapeDescriptor>(),
+            Flags.getNumConditionalPackShapeDescriptors()};
   }
 
   /// Get the directly-referenced witness table pattern, which may also
@@ -2759,6 +2788,10 @@ private:
     return Flags.getNumConditionalRequirements();
   }
 
+  size_t numTrailingObjects(OverloadToken<GenericPackShapeDescriptor>) const {
+    return Flags.getNumConditionalPackShapeDescriptors();
+  }
+
   size_t numTrailingObjects(OverloadToken<ResilientWitnessesHeader>) const {
     return Flags.hasResilientWitnesses() ? 1 : 0;
   }
@@ -2790,12 +2823,14 @@ using ExternalProtocolConformanceDescriptor = TargetProtocolConformanceDescripto
 template<template <typename Runtime> class ObjCInteropKind, unsigned PointerSize>
 using ExternalProtocolConformanceRecord = TargetProtocolConformanceRecord<External<ObjCInteropKind<RuntimeTarget<PointerSize>>>>;
 
-template<typename Runtime>
-struct TargetModuleContextDescriptor;
+template <typename Runtime>
+struct swift_ptrauth_struct_context_descriptor(ModuleContextDescriptor)
+    TargetModuleContextDescriptor;
 
 /// Base class for all context descriptors.
-template<typename Runtime>
-struct TargetContextDescriptor {
+template <typename Runtime>
+struct swift_ptrauth_struct_context_descriptor(ContextDescriptor)
+    TargetContextDescriptor {
   /// Flags describing the context, including its kind and format version.
   ContextDescriptorFlags Flags;
   
@@ -2851,8 +2886,9 @@ inline bool isCImportedModuleName(llvm::StringRef name) {
 }
 
 /// Descriptor for a module context.
-template<typename Runtime>
-struct TargetModuleContextDescriptor final : TargetContextDescriptor<Runtime> {
+template <typename Runtime>
+struct swift_ptrauth_struct_context_descriptor(ModuleContextDescriptor)
+    TargetModuleContextDescriptor final : TargetContextDescriptor<Runtime> {
   /// The module name.
   RelativeDirectPointer<const char, /*nullable*/ false> Name;
 
@@ -2892,8 +2928,9 @@ TargetContextDescriptor<Runtime>::getModuleContext() const {
 }
 
 /// Descriptor for an extension context.
-template<typename Runtime>
-struct TargetExtensionContextDescriptor final
+template <typename Runtime>
+struct swift_ptrauth_struct_context_descriptor(ExtensionContextDescriptor)
+    TargetExtensionContextDescriptor final
     : TargetContextDescriptor<Runtime>,
       TrailingGenericContextObjects<TargetExtensionContextDescriptor<Runtime>>
 {
@@ -2931,8 +2968,9 @@ struct TargetMangledContextName {
   TargetRelativeDirectPointer<Runtime, const char, /*nullable*/ false> name;
 };
 
-template<typename Runtime>
-struct TargetAnonymousContextDescriptor final
+template <typename Runtime>
+struct swift_ptrauth_struct_context_descriptor(AnonymousContextDescriptor)
+    TargetAnonymousContextDescriptor final
     : TargetContextDescriptor<Runtime>,
       TrailingGenericContextObjects<TargetAnonymousContextDescriptor<Runtime>,
                                     TargetGenericContextDescriptorHeader,
@@ -3012,8 +3050,9 @@ using ExternalAnonymousContextDescriptor = TargetAnonymousContextDescriptor<Exte
 /// Only Swift protocols are defined by a protocol descriptor, whereas
 /// Objective-C (including protocols defined in Swift as @objc) use the
 /// Objective-C protocol layout.
-template<typename Runtime>
-struct TargetProtocolDescriptor final
+template <typename Runtime>
+struct swift_ptrauth_struct_context_descriptor(ProtocolDescriptor)
+    TargetProtocolDescriptor final
     : TargetContextDescriptor<Runtime>,
       swift::ABI::TrailingObjects<
         TargetProtocolDescriptor<Runtime>,
@@ -3101,11 +3140,12 @@ public:
     return cd->getKind() == ContextDescriptorKind::Protocol;
   }
 };
-  
+
 /// The descriptor for an opaque type.
 template <typename Runtime>
-struct TargetOpaqueTypeDescriptor final
-  : TargetContextDescriptor<Runtime>,
+struct swift_ptrauth_struct_context_descriptor(OpaqueTypeDescriptor)
+    TargetOpaqueTypeDescriptor final
+    : TargetContextDescriptor<Runtime>,
     TrailingGenericContextObjects<TargetOpaqueTypeDescriptor<Runtime>,
                                   TargetGenericContextDescriptorHeader,
                                   RelativeDirectPointer<const char>>
@@ -3681,8 +3721,8 @@ struct TargetCanonicalSpecializedMetadatasCachingOnceToken {
 };
 
 template <typename Runtime>
-class TargetTypeContextDescriptor
-    : public TargetContextDescriptor<Runtime> {
+class swift_ptrauth_struct_context_descriptor(TypeContextDescriptor)
+    TargetTypeContextDescriptor : public TargetContextDescriptor<Runtime> {
 public:
   /// The name of the type.
   TargetRelativeDirectPointer<Runtime, const char, /*nullable*/ false> Name;
@@ -3904,7 +3944,8 @@ struct TargetObjCResilientClassStubInfo {
 };
 
 template <typename Runtime>
-class TargetClassDescriptor final
+class swift_ptrauth_struct_context_descriptor(ClassDescriptor)
+    TargetClassDescriptor final
     : public TargetTypeContextDescriptor<Runtime>,
       public TrailingGenericContextObjects<TargetClassDescriptor<Runtime>,
                               TargetTypeGenericContextDescriptorHeader,
@@ -4294,8 +4335,8 @@ public:
 using ClassDescriptor = TargetClassDescriptor<InProcess>;
 
 template <typename Runtime>
-class TargetValueTypeDescriptor
-    : public TargetTypeContextDescriptor<Runtime> {
+class swift_ptrauth_struct_context_descriptor(ValueTypeDescriptor)
+    TargetValueTypeDescriptor : public TargetTypeContextDescriptor<Runtime>{
 public:
   static bool classof(const TargetContextDescriptor<Runtime> *cd) {
     return cd->getKind() == ContextDescriptorKind::Struct ||
@@ -4305,7 +4346,8 @@ public:
 using ValueTypeDescriptor = TargetValueTypeDescriptor<InProcess>;
 
 template <typename Runtime>
-class TargetStructDescriptor final
+class swift_ptrauth_struct_context_descriptor(StructDescriptor)
+    TargetStructDescriptor final
     : public TargetValueTypeDescriptor<Runtime>,
       public TrailingGenericContextObjects<TargetStructDescriptor<Runtime>,
                             TargetTypeGenericContextDescriptorHeader,
@@ -4432,7 +4474,8 @@ public:
 using StructDescriptor = TargetStructDescriptor<InProcess>;
 
 template <typename Runtime>
-class TargetEnumDescriptor final
+class swift_ptrauth_struct_context_descriptor(EnumDescriptor)
+    TargetEnumDescriptor final
     : public TargetValueTypeDescriptor<Runtime>,
       public TrailingGenericContextObjects<TargetEnumDescriptor<Runtime>,
                             TargetTypeGenericContextDescriptorHeader,
@@ -4859,48 +4902,6 @@ public:
 };
 
 using AccessibleFunctionRecord = TargetAccessibleFunctionRecord<InProcess>;
-
-/// A single entry in an runtine discoverable attribute record
-/// that relates a type attribute is attached to a generator function.
-template <typename Runtime>
-struct TargetRuntimeDiscoverableAttributeEntry {
-  RelativeDirectPointer<const char, /*nullable*/ false> Type;
-  RelativeDirectPointer<TargetAccessibleFunctionRecord<Runtime>> Generator;
-};
-
-/// A record that relates a runtime discoverable attribute to all of the
-/// types (i.e. a nominal type, method, property etc.) it's attached to.
-template <typename Runtime>
-class RuntimeDiscoverableAttributeRecord
-    : private swift::ABI::TrailingObjects<
-          RuntimeDiscoverableAttributeRecord<Runtime>,
-          TargetRuntimeDiscoverableAttributeEntry<Runtime>> {
-  using TrailingObjects = swift::ABI::TrailingObjects<
-      RuntimeDiscoverableAttributeRecord<Runtime>,
-      ConstTargetMetadataPointer<Runtime, TargetMetadata>>;
-  friend TrailingObjects;
-
-  uint32_t flags;
-
-  /// The nominal type that describes the attribute.
-  TargetRelativeIndirectablePointer<Runtime,
-                                    TargetTypeContextDescriptor<Runtime>,
-                                    /*nullable*/ false>
-      Attribute;
-
-  /// The number of types this attribute is associated with.
-  uint32_t numEntries;
-
-public:
-  uint32_t getFlags() { return flags; }
-
-  llvm::ArrayRef<TargetRuntimeDiscoverableAttributeEntry<Runtime>>
-  getEntries() const {
-    return {this->template getTrailingObjects<
-                TargetRuntimeDiscoverableAttributeEntry<Runtime>>(),
-            numEntries};
-  }
-};
 
 enum class PackLifetime : uint8_t {
   OnStack = 0,

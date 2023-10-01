@@ -143,6 +143,16 @@ SourceRange MacroDeclScope::getSourceRangeOfThisASTNode(
   return decl->getSourceRangeIncludingAttrs();
 }
 
+SourceRange MacroDefinitionScope::getSourceRangeOfThisASTNode(
+    const bool omitAssertions) const {
+  return definition->getSourceRange();
+}
+
+SourceRange MacroExpansionDeclScope::getSourceRangeOfThisASTNode(
+    const bool omitAssertions) const {
+  return decl->getSourceRangeIncludingAttrs();
+}
+
 SourceRange
 EnumElementScope::getSourceRangeOfThisASTNode(const bool omitAssertions) const {
   return decl->getSourceRange();
@@ -350,7 +360,7 @@ SourceRange ClosureParametersScope::getSourceRangeOfThisASTNode(
   return explicitClosureExpr->getSourceRange();
 }
 
-SourceRange AttachedPropertyWrapperScope::getSourceRangeOfThisASTNode(
+SourceRange CustomAttributeScope::getSourceRangeOfThisASTNode(
     const bool omitAssertions) const {
   return attr->getRange();
 }

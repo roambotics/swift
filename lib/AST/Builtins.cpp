@@ -235,21 +235,25 @@ static const char * const GenericParamNames[] = {
 };
 
 static GenericTypeParamDecl*
-createGenericParam(ASTContext &ctx, const char *name, unsigned index) {
+createGenericParam(ASTContext &ctx, const char *name, unsigned index,
+                   bool isParameterPack = false) {
   ModuleDecl *M = ctx.TheBuiltinModule;
   Identifier ident = ctx.getIdentifier(name);
   return GenericTypeParamDecl::createImplicit(
-      &M->getMainFile(FileUnitKind::Builtin), ident, /*depth*/ 0, index);
+      &M->getMainFile(FileUnitKind::Builtin), ident, /*depth*/ 0, index,
+                      isParameterPack);
 }
 
 /// Create a generic parameter list with multiple generic parameters.
 static GenericParamList *getGenericParams(ASTContext &ctx,
-                                          unsigned numParameters) {
+                                          unsigned numParameters,
+                                          bool areParameterPacks = false) {
   assert(numParameters <= std::size(GenericParamNames));
 
   SmallVector<GenericTypeParamDecl *, 2> genericParams;
   for (unsigned i = 0; i != numParameters; ++i)
-    genericParams.push_back(createGenericParam(ctx, GenericParamNames[i], i));
+    genericParams.push_back(createGenericParam(ctx, GenericParamNames[i], i,
+                                               areParameterPacks));
 
   auto paramList = GenericParamList::create(ctx, SourceLoc(), genericParams,
                                             SourceLoc());
@@ -339,7 +343,7 @@ getBuiltinFunction(Identifier Id, ArrayRef<Type> argTypes, Type ResType) {
   DeclName Name(Context, Id, paramList);
   auto *const FD = FuncDecl::createImplicit(
       Context, StaticSpellingKind::None, Name, /*NameLoc=*/SourceLoc(),
-      /*Async=*/false, /*Throws=*/false,
+      /*Async=*/false, /*Throws=*/false, /*thrownType=*/Type(),
       /*GenericParams=*/nullptr, paramList, ResType, DC);
   FD->setAccess(AccessLevel::Public);
   return FD;
@@ -360,7 +364,7 @@ getBuiltinFunctionImpl(SynthesisContext &SC, Identifier id,
   DeclName name(SC.Context, id, params);
   auto *FD = FuncDecl::createImplicit(
       SC.Context, StaticSpellingKind::None, name, /*NameLoc=*/SourceLoc(),
-      extInfo.isAsync(), extInfo.isThrowing(),
+      extInfo.isAsync(), extInfo.isThrowing(), /*thrownType=*/Type(),
       genericParams, params, resultType, SC.DC);
   FD->setAccess(AccessLevel::Public);
   FD->setGenericSignature(signature);
@@ -446,7 +450,7 @@ getBuiltinGenericFunction(Identifier Id,
       Context, StaticSpellingKind::None, Name,
       /*NameLoc=*/SourceLoc(),
       Async,
-      Throws != BuiltinThrowsKind::None,
+      Throws != BuiltinThrowsKind::None, /*thrownType=*/Type(),
       GenericParams, paramList, ResType, DC);
 
   func->setAccess(AccessLevel::Public);
@@ -678,9 +682,11 @@ namespace {
 
   public:
     BuiltinFunctionBuilder(ASTContext &ctx, unsigned numGenericParams = 1,
-                           bool wantsAdditionalAnyObjectRequirement = false)
+                           bool wantsAdditionalAnyObjectRequirement = false,
+                           bool areParametersPacks = false)
         : Context(ctx) {
-      TheGenericParamList = getGenericParams(ctx, numGenericParams);
+      TheGenericParamList = getGenericParams(ctx, numGenericParams,
+                                             areParametersPacks);
       if (wantsAdditionalAnyObjectRequirement) {
         Requirement req(RequirementKind::Conformance,
                         TheGenericParamList->getParams()[0]->getInterfaceType(),
@@ -750,7 +756,7 @@ namespace {
       unsigned Index;
       Type build(BuiltinFunctionBuilder &builder) const {
         return builder.TheGenericParamList->getParams()[Index]
-            ->getDeclaredInterfaceType();
+                    ->getDeclaredInterfaceType();
       }
     };
     struct LambdaGenerator {
@@ -762,9 +768,19 @@ namespace {
     template <class T>
     struct MetatypeGenerator {
       T Object;
-      Optional<MetatypeRepresentation> Repr;
+      llvm::Optional<MetatypeRepresentation> Repr;
       Type build(BuiltinFunctionBuilder &builder) const {
         return MetatypeType::get(Object.build(builder), Repr);
+      }
+    };
+    template <class T>
+    struct PackExpansionGenerator {
+      T Object;
+      Type build(BuiltinFunctionBuilder &builder) const {
+        auto patternTy = Object.build(builder);
+        SmallVector<Type, 2> packs;
+        patternTy->getTypeParameterPacks(packs);
+        return PackExpansionType::get(patternTy, packs[0]);
       }
     };
   };
@@ -809,8 +825,15 @@ makeBoundGenericType(NominalTypeDecl *decl,
 
 template <class T>
 static BuiltinFunctionBuilder::MetatypeGenerator<T>
-makeMetatype(const T &object, Optional<MetatypeRepresentation> repr = None) {
+makeMetatype(const T &object,
+             llvm::Optional<MetatypeRepresentation> repr = llvm::None) {
   return { object, repr };
+}
+
+template <class T>
+static BuiltinFunctionBuilder::PackExpansionGenerator<T>
+makePackExpansion(const T &object) {
+  return { object };
 }
 
 /// Create a function with type <T> T -> ().
@@ -1244,7 +1267,7 @@ static ValueDecl *getGetObjCTypeEncodingOperation(ASTContext &Context,
 
 static ValueDecl *getAutoDiffApplyDerivativeFunction(
     ASTContext &Context, Identifier Id, AutoDiffDerivativeFunctionKind kind,
-    unsigned arity, bool throws) {
+    unsigned arity, bool throws, Type thrownType) {
   assert(arity >= 1);
   // JVP:
   //   <...T...(arity), R> (@differentiable(_forward) (...T) throws -> R, ...T)
@@ -1275,7 +1298,7 @@ static ValueDecl *getAutoDiffApplyDerivativeFunction(
                 // TODO: Use `kind.getMinimalDifferentiabilityKind()`.
                 .withDifferentiabilityKind(DifferentiabilityKind::Reverse)
                 .withNoEscape()
-                .withThrows(throws)
+                .withThrows(throws, thrownType)
                 .build();
         SmallVector<FunctionType::Param, 2> params;
         for (auto &paramGen : fnParamGens)
@@ -1308,7 +1331,8 @@ static ValueDecl *getAutoDiffApplyDerivativeFunction(
 }
 
 static ValueDecl *getAutoDiffApplyTransposeFunction(
-    ASTContext &Context, Identifier Id, unsigned arity, bool throws) {
+    ASTContext &Context, Identifier Id, unsigned arity, bool throws,
+    Type thrownType) {
   assert(arity >= 1);
   // <...T...(arity), R>
   //     (@differentiable(_linear) (...T) throws -> R, ...R.TangentVector)
@@ -1340,7 +1364,7 @@ static ValueDecl *getAutoDiffApplyTransposeFunction(
           FunctionType::ExtInfoBuilder()
               .withDifferentiabilityKind(DifferentiabilityKind::Linear)
               .withNoEscape()
-              .withThrows(throws)
+              .withThrows(throws, thrownType)
               .build();
       SmallVector<FunctionType::Param, 2> params;
       for (auto &paramGen : linearFnParamGens)
@@ -1596,10 +1620,20 @@ static ValueDecl *getBuildOrdinarySerialExecutorRef(ASTContext &ctx,
                             _executor);
 }
 
+static ValueDecl *getBuildComplexEqualitySerialExecutorRef(ASTContext &ctx,
+                                                           Identifier id) {
+  return getBuiltinFunction(ctx, id, _thin,
+                            _generics(_unrestricted,
+                              _conformsTo(_typeparam(0), _serialExecutor)),
+                            _parameters(_typeparam(0)),
+                            _executor);
+}
+
 static ValueDecl *getAutoDiffCreateLinearMapContext(ASTContext &ctx,
                                                     Identifier id) {
   return getBuiltinFunction(
-      id, {BuiltinIntegerType::getWordType(ctx)}, ctx.TheNativeObjectType);
+    ctx, id, _thin, _generics(_unrestricted), 
+    _parameters(_metatype(_typeparam(0))), _nativeObject);
 }
 
 static ValueDecl *getAutoDiffProjectTopLevelSubcontext(ASTContext &ctx,
@@ -1611,8 +1645,8 @@ static ValueDecl *getAutoDiffProjectTopLevelSubcontext(ASTContext &ctx,
 static ValueDecl *getAutoDiffAllocateSubcontext(ASTContext &ctx,
                                                 Identifier id) {
   return getBuiltinFunction(
-      id, {ctx.TheNativeObjectType, BuiltinIntegerType::getWordType(ctx)},
-      ctx.TheRawPointerType);
+      ctx, id, _thin, _generics(_unrestricted),
+      _parameters(_nativeObject, _metatype(_typeparam(0))), _rawPointer);
 }
 
 static ValueDecl *getPoundAssert(ASTContext &Context, Identifier Id) {
@@ -1870,7 +1904,7 @@ static ValueDecl *getOnceOperation(ASTContext &Context,
   auto ClangType = Context.getClangFunctionType(CFuncParams, VoidTy, Rep);
   auto Thin =
       FunctionType::ExtInfoBuilder(FunctionTypeRepresentation::CFunctionPointer,
-                                   /*throws*/ false)
+                                   /*throws*/ false, Type())
           .withClangFunctionType(ClangType)
           .build();
   auto BlockTy = FunctionType::get(CFuncParams, VoidTy, Thin);
@@ -1920,6 +1954,18 @@ static ValueDecl *getHopToActor(ASTContext &ctx, Identifier id) {
   builder.addParameter(actorParam);
   builder.addConformanceRequirement(actorParam, actorProto);
   builder.setResult(makeConcrete(TupleType::getEmpty(ctx)));
+  return builder.build(id);
+}
+
+static ValueDecl *getPackLength(ASTContext &ctx, Identifier id) {
+  BuiltinFunctionBuilder builder(ctx, /* genericParamCount */ 1,
+                                 /* anyObject */ false,
+                                 /* areParametersPack */ true);
+
+  auto paramTy = makeMetatype(makeTuple(makePackExpansion(makeGenericParam())));
+  builder.addParameter(paramTy);
+  builder.setResult(makeConcrete(BuiltinIntegerType::getWordType(ctx)));
+
   return builder.build(id);
 }
 
@@ -2506,7 +2552,7 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
             OperationName, kind, arity, throws))
       return nullptr;
     return getAutoDiffApplyDerivativeFunction(Context, Id, kind, arity,
-                                              throws);
+                                              throws, /*thrownType=*/Type());
   }
   if (OperationName.startswith("applyTranspose_")) {
     unsigned arity;
@@ -2514,7 +2560,8 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
     if (!autodiff::getBuiltinApplyTransposeConfig(
             OperationName, arity, throws))
       return nullptr;
-    return getAutoDiffApplyTransposeFunction(Context, Id, arity, throws);
+    return getAutoDiffApplyTransposeFunction(Context, Id, arity, throws,
+                                             /*thrownType=*/Type());
   }
 
   auto BV = llvm::StringSwitch<BuiltinValueKind>(OperationName)
@@ -2887,6 +2934,8 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
 
   case BuiltinValueKind::BuildOrdinarySerialExecutorRef:
     return getBuildOrdinarySerialExecutorRef(Context, Id);
+  case BuiltinValueKind::BuildComplexEqualitySerialExecutorRef:
+    return getBuildComplexEqualitySerialExecutorRef(Context, Id);
 
   case BuiltinValueKind::PoundAssert:
     return getPoundAssert(Context, Id);
@@ -2954,14 +3003,17 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
   case BuiltinValueKind::HopToActor:
     return getHopToActor(Context, Id);
 
-  case BuiltinValueKind::AutoDiffCreateLinearMapContext:
+  case BuiltinValueKind::AutoDiffCreateLinearMapContextWithType:
     return getAutoDiffCreateLinearMapContext(Context, Id);
 
   case BuiltinValueKind::AutoDiffProjectTopLevelSubcontext:
     return getAutoDiffProjectTopLevelSubcontext(Context, Id);
 
-  case BuiltinValueKind::AutoDiffAllocateSubcontext:
+  case BuiltinValueKind::AutoDiffAllocateSubcontextWithType:
     return getAutoDiffAllocateSubcontext(Context, Id);
+
+  case BuiltinValueKind::PackLength:
+    return getPackLength(Context, Id);
   }
 
   llvm_unreachable("bad builtin value!");

@@ -102,7 +102,7 @@ public:
   /// support for. It's also common for valid versions to produce a different
   /// result; for example "-swift-version 3" at one point instructed the
   /// compiler to act as if it is version 3.1.
-  Optional<Version> getEffectiveLanguageVersion() const;
+  llvm::Optional<Version> getEffectiveLanguageVersion() const;
 
   /// Whether this version is greater than or equal to the given major version
   /// number.
@@ -174,6 +174,11 @@ StringRef getCurrentCompilerTag();
 /// if any. This can hold more information than \c getCurrentCompilerTag
 /// depending on the vendor.
 StringRef getCurrentCompilerSerializationTag();
+
+/// Retrieves the value of the upcoming C++ interoperability compatibility
+/// version that's going to be presented as some new concrete version to the
+/// users.
+unsigned getUpcomingCxxInteropCompatVersion();
 
 } // end namespace version
 } // end namespace swift

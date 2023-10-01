@@ -1,5 +1,8 @@
-// RUN: %target-typecheck-verify-swift  -disable-availability-checking -warn-concurrency
+// RUN: %target-swift-frontend  -disable-availability-checking -warn-concurrency %s -emit-sil -o /dev/null -verify -verify-additional-prefix complete-
+// RUN: %target-swift-frontend  -disable-availability-checking -warn-concurrency %s -emit-sil -o /dev/null -verify -enable-experimental-feature SendNonSendable
+
 // REQUIRES: concurrency
+// REQUIRES: asserts
 
 @available(SwiftStdlib 5.1, *)
 actor A {
@@ -86,11 +89,11 @@ func testIsolatedParamCallsAsync(a: isolated A, b: A) async {
 @available(SwiftStdlib 5.1, *)
 func testIsolatedParamCaptures(a: isolated A) async {
   let _ = { @MainActor in
-    a.f() // expected-error {{actor-isolated instance method 'f()' can not be referenced from the main actor}}
+    a.f() // expected-error {{call to actor-isolated instance method 'f()' in a synchronous main actor-isolated context}}
   }
 
   let _: @MainActor () -> () = {
-    a.f() // expected-error {{actor-isolated instance method 'f()' can not be referenced from the main actor}}
+    a.f() // expected-error {{call to actor-isolated instance method 'f()' in a synchronous main actor-isolated context}}
   }
 
   let _ = {
@@ -98,7 +101,7 @@ func testIsolatedParamCaptures(a: isolated A) async {
   }
 
   let _ = { @Sendable in
-    a.f() // expected-error {{actor-isolated instance method 'f()' can not be referenced from a Sendable closure}}
+    a.f() // expected-error {{call to actor-isolated instance method 'f()' in a synchronous nonisolated context}}
   }
 
 }
@@ -139,12 +142,13 @@ struct S: P {
   func j(isolated: Int) -> Int { return isolated }
   func k(isolated y: Int) -> Int { return j(isolated: y) }
   func l(isolated _: Int) -> Int { return k(isolated: 0) }
-  func m(thing: MyActor) { thing.hello() } // expected-error {{actor-isolated instance method 'hello()' can not be referenced from a non-isolated context}}
+  func m(thing: MyActor) { thing.hello() } // expected-error {{call to actor-isolated instance method 'hello()' in a synchronous nonisolated context}}
 }
 
 func checkConformer(_ s: S, _ p: any P, _ ma: MyActor) async {
   s.m(thing: ma)
   await p.m(thing: ma)
+  // expected-complete-warning@-1 {{passing argument of non-sendable type 'any P' into actor-isolated context may introduce data races}}
 }
 
 
@@ -267,7 +271,7 @@ extension TestActor {
   // expected-warning@+1 {{instance method with 'isolated' parameter cannot be 'nonisolated'; this is an error in Swift 6}}{{3-15=}}
   nonisolated func isolatedToParameter(_ other: isolated TestActor) {
     isolatedMethod()
-    // expected-error@-1{{actor-isolated instance method 'isolatedMethod()' can not be referenced on a non-isolated actor instance}}
+    // expected-error@-1{{call to actor-isolated instance method 'isolatedMethod()' in a synchronous actor-isolated context}}
 
     other.isolatedMethod()
   }
@@ -305,8 +309,8 @@ func isolatedClosures() {
   // expected-warning@+1 {{subscript with 'isolated' parameter cannot be 'nonisolated'; this is an error in Swift 6}}{{3-15=}}
   nonisolated subscript(_ a: isolated A, _ b: isolated A) -> Int {
     // FIXME: wrong isolation. should be isolated to `a`.
-    a.f() // expected-error {{actor-isolated instance method 'f()' can not be referenced on a non-isolated actor instance}}
-    b.f() // expected-error {{actor-isolated instance method 'f()' can not be referenced on a non-isolated actor instance}}
+    a.f() // expected-error {{call to actor-isolated instance method 'f()' in a synchronous actor-isolated context}}
+    b.f() // expected-error {{call to actor-isolated instance method 'f()' in a synchronous actor-isolated context}}
     return 0
   }
 
@@ -315,3 +319,41 @@ func isolatedClosures() {
     a.f()
   }
 }
+
+// Test case for https://github.com/apple/swift/issues/62568
+func execute<ActorType: Actor>(
+  on isolatedActor: isolated ActorType,
+  task: @escaping @Sendable (isolated ActorType) -> Void)
+{
+  // Compiler correctly allows this task to execute synchronously.
+  task(isolatedActor)
+  // Start a task that inherits the current execution context (i.e. that of the isolatedActor)
+  Task {
+    // 'await' is not not necessary because 'task' is synchronous.
+    task(isolatedActor)
+  }
+}
+
+actor ProtectsDictionary {
+  var dictionary: [String: String] = ["A": "B"]
+}
+
+func getValues(
+  forKeys keys: [String],
+  from actor: isolated ProtectsDictionary
+) -> [String?] {
+  // A non-escaping, synchronous closure cannot cross isolation
+  // boundaries; it should be isolated to 'actor'.
+  keys.map { key in
+    actor.dictionary[key]
+  }
+}
+
+func isolated_generic_bad_1<T>(_ t: isolated T) {}
+// expected-error@-1 {{'isolated' parameter 'T' must conform to 'Actor' or 'DistributedActor' protocol}}
+func isolated_generic_bad_2<T: Equatable>(_ t: isolated T) {}
+// expected-error@-1 {{'isolated' parameter 'T' must conform to 'Actor' or 'DistributedActor' protocol}}
+func isolated_generic_bad_3<T: AnyActor>(_ t: isolated T) {}
+// expected-error@-1 {{'isolated' parameter 'T' must conform to 'Actor' or 'DistributedActor' protocol}}
+
+func isolated_generic_ok_1<T: Actor>(_ t: isolated T) {}

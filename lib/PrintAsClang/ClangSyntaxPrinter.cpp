@@ -96,6 +96,14 @@ bool ClangSyntaxPrinter::printNominalTypeOutsideMemberDeclInnerStaticAssert(
 }
 
 void ClangSyntaxPrinter::printClangTypeReference(const clang::Decl *typeDecl) {
+  if (cast<clang::NamedDecl>(typeDecl)->getDeclName().isEmpty() &&
+      isa<clang::TagDecl>(typeDecl)) {
+    if (auto *tnd =
+            cast<clang::TagDecl>(typeDecl)->getTypedefNameForAnonDecl()) {
+      printClangTypeReference(tnd);
+      return;
+    }
+  }
   auto &clangCtx = typeDecl->getASTContext();
   clang::PrintingPolicy pp(clangCtx.getLangOpts());
   const auto *NS = clang::NestedNameSpecifier::getRequiredQualification(
@@ -202,7 +210,8 @@ void ClangSyntaxPrinter::printInlineForHelperFunction() const {
 }
 
 void ClangSyntaxPrinter::printNullability(
-    Optional<OptionalTypeKind> kind, NullabilityPrintKind printKind) const {
+    llvm::Optional<OptionalTypeKind> kind,
+    NullabilityPrintKind printKind) const {
   if (!kind)
     return;
 
@@ -378,24 +387,28 @@ void ClangSyntaxPrinter::printPrimaryCxxTypeName(
 }
 
 void ClangSyntaxPrinter::printIncludeForShimHeader(StringRef headerName) {
-  os << "// Look for the C++ interop support header relative to clang's "
-        "resource dir:\n";
-  os << "//  "
-        "'<toolchain>/usr/lib/clang/<version>/include/../../../swift/"
-        "swiftToCxx'.\n";
-  os << "#if __has_include(<../../../swift/swiftToCxx/" << headerName << ">)\n";
-  os << "#include <../../../swift/swiftToCxx/" << headerName << ">\n";
-  os << "#elif __has_include(<../../../../../lib/swift/swiftToCxx/"
-     << headerName << ">)\n";
-  os << "//  "
-        "'<toolchain>/usr/local/lib/clang/<version>/include/../../../../../lib/"
-        "swift/swiftToCxx'.\n";
-  os << "#include <../../../../../lib/swift/swiftToCxx/" << headerName << ">\n";
-  os << "// Alternatively, allow user to find the header using additional "
-        "include path into '<toolchain>/lib/swift'.\n";
-  os << "#elif __has_include(<swiftToCxx/" << headerName << ">)\n";
-  os << "#include <swiftToCxx/" << headerName << ">\n";
-  os << "#endif\n";
+  printIgnoredDiagnosticBlock("non-modular-include-in-framework-module", [&] {
+    os << "// Allow user to find the header using additional include paths\n";
+    os << "#if __has_include(<swiftToCxx/" << headerName << ">)\n";
+    os << "#include <swiftToCxx/" << headerName << ">\n";
+    os << "// Look for the C++ interop support header relative to clang's "
+          "resource dir:\n";
+    os << "//  "
+          "'<toolchain>/usr/lib/clang/<version>/include/../../../swift/"
+          "swiftToCxx'.\n";
+    os << "#elif __has_include(<../../../swift/swiftToCxx/" << headerName
+       << ">)\n";
+    os << "#include <../../../swift/swiftToCxx/" << headerName << ">\n";
+    os << "#elif __has_include(<../../../../../lib/swift/swiftToCxx/"
+       << headerName << ">)\n";
+    os << "//  "
+          "'<toolchain>/usr/local/lib/clang/<version>/include/../../../../../"
+          "lib/"
+          "swift/swiftToCxx'.\n";
+    os << "#include <../../../../../lib/swift/swiftToCxx/" << headerName
+       << ">\n";
+    os << "#endif\n";
+  });
 }
 
 void ClangSyntaxPrinter::printDefine(StringRef macroName) {

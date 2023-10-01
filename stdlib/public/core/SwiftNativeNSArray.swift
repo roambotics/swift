@@ -367,9 +367,11 @@ extension __SwiftNativeNSArrayWithContiguousStorage {
 
   internal func _destroyBridgedStorage(_ hb: __BridgingBufferStorage?) {
     if let bridgedStorage = hb {
-      let buffer = _BridgingBuffer(bridgedStorage)
-      let count = buffer.count
-      buffer.baseAddress.deinitialize(count: count)
+      withExtendedLifetime(bridgedStorage) {
+        let buffer = _BridgingBuffer(bridgedStorage)
+        let count = buffer.count
+        buffer.baseAddress.deinitialize(count: count)
+      }
     }
   }
 
@@ -505,6 +507,7 @@ internal class __ContiguousArrayStorageBase
 
   /// A type that every element in the array is.
   @inlinable
+  @_unavailableInEmbedded
   internal var staticElementType: Any.Type {
     _internalInvariantFailure(
       "Concrete subclasses must implement staticElementType")

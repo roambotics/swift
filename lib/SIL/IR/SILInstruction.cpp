@@ -15,16 +15,18 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SIL/SILInstruction.h"
-#include "swift/Basic/type_traits.h"
+#include "swift/Basic/AssertImplements.h"
 #include "swift/Basic/Unicode.h"
+#include "swift/Basic/type_traits.h"
 #include "swift/SIL/ApplySite.h"
+#include "swift/SIL/DynamicCasts.h"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILCloner.h"
 #include "swift/SIL/SILDebugScope.h"
-#include "swift/SIL/SILVisitor.h"
-#include "swift/SIL/DynamicCasts.h"
-#include "swift/Basic/AssertImplements.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/SIL/SILVisitor.h"
+#include "swift/SIL/Test.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -118,6 +120,15 @@ void SILInstruction::moveFront(SILBasicBlock *Block) {
 void SILInstruction::moveBefore(SILInstruction *Later) {
   SILBasicBlock::moveInstruction(this, Later);
 }
+
+namespace swift::test {
+FunctionTest MoveBeforeTest("instruction-move-before",
+                            [](auto &function, auto &arguments, auto &test) {
+                              auto *inst = arguments.takeInstruction();
+                              auto *other = arguments.takeInstruction();
+                              inst->moveBefore(other);
+                            });
+} // end namespace swift::test
 
 /// Unlink this instruction from its current basic block and insert it into
 /// the basic block that Earlier lives in, right after Earlier.
@@ -664,17 +675,17 @@ namespace {
       return X->getElement() == RHS->getElement();
     }
 
-    bool visitSelectEnumInstBase(const SelectEnumInstBase *RHS) {
+    bool visitSelectEnumOperation(SelectEnumOperation RHS) {
       // Check that the instructions match cases in the same order.
-      auto *X = cast<SelectEnumInstBase>(LHS);
+      auto X = SelectEnumOperation(LHS);
 
-      if (X->getNumCases() != RHS->getNumCases())
+      if (X.getNumCases() != RHS.getNumCases())
         return false;
-      if (X->hasDefault() != RHS->hasDefault())
+      if (X.hasDefault() != RHS.hasDefault())
         return false;
 
-      for (unsigned i = 0, e = X->getNumCases(); i < e; ++i) {
-        if (X->getCase(i).first != RHS->getCase(i).first)
+      for (unsigned i = 0, e = X.getNumCases(); i < e; ++i) {
+        if (X.getCase(i).first != RHS.getCase(i).first)
           return false;
       }
 
@@ -682,29 +693,10 @@ namespace {
     }
 
     bool visitSelectEnumInst(const SelectEnumInst *RHS) {
-      return visitSelectEnumInstBase(RHS);
+      return visitSelectEnumOperation(RHS);
     }
     bool visitSelectEnumAddrInst(const SelectEnumAddrInst *RHS) {
-      return visitSelectEnumInstBase(RHS);
-    }
-
-    bool visitSelectValueInst(const SelectValueInst *RHS) {
-      // Check that the instructions match cases in the same order.
-      auto *X = cast<SelectValueInst>(LHS);
-
-      if (X->getNumCases() != RHS->getNumCases())
-        return false;
-      if (X->hasDefault() != RHS->hasDefault())
-        return false;
-
-      for (unsigned i = 0, e = X->getNumCases(); i < e; ++i) {
-        if (X->getCase(i).first != RHS->getCase(i).first)
-          return false;
-        if (X->getCase(i).second != RHS->getCase(i).second)
-          return false;
-      }
-
-      return true;
+      return visitSelectEnumOperation(RHS);
     }
 
     // Conversion instructions.
@@ -881,6 +873,22 @@ namespace {
       return true;
     }
 
+    bool visitScalarPackIndexInst(const ScalarPackIndexInst *RHS) {
+      auto *X = cast<ScalarPackIndexInst>(LHS);
+      return (X->getIndexedPackType() == RHS->getIndexedPackType() &&
+              X->getComponentIndex() == RHS->getComponentIndex());
+    }
+
+    bool visitDynamicPackIndexInst(const DynamicPackIndexInst *RHS) {
+      auto *X = cast<DynamicPackIndexInst>(LHS);
+      return X->getIndexedPackType() == RHS->getIndexedPackType();
+    }
+
+    bool visitTuplePackElementAddrInst(const TuplePackElementAddrInst *RHS) {
+      auto *X = cast<TuplePackElementAddrInst>(LHS);
+      return X->getElementType() == RHS->getElementType();
+    }
+
   private:
     const SILInstruction *LHS;
   };
@@ -973,11 +981,18 @@ unsigned Operand::getOperandNumber() const {
   return this - &cast<SILInstruction>(getUser())->getAllOperands()[0];
 }
 
-SILInstruction::MemoryBehavior SILInstruction::getMemoryBehavior() const {
+MemoryBehavior SILInstruction::getMemoryBehavior() const {
 
   if (auto *BI = dyn_cast<BuiltinInst>(this)) {
     // Handle Swift builtin functions.
     const BuiltinInfo &BInfo = BI->getBuiltinInfo();
+    if (BInfo.ID == BuiltinValueKind::ZeroInitializer) {
+      // The address form of `zeroInitializer` writes to its argument to
+      // initialize it. The value form has no side effects.
+      return BI->getArguments().size() > 0
+        ? MemoryBehavior::MayWrite
+        : MemoryBehavior::None;
+    }
     if (BInfo.ID != BuiltinValueKind::None)
       return BInfo.isReadNone() ? MemoryBehavior::None
                                 : MemoryBehavior::MayHaveSideEffects;
@@ -1122,6 +1137,7 @@ bool SILInstruction::mayRelease() const {
     return true;
 
   case SILInstructionKind::DestroyValueInst:
+  case SILInstructionKind::HopToExecutorInst:
     return true;
 
   case SILInstructionKind::UnconditionalCheckedCastAddrInst:
@@ -1231,7 +1247,8 @@ namespace {
 
 bool SILInstruction::isAllocatingStack() const {
   if (isa<AllocStackInst>(this) ||
-      isa<AllocPackInst>(this))
+      isa<AllocPackInst>(this) ||
+      isa<AllocPackMetadataInst>(this))
     return true;
 
   if (auto *ARI = dyn_cast<AllocRefInstBase>(this)) {
@@ -1262,7 +1279,8 @@ bool SILInstruction::isAllocatingStack() const {
 bool SILInstruction::isDeallocatingStack() const {
   if (isa<DeallocStackInst>(this) ||
       isa<DeallocStackRefInst>(this) ||
-      isa<DeallocPackInst>(this))
+      isa<DeallocPackInst>(this) ||
+      isa<DeallocPackMetadataInst>(this))
     return true;
 
   if (auto *BI = dyn_cast<BuiltinInst>(this)) {
@@ -1274,6 +1292,79 @@ bool SILInstruction::isDeallocatingStack() const {
   return false;
 }
 
+bool SILInstruction::mayRequirePackMetadata() const {
+  switch (getKind()) {
+  case SILInstructionKind::AllocPackInst:
+  case SILInstructionKind::TuplePackElementAddrInst:
+  case SILInstructionKind::OpenPackElementInst:
+    return true;
+  case SILInstructionKind::PartialApplyInst:
+  case SILInstructionKind::ApplyInst:
+  case SILInstructionKind::BeginApplyInst:
+  case SILInstructionKind::TryApplyInst: {
+    // Check the function type for packs.
+    auto apply = ApplySite::isa(const_cast<SILInstruction *>(this));
+    if (apply.getCallee()->getType().hasAnyPack())
+      return true;
+    // Check the substituted types for packs.
+    for (auto ty : apply.getSubstitutionMap().getReplacementTypes()) {
+      if (ty->hasAnyPack())
+        return true;
+    }
+    return false;
+  }
+  case SILInstructionKind::ClassMethodInst:
+  case SILInstructionKind::DebugValueInst: 
+  case SILInstructionKind::DestroyAddrInst:
+  case SILInstructionKind::DestroyValueInst:
+  // Unary instructions.
+  {
+    return getOperand(0)->getType().hasAnyPack();
+  }
+  case SILInstructionKind::AllocStackInst: {
+    auto *asi = cast<AllocStackInst>(this);
+    return asi->getType().hasAnyPack();
+  }
+  case SILInstructionKind::MetatypeInst: {
+    auto *mi = cast<MetatypeInst>(this);
+    return mi->getType().hasAnyPack();
+  }
+  case SILInstructionKind::WitnessMethodInst: {
+    auto *wmi = cast<WitnessMethodInst>(this);
+    auto ty = wmi->getLookupType();
+    return ty->hasAnyPack();
+  }
+  default:
+    // Instructions that deallocate stack must not result in pack metadata
+    // materialization.  If they did there would be no way to create the pack
+    // metadata on stack.
+    if (isDeallocatingStack())
+      return false;
+
+    // Terminators that exit the function must not result in pack metadata
+    // materialization.
+    auto *ti = dyn_cast<TermInst>(this);
+    if (ti && ti->isFunctionExiting())
+      return false;
+
+    // Check results and operands for packs.  If a pack appears, lowering the
+    // instruction might result in pack metadata emission.
+    for (auto result : getResults()) {
+      if (result->getType().hasAnyPack())
+        return true;
+    }
+    for (auto operandTy : getOperandTypes()) {
+      if (operandTy.hasAnyPack())
+        return true;
+    }
+    for (auto &tdo : getTypeDependentOperands()) {
+      if (tdo.get()->getType().hasAnyPack())
+        return true;
+    }
+
+    return false;
+  }
+}
 
 /// Create a new copy of this instruction, which retains all of the operands
 /// and other information of this one.  If an insertion point is specified,
@@ -1374,17 +1465,17 @@ unsigned SILInstruction::getCachedCaseIndex(EnumElementDecl *enumElement) {
 //===----------------------------------------------------------------------===//
 
 llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &OS,
-                                     SILInstruction::MemoryBehavior B) {
+                                     MemoryBehavior B) {
   switch (B) {
-    case SILInstruction::MemoryBehavior::None:
+    case MemoryBehavior::None:
       return OS << "None";
-    case SILInstruction::MemoryBehavior::MayRead:
+    case MemoryBehavior::MayRead:
       return OS << "MayRead";
-    case SILInstruction::MemoryBehavior::MayWrite:
+    case MemoryBehavior::MayWrite:
       return OS << "MayWrite";
-    case SILInstruction::MemoryBehavior::MayReadWrite:
+    case MemoryBehavior::MayReadWrite:
       return OS << "MayReadWrite";
-    case SILInstruction::MemoryBehavior::MayHaveSideEffects:
+    case MemoryBehavior::MayHaveSideEffects:
       return OS << "MayHaveSideEffects";
   }
 
@@ -1588,12 +1679,12 @@ void OpenPackElementInst::forEachDefinedLocalArchetype(
 //                         Multiple Value Instruction
 //===----------------------------------------------------------------------===//
 
-Optional<unsigned>
+llvm::Optional<unsigned>
 MultipleValueInstruction::getIndexOfResult(SILValue Target) const {
   // First make sure we actually have one of our instruction results.
   auto *MVIR = dyn_cast<MultipleValueInstructionResult>(Target);
   if (!MVIR || MVIR->getParent() != this)
-    return None;
+    return llvm::None;
   return MVIR->getIndex();
 }
 
@@ -1726,8 +1817,8 @@ DestroyValueInst::getNonescapingClosureAllocation() const {
       // Stop at a conversion from escaping closure, since there's no stack
       // allocation in that case.
       return nullptr;
-    } else if (auto conv = dyn_cast<ConversionInst>(operand)) {
-      operand = conv->getConverted();
+    } else if (auto convert = ConversionOperation(operand)) {
+      operand = convert.getConverted();
       continue;
     } else if (auto pa = dyn_cast<PartialApplyInst>(operand)) {
       // If we found the `[on_stack]` partial apply, we're done.

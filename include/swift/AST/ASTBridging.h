@@ -13,9 +13,10 @@
 #ifndef SWIFT_AST_ASTBRIDGING_H
 #define SWIFT_AST_ASTBRIDGING_H
 
+#include "swift/AST/DiagnosticEngine.h"
 #include "swift/Basic/BasicBridging.h"
 #include "swift/Basic/Compiler.h"
-#include "swift/AST/DiagnosticEngine.h"
+#include "swift/Basic/Nullability.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -32,11 +33,21 @@ typedef enum ENUM_EXTENSIBILITY_ATTR(open) BridgedDiagID : uint32_t {
 #include "swift/AST/DiagnosticsAll.def"
 } BridgedDiagID;
 
+typedef struct {
+  void * _Nonnull object;
+} BridgedDiagnosticEngine;
+
+typedef struct {
+  void *_Nullable object;
+} BridgedOptionalDiagnosticEngine;
+
 // FIXME: Can we bridge InFlightDiagnostic?
-void DiagnosticEngine_diagnose(swift::DiagnosticEngine &, swift::SourceLoc loc,
+void DiagnosticEngine_diagnose(BridgedDiagnosticEngine, swift::SourceLoc loc,
                                BridgedDiagID diagID, BridgedArrayRef arguments,
                                swift::CharSourceRange highlight,
                                BridgedArrayRef fixIts);
+
+bool DiagnosticEngine_hadAnyError(BridgedDiagnosticEngine);
 
 using ArrayRefOfDiagnosticArgument = llvm::ArrayRef<swift::DiagnosticArgument>;
 

@@ -1,7 +1,14 @@
 // RUN: %empty-directory(%t)
+
 // RUN: %target-swift-frontend -emit-module -emit-module-path %t/other_global_actor_inference.swiftmodule -module-name other_global_actor_inference -warn-concurrency %S/Inputs/other_global_actor_inference.swift
-// RUN: %target-typecheck-verify-swift -I %t -disable-availability-checking
+// RUN: %target-swift-frontend -I %t -disable-availability-checking %s -emit-sil -o /dev/null -verify
+// RUN: %target-swift-frontend -I %t -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=targeted
+// RUN: %target-swift-frontend -I %t -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -verify-additional-prefix complete-sns-
+// RUN: %target-swift-frontend -I %t -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -enable-experimental-feature SendNonSendable -verify-additional-prefix complete-sns-
+
 // REQUIRES: concurrency
+// REQUIRES: asserts
+
 import other_global_actor_inference
 
 actor SomeActor { }
@@ -201,7 +208,7 @@ actor GenericSub<T> : GenericSuper<[T]> { // expected-error{{actor types do not 
   nonisolated override func method3() { } // expected-error{{instance method overrides a 'final' instance method}}
 
   @OtherGlobalActor func testMethod() {
-    method() // expected-error{{actor-isolated instance method 'method()' can not be referenced from global actor 'OtherGlobalActor'}}
+    method() // expected-error{{call to actor-isolated instance method 'method()' in a synchronous global actor 'OtherGlobalActor'-isolated context}}
     _ = method // expected-error{{actor-isolated instance method 'method()' can not be partially applied}}
   }
 }
@@ -537,12 +544,16 @@ struct WrapperOnUnsafeActor<Wrapped> {
 
 struct HasWrapperOnUnsafeActor {
   @WrapperOnUnsafeActor var synced: Int = 0
-  // expected-note@-1 3{{property declared here}}
+  // expected-note @-1 3{{property declared here}}
+  // expected-complete-sns-note @-2 3{{property declared here}}
 
   func testUnsafeOkay() {
-    _ = synced
-    _ = $synced
-    _ = _synced
+    // expected-complete-sns-note @-1 {{add '@OtherGlobalActor' to make instance method 'testUnsafeOkay()' part of global actor 'OtherGlobalActor'}}
+    // expected-complete-sns-note @-2 {{add '@SomeGlobalActor' to make instance method 'testUnsafeOkay()' part of global actor 'SomeGlobalActor'}}
+    // expected-complete-sns-note @-3 {{add '@MainActor' to make instance method 'testUnsafeOkay()' part of global actor 'MainActor'}}
+    _ = synced // expected-complete-sns-error {{main actor-isolated property 'synced' can not be referenced from a non-isolated context}}
+    _ = $synced // expected-complete-sns-error {{global actor 'SomeGlobalActor'-isolated property '$synced' can not be referenced from a non-isolated context}}
+    _ = _synced // expected-complete-sns-error {{global actor 'OtherGlobalActor'-isolated property '_synced' can not be referenced from a non-isolated context}}
   }
 
   nonisolated func testErrors() {
@@ -618,6 +629,7 @@ func acceptAsyncSendableClosureInheriting<T>(@_inheritActorContext _: @Sendable 
 // defer bodies inherit global actor-ness
 @MainActor
 var statefulThingy: Bool = false // expected-note {{var declared here}}
+// expected-complete-sns-error @-1 {{top-level code variables cannot have a global actor}}
 
 @MainActor
 func useFooInADefer() -> String { // expected-note {{calls to global function 'useFooInADefer()' from outside of its actor context are implicitly asynchronous}}

@@ -55,7 +55,18 @@ enum class MacroRole: uint32_t {
   /// An attached macro that adds conformances to the declaration the
   /// macro is attached to.
   Conformance = 0x40,
+  /// A freestanding macro that expands to expressions, statements and
+  /// declarations in a code block.
+  CodeItem = 0x80,
+  /// An attached macro that adds extensions to the declaration the
+  /// macro is attached to.
+  Extension = 0x100,
+
+  // NOTE: When adding a new macro role, also add it to `getAllMacroRoles`.
 };
+
+/// Returns an enumeratable list of all macro roles.
+std::vector<MacroRole> getAllMacroRoles();
 
 /// The contexts in which a particular macro declaration can be used.
 using MacroRoles = OptionSet<MacroRole>;
@@ -80,13 +91,22 @@ bool isAttachedMacro(MacroRoles contexts);
 
 MacroRoles getAttachedMacroRoles();
 
+/// Checks if the macro is supported or guarded behind an experimental flag.
+bool isMacroSupported(MacroRole role, ASTContext &ctx);
+
 enum class MacroIntroducedDeclNameKind {
   Named,
   Overloaded,
   Prefixed,
   Suffixed,
   Arbitrary,
+
+  // NOTE: When adding a new name kind, also add it to
+  // `getAllMacroIntroducedDeclNameKinds`.
 };
+
+/// Returns an enumeratable list of all macro introduced decl name kinds.
+std::vector<MacroIntroducedDeclNameKind> getAllMacroIntroducedDeclNameKinds();
 
 /// Whether a macro-introduced name of this kind requires an argument.
 bool macroIntroducedNameRequiresArgument(MacroIntroducedDeclNameKind kind);
@@ -96,25 +116,19 @@ StringRef getMacroIntroducedDeclNameString(
 
 class CustomAttr;
 
-/// Perform lookup to determine whether the given custom attribute refers to
-/// a macro declaration, and populate the \c macros vector with the lookup
-/// results that are attached macros.
-void findMacroForCustomAttr(CustomAttr *attr, DeclContext *dc,
-                            llvm::TinyPtrVector<ValueDecl *> &macros);
-
 class MacroIntroducedDeclName {
 public:
   using Kind = MacroIntroducedDeclNameKind;
 
 private:
   Kind kind;
-  Identifier identifier;
+  DeclName name;
 
 public:
-  MacroIntroducedDeclName(Kind kind, Identifier identifier = Identifier())
-      : kind(kind), identifier(identifier) {};
+  MacroIntroducedDeclName(Kind kind, DeclName name = DeclName())
+      : kind(kind), name(name) {};
 
-  static MacroIntroducedDeclName getNamed(Identifier name) {
+  static MacroIntroducedDeclName getNamed(DeclName name) {
     return MacroIntroducedDeclName(Kind::Named, name);
   }
 
@@ -135,7 +149,7 @@ public:
   }
 
   Kind getKind() const { return kind; }
-  Identifier getIdentifier() const { return identifier; }
+  DeclName getName() const { return name; }
 };
 
 }

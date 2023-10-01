@@ -100,11 +100,11 @@ public:
                  SILBuilder *Builder)
       : Loc(Loc), Builder(Builder), BeginApply(BeginApply) {}
 
-  static Optional<BeginApplySite> get(FullApplySite AI, SILLocation Loc,
-                                      SILBuilder *Builder) {
+  static llvm::Optional<BeginApplySite> get(FullApplySite AI, SILLocation Loc,
+                                            SILBuilder *Builder) {
     auto *BeginApply = dyn_cast<BeginApplyInst>(AI);
     if (!BeginApply)
-      return None;
+      return llvm::None;
     return BeginApplySite(BeginApply, Loc, Builder);
   }
 
@@ -276,7 +276,7 @@ class SILInlineCloner
   // The original, noninlined apply site. These become invalid after fixUp,
   // which is called as the last step in SILCloner::cloneFunctionBody.
   FullApplySite Apply;
-  Optional<BeginApplySite> BeginApply;
+  llvm::Optional<BeginApplySite> BeginApply;
 
   InstructionDeleter &deleter;
 
@@ -336,8 +336,8 @@ protected:
     // For performance inlining return the original location.
     if (IKind == InlineKind::PerformanceInline)
       return InLoc;
-    // Inlined location wraps the call site that is being inlined, regardless
-    // of the input location.
+    // Inlined location wraps the call site that is being inlined, regardless of
+    // the input location.
     return Loc;
   }
 
@@ -876,11 +876,15 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::BindMemoryInst:
   case SILInstructionKind::RebindMemoryInst:
   case SILInstructionKind::MoveValueInst:
-  case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::DropDeinitInst:
+  case SILInstructionKind::MarkUnresolvedNonCopyableValueInst:
   case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
   case SILInstructionKind::CopyableToMoveOnlyWrapperValueInst:
   case SILInstructionKind::MoveOnlyWrapperToCopyableValueInst:
   case SILInstructionKind::TestSpecificationInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableAddrInst:
+  case SILInstructionKind::CopyableToMoveOnlyWrapperAddrInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableBoxInst:
     return InlineCost::Free;
 
   // Typed GEPs are free.
@@ -892,6 +896,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   // tuple_pack_element_addr is just a GEP, but getting the offset
   // can require accessing metadata, so conservatively treat it as
   // expensive.
+  case SILInstructionKind::TuplePackExtractInst:
   case SILInstructionKind::TuplePackElementAddrInst:
     return InlineCost::Expensive;
 
@@ -938,6 +943,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::RefToRawPointerInst:
 
   case SILInstructionKind::UpcastInst:
+  case SILInstructionKind::EndInitLetRefInst:
 
   case SILInstructionKind::ThinToThickFunctionInst:
   case SILInstructionKind::ConvertFunctionInst:
@@ -1019,11 +1025,13 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::AllocRefDynamicInst:
   case SILInstructionKind::AllocStackInst:
   case SILInstructionKind::AllocPackInst:
+  case SILInstructionKind::AllocPackMetadataInst:
   case SILInstructionKind::BeginApplyInst:
   case SILInstructionKind::ValueMetatypeInst:
   case SILInstructionKind::WitnessMethodInst:
   case SILInstructionKind::AssignInst:
   case SILInstructionKind::AssignByWrapperInst:
+  case SILInstructionKind::AssignOrInitInst:
   case SILInstructionKind::CheckedCastBranchInst:
   case SILInstructionKind::CheckedCastAddrBranchInst:
   case SILInstructionKind::ClassMethodInst:
@@ -1047,6 +1055,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::DeallocPartialRefInst:
   case SILInstructionKind::DeallocStackInst:
   case SILInstructionKind::DeallocPackInst:
+  case SILInstructionKind::DeallocPackMetadataInst:
   case SILInstructionKind::DeinitExistentialAddrInst:
   case SILInstructionKind::DeinitExistentialValueInst:
   case SILInstructionKind::DestroyAddrInst:
@@ -1086,7 +1095,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::StoreInst:
   case SILInstructionKind::StoreBorrowInst:
   case SILInstructionKind::StrongReleaseInst:
-  case SILInstructionKind::SetDeallocatingInst:
+  case SILInstructionKind::BeginDeallocRefInst:
   case SILInstructionKind::StrongRetainInst:
   case SILInstructionKind::SuperMethodInst:
   case SILInstructionKind::ObjCSuperMethodInst:
@@ -1103,7 +1112,6 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::InitBlockStorageHeaderInst:
   case SILInstructionKind::SelectEnumAddrInst:
   case SILInstructionKind::SelectEnumInst:
-  case SILInstructionKind::SelectValueInst:
   case SILInstructionKind::KeyPathInst:
   case SILInstructionKind::GlobalValueInst:
   case SILInstructionKind::DifferentiableFunctionInst:
@@ -1116,21 +1124,25 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::HopToExecutorInst:
   case SILInstructionKind::ExtractExecutorInst:
   case SILInstructionKind::HasSymbolInst:
+  case SILInstructionKind::UnownedCopyValueInst:
+  case SILInstructionKind::WeakCopyValueInst:
 #define COMMON_ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name)          \
   case SILInstructionKind::Name##ToRefInst:                                    \
   case SILInstructionKind::RefTo##Name##Inst:                                  \
   case SILInstructionKind::StrongCopy##Name##ValueInst:
-#define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
-  case SILInstructionKind::Load##Name##Inst: \
-  case SILInstructionKind::Store##Name##Inst:
+#define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, ...)                          \
+  case SILInstructionKind::Load##Name##Inst:                                   \
+  case SILInstructionKind::Store##Name##Inst:                                  \
+  case SILInstructionKind::StrongCopy##Name##ValueInst:
 #define ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, ...)                         \
   COMMON_ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name)                \
   case SILInstructionKind::Name##RetainInst:                                   \
   case SILInstructionKind::Name##ReleaseInst:                                  \
   case SILInstructionKind::StrongRetain##Name##Inst:
-#define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
-  NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, "...") \
-  ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, "...")
+#define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)                      \
+  case SILInstructionKind::Load##Name##Inst:                                   \
+  case SILInstructionKind::Store##Name##Inst:                                  \
+    ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, "...")
 #define UNCHECKED_REF_STORAGE(Name, ...) \
   COMMON_ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name)
 #include "swift/AST/ReferenceStorage.def"

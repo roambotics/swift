@@ -12,13 +12,8 @@
 # directory.
 list(APPEND LLVM_COMMON_DEPENDS intrinsics_gen clang-tablegen-targets)
 
-# Add generated Swift Syntax headers to global dependencies.
-list(APPEND LLVM_COMMON_DEPENDS swift-ast-generated-headers)
-
 # Set up for linking against swift-syntax.
-if (SWIFT_SWIFT_PARSER)
-  # Set up linking against the swift-syntax modules.
-  # Link against the swift-syntax modules.
+if (SWIFT_BUILD_SWIFT_SYNTAX)
   set(SWIFT_SYNTAX_MODULES
     SwiftBasicFormat
     SwiftParser
@@ -28,83 +23,47 @@ if (SWIFT_SWIFT_PARSER)
     SwiftOperators
     SwiftSyntaxBuilder
     SwiftSyntaxMacros
+    SwiftSyntaxMacroExpansion
     SwiftCompilerPluginMessageHandling
   )
 
-  # Compute the list of SwiftSyntax targets that we will link against.
-  list(TRANSFORM SWIFT_SYNTAX_MODULES PREPEND "SwiftSyntax::"
-       OUTPUT_VARIABLE SWIFT_SYNTAX_TARGETS)
+  # Install shared runtime libraries
+  if(CMAKE_SYSTEM_NAME MATCHES Windows)
+    swift_install_in_component(TARGETS ${SWIFT_SYNTAX_MODULES}
+                               RUNTIME
+                               DESTINATION "bin"
+                               COMPONENT swift-syntax-lib)
+  else()
+    swift_install_in_component(TARGETS ${SWIFT_SYNTAX_MODULES}
+                               LIBRARY
+                               DESTINATION "lib${LLVM_LIBDIR_SUFFIX}/swift/host"
+                               COMPONENT swift-syntax-lib)
+  endif()
 
-  set(SWIFT_SYNTAX_LIBRARIES_SOURCE_DIR
-      "${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/lib/swift/host")
-  set(SWIFT_HOST_LIBRARIES_DEST_DIR
-      "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/swift/host")
+  # Install import libraries in Windows.
+  if(CMAKE_SYSTEM_NAME MATCHES Windows)
+    list(TRANSFORM SWIFT_SYNTAX_MODULES
+         PREPEND "${CMAKE_IMPORT_LIBRARY_PREFIX}"
+         OUTPUT_VARIABLE SWIFT_SYNTAX_IMPORT_LIBRARIES)
+    list(TRANSFORM SWIFT_SYNTAX_IMPORT_LIBRARIES
+         APPEND "${CMAKE_IMPORT_LIBRARY_SUFFIX}"
+         OUTPUT_VARIABLE SWIFT_SYNTAX_IMPORT_LIBRARIES)
+    list(TRANSFORM SWIFT_SYNTAX_IMPORT_LIBRARIES
+         PREPEND "${SWIFT_HOST_LIBRARIES_DEST_DIR}/"
+         OUTPUT_VARIABLE SWIFT_SYNTAX_IMPORT_LIBRARIES)
+    swift_install_in_component(PROGRAMS "${SWIFT_SYNTAX_IMPORT_LIBRARIES}"
+                               DESTINATION lib
+                               COMPONENT swift-syntax-lib)
+  endif()
 
-  # Determine the SwiftSyntax shared library files that were built as
-  # part of earlyswiftsyntax.
-  list(TRANSFORM SWIFT_SYNTAX_MODULES PREPEND ${CMAKE_SHARED_LIBRARY_PREFIX}
-       OUTPUT_VARIABLE SWIFT_SYNTAX_SHARED_LIBRARIES)
-  list(TRANSFORM SWIFT_SYNTAX_SHARED_LIBRARIES APPEND
-       ${CMAKE_SHARED_LIBRARY_SUFFIX}
-       OUTPUT_VARIABLE SWIFT_SYNTAX_SHARED_LIBRARIES)
-
-  # Interface library to collect swiftinterfaces and swiftmodules from
-  # SwiftSyntax
-  add_library(swiftSyntaxLibraries INTERFACE)
-
-  # Copy over all of the shared libraries from earlyswiftsyntax so they can
-  # be found via RPATH.
-  foreach (sharedlib ${SWIFT_SYNTAX_SHARED_LIBRARIES})
-    add_custom_command(
-      OUTPUT "${SWIFT_HOST_LIBRARIES_DEST_DIR}/${sharedlib}"
-      DEPENDS "${SWIFT_SYNTAX_LIBRARIES_SOURCE_DIR}/${sharedlib}"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SWIFT_SYNTAX_LIBRARIES_SOURCE_DIR}/${sharedlib} ${SWIFT_HOST_LIBRARIES_DEST_DIR}/${sharedlib}
-    )
-
-    add_custom_target(copy_swiftSyntaxLibrary_${sharedlib}
-      DEPENDS "${SWIFT_HOST_LIBRARIES_DEST_DIR}/${sharedlib}"
-      COMMENT "Copying ${sharedlib}"
-    )
-
-    add_dependencies(swiftSyntaxLibraries copy_swiftSyntaxLibrary_${sharedlib})
+  # Install Swift module interface files.
+  foreach(module ${SWIFT_SYNTAX_MODULES})
+    set(module_dir "${module}.swiftmodule")
+    set(module_file "${SWIFT_HOST_LIBRARIES_DEST_DIR}/${module_dir}/${SWIFT_HOST_MODULE_TRIPLE}.swiftinterface")
+    swift_install_in_component(FILES "${module_file}"
+                               DESTINATION "lib${LLVM_LIBDIR_SUFFIX}/swift/host/${module_dir}"
+                               COMPONENT swift-syntax-lib)
   endforeach()
-
-  # Copy all of the Swift modules from earlyswiftsyntax so they can be found
-  # in the same relative place within the build directory as in the final
-  # toolchain.
-  list(TRANSFORM SWIFT_SYNTAX_MODULES APPEND ".swiftmodule"
-       OUTPUT_VARIABLE SWIFT_SYNTAX_MODULE_DIRS)
-
-  foreach(module_dir ${SWIFT_SYNTAX_MODULE_DIRS})
-    # Find all of the source module files.
-    file(GLOB module_files
-         "${SWIFT_SYNTAX_LIBRARIES_SOURCE_DIR}/${module_dir}/*.swiftinterface")
-
-    # Determine the destination module files.
-    set(dest_module_files)
-    foreach(full_module_file ${module_files})
-        get_filename_component(module_file ${full_module_file} NAME)
-        list(APPEND dest_module_files
-            "${SWIFT_HOST_LIBRARIES_DEST_DIR}/${module_dir}/${module_file}")
-    endforeach()
-
-    add_custom_command(
-      OUTPUT ${dest_module_files}
-      DEPENDS ${module_files}
-      COMMAND ${CMAKE_COMMAND} -E make_directory ${SWIFT_HOST_LIBRARIES_DEST_DIR}/${module_dir}
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${module_files} ${SWIFT_HOST_LIBRARIES_DEST_DIR}/${module_dir}/
-    )
-
-    add_custom_target(copy_swiftSyntaxModule_${module_dir}
-      DEPENDS ${dest_module_files}
-      COMMENT "Copying ${module_dir}"
-    )
-
-    add_dependencies(swiftSyntaxLibraries copy_swiftSyntaxModule_${module_dir})
-  endforeach()
-
-  # Add copied SwiftSyntax libraries to global dependencies.
-  list(APPEND LLVM_COMMON_DEPENDS swiftSyntaxLibraries)
 endif()
 
 add_subdirectory(APIDigester)

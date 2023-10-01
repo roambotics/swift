@@ -89,6 +89,25 @@ static bool validateModule(
       llvm::outs() << ", system=" << (searchPath.IsSystem ? "true" : "false")
                    << "\n";
     }
+    llvm::outs() << "- Plugin Search Options:\n";
+    for (auto opt : extendedInfo.getPluginSearchOptions()) {
+      StringRef optStr;
+      switch (opt.first) {
+      case swift::PluginSearchOption::Kind::PluginPath:
+        optStr = "-plugin-path";
+        break;
+      case swift::PluginSearchOption::Kind::ExternalPluginPath:
+        optStr = "-external-plugin-path";
+        break;
+      case swift::PluginSearchOption::Kind::LoadPluginLibrary:
+        optStr = "-load-plugin-library";
+        break;
+      case swift::PluginSearchOption::Kind::LoadPluginExecutable:
+        optStr = "-load-plugin-executable";
+        break;
+      }
+      llvm::outs() << "    " << optStr << " " << opt.second << "\n";
+    }
   }
 
   return true;
@@ -230,6 +249,9 @@ int main(int argc, char **argv) {
   opt<bool> Verbose("verbose", desc("Dump informations on the loaded module"),
                     cat(Visible));
 
+  opt<std::string> Filter("filter", desc("triple for filtering modules"),
+                          cat(Visible));
+
   opt<std::string> ModuleCachePath(
       "module-cache-path", desc("Clang module cache path"), cat(Visible));
 
@@ -342,12 +364,20 @@ int main(int argc, char **argv) {
     ClangImporter->setDWARFImporterDelegate(dummyDWARFImporter);
   }
 
-  for (auto &Module : Modules)
-    if (!parseASTSection(*CI.getMemoryBufferSerializedModuleLoader(),
-                         StringRef(Module.first, Module.second), modules)) {
-      llvm::errs() << "error: Failed to parse AST section!\n";
+  llvm::SmallString<0> error;
+  llvm::raw_svector_ostream errs(error);
+  llvm::Triple filter(Filter);
+  for (auto &Module : Modules) {
+    auto Result = parseASTSection(
+        *CI.getMemoryBufferSerializedModuleLoader(),
+        StringRef(Module.first, Module.second), filter);
+    if (auto E = Result.takeError()) {
+      std::string error = toString(std::move(E));
+      llvm::errs() << "error: Failed to parse AST section! " << error << "\n";
       return 1;
     }
+    modules.insert(modules.end(), Result->begin(), Result->end());
+  }
 
   // Attempt to import all modules we found.
   for (auto path : modules) {

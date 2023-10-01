@@ -107,10 +107,11 @@ ABSTRACT_EXPR(Identity, Expr)
   EXPR(Paren, IdentityExpr)
   EXPR(DotSelf, IdentityExpr)
   EXPR(Await, IdentityExpr)
-  EXPR(Move, IdentityExpr)
   EXPR(Borrow, IdentityExpr)
   EXPR(UnresolvedMemberChainResult, IdentityExpr)
   EXPR_RANGE(Identity, Paren, UnresolvedMemberChainResult)
+EXPR(Copy, Expr)
+EXPR(Consume, Expr)
 ABSTRACT_EXPR(AnyTry, Expr)
   EXPR(Try, AnyTryExpr)
   EXPR(ForceTry, AnyTryExpr)
@@ -212,7 +213,8 @@ UNCHECKED_EXPR(OneWay, Expr)
 EXPR(Tap, Expr)
 UNCHECKED_EXPR(TypeJoin, Expr)
 EXPR(MacroExpansion, Expr)
-LAST_EXPR(TypeJoin)
+// Don't forget to update the LAST_EXPR below when adding a new Expr here.
+LAST_EXPR(MacroExpansion)
 
 #undef EXPR_RANGE
 #undef LITERAL_EXPR

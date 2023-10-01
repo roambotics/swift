@@ -46,7 +46,7 @@ struct C<T> { // expected-note 4 {{'T' declared as parameter to type 'C'}}
 
 struct Unavailable {
   @available(*, unavailable)
-  var unavailableProperty: Int
+  var unavailableProperty: Int { 0 }
   // expected-note@-1 {{'unavailableProperty' has been explicitly marked unavailable here}}
 
   @available(*, unavailable)
@@ -228,7 +228,7 @@ func testNoComponents() {
   let _: KeyPath<A, A> = \A // expected-error{{must have at least one component}}
   let _: KeyPath<C, A> = \C // expected-error{{must have at least one component}}
   // expected-error@-1 {{generic parameter 'T' could not be inferred}}
-  let _: KeyPath<A, C> = \A // expected-error{{must have at least one component}} 
+  let _: KeyPath<A, C> = \A // expected-error{{must have at least one component}}
   // expected-error@-1 {{generic parameter 'T' could not be inferred}}
   _ = \A // expected-error {{key path must have at least one component}}
 }
@@ -795,7 +795,8 @@ func test_keypath_with_method_refs() {
 
   let _: KeyPath<S, Int> = \.foo // expected-error {{key path cannot refer to instance method 'foo()'}}
   // expected-error@-1 {{key path value type '() -> Int' cannot be converted to contextual type 'Int'}}
-  let _: KeyPath<S, Int> = \.bar // expected-error {{key path cannot refer to static member 'bar()'}}
+  let _: KeyPath<S, Int> = \.bar // expected-error {{key path cannot refer to static method 'bar()'}}
+  // expected-error@-1 {{key path value type '() -> Int' cannot be converted to contextual type 'Int'}}
   let _ = \S.Type.bar // expected-error {{key path cannot refer to static method 'bar()'}}
 
   struct A {
@@ -808,7 +809,7 @@ func test_keypath_with_method_refs() {
   }
 
   let _: KeyPath<A, Int> = \.foo.bar // expected-error {{key path cannot refer to instance method 'foo()'}}
-  let _: KeyPath<A, Int> = \.faz.bar // expected-error {{key path cannot refer to static member 'faz()'}}
+  let _: KeyPath<A, Int> = \.faz.bar // expected-error {{key path cannot refer to static method 'faz()'}}
   let _ = \A.foo.bar // expected-error {{key path cannot refer to instance method 'foo()'}}
   let _ = \A.Type.faz.bar // expected-error {{key path cannot refer to static method 'faz()'}}
 }
@@ -918,13 +919,12 @@ func testKeyPathHole() {
   provideValueButNotRoot(\.x.y) // expected-error {{cannot infer key path type from context; consider explicitly specifying a root type}}
   provideValueButNotRoot(\String.foo) // expected-error {{value of type 'String' has no member 'foo'}}
 
-  func provideKPValueButNotRoot<T>(_ kp: KeyPath<T, String>) {} // expected-note {{in call to function 'provideKPValueButNotRoot'}}
+  func provideKPValueButNotRoot<T>(_ kp: KeyPath<T, String>) {} 
   provideKPValueButNotRoot(\.x) // expected-error {{cannot infer key path type from context; consider explicitly specifying a root type}}
   provideKPValueButNotRoot(\.x.y) // expected-error {{cannot infer key path type from context; consider explicitly specifying a root type}}
 
   provideKPValueButNotRoot(\String.foo)
   // expected-error@-1 {{value of type 'String' has no member 'foo'}}
-  // expected-error@-2 {{generic parameter 'T' could not be inferred}}
 }
 
 func testMissingMember() {

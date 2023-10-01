@@ -150,7 +150,6 @@ Globals
   #endif
   global ::= protocol-conformance 'Hc'   // protocol conformance runtime record
   global ::= global 'HF'                 // accessible function runtime record
-  global ::= global 'Ha'                 // runtime discoverable attribute record
 
   global ::= nominal-type 'Mo'           // class metadata immediate member base offset
 
@@ -301,6 +300,8 @@ are always non-polymorphic ``<impl-function-type>`` types.
   VALUE-WITNESS-KIND ::= 'ug'           // getEnumTag
   VALUE-WITNESS-KIND ::= 'up'           // destructiveProjectEnumData
   VALUE-WITNESS-KIND ::= 'ui'           // destructiveInjectEnumTag
+  VALUE-WITNESS-KIND ::= 'et'           // getEnumTagSinglePayload
+  VALUE-WITNESS-KIND ::= 'st'           // storeEnumTagSinglePayload
 
 ``<VALUE-WITNESS-KIND>`` differentiates the kinds of value
 witness functions for a type.
@@ -394,13 +395,15 @@ Entities
   RELATED-DISCRIMINATOR ::= [a-j]
   RELATED-DISCRIMINATOR ::= [A-J]
 
-  macro-discriminator-list ::= macro-discriminator-list? 'fM' macro-expansion-operator INDEX
+  macro-discriminator-list ::= macro-discriminator-list? file-discriminator? macro-expansion-operator INDEX
 
-  macro-expansion-operator ::= identifier 'a' // accessor attached macro
-  macro-expansion-operator ::= identifier 'A' // member-attribute attached macro
-  macro-expansion-operator ::= identifier 'f' // freestanding macro
-  macro-expansion-operator ::= identifier 'm' // member attached macro
-  macro-expansion-operator ::= identifier 'u' // uniquely-named entity
+  macro-expansion-operator ::= decl-name identifier 'fMa' // attached accessor macro
+  macro-expansion-operator ::= decl-name identifier 'fMr' // attached member-attribute macro
+  macro-expansion-operator ::= identifier 'fMf' // freestanding macro
+  macro-expansion-operator ::= decl-name identifier 'fMm' // attached member macro
+  macro-expansion-operator ::= decl-name identifier 'fMp' // attached peer macro
+  macro-expansion-operator ::= decl-name identifier 'fMc' // attached conformance macro
+  macro-expansion-operator ::= decl-name identifier 'fMu' // uniquely-named entity
 
   file-discriminator ::= identifier 'Ll'     // anonymous file-discriminated declaration
 
@@ -670,6 +673,8 @@ Types
   type ::= assoc-type-list 'QY' GENERIC-PARAM-INDEX  // associated type at depth
   type ::= assoc-type-list 'QZ'                      // shortcut for 'QYz'
   type ::= opaque-type-decl-name bound-generic-args 'Qo' INDEX // opaque type
+  
+  type ::= pack-type 'Qe' INDEX              // pack element type
   
   type ::= pattern-type count-type 'Qp'      // pack expansion type
   type ::= pack-element-list 'QP'            // pack type
@@ -1145,6 +1150,7 @@ Function Specializations
   specialization ::= type '_' type* 'Ts' SPEC-INFO     // Generic re-abstracted prespecialization
   specialization ::= type '_' type* 'TG' SPEC-INFO     // Generic not re-abstracted specialization
   specialization ::= type '_' type* 'Ti' SPEC-INFO     // Inlined function with generic substitutions.
+  specialization ::= type '_' type* 'Ta' SPEC-INFO     // Non-async specialization
 
 The types are the replacement types of the substitution list.
 
@@ -1167,7 +1173,7 @@ Some kinds need arguments, which precede ``Tf``.
   spec-arg ::= identifier
   spec-arg ::= type
 
-  SPEC-INFO ::= MT-REMOVED? FRAGILE? PASSID
+  SPEC-INFO ::= MT-REMOVED? FRAGILE? ASYNC-REMOVED? PASSID
 
   PASSID ::= '0'                             // AllocBoxToStack,
   PASSID ::= '1'                             // ClosureSpecializer,
@@ -1175,10 +1181,14 @@ Some kinds need arguments, which precede ``Tf``.
   PASSID ::= '3'                             // CapturePropagation,
   PASSID ::= '4'                             // FunctionSignatureOpts,
   PASSID ::= '5'                             // GenericSpecializer,
+  PASSID ::= '6'                             // MoveDiagnosticInOutToOut,
+  PASSID ::= '7'                             // AsyncDemotion,
 
   MT-REMOVED ::= 'm'                         // non-generic metatype arguments are removed in the specialized function
 
   FRAGILE ::= 'q'
+
+  ASYNC-REMOVED ::= 'a'                      // async effect removed
 
   ARG-SPEC-KIND ::= 'n'                      // Unmodified argument
   ARG-SPEC-KIND ::= 'c'                      // Consumes n 'type' arguments which are closed over types in argument order

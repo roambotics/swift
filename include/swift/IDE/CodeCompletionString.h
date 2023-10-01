@@ -32,7 +32,7 @@ class CodeCompletionStringChunk {
 
 public:
   enum class ChunkKind {
-    /// "open", "public", "internal", "fileprivate", or "private".
+    /// "open", "public", "package", "internal", "fileprivate", or "private".
     AccessControlKeyword,
 
     /// such as @"available".
@@ -352,7 +352,7 @@ public:
   }
 
   StringRef getFirstTextChunk(bool includeLeadingPunctuation = false) const;
-  Optional<unsigned>
+  llvm::Optional<unsigned>
   getFirstTextChunkIndex(bool includeLeadingPunctuation = false) const;
 
   /// Print a debug representation of the code completion string to \p OS.

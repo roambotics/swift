@@ -30,8 +30,7 @@ class TypeAccessScopeChecker {
   const SourceFile *File;
   bool TreatUsableFromInlineAsPublic;
 
-  Optional<AccessScope> Scope = AccessScope::getPublic();
-  ImportAccessLevel ImportRestriction = None;
+  llvm::Optional<AccessScope> Scope = AccessScope::getPublic();
 
   TypeAccessScopeChecker(const DeclContext *useDC,
                          bool treatUsableFromInlineAsPublic)
@@ -44,41 +43,22 @@ class TypeAccessScopeChecker {
 
     auto AS = VD->getFormalAccessScope(File, TreatUsableFromInlineAsPublic);
     Scope = Scope->intersectWith(AS);
-
-    auto targetModule = VD->getDeclContext()->getParentModule();
-    if (targetModule != File->getParentModule()) {
-      auto localImportRestriction = File->getImportAccessLevel(targetModule);
-
-      if (localImportRestriction.has_value() &&
-          (!ImportRestriction.has_value() ||
-           localImportRestriction.value().accessLevel <
-             ImportRestriction.value().accessLevel)) {
-        ImportRestriction = localImportRestriction;
-      }
-    }
-
     return Scope.has_value();
   }
 
 public:
 
-  struct Result {
-    Optional<AccessScope> Scope;
-    ImportAccessLevel Import;
-  };
-
-  static Result
+  static llvm::Optional<AccessScope>
   getAccessScope(TypeRepr *TR, const DeclContext *useDC,
                  bool treatUsableFromInlineAsPublic = false) {
     TypeAccessScopeChecker checker(useDC, treatUsableFromInlineAsPublic);
     TR->walk(TypeReprIdentFinder([&](const IdentTypeRepr *typeRepr) {
       return checker.visitDecl(typeRepr->getBoundDecl());
     }));
-    return {checker.Scope,
-            checker.ImportRestriction};
+    return checker.Scope;
   }
 
-  static Result
+  static llvm::Optional<AccessScope>
   getAccessScope(Type T, const DeclContext *useDC,
                  bool treatUsableFromInlineAsPublic = false) {
     TypeAccessScopeChecker checker(useDC, treatUsableFromInlineAsPublic);
@@ -88,8 +68,7 @@ public:
       return TypeWalker::Action::Stop;
     }));
 
-    return {checker.Scope,
-            checker.ImportRestriction};
+    return checker.Scope;
   }
 };
 

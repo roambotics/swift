@@ -1,14 +1,19 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend -enable-experimental-feature LayoutStringValueWitnesses -enable-type-layout -parse-stdlib -emit-module -emit-module-path=%t/layout_string_witnesses_types.swiftmodule %S/Inputs/layout_string_witnesses_types.swift
-// RUN: %target-build-swift -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-type-layout -Xfrontend -parse-stdlib -c -parse-as-library -o %t/layout_string_witnesses_types.o %S/Inputs/layout_string_witnesses_types.swift
-// RUN: %target-swift-frontend -enable-experimental-feature LayoutStringValueWitnesses -enable-library-evolution -emit-module -emit-module-path=%t/layout_string_witnesses_types_resilient.swiftmodule %S/Inputs/layout_string_witnesses_types_resilient.swift
-// RUN: %target-build-swift -g -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-library-evolution -c -parse-as-library -o %t/layout_string_witnesses_types_resilient.o %S/Inputs/layout_string_witnesses_types_resilient.swift
-// RUN: %target-build-swift -g -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-type-layout -Xfrontend -parse-stdlib -module-name layout_string_witnesses_static %t/layout_string_witnesses_types.o %t/layout_string_witnesses_types_resilient.o -I %t -o %t/main %s
+// RUN: %target-swift-frontend -enable-experimental-feature LayoutStringValueWitnesses -enable-layout-string-value-witnesses -parse-stdlib -emit-module -emit-module-path=%t/layout_string_witnesses_types.swiftmodule %S/Inputs/layout_string_witnesses_types.swift
+
+// NOTE: We have to build this as dylib to turn private external symbols into local symbols, so we can observe potential issues with linkage
+// RUN: %target-build-swift-dylib(%t/%target-library-name(layout_string_witnesses_types)) -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-layout-string-value-witnesses -Xfrontend -parse-stdlib -parse-as-library %S/Inputs/layout_string_witnesses_types.swift
+// RUN: %target-codesign %t/%target-library-name(layout_string_witnesses_types)
+// RUN: %target-swift-frontend -enable-experimental-feature LayoutStringValueWitnesses -enable-layout-string-value-witnesses -enable-library-evolution -emit-module -emit-module-path=%t/layout_string_witnesses_types_resilient.swiftmodule %S/Inputs/layout_string_witnesses_types_resilient.swift
+// RUN: %target-build-swift -g -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-layout-string-value-witnesses -Xfrontend -enable-library-evolution -c -parse-as-library -o %t/layout_string_witnesses_types_resilient.o %S/Inputs/layout_string_witnesses_types_resilient.swift
+// RUN: %target-build-swift -g -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-layout-string-value-witnesses -Xfrontend -enable-type-layout -Xfrontend -parse-stdlib -module-name layout_string_witnesses_static -llayout_string_witnesses_types -L%t %t/layout_string_witnesses_types_resilient.o -I %t -o %t/main %s %target-rpath(%t)
 // RUN: %target-codesign %t/main
-// RUN: %target-run %t/main | %FileCheck %s --check-prefix=CHECK -check-prefix=CHECK-%target-os
+// RUN: %target-run %t/main %t/%target-library-name(layout_string_witnesses_types) | %FileCheck %s --check-prefix=CHECK -check-prefix=CHECK-%target-os
 
 // REQUIRES: executable_test
 
+// Requires runtime functions added in Swift 5.9.
+// UNSUPPORTED: use_os_stdlib
 // UNSUPPORTED: back_deployment_runtime
 
 import Swift
@@ -39,7 +44,7 @@ func testSimple() {
 
         // CHECK-NEXT: Before deinit
         print("Before deinit")
-        
+
         // CHECK-NEXT: SimpleClass deinitialized!
         testAssign(ptr, from: y)
     }
@@ -49,11 +54,11 @@ func testSimple() {
 
     // CHECK-NEXT: Before deinit
     print("Before deinit")
-        
+
 
     // CHECK-NEXT: SimpleClass deinitialized!
     testDestroy(ptr)
-    
+
     ptr.deallocate()
 }
 
@@ -82,9 +87,9 @@ func testWeakNative() {
 
     do {
         let ref = SimpleClass(x: 34)
-        
+
         withExtendedLifetime(ref) {
-            
+
             // CHECK-NEXT: SimpleClass deinitialized!
             testAssign(ptr, from: WeakNativeWrapper(x: ref))
 
@@ -128,7 +133,7 @@ func testUnownedNative() {
 
     do {
         let ref = SimpleClass(x: 34)
-        
+
         withExtendedLifetime(ref) {
             // CHECK-NEXT: SimpleClass deinitialized!
             testAssign(ptr, from: UnownedNativeWrapper(x: ref))
@@ -190,7 +195,7 @@ class ClassWithSomeProtocol: SomeProtocol {
     }
 }
 
-func testExistential() {
+func testExistentialClass() {
     let ptr = UnsafeMutablePointer<ExistentialWrapper>.allocate(capacity: 1)
 
     do {
@@ -217,7 +222,146 @@ func testExistential() {
     ptr.deallocate()
 }
 
-testExistential()
+testExistentialClass()
+
+struct StructWithSomeProtocolInline: SomeProtocol {
+    let y: Int = 0
+    let x: SimpleClass
+}
+
+func testExistentialStructInline() {
+    let ptr = UnsafeMutablePointer<ExistentialWrapper>.allocate(capacity: 1)
+
+    do {
+        let x = StructWithSomeProtocolInline(x: SimpleClass(x: 23))
+        testInit(ptr, to: createExistentialWrapper(x))
+    }
+
+    do {
+        let y = StructWithSomeProtocolInline(x: SimpleClass(x: 32))
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: createExistentialWrapper(y))
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testExistentialStructInline()
+
+struct StructWithSomeProtocolBox: SomeProtocol {
+    let y: Int = 0
+    let x: SimpleClass
+    let z: Int = 0
+    let zz: Int = 0
+    let zzz: Int = 0
+}
+
+func testExistentialStructBox() {
+    let ptr = UnsafeMutablePointer<ExistentialWrapper>.allocate(capacity: 1)
+
+    do {
+        let x = StructWithSomeProtocolBox(x: SimpleClass(x: 23))
+        testInit(ptr, to: createExistentialWrapper(x))
+    }
+
+    do {
+        let y = StructWithSomeProtocolBox(x: SimpleClass(x: 32))
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: createExistentialWrapper(y))
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testExistentialStructBox()
+
+func testAnyWrapper() {
+    let ptr = UnsafeMutablePointer<AnyWrapper>.allocate(capacity: 1)
+
+    do {
+        let x = TestClass()
+        testInit(ptr, to: AnyWrapper(y: x, z: SimpleClass(x: 23)))
+    }
+
+    do {
+        let y = TestClass()
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: TestClass deinitialized!
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: AnyWrapper(y: y, z: SimpleClass(x: 32)))
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: TestClass deinitialized!
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testAnyWrapper()
+
+class ClassWithABC: A, B, C {
+    deinit {
+        print("ClassWithABC deinitialized!")
+    }
+}
+
+func testMultiProtocolExistential() {
+    let ptr = UnsafeMutablePointer<MultiProtocolExistentialWrapper>.allocate(capacity: 1)
+
+    do {
+        let x = ClassWithABC()
+        testInit(ptr, to: MultiProtocolExistentialWrapper(y: x, z: SimpleClass(x: 23)))
+    }
+
+    do {
+        let y = ClassWithABC()
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: ClassWithABC deinitialized!
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: MultiProtocolExistentialWrapper(y: y, z: SimpleClass(x: 32)))
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: ClassWithABC deinitialized!
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testMultiProtocolExistential()
 
 class ClassWithSomeClassProtocol: SomeClassProtocol {
     deinit {
@@ -227,7 +371,7 @@ class ClassWithSomeClassProtocol: SomeClassProtocol {
 
 func testExistentialReference() {
     let ptr = UnsafeMutablePointer<ExistentialRefWrapper>.allocate(capacity: 1)
-    
+
     do {
         let x = ClassWithSomeClassProtocol()
         testInit(ptr, to: ExistentialRefWrapper(x: x))
@@ -254,6 +398,173 @@ func testExistentialReference() {
 
 testExistentialReference()
 
+func testSinglePayloadSimpleClassEnum() {
+    let ptr = UnsafeMutablePointer<SinglePayloadSimpleClassEnum>.allocate(capacity: 1)
+
+    do {
+        let x = SinglePayloadSimpleClassEnum.nonEmpty(SimpleClass(x: 23))
+        testInit(ptr, to: x)
+    }
+
+    do {
+        // CHECK: Value: 23
+        if case .nonEmpty(let c) = ptr.pointee {
+            print("Value: \(c.x)")
+        }
+
+        let y = SinglePayloadSimpleClassEnum.nonEmpty(SimpleClass(x: 28))
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: Value: 28
+    if case .nonEmpty(let c) = ptr.pointee {
+        print("Value: \(c.x)")
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testSinglePayloadSimpleClassEnum()
+
+func testSinglePayloadSimpleClassEnumEmpty() {
+    let ptr = UnsafeMutablePointer<SinglePayloadSimpleClassEnum>.allocate(capacity: 1)
+
+    do {
+        let x = SinglePayloadSimpleClassEnum.empty0
+        testInit(ptr, to: x)
+    }
+
+    do {
+        let y = SinglePayloadSimpleClassEnum.empty1
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testSinglePayloadSimpleClassEnumEmpty()
+
+func testContainsSinglePayloadSimpleClassEnum() {
+    let ptr = UnsafeMutablePointer<ContainsSinglePayloadSimpleClassEnum>.allocate(capacity: 1)
+
+    do {
+        let x = ContainsSinglePayloadSimpleClassEnum(x: SinglePayloadSimpleClassEnum.nonEmpty(SimpleClass(x: 23)), y: TestClass())
+        testInit(ptr, to: x)
+    }
+
+    do {
+        // CHECK: Value: 23
+        if case .nonEmpty(let c) = ptr.pointee.x {
+            print("Value: \(c.x)")
+        }
+
+        let y = ContainsSinglePayloadSimpleClassEnum(x: SinglePayloadSimpleClassEnum.nonEmpty(SimpleClass(x: 28)), y: TestClass())
+
+        // CHECK-NEXT: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        // CHECK-NEXT: TestClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: Value: 28
+    if case .nonEmpty(let c) = ptr.pointee.x {
+        print("Value: \(c.x)")
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    // CHECK-NEXT: TestClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testContainsSinglePayloadSimpleClassEnum()
+
+func testContainsSinglePayloadSimpleClassEnumEmpty() {
+    let ptr = UnsafeMutablePointer<ContainsSinglePayloadSimpleClassEnum>.allocate(capacity: 1)
+
+    do {
+        let x = ContainsSinglePayloadSimpleClassEnum(x: SinglePayloadSimpleClassEnum.empty0, y: TestClass())
+        testInit(ptr, to: x)
+    }
+
+    do {
+        let y = ContainsSinglePayloadSimpleClassEnum(x: SinglePayloadSimpleClassEnum.empty1, y: TestClass())
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: TestClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: TestClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testContainsSinglePayloadSimpleClassEnumEmpty()
+
+func testSinglePayloadAnyHashableEnum() {
+    let ptr = UnsafeMutablePointer<SinglePayloadAnyHashableEnum>.allocate(capacity: 1)
+
+    do {
+        let x = SinglePayloadAnyHashableEnum.empty0
+        testInit(ptr, to: x)
+    }
+
+    do {
+        // CHECK: empty0
+        if case .empty0 = ptr.pointee {
+            print("empty0")
+        }
+
+        let y = SinglePayloadAnyHashableEnum.empty0
+
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: empty0
+    if case .empty0 = ptr.pointee {
+        print("empty0")
+    }
+
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testSinglePayloadAnyHashableEnum()
+
 func testMultiPayloadEnum() {
     let ptr = UnsafeMutablePointer<MultiPayloadEnumWrapper>.allocate(capacity: 1)
 
@@ -267,7 +578,7 @@ func testMultiPayloadEnum() {
 
         // CHECK: Before deinit
         print("Before deinit")
-        
+
         // CHECK-NEXT: SimpleClass deinitialized!
         testAssign(ptr, from: y)
     }
@@ -340,6 +651,124 @@ func testForwardToPayloadEnum() {
 }
 
 testForwardToPayloadEnum()
+
+struct InternalEnumWrapperWrapper {
+    let x: InternalEnumWrapper
+}
+
+func testInternalEnumWrapper() {
+    let ptr = UnsafeMutablePointer<InternalEnumWrapperWrapper>.allocate(capacity: 1)
+
+    do {
+        let x = InternalEnumWrapper(x: SimpleClass(x: 23))
+        testInit(ptr, to: .init(x: x))
+    }
+
+    do {
+        let y = InternalEnumWrapper(x: SimpleClass(x: 28))
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: .init(x: y))
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testInternalEnumWrapper()
+
+func testSinglePayloadEnumExtraTagBytesWrapper() {
+    let ptr = UnsafeMutablePointer<SinglePayloadEnumExtraTagBytesWrapper>.allocate(capacity: 1)
+
+    do {
+        let x = SinglePayloadEnumExtraTagBytesWrapper(x: .empty0, y: SimpleClass(x: 23))
+        testInit(ptr, to: x)
+    }
+
+    do {
+        let y = SinglePayloadEnumExtraTagBytesWrapper(x: .empty0, y: SimpleClass(x: 28))
+
+        // CHECK-NEXT: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testSinglePayloadEnumExtraTagBytesWrapper()
+
+func testSinglePayloadEnumManyXI() {
+    let ptr = UnsafeMutablePointer<SinglePayloadEnumManyXI>.allocate(capacity: 1)
+
+    do {
+        let x = SinglePayloadEnumManyXI.nonEmpty(Builtin.zeroInitializer(), SimpleClass(x: 23))
+        testInit(ptr, to: x)
+    }
+
+    do {
+        let y = SinglePayloadEnumManyXI.nonEmpty(Builtin.zeroInitializer(), SimpleClass(x: 28))
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testSinglePayloadEnumManyXI()
+
+func testSinglePayloadEnumManyXIEmpty() {
+    let ptr = UnsafeMutablePointer<SinglePayloadEnumManyXI>.allocate(capacity: 1)
+
+    do {
+        let x = SinglePayloadEnumManyXI.empty0
+        testInit(ptr, to: x)
+    }
+
+    do {
+        let y = SinglePayloadEnumManyXI.empty1
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testSinglePayloadEnumManyXIEmpty()
 
 #if os(macOS)
 func testObjc() {
@@ -446,7 +875,7 @@ func testUnownedObjc() {
 
     do {
         let ref = ObjcClass(x: 34)
-        
+
         withExtendedLifetime(ref) {
             // CHECK-macosx-NEXT: ObjcClass deinitialized!
             testAssign(ptr, from: UnownedObjcWrapper(x: ref))

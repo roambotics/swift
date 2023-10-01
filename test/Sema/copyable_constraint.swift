@@ -5,10 +5,10 @@
 // FIXME: Now demonstrate that plain -parse-stdlib, such as in some arbitrary test, doesn't get the Copyable constraint :(
 // RUN: not %target-swift-frontend -typecheck -verify -parse-stdlib %s
 
-@_marker public protocol _Copyable {}
+@_marker public protocol Copyable {}
 
-func nextTime<T>(_ t: T) {}
+func nextTime<T>(_ t: T) {} // expected-note {{generic parameter 'T' has an implicit Copyable requirement}}
 
 @_moveOnly struct MO {}
 
-nextTime(MO()) // expected-error {{move-only type 'MO' cannot be used with generics yet}}
+nextTime(MO()) // expected-error {{noncopyable type 'MO' cannot be substituted for copyable generic parameter 'T' in 'nextTime'}}

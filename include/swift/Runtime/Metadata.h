@@ -423,6 +423,20 @@ const RelativeWitnessTable *swift_getAssociatedConformanceWitnessRelative(
                                   const ProtocolRequirement *reqBase,
                                   const ProtocolRequirement *assocConformance);
 
+/// Compare two witness tables, which may involving checking the
+/// contents of their conformance descriptors.
+///
+/// Runtime availability: Swift 5.4
+///
+/// \param lhs The first protocol witness table to compare.
+/// \param rhs The second protocol witness table to compare.
+///
+/// \returns true if both witness tables describe the same conformance, false otherwise.
+SWIFT_RUNTIME_EXPORT
+SWIFT_CC(swift)
+bool swift_compareWitnessTables(const WitnessTable *lhs,
+                                const WitnessTable *rhs);
+
 /// Determine whether two protocol conformance descriptors describe the same
 /// conformance of a type to a protocol.
 ///
@@ -651,6 +665,37 @@ void swift_initStructMetadataWithLayoutString(StructMetadata *self,
                                               const uint8_t *const *fieldTypes,
                                               const uint8_t *fieldTags,
                                               uint32_t *fieldOffsets);
+
+enum LayoutStringFlags : uint64_t {
+  Empty = 0,
+  // TODO: Track other useful information tha can be used to optimize layout
+  //       strings, like different reference kinds contained in the string
+  //       number of ref counting operations (maybe up to 4), so we can
+  //       use witness functions optimized for these cases.
+  HasRelativePointers = (1ULL << 63),
+};
+
+inline bool operator&(LayoutStringFlags a, LayoutStringFlags b) {
+  return (uint64_t(a) & uint64_t(b)) != 0;
+}
+inline LayoutStringFlags operator|(LayoutStringFlags a, LayoutStringFlags b) {
+  return LayoutStringFlags(uint64_t(a) | uint64_t(b));
+}
+inline LayoutStringFlags &operator|=(LayoutStringFlags &a, LayoutStringFlags b) {
+  return a = (a | b);
+}
+
+SWIFT_RUNTIME_STDLIB_INTERNAL
+size_t _swift_refCountBytesForMetatype(const Metadata *type);
+
+struct LayoutStringWriter;
+
+SWIFT_RUNTIME_STDLIB_INTERNAL
+void _swift_addRefCountStringForMetatype(LayoutStringWriter &writer,
+                                         LayoutStringFlags &flags,
+                                         const Metadata *fieldType,
+                                         size_t &fullOffset,
+                                         size_t &previousFieldOffset);
 
 /// Allocate the metadata for a class and copy fields from the given pattern.
 /// The final size of the metadata is calculated at runtime from the metadata
@@ -977,6 +1022,41 @@ void swift_enableDynamicReplacementScope(const DynamicReplacementScope *scope);
 
 SWIFT_RUNTIME_EXPORT
 void swift_disableDynamicReplacementScope(const DynamicReplacementScope *scope);
+
+/// A struct containing pointers to all of the type descriptors in the
+/// Concurrency runtime which have standard manglings.
+struct ConcurrencyStandardTypeDescriptors {
+#define STANDARD_TYPE(KIND, MANGLING, TYPENAME)
+#define STANDARD_TYPE_CONCURRENCY(KIND, MANGLING, TYPENAME)                    \
+  const ContextDescriptor * __ptrauth_swift_type_descriptor TYPENAME;
+#include "swift/Demangling/StandardTypesMangling.def"
+};
+
+/// Register the type descriptors with standard manglings from the Concurrency
+/// runtime. The passed-in struct must be immortal.
+SWIFT_RUNTIME_STDLIB_SPI
+void _swift_registerConcurrencyStandardTypeDescriptors(
+    const ConcurrencyStandardTypeDescriptors *descriptors);
+
+/// Initialize the value witness table for a struct using the provided like type
+/// as the basis for the layout.
+SWIFT_RUNTIME_EXPORT
+void swift_initRawStructMetadata(StructMetadata *self,
+                                 StructLayoutFlags flags,
+                                 const TypeLayout *likeType,
+                                 int32_t count);
+
+/// Check if the given generic arguments are valid inputs for the generic type
+/// context and if so call the metadata access function and return the metadata.
+///
+/// Note: This expects the caller to heap allocate all pack pointers within the
+/// generic arguments via 'swift_allocateMetadataPack'.
+SWIFT_RUNTIME_STDLIB_SPI
+SWIFT_CC(swift)
+const Metadata *_swift_instantiateCheckedGenericMetadata(
+    const TypeContextDescriptor *context,
+    const void * const *genericArgs,
+    size_t genericArgsSize);
 
 #pragma clang diagnostic pop
 

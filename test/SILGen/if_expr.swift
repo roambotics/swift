@@ -6,8 +6,7 @@ func foo() -> Int {
 }
 
 // CHECK-LABEL: sil hidden [ossa] @$s7if_expr3fooSiyF : $@convention(thin) () -> Int
-// CHECK:       [[RESULT_STORAGE:%[0-9]+]] = alloc_stack $Int
-// CHECK:       [[RESULT:%[0-9]+]] = mark_uninitialized [var] [[RESULT_STORAGE]] : $*Int
+// CHECK:       [[RESULT:%[0-9]+]] = alloc_stack $Int
 // CHECK:       cond_br {{%[0-9]+}}, [[TRUEBB:bb[0-9]+]], [[FALSEBB:bb[0-9]+]]
 //
 // CHECK:       [[TRUEBB]]:
@@ -24,7 +23,7 @@ func foo() -> Int {
 //
 // CHECK:       [[EXITBB]]:
 // CHECK:       [[VAL:%[0-9]+]] = load [trivial] [[RESULT]] : $*Int
-// CHECK:       dealloc_stack [[RESULT_STORAGE]] : $*Int
+// CHECK:       dealloc_stack [[RESULT]] : $*Int
 // CHECK:       return [[VAL]] : $Int
 
 class C {}
@@ -35,8 +34,7 @@ func bar(_ x: C) -> C {
 
 // CHECK-LABEL: sil hidden [ossa] @$s7if_expr3baryAA1CCADF : $@convention(thin) (@guaranteed C) -> @owned C
 // CHECK:       bb0([[CPARAM:%[0-9]+]] : @guaranteed $C):
-// CHECK:       [[RESULT_STORAGE:%[0-9]+]] = alloc_stack $C
-// CHECK:       [[RESULT:%[0-9]+]] = mark_uninitialized [var] [[RESULT_STORAGE]] : $*C
+// CHECK:       [[RESULT:%[0-9]+]] = alloc_stack $C
 // CHECK:       cond_br {{%[0-9]+}}, [[TRUEBB:bb[0-9]+]], [[FALSEBB:bb[0-9]+]]
 //
 // CHECK:       [[TRUEBB]]:
@@ -52,7 +50,7 @@ func bar(_ x: C) -> C {
 //
 // CHECK:       [[EXITBB]]:
 // CHECK:       [[VAL:%[0-9]+]] = load [take] [[RESULT]] : $*C
-// CHECK:       dealloc_stack [[RESULT_STORAGE]] : $*C
+// CHECK:       dealloc_stack [[RESULT]] : $*C
 // CHECK:       return [[VAL]] : $C
 
 struct Err: Error {}
@@ -68,8 +66,7 @@ func baz() throws -> Int {
 }
 
 // CHECK-LABEL: sil hidden [ossa] @$s7if_expr3bazSiyKF : $@convention(thin) () -> (Int, @error any Error)
-// CHECK:       [[RESULT_STORAGE:%[0-9]+]] = alloc_stack $Int
-// CHECK:       [[RESULT:%[0-9]+]] = mark_uninitialized [var] [[RESULT_STORAGE]] : $*Int
+// CHECK:       [[RESULT:%[0-9]+]] = alloc_stack $Int
 // CHECK:       cond_br {{%[0-9]+}}, [[TRUEBB:bb[0-9]+]], [[FALSEBB:bb[0-9]+]]
 //
 // CHECK:       [[FALSEBB]]:
@@ -83,7 +80,7 @@ func baz() throws -> Int {
 //
 // CHECK:       [[EXITBB]]:
 // CHECK:       [[VAL:%[0-9]+]] = load [trivial] [[RESULT]] : $*Int
-// CHECK:       dealloc_stack [[RESULT_STORAGE]] : $*Int
+// CHECK:       dealloc_stack [[RESULT]] : $*Int
 // CHECK:       return [[VAL]] : $Int
 
 func qux() throws -> Int {
@@ -91,8 +88,7 @@ func qux() throws -> Int {
 }
 
 // CHECK-LABEL: sil hidden [ossa] @$s7if_expr3quxSiyKF : $@convention(thin) () -> (Int, @error any Error)
-// CHECK:       [[RESULT_STORAGE:%[0-9]+]] = alloc_stack $Int
-// CHECK:       [[RESULT:%[0-9]+]] = mark_uninitialized [var] [[RESULT_STORAGE]] : $*Int
+// CHECK:       [[RESULT:%[0-9]+]] = alloc_stack $Int
 // CHECK:       cond_br {{%[0-9]+}}, [[TRUEBB:bb[0-9]+]], [[FALSEBB:bb[0-9]+]]
 //
 // CHECK:       [[FALSEBB]]:
@@ -104,11 +100,11 @@ func qux() throws -> Int {
 //
 // CHECK:       [[EXITBB]]:
 // CHECK:       [[VAL:%[0-9]+]] = load [trivial] [[RESULT]] : $*Int
-// CHECK:       dealloc_stack [[RESULT_STORAGE]] : $*Int
+// CHECK:       dealloc_stack [[RESULT]] : $*Int
 // CHECK:       return [[VAL]] : $Int
 //
 // CHECK:       [[ERRORBB]]([[ERR:%[0-9]+]] : @owned $any Error):
-// CHECK:       dealloc_stack [[RESULT_STORAGE]] : $*Int
+// CHECK:       dealloc_stack [[RESULT]] : $*Int
 // CHECK:       throw [[ERR]] : $any Error
 
 func optionalVoidCrash() {
@@ -140,8 +136,7 @@ func testClosure() throws -> Int {
 }
 
 // CHECK-LABEL: sil private [ossa] @$s7if_expr11testClosureSiyKFSiyKcfU_ : $@convention(thin) () -> (Int, @error any Error)
-// CHECK:       [[RESULT_STORAGE:%[0-9]+]] = alloc_stack $Int
-// CHECK:       [[RESULT:%[0-9]+]] = mark_uninitialized [var] [[RESULT_STORAGE]] : $*Int
+// CHECK:       [[RESULT:%[0-9]+]] = alloc_stack $Int
 // CHECK:       cond_br {{%[0-9]+}}, [[TRUEBB:bb[0-9]+]], [[FALSEBB:bb[0-9]+]]
 //
 // CHECK:       [[FALSEBB]]:
@@ -153,11 +148,11 @@ func testClosure() throws -> Int {
 //
 // CHECK:       [[EXITBB]]:
 // CHECK:       [[VAL:%[0-9]+]] = load [trivial] [[RESULT]] : $*Int
-// CHECK:       dealloc_stack [[RESULT_STORAGE]] : $*Int
+// CHECK:       dealloc_stack [[RESULT]] : $*Int
 // CHECK:       return [[VAL]] : $Int
 //
 // CHECK:       [[ERRORBB]]([[ERR:%[0-9]+]] : @owned $any Error):
-// CHECK:       dealloc_stack [[RESULT_STORAGE]] : $*Int
+// CHECK:       dealloc_stack [[RESULT]] : $*Int
 // CHECK:       throw [[ERR]] : $any Error
 
 func testNested() throws -> Int {
@@ -173,8 +168,7 @@ func testNested() throws -> Int {
 }
 
 // CHECK-LABEL: sil hidden [ossa] @$s7if_expr10testNestedSiyKF : $@convention(thin) () -> (Int, @error any Error)
-// CHECK:       [[RESULT_STORAGE:%[0-9]+]] = alloc_stack $Int
-// CHECK:       [[RESULT:%[0-9]+]] = mark_uninitialized [var] [[RESULT_STORAGE]] : $*Int
+// CHECK:       [[RESULT:%[0-9]+]] = alloc_stack $Int
 // CHECK:       cond_br {{%[0-9]+}}, [[TRUEBB:bb[0-9]+]], [[FALSEBB:bb[0-9]+]]
 //
 // CHECK:       [[FALSEBB]]:
@@ -188,12 +182,45 @@ func testNested() throws -> Int {
 //
 // CHECK:       [[EXITBB]]:
 // CHECK:       [[VAL:%[0-9]+]] = load [trivial] [[RESULT]] : $*Int
-// CHECK:       dealloc_stack [[RESULT_STORAGE]] : $*Int
+// CHECK:       dealloc_stack [[RESULT]] : $*Int
 // CHECK:       return [[VAL]] : $Int
 
 func testVar() -> Int {
   let x = if .random() { 1 } else { 2 }
   return x
+}
+
+func testPoundIf1() -> Int {
+  let x = if .random() {
+    #if true
+    1
+    #else
+    ""
+    #endif
+  } else {
+    #if false
+    ""
+    #else
+    2
+    #endif
+  }
+  return x
+}
+
+func testPoundIf2() -> Int {
+  if .random() {
+    #if false
+    0
+    #else
+    #if true
+    if .random() { 0 } else { 1 }
+    #endif
+    #endif
+  } else {
+    #if true
+    if .random() { 0 } else { 1 }
+    #endif
+  }
 }
 
 func testCatch() -> Int {
@@ -228,5 +255,328 @@ func nestedType() throws -> Int {
     throw S()
   } else {
     0
+  }
+}
+
+// MARK: Bindings
+
+enum E {
+  case e(Int)
+}
+
+struct S {
+  var i: Int
+  var opt: Int?
+
+  var computed: Int {
+    get { i }
+    set { i = newValue }
+  }
+  var coroutined: Int {
+    _read { yield i }
+    _modify { yield &i }
+  }
+
+  subscript(x: Int) -> Int {
+    get { i }
+    set { i = newValue }
+  }
+
+  mutating func testAssign1(_ x: E) {
+    i = if case .e(let y) = x { y } else { 0 }
+  }
+
+
+  mutating func testAssign2(_ x: E) {
+    i = if case .e(let y) = x { Int(y) } else { 0 }
+  }
+
+  func testAssign3(_ x: E) {
+    var i = 0
+    i = if case .e(let y) = x { y } else { 0 }
+    _ = i
+  }
+
+  func testAssign4(_ x: E) {
+    var i = 0
+    let _ = {
+      i = if case .e(let y) = x { y } else { 0 }
+    }
+    _ = i
+  }
+
+  mutating func testAssign5(_ x: E) {
+    i = switch Bool.random() {
+    case true:
+      if case .e(let y) = x { y } else { 0 }
+    case let z:
+      z ? 0 : 1
+    }
+  }
+
+  mutating func testAssign6(_ x: E) {
+    i = if case .e(let y) = x {
+      switch Bool.random() {
+      case true: y
+      case false: y
+      }
+    } else {
+      0
+    }
+  }
+
+  mutating func testAssign7(_ x: E?) {
+    i = if let x = x {
+      switch x {
+      case .e(let y): y
+      }
+    } else {
+      0
+    }
+  }
+
+  func testReturn1(_ x: E) -> Int {
+    if case .e(let y) = x { y } else { 0 }
+  }
+
+  func testReturn2(_ x: E) -> Int {
+    return if case .e(let y) = x { y } else { 0 }
+  }
+
+  func testReturn3(_ x: E) -> Int {
+    {
+      if case .e(let y) = x { y } else { 0 }
+    }()
+  }
+
+  func testReturn4(_ x: E) -> Int {
+    return {
+      if case .e(let y) = x { y } else { 0 }
+    }()
+  }
+
+  func testBinding1(_ x: E) -> Int {
+    let i = if case .e(let y) = x { y } else { 0 }
+    return i
+  }
+
+  func testBinding2(_ x: E) -> Int {
+    let i = {
+      if case .e(let y) = x { y } else { 0 }
+    }()
+    return i
+  }
+}
+
+enum G {
+  case e(Int)
+  case f
+}
+
+struct TestLValues {
+  var s: S
+  var opt: S?
+  var optopt: S??
+
+  mutating func testOptPromote1() {
+    opt = if .random() { s } else { s }
+  }
+
+  mutating func testOptPromote2() {
+    optopt = if .random() { s } else { s }
+  }
+
+  mutating func testStored1() {
+    s.i = if .random() { 1 } else { 0 }
+  }
+
+  mutating func testStored2() throws {
+    s.i = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testComputed1() {
+    s.computed = if .random() { 1 } else { 0 }
+  }
+
+  mutating func testComputed2() throws {
+    s.computed = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testCoroutined1() {
+    s.coroutined = if .random() { 1 } else { 0 }
+  }
+
+  mutating func testCoroutined2() throws {
+    s.coroutined = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testOptionalChain1() {
+    opt?.i = if .random() { 1 } else { 0 }
+  }
+
+  mutating func testOptionalChain2() throws {
+    opt?.i = if .random() { throw Err() } else { 0 }
+  }
+
+  mutating func testOptionalChain3(_ g: G) {
+    opt?.i = if case .e(let i) = g { i } else { 0 }
+  }
+
+  mutating func testOptionalChain4(_ g: G) throws {
+    opt?.i = if case .e(let i) = g { i } else { throw Err() }
+  }
+
+  mutating func testOptionalChain5(_ g: G) throws {
+    opt?.computed = if case .e(let i) = g { i } else { throw Err() }
+  }
+
+  mutating func testOptionalChain6(_ g: G) throws {
+    opt?.coroutined = if case .e(let i) = g { i } else { throw Err() }
+  }
+
+  mutating func testOptionalChain7() throws {
+    optopt??.i = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testOptionalChain8() throws {
+    optopt??.opt = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testOptionalChain9() throws {
+    optopt??.opt? = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testOptionalForce1() throws {
+    opt!.i = if .random() { throw Err() } else { 0 }
+  }
+
+  mutating func testOptionalForce2() throws {
+    opt!.computed = if .random() { throw Err() } else { 0 }
+  }
+
+  mutating func testOptionalForce3(_ g: G) throws {
+    opt!.coroutined = if case .e(let i) = g { i } else { throw Err() }
+  }
+
+  mutating func testOptionalForce4() throws {
+    optopt!!.i = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testOptionalForce5() throws {
+    optopt!!.opt = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testOptionalForce6() throws {
+    optopt!!.opt! = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testSubscript1() throws {
+    s[5] = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testSubscript2() throws {
+    opt?[5] = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testSubscript3() throws {
+    opt![5] = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testKeyPath1(_ kp: WritableKeyPath<S, Int>) throws {
+    s[keyPath: kp] = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testKeyPath2(_ kp: WritableKeyPath<S, Int>) throws {
+    opt?[keyPath: kp] = if .random() { 1 } else { throw Err() }
+  }
+
+  mutating func testKeyPath3(_ kp: WritableKeyPath<S, Int>) throws {
+    opt![keyPath: kp] = if .random() { 1 } else { throw Err() }
+  }
+}
+
+func testNever1() -> Never {
+  if case let x = fatalError() { x } else { fatalError() }
+}
+
+func testNever2() -> Never {
+  if .random() { fatalError() } else { fatalError() }
+}
+
+func testNever3() -> Int {
+  if .random() {
+    fatalError()
+  } else {
+    0
+  }
+}
+// CHECK-LABEL: sil hidden [ossa] @$s7if_expr10testNever3SiyF : $@convention(thin) () -> Int
+// CHECK:       [[RESULT:%[0-9]+]] = alloc_stack $Int
+// CHECK:       cond_br {{%[0-9]+}}, [[BB_TRUE:bb[0-9]+]], [[BB_FALSE:bb[0-9]+]]
+//
+// CHECK:       [[BB_TRUE]]:
+// CHECK:       function_ref fatalError(_:file:line:)
+// CHECK:       unreachable
+//
+// CHECK:       [[BB_FALSE]]:
+// CHECK:       store {{%[0-9]+}} to [trivial] [[RESULT]] : $*Int
+// CHECK:       [[RET:%[0-9]+]] = load [trivial] [[RESULT]] : $*Int
+// CHECK:       dealloc_stack [[RESULT]] : $*Int
+// CHECK:       return [[RET]]
+
+func never() -> Never { fatalError() }
+
+func testNever4() -> Int {
+  if .random() {
+    never()
+  } else {
+    0
+  }
+}
+
+func neverTuple() -> (Never, Int) { fatalError() }
+
+func testNever5() -> (Never, Int) {
+  if .random() {
+    neverTuple()
+  } else {
+    (never(), 0)
+  }
+}
+// CHECK-LABEL: sil hidden [ossa] @$s7if_expr10testNever5s5NeverO_SityF : $@convention(thin) () -> (Never, Int)
+// CHECK:       [[RESULT:%[0-9]+]] = alloc_stack $(Never, Int)
+// CHECK:       cond_br {{%[0-9]+}}, [[BB_TRUE:bb[0-9]+]], [[BB_FALSE:bb[0-9]+]]
+//
+// CHECK:       [[BB_TRUE]]:
+// CHECK:       [[ELT_0:%[0-9]+]] = tuple_element_addr [[RESULT]] : $*(Never, Int), 0
+// CHECK:       [[ELT_1:%[0-9]+]] = tuple_element_addr [[RESULT]] : $*(Never, Int), 1
+// CHECK:       ([[RET_0:%[0-9]+]], [[RET_1:%[0-9]+]]) = destructure_tuple {{%[0-9]+}} : $(Never, Int)
+// CHECK:       store [[RET_0]] to [trivial] [[ELT_0]] : $*Never
+// CHECK:       store [[RET_1]] to [trivial] [[ELT_1]] : $*Int
+// CHECK:       br [[BB_EXIT:bb[0-9]+]]
+//
+// CHECK:       [[BB_FALSE]]:
+// CHECK:       [[ELT_0:%[0-9]+]] = tuple_element_addr [[RESULT]] : $*(Never, Int), 0
+// CHECK:       [[ELT_1:%[0-9]+]] = tuple_element_addr [[RESULT]] : $*(Never, Int), 1
+// CHECK:       store {{%[0-9]+}} to [trivial] [[ELT_0]] : $*Never
+// CHECK:       store {{%[0-9]+}} to [trivial] [[ELT_1]] : $*Int
+// CHECK:       br [[BB_EXIT:bb[0-9]+]]
+//
+// CHECK:       [[BB_EXIT]]:
+// CHECK:       dealloc_stack [[RESULT]] : $*(Never, Int)
+// CHECK:       [[RET:%[0-9]+]] = tuple ({{%[0-9]+}} : $Never, {{%[0-9]+}} : $Int)
+// CHECK:       return [[RET]]
+
+func testCaptureList() -> Int {
+  let fn = { [x = if .random() { 0 } else { 1 }] in x }
+  return fn()
+}
+
+// https://github.com/apple/swift/issues/68764
+func testConditionalCast<T>(_ x: Any) -> T? {
+  if .random() {
+    x as? T
+  } else {
+    nil
   }
 }

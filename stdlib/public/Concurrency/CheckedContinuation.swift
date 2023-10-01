@@ -256,7 +256,7 @@ extension CheckedContinuation {
 ///
 /// The body of the closure executes synchronously on the calling task, and once it returns
 /// the calling task is suspended. It is possible to immediately resume the task, or escape the
-/// continuation in order to complete it afterwards, which will them resume suspended task.
+/// continuation in order to complete it afterwards, which will then resume the suspended task.
 ///
 /// You must invoke the continuation's `resume` method exactly once.
 ///
@@ -294,7 +294,7 @@ public func withCheckedContinuation<T>(
 ///
 /// The body of the closure executes synchronously on the calling task, and once it returns
 /// the calling task is suspended. It is possible to immediately resume the task, or escape the
-/// continuation in order to complete it afterwards, which will them resume suspended task.
+/// continuation in order to complete it afterwards, which will then resume the suspended task.
 ///
 /// If `resume(throwing:)` is called on the continuation, this function throws that error.
 ///
@@ -330,3 +330,50 @@ public func withCheckedThrowingContinuation<T>(
   }
 }
 
+#if _runtime(_ObjC)
+
+// Intrinsics used by SILGen to create, resume, or fail checked continuations.
+@available(SwiftStdlib 5.1, *)
+@_alwaysEmitIntoClient
+internal func _createCheckedContinuation<T>(
+  _ continuation: __owned UnsafeContinuation<T, Never>
+) -> CheckedContinuation<T, Never> {
+  return CheckedContinuation(continuation: continuation)
+}
+
+@available(SwiftStdlib 5.1, *)
+@_alwaysEmitIntoClient
+internal func _createCheckedThrowingContinuation<T>(
+  _ continuation: __owned UnsafeContinuation<T, Error>
+) -> CheckedContinuation<T, Error> {
+  return CheckedContinuation(continuation: continuation)
+}
+
+@available(SwiftStdlib 5.1, *)
+@_alwaysEmitIntoClient
+internal func _resumeCheckedContinuation<T>(
+  _ continuation: CheckedContinuation<T, Never>,
+  _ value: __owned T
+) {
+  continuation.resume(returning: value)
+}
+
+@available(SwiftStdlib 5.1, *)
+@_alwaysEmitIntoClient
+internal func _resumeCheckedThrowingContinuation<T>(
+  _ continuation: CheckedContinuation<T, Error>,
+  _ value: __owned T
+) {
+  continuation.resume(returning: value)
+}
+
+@available(SwiftStdlib 5.1, *)
+@_alwaysEmitIntoClient
+internal func _resumeCheckedThrowingContinuationWithError<T>(
+  _ continuation: CheckedContinuation<T, Error>,
+  _ error: __owned Error
+) {
+  continuation.resume(throwing: error)
+}
+
+#endif

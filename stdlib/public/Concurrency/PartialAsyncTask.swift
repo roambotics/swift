@@ -13,7 +13,7 @@
 import Swift
 @_implementationOnly import _SwiftConcurrencyShims
 
-// TODO(swift): rename the file to Job.swift eventually, we don't use PartialTask terminology anymore
+// TODO(swift): rename the file to ExecutorJob.swift eventually, we don't use PartialTask terminology anymore
 
 @available(SwiftStdlib 5.1, *)
 @_silgen_name("swift_job_run")
@@ -45,7 +45,15 @@ public struct UnownedJob: Sendable {
   #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
   /// Create an `UnownedJob` whose lifetime must be managed carefully until it is run exactly once.
   @available(SwiftStdlib 5.9, *)
-  public init(_ job: __owned Job) {
+  public init(_ job: __owned Job) { // must remain '__owned' in order to not break ABI
+    self.context = job.context
+  }
+  #endif // !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+
+  #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+  /// Create an `UnownedJob` whose lifetime must be managed carefully until it is run exactly once.
+  @available(SwiftStdlib 5.9, *)
+  public init(_ job: __owned ExecutorJob) { // must remain '__owned' in order to not break ABI
     self.context = job.context
   }
   #endif // !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
@@ -65,7 +73,7 @@ public struct UnownedJob: Sendable {
   /// Deprecated API to run a job on a specific executor.
   @_alwaysEmitIntoClient
   @inlinable
-  @available(*, deprecated, renamed: "Job.runSynchronously(on:)")
+  @available(*, deprecated, renamed: "ExecutorJob.runSynchronously(on:)")
   public func _runSynchronously(on executor: UnownedSerialExecutor) {
     _swiftJobRun(self, executor)
   }
@@ -105,11 +113,15 @@ extension UnownedJob: CustomStringConvertible {
 }
 
 #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
-//// A unit of scheduleable work.
+
+/// Deprecated equivalent of ``ExecutorJob``.
+///
+/// A unit of scheduleable work.
 ///
 /// Unless you're implementing a scheduler,
 /// you don't generally interact with jobs directly.
 @available(SwiftStdlib 5.9, *)
+@available(*, deprecated, renamed: "ExecutorJob")
 @frozen
 @_moveOnly
 public struct Job: Sendable {
@@ -122,6 +134,10 @@ public struct Job: Sendable {
 
   public init(_ job: UnownedJob) {
     self.context = job._context
+  }
+
+  public init(_ job: __owned ExecutorJob) {
+    self.context = job.context
   }
 
   public var priority: JobPriority {
@@ -137,9 +153,9 @@ public struct Job: Sendable {
     /// and it appearing as 0 for _different_ jobs may lead to misunderstanding it as
     /// being "the same 0 id job", we specifically print 0 (id not set) as nil.
     if (id > 0) {
-      return "\(Self.self)(id: \(id))"
+      return "Job(id: \(id))"
     } else {
-      return "\(Self.self)(id: nil)"
+      return "Job(id: nil)"
     }
   }
 }
@@ -158,7 +174,75 @@ extension Job {
   ///
   /// This operation consumes the job, preventing it accidental use after it has ben run.
   ///
-  /// Converting a `Job` to an ``UnownedJob`` and invoking ``UnownedJob/runSynchronously(_:)` on it multiple times is undefined behavior,
+  /// Converting a `ExecutorJob` to an ``UnownedJob`` and invoking ``UnownedJob/runSynchronously(_:)` on it multiple times is undefined behavior,
+  /// as a job can only ever be run once, and must not be accessed after it has been run.
+  ///
+  /// - Parameter executor: the executor this job will be semantically running on.
+  @_alwaysEmitIntoClient
+  @inlinable
+  __consuming public func runSynchronously(on executor: UnownedSerialExecutor) {
+    _swiftJobRun(UnownedJob(self), executor)
+  }
+}
+
+/// A unit of scheduleable work.
+///
+/// Unless you're implementing a scheduler,
+/// you don't generally interact with jobs directly.
+@available(SwiftStdlib 5.9, *)
+@frozen
+@_moveOnly
+public struct ExecutorJob: Sendable {
+  internal var context: Builtin.Job
+
+  @usableFromInline
+  internal init(context: __owned Builtin.Job) {
+    self.context = context
+  }
+
+  public init(_ job: UnownedJob) {
+    self.context = job._context
+  }
+
+  public init(_ job: __owned Job) {
+    self.context = job.context
+  }
+
+  public var priority: JobPriority {
+    let raw = _swift_concurrency_jobPriority(UnownedJob(context: self.context))
+    return JobPriority(rawValue: raw)
+  }
+
+  // TODO: move only types cannot conform to protocols, so we can't conform to CustomStringConvertible;
+  //       we can still offer a description to be called explicitly though.
+  public var description: String {
+    let id = _getJobTaskId(UnownedJob(context: self.context))
+    /// Tasks are always assigned an unique ID, however some jobs may not have it set,
+    /// and it appearing as 0 for _different_ jobs may lead to misunderstanding it as
+    /// being "the same 0 id job", we specifically print 0 (id not set) as nil.
+    if (id > 0) {
+      return "ExecutorJob(id: \(id))"
+    } else {
+      return "ExecutorJob(id: nil)"
+    }
+  }
+}
+
+@available(SwiftStdlib 5.9, *)
+extension ExecutorJob {
+
+  /// Run this job on the passed in executor.
+  ///
+  /// This operation runs the job on the calling thread and *blocks* until the job completes.
+  /// The intended use of this method is for an executor to determine when and where it
+  /// wants to run the job and then call this method on it.
+  ///
+  /// The passed in executor reference is used to establish the executor context for the job,
+  /// and should be the same executor as the one semantically calling the `runSynchronously` method.
+  ///
+  /// This operation consumes the job, preventing it accidental use after it has ben run.
+  ///
+  /// Converting a `ExecutorJob` to an ``UnownedJob`` and invoking ``UnownedJob/runSynchronously(_:)` on it multiple times is undefined behavior,
   /// as a job can only ever be run once, and must not be accessed after it has been run.
   ///
   /// - Parameter executor: the executor this job will be semantically running on.
@@ -182,7 +266,7 @@ extension Job {
 /// However, the semantics of how priority is treated are left up to each
 /// platform and `Executor` implementation.
 ///
-/// A Job's priority is roughly equivalent to a `TaskPriority`,
+/// A ExecutorJob's priority is roughly equivalent to a `TaskPriority`,
 /// however, since not all jobs are tasks, represented as separate type.
 ///
 /// Conversions between the two priorities are available as initializers on the respective types.
@@ -459,7 +543,7 @@ internal func _resumeUnsafeThrowingContinuationWithError<T>(
 ///
 /// The body of the closure executes synchronously on the calling task, and once it returns
 /// the calling task is suspended. It is possible to immediately resume the task, or escape the
-/// continuation in order to complete it afterwards, which will them resume suspended task.
+/// continuation in order to complete it afterwards, which will then resume the suspended task.
 ///
 /// You must invoke the continuation's `resume` method exactly once.
 ///
@@ -493,7 +577,7 @@ public func withUnsafeContinuation<T>(
 ///
 /// The body of the closure executes synchronously on the calling task, and once it returns
 /// the calling task is suspended. It is possible to immediately resume the task, or escape the
-/// continuation in order to complete it afterwards, which will them resume suspended task.
+/// continuation in order to complete it afterwards, which will then resume the suspended task.
 ///
 /// If `resume(throwing:)` is called on the continuation, this function throws that error.
 ///

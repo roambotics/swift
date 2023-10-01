@@ -184,7 +184,7 @@ private:
 
     // Don't capture variables which aren't default-initialized.
     if (auto *VD = dyn_cast<VarDecl>(DstDecl))
-      if (!VD->isParentInitialized() &&
+      if (!VD->isParentExecutabledInitialized() &&
           !(isa<ParamDecl>(VD) &&
             cast<ParamDecl>(VD)->isInOut()))
         return Action::Continue(OriginalExpr);
@@ -269,7 +269,7 @@ private:
     auto *Params = ParameterList::createEmpty(Ctx);
     auto *Closure = new (Ctx)
         ClosureExpr(DeclAttributes(), SourceRange(), nullptr, Params,
-                    SourceLoc(), SourceLoc(),
+                    SourceLoc(), SourceLoc(), /*thrownType=*/nullptr,
                     SourceLoc(), SourceLoc(), nullptr,
                     getCurrentDeclContext());
     Closure->setImplicit(true);

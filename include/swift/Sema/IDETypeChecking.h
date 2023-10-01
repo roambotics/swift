@@ -37,6 +37,7 @@ namespace swift {
   enum class DeclRefKind;
   class Expr;
   class ExtensionDecl;
+  class FreestandingMacroExpansion;
   class FunctionType;
   class LabeledConditionalStmt;
   class LookupResult;
@@ -123,26 +124,9 @@ namespace swift {
 
   /// Return the type of an expression parsed during code completion, or
   /// None on error.
-  Optional<Type> getTypeOfCompletionContextExpr(
-                   ASTContext &Ctx,
-                   DeclContext *DC,
-                   CompletionTypeCheckKind kind,
-                   Expr *&parsedExpr,
-                   ConcreteDeclRef &referencedDecl);
-
-  /// Resolve type of operator function with \c opName appending it to \c LHS.
-  ///
-  /// For \p refKind, use \c DeclRefKind::PostfixOperator for postfix operator,
-  /// or \c DeclRefKind::BinaryOperator for infix operator.
-  /// On success, returns resolved function type of the operator. The LHS should
-  /// already be type-checked. This function guarantees LHS not to be modified.
-  FunctionType *getTypeOfCompletionOperator(DeclContext *DC, Expr *LHS,
-                                            Identifier opName,
-                                            DeclRefKind refKind,
-                                            ConcreteDeclRef &referencedDecl);
-
-  /// Typecheck the given expression.
-  bool typeCheckExpression(DeclContext *DC, Expr *&parsedExpr);
+  llvm::Optional<Type> getTypeOfCompletionContextExpr(
+      ASTContext &Ctx, DeclContext *DC, CompletionTypeCheckKind kind,
+      Expr *&parsedExpr, ConcreteDeclRef &referencedDecl);
 
   /// Type check a function body element which is at \p TagetLoc.
   bool typeCheckASTNodeAtLoc(TypeCheckASTNodeAtLocContext TypeCheckCtx,
@@ -319,10 +303,11 @@ namespace swift {
 
   /// Print the declaration for a result builder "build" function, for use
   /// in Fix-Its, code completion, and so on.
-  void printResultBuilderBuildFunction(
-      NominalTypeDecl *builder, Type componentType,
-      ResultBuilderBuildFunction function,
-      Optional<std::string> stubIndent, llvm::raw_ostream &out);
+  void printResultBuilderBuildFunction(NominalTypeDecl *builder,
+                                       Type componentType,
+                                       ResultBuilderBuildFunction function,
+                                       llvm::Optional<std::string> stubIndent,
+                                       llvm::raw_ostream &out);
 
   /// Compute the insertion location, indentation string, and component type
   /// for a Fix-It that adds a new build* function to a result builder.
@@ -333,9 +318,9 @@ namespace swift {
   bool completionContextUsesConcurrencyFeatures(const DeclContext *dc);
 
   /// Determine the isolation of a particular closure.
-  ClosureActorIsolation determineClosureActorIsolation(
+  ActorIsolation determineClosureActorIsolation(
       AbstractClosureExpr *closure, llvm::function_ref<Type(Expr *)> getType,
-      llvm::function_ref<ClosureActorIsolation(AbstractClosureExpr *)>
+      llvm::function_ref<ActorIsolation(AbstractClosureExpr *)>
           getClosureActorIsolation);
 
   /// If the capture list shadows any declarations using shorthand syntax, i.e.
@@ -355,6 +340,13 @@ namespace swift {
   SmallVector<std::pair<ValueDecl *, ValueDecl *>, 1>
   getShorthandShadows(LabeledConditionalStmt *CondStmt,
                       DeclContext *DC = nullptr);
+
+  SourceFile *evaluateFreestandingMacro(FreestandingMacroExpansion *expansion,
+                                        StringRef discriminator);
+
+  SourceFile *evaluateAttachedMacro(MacroDecl *macro, Decl *attachedTo,
+                                    CustomAttr *attr, bool passParentContext,
+                                    MacroRole role, StringRef discriminator);
 }
 
 #endif

@@ -138,8 +138,8 @@ void DifferentiableActivityInfo::propagateVaried(
     if (isVaried(operand->get(), i)) {
       for (auto indRes : applySite.getIndirectSILResults())
         propagateVariedInwardsThroughProjections(indRes, i);
-      for (auto inoutArg : applySite.getInoutArguments())
-        propagateVariedInwardsThroughProjections(inoutArg, i);
+      for (auto semresArg : applySite.getAutoDiffSemanticResultArguments())
+        propagateVariedInwardsThroughProjections(semresArg, i);
       // Propagate variedness to apply site direct results.
       forEachApplyDirectResult(applySite, [&](SILValue directResult) {
         setVariedAndPropagateToUsers(directResult, i);
@@ -231,13 +231,13 @@ void DifferentiableActivityInfo::propagateVaried(
 
 /// Returns the accessor kind of the given SIL function, if it is a lowered
 /// accessor. Otherwise, return `None`.
-static Optional<AccessorKind> getAccessorKind(SILFunction *fn) {
+static llvm::Optional<AccessorKind> getAccessorKind(SILFunction *fn) {
   auto *dc = fn->getDeclContext();
   if (!dc)
-    return None;
+    return llvm::None;
   auto *accessor = dyn_cast_or_null<AccessorDecl>(dc->getAsDecl());
   if (!accessor)
-    return None;
+    return llvm::None;
   return accessor->getAccessorKind();
 }
 
@@ -408,7 +408,7 @@ void DifferentiableActivityInfo::propagateUsefulThroughAddress(
       SKIP_NODERIVATIVE(RefElementAddr)
 #undef SKIP_NODERIVATIVE
       if (Projection::isAddressProjection(res) || isa<BeginAccessInst>(res) ||
-          isa<BeginBorrowInst>(res))
+          isa<BeginBorrowInst>(res) || isa<InitEnumDataAddrInst>(res))
         propagateUsefulThroughAddress(res, dependentVariableIndex);
     }
   }

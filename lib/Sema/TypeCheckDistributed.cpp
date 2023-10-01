@@ -155,10 +155,8 @@ void swift::diagnoseDistributedFunctionInNonDistributedActorProtocol(
   } else {
     // Similar to how Sendable FitIts do this, we insert at the end of
     // the inherited types.
-    ASTContext &ctx = proto->getASTContext();
-    SourceLoc fixItLoc = proto->getInherited().back().getSourceRange().End;
-    fixItLoc = Lexer::getLocForEndOfToken(ctx.SourceMgr, fixItLoc);
-    diag.fixItInsert(fixItLoc, ", DistributedActor");
+    SourceLoc fixItLoc = proto->getInherited().getEndLoc();
+    diag.fixItInsertAfter(fixItLoc, ", DistributedActor");
   }
 }
 
@@ -173,10 +171,8 @@ void swift::addCodableFixIt(
     SourceLoc fixItLoc = nominal->getBraces().Start;
     diag.fixItInsert(fixItLoc, ": Codable");
   } else {
-    ASTContext &ctx = nominal->getASTContext();
-    SourceLoc fixItLoc = nominal->getInherited().back().getSourceRange().End;
-    fixItLoc = Lexer::getLocForEndOfToken(ctx.SourceMgr, fixItLoc);
-    diag.fixItInsert(fixItLoc, ", Codable");
+    SourceLoc fixItLoc = nominal->getInherited().getEndLoc();
+    diag.fixItInsertAfter(fixItLoc, ", Codable");
   }
 }
 
@@ -216,13 +212,10 @@ static bool checkAdHocRequirementAccessControl(
     return false;
   }
 
-  func->diagnose(diag::witness_not_accessible_type,
-                 diag::RequirementKind::Func,
-                 func->getName(),
-                 /*isSetter=*/false,
-                 /*requiredAccess=*/AccessLevel::Public,
-                 AccessLevel::Public,
-                 proto->getName());
+  func->diagnose(diag::witness_not_accessible_type, diag::RequirementKind::Func,
+                 func, /*isSetter=*/false,
+                 /*requiredAccess=*/AccessLevel::Public, AccessLevel::Public,
+                 proto);
       return true;
 }
 
@@ -245,7 +238,7 @@ bool swift::checkDistributedActorSystemAdHocProtocolRequirements(
       auto identifier = C.Id_remoteCall;
       decl->diagnose(
           diag::distributed_actor_system_conformance_missing_adhoc_requirement,
-          decl->getDescriptiveKind(), decl->getName(), identifier);
+          decl, identifier);
       decl->diagnose(
           diag::note_distributed_actor_system_conformance_missing_adhoc_requirement,
           Proto->getName(), identifier,
@@ -272,7 +265,7 @@ bool swift::checkDistributedActorSystemAdHocProtocolRequirements(
       auto identifier = C.Id_remoteCallVoid;
       decl->diagnose(
           diag::distributed_actor_system_conformance_missing_adhoc_requirement,
-          decl->getDescriptiveKind(), decl->getName(), identifier);
+          decl, identifier);
       decl->diagnose(
           diag::note_distributed_actor_system_conformance_missing_adhoc_requirement,
           Proto->getName(), identifier,
@@ -302,7 +295,7 @@ bool swift::checkDistributedActorSystemAdHocProtocolRequirements(
       auto identifier = C.Id_recordArgument;
       decl->diagnose(
           diag::distributed_actor_system_conformance_missing_adhoc_requirement,
-          decl->getDescriptiveKind(), decl->getName(), identifier);
+          decl, identifier);
       decl->diagnose(diag::note_distributed_actor_system_conformance_missing_adhoc_requirement,
                      Proto->getName(), identifier,
                      "mutating func recordArgument<Value: SerializationRequirement>(_ argument: RemoteCallArgument<Value>) throws\n");
@@ -317,7 +310,7 @@ bool swift::checkDistributedActorSystemAdHocProtocolRequirements(
       auto identifier = C.Id_recordReturnType;
       decl->diagnose(
           diag::distributed_actor_system_conformance_missing_adhoc_requirement,
-          decl->getDescriptiveKind(), decl->getName(), identifier);
+          decl, identifier);
       decl->diagnose(diag::note_distributed_actor_system_conformance_missing_adhoc_requirement,
                      Proto->getName(), identifier,
                      "mutating func recordReturnType<Res: SerializationRequirement>(_ resultType: Res.Type) throws\n");
@@ -338,7 +331,7 @@ bool swift::checkDistributedActorSystemAdHocProtocolRequirements(
       auto identifier = C.Id_decodeNextArgument;
       decl->diagnose(
           diag::distributed_actor_system_conformance_missing_adhoc_requirement,
-          decl->getDescriptiveKind(), decl->getName(), identifier);
+          decl, identifier);
       decl->diagnose(diag::note_distributed_actor_system_conformance_missing_adhoc_requirement,
                      Proto->getName(), identifier,
                      "mutating func decodeNextArgument<Argument: SerializationRequirement>() throws -> Argument\n");
@@ -359,7 +352,7 @@ bool swift::checkDistributedActorSystemAdHocProtocolRequirements(
       auto identifier = C.Id_onReturn;
       decl->diagnose(
           diag::distributed_actor_system_conformance_missing_adhoc_requirement,
-          decl->getDescriptiveKind(), decl->getName(), identifier);
+          decl, identifier);
       decl->diagnose(
           diag::note_distributed_actor_system_conformance_missing_adhoc_requirement,
           Proto->getName(), identifier,
@@ -412,8 +405,7 @@ static bool checkDistributedTargetResultType(
         auto diag = valueDecl->diagnose(
             diag::distributed_actor_target_result_not_codable,
             resultType,
-            valueDecl->getDescriptiveKind(),
-            valueDecl->getBaseIdentifier(),
+            valueDecl,
             conformanceToSuggest
         );
 
@@ -535,8 +527,8 @@ bool CheckDistributedFunctionRequest::evaluate(
       checkDistributedSerializationRequirementIsExactlyCodable(
           C, serializationRequirements);
 
-  // --- Check parameters for 'Codable' conformance
   for (auto param : *func->getParameters()) {
+    // --- Check parameters for 'Codable' conformance
     auto paramTy = func->mapTypeIntoContext(param->getInterfaceType());
 
     for (auto req : serializationRequirements) {
@@ -555,14 +547,27 @@ bool CheckDistributedFunctionRequest::evaluate(
       }
     }
 
+    // --- Check parameters for various illegal modifiers
     if (param->isInOut()) {
       param->diagnose(
           diag::distributed_actor_func_inout,
           param->getName(),
-          func->getDescriptiveKind(), func->getName()
+          func
       ).fixItRemove(SourceRange(param->getTypeSourceRangeForDiagnostics().Start,
                                 param->getTypeSourceRangeForDiagnostics().Start.getAdvancedLoc(1)));
       // FIXME(distributed): the fixIt should be on param->getSpecifierLoc(), but that Loc is invalid for some reason?
+      return true;
+    }
+
+    if (param->getSpecifier() == ParamSpecifier::LegacyShared ||
+        param->getSpecifier() == ParamSpecifier::LegacyOwned ||
+        param->getSpecifier() == ParamSpecifier::Consuming ||
+        param->getSpecifier() == ParamSpecifier::Borrowing) {
+      param->diagnose(
+          diag::distributed_actor_func_unsupported_specifier,
+          ParamDecl::getSpecifierSpelling(param->getSpecifier()),
+          param->getName(),
+          func);
       return true;
     }
 
@@ -570,7 +575,7 @@ bool CheckDistributedFunctionRequest::evaluate(
       param->diagnose(
           diag::distributed_actor_func_variadic,
           param->getName(),
-          func->getDescriptiveKind(), func->getName()
+          func
       );
     }
   }
@@ -610,8 +615,7 @@ bool swift::checkDistributedActorProperty(VarDecl *var, bool diagnose) {
   // it is not a computed property
   if (var->isLet() || var->hasStorageOrWrapsStorage()) {
     if (diagnose)
-      var->diagnose(diag::distributed_property_can_only_be_computed,
-                    var->getDescriptiveKind(), var->getName());
+      var->diagnose(diag::distributed_property_can_only_be_computed, var);
     return true;
   }
 
@@ -643,6 +647,16 @@ bool swift::checkDistributedActorProperty(VarDecl *var, bool diagnose) {
 void swift::checkDistributedActorProperties(const NominalTypeDecl *decl) {
   auto &C = decl->getASTContext();
 
+  if (auto sourceFile = decl->getDeclContext()->getParentSourceFile()) {
+    if (sourceFile->Kind == SourceFileKind::Interface) {
+      // Don't diagnose properties in swiftinterfaces.
+      return;
+    }
+  } else {
+    // Don't diagnose when checking without source file (e.g. from module, importer etc).
+    return;
+  }
+
   if (isa<ProtocolDecl>(decl)) {
     // protocols don't matter for stored property checking
     return;
@@ -657,6 +671,7 @@ void swift::checkDistributedActorProperties(const NominalTypeDecl *decl) {
       if (id == C.Id_actorSystem || id == C.Id_id) {
         prop->diagnose(diag::distributed_actor_user_defined_special_property,
                       id);
+        prop->setInvalid();
       }
     }
   }
@@ -698,7 +713,7 @@ void TypeChecker::checkDistributedActor(SourceFile *SF, NominalTypeDecl *nominal
         continue;
 
       if (auto thunk = var->getDistributedThunk())
-        SF->DelayedFunctions.push_back(thunk);
+        SF->addDelayedFunction(thunk);
 
       continue;
     }
@@ -761,7 +776,7 @@ void TypeChecker::checkDistributedActor(SourceFile *SF, NominalTypeDecl *nominal
       }
 
       if (auto thunk = func->getDistributedThunk()) {
-        SF->DelayedFunctions.push_back(thunk);
+        SF->addDelayedFunction(thunk);
       }
     }
   }

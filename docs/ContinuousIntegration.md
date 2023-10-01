@@ -95,11 +95,6 @@ macOS platform               | @swift-ci Please smoke benchmark              | S
 Linux platform               | @swift-ci Please test Linux platform          | Swift Test Linux Platform (smoke test)<br>Swift Test Linux Platform
 Linux platform               | @swift-ci Please clean test Linux platform    | Swift Test Linux Platform (smoke test)<br>Swift Test Linux Platform
 macOS platform               | @swift-ci Please ASAN test                    | Swift ASAN Test macOS Platform
-Ubuntu 18.04                 | @swift-ci Please test Ubuntu 18.04 platform   | Swift Test Ubuntu 18.04 Platform
-Ubuntu 20.04                 | @swift-ci Please test Ubuntu 20.04 platform   | Swift Test Ubuntu 20.04 Platform
-CentOS 7                     | @swift-ci Please test CentOS 7 platform       | Swift Test CentOS 7 Platform
-CentOS 8                     | @swift-ci Please test CentOS 8 platform       | Swift Test CentOS 8 Platform
-Amazon Linux 2               | @swift-ci Please test Amazon Linux 2 platform | Swift Test Amazon Linux 2 Platform
 
 The core principles of validation testing is that:
 
@@ -162,7 +157,18 @@ macOS platform | @swift-ci Please Sourcekit Stress test | Swift Sourcekit Stress
 Platform       | Comment | Check Status
 ------------   | ------- | ------------
 macOS platform | @swift-ci Please Build Toolchain macOS Platform| Swift Build Toolchain macOS Platform
-Linux platform | @swift-ci Please Build Toolchain Linux Platform| Swift Build Toolchain Linux Platform
+Linux platform | @swift-ci Please Build Toolchain Linux Platform| Swift Build Toolchain Ubuntu 22.04 (x86_64)
+
+You can also build a toolchain for a specific Linux distribution
+
+Distro         | Comment                                          | Check Status
+-------------- | ------------------------------------------------ | ----------------------------------------------
+UBI9           | @swift-ci Please Build Toolchain UBI9            | Swift Build Toolchain UBI9 (x86_64)
+CentOS 7       | @swift-ci Please Build Toolchain CentOS 7        | Swift Build Toolchain CentOS 7 (x86_64)
+Ubuntu 18.04   | @swift-ci Please Build Toolchain Ubuntu 18.04    | Swift Build Toolchain Ubuntu 18.04 (x86_64)
+Ubuntu 20.04   | @swift-ci Please Build Toolchain Ubuntu 20.04    | Swift Build Toolchain Ubuntu 20.04 (x86_64)
+Ubuntu 22.04   | @swift-ci Please Build Toolchain Ubuntu 22.04    | Swift Build Toolchain Ubuntu 22.04 (x86_64)
+Amazon Linux 2 | @swift-ci Please Build Toolchain Amazon Linux 2  | Swift Build Toolchain Amazon Linux 2 (x86_64)
 
 ### Build and Test Stdlib against Snapshot Toolchain
 
@@ -280,9 +286,6 @@ Currently, supported pull request testing triggers:
 Platform     | Comment | Check Status
 ------------ | ------- | ------------
 Windows      | @swift-ci Please test Windows platform | Swift Test Windows Platform
-Linux        | @swift-ci Please test Tensorflow Linux platform | Swift Test Linux Platform (TensorFlow)
-Linux (GPU)  | @swift-ci Please test Tensorflow Linux GPU platform |Swift Test Linux Platform with GPU (TensorFlow)
-macOS        | @swift-ci Please test Tensorflow macOS platform | Swift Test macOS Platform (TensorFlow)
 
 ## ci.swift.org bots
 

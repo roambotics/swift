@@ -111,12 +111,12 @@ public:
 
   void visitTupleTypeRef(const TupleTypeRef *T) {
     printHeader("tuple");
-    T->getLabels();
+
     auto Labels = T->getLabels();
     for (auto NameElement : llvm::zip_first(Labels, T->getElements())) {
       auto Label = std::get<0>(NameElement);
       if (!Label.empty())
-        stream << Label.str() << " = ";
+        stream << Label << " = ";
       printRec(std::get<1>(NameElement));
     }
     stream << ")";
@@ -852,11 +852,28 @@ public:
 
   Demangle::NodePointer
   visitDependentMemberTypeRef(const DependentMemberTypeRef *DM) {
-    assert(DM->getProtocol().empty() && "not implemented");
+
     auto node = Dem.createNode(Node::Kind::DependentMemberType);
-    node->addChild(visit(DM->getBase()), Dem);
-    node->addChild(Dem.createNode(Node::Kind::Identifier, DM->getMember()),
-                   Dem);
+    auto Base = visit(DM->getBase());
+    node->addChild(Base, Dem);
+
+    auto MemberId = Dem.createNode(Node::Kind::Identifier, DM->getMember());
+
+    auto MangledProtocol = DM->getProtocol();
+    if (MangledProtocol.empty()) {
+      // If there's no protocol, add the Member as an Identifier node
+      node->addChild(MemberId, Dem);
+    } else {
+      // Otherwise, build up a DependentAssociatedTR node with
+      // the member Identifer and protocol
+      auto AssocTy = Dem.createNode(Node::Kind::DependentAssociatedTypeRef);
+      AssocTy->addChild(MemberId, Dem);
+      auto Proto = Dem.demangleType(MangledProtocol);
+      assert(Proto && "Failed to demangle");
+      assert(Proto->getKind() == Node::Kind::Type && "Protocol type is not a type?!");
+      AssocTy->addChild(Proto, Dem);
+      node->addChild(AssocTy, Dem);
+    }
     return node;
   }
 
@@ -1047,13 +1064,13 @@ llvm::Optional<GenericArgumentMap> TypeRef::getSubstMap() const {
       unsigned Index = 0;
       for (auto Param : BG->getGenericParams()) {
         if (!Param->isConcrete())
-          return None;
+          return llvm::None;
         Substitutions.insert({{Depth, Index++}, Param});
       }
       if (auto Parent = BG->getParent()) {
         auto ParentSubs = Parent->getSubstMap();
         if (!ParentSubs)
-          return None;
+          return llvm::None;
         Substitutions.insert(ParentSubs->begin(), ParentSubs->end());
       }
       break;
@@ -1116,8 +1133,8 @@ public:
     std::vector<const TypeRef *> Elements;
     for (auto Element : T->getElements())
       Elements.push_back(visit(Element));
-    std::string Labels = T->getLabelString();
-    return TupleTypeRef::create(Builder, Elements, std::move(Labels));
+    auto Labels = T->getLabels();
+    return TupleTypeRef::create(Builder, Elements, Labels);
   }
 
   const TypeRef *visitFunctionTypeRef(const FunctionTypeRef *F) {
@@ -1215,11 +1232,15 @@ class TypeRefSubstitution
   : public TypeRefVisitor<TypeRefSubstitution, const TypeRef *> {
   TypeRefBuilder &Builder;
   GenericArgumentMap Substitutions;
+  // Set true iff the Substitution map was actually used
+  bool DidSubstitute;
 public:
   using TypeRefVisitor<TypeRefSubstitution, const TypeRef *>::visit;
 
   TypeRefSubstitution(TypeRefBuilder &Builder, GenericArgumentMap Substitutions)
-      : Builder(Builder), Substitutions(Substitutions) {}
+      : Builder(Builder), Substitutions(Substitutions), DidSubstitute(false) {}
+
+  bool didSubstitute() const { return DidSubstitute; }
 
   const TypeRef *visitBuiltinTypeRef(const BuiltinTypeRef *B) {
     return B;
@@ -1247,8 +1268,8 @@ public:
     std::vector<const TypeRef *> Elements;
     for (auto Element : T->getElements())
       Elements.push_back(visit(Element));
-    std::string Labels = T->getLabelString();
-    return TupleTypeRef::create(Builder, Elements, std::move(Labels));
+    auto Labels = T->getLabels();
+    return TupleTypeRef::create(Builder, Elements, Labels);
   }
 
   const TypeRef *visitFunctionTypeRef(const FunctionTypeRef *F) {
@@ -1301,7 +1322,7 @@ public:
   visitTypeRefRequirement(const TypeRefRequirement &req) {
     auto newFirst = visit(req.getFirstType());
     if (!newFirst)
-      return None;
+      return llvm::None;
 
     switch (req.getKind()) {
     case RequirementKind::SameShape:
@@ -1310,7 +1331,7 @@ public:
     case RequirementKind::SameType: {
       auto newSecond = visit(req.getFirstType());
       if (!newSecond)
-        return None;
+        return llvm::None;
       return TypeRefRequirement(req.getKind(), newFirst, newSecond);
     }
     case RequirementKind::Layout:
@@ -1340,6 +1361,7 @@ public:
     if (found == Substitutions.end())
       return GTP;
     assert(found->second->isConcrete());
+    DidSubstitute = true; // We actually used the Substitutions
 
     // When substituting a concrete type containing a metatype into a
     // type parameter, (eg: T, T := C.Type), we must also represent
@@ -1449,6 +1471,15 @@ public:
 const TypeRef *TypeRef::subst(TypeRefBuilder &Builder,
                               const GenericArgumentMap &Subs) const {
   return TypeRefSubstitution(Builder, Subs).visit(this);
+}
+
+const TypeRef *TypeRef::subst(TypeRefBuilder &Builder,
+                              const GenericArgumentMap &Subs,
+			      bool &DidSubstitute) const {
+  auto subst = TypeRefSubstitution(Builder, Subs);
+  auto TR = subst.visit(this);
+  DidSubstitute = subst.didSubstitute();
+  return TR;
 }
 
 bool TypeRef::deriveSubstitutions(GenericArgumentMap &Subs,

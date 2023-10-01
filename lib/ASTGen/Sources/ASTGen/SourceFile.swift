@@ -1,6 +1,12 @@
-import SwiftParser
+import CBasicBridging
+import CASTBridging
+
+import SwiftDiagnostics
 import SwiftSyntax
 import SwiftParserDiagnostics
+
+@_spi(ExperimentalLanguageFeatures)
+import SwiftParser
 
 /// Describes a source file that has been "exported" to the C++ part of the
 /// compiler, with enough information to interface with the C++ layer.
@@ -19,15 +25,33 @@ struct ExportedSourceFile {
   let syntax: SourceFileSyntax
 }
 
+extension Parser.ExperimentalFeatures {
+  init(from context: BridgedASTContext?) {
+    self = []
+    guard let context = context else { return }
+
+    func mapFeature(_ bridged: BridgedFeature, to feature: Self) {
+      if ASTContext_langOptsHasFeature(context, bridged) {
+        insert(feature)
+      }
+    }
+    mapFeature(.ThenStatements, to: .thenStatements)
+    mapFeature(.TypedThrows, to: .typedThrows)
+  }
+}
+
 /// Parses the given source file and produces a pointer to a new
 /// ExportedSourceFile instance.
 @_cdecl("swift_ASTGen_parseSourceFile")
 public func parseSourceFile(
   buffer: UnsafePointer<UInt8>, bufferLength: Int,
-  moduleName: UnsafePointer<UInt8>, filename: UnsafePointer<UInt8>
+  moduleName: UnsafePointer<UInt8>, filename: UnsafePointer<UInt8>,
+  ctxPtr: UnsafeMutableRawPointer?
 ) -> UnsafeRawPointer {
   let buffer = UnsafeBufferPointer(start: buffer, count: bufferLength)
-  let sourceFile = Parser.parse(source: buffer)
+
+  let ctx = ctxPtr.map { BridgedASTContext(raw: $0) }
+  let sourceFile = Parser.parse(source: buffer, experimentalFeatures: .init(from: ctx))
 
   let exportedPtr = UnsafeMutablePointer<ExportedSourceFile>.allocate(capacity: 1)
   exportedPtr.initialize(
@@ -77,7 +101,8 @@ extension Syntax {
 public func emitParserDiagnostics(
   diagEnginePtr: UnsafeMutablePointer<UInt8>,
   sourceFilePtr: UnsafeMutablePointer<UInt8>,
-  emitOnlyErrors: CInt
+  emitOnlyErrors: CInt,
+  downgradePlaceholderErrorsToWarnings: CInt
 ) -> CInt {
   return sourceFilePtr.withMemoryRebound(
     to: ExportedSourceFile.self, capacity: 1
@@ -87,6 +112,8 @@ public func emitParserDiagnostics(
     let diags = ParseDiagnosticsGenerator.diagnostics(
       for: sourceFile.pointee.syntax
     )
+
+    let diagnosticEngine = BridgedDiagnosticEngine(raw: diagEnginePtr)
     for diag in diags {
       // Skip over diagnostics within #if, because we don't know whether
       // we are in an active region or not.
@@ -94,15 +121,23 @@ public func emitParserDiagnostics(
       if diag.node.isInIfConfig {
         continue
       }
-      if emitOnlyErrors != 0, diag.diagMessage.severity != .error {
+
+      let diagnosticSeverity: DiagnosticSeverity
+      if downgradePlaceholderErrorsToWarnings == 1 && diag.diagMessage.diagnosticID == StaticTokenError.editorPlaceholder.diagnosticID {
+        diagnosticSeverity = .warning
+      } else {
+        diagnosticSeverity = diag.diagMessage.severity
+      }
+
+      if emitOnlyErrors != 0, diagnosticSeverity != .error {
         continue
       }
 
       emitDiagnostic(
-        diagEnginePtr: diagEnginePtr,
-        sourceFileBuffer: UnsafeMutableBufferPointer(
-          mutating: sourceFile.pointee.buffer),
-        diagnostic: diag
+        diagnosticEngine: diagnosticEngine,
+        sourceFileBuffer: sourceFile.pointee.buffer,
+        diagnostic: diag,
+        diagnosticSeverity: diagnosticSeverity
       )
       anyDiags = true
     }

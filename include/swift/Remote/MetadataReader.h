@@ -17,6 +17,7 @@
 #ifndef SWIFT_REMOTE_METADATAREADER_H
 #define SWIFT_REMOTE_METADATAREADER_H
 
+
 #include "swift/Runtime/Metadata.h"
 #include "swift/Remote/MemoryReader.h"
 #include "swift/Demangling/Demangler.h"
@@ -32,7 +33,6 @@
 
 #include <type_traits>
 #include <vector>
-#include <unordered_map>
 
 #include <inttypes.h>
 
@@ -179,7 +179,6 @@ public:
   using BuiltRequirement = typename BuilderType::BuiltRequirement;
   using BuiltSubstitution = typename BuilderType::BuiltSubstitution;
   using BuiltSubstitutionMap = typename BuilderType::BuiltSubstitutionMap;
-  using BuiltGenericTypeParam = typename BuilderType::BuiltGenericTypeParam;
   using BuiltGenericSignature = typename BuilderType::BuiltGenericSignature;
   using StoredPointer = typename Runtime::StoredPointer;
   using StoredSignedPointer = typename Runtime::StoredSignedPointer;
@@ -194,15 +193,43 @@ private:
   /// amounts of data when we encounter corrupt values for sizes/counts.
   static const uint64_t MaxMetadataSize = 1048576; // 1MB
 
-  /// A cache of built types, keyed by the address of the type.
-  std::unordered_map<StoredPointer, BuiltType> TypeCache;
+  /// The dense map info for a std::pair<StoredPointer, bool>.
+  struct DenseMapInfoTypeCacheKey {
+    using Pair = std::pair<StoredPointer, bool>;
+    using StoredPointerInfo = llvm::DenseMapInfo<StoredPointer>;
+
+    static inline Pair getEmptyKey() {
+      // Since bool doesn't have an empty key implementation, we only use the
+      // StoredPointer's empty key.
+      return std::make_pair(StoredPointerInfo::getEmptyKey(), false);
+    }
+
+    static inline Pair getTombstoneKey() {
+      // Since bool doesn't have a tombstone key implementation, we only use the
+      // StoredPointer's tombstone key.
+      return std::make_pair(StoredPointerInfo::getTombstoneKey(), false);
+    }
+
+    static unsigned getHashValue(const Pair &PairVal) {
+      return llvm::hash_combine(PairVal.first, PairVal.second);
+    }
+
+    static bool isEqual(const Pair &LHS, const Pair &RHS) {
+      return LHS.first == RHS.first && LHS.second == RHS.second;
+    }
+  };
+
+  /// A cache of built types, keyed by the address of the type and whether the
+  /// request ignored articial superclasses or not.
+  llvm::DenseMap<std::pair<StoredPointer, bool>, BuiltType,
+                 DenseMapInfoTypeCacheKey>
+      TypeCache;
 
   using MetadataRef = RemoteRef<const TargetMetadata<Runtime>>;
   using OwnedMetadataRef = MemoryReader::ReadBytesResult;
 
   /// A cache of read type metadata, keyed by the address of the metadata.
-  std::unordered_map<StoredPointer, OwnedMetadataRef>
-    MetadataCache;
+  llvm::DenseMap<StoredPointer, OwnedMetadataRef> MetadataCache;
 
   using ContextDescriptorRef =
       RemoteRef<const TargetContextDescriptor<Runtime>>;
@@ -284,15 +311,14 @@ private:
 
   /// A cache of read nominal type descriptors, keyed by the address of the
   /// nominal type descriptor.
-  std::unordered_map<StoredPointer, OwnedContextDescriptorRef>
-    ContextDescriptorCache;
+  llvm::DenseMap<StoredPointer, OwnedContextDescriptorRef>
+      ContextDescriptorCache;
 
   using OwnedProtocolDescriptorRef =
     std::unique_ptr<const TargetProtocolDescriptor<Runtime>, delete_with_free>;
   /// A cache of read extended existential shape metadata, keyed by the
   /// address of the shape metadata.
-  std::unordered_map<StoredPointer, OwnedShapeRef>
-    ShapeCache;
+  llvm::DenseMap<StoredPointer, OwnedShapeRef> ShapeCache;
 
   enum class IsaEncodingKind {
     /// We haven't checked yet.
@@ -534,7 +560,7 @@ public:
       if (encoding == IsaEncodingKind::None)
         return 0;
       else
-        return None;
+        return llvm::None;
     }
 
     return IsaMask;
@@ -544,7 +570,8 @@ public:
   llvm::Optional<MetadataKind>
   readKindFromMetadata(StoredPointer MetadataAddress) {
     auto meta = readMetadata(MetadataAddress);
-    if (!meta) return None;
+    if (!meta)
+      return llvm::None;
 
     return meta->getKind();
   }
@@ -566,7 +593,7 @@ public:
       StoredPointer MetadataAddress) {
     auto meta = readMetadata(MetadataAddress);
     if (!meta || meta->getKind() != MetadataKind::Class)
-      return None;
+      return llvm::None;
 
     if (Runtime::ObjCInterop) {
       // The following algorithm only works on the non-fragile Apple runtime.
@@ -574,14 +601,14 @@ public:
       // Grab the RO-data pointer.  This part is not ABI.
       StoredPointer roDataPtr = readObjCRODataPtr(MetadataAddress);
       if (!roDataPtr)
-        return None;
+        return llvm::None;
 
       // Get the address of the InstanceStart field.
       auto address = roDataPtr + sizeof(uint32_t) * 1;
 
       unsigned start;
       if (!Reader->readInteger(RemoteAddress(address), &start))
-        return None;
+        return llvm::None;
 
       return start;
     } else {
@@ -616,10 +643,10 @@ public:
     StoredPointer ValueWitnessTableAddr;
     if (!Reader->readInteger(RemoteAddress(ValueWitnessTableAddrAddr),
                              &ValueWitnessTableAddr))
-      return None;
+      return llvm::None;
     if (!Reader->readBytes(RemoteAddress(ValueWitnessTableAddr),
                            (uint8_t *)&VWT, sizeof(VWT)))
-      return None;
+      return llvm::None;
     return VWT;
   }
 
@@ -633,14 +660,14 @@ public:
     auto MetadataAddress =
         readMetadataFromInstance(ExistentialAddress.getAddressData());
     if (!MetadataAddress)
-      return None;
+      return llvm::None;
 
     bool isObjC = false;
     bool isBridged = false;
 
     auto Meta = readMetadata(*MetadataAddress);
     if (!Meta)
-      return None;
+      return llvm::None;
 
     if (auto ClassMeta = dyn_cast<TargetClassMetadata>(Meta)) {
       if (ClassMeta->isPureObjC()) {
@@ -678,12 +705,12 @@ public:
     auto InstanceMetadataAddress =
         readMetadataFromInstance(InstanceMetadataAddressAddress);
     if (!InstanceMetadataAddress)
-      return None;
+      return llvm::None;
 
     // Read the value witness table.
     auto VWT = readValueWitnessTable(*InstanceMetadataAddress);
     if (!VWT)
-      return None;
+      return llvm::None;
 
     // Now we need to skip over the instance metadata pointer and instance's
     // conformance pointer for Swift.Error.
@@ -715,15 +742,15 @@ public:
     TargetOpaqueExistentialContainer<Runtime> Container;
     if (!Reader->readBytes(RemoteAddress(ExistentialAddress),
                            (uint8_t *)&Container, sizeof(Container)))
-      return None;
+      return llvm::None;
     auto MetadataAddress = static_cast<StoredPointer>(Container.Type);
     auto Metadata = readMetadata(MetadataAddress);
     if (!Metadata)
-      return None;
+      return llvm::None;
 
     auto VWT = readValueWitnessTable(MetadataAddress);
     if (!VWT)
-      return None;
+      return llvm::None;
 
     // Inline representation (the value fits in the existential container).
     // So, the value starts at the first word of the container.
@@ -735,7 +762,7 @@ public:
     // The first word of the container stores the address to the box.
     StoredPointer BoxAddress;
     if (!Reader->readInteger(ExistentialAddress, &BoxAddress))
-      return None;
+      return llvm::None;
 
     auto AlignmentMask = VWT->getAlignmentMask();
     auto Offset = (sizeof(HeapObject) + AlignmentMask) & ~AlignmentMask;
@@ -753,15 +780,15 @@ public:
     TargetOpaqueExistentialContainer<Runtime> Container;
     if (!Reader->readBytes(RemoteAddress(ExistentialAddress),
                            (uint8_t *)&Container, sizeof(Container)))
-      return None;
+      return llvm::None;
     auto MetadataAddress = static_cast<StoredPointer>(Container.Type);
     auto Metadata = readMetadata(MetadataAddress);
     if (!Metadata)
-      return None;
+      return llvm::None;
 
     auto VWT = readValueWitnessTable(MetadataAddress);
     if (!VWT)
-      return None;
+      return llvm::None;
 
     return VWT->isValueInline();
   }
@@ -821,7 +848,9 @@ public:
   readTypeFromMetadata(StoredPointer MetadataAddress,
                        bool skipArtificialSubclasses = false,
                        int recursion_limit = defaultTypeRecursionLimit) {
-    auto Cached = TypeCache.find(MetadataAddress);
+    std::pair<StoredPointer, bool> TypeCacheKey(MetadataAddress,
+                                                skipArtificialSubclasses);
+    auto Cached = TypeCache.find(TypeCacheKey);
     if (Cached != TypeCache.end())
       return Cached->second;
 
@@ -841,7 +870,7 @@ public:
     // Insert a negative result into the cache now so that, if we recur with
     // the same address, we will return the negative result with the check
     // just above.
-    TypeCache.insert({MetadataAddress, BuiltType()});
+    TypeCache.insert({TypeCacheKey, BuiltType()});
 
     auto Meta = readMetadata(MetadataAddress);
     if (!Meta) return BuiltType();
@@ -870,14 +899,27 @@ public:
       }
 
       // Read the labels string.
-      std::string labels;
+      std::string labelStr;
       if (tupleMeta->Labels &&
-          !Reader->readString(RemoteAddress(tupleMeta->Labels), labels))
+          !Reader->readString(RemoteAddress(tupleMeta->Labels), labelStr))
         return BuiltType();
 
+      std::vector<llvm::StringRef> labels;
+      std::string::size_type end, start = 0;
+      while (true) {
+        end = labelStr.find(' ', start);
+        if (end == std::string::npos)
+          break;
+        labels.push_back(llvm::StringRef(labelStr.data() + start, end - start));
+        start = end + 1;
+      }
+      // Pad the vector with empty labels.
+      for (unsigned i = labels.size(); i < elementTypes.size(); ++i)
+        labels.push_back(StringRef());
+
       auto BuiltTuple =
-          Builder.createTupleType(elementTypes, std::move(labels));
-      TypeCache[MetadataAddress] = BuiltTuple;
+          Builder.createTupleType(elementTypes, labels);
+      TypeCache[TypeCacheKey] = BuiltTuple;
       return BuiltTuple;
     }
     case MetadataKind::Function: {
@@ -934,7 +976,7 @@ public:
 
       auto BuiltFunction = Builder.createFunctionType(
           Parameters, Result, flags, diffKind, globalActor);
-      TypeCache[MetadataAddress] = BuiltFunction;
+      TypeCache[TypeCacheKey] = BuiltFunction;
       return BuiltFunction;
     }
     case MetadataKind::Existential: {
@@ -985,7 +1027,7 @@ public:
       }
       auto BuiltExist = Builder.createProtocolCompositionType(
         Protocols, SuperclassType, HasExplicitAnyObject);
-      TypeCache[MetadataAddress] = BuiltExist;
+      TypeCache[TypeCacheKey] = BuiltExist;
       return BuiltExist;
     }
     case MetadataKind::ExtendedExistential: {
@@ -1063,7 +1105,7 @@ public:
         }
       }
 
-      TypeCache[MetadataAddress] = builtProto;
+      TypeCache[TypeCacheKey] = builtProto;
       return builtProto;
     }
 
@@ -1073,7 +1115,7 @@ public:
           readTypeFromMetadata(Metatype->InstanceType, false, recursion_limit);
       if (!Instance) return BuiltType();
       auto BuiltMetatype = Builder.createMetatypeType(Instance);
-      TypeCache[MetadataAddress] = BuiltMetatype;
+      TypeCache[TypeCacheKey] = BuiltMetatype;
       return BuiltMetatype;
     }
     case MetadataKind::ObjCClassWrapper: {
@@ -1085,7 +1127,7 @@ public:
         return BuiltType();
 
       auto BuiltObjCClass = Builder.createObjCClassType(std::move(className));
-      TypeCache[MetadataAddress] = BuiltObjCClass;
+      TypeCache[TypeCacheKey] = BuiltObjCClass;
       return BuiltObjCClass;
     }
     case MetadataKind::ExistentialMetatype: {
@@ -1094,7 +1136,7 @@ public:
           readTypeFromMetadata(Exist->InstanceType, false, recursion_limit);
       if (!Instance) return BuiltType();
       auto BuiltExist = Builder.createExistentialMetatypeType(Instance);
-      TypeCache[MetadataAddress] = BuiltExist;
+      TypeCache[TypeCacheKey] = BuiltExist;
       return BuiltExist;
     }
     case MetadataKind::ForeignReferenceType:
@@ -1118,7 +1160,7 @@ public:
       auto name = mangling.result();
 
       auto BuiltForeign = Builder.createForeignClassType(std::move(name));
-      TypeCache[MetadataAddress] = BuiltForeign;
+      TypeCache[TypeCacheKey] = BuiltForeign;
       return BuiltForeign;
     }
     case MetadataKind::HeapLocalVariable:
@@ -1129,7 +1171,7 @@ public:
     case MetadataKind::Opaque:
     default: {
       auto BuiltOpaque = Builder.getOpaqueType();
-      TypeCache[MetadataAddress] = BuiltOpaque;
+      TypeCache[TypeCacheKey] = BuiltOpaque;
       return BuiltOpaque;
     }
     }
@@ -1601,7 +1643,7 @@ public:
       StoredPointer addr = base + tag * sizeof(StoredPointer);
       StoredPointer isa;
       if (!Reader->readInteger(RemoteAddress(addr), &isa))
-        return None;
+        return llvm::None;
       return isa;
     };
 
@@ -1630,12 +1672,12 @@ public:
 
     StoredPointer isa;
     if (!Reader->readInteger(RemoteAddress(objectAddress), &isa))
-      return None;
+      return llvm::None;
 
     switch (getIsaEncoding()) {
     case IsaEncodingKind::Unknown:
     case IsaEncodingKind::Error:
-      return None;
+      return llvm::None;
 
     case IsaEncodingKind::None:
       return isa;
@@ -1654,21 +1696,21 @@ public:
 
       // 0 is never a valid index.
       if (classIndex == 0) {
-        return None;
+        return llvm::None;
 
-      // If the index is out of range, it's an error; but check for an
-      // update first.  (This will also trigger the first time because
-      // we initialize LastIndexedClassesCount to 0).
+        // If the index is out of range, it's an error; but check for an
+        // update first.  (This will also trigger the first time because
+        // we initialize LastIndexedClassesCount to 0).
       } else if (classIndex >= LastIndexedClassesCount) {
         StoredPointer count;
         if (!Reader->readInteger(RemoteAddress(IndexedClassesCountPointer),
                                  &count)) {
-          return None;
+          return llvm::None;
         }
 
         LastIndexedClassesCount = count;
         if (classIndex >= count) {
-          return None;
+          return llvm::None;
         }
       }
 
@@ -1678,7 +1720,7 @@ public:
                         + classIndex * sizeof(StoredPointer));
       StoredPointer metadataPointer;
       if (!Reader->readInteger(eltPointer, &metadataPointer)) {
-        return None;
+        return llvm::None;
       }
 
       return metadataPointer;
@@ -1705,7 +1747,7 @@ public:
 
       auto bounds = readMetadataBoundsOfSuperclass(descriptor);
       if (!bounds)
-        return None;
+        return llvm::None;
 
       bounds->adjustForSubclass(type->areImmediateMembersNegative(),
                                 type->NumImmediateMembers);
@@ -1724,7 +1766,7 @@ public:
     }
 
     default:
-      return None;
+      return llvm::None;
     }
   }
 
@@ -1748,20 +1790,20 @@ public:
         [&](ContextDescriptorRef superclass)
             -> llvm::Optional<ClassMetadataBounds> {
           if (!isa<TargetClassDescriptor<Runtime>>(superclass))
-            return None;
+            return llvm::None;
           return readMetadataBoundsOfSuperclass(superclass);
         },
         [&](MetadataRef metadata) -> llvm::Optional<ClassMetadataBounds> {
           auto cls = dyn_cast<TargetClassMetadata>(metadata);
           if (!cls)
-            return None;
+            return llvm::None;
 
           return cls->getClassBoundsAsSwiftSuperclass();
         },
         [](StoredPointer objcClassName) -> llvm::Optional<ClassMetadataBounds> {
           // We have no ability to look up an ObjC class by name.
           // FIXME: add a query for this; clients may have a way to do it.
-          return None;
+          return llvm::None;
         });
   }
 
@@ -1776,7 +1818,7 @@ public:
     case TypeReferenceKind::IndirectTypeDescriptor: {
       StoredPointer descriptorAddress = 0;
       if (!Reader->readInteger(RemoteAddress(ref), &descriptorAddress))
-        return None;
+        return llvm::None;
 
       ref = descriptorAddress;
       LLVM_FALLTHROUGH;
@@ -1785,7 +1827,7 @@ public:
     case TypeReferenceKind::DirectTypeDescriptor: {
       auto descriptor = readContextDescriptor(ref);
       if (!descriptor)
-        return None;
+        return llvm::None;
 
       return descriptorFn(descriptor);
     }
@@ -1796,17 +1838,17 @@ public:
     case TypeReferenceKind::IndirectObjCClass: {
       StoredPointer classRef = 0;
       if (!Reader->readInteger(RemoteAddress(ref), &classRef))
-        return None;
+        return llvm::None;
 
       auto metadata = readMetadata(classRef);
       if (!metadata)
-        return None;
+        return llvm::None;
 
       return metadataFn(metadata);
     }
     }
 
-    return None;
+    return llvm::None;
   }
 
   /// Read a single generic type argument from a bound generic type
@@ -1815,24 +1857,24 @@ public:
   readGenericArgFromMetadata(StoredPointer metadata, unsigned index) {
     auto Meta = readMetadata(metadata);
     if (!Meta)
-      return None;
+      return llvm::None;
 
     auto descriptorAddress = readAddressOfNominalTypeDescriptor(Meta);
     if (!descriptorAddress)
-      return None;
+      return llvm::None;
 
     // Read the nominal type descriptor.
     auto descriptor = readContextDescriptor(descriptorAddress);
     if (!descriptor)
-      return None;
+      return llvm::None;
 
     auto generics = descriptor->getGenericContext();
     if (!generics)
-      return None;
-    
+      return llvm::None;
+
     auto offsetToGenericArgs = readGenericArgsOffset(Meta, descriptor);
     if (!offsetToGenericArgs)
-      return None;
+      return llvm::None;
 
     auto addressOfGenericArgAddress =
       (getAddress(Meta) +
@@ -1840,12 +1882,12 @@ public:
        index * sizeof(StoredPointer));
 
     if (index >= generics->getGenericContextHeader().getNumArguments())
-      return None;
+      return llvm::None;
 
     StoredPointer genericArgAddress;
     if (!Reader->readInteger(RemoteAddress(addressOfGenericArgAddress),
                              &genericArgAddress))
-      return None;
+      return llvm::None;
 
     return genericArgAddress;
   }
@@ -1888,7 +1930,7 @@ public:
   readOffsetToFirstCaptureFromMetadata(StoredPointer MetadataAddress) {
     auto meta = readMetadata(MetadataAddress);
     if (!meta || meta->getKind() != MetadataKind::HeapLocalVariable)
-      return None;
+      return llvm::None;
 
     auto heapMeta = cast<TargetHeapLocalVariableMetadata<Runtime>>(meta);
     return heapMeta->OffsetToFirstCapture;
@@ -1902,10 +1944,10 @@ public:
   readResolvedPointerValue(StoredPointer address) {
     if (auto pointer = readPointer(address)) {
       if (!pointer->isResolved())
-        return None;
+        return llvm::None;
       return (StoredPointer)pointer->getResolvedAddress().getAddressData();
     }
-    return None;
+    return llvm::None;
   }
 
   template<typename T, typename U>
@@ -1921,7 +1963,7 @@ public:
   readCaptureDescriptorFromMetadata(StoredPointer MetadataAddress) {
     auto meta = readMetadata(MetadataAddress);
     if (!meta || meta->getKind() != MetadataKind::HeapLocalVariable)
-      return None;
+      return llvm::None;
 
     auto heapMeta = cast<TargetHeapLocalVariableMetadata<Runtime>>(meta);
     return resolvePointerField(meta, heapMeta->CaptureDescription);
@@ -1961,7 +2003,7 @@ protected:
       if (auto ptr = readPointer(resultAddress)) {
         return stripSignedPointer(*ptr);
       }
-      return None;
+      return llvm::None;
     }
     
     return RemoteAbsolutePointer("", resultAddress);
@@ -2219,12 +2261,12 @@ private:
   readParentContextDescriptor(ContextDescriptorRef base) {
     auto parentAddress = resolveRelativeIndirectableField(base, base->Parent);
     if (!parentAddress)
-      return None;
+      return llvm::None;
     if (!parentAddress->isResolved()) {
       // Currently we can only handle references directly to a symbol without
       // an offset.
       if (parentAddress->getOffset() != 0) {
-        return None;
+        return llvm::None;
       }
       return ParentContextDescriptorRef(parentAddress->getSymbol());
     }
@@ -2233,7 +2275,7 @@ private:
       return ParentContextDescriptorRef();
     if (auto parentDescriptor = readContextDescriptor(addr.getAddressData()))
       return ParentContextDescriptorRef(parentDescriptor);
-    return None;
+    return llvm::None;
   }
 
   static bool isCImportedContext(Demangle::NodePointer node) {
@@ -2262,7 +2304,7 @@ private:
       if (Reader->readString(RemoteAddress(nameAddress), name))
         return name;
 
-      return None;
+      return llvm::None;
     }
 
     // Read the name of a module.
@@ -2272,17 +2314,17 @@ private:
       if (Reader->readString(RemoteAddress(nameAddress), name))
         return name;
 
-      return None;
+      return llvm::None;
     }
 
     // Only type contexts remain.
     auto typeBuffer = dyn_cast<TargetTypeContextDescriptor<Runtime>>(context);
     if (!typeBuffer)
-      return None;
+      return llvm::None;
 
     auto nameAddress = resolveRelativeField(descriptor, typeBuffer->Name);
     if (!Reader->readString(RemoteAddress(nameAddress), name))
-      return None;
+      return llvm::None;
 
     // Read the TypeImportInfo if present.
     if (typeBuffer->getTypeContextDescriptorFlags().hasImportInfo()) {
@@ -2293,7 +2335,7 @@ private:
         // Read the next string.
         std::string temp;
         if (!Reader->readString(RemoteAddress(nameAddress), temp))
-          return None;
+          return llvm::None;
 
         // If we read an empty string, we're done.
         if (temp.empty())
@@ -2959,19 +3001,13 @@ private:
           // Only consider generic contexts of type class, enum or struct.
           // There are other context types that can be generic, but they should
           // not affect the generic shape.
-          if (current->getKind() == ContextDescriptorKind::Class ||
-              current->getKind() == ContextDescriptorKind::Enum ||
-              current->getKind() == ContextDescriptorKind::Struct) {
-            if (genericContext) {
-              auto contextHeader = genericContext->getGenericContextHeader();
-              paramsPerLevel.emplace_back(contextHeader.NumParams -
-                                          runningCount);
-              runningCount += paramsPerLevel.back();
-            } else {
-              // If there is no generic context, this is a non-generic type
-              // which has 0 generic parameters.
-              paramsPerLevel.emplace_back(0);
-            }
+          if (genericContext &&
+              (current->getKind() == ContextDescriptorKind::Class ||
+               current->getKind() == ContextDescriptorKind::Enum ||
+               current->getKind() == ContextDescriptorKind::Struct)) {
+            auto contextHeader = genericContext->getGenericContextHeader();
+            paramsPerLevel.emplace_back(contextHeader.NumParams - runningCount);
+            runningCount += paramsPerLevel.back();
           }
         };
     countLevels(descriptor, runningCount);
@@ -3077,9 +3113,12 @@ private:
     // If we've skipped an artificial subclasses, check the cache at
     // the superclass.  (This also protects against recursion.)
     if (skipArtificialSubclasses && metadata != origMetadata) {
-      auto it = TypeCache.find(getAddress(metadata));
-      if (it != TypeCache.end())
+      auto it =
+          TypeCache.find({getAddress(metadata), skipArtificialSubclasses});
+      if (it != TypeCache.end()) {
+        TypeCache.erase({getAddress(origMetadata), skipArtificialSubclasses});
         return it->second;
+      }
     }
 
     // Read the nominal type descriptor.
@@ -3108,12 +3147,12 @@ private:
     if (!nominal)
       return BuiltType();
     
-    TypeCache[getAddress(metadata)] = nominal;
+    TypeCache[{getAddress(metadata), skipArtificialSubclasses}] = nominal;
 
     // If we've skipped an artificial subclass, remove the
     // recursion-protection entry we made for it.
     if (skipArtificialSubclasses && metadata != origMetadata) {
-      TypeCache.erase(getAddress(origMetadata));
+      TypeCache.erase({getAddress(origMetadata), skipArtificialSubclasses});
     }
 
     return nominal;
@@ -3144,7 +3183,7 @@ private:
                                skipArtificialSubclasses, recursion_limit);
     }
 
-    TypeCache[origMetadataPtr] = BuiltObjCClass;
+    TypeCache[{origMetadataPtr, skipArtificialSubclasses}] = BuiltObjCClass;
     return BuiltObjCClass;
   }
 

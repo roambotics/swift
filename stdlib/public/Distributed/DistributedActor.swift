@@ -242,8 +242,13 @@ public protocol DistributedActor: AnyActor, Identifiable, Hashable
   /// the default initializer is not synthesized, and all the user-defined initializers must take care to initialize this property.
   nonisolated var actorSystem: ActorSystem { get }
 
-  /// Retrieve the executor for this actor as an optimized, unowned
-  /// reference.
+  /// Retrieve the executor for this distributed actor as an optimized,
+  /// unowned reference. This API is equivalent to ``Actor/unownedExecutor``,
+  /// however, by default, it intentionally returns `nil` if this actor is a reference
+  /// to a remote distributed actor, because the executor for remote references
+  /// is effectively never g
+  ///
+  /// ## Custom implementation requirements
   ///
   /// This property must always evaluate to the same executor for a
   /// given actor instance, and holding on to the actor must keep the
@@ -255,7 +260,7 @@ public protocol DistributedActor: AnyActor, Identifiable, Hashable
   /// be introduced when not strictly required.  Visible side effects
   /// are therefore strongly discouraged within this property.
   @available(SwiftStdlib 5.9, *)
-  nonisolated var unownedExecutor: UnownedSerialExecutor { get }
+  nonisolated var unownedExecutor: UnownedSerialExecutor{ get }
 
   /// Resolves the passed in `id` against the `system`, returning
   /// either a local or remote actor reference.

@@ -45,12 +45,12 @@ void ConformancePath::dump() const {
 }
 
 GenericSignatureImpl::GenericSignatureImpl(
-    TypeArrayView<GenericTypeParamType> params,
+    ArrayRef<GenericTypeParamType *> params,
     ArrayRef<Requirement> requirements, bool isKnownCanonical)
     : NumGenericParams(params.size()), NumRequirements(requirements.size()),
       CanonicalSignatureOrASTContext() {
   std::uninitialized_copy(params.begin(), params.end(),
-                          getTrailingObjects<Type>());
+                          getTrailingObjects<GenericTypeParamType *>());
   std::uninitialized_copy(requirements.begin(), requirements.end(),
                           getTrailingObjects<Requirement>());
 
@@ -75,7 +75,7 @@ GenericSignatureImpl::GenericSignatureImpl(
         &GenericSignature::getASTContext(params, requirements);
 }
 
-TypeArrayView<GenericTypeParamType>
+ArrayRef<GenericTypeParamType *>
 GenericSignatureImpl::getInnermostGenericParams() const {
   const auto params = getGenericParams();
 
@@ -168,8 +168,17 @@ bool GenericSignatureImpl::areAllParamsConcrete() const {
   return numConcreteGenericParams == getGenericParams().size();
 }
 
+bool GenericSignatureImpl::hasParameterPack() const {
+  for (auto *paramTy : getGenericParams()) {
+    if (paramTy->isParameterPack())
+      return true;
+  }
+
+  return false;
+}
+
 ASTContext &GenericSignature::getASTContext(
-                                    TypeArrayView<GenericTypeParamType> params,
+                                    ArrayRef<GenericTypeParamType *> params,
                                     ArrayRef<swift::Requirement> requirements) {
   // The params and requirements cannot both be empty.
   if (!params.empty())
@@ -179,9 +188,9 @@ ASTContext &GenericSignature::getASTContext(
 }
 
 /// Retrieve the generic parameters.
-TypeArrayView<GenericTypeParamType> GenericSignature::getGenericParams() const {
+ArrayRef<GenericTypeParamType *> GenericSignature::getGenericParams() const {
   return isNull()
-      ? TypeArrayView<GenericTypeParamType>{}
+      ? ArrayRef<GenericTypeParamType *>()
       : getPointer()->getGenericParams();
 }
 
@@ -189,9 +198,9 @@ TypeArrayView<GenericTypeParamType> GenericSignature::getGenericParams() const {
 ///
 /// Given a generic signature for a nested generic type, produce an
 /// array of the generic parameters for the innermost generic type.
-TypeArrayView<GenericTypeParamType> GenericSignature::getInnermostGenericParams() const {
+ArrayRef<GenericTypeParamType *> GenericSignature::getInnermostGenericParams() const {
   return isNull()
-      ? TypeArrayView<GenericTypeParamType>{}
+      ? ArrayRef<GenericTypeParamType *>()
       : getPointer()->getInnermostGenericParams();
 }
 
@@ -224,7 +233,7 @@ bool GenericSignatureImpl::isCanonical() const {
 }
 
 CanGenericSignature
-CanGenericSignature::getCanonical(TypeArrayView<GenericTypeParamType> params,
+CanGenericSignature::getCanonical(ArrayRef<GenericTypeParamType *> params,
                                   ArrayRef<Requirement> requirements) {
   // Canonicalize the parameters and requirements.
   SmallVector<GenericTypeParamType*, 8> canonicalParams;
@@ -529,8 +538,9 @@ bool GenericSignatureImpl::isValidTypeParameter(Type type) const {
 
 ArrayRef<CanTypeWrapper<GenericTypeParamType>>
 CanGenericSignature::getGenericParams() const {
-  auto params = this->GenericSignature::getGenericParams().getOriginalArray();
-  auto base = static_cast<const CanTypeWrapper<GenericTypeParamType>*>(
+  auto params =
+      this->GenericSignature::getGenericParams();
+  auto base = reinterpret_cast<const CanTypeWrapper<GenericTypeParamType> *>(
                                                               params.data());
   return {base, params.size()};
 }
@@ -572,7 +582,7 @@ SmallVector<CanType, 2> GenericSignatureImpl::getShapeClasses() const {
 }
 
 unsigned GenericParamKey::findIndexIn(
-                      TypeArrayView<GenericTypeParamType> genericParams) const {
+                      ArrayRef<GenericTypeParamType *> genericParams) const {
   // For depth 0, we have random access. We perform the extra checking so that
   // we can return
   if (Depth == 0 && Index < genericParams.size() &&
@@ -626,59 +636,36 @@ unsigned GenericSignatureImpl::getGenericParamOrdinal(
 }
 
 Type GenericSignatureImpl::getNonDependentUpperBounds(Type type) const {
+  return getUpperBound(type);
+}
+
+Type GenericSignatureImpl::getDependentUpperBounds(Type type) const {
+  return getUpperBound(type, /*wantDependentBound=*/true);
+}
+
+Type GenericSignatureImpl::getUpperBound(Type type,
+                                         bool wantDependentBound) const {
   assert(type->isTypeParameter());
 
   bool hasExplicitAnyObject = requiresClass(type);
 
   llvm::SmallVector<Type, 2> types;
+
   if (Type superclass = getSuperclassBound(type)) {
-    // If the class contains a type parameter, try looking for a non-dependent
-    // superclass.
-    while (superclass && superclass->hasTypeParameter()) {
-      superclass = superclass->getSuperclass();
-    }
+    do {
+      superclass = getReducedType(superclass);
+      if (wantDependentBound || !superclass->hasTypeParameter()) {
+        break;
+      }
+    } while ((superclass = superclass->getSuperclass()));
 
     if (superclass) {
       types.push_back(superclass);
       hasExplicitAnyObject = false;
     }
   }
+
   for (auto *proto : getRequiredProtocols(type)) {
-    if (proto->requiresClass())
-      hasExplicitAnyObject = false;
-
-    types.push_back(proto->getDeclaredInterfaceType());
-  }
-
-  auto constraint = ProtocolCompositionType::get(
-      getASTContext(), types,
-      hasExplicitAnyObject);
-
-  if (!constraint->isConstraintType()) {
-    assert(constraint->getClassOrBoundGenericClass());
-    return constraint;
-  }
-
-  return ExistentialType::get(constraint);
-}
-
-Type GenericSignatureImpl::getDependentUpperBounds(Type type) const {
-  assert(type->isTypeParameter());
-
-  llvm::SmallVector<Type, 2> types;
-
-  auto &ctx = type->getASTContext();
-
-  bool hasExplicitAnyObject = requiresClass(type);
-
-  // FIXME: If the superclass bound is implied by one of our protocols, we
-  // shouldn't add it to the constraint type.
-  if (Type superclass = getSuperclassBound(type)) {
-    types.push_back(superclass);
-    hasExplicitAnyObject = false;
-  }
-
-  for (auto proto : getRequiredProtocols(type)) {
     if (proto->requiresClass())
       hasExplicitAnyObject = false;
 
@@ -720,30 +707,29 @@ Type GenericSignatureImpl::getDependentUpperBounds(Type type) const {
           abort();
         }
 
-        if (!hasInnerGenericParam)
+        if (!hasInnerGenericParam && (wantDependentBound || !hasOuterGenericParam))
           argTypes.push_back(reducedType);
       }
 
-      // We should have either constrained all primary associated types,
-      // or none of them.
-      if (!argTypes.empty()) {
-        if (argTypes.size() != primaryAssocTypes.size()) {
-          llvm::errs() << "Not all primary associated types constrained?\n";
-          llvm::errs() << "Interface type: " << type << "\n";
-          llvm::errs() << GenericSignature(this) << "\n";
-          abort();
-        }
-
-        types.push_back(ParameterizedProtocolType::get(ctx, baseType, argTypes));
+      // If we have constrained all primary associated types, create a
+      // parameterized protocol type. During code completion, we might call
+      // `getExistentialType` (which calls this method) on a generic parameter
+      // that doesn't have all parameters specified, e.g. to get a consise
+      // description of the parameter type to the following function.
+      //
+      // func foo<P: Publisher>(p: P) where P.Failure == Never
+      //
+      // In that case just add the base type in the default branch below.
+      if (argTypes.size() == primaryAssocTypes.size()) {
+        types.push_back(ParameterizedProtocolType::get(getASTContext(), baseType, argTypes));
         continue;
       }
     }
-
     types.push_back(baseType);
   }
 
-  auto constraint = ProtocolCompositionType::get(
-     ctx, types, hasExplicitAnyObject);
+  auto constraint = ProtocolCompositionType::get(getASTContext(), types,
+                                                 hasExplicitAnyObject);
 
   if (!constraint->isConstraintType()) {
     assert(constraint->getClassOrBoundGenericClass());
@@ -759,7 +745,7 @@ void GenericSignature::Profile(llvm::FoldingSetNodeID &id) const {
 }
 
 void GenericSignature::Profile(llvm::FoldingSetNodeID &ID,
-                               TypeArrayView<GenericTypeParamType> genericParams,
+                               ArrayRef<GenericTypeParamType *> genericParams,
                                ArrayRef<Requirement> requirements) {
   return GenericSignatureImpl::Profile(ID, genericParams, requirements);
 }
@@ -889,7 +875,7 @@ void GenericSignature::verify(ArrayRef<Requirement> reqts) const {
         abort();
       }
 
-      if (!reqt.getFirstType()->castTo<GenericTypeParamType>()->isParameterPack()) {
+      if (!reqt.getFirstType()->isRootParameterPack()) {
         llvm::errs() << "Left hand side is not a parameter pack: ";
         reqt.dump(llvm::errs());
         llvm::errs() << "\n";
@@ -903,7 +889,7 @@ void GenericSignature::verify(ArrayRef<Requirement> reqts) const {
         abort();
       }
 
-      if (!reqt.getSecondType()->castTo<GenericTypeParamType>()->isParameterPack()) {
+      if (!reqt.getSecondType()->isRootParameterPack()) {
         llvm::errs() << "Right hand side is not a parameter pack: ";
         reqt.dump(llvm::errs());
         llvm::errs() << "\n";

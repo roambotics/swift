@@ -753,7 +753,7 @@ SILFunction *swift::getEligibleFunction(FullApplySite AI,
   // Don't inline functions that are marked with the @_semantics or @_effects
   // attribute if the inliner is asked not to inline them.
   if (Callee->hasSemanticsAttrs() || Callee->hasEffectsKind()) {
-    if (WhatToInline >= InlineSelection::NoSemanticsAndGlobalInit) {
+    if (WhatToInline >= InlineSelection::NoSemanticsAndEffects) {
       // TODO: for stable optimization of semantics, prevent inlining whenever
       // isOptimizableSemanticFunction(Callee) is true.
       if (getSemanticFunctionLevel(Callee) == SemanticFunctionLevel::Fundamental
@@ -775,11 +775,6 @@ SILFunction *swift::getEligibleFunction(FullApplySite AI,
       if (Callee->hasSemanticsAttrThatStartsWith("inline_late") && IsInStdlib) {
         return nullptr;
       }
-    }
-
-  } else if (Callee->isGlobalInit()) {
-    if (WhatToInline != InlineSelection::Everything) {
-      return nullptr;
     }
   }
 
@@ -883,7 +878,7 @@ static bool hasInterestingSideEffect(SILInstruction *I) {
     case swift::SILInstructionKind::DeallocRefInst:
       return false;
     default:
-      return I->getMemoryBehavior() != SILInstruction::MemoryBehavior::None;
+      return I->getMemoryBehavior() != MemoryBehavior::None;
   }
 }
 
@@ -937,7 +932,7 @@ bool swift::isPureCall(FullApplySite AI, BasicCalleeAnalysis *BCA) {
   // If a call has only constant arguments and the call is pure, i.e. has
   // no side effects, then we should always inline it.
   // This includes arguments which are objects initialized with constant values.
-  if (BCA->getMemoryBehavior(AI, /*observeRetains*/ true) != SILInstruction::MemoryBehavior::None)
+  if (BCA->getMemoryBehavior(AI, /*observeRetains*/ true) != MemoryBehavior::None)
     return false;
   // Check if all parameters are constant.
   auto Args = AI.getArgumentOperands().slice(AI.getNumIndirectSILResults());

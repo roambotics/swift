@@ -33,15 +33,15 @@ func testObjCMethodCall() {
 testObjCMethodCall()
 
 // CHECK: define {{.*}} @"$s4test0A14ObjCMethodCallyyF"() #[[#UWATTR:]] personality
-// CHECK: invoke void {{.*}} @objc_msgSend
+// CHECK: invoke void {{.*}}@objc_msgSend
 // CHECK-NEXT: to label %[[CONT1:.*]] unwind label %[[UNWIND1:.*]]
 // CHECK-EMPTY:
 // CHECK-NEXT: [[CONT1]]:
 // CHECK:  ret
 // CHECK-EMPTY:
 // CHECK-NEXT: [[UNWIND1]]:
-// CHECK-NEXT: landingpad { i8*, i32 }
-// CHECK-NEXT:    catch i8* null
+// CHECK-NEXT: landingpad { ptr, i32 }
+// CHECK-NEXT:    catch ptr null
 // CHECK-NEXT: call void @llvm.trap()
 // CHECK-NEXT: unreachable
 // CHECK-NEXT: }

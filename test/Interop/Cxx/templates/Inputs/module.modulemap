@@ -133,6 +133,11 @@ module TemplateTypeParameterNotInSignature {
   requires cplusplus
 }
 
+module EnableIf {
+  header "enable-if.h"
+  requires cplusplus
+}
+
 module DefineReferencedInline {
   header "define-referenced-inline.h"
   requires cplusplus
@@ -145,5 +150,10 @@ module DependentTypes {
 
 module UnevaluatedContext {
   header "unevaluated-context.h"
+  requires cplusplus
+}
+
+module ManySpecializations {
+  header "many-specializations.h"
   requires cplusplus
 }

@@ -1,8 +1,13 @@
 // RUN: %empty-directory(%t)
+
 // RUN: %target-swift-frontend -swift-version 6 -emit-module -emit-module-path %t/other_global_actor_inference.swiftmodule -module-name other_global_actor_inference -warn-concurrency %S/Inputs/other_global_actor_inference.swift
-// RUN: %target-typecheck-verify-swift -swift-version 6 -I %t -disable-availability-checking
+
+// RUN: %target-swift-frontend -swift-version 6 -I %t -disable-availability-checking %s -emit-sil -o /dev/null -verify
+// RUN: %target-swift-frontend -swift-version 6 -I %t -disable-availability-checking %s -emit-sil -o /dev/null -verify -enable-experimental-feature SendNonSendable
+
 // REQUIRES: concurrency
 // REQUIRES: asserts
+
 import other_global_actor_inference
 
 actor SomeActor { }
@@ -78,7 +83,7 @@ struct HasMainActorWrappedProp {
 
   var plainStorage: Int
 
-  var computedProp: Int { 0 } // expected-note {{property declared here}}
+  var computedProp: Int { 0 }
 
   nonisolated func testErrors() {
     _ = thing // expected-error {{main actor-isolated property 'thing' can not be referenced from a non-isolated context}}
@@ -89,7 +94,7 @@ struct HasMainActorWrappedProp {
 
     _ = plainStorage
 
-    _ = computedProp // expected-error {{main actor-isolated property 'computedProp' can not be referenced from a non-isolated context}}
+    _ = computedProp
   }
 }
 

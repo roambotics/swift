@@ -340,11 +340,23 @@ extension ValueDefUseWalker {
       } else {
         return unmatchedPath(value: operand, path: path)
       }
-    case is InitExistentialRefInst, is OpenExistentialRefInst,
-      is BeginBorrowInst, is CopyValueInst, is MoveValueInst,
-      is UpcastInst, is UncheckedRefCastInst, is EndCOWMutationInst,
-      is RefToBridgeObjectInst, is BridgeObjectToRefInst, is MarkMustCheckInst:
+    case let ier as InitExistentialRefInst:
+      return walkDownUses(ofValue: ier, path: path.push(.existential, index: 0))
+    case let oer as OpenExistentialRefInst:
+      if let path = path.popIfMatches(.existential, index: 0) {
+        return walkDownUses(ofValue: oer, path: path)
+      } else {
+        return unmatchedPath(value: operand, path: path)
+      }
+    case is BeginBorrowInst, is CopyValueInst, is MoveValueInst,
+         is UpcastInst, is UncheckedRefCastInst, is EndCOWMutationInst, is EndInitLetRefInst,
+         is RefToBridgeObjectInst, is BridgeObjectToRefInst, is MarkUnresolvedNonCopyableValueInst:
       return walkDownUses(ofValue: (instruction as! SingleValueInstruction), path: path)
+    case let beginDealloc as BeginDeallocRefInst:
+      if operand.index == 0 {
+        return walkDownUses(ofValue: beginDealloc, path: path)
+      }
+      return .continueWalk
     case let mdi as MarkDependenceInst:
       if operand.index == 0 {
         return walkDownUses(ofValue: mdi, path: path)
@@ -470,14 +482,26 @@ extension AddressDefUseWalker {
       } else {
         return unmatchedPath(address: operand, path: path)
       }
-    case is InitExistentialAddrInst, is OpenExistentialAddrInst, is BeginAccessInst,
-         is IndexAddrInst, is MarkMustCheckInst:
-      // FIXME: for now `index_addr` is treated as a forwarding instruction since
-      // SmallProjectionPath does not track indices.
-      // This is ok since `index_addr` is eventually preceeded by a `tail_addr`
-      // which has pushed a `"ct"` component on the path that matches any
-      // `index_addr` address.
-      return walkDownUses(ofAddress: instruction as! SingleValueInstruction, path: path)
+    case is InitExistentialAddrInst, is OpenExistentialAddrInst:
+      if let path = path.popIfMatches(.existential, index: 0) {
+        return walkDownUses(ofAddress: instruction as! SingleValueInstruction, path: path)
+      } else {
+        return unmatchedPath(address: operand, path: path)
+      }
+    case let ia as IndexAddrInst:
+      if let (pathIdx, subPath) = path.pop(kind: .indexedElement) {
+        if let idx = ia.constantSmallIndex,
+           idx == pathIdx {
+          return walkDownUses(ofAddress: ia, path: subPath)
+        }
+        return walkDownUses(ofAddress: ia, path: subPath.push(.anyIndexedElement, index: 0))
+      }
+      return walkDownUses(ofAddress: ia, path: path)
+    case let mmc as MarkUnresolvedNonCopyableValueInst:
+      return walkDownUses(ofAddress: mmc, path: path)
+    case let ba as BeginAccessInst:
+      // Don't treat `end_access` as leaf-use. Just ignore it.
+      return walkDownNonEndAccessUses(of: ba, path: path)
     case let mdi as MarkDependenceInst:
       if operand.index == 0 {
         return walkDownUses(ofAddress: mdi, path: path)
@@ -492,6 +516,16 @@ extension AddressDefUseWalker {
   mutating func walkDownUses(ofAddress: Value, path: Path) -> WalkResult {
     for operand in ofAddress.uses where !operand.isTypeDependent {
       if walkDown(address: operand, path: path) == .abortWalk {
+        return .abortWalk
+      }
+    }
+    return .continueWalk
+  }
+
+  private mutating func walkDownNonEndAccessUses(of beginAccess: BeginAccessInst, path: Path) -> WalkResult {
+    for operand in beginAccess.uses where !operand.isTypeDependent {
+      if !(operand.instruction is EndAccessInst),
+         walkDown(address: operand, path: path) == .abortWalk {
         return .abortWalk
       }
     }
@@ -597,6 +631,15 @@ extension ValueUseDefWalker {
       if let path = path.popIfMatches(.enumCase, index: e.caseIndex),
          let payload = e.payload {
         return walkUp(value: payload, path: path)
+
+      } else if path.popIfMatches(.anyValueFields, index: nil) != nil {
+        if let payload = e.payload {
+          return walkUp(value: payload, path: path)
+        } else {
+          // without a payload, this enum is itself a definition root.
+          return rootDef(value: e, path: path)
+        }
+
       } else {
         return unmatchedPath(value: e, path: path)
       }
@@ -617,14 +660,22 @@ extension ValueUseDefWalker {
       } else {
         return rootDef(value: mvr, path: path)
       }
-    case is InitExistentialRefInst, is OpenExistentialRefInst,
-      is BeginBorrowInst, is CopyValueInst, is MoveValueInst,
-      is UpcastInst, is UncheckedRefCastInst, is EndCOWMutationInst,
-      is RefToBridgeObjectInst, is BridgeObjectToRefInst, is MarkMustCheckInst:
+    case let ier as InitExistentialRefInst:
+      if let path = path.popIfMatches(.existential, index: 0) {
+        return walkUp(value: ier.instance, path: path)
+      } else {
+        return unmatchedPath(value: ier, path: path)
+      }
+    case let oer as OpenExistentialRefInst:
+      return walkUp(value: oer.existential, path: path.push(.existential, index: 0))
+    case is BeginBorrowInst, is CopyValueInst, is MoveValueInst,
+         is UpcastInst, is UncheckedRefCastInst, is EndCOWMutationInst, is EndInitLetRefInst,
+         is BeginDeallocRefInst,
+         is RefToBridgeObjectInst, is BridgeObjectToRefInst, is MarkUnresolvedNonCopyableValueInst:
       return walkUp(value: (def as! Instruction).operands[0].value, path: path)
-    case let arg as BlockArgument:
-      if arg.isPhiArgument {
-        for incoming in arg.incomingPhiValues {
+    case let arg as Argument:
+      if let phi = Phi(arg) {
+        for incoming in phi.incomingValues {
           // Check the cache to avoid cycles in the walk
           if let path = walkUpCache.needWalk(for: incoming, path: path) {
             if walkUp(value: incoming, path: path) == .abortWalk {
@@ -634,14 +685,13 @@ extension ValueUseDefWalker {
         }
         return .continueWalk
       }
-      
-      let block = arg.parentBlock
-      if let pred = block.singlePredecessor,
-         let se = pred.terminator as? SwitchEnumInst,
-         let caseIdx = se.getUniqueCase(forSuccessor: block) {
-        return walkUp(value: se.enumOp, path: path.push(.enumCase, index: caseIdx))
+      if let termResult = TerminatorResult(arg) {
+        let pred = termResult.predecessor
+        if let se = pred.terminator as? SwitchEnumInst,
+           let caseIdx = se.getUniqueCase(forSuccessor: termResult.successor) {
+          return walkUp(value: se.enumOp, path: path.push(.enumCase, index: caseIdx))
+        }
       }
-      
       return rootDef(value: def, path: path)
     default:
       return rootDef(value: def, path: path)
@@ -702,17 +752,20 @@ extension AddressUseDefWalker {
       return walkUp(address: sea.struct, path: path.push(.structField, index: sea.fieldIndex))
     case let tea as TupleElementAddrInst:
       return walkUp(address: tea.tuple, path: path.push(.tupleField, index: tea.fieldIndex))
-    case is InitEnumDataAddrInst, is UncheckedTakeEnumDataAddrInst:
-      return walkUp(address: (def as! UnaryInstruction).operand.value,
-                    path: path.push(.enumCase, index: (def as! EnumInstruction).caseIndex))
-    case is InitExistentialAddrInst, is OpenExistentialAddrInst, is BeginAccessInst, is IndexAddrInst,
-         is MarkMustCheckInst:
-      // FIXME: for now `index_addr` is treated as a forwarding instruction since
-      // SmallProjectionPath does not track indices.
-      // This is ok since `index_addr` is eventually preceeded by a `tail_addr`
-      // which has pushed a `"ct"` component on the path that matches any
-      // `index_addr` address.
+    case let ida as InitEnumDataAddrInst:
+      return walkUp(address: ida.operand.value, path: path.push(.enumCase, index: ida.caseIndex))
+    case let uteda as UncheckedTakeEnumDataAddrInst:
+      return walkUp(address: uteda.operand.value, path: path.push(.enumCase, index: uteda.caseIndex))
+    case is InitExistentialAddrInst, is OpenExistentialAddrInst:
+      return walkUp(address: (def as! Instruction).operands[0].value, path: path.push(.existential, index: 0))
+    case is BeginAccessInst, is MarkUnresolvedNonCopyableValueInst:
       return walkUp(address: (def as! Instruction).operands[0].value, path: path)
+    case let ia as IndexAddrInst:
+      if let idx = ia.constantSmallIndex {
+        return walkUp(address: ia.base, path: path.push(.indexedElement, index: idx))
+      } else {
+        return walkUp(address: ia.base, path: path.push(.anyIndexedElement, index: 0))
+      }
     case let mdi as MarkDependenceInst:
       return walkUp(address: mdi.operands[0].value, path: path)
     default:
@@ -720,3 +773,17 @@ extension AddressUseDefWalker {
     }
   }
 }
+
+private extension IndexAddrInst {
+  var constantSmallIndex: Int? {
+    guard let literal = index as? IntegerLiteralInst else {
+      return nil
+    }
+    let index = literal.value
+    if index.isIntN(16) {
+      return Int(index.getSExtValue())
+    }
+    return nil
+  }
+}
+

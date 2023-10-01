@@ -29,6 +29,15 @@ enum class ObjCSelectorContext {
   SetterSelector
 };
 
+/// Attributes that have syntax which can't be modelled using a function call.
+/// This can't be \c DeclAttrKind because '@freestandig' and '@attached' have
+/// the same attribute kind but take different macro roles as arguemnts.
+enum class CustomSyntaxAttributeKind {
+  Available,
+  FreestandingMacro,
+  AttachedMacro,
+};
+
 /// Parser's interface to code completion.
 class CodeCompletionCallbacks {
 protected:
@@ -114,7 +123,7 @@ public:
   };
 
   /// Set target decl for attribute if the CC token is in attribute of the decl.
-  virtual void setAttrTargetDeclKind(Optional<DeclKind> DK) {}
+  virtual void setAttrTargetDeclKind(llvm::Optional<DeclKind> DK) {}
 
   /// Set that the code completion token occurred in a custom attribute. This
   /// allows us to type check the custom attribute even if it is not attached to
@@ -138,8 +147,9 @@ public:
   /// Complete the \c in keyword in a for-each loop.
   virtual void completeForEachInKeyword(){};
 
-  /// Complete a given expr-postfix.
-  virtual void completePostfixExpr(Expr *E, bool hasSpace) {};
+  /// Complete a expr-postfix. The \c CodeCompletionExpr has the expression it
+  /// is completing after set as its base.
+  virtual void completePostfixExpr(CodeCompletionExpr *E, bool hasSpace){};
 
   /// Complete a given expr-postfix, given that there is a following
   /// left parenthesis.
@@ -185,7 +195,10 @@ public:
 
   /// Complete the parameters in attribute, for instance, version specifier for
   /// @available.
-  virtual void completeDeclAttrParam(DeclAttrKind DK, int Index) {};
+  /// If `HasLabel` is `true`, then the argument already has a label specified,
+  /// e.g. we're completing after `names: ` in a macro declaration.
+  virtual void completeDeclAttrParam(CustomSyntaxAttributeKind DK, int Index,
+                                     bool HasLabel){};
 
   /// Complete 'async' and 'throws' at effects specifier position.
   virtual void completeEffectsSpecifier(bool hasAsync, bool hasThrows) {};
@@ -217,10 +230,9 @@ public:
     return false;
   }
 
-  virtual void completeLabeledTrailingClosure(CodeCompletionExpr *E,
-                                              bool isAtStartOfLine) {};
+  virtual void completeReturnStmt(CodeCompletionExpr *E){};
 
-  virtual void completeReturnStmt(CodeCompletionExpr *E) {};
+  virtual void completeThenStmt(CodeCompletionExpr *E) {};
 
   /// Complete a yield statement.  A missing yield index means that the
   /// completion immediately follows the 'yield' keyword; it may be either
@@ -228,10 +240,10 @@ public:
   /// index means that the completion is within the parentheses and is
   /// for a specific yield value.
   virtual void completeYieldStmt(CodeCompletionExpr *E,
-                                 Optional<unsigned> yieldIndex) {};
+                                 llvm::Optional<unsigned> yieldIndex){};
 
   virtual void completeAfterPoundExpr(CodeCompletionExpr *E,
-                                      Optional<StmtKind> ParentKind) {};
+                                      llvm::Optional<StmtKind> ParentKind){};
 
   virtual void completeAfterPoundDirective() {};
 
@@ -249,6 +261,8 @@ public:
   virtual void completeTypeAttrBeginning() {};
 
   virtual void completeOptionalBinding(){};
+
+  virtual void completeWithoutConstraintType(){};
 };
 
 class DoneParsingCallback {

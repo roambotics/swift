@@ -2,20 +2,17 @@ include(macCatalystUtils)
 
 # Workaround a cmake bug, see the corresponding function in swift-syntax
 function(force_target_link_libraries TARGET)
-  cmake_parse_arguments(ARGS "" "" "PUBLIC" ${ARGN})
+  target_link_libraries(${TARGET} ${ARGN})
 
-  foreach(DEPENDENCY ${ARGS_PUBLIC})
-    target_link_libraries(${TARGET} PRIVATE
-      ${DEPENDENCY}
-    )
-    add_dependencies(${TARGET} ${DEPENDENCY})
-
-    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forced-${DEPENDENCY}-dep.swift
-      COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/forced-${DEPENDENCY}-dep.swift
+  cmake_parse_arguments(ARGS "PUBLIC;PRIVATE;INTERFACE" "" "" ${ARGN})
+  foreach(DEPENDENCY ${ARGS_UNPARSED_ARGUMENTS})
+    string(REGEX REPLACE [<>:\"/\\|?*] _ sanitized ${DEPENDENCY})
+    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forced-${sanitized}-dep.swift
+      COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/forced-${sanitized}-dep.swift
       DEPENDS ${DEPENDENCY}
-      )
+    )
     target_sources(${TARGET} PRIVATE
-      ${CMAKE_CURRENT_BINARY_DIR}/forced-${DEPENDENCY}-dep.swift
+      ${CMAKE_CURRENT_BINARY_DIR}/forced-${sanitized}-dep.swift
     )
   endforeach()
 endfunction()
@@ -47,21 +44,27 @@ function(_add_host_swift_compile_options name)
     $<$<COMPILE_LANGUAGE:Swift>:-runtime-compatibility-version>
     $<$<COMPILE_LANGUAGE:Swift>:none>)
 
-  # Set the appropriate target triple.
-  # FIXME: This should be set by CMake.
-  if(SWIFT_HOST_VARIANT_SDK IN_LIST SWIFT_DARWIN_PLATFORMS)
-    set(DEPLOYMENT_VERSION "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_DEPLOYMENT_VERSION}")
+  target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:Swift>:-target;${SWIFT_HOST_TRIPLE}>)
+  _add_host_variant_swift_sanitizer_flags(${name})
+endfunction()
+
+function(_set_pure_swift_link_flags name relpath_to_lib_dir)
+  if(SWIFT_HOST_VARIANT_SDK MATCHES "LINUX|ANDROID|OPENBSD|FREEBSD")
+    # Don't add builder's stdlib RPATH automatically.
+    target_compile_options(${name} PRIVATE
+      $<$<COMPILE_LANGUAGE:Swift>:-no-toolchain-stdlib-rpath>
+    )
+
+    set_property(TARGET ${name}
+      APPEND PROPERTY INSTALL_RPATH
+        # At runtime, use swiftCore in the current just-built toolchain.
+        # NOTE: This relies on the ABI being the same as the builder.
+        "$ORIGIN/${relpath_to_lib_dir}swift/${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}"
+    )
+    # NOTE: At this point we don't have any pure swift executables/shared
+    # libraries required for building runtime/stdlib. So we don't need to add
+    # RPATH to the builder's runtime.
   endif()
-
-  if(SWIFT_HOST_VARIANT_SDK STREQUAL ANDROID)
-    set(DEPLOYMENT_VERSION ${SWIFT_ANDROID_API_LEVEL})
-  endif()
-
-  get_target_triple(target target_variant "${SWIFT_HOST_VARIANT_SDK}" "${SWIFT_HOST_VARIANT_ARCH}"
-    MACCATALYST_BUILD_FLAVOR ""
-    DEPLOYMENT_VERSION "${DEPLOYMENT_VERSION}")
-
-  target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:Swift>:-target;${target}>)
 endfunction()
 
 # Add a new "pure" Swift host library.
@@ -102,7 +105,7 @@ endfunction()
 # source1 ...
 #   Sources to add into this library.
 function(add_pure_swift_host_library name)
-  if (NOT SWIFT_SWIFT_PARSER)
+  if (NOT SWIFT_BUILD_SWIFT_SYNTAX)
     message(STATUS "Not building ${name} because swift-syntax is not available")
     return()
   endif()
@@ -140,6 +143,12 @@ function(add_pure_swift_host_library name)
   set_property(TARGET ${name}
     PROPERTY BUILD_WITH_INSTALL_RPATH YES)
 
+  if(APSHL_SHARED AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    # Allow install_name_tool to update paths (for rdar://109473564)
+    set_property(TARGET ${name} APPEND_STRING PROPERTY
+                 LINK_FLAGS " -Xlinker -headerpad_max_install_names")
+  endif()
+
   # Respect LLVM_COMMON_DEPENDS if it is set.
   #
   # LLVM_COMMON_DEPENDS if a global variable set in ./lib that provides targets
@@ -156,7 +165,7 @@ function(add_pure_swift_host_library name)
   add_custom_command(
       TARGET ${name}
       POST_BUILD
-      COMMAND "${CMAKE_COMMAND}" -E touch_nocreate $<TARGET_FILE:${name}> $<TARGET_OBJECTS:${name}>
+      COMMAND "${CMAKE_COMMAND}" -E touch_nocreate $<TARGET_FILE:${name}> $<TARGET_OBJECTS:${name}> "${SWIFT_HOST_LIBRARIES_DEST_DIR}/${name}.swiftmodule" "${CMAKE_CURRENT_BINARY_DIR}/${name}.swiftmodule"
       COMMAND_EXPAND_LISTS
       COMMENT "Update mtime of library outputs workaround")
 
@@ -171,13 +180,15 @@ function(add_pure_swift_host_library name)
 
   # Make sure we can use the host libraries.
   target_include_directories(${name} PUBLIC
-    ${SWIFT_HOST_LIBRARIES_DEST_DIR})
+    "${SWIFT_HOST_LIBRARIES_DEST_DIR}")
+  target_link_directories(${name} PUBLIC
+    "${SWIFT_HOST_LIBRARIES_DEST_DIR}")
 
   if(APSHL_EMIT_MODULE)
     # Determine where Swift modules will be built and installed.
 
-    set(module_triple ${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${SWIFT_HOST_VARIANT_ARCH}_MODULE})
-    set(module_dir ${SWIFT_HOST_LIBRARIES_DEST_DIR})
+    set(module_triple "${SWIFT_HOST_MODULE_TRIPLE}")
+    set(module_dir "${SWIFT_HOST_LIBRARIES_DEST_DIR}")
     set(module_base "${module_dir}/${name}.swiftmodule")
     set(module_file "${module_base}/${module_triple}.swiftmodule")
     set(module_interface_file "${module_base}/${module_triple}.swiftinterface")
@@ -209,6 +220,12 @@ function(add_pure_swift_host_library name)
         >)
   endif()
 
+  if(LLVM_USE_LINKER)
+    target_link_options(${name} PRIVATE
+      "-use-ld=${LLVM_USE_LINKER}"
+    )
+  endif()
+
   # Export this target.
   set_property(GLOBAL APPEND PROPERTY SWIFT_EXPORTS ${name})
 endfunction()
@@ -216,7 +233,7 @@ endfunction()
 # Add a new "pure" Swift host tool.
 #
 # "Pure" Swift host tools can only contain Swift code, and will be built
-# with the host compiler. 
+# with the host compiler.
 #
 # Usage:
 #   add_pure_swift_host_tool(name
@@ -237,14 +254,15 @@ endfunction()
 # source1 ...
 #   Sources to add into this tool.
 function(add_pure_swift_host_tool name)
-  if (NOT SWIFT_SWIFT_PARSER)
+  if (NOT SWIFT_BUILD_SWIFT_SYNTAX)
     message(STATUS "Not building ${name} because swift-syntax is not available")
     return()
   endif()
 
   # Option handling
   set(options)
-  set(single_parameter_options)
+  set(single_parameter_options
+    SWIFT_COMPONENT)
   set(multiple_parameter_options
         DEPENDENCIES
         SWIFT_DEPENDENCIES)
@@ -259,10 +277,17 @@ function(add_pure_swift_host_tool name)
   # Create the library.
   add_executable(${name} ${APSHT_SOURCES})
   _add_host_swift_compile_options(${name})
+  _set_pure_swift_link_flags(${name} "../lib/")
 
-  set_property(TARGET ${name}
-    APPEND PROPERTY INSTALL_RPATH
-      "@executable_path/../lib/swift/host")
+  if(SWIFT_HOST_VARIANT_SDK IN_LIST SWIFT_DARWIN_PLATFORMS)
+    set_property(TARGET ${name}
+      APPEND PROPERTY INSTALL_RPATH
+        "@executable_path/../lib/swift/host")
+  elseif(SWIFT_HOST_VARIANT_SDK MATCHES "LINUX|ANDROID|OPENBSD|FREEBSD")
+    set_property(TARGET ${name}
+      APPEND PROPERTY INSTALL_RPATH
+        "$ORIGIN/../lib/swift/host")
+  endif()
 
   set_property(TARGET ${name}
     PROPERTY BUILD_WITH_INSTALL_RPATH YES)
@@ -289,8 +314,46 @@ function(add_pure_swift_host_tool name)
 
   # Make sure we can use the host libraries.
   target_include_directories(${name} PUBLIC
-    ${SWIFT_HOST_LIBRARIES_DEST_DIR})
+    "${SWIFT_HOST_LIBRARIES_DEST_DIR}")
+  target_link_directories(${name} PUBLIC
+    "${SWIFT_HOST_LIBRARIES_DEST_DIR}")
 
-  # Export this target.
-  set_property(GLOBAL APPEND PROPERTY SWIFT_EXPORTS ${name})
+  if(LLVM_USE_LINKER)
+    target_link_options(${name} PRIVATE
+      "-use-ld=${LLVM_USE_LINKER}"
+    )
+  endif()
+
+  # Workaround to touch the library and its objects so that we don't
+  # continually rebuild (again, see corresponding change in swift-syntax).
+  add_custom_command(
+      TARGET ${name}
+      POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E touch_nocreate $<TARGET_FILE:${name}> $<TARGET_OBJECTS:${name}>
+      COMMAND_EXPAND_LISTS
+      COMMENT "Update mtime of executable outputs workaround")
+
+  # Even worse hack - ${name}.swiftmodule is added as an output, even though
+  # this is an executable target. Just touch it all the time to avoid having
+  # to rebuild it every time.
+  add_custom_command(
+      TARGET ${name}
+      POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E touch "${CMAKE_CURRENT_BINARY_DIR}/${name}.swiftmodule"
+      COMMAND_EXPAND_LISTS
+      COMMENT "Update mtime of executable outputs workaround")
+
+  if(NOT APSHT_SWIFT_COMPONENT STREQUAL no_component)
+    add_dependencies(${APSHT_SWIFT_COMPONENT} ${name})
+    swift_install_in_component(TARGETS ${name}
+      COMPONENT ${APSHT_SWIFT_COMPONENT}
+      RUNTIME DESTINATION bin)
+    swift_is_installing_component(${APSHT_SWIFT_COMPONENT} is_installing)
+  endif()
+
+  if(NOT is_installing)
+    set_property(GLOBAL APPEND PROPERTY SWIFT_BUILDTREE_EXPORTS ${name})
+  else()
+    set_property(GLOBAL APPEND PROPERTY SWIFT_EXPORTS ${name})
+  endif()
 endfunction()

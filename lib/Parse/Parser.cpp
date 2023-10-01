@@ -137,8 +137,8 @@ bool IDEInspectionSecondPassRequest::evaluate(
 void Parser::performIDEInspectionSecondPassImpl(
     IDEInspectionDelayedDeclState &info) {
   // Disable updating the interface hash
-  llvm::SaveAndRestore<Optional<StableHasher>> CurrentTokenHashSaver(
-      CurrentTokenHash, None);
+  llvm::SaveAndRestore<llvm::Optional<StableHasher>> CurrentTokenHashSaver(
+      CurrentTokenHash, llvm::None);
 
   auto BufferID = L->getBufferID();
   auto startLoc = SourceMgr.getLocForOffset(BufferID, info.StartOffset);
@@ -153,6 +153,9 @@ void Parser::performIDEInspectionSecondPassImpl(
   // Forget about the fact that we may have already computed local
   // discriminators.
   Context.evaluator.clearCachedOutput(LocalDiscriminatorsRequest{DC});
+
+  // Clear any ASTScopes that were expanded.
+  SF.clearScope();
 
   switch (info.Kind) {
   case IDEInspectionDelayedDeclKind::TopLevelCodeDecl: {
@@ -404,7 +407,7 @@ public:
   TokenRecorder(ASTContext &ctx, Lexer &BaseLexer)
       : Ctx(ctx), BaseLexer(BaseLexer), BufferID(BaseLexer.getBufferID()) {}
 
-  Optional<std::vector<Token>> finalize() override {
+  llvm::Optional<std::vector<Token>> finalize() override {
     auto &SM = Ctx.SourceMgr;
 
     // We should consume the comments at the end of the file that don't attach
@@ -494,6 +497,9 @@ Parser::Parser(std::unique_ptr<Lexer> Lex, SourceFile &SF,
   // Set the token to a sentinel so that we know the lexer isn't primed yet.
   // This cannot be tok::unknown, since that is a token the lexer could produce.
   Tok.setKind(tok::NUM_TOKENS);
+
+  EnabledNoncopyableGenerics =
+      Context.LangOpts.hasFeature(Feature::NoncopyableGenerics);
 }
 
 Parser::~Parser() {
@@ -704,8 +710,10 @@ SourceLoc Parser::skipUntilGreaterInTypeList(bool protocolComposition) {
     // 'Self' can appear in types, skip it.
     if (Tok.is(tok::kw_Self))
       break;
-    if (isStartOfStmt() || isStartOfSwiftDecl() || Tok.is(tok::pound_endif))
+    if (isStartOfStmt(/*preferExpr*/ false) || isStartOfSwiftDecl() ||
+        Tok.is(tok::pound_endif)) {
       return lastLoc;
+    }
     break;
 
     case tok::l_paren:
@@ -823,7 +831,7 @@ getStructureMarkerKindForToken(const Token &tok) {
 Parser::StructureMarkerRAII::StructureMarkerRAII(Parser &parser, SourceLoc loc,
                                                  StructureMarkerKind kind)
     : StructureMarkerRAII(parser) {
-  parser.StructureMarkers.push_back({loc, kind, None});
+  parser.StructureMarkers.push_back({loc, kind, llvm::None});
   if (parser.StructureMarkers.size() > MaxDepth) {
     parser.diagnose(loc, diag::structure_overflow, MaxDepth);
     // We need to cut off parsing or we will stack-overflow.
@@ -1016,8 +1024,8 @@ Parser::parseListItem(ParserStatus &Status, tok RightK, SourceLoc LeftLoc,
   }
   // If we're in a comma-separated list, the next token is at the
   // beginning of a new line and can never start an element, break.
-  if (Tok.isAtStartOfLine() &&
-      (Tok.is(tok::r_brace) || isStartOfSwiftDecl() || isStartOfStmt())) {
+  if (Tok.isAtStartOfLine() && (Tok.is(tok::r_brace) || isStartOfSwiftDecl() ||
+                                isStartOfStmt(/*preferExpr*/ false))) {
     return ParseListItemResult::Finished;
   }
   // If we found EOF or such, bailout.
@@ -1073,15 +1081,14 @@ Parser::parseList(tok RightK, SourceLoc LeftLoc, SourceLoc &RightLoc,
   return Status;
 }
 
-Optional<StringRef>
-Parser::getStringLiteralIfNotInterpolated(SourceLoc Loc,
-                                          StringRef DiagText) {
+llvm::Optional<StringRef>
+Parser::getStringLiteralIfNotInterpolated(SourceLoc Loc, StringRef DiagText) {
   assert(Tok.is(tok::string_literal));
 
   // FIXME: Support extended escaping string literal.
   if (Tok.getCustomDelimiterLen()) {
     diagnose(Loc, diag::forbidden_extended_escaping_string, DiagText);
-    return None;
+    return llvm::None;
   }
 
   SmallVector<Lexer::StringSegment, 1> Segments;
@@ -1089,36 +1096,11 @@ Parser::getStringLiteralIfNotInterpolated(SourceLoc Loc,
   if (Segments.size() != 1 ||
       Segments.front().Kind == Lexer::StringSegment::Expr) {
     diagnose(Loc, diag::forbidden_interpolated_string, DiagText);
-    return None;
+    return llvm::None;
   }
 
   return SourceMgr.extractText(CharSourceRange(Segments.front().Loc,
                                                Segments.front().Length));
-}
-
-bool Parser::shouldReturnSingleExpressionElement(ArrayRef<ASTNode> Body) {
-  // If the body consists of an #if declaration with a single
-  // expression active clause, find a single expression.
-  if (Body.size() == 2) {
-    if (auto *D = Body.front().dyn_cast<Decl *>()) {
-      // Step into nested active clause.
-      while (auto *ICD = dyn_cast<IfConfigDecl>(D)) {
-        auto ACE = ICD->getActiveClauseElements();
-        if (ACE.size() == 1) {
-          assert(Body.back() == ACE.back() &&
-                 "active clause not found in body");
-          return true;
-        } else if (ACE.size() == 2) {
-          if (auto *ND = ACE.front().dyn_cast<Decl *>()) {
-            D = ND;
-            continue;
-          }
-        }
-        break;
-      }
-    }
-  }
-  return Body.size() == 1;
 }
 
 struct ParserUnit::Implementation {
@@ -1140,6 +1122,8 @@ struct ParserUnit::Implementation {
         TypeCheckerOpts(TyOpts), SILOpts(silOpts), Diags(SM),
         Ctx(*ASTContext::get(LangOpts, TypeCheckerOpts, SILOpts, SearchPathOpts,
                              clangImporterOpts, symbolGraphOpts, SM, Diags)) {
+    registerParseRequestFunctions(Ctx.evaluator);
+
     auto parsingOpts = SourceFile::getDefaultParsingOptions(LangOpts);
     parsingOpts |= ParsingFlags::DisableDelayedBodies;
     parsingOpts |= ParsingFlags::DisablePoundIfEvaluation;
@@ -1197,7 +1181,7 @@ void ParserUnit::parse() {
   SmallVector<ASTNode, 128> items;
   P.parseTopLevelItems(items);
 
-  Optional<ArrayRef<Token>> tokensRef;
+  llvm::Optional<ArrayRef<Token>> tokensRef;
   if (auto tokens = P.takeTokenReceiver()->finalize())
     tokensRef = ctx.AllocateCopy(*tokens);
 

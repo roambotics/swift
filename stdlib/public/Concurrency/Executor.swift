@@ -16,17 +16,25 @@ import Swift
 @available(SwiftStdlib 5.1, *)
 public protocol Executor: AnyObject, Sendable {
 
+  // Since lack move-only type support in the SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY configuration
+  // Do not deprecate the UnownedJob enqueue in that configuration just yet - as we cannot introduce the replacements.
   #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
-  @available(macOS, introduced: 10.15, deprecated: 9999, message: "Implement 'enqueue(_: __owned Job)' instead")
-  @available(iOS, introduced: 13.0, deprecated: 9999, message: "Implement 'enqueue(_: __owned Job)' instead")
-  @available(watchOS, introduced: 6.0, deprecated: 9999, message: "Implement 'enqueue(_: __owned Job)' instead")
-  @available(tvOS, introduced: 13.0, deprecated: 9999, message: "Implement 'enqueue(_: __owned Job)' instead")
+  @available(SwiftStdlib 5.1, *)
+  @available(*, deprecated, message: "Implement 'enqueue(_: __owned ExecutorJob)' instead")
   #endif // !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
   func enqueue(_ job: UnownedJob)
 
+  // Cannot introduce these methods in SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+  // since it lacks move-only type support.
   #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
   @available(SwiftStdlib 5.9, *)
-  func enqueue(_ job: __owned Job)
+  @available(*, deprecated, message: "Implement 'enqueue(_: __owned ExecutorJob)' instead")
+  func enqueue(_ job: consuming Job)
+  #endif // !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+
+  #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+  @available(SwiftStdlib 5.9, *)
+  func enqueue(_ job: consuming ExecutorJob)
   #endif // !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
 }
 
@@ -39,10 +47,8 @@ public protocol SerialExecutor: Executor {
   // work-scheduling operation.
   @_nonoverride
   #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
-  @available(macOS, introduced: 10.15, deprecated: 9999, message: "Implement 'enqueue(_: __owned Job)' instead")
-  @available(iOS, introduced: 13.0, deprecated: 9999, message: "Implement 'enqueue(_: __owned Job)' instead")
-  @available(watchOS, introduced: 6.0, deprecated: 9999, message: "Implement 'enqueue(_: __owned Job)' instead")
-  @available(tvOS, introduced: 13.0, deprecated: 9999, message: "Implement 'enqueue(_: __owned Job)' instead")
+  @available(SwiftStdlib 5.1, *)
+  @available(*, deprecated, message: "Implement 'enqueue(_: __owned ExecutorJob)' instead")
   #endif // !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
   func enqueue(_ job: UnownedJob)
 
@@ -53,23 +59,62 @@ public protocol SerialExecutor: Executor {
   // work-scheduling operation.
   @_nonoverride
   @available(SwiftStdlib 5.9, *)
-  func enqueue(_ job: __owned Job)
+  @available(*, deprecated, message: "Implement 'enqueue(_: __owned ExecutorJob)' instead")
+  func enqueue(_ job: consuming Job)
+  #endif // !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+
+  #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+  // This requirement is repeated here as a non-override so that we
+  // get a redundant witness-table entry for it.  This allows us to
+  // avoid drilling down to the base conformance just for the basic
+  // work-scheduling operation.
+  @_nonoverride
+  @available(SwiftStdlib 5.9, *)
+  func enqueue(_ job: consuming ExecutorJob)
   #endif // !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
 
   /// Convert this executor value to the optimized form of borrowed
   /// executor references.
-  @available(SwiftStdlib 5.9, *)
   func asUnownedSerialExecutor() -> UnownedSerialExecutor
+
+  /// If this executor has complex equality semantics, and the runtime needs to compare
+  /// two executors, it will first attempt the usual pointer-based equality check,
+  /// and if it fails it will compare the types of both executors, if they are the same,
+  /// it will finally invoke this method, in an attempt to let the executor itself decide
+  /// if this and the `other` executor represent the same serial, exclusive, isolation context.
+  ///
+  /// This method must be implemented with great care, as wrongly returning `true` would allow
+  /// code from a different execution context (e.g. thread) to execute code which was intended
+  /// to be isolated by another actor.
+  ///
+  /// This check is not used when performing executor switching.
+  ///
+  /// This check is used when performing ``Actor/assertIsolated()``, ``Actor/preconditionIsolated()``,
+  /// ``Actor/assumeIsolated()`` and similar APIs which assert about the same "exclusive serial execution context".
+  ///
+  /// - Parameter other: the executor to compare with.
+  /// - Returns: true, if `self` and the `other` executor actually are mutually exclusive
+  ///            and it is safe–from a concurrency perspective–to execute code assuming one on the other.
+  @available(SwiftStdlib 5.9, *)
+  func isSameExclusiveExecutionContext(other: Self) -> Bool
 }
 
 #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
 @available(SwiftStdlib 5.9, *)
 extension Executor {
+
+  // Delegation goes like this:
+  // Unowned Job -> Executor Job -> Job -> ---||---
+
   public func enqueue(_ job: UnownedJob) {
+    self.enqueue(ExecutorJob(job))
+  }
+
+  public func enqueue(_ job: consuming ExecutorJob) {
     self.enqueue(Job(job))
   }
 
-  public func enqueue(_ job: __owned Job) {
+  public func enqueue(_ job: consuming Job) {
     self.enqueue(UnownedJob(job))
   }
 }
@@ -81,6 +126,16 @@ extension SerialExecutor {
   public func asUnownedSerialExecutor() -> UnownedSerialExecutor {
     UnownedSerialExecutor(ordinary: self)
   }
+}
+
+@available(SwiftStdlib 5.9, *)
+extension SerialExecutor {
+
+  @available(SwiftStdlib 5.9, *)
+  public func isSameExclusiveExecutionContext(other: Self) -> Bool {
+    return self === other
+  }
+
 }
 
 /// An unowned reference to a serial executor (a `SerialExecutor`
@@ -101,7 +156,8 @@ public struct UnownedSerialExecutor: Sendable {
   @usableFromInline
   internal var executor: Builtin.Executor
 
-  @_spi(ConcurrencyExecutors)
+  /// SPI: Do not use. Cannot be marked @_spi, since we need to use it from Distributed module
+  /// which needs to reach for this from an @_transparent function which prevents @_spi use.
   @available(SwiftStdlib 5.9, *)
   public var _executor: Builtin.Executor {
     self.executor
@@ -109,7 +165,7 @@ public struct UnownedSerialExecutor: Sendable {
   #endif
 
   @inlinable
-  internal init(_ executor: Builtin.Executor) {
+  public init(_ executor: Builtin.Executor) {
     #if compiler(>=5.5) && $BuiltinExecutor
     self.executor = executor
     #endif
@@ -122,6 +178,32 @@ public struct UnownedSerialExecutor: Sendable {
     #else
     fatalError("Swift compiler is incompatible with this SDK version")
     #endif
+  }
+
+  /// Opts the executor into complex "same exclusive execution context" equality checks.
+  ///
+  /// This means what when asserting or assuming executors, and the current and expected
+  /// executor are not the same instance (by object equality), the runtime may invoke
+  /// `isSameExclusiveExecutionContext` in order to compare the executors for equality.
+  ///
+  /// Implementing such complex equality can be useful if multiple executor instances
+  /// actually use the same underlying serialization context and can be therefore
+  /// safely treated as the same serial exclusive execution context (e.g. multiple
+  /// dispatch queues targeting the same serial queue).
+  @available(SwiftStdlib 5.9, *)
+  @inlinable
+  public init<E: SerialExecutor>(complexEquality executor: __shared E) {
+    #if compiler(>=5.9) && $BuiltinBuildComplexEqualityExecutor
+    self.executor = Builtin.buildComplexEqualitySerialExecutorRef(executor)
+    #else
+    fatalError("Swift compiler is incompatible with this SDK version")
+    #endif
+  }
+
+  @_spi(ConcurrencyExecutors)
+  @available(SwiftStdlib 5.9, *)
+  public var _isComplexEquality: Bool {
+    _executor_isComplexEquality(self)
   }
 
 }
@@ -137,6 +219,11 @@ public struct UnownedSerialExecutor: Sendable {
 @available(SwiftStdlib 5.9, *)
 @_silgen_name("swift_task_isOnExecutor")
 public func _taskIsOnExecutor<Executor: SerialExecutor>(_ executor: Executor) -> Bool
+
+@_spi(ConcurrencyExecutors)
+@available(SwiftStdlib 5.9, *)
+@_silgen_name("swift_executor_isComplexEquality")
+public func _executor_isComplexEquality(_ executor: UnownedSerialExecutor) -> Bool
 
 @available(SwiftStdlib 5.1, *)
 @_transparent
@@ -156,13 +243,29 @@ func _checkExpectedExecutor(_filenameStart: Builtin.RawPointer,
 
 /// Primarily a debug utility.
 ///
-/// If the passed in Job is a Task, returns the complete 64bit TaskId,
+/// If the passed in ExecutorJob is a Task, returns the complete 64bit TaskId,
 /// otherwise returns only the job's 32bit Id.
 ///
-/// - Returns: the Id stored in this Job or Task, for purposes of debug printing
+/// - Returns: the Id stored in this ExecutorJob or Task, for purposes of debug printing
 @available(SwiftStdlib 5.9, *)
 @_silgen_name("swift_task_getJobTaskId")
 internal func _getJobTaskId(_ job: UnownedJob) -> UInt64
+
+@available(SwiftStdlib 5.9, *)
+@_silgen_name("_task_serialExecutor_isSameExclusiveExecutionContext")
+internal func _task_serialExecutor_isSameExclusiveExecutionContext<E>(current currentExecutor: E, executor: E) -> Bool
+    where E: SerialExecutor {
+  currentExecutor.isSameExclusiveExecutionContext(other: executor)
+}
+
+/// Obtain the executor ref by calling the executor's `asUnownedSerialExecutor()`.
+/// The obtained executor ref will have all the user-defined flags set on the executor.
+@available(SwiftStdlib 5.9, *)
+@_silgen_name("_task_serialExecutor_getExecutorRef")
+internal func _task_serialExecutor_getExecutorRef<E>(_ executor: E) -> Builtin.Executor
+    where E: SerialExecutor {
+  return executor.asUnownedSerialExecutor().executor
+}
 
 // Used by the concurrency runtime
 @available(SwiftStdlib 5.1, *)
@@ -171,7 +274,7 @@ internal func _enqueueOnExecutor<E>(job unownedJob: UnownedJob, executor: E)
 where E: SerialExecutor {
   #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
   if #available(SwiftStdlib 5.9, *) {
-    executor.enqueue(Job(context: unownedJob._context))
+    executor.enqueue(ExecutorJob(context: unownedJob._context))
   } else {
     executor.enqueue(unownedJob)
   }

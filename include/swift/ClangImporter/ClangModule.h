@@ -36,7 +36,7 @@ class ClangModuleUnit final : public LoadedFile {
   ClangImporter::Implementation &owner;
   const clang::Module *clangModule;
   llvm::PointerIntPair<ModuleDecl *, 1, bool> overlayModule;
-  mutable Optional<ArrayRef<ImportedModule>> importedModulesForLookup;
+  mutable llvm::Optional<ArrayRef<ImportedModule>> importedModulesForLookup;
   /// The metadata of the underlying Clang module.
   clang::ASTSourceDescriptor ASTSourceDescriptor;
 
@@ -66,6 +66,7 @@ public:
   virtual bool isSystemModule() const override;
 
   virtual void lookupValue(DeclName name, NLKind lookupKind,
+                           OptionSet<ModuleLookupFlags> Flags,
                            SmallVectorImpl<ValueDecl*> &results) const override;
 
   virtual TypeDecl *
@@ -104,7 +105,7 @@ public:
   collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const override;
 
   Identifier
-  getDiscriminatorForPrivateValue(const ValueDecl *D) const override {
+  getDiscriminatorForPrivateDecl(const Decl *D) const override {
     llvm_unreachable("no private decls in Clang modules");
   }
 
@@ -120,7 +121,7 @@ public:
 
   /// Returns the ASTSourceDescriptor of the associated Clang module if one
   /// exists.
-  Optional<clang::ASTSourceDescriptor> getASTSourceDescriptor() const;
+  llvm::Optional<clang::ASTSourceDescriptor> getASTSourceDescriptor() const;
 
   virtual StringRef getModuleDefiningPath() const override;
 

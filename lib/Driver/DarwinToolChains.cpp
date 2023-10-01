@@ -24,6 +24,7 @@
 #include "swift/Driver/Compilation.h"
 #include "swift/Driver/Driver.h"
 #include "swift/Driver/Job.h"
+#include "swift/IDETool/CompilerInvocation.h"
 #include "swift/Option/Options.h"
 #include "clang/Basic/DarwinSDKInfo.h"
 #include "clang/Basic/Version.h"
@@ -121,6 +122,31 @@ std::string toolchains::Darwin::sanitizerRuntimeLibName(StringRef Sanitizer,
           getDarwinLibraryNameSuffixForTriple(this->getTriple()) +
           (shared ? "_dynamic.dylib" : ".a"))
       .str();
+}
+
+void
+toolchains::Darwin::addPluginArguments(const ArgList &Args,
+                                       ArgStringList &Arguments) const {
+  SmallString<64> pluginPath;
+  auto programPath = getDriver().getSwiftProgramPath();
+  CompilerInvocation::computeRuntimeResourcePathFromExecutablePath(
+      programPath, /*shared=*/true, pluginPath);
+
+  auto defaultPluginPath = pluginPath;
+  llvm::sys::path::append(defaultPluginPath, "host", "plugins");
+
+  // Default plugin path.
+  Arguments.push_back("-plugin-path");
+  Arguments.push_back(Args.MakeArgString(defaultPluginPath));
+
+  // Local plugin path.
+  llvm::sys::path::remove_filename(pluginPath); // Remove "swift"
+  llvm::sys::path::remove_filename(pluginPath); // Remove "lib"
+  llvm::sys::path::append(pluginPath, "local", "lib");
+  llvm::sys::path::append(pluginPath, "swift");
+  llvm::sys::path::append(pluginPath, "host", "plugins");
+  Arguments.push_back("-plugin-path");
+  Arguments.push_back(Args.MakeArgString(pluginPath));
 }
 
 static void addLinkRuntimeLibRPath(const ArgList &Args,
@@ -338,8 +364,8 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
   // have an older Swift runtime.
   SmallString<128> SharedResourceDirPath;
   getResourceDirPath(SharedResourceDirPath, context.Args, /*Shared=*/true);
-  Optional<llvm::VersionTuple> runtimeCompatibilityVersion;
-  
+  llvm::Optional<llvm::VersionTuple> runtimeCompatibilityVersion;
+
   if (context.Args.hasArg(options::OPT_runtime_compatibility_version)) {
     auto value = context.Args.getLastArgValue(
                                     options::OPT_runtime_compatibility_version);
@@ -351,8 +377,10 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 5);
     } else if (value.equals("5.6")) {
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 6);
+    } else if (value.equals("5.8")) {
+      runtimeCompatibilityVersion = llvm::VersionTuple(5, 8);
     } else if (value.equals("none")) {
-      runtimeCompatibilityVersion = None;
+      runtimeCompatibilityVersion = llvm::None;
     } else {
       // TODO: diagnose unknown runtime compatibility version?
     }
@@ -364,7 +392,8 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
   if (runtimeCompatibilityVersion) {
     auto addBackDeployLib = [&](llvm::VersionTuple version,
                                 BackDeployLibFilter filter,
-                                StringRef libraryName) {
+                                StringRef libraryName,
+                                bool forceLoad) {
       if (*runtimeCompatibilityVersion > version)
         return;
 
@@ -376,14 +405,16 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
       llvm::sys::path::append(BackDeployLib, "lib" + libraryName + ".a");
       
       if (llvm::sys::fs::exists(BackDeployLib)) {
-        Arguments.push_back("-force_load");
+        if (forceLoad)
+          Arguments.push_back("-force_load");
         Arguments.push_back(context.Args.MakeArgString(BackDeployLib));
       }
     };
 
-    #define BACK_DEPLOYMENT_LIB(Version, Filter, LibraryName) \
-      addBackDeployLib(                                       \
-          llvm::VersionTuple Version, BackDeployLibFilter::Filter, LibraryName);
+    #define BACK_DEPLOYMENT_LIB(Version, Filter, LibraryName, ForceLoad) \
+      addBackDeployLib(                                                  \
+          llvm::VersionTuple Version, BackDeployLibFilter::Filter,       \
+          LibraryName, ForceLoad);
     #include "swift/Frontend/BackDeploymentLibs.def"
   }
     
@@ -487,10 +518,10 @@ toolchains::Darwin::addProfileGenerationArgs(ArgStringList &Arguments,
   }
 }
 
-Optional<llvm::VersionTuple>
+llvm::Optional<llvm::VersionTuple>
 toolchains::Darwin::getTargetSDKVersion(const llvm::Triple &triple) const {
   if (!SDKInfo)
-    return None;
+    return llvm::None;
   return swift::getTargetSDKVersion(*SDKInfo, triple);
 }
 
@@ -612,6 +643,60 @@ void toolchains::Darwin::addCommonFrontendArgs(
       arguments.push_back(
           inputArgs.MakeArgString(variantSDKVersion->getAsString()));
     }
+  }
+}
+
+/// Add the frontend arguments needed to find external plugins in standard
+/// locations based on the base path.
+static void addExternalPluginFrontendArgs(
+    StringRef basePath, const llvm::opt::ArgList &inputArgs,
+    llvm::opt::ArgStringList &arguments) {
+  // Plugin server: $BASE/usr/bin/swift-plugin-server
+  SmallString<128> pluginServer;
+  llvm::sys::path::append(
+      pluginServer, basePath, "usr", "bin", "swift-plugin-server");
+
+  SmallString<128> pluginDir;
+  llvm::sys::path::append(pluginDir, basePath, "usr", "lib");
+  llvm::sys::path::append(pluginDir, "swift", "host", "plugins");
+  arguments.push_back("-external-plugin-path");
+  arguments.push_back(inputArgs.MakeArgString(pluginDir + "#" + pluginServer));
+
+  pluginDir.clear();
+  llvm::sys::path::append(pluginDir, basePath, "usr", "local", "lib");
+  llvm::sys::path::append(pluginDir, "swift", "host", "plugins");
+  arguments.push_back("-external-plugin-path");
+  arguments.push_back(inputArgs.MakeArgString(pluginDir + "#" + pluginServer));
+}
+
+void toolchains::Darwin::addPlatformSpecificPluginFrontendArgs(
+    const OutputInfo &OI,
+    const CommandOutput &output,
+    const llvm::opt::ArgList &inputArgs,
+    llvm::opt::ArgStringList &arguments) const {
+  // Add SDK-relative directories for plugins.
+  if (!OI.SDKPath.empty()) {
+    addExternalPluginFrontendArgs(OI.SDKPath, inputArgs, arguments);
+  }
+
+  // Add platform-relative directories for plugins.
+  if (!OI.SDKPath.empty()) {
+    SmallString<128> platformPath;
+    llvm::sys::path::append(platformPath, OI.SDKPath);
+    llvm::sys::path::remove_filename(platformPath); // specific SDK
+    llvm::sys::path::remove_filename(platformPath); // SDKs
+    llvm::sys::path::remove_filename(platformPath); // Developer
+
+    StringRef platformName = llvm::sys::path::filename(platformPath);
+    if (platformName.endswith("Simulator.platform")){
+      StringRef devicePlatformName =
+          platformName.drop_back(strlen("Simulator.platform"));
+      llvm::sys::path::remove_filename(platformPath); // Platform
+      llvm::sys::path::append(platformPath, devicePlatformName + "OS.platform");
+    }
+
+    llvm::sys::path::append(platformPath, "Developer");
+    addExternalPluginFrontendArgs(platformPath, inputArgs, arguments);
   }
 }
 

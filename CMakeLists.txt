@@ -50,10 +50,10 @@ enable_language(CXX)
 set(SWIFT_ASM_DIALECT ASM)
 set(SWIFT_ASM_EXT S)
 set(SWIFT_ASM_AVAILABLE YES)
-if(CMAKE_SYSTEM_NAME STREQUAL Windows)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64")
     if(CMAKE_VERSION VERSION_LESS "3.26")
-      message(warning "We can't build assembly language for ARM64 until CMake 3.26")
+      message(WARNING "We can't build assembly language for ARM64 until CMake 3.26")
       set(SWIFT_ASM_AVAILABLE NO)
     else()
       set(SWIFT_ASM_DIALECT ASM_MARMASM)
@@ -94,6 +94,7 @@ include(CMakeDependentOption)
 include(CheckLanguage)
 include(GNUInstallDirs)
 include(SwiftImplicitImport)
+include(FetchContent)
 
 # Enable Swift for the host compiler build if we have the language. It is
 # optional until we have a bootstrap story.
@@ -158,7 +159,7 @@ else()
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     set(SWIFT_HOST_VARIANT_ARCH_default "x86_64")
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
-    if(SWIFT_HOST_VARIANT_SDK_default STREQUAL OSX)
+    if(SWIFT_HOST_VARIANT_SDK_default STREQUAL "OSX")
       set(SWIFT_HOST_VARIANT_ARCH_default "arm64")
     else()
       set(SWIFT_HOST_VARIANT_ARCH_default "aarch64")
@@ -243,6 +244,10 @@ option(SWIFT_BUILD_STDLIB_EXTRA_TOOLCHAIN_CONTENT
     "If not building stdlib, controls whether to build 'stdlib/toolchain' content"
     TRUE)
 
+option(SWIFT_BUILD_STDLIB_CXX_MODULE
+  "If not building stdlib, controls whether to build the Cxx module"
+  TRUE)
+
 # In many cases, the CMake build system needs to determine whether to include
 # a directory, or perform other actions, based on whether the stdlib or SDK is
 # being built at all -- statically or dynamically. Please note that these
@@ -304,12 +309,7 @@ endif()
 set(SWIFT_ANALYZE_CODE_COVERAGE FALSE CACHE STRING
     "Build Swift with code coverage instrumenting enabled [FALSE, NOT-MERGED, MERGED]")
 
-# SWIFT_VERSION is deliberately /not/ cached so that an existing build directory
-# can be reused when a new version of Swift comes out (assuming the user hasn't
-# manually set it as part of their own CMake configuration).
-set(SWIFT_VERSION_MAJOR 5)
-set(SWIFT_VERSION_MINOR 9)
-set(SWIFT_VERSION "${SWIFT_VERSION_MAJOR}.${SWIFT_VERSION_MINOR}")
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/SwiftVersion.cmake)
 
 set(SWIFT_VENDOR "" CACHE STRING
     "The vendor name of the Swift compiler")
@@ -381,7 +381,7 @@ set(SWIFT_STDLIB_BUILD_TYPE "${CMAKE_BUILD_TYPE}" CACHE STRING
 #   - MultiThreadedDebug (/MTd)
 #   - MultiThreadedDLL (/MD)
 #   - MultiThreadedDebugDLL (/MDd)
-if(CMAKE_BUILD_TYPE STREQUAL Debug)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(SWIFT_STDLIB_MSVC_RUNTIME_LIBRARY_default MultiThreadedDebugDLL)
 else()
   set(SWIFT_STDLIB_MSVC_RUNTIME_LIBRARY_default MultiThreadedDLL)
@@ -606,6 +606,14 @@ option(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
   "Enable build of the Swift concurrency module"
   FALSE)
 
+option(SWIFT_ENABLE_EXPERIMENTAL_CXX_INTEROP
+  "Enable experimental C++ interop modules"
+  FALSE)
+
+option(SWIFT_ENABLE_CXX_INTEROP_SWIFT_BRIDGING_HEADER
+  "Install the <swift/bridging> C++ interoperability header alongside compiler"
+  TRUE)
+
 option(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED
   "Enable experimental distributed actors and functions"
   FALSE)
@@ -639,6 +647,11 @@ option(SWIFT_THREADING_PACKAGE
    Valid package names are 'pthreads', 'darwin', 'linux', 'win32', 'c11', 'none'
    or the empty string for the SDK default.")
 
+option(SWIFT_THREADING_HAS_DLSYM
+  "Enable the use of the dlsym() function.  This gets used to provide TSan
+   support on some platforms."
+  TRUE)
+
 option(SWIFT_ENABLE_MACCATALYST
   "Build the Standard Library and overlays with MacCatalyst support"
   FALSE)
@@ -663,7 +676,7 @@ if(SWIFT_BUILT_STANDALONE)
   project(Swift C CXX ${SWIFT_ASM_DIALECT})
 endif()
 
-if(MSVC OR "${CMAKE_SIMULATE_ID}" STREQUAL MSVC)
+if(MSVC OR "${CMAKE_SIMULATE_ID}" STREQUAL "MSVC")
   include(ClangClCompileRules)
 elseif(UNIX)
   include(UnixCompileRules)
@@ -679,29 +692,21 @@ if(CMAKE_C_COMPILER_ID MATCHES Clang)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Werror=c++98-compat-extra-semi>)
 endif()
 
-# Make sure we know where swift-syntax is because we need it to build the parser.
-if(NOT EXISTS "${SWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE}")
-  message(SEND_ERROR "swift-syntax is required to build the Swift compiler. Please run update-checkout or specify SWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE")
-endif()
-
-# Use dispatch as the system scheduler by default.
-# For convenience, we set this to false when concurrency is disabled.
-set(SWIFT_CONCURRENCY_USES_DISPATCH FALSE)
-if(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY AND "${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}" STREQUAL "dispatch")
-  set(SWIFT_CONCURRENCY_USES_DISPATCH TRUE)
-endif()
+option(SWIFT_BUILD_SWIFT_SYNTAX
+  "Enable building swift syntax"
+  FALSE)
 
 set(SWIFT_BUILD_HOST_DISPATCH FALSE)
-if(SWIFT_ENABLE_DISPATCH AND NOT CMAKE_SYSTEM_NAME STREQUAL Darwin)
+if(SWIFT_ENABLE_DISPATCH AND NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   # Only build libdispatch for the host if the host tools are being built and
   # specifically if these two libraries that depend on it are built.
   if(SWIFT_INCLUDE_TOOLS AND SWIFT_BUILD_SOURCEKIT)
     set(SWIFT_BUILD_HOST_DISPATCH TRUE)
   endif()
 
-  if(SWIFT_BUILD_HOST_DISPATCH OR SWIFT_CONCURRENCY_USES_DISPATCH)
+  if(SWIFT_BUILD_HOST_DISPATCH)
     if(NOT EXISTS "${SWIFT_PATH_TO_LIBDISPATCH_SOURCE}")
-      message(SEND_ERROR "SourceKit and concurrency require libdispatch on non-Darwin hosts.  Please specify SWIFT_PATH_TO_LIBDISPATCH_SOURCE")
+      message(SEND_ERROR "SourceKit requires libdispatch on non-Darwin hosts.  Please specify SWIFT_PATH_TO_LIBDISPATCH_SOURCE")
     endif()
   endif()
 endif()
@@ -824,12 +829,20 @@ elseif(BOOTSTRAPPING_MODE MATCHES "BOOTSTRAPPING.*")
   else()
     set(BOOTSTRAPPING_MODE "HOSTTOOLS")
   endif()
-elseif(BOOTSTRAPPING_MODE STREQUAL "HOSTTOOLS" OR SWIFT_SWIFT_PARSER)
+elseif(BOOTSTRAPPING_MODE STREQUAL "HOSTTOOLS" OR SWIFT_BUILD_SWIFT_SYNTAX)
   # We are building using a pre-installed host toolchain but not bootstrapping
   # the Swift modules. This happens when building using 'build-tooling-libs'
   # where we haven't built a new Swift compiler. Use the Swift compiler from the
   # pre-installed host toolchain to build the Swift modules.
   set(SWIFT_EXEC_FOR_SWIFT_MODULES "${CMAKE_Swift_COMPILER}")
+endif()
+
+if(SWIFT_BUILD_SWIFT_SYNTAX)
+  # Only "HOSTTOOLS" is supported in Linux when Swift parser integration is enabled.
+  if(SWIFT_HOST_VARIANT_SDK MATCHES "LINUX|ANDROID|OPENBSD|FREEBSD" AND NOT BOOTSTRAPPING_MODE STREQUAL "HOSTTOOLS")
+    message(WARNING "Force setting BOOTSTRAPPING=HOSTTOOLS because Swift parser integration is enabled")
+    set(BOOTSTRAPPING_MODE "HOSTTOOLS")
+  endif()
 endif()
 
 if(BOOTSTRAPPING_MODE MATCHES "HOSTTOOLS|.*-WITH-HOSTLIBS")
@@ -878,11 +891,11 @@ endif()
 # build environment.
 if(LLVM_USE_LINKER)
   set(SWIFT_USE_LINKER_default "${LLVM_USE_LINKER}")
-elseif(${SWIFT_HOST_VARIANT_SDK} STREQUAL ANDROID)
+elseif(SWIFT_HOST_VARIANT_SDK STREQUAL "ANDROID")
   set(SWIFT_USE_LINKER_default "lld")
-elseif(CMAKE_SYSTEM_NAME STREQUAL Windows AND NOT CMAKE_HOST_SYSTEM_NAME STREQUAL Windows)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
   set(SWIFT_USE_LINKER_default "lld")
-elseif(CMAKE_SYSTEM_NAME STREQUAL Darwin)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   set(SWIFT_USE_LINKER_default "")
 else()
   set(SWIFT_USE_LINKER_default "gold")
@@ -937,19 +950,6 @@ if(XCODE)
   # clang-11, so we might be able to undo this.
   set(SWIFT_SDKS "OSX")
 endif()
-
-# When we have the early SwiftSyntax build, we can include its parser.
-if(SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR)
-  set(SWIFT_PATH_TO_EARLYSWIFTSYNTAX_TARGETS
-    ${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/cmake/SwiftSyntaxTargets.cmake)
-  if(NOT EXISTS "${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_TARGETS}")
-    message(STATUS "Skipping Swift Swift parser integration due to missing early SwiftSyntax")
-  else()
-    set(SWIFT_SWIFT_PARSER TRUE)
-    include(${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_TARGETS})
-  endif()
-endif()
-
 
 # FIXME: the parameters we specify in SWIFT_SDKS are lacking architecture specifics,
 # so we need to hard-code it. For example, the SDK for Android is just 'ANDROID',
@@ -1040,6 +1040,14 @@ elseif("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "ANDROID")
   endif()
 
   configure_sdk_unix("Android" "${SWIFT_SDK_ANDROID_ARCHITECTURES}")
+  set(SWIFT_PRIMARY_VARIANT_SDK_default  "${SWIFT_HOST_VARIANT_SDK}")
+  set(SWIFT_PRIMARY_VARIANT_ARCH_default "${SWIFT_HOST_VARIANT_ARCH}")
+
+elseif("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "WASI")
+  set(SWIFT_HOST_VARIANT "wasi" CACHE STRING
+      "Deployment OS for Swift host tools (the compiler) [wasi]")
+
+  configure_sdk_unix("WASI" "wasm32")
   set(SWIFT_PRIMARY_VARIANT_SDK_default  "${SWIFT_HOST_VARIANT_SDK}")
   set(SWIFT_PRIMARY_VARIANT_ARCH_default "${SWIFT_HOST_VARIANT_ARCH}")
 
@@ -1151,13 +1159,17 @@ if("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin" AND NOT CMAKE_CROSSCOMPILING)
   set(CMAKE_OSX_DEPLOYMENT_TARGET "")
 endif()
 
+swift_get_host_triple(SWIFT_HOST_TRIPLE)
+set(SWIFT_HOST_MODULE_TRIPLE "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${SWIFT_HOST_VARIANT_ARCH}_MODULE}")
+set(SWIFT_HOST_LIBRARIES_DEST_DIR "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/swift/host")
+
 if(SWIFT_INCLUDE_TOOLS)
   message(STATUS "Building host Swift tools for ${SWIFT_HOST_VARIANT_SDK} ${SWIFT_HOST_VARIANT_ARCH}")
   message(STATUS "  Build type:     ${CMAKE_BUILD_TYPE}")
   message(STATUS "  Assertions:     ${LLVM_ENABLE_ASSERTIONS}")
   message(STATUS "  LTO:            ${SWIFT_TOOLS_ENABLE_LTO}")
   message(STATUS "  Bootstrapping:  ${BOOTSTRAPPING_MODE}")
-  message(STATUS "  Swift parser:   ${SWIFT_SWIFT_PARSER}")
+  message(STATUS "  Swift parser:   ${SWIFT_BUILD_SWIFT_SYNTAX}")
   message(STATUS "")
 else()
   message(STATUS "Not building host Swift tools")
@@ -1201,7 +1213,7 @@ endif()
 # Find required dependencies.
 #
 
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_package(Python3 3.6 COMPONENTS Interpreter REQUIRED)
 
 #
 # Find optional dependencies.
@@ -1270,16 +1282,15 @@ else()
 
   if(SWIFT_BUILD_STDLIB_EXTRA_TOOLCHAIN_CONTENT)
     add_subdirectory(stdlib/toolchain)
-  endif()
 
-  if (BUILD_SWIFT_CONCURRENCY_BACK_DEPLOYMENT_LIBRARIES)
-    # Build the back-deployed concurrency library.
-    add_subdirectory(stdlib/public/BackDeployConcurrency)
+    if(SWIFT_BUILD_STDLIB_CXX_MODULE)
+      add_subdirectory(stdlib/public/Cxx)
+    endif()
   endif()
 
   # Some tools (e.g. swift-reflection-dump) rely on a host swiftRemoteInspection,
   # so ensure we build that when building tools.
-  if(SWIFT_INCLUDE_TOOLS)
+  if(SWIFT_INCLUDE_TOOLS OR SWIFT_BUILD_STDLIB_CXX_MODULE)
     add_subdirectory(stdlib/public/SwiftShims/swift/shims)
   endif()
 
@@ -1304,6 +1315,35 @@ endif()
 add_subdirectory(include)
 
 if(SWIFT_INCLUDE_TOOLS)
+  # Include 'swift-syntax'.
+  # This is a function because we want to set some 'CMAKE_*' variables temporarily.'
+  # TODO: Replace this with 'block()' after CMake 3.25
+  function(include_swift_syntax)
+    if(NOT SWIFT_BUILD_SWIFT_SYNTAX)
+      return()
+    endif()
+    if(NOT EXISTS "${SWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE}")
+      message(SEND_ERROR "swift-syntax is required to build the Swift compiler. Please run update-checkout or specify SWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE")
+      return()
+    endif()
+
+    set(CMAKE_Swift_COMPILER_TARGET ${SWIFT_HOST_TRIPLE})
+    set(BUILD_SHARED_LIBS ON)
+    # All libraries in 'swift-syntax' goes to 'lib/swift/host'.
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${SWIFT_HOST_LIBRARIES_DEST_DIR}")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${SWIFT_HOST_LIBRARIES_DEST_DIR}")
+    if(SWIFT_HOST_VARIANT_SDK MATCHES "LINUX|ANDROID|OPENBSD|FREEBSD")
+      set(SWIFT_HOST_LIBRARIES_RPATH "$ORIGIN;$ORIGIN/../${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}")
+    endif()
+
+    file(TO_CMAKE_PATH "${SWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE}" swift_syntax_path)
+    FetchContent_Declare(SwiftSyntax
+      SOURCE_DIR "${swift_syntax_path}"
+    )
+    FetchContent_MakeAvailable(SwiftSyntax)
+  endfunction()
+  include_swift_syntax()
+
   add_subdirectory(lib)
 
   # SwiftCompilerSources must come before "tools".

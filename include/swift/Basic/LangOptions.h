@@ -23,12 +23,14 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Version.h"
 #include "swift/Config.h"
+#include "clang/CAS/CASOptions.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/None.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/Support/Regex.h"
@@ -105,6 +107,28 @@ namespace swift {
     TaskToThread,
   };
 
+  /// Describes the code size optimization behavior for code associated with
+  /// declarations that are marked unavailable.
+  enum class UnavailableDeclOptimization : uint8_t {
+    /// No optimization. Unavailable declarations will contribute to the
+    /// resulting binary by default in this mode.
+    None,
+
+    /// Stub out code associated with unavailable declarations.
+    ///
+    /// For example, the bodies of unavailable functions should be compiled as
+    /// if they just contained a call to fatalError().
+    Stub,
+
+    /// Avoid generating any code for unavailable declarations.
+    ///
+    /// NOTE: This optimization can be ABI breaking for a library evolution
+    /// enabled module because existing client binaries built with a
+    /// pre-Swift 5.9 compiler may depend on linkable symbols associated with
+    /// unavailable declarations.
+    Complete,
+  };
+
   /// A collection of options that affect the language dialect and
   /// provide compiler debugging facilities.
   class LangOptions final {
@@ -137,10 +161,10 @@ namespace swift {
     llvm::Optional<llvm::Triple> ClangTarget;
 
     /// The SDK version, if known.
-    Optional<llvm::VersionTuple> SDKVersion;
+    llvm::Optional<llvm::VersionTuple> SDKVersion;
 
     /// The target variant SDK version, if known.
-    Optional<llvm::VersionTuple> VariantSDKVersion;
+    llvm::Optional<llvm::VersionTuple> VariantSDKVersion;
 
     /// The SDK canonical name, if known.
     std::string SDKName;
@@ -166,13 +190,14 @@ namespace swift {
     version::Version PackageDescriptionVersion;
 
     /// Enable experimental string processing
-    bool EnableExperimentalStringProcessing = false;
+    bool EnableExperimentalStringProcessing = true;
 
     /// Disable API availability checking.
     bool DisableAvailabilityChecking = false;
 
-    /// Only check the availability of the API, ignore function bodies.
-    bool CheckAPIAvailabilityOnly = false;
+    /// Optimization mode for unavailable declarations.
+    UnavailableDeclOptimization UnavailableDeclOptimizationMode =
+        UnavailableDeclOptimization::None;
 
     /// Causes the compiler to use weak linkage for symbols belonging to
     /// declarations introduced at the deployment target.
@@ -180,9 +205,6 @@ namespace swift {
 
     /// Should conformance availability violations be diagnosed as errors?
     bool EnableConformanceAvailabilityErrors = false;
-
-    /// Should potential unavailability on enum cases be downgraded to a warning?
-    bool WarnOnPotentiallyUnavailableEnumCase = false;
 
     /// Should the editor placeholder error be downgraded to a warning?
     bool WarnOnEditorPlaceholder = false;
@@ -199,7 +221,7 @@ namespace swift {
 
     /// Diagnostic level to report when a public declarations doesn't declare
     /// an introduction OS version.
-    Optional<DiagnosticBehavior> RequireExplicitAvailability = None;
+    llvm::Optional<DiagnosticBehavior> RequireExplicitAvailability = llvm::None;
 
     /// Introduction platform and version to suggest as fix-it
     /// when using RequireExplicitAvailability.
@@ -220,6 +242,15 @@ namespace swift {
 
     /// Emit a remark after loading a module.
     bool EnableModuleLoadingRemarks = false;
+
+    /// Emit remarks about contextual inconsistencies in loaded modules.
+    bool EnableModuleRecoveryRemarks = false;
+
+    /// Emit remarks about the source of each element exposed by the module API.
+    bool EnableModuleApiImportRemarks = false;
+
+     /// Emit a remark after loading a macro implementation.
+    bool EnableMacroLoadingRemarks = false;
 
     /// Emit a remark when indexing a system module.
     bool EnableIndexingSystemModuleRemarks = false;
@@ -243,6 +274,9 @@ namespace swift {
 
     /// Allow throwing call expressions without annotation with 'try'.
     bool EnableThrowWithoutTry = false;
+
+    /// Turn all throw sites into immediate traps.
+    bool ThrowsAsTraps = false;
 
     /// If set, inserts instrumentation useful for testing the debugger.
     bool DebuggerTestingTransform = false;
@@ -282,10 +316,18 @@ namespace swift {
     /// disabled because it is not complete.
     bool EnableCXXInterop = false;
 
+    /// The C++ interoperability source compatibility version. Defaults
+    /// to the Swift language version.
+    version::Version cxxInteropCompatVersion;
+
     bool CForeignReferenceTypes = false;
 
     /// Imports getters and setters as computed properties.
     bool CxxInteropGettersSettersAsProperties = false;
+
+    /// Should the compiler require C++ interoperability to be enabled
+    /// when importing Swift modules that enable C++ interoperability.
+    bool RequireCxxInteropToImportCxxInteropModule = true;
 
     /// On Darwin platforms, use the pre-stable ABI's mark bit for Swift
     /// classes instead of the stable ABI's bit. This is needed when
@@ -307,9 +349,6 @@ namespace swift {
     /// Flags for developers
     ///
 
-    /// Enable named lazy member loading.
-    bool NamedLazyMemberLoading = true;
-    
     /// Whether to record request references for incremental builds.
     bool RecordRequestReferences = true;
 
@@ -356,6 +395,10 @@ namespace swift {
     bool DisableImplicitBacktracingModuleImport =
         !SWIFT_IMPLICIT_BACKTRACING_IMPORT;
 
+    // Whether to use checked continuations when making an async call from
+    // Swift into ObjC. If false, will use unchecked continuations instead.
+    bool UseCheckedAsyncObjCBridging = false;
+
     /// Should we check the target OSs of serialized modules to see that they're
     /// new enough?
     bool EnableTargetOSChecking = true;
@@ -372,6 +415,11 @@ namespace swift {
     /// unsafe to read.
     bool EnableDeserializationSafety =
       ::getenv("SWIFT_ENABLE_DESERIALIZATION_SAFETY");
+
+    /// Attempt to recover for imported modules with broken modularization
+    /// in an unsafe way. Currently applies only to xrefs where the target
+    /// decl moved to a different module that is already loaded.
+    bool ForceWorkaroundBrokenModules = false;
 
     /// Whether to enable the new operator decl and precedencegroup lookup
     /// behavior. This is a staging flag, and will be removed in the future.
@@ -539,8 +587,12 @@ namespace swift {
     /// The model of concurrency to be used.
     ConcurrencyModel ActiveConcurrencyModel = ConcurrencyModel::Standard;
 
-    /// Allows the explicit 'import Builtin' within Swift modules.
-    bool EnableBuiltinModule = false;
+    /// All block list configuration files to be honored in this compilation.
+    std::vector<std::string> BlocklistConfigFilePaths;
+
+    /// Whether to ignore checks that a module is resilient during
+    /// type-checking, SIL verification, and IR emission,
+    bool BypassResilienceChecks = false;
 
     bool isConcurrencyModelTaskToThread() const {
       return ActiveConcurrencyModel == ConcurrencyModel::TaskToThread;
@@ -617,12 +669,22 @@ namespace swift {
       return EffectiveLanguageVersion.isVersionAtLeast(major, minor);
     }
 
+    /// Whether the C++ interoperability compatibility version is at least
+    /// 'major'.
+    bool isCxxInteropCompatVersionAtLeast(unsigned major,
+                                          unsigned minor = 0) const {
+      return cxxInteropCompatVersion.isVersionAtLeast(major, minor);
+    }
+
     /// Determine whether the given feature is enabled.
     bool hasFeature(Feature feature) const;
 
     /// Determine whether the given feature is enabled, looking up the feature
     /// by name.
     bool hasFeature(llvm::StringRef featureName) const;
+
+    /// Sets the "_atomicBitWidth" conditional.
+    void setAtomicBitWidth(llvm::Triple triple);
 
     /// Returns true if the given platform condition argument represents
     /// a supported target operating system.
@@ -661,7 +723,7 @@ namespace swift {
     }
 
   private:
-    llvm::SmallVector<std::pair<PlatformConditionKind, std::string>, 6>
+    llvm::SmallVector<std::pair<PlatformConditionKind, std::string>, 10>
         PlatformConditionValues;
     llvm::SmallVector<std::string, 2> CustomConditionalCompilationFlags;
   };
@@ -724,10 +786,10 @@ namespace swift {
     /// Should be stored sorted.
     llvm::SmallVector<unsigned, 4> DebugConstraintSolverOnLines;
 
-    /// Triggers llvm fatal_error if typechecker tries to typecheck a decl or an
-    /// identifier reference with the provided prefix name.
-    /// This is for testing purposes.
-    std::string DebugForbidTypecheckPrefix;
+    /// Triggers llvm fatal error if the typechecker tries to typecheck a decl
+    /// or an identifier reference with any of the provided prefix names. This
+    /// is for testing purposes.
+    std::vector<std::string> DebugForbidTypecheckPrefixes;
 
     /// The upper bound, in bytes, of temporary data that can be
     /// allocated by the constraint solver.
@@ -750,6 +812,13 @@ namespace swift {
 
     /// See \ref FrontendOptions.PrintFullConvention
     bool PrintFullConvention = false;
+
+    /// Defer typechecking of declarations to their use at runtime
+    bool DeferToRuntime = false;
+
+    /// Allow request evalutation to perform type checking lazily, instead of
+    /// eagerly typechecking source files after parsing.
+    bool EnableLazyTypecheck = false;
   };
 
   /// Options for controlling the behavior of the Clang importer.
@@ -761,6 +830,9 @@ namespace swift {
 
     /// The module cache path which the Clang importer should use.
     std::string ModuleCachePath;
+
+    /// The Scanning module cache path which the Clang Dependency Scanner should use.
+    std::string ClangScannerModuleCachePath;
 
     /// Extra arguments which should be passed to the Clang importer.
     std::vector<std::string> ExtraArgs;
@@ -786,6 +858,12 @@ namespace swift {
     /// The optimization setting.  This doesn't typically matter for
     /// import, but it can affect Clang's IR generation of static functions.
     std::string Optimization;
+
+    /// clang CASOptions.
+    llvm::Optional<clang::CASOptions> CASOpts;
+
+    /// Cache key for imported bridging header.
+    std::string BridgingHeaderPCHCacheKey;
 
     /// Disable validating the persistent PCH.
     bool PCHDisableValidation = false;
@@ -851,6 +929,13 @@ namespace swift {
     /// to build the Clang module via Clang frontend directly,
     /// and completely bypass the Clang driver.
     bool DirectClangCC1ModuleBuild = false;
+
+    /// Disable implicitly-built Clang modules because they are explicitly
+    /// built and provided to the compiler invocation.
+    bool DisableImplicitClangModules = false;
+
+    /// Enable ClangIncludeTree for explicit module builds.
+    bool UseClangIncludeTree = false;
 
     /// Return a hash code of any components from these options that should
     /// contribute to a Swift Bridging PCH hash.

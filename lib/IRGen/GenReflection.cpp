@@ -174,7 +174,7 @@ public:
   }
 };
 
-Optional<llvm::VersionTuple>
+llvm::Optional<llvm::VersionTuple>
 getRuntimeVersionThatSupportsDemanglingType(CanType type) {
   // The Swift 5.5 runtime is the first version able to demangle types
   // related to concurrency.
@@ -215,7 +215,7 @@ getRuntimeVersionThatSupportsDemanglingType(CanType type) {
     // involving them.
   }
 
-  return None;
+  return llvm::None;
 }
 
 // Produce a fallback mangled type name that uses an open-coded callback
@@ -266,7 +266,7 @@ getTypeRefByFunction(IRGenModule &IGM,
 
         // If a type is noncopyable, lie about the resolved type unless the
         // runtime is sufficiently aware of noncopyable types.
-        if (substT->isPureMoveOnly()) {
+        if (substT->isNoncopyable()) {
           // Darwin-based platforms have ABI stability, and we want binaries
           // that use noncopyable types nongenerically today to be forward
           // compatible with a future OS runtime that supports noncopyable
@@ -279,11 +279,28 @@ getTypeRefByFunction(IRGenModule &IGM,
           llvm::Instruction *br = nullptr;
           llvm::BasicBlock *supportedBB = nullptr;
           if (useForwardCompatibility) {
-            auto runtimeSupportsNoncopyableTypesSymbol
-              = IGM.Module.getOrInsertGlobal("swift_runtimeSupportsNoncopyableTypes",
-                                             IGM.Int8Ty);
-            cast<llvm::GlobalVariable>(runtimeSupportsNoncopyableTypesSymbol)
-              ->setLinkage(llvm::GlobalValue::ExternalWeakLinkage);
+            llvm::Value *runtimeSupportsNoncopyableTypesSymbol = nullptr;
+
+            // This is weird. When building the stdlib, we don't have access to
+            // the swift_runtimeSupportsNoncopyableTypes symbol in the Swift.o,
+            // so we'll emit an adrp + ldr to resolve the GOT address. However,
+            // this symbol is defined as an abolsute in the runtime object files
+            // to address 0x0 right now and ld doesn't quite understand how to
+            // fixup this GOT address when merging the runtime and stdlib. Just
+            // unconditionally fail the branch.
+            //
+            // Note: When the value of this symbol changes, this MUST be
+            // updated.
+            if (IGM.getSwiftModule()->isStdlibModule()) {
+              runtimeSupportsNoncopyableTypesSymbol
+                  = llvm::ConstantInt::get(IGM.Int8Ty, 0);
+            } else {
+              runtimeSupportsNoncopyableTypesSymbol
+                  = IGM.Module.getOrInsertGlobal(
+                      "swift_runtimeSupportsNoncopyableTypes", IGM.Int8Ty);
+              cast<llvm::GlobalVariable>(runtimeSupportsNoncopyableTypesSymbol)
+                  ->setLinkage(llvm::GlobalValue::ExternalWeakLinkage);
+            }
               
             auto runtimeSupportsNoncopyableTypes
               = IGF.Builder.CreateIsNotNull(runtimeSupportsNoncopyableTypesSymbol,
@@ -312,14 +329,14 @@ getTypeRefByFunction(IRGenModule &IGM,
           IGF.Builder.emitBlock(supportedBB);
         }
 
+        SubstitutionMap subs;
+        if (genericEnv)
+          subs = genericEnv->getForwardingSubstitutionMap();
+
         bindFromGenericRequirementsBuffer(
             IGF, requirements,
             Address(bindingsBufPtr, IGM.Int8Ty, IGM.getPointerAlignment()),
-            MetadataState::Complete, [&](CanType t) {
-              return genericEnv
-                ? genericEnv->mapTypeIntoContext(t)->getCanonicalType()
-                : t;
-            });
+            MetadataState::Complete, subs);
 
         auto ret = IGF.emitTypeMetadataRef(substT);
         IGF.Builder.CreateRet(ret);
@@ -374,7 +391,7 @@ getTypeRefImpl(IRGenModule &IGM,
     // noncopyable, use a function to emit the type ref which will look for a
     // signal from future runtimes whether they support noncopyable types before
     // exposing their metadata to them.
-    if (type->isPureMoveOnly()) {
+    if (type->isNoncopyable()) {
       IGM.IRGen.noteUseOfTypeMetadata(type);
       return getTypeRefByFunction(IGM, sig, type);
     }
@@ -485,17 +502,13 @@ IRGenModule::emitWitnessTableRefString(CanType type,
             bindFromGenericRequirementsBuffer(
                 IGF, requirements,
                 Address(bindingsBufPtr, Int8Ty, getPointerAlignment()),
-                MetadataState::Complete, [&](CanType t) {
-                  return genericEnv->mapTypeIntoContext(t)->getCanonicalType();
-                });
+                MetadataState::Complete, genericEnv->getForwardingSubstitutionMap());
 
             type = genericEnv->mapTypeIntoContext(type)->getCanonicalType();
           }
           if (origType->hasTypeParameter()) {
-            auto origSig = genericEnv->getGenericSignature();
             conformance = conformance.subst(origType,
-              QueryInterfaceTypeSubstitutions(genericEnv),
-              LookUpConformanceInSignature(origSig.getPointer()));
+                genericEnv->getForwardingSubstitutionMap());
           }
           auto ret = emitWitnessTableRef(IGF, type, conformance);
           IGF.Builder.CreateRet(ret);
@@ -666,9 +679,9 @@ protected:
   // method.
   using GetAddrOfEntityFn = llvm::Constant* (IRGenModule &, ConstantInit);
 
-  llvm::GlobalVariable *emit(
-                        Optional<llvm::function_ref<GetAddrOfEntityFn>> getAddr,
-                        const char *section) {
+  llvm::GlobalVariable *
+  emit(llvm::Optional<llvm::function_ref<GetAddrOfEntityFn>> getAddr,
+       const char *section) {
     layout();
 
     llvm::GlobalVariable *var;
@@ -702,15 +715,14 @@ protected:
   }
 
   // Helpers to guide the C++ type system into converting lambda arguments
-  // to Optional<function_ref>
+  // to llvm::Optional<function_ref>
   llvm::GlobalVariable *emit(llvm::function_ref<GetAddrOfEntityFn> getAddr,
                              const char *section) {
-    return emit(Optional<llvm::function_ref<GetAddrOfEntityFn>>(getAddr),
+    return emit(llvm::Optional<llvm::function_ref<GetAddrOfEntityFn>>(getAddr),
                 section);
   }
-  llvm::GlobalVariable *emit(NoneType none,
-                             const char *section) {
-    return emit(Optional<llvm::function_ref<GetAddrOfEntityFn>>(),
+  llvm::GlobalVariable *emit(llvm::NoneType none, const char *section) {
+    return emit(llvm::Optional<llvm::function_ref<GetAddrOfEntityFn>>(),
                 section);
   }
 
@@ -858,8 +870,11 @@ private:
     if (hasPayload && (decl->isIndirect() || enumDecl->isIndirect()))
       flags.setIsIndirectCase();
 
-    addField(flags, decl->getArgumentInterfaceType(),
-             decl->getBaseIdentifier().str());
+    Type interfaceType = decl->isAvailableDuringLowering()
+                             ? decl->getArgumentInterfaceType()
+                             : nullptr;
+
+    addField(flags, interfaceType, decl->getBaseIdentifier().str());
   }
 
   void layoutEnum() {
@@ -1083,6 +1098,7 @@ void IRGenModule::emitBuiltinTypeMetadataRecord(CanType builtinType) {
 
 class MultiPayloadEnumDescriptorBuilder : public ReflectionMetadataBuilder {
   CanType type;
+  CanType typeInContext;
   const FixedTypeInfo *ti;
 
 public:
@@ -1090,12 +1106,12 @@ public:
                                     const NominalTypeDecl *nominalDecl)
     : ReflectionMetadataBuilder(IGM) {
     type = nominalDecl->getDeclaredType()->getCanonicalType();
-    ti = &cast<FixedTypeInfo>(IGM.getTypeInfoForUnlowered(
-        nominalDecl->getDeclaredTypeInContext()->getCanonicalType()));
+    typeInContext = nominalDecl->getDeclaredTypeInContext()->getCanonicalType();
+    ti = &cast<FixedTypeInfo>(IGM.getTypeInfoForUnlowered(typeInContext));
   }
 
   void layout() override {
-    auto &strategy = getEnumImplStrategy(IGM, getFormalTypeInPrimaryContext(type));
+    auto &strategy = getEnumImplStrategy(IGM, typeInContext);
     bool isMPE = strategy.getElementsWithPayload().size() > 1;
     assert(isMPE && "Cannot emit Multi-Payload Enum data for an enum that doesn't have multiple payloads");
 
@@ -1154,7 +1170,7 @@ public:
 
   llvm::GlobalVariable *emit() {
     auto section = IGM.getMultiPayloadEnumDescriptorSectionName();
-    return ReflectionMetadataBuilder::emit(None, section);
+    return ReflectionMetadataBuilder::emit(llvm::None, section);
   }
 };
 
@@ -1180,7 +1196,7 @@ public:
 
   llvm::GlobalVariable *emit() {
     auto section = IGM.getCaptureDescriptorMetadataSectionName();
-    return ReflectionMetadataBuilder::emit(None, section);
+    return ReflectionMetadataBuilder::emit(llvm::None, section);
   }
 };
 
@@ -1213,15 +1229,37 @@ public:
       Subs(Subs),
       Layout(Layout) {}
 
-  using MetadataSourceMap
-    = std::vector<std::pair<CanType, const reflection::MetadataSource*>>;
+  struct Entry {
+    enum Kind {
+      Metadata,
+      Shape
+    };
 
-  void addMetadataSource(const reflection::MetadataSource *Source) {
+    Kind kind;
+
+    CanType type;
+    const reflection::MetadataSource *source;
+
+    Entry(Kind kind, CanType type, const reflection::MetadataSource *source)
+      : kind(kind), type(type), source(source) {}
+  };
+
+  using MetadataSourceMap = std::vector<Entry>;
+
+  void addMetadataSource(Entry::Kind Kind, const reflection::MetadataSource *Source) {
     if (Source == nullptr) {
       B.addInt32(0);
     } else {
       SmallString<16> EncodeBuffer;
       llvm::raw_svector_ostream OS(EncodeBuffer);
+      switch (Kind) {
+      case Entry::Kind::Shape:
+        OS << "s";
+        break;
+      case Entry::Kind::Metadata:
+        break;
+      }
+
       MetadataSourceEncoder Encoder(OS);
       Encoder.visit(Source);
 
@@ -1234,7 +1272,7 @@ public:
   /// Give up if we captured an opened existential type. Eventually we
   /// should figure out how to represent this.
   static bool hasLocalArchetype(CanSILFunctionType OrigCalleeType,
-                                   const HeapLayout &Layout) {
+                                const HeapLayout &Layout) {
     if (!OrigCalleeType->isPolymorphic() ||
         OrigCalleeType->isPseudogeneric())
       return false;
@@ -1247,7 +1285,8 @@ public:
       if (!Bindings[i].isAnyMetadata())
         continue;
 
-      if (Bindings[i].getTypeParameter()->hasLocalArchetype())
+      if (Bindings[i].getTypeParameter().subst(Bindings.getSubstitutionMap())
+            ->hasLocalArchetype())
         return true;
     }
 
@@ -1287,24 +1326,31 @@ public:
     // the bindings structure directly.
     auto &Bindings = Layout.getBindings();
     for (unsigned i = 0; i < Bindings.size(); ++i) {
-      // Skip protocol requirements (FIXME: for now?)
-      if (Bindings[i].isAnyWitnessTable())
-        continue;
-
-      // FIXME: bind pack counts in the source map
-      assert(Bindings[i].isAnyMetadata());
-
-      auto Source = SourceBuilder.createClosureBinding(i);
-      auto BindingType = Bindings[i].getTypeParameter();
-      auto InterfaceType = BindingType->mapTypeOutOfContext();
-      SourceMap.push_back({InterfaceType->getCanonicalType(), Source});
+      switch (Bindings[i].getKind()) {
+      case GenericRequirement::Kind::Shape:
+      case GenericRequirement::Kind::Metadata:
+      case GenericRequirement::Kind::MetadataPack: {
+        auto Kind = (Bindings[i].getKind() == GenericRequirement::Kind::Shape
+                     ? Entry::Kind::Shape
+                     : Entry::Kind::Metadata);
+        auto Source = SourceBuilder.createClosureBinding(i);
+        auto BindingType = Bindings[i].getTypeParameter().subst(Subs);
+        auto InterfaceType = BindingType->mapTypeOutOfContext();
+        SourceMap.emplace_back(Kind, InterfaceType->getCanonicalType(), Source);
+        break;
+      }
+      case GenericRequirement::Kind::WitnessTable:
+      case GenericRequirement::Kind::WitnessTablePack:
+        // Skip protocol requirements (FIXME: for now?)
+        break;
+      }
     }
 
     // Check if any requirements were fulfilled by metadata stored inside a
     // captured value.
 
     enumerateGenericParamFulfillments(IGM, OrigCalleeType,
-        [&](CanType GenericParam,
+        [&](GenericRequirement Req,
             const irgen::MetadataSource &Source,
             const MetadataPath &Path) {
 
@@ -1332,15 +1378,31 @@ public:
         break;
       }
 
+      Entry::Kind Kind;
+      switch (Req.getKind()) {
+      case GenericRequirement::Kind::Shape:
+        Kind = Entry::Kind::Shape;
+        break;
+
+      case GenericRequirement::Kind::Metadata:
+      case GenericRequirement::Kind::MetadataPack:
+        Kind = Entry::Kind::Metadata;
+        break;
+
+      case GenericRequirement::Kind::WitnessTable:
+      case GenericRequirement::Kind::WitnessTablePack:
+        llvm_unreachable("Bad kind");
+      }
+
       // The metadata might be reached via a non-trivial path (eg,
       // dereferencing an isa pointer or a generic argument). Record
       // the path. We assume captured values map 1-1 with function
       // parameters.
       auto Src = Path.getMetadataSource(SourceBuilder, Root);
 
-      auto SubstType = GenericParam.subst(Subs);
+      auto SubstType = Req.getTypeParameter().subst(Subs);
       auto InterfaceType = SubstType->mapTypeOutOfContext();
-      SourceMap.push_back({InterfaceType->getCanonicalType(), Src});
+      SourceMap.emplace_back(Kind, InterfaceType->getCanonicalType(), Src);
     });
 
     return SourceMap;
@@ -1398,18 +1460,15 @@ public:
 
     // Add the pairs that make up the generic param -> metadata source map
     // to the struct.
-    for (auto GenericAndSource : MetadataSources) {
-      auto GenericParam = GenericAndSource.first->getCanonicalType();
-      auto Source = GenericAndSource.second;
-
-      addTypeRef(GenericParam, sig);
-      addMetadataSource(Source);
+    for (auto entry : MetadataSources) {
+      addTypeRef(entry.type, sig);
+      addMetadataSource(entry.kind, entry.source);
     }
   }
 
   llvm::GlobalVariable *emit() {
     auto section = IGM.getCaptureDescriptorMetadataSectionName();
-    return ReflectionMetadataBuilder::emit(None, section);
+    return ReflectionMetadataBuilder::emit(llvm::None, section);
   }
 };
 
@@ -1632,13 +1691,15 @@ void IRGenModule::emitFieldDescriptor(const NominalTypeDecl *D) {
       needsFieldDescriptor = false;
   }
 
-  // If the type has custom @_alignment, emit a fixed record with the
-  // alignment since remote mirrors will need to treat the type as opaque.
+  // If the type has custom @_alignment, @_rawLayout, or other manual layout
+  // attributes, emit a fixed record with the size and alignment since the
+  // remote mirrors will need to treat the type as opaque.
   //
   // Note that we go on to also emit a field descriptor in this case,
   // since in-process reflection only cares about the types of the fields
   // and does not independently re-derive the layout.
-  if (D->getAttrs().hasAttribute<AlignmentAttr>()) {
+  if (D->getAttrs().hasAttribute<AlignmentAttr>()
+      || D->getAttrs().hasAttribute<RawLayoutAttr>()) {
     auto &TI = getTypeInfoForUnlowered(T);
     if (isa<FixedTypeInfo>(TI)) {
       needsOpaqueDescriptor = true;

@@ -67,6 +67,10 @@ void TypeVariableType::Implementation::print(llvm::raw_ostream &OS) {
     bindingOptions.push_back(TypeVariableOptions::TVO_CanBindToNoEscape);
   if (canBindToHole())
     bindingOptions.push_back(TypeVariableOptions::TVO_CanBindToHole);
+  if (canBindToPack())
+    bindingOptions.push_back(TypeVariableOptions::TVO_CanBindToPack);
+  if (isPackExpansion())
+    bindingOptions.push_back(TypeVariableOptions::TVO_PackExpansion);
   if (!bindingOptions.empty()) {
     OS << " [allows bindings to: ";
     interleave(bindingOptions, OS,
@@ -91,10 +95,10 @@ TypeVariableType::Implementation::getGenericParameter() const {
   return locator ? locator->getGenericParameter() : nullptr;
 }
 
-Optional<ExprKind>
+llvm::Optional<ExprKind>
 TypeVariableType::Implementation::getAtomicLiteralKind() const {
   if (!locator || !locator->directlyAt<LiteralExpr>())
-    return None;
+    return llvm::None;
 
   auto kind = getAsExpr(locator->getAnchor())->getKind();
   switch (kind) {
@@ -105,7 +109,7 @@ TypeVariableType::Implementation::getAtomicLiteralKind() const {
   case ExprKind::NilLiteral:
     return kind;
   default:
-    return None;
+    return llvm::None;
   }
 }
 
@@ -114,6 +118,10 @@ bool TypeVariableType::Implementation::isClosureType() const {
     return false;
 
   return isExpr<ClosureExpr>(locator->getAnchor()) && locator->getPath().empty();
+}
+
+bool TypeVariableType::Implementation::isTapType() const {
+  return locator && locator->directlyAt<TapExpr>();
 }
 
 bool TypeVariableType::Implementation::isClosureParameterType() const {
@@ -134,6 +142,10 @@ bool TypeVariableType::Implementation::isClosureResultType() const {
 
 bool TypeVariableType::Implementation::isKeyPathType() const {
   return locator && locator->isKeyPathType();
+}
+
+bool TypeVariableType::Implementation::isKeyPathValue() const {
+  return locator && locator->isKeyPathValue();
 }
 
 bool TypeVariableType::Implementation::isSubscriptResultType() const {
@@ -295,7 +307,11 @@ public:
   }
 
   PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
-    performSyntacticExprDiagnostics(expr, dcStack.back(), /*isExprStmt=*/false);
+    // We skip out-of-place expr checking here since we've already performed it.
+    performSyntacticExprDiagnostics(expr, dcStack.back(), /*ctp*/ llvm::None,
+                                    /*isExprStmt=*/false,
+                                    /*disableAvailabilityChecking*/ false,
+                                    /*disableOutOfPlaceExprChecking*/ true);
 
     if (auto closure = dyn_cast<ClosureExpr>(expr)) {
       if (closure->isSeparatelyTypeChecked()) {
@@ -342,8 +358,9 @@ void constraints::performSyntacticDiagnosticsForTarget(
   switch (target.kind) {
   case SyntacticElementTarget::Kind::expression: {
     // First emit diagnostics for the main expression.
-    performSyntacticExprDiagnostics(target.getAsExpr(), dc,
-                                    isExprStmt, disableExprAvailabilityChecking);
+    performSyntacticExprDiagnostics(
+        target.getAsExpr(), dc, target.getExprContextualTypePurpose(),
+        isExprStmt, disableExprAvailabilityChecking);
     return;
   }
 
@@ -352,17 +369,25 @@ void constraints::performSyntacticDiagnosticsForTarget(
 
     // First emit diagnostics for the main expression.
     performSyntacticExprDiagnostics(stmt->getTypeCheckedSequence(), dc,
-                                    isExprStmt,
+                                    CTP_ForEachSequence, isExprStmt,
                                     disableExprAvailabilityChecking);
 
     if (auto *whereExpr = stmt->getWhere())
-      performSyntacticExprDiagnostics(whereExpr, dc, /*isExprStmt*/ false);
+      performSyntacticExprDiagnostics(whereExpr, dc, CTP_Condition,
+                                      /*isExprStmt*/ false);
     return;
   }
 
   case SyntacticElementTarget::Kind::function: {
+    // Check for out of place expressions. This needs to be done on the entire
+    // function body rather than on individual expressions since we need the
+    // context of the parent nodes.
+    auto *body = target.getFunctionBody();
+    diagnoseOutOfPlaceExprs(dc->getASTContext(), body,
+                            /*contextualPurpose*/ llvm::None);
+
     FunctionSyntacticDiagnosticWalker walker(dc);
-    target.getFunctionBody()->walk(walker);
+    body->walk(walker);
     return;
   }
   case SyntacticElementTarget::Kind::closure:
@@ -396,7 +421,7 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
 /// FIXME: In order to remote this function both \c FrontendStatsTracer
 /// and \c PrettyStackTrace* have to be updated to accept `ASTNode`
 // instead of each individual syntactic element types.
-Optional<SyntacticElementTarget>
+llvm::Optional<SyntacticElementTarget>
 TypeChecker::typeCheckExpression(SyntacticElementTarget &target,
                                  TypeCheckExprOptions options) {
   DeclContext *dc = target.getDeclContext();
@@ -408,7 +433,7 @@ TypeChecker::typeCheckExpression(SyntacticElementTarget &target,
   return typeCheckTarget(target, options);
 }
 
-Optional<SyntacticElementTarget>
+llvm::Optional<SyntacticElementTarget>
 TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
                              TypeCheckExprOptions options) {
   DeclContext *dc = target.getDeclContext();
@@ -421,7 +446,7 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
   if (ConstraintSystem::preCheckTarget(
           target, /*replaceInvalidRefsWithErrors=*/true,
           options.contains(TypeCheckExprFlags::LeaveClosureBodyUnchecked))) {
-    return None;
+    return llvm::None;
   }
 
   // Check whether given target has a code completion token which requires
@@ -431,7 +456,7 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
                                  [&](const constraints::Solution &S) {
                                    Context.CompletionCallback->sawSolution(S);
                                  }))
-    return None;
+    return llvm::None;
 
   // Construct a constraint system from this expression.
   ConstraintSystemOptions csOptions = ConstraintSystemFlags::AllowFixes;
@@ -450,8 +475,7 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
   if (auto *expr = target.getAsExpr()) {
     // Tell the constraint system what the contextual type is.  This informs
     // diagnostics and is a hint for various performance optimizations.
-    cs.setContextualType(expr, target.getExprContextualTypeLoc(),
-                         target.getExprContextualTypePurpose());
+    cs.setContextualInfo(expr, target.getExprContextualTypeInfo());
 
     // Try to shrink the system by reducing disjunction domains. This
     // goes through every sub-expression and generate its own sub-system, to
@@ -467,7 +491,7 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
   // Attempt to solve the constraint system.
   auto viable = cs.solve(target, allowFreeTypeVariables);
   if (!viable)
-    return None;
+    return llvm::None;
 
   // Apply this solution to the constraint system.
   // FIXME: This shouldn't be necessary.
@@ -478,7 +502,7 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
   auto resultTarget = cs.applySolution(solution, target);
   if (!resultTarget) {
     // Failure already diagnosed, above, as part of applying the solution.
-    return None;
+    return llvm::None;
   }
 
   // Unless the client has disabled them, perform syntactic checks on the
@@ -654,7 +678,8 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
       cs.openGenericRequirement(DC->getParent(), index, requirement,
                                 /*skipSelfProtocolConstraint=*/false, locator,
                                 [&](Type type) -> Type {
-                                  return cs.openType(type, genericParameters);
+                                  return cs.openType(type, genericParameters,
+                                                     locator);
                                 });
     };
 
@@ -742,9 +767,8 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
   }
 
   defaultExprTarget.setExprConversionType(contextualTy);
-  cs.setContextualType(defaultValue,
-                       defaultExprTarget.getExprContextualTypeLoc(),
-                       defaultExprTarget.getExprContextualTypePurpose());
+  cs.setContextualInfo(defaultValue,
+                       defaultExprTarget.getExprContextualTypeInfo());
 
   auto viable = cs.solve(defaultExprTarget, FreeTypeVariableBinding::Disallow);
   if (!viable)
@@ -777,16 +801,6 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
                 initializer, DC, patternType, pattern,
                 /*bindPatternVarsOneWay=*/false);
 
-  if (DC->getASTContext().LangOpts.CheckAPIAvailabilityOnly &&
-      PBD && !DC->getAsDecl()) {
-    // Skip checking the initializer for non-public decls when
-    // checking the API only.
-    auto VD = PBD->getAnchoringVarDecl(0);
-    if (!swift::shouldCheckAvailability(VD)) {
-      options |= TypeCheckExprFlags::DisableExprAvailabilityChecking;
-    }
-  }
-
   // Type-check the initializer.
   auto resultTarget = typeCheckExpression(target, options);
 
@@ -814,7 +828,7 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
     // Don't change the type of a variable that we've been able to
     // compute a type for.
     if (var->hasInterfaceType() &&
-        !var->getType()->hasUnboundGenericType() &&
+        !var->getTypeInContext()->hasUnboundGenericType() &&
         !var->isInvalid())
       return;
 
@@ -1450,14 +1464,14 @@ void ConstraintSystem::print(raw_ostream &out) const {
     auto rep = getRepresentative(tv);
     if (rep == tv) {
       if (auto fixed = getFixedType(tv)) {
-        tv->getImpl().print(out);
+        tv->print(out, PO);
         out << " as ";
         Type(fixed).print(out, PO);
       } else {
         const_cast<ConstraintSystem *>(this)->getBindingsFor(tv).dump(out, 1);
       }
     } else {
-      tv->getImpl().print(out);
+      tv->print(out, PO);
       out << " equivalent to ";
       Type(rep).print(out, PO);
     }
@@ -1586,6 +1600,26 @@ void ConstraintSystem::print(raw_ostream &out) const {
     }
   }
 
+  if (!PackExpansionEnvironments.empty()) {
+    out.indent(indent) << "Pack Expansion Environments:\n";
+    for (const auto &env : PackExpansionEnvironments) {
+      out.indent(indent + 2);
+      env.first->dump(&getASTContext().SourceMgr, out);
+      out << " = (" << env.second.first << ", "
+          << env.second.second->getString(PO) << ")" << '\n';
+    }
+  }
+
+  if (!OpenedPackExpansionTypes.empty()) {
+    out.indent(indent) << "Opened pack expansion types:\n";
+    for (const auto &expansion : OpenedPackExpansionTypes) {
+      out.indent(indent + 2);
+      out << expansion.first->getString(PO);
+      out << " opens to " << expansion.second->getString(PO);
+      out << "\n";
+    }
+  }
+
   if (!DefaultedConstraints.empty()) {
     out.indent(indent) << "Defaulted constraints:\n";
     interleave(DefaultedConstraints, [&](ConstraintLocator *locator) {
@@ -1627,12 +1661,12 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
   }
 
   // Since move-only types currently cannot conform to protocols, nor be a class
-  // type, the subtyping hierarchy is a bit bizarre as of now:
+  // type, the subtyping hierarchy looks a bit like this:
   //
-  //              noncopyable
-  //           structs and enums
-  //                   |
-  //       +--------- Any
+  //                  ~Copyable
+  //                    /  \
+  //                   /    \
+  //       +--------- Any    noncopyable structs/enums
   //       |           |
   //   AnyObject    protocol
   //       |       existentials
@@ -1644,7 +1678,9 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
   //
   //
   // Thus, right now, a move-only type is only a subtype of itself.
-  if (fromType->isPureMoveOnly() || toType->isPureMoveOnly())
+  // We also want to prevent conversions of a move-only type's metatype.
+  if (fromType->getMetatypeInstanceType()->isNoncopyable()
+      || toType->getMetatypeInstanceType()->isNoncopyable())
     return CheckedCastKind::Unresolved;
   
   // Check for a bridging conversion.

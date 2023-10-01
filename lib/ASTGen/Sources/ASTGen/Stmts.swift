@@ -1,32 +1,32 @@
 import CASTBridging
-import SwiftParser
 import SwiftSyntax
 
 extension ASTGenVisitor {
   public func visit(_ node: CodeBlockSyntax) -> ASTNode {
-    let statements = node.statements.map { self.visit($0).bridged() }
-    let startLoc = self.base.advanced(by: node.leftBrace.position.utf8Offset).raw
-    let endLoc = self.base.advanced(by: node.rightBrace.position.utf8Offset).raw
-
-    return .stmt(
-      statements.withBridgedArrayRef { ref in
-        BraceStmt_create(ctx, startLoc, ref, endLoc)
-      })
+    .stmt(
+      BraceStmt_create(
+        self.ctx,
+        node.leftBrace.bridgedSourceLoc(in: self),
+        self.visit(node.statements),
+        node.rightBrace.bridgedSourceLoc(in: self)
+      )
+    )
   }
 
   func makeIfStmt(_ node: IfExprSyntax) -> ASTNode {
     let conditions = node.conditions.map { self.visit($0).rawValue }
     assert(conditions.count == 1)  // TODO: handle multiple conditions.
 
-    let body = visit(node.body).rawValue
-    let loc = self.base.advanced(by: node.position.utf8Offset).raw
-
-    if let elseBody = node.elseBody, node.elseKeyword != nil {
-      return .stmt(IfStmt_create(ctx, loc, conditions.first!, body, loc,
-                                 visit(elseBody).rawValue))
-    }
-
-    return .stmt(IfStmt_create(ctx, loc, conditions.first!, body, nil, nil))
+    return .stmt(
+      IfStmt_create(
+        self.ctx,
+        node.ifKeyword.bridgedSourceLoc(in: self),
+        conditions.first!,
+        self.visit(node.body).rawValue,
+        node.elseKeyword.bridgedSourceLoc(in: self),
+        self.visit(node.elseBody)?.rawValue
+      )
+    )
   }
 
   public func visit(_ node: ExpressionStmtSyntax) -> ASTNode {
@@ -39,15 +39,12 @@ extension ASTGenVisitor {
   }
 
   public func visit(_ node: ReturnStmtSyntax) -> ASTNode {
-    let loc = self.base.advanced(by: node.position.utf8Offset).raw
-
-    let expr: ASTNode?
-    if let expression = node.expression {
-      expr = visit(expression)
-    } else {
-      expr = nil
-    }
-
-    return .stmt(ReturnStmt_create(ctx, loc, expr?.rawValue))
+    .stmt(
+      ReturnStmt_create(
+        self.ctx,
+        node.returnKeyword.bridgedSourceLoc(in: self),
+        self.visit(node.expression)?.rawValue
+      )
+    )
   }
 }

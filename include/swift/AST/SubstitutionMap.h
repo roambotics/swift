@@ -121,6 +121,14 @@ public:
                              TypeSubstitutionFn subs,
                              LookupConformanceFn lookupConformance);
 
+  /// Build a substitution map from the substitutions represented by
+  /// the given in-flight substitution.
+  ///
+  /// This function should generally only be used by the substitution
+  /// subsystem.
+  static SubstitutionMap get(GenericSignature genericSig,
+                             InFlightSubstitution &IFS);
+
   /// Retrieve the generic signature describing the environment in which
   /// substitutions occur.
   GenericSignature getGenericSignature() const;
@@ -160,7 +168,7 @@ public:
 
   /// Query whether any replacement types in the map contain an opened
   /// existential.
-  bool hasOpenedExistential() const;
+  bool hasLocalArchetypes() const;
 
   /// Query whether any replacement types in the map contain dynamic Self.
   bool hasDynamicSelf() const;
@@ -174,13 +182,20 @@ public:
   /// Apply a substitution to all replacement types in the map. Does not
   /// change keys.
   SubstitutionMap subst(SubstitutionMap subMap,
-                        SubstOptions options=None) const;
+                        SubstOptions options = llvm::None) const;
 
   /// Apply a substitution to all replacement types in the map. Does not
   /// change keys.
   SubstitutionMap subst(TypeSubstitutionFn subs,
                         LookupConformanceFn conformances,
-                        SubstOptions options=None) const;
+                        SubstOptions options = llvm::None) const;
+
+  /// Apply an in-flight substitution to all replacement types in the map.
+  /// Does not change keys.
+  ///
+  /// This should generally not be used outside of the substitution
+  /// subsystem.
+  SubstitutionMap subst(InFlightSubstitution &subs) const;
 
   /// Apply type expansion lowering to all types in the substitution map. Opaque
   /// archetypes will be lowered to their underlying types if the type expansion

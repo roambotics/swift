@@ -34,8 +34,8 @@ public:
   void dump(SILGenFunction &) const override {
 #ifndef NDEBUG
     llvm::errs() << "DeallocPackCleanup\n"
-                 << "State:" << getState() << "\n"
-                 << "Addr:" << Addr << "\n";
+                 << "State: " << getState() << "\n"
+                 << "Addr: " << Addr << "\n";
 #endif
   }
 };
@@ -44,16 +44,16 @@ public:
 class DestroyPackCleanup : public Cleanup {
   SILValue Addr;
   CanPackType FormalPackType;
-  unsigned FirstComponentIndex;
+  unsigned BeginIndex, EndIndex;
 public:
   DestroyPackCleanup(SILValue addr, CanPackType formalPackType,
-                     unsigned firstComponentIndex = 0)
+                     unsigned beginIndex, unsigned endIndex)
     : Addr(addr), FormalPackType(formalPackType),
-      FirstComponentIndex(firstComponentIndex) {}
+      BeginIndex(beginIndex), EndIndex(endIndex) {}
 
   void emit(SILGenFunction &SGF, CleanupLocation l,
             ForUnwind_t forUnwind) override {
-    SGF.emitDestroyPack(l, Addr, FormalPackType, FirstComponentIndex);
+    SGF.emitDestroyPack(l, Addr, FormalPackType, BeginIndex, EndIndex);
   }
 
   void dump(SILGenFunction &) const override {
@@ -61,8 +61,9 @@ public:
     llvm::errs() << "DestroyPackCleanup\n"
                  << "State:" << getState() << "\n"
                  << "Addr:" << Addr << "\n"
-                 << "FormalPackType:" << FormalPackType
-                 << "FirstComponentIndex:" << FirstComponentIndex << "\n";
+                 << "FormalPackType:" << FormalPackType << "\n"
+                 << "BeginIndex:" << BeginIndex << "\n"
+                 << "EndIndex:" << EndIndex << "\n";
 #endif
   }
 };
@@ -72,16 +73,17 @@ public:
 class PartialDestroyPackCleanup : public Cleanup {
   SILValue Addr;
   unsigned PackComponentIndex;
+
+  /// NOTE: It is expected that LimitWithinComponent maybe an empty SILValue.
   SILValue LimitWithinComponent;
   CanPackType FormalPackType;
 public:
-  PartialDestroyPackCleanup(SILValue addr,
-                            CanPackType formalPackType,
+  PartialDestroyPackCleanup(SILValue addr, CanPackType formalPackType,
                             unsigned packComponentIndex,
                             SILValue limitWithinComponent)
-    : Addr(addr), PackComponentIndex(packComponentIndex),
-      LimitWithinComponent(limitWithinComponent),
-      FormalPackType(formalPackType) {}
+      : Addr(addr), PackComponentIndex(packComponentIndex),
+        LimitWithinComponent(limitWithinComponent),
+        FormalPackType(formalPackType) {}
 
   void emit(SILGenFunction &SGF, CleanupLocation l,
             ForUnwind_t forUnwind) override {
@@ -92,11 +94,15 @@ public:
   void dump(SILGenFunction &) const override {
 #ifndef NDEBUG
     llvm::errs() << "PartialDestroyPackCleanup\n"
-                 << "State:" << getState() << "\n"
-                 << "Addr:" << Addr << "\n"
-                 << "FormalPackType:" << FormalPackType << "\n"
-                 << "ComponentIndex:" << PackComponentIndex << "\n"
-                 << "LimitWithinComponent:" << LimitWithinComponent << "\n";
+                 << "State: " << getState() << "\n"
+                 << "Addr: " << Addr << "FormalPackType: " << FormalPackType
+                 << "\n"
+                 << "ComponentIndex: " << PackComponentIndex << "\n"
+                 << "LimitWithinComponent: ";
+    if (LimitWithinComponent)
+      llvm::errs() << LimitWithinComponent;
+    else
+      llvm::errs() << "None\n";
 #endif
   }
 };
@@ -127,11 +133,11 @@ public:
   void dump(SILGenFunction &) const override {
 #ifndef NDEBUG
     llvm::errs() << "PartialDestroyRemainingPackCleanup\n"
-                 << "State:" << getState() << "\n"
-                 << "Addr:" << Addr << "\n"
-                 << "FormalPackType:" << FormalPackType << "\n"
-                 << "ComponentIndex:" << ComponentIndex << "\n"
-                 << "CurrentIndexWithinComponent:"
+                 << "State: " << getState() << "\n"
+                 << "Addr: " << Addr << "FormalPackType: " << FormalPackType
+                 << "\n"
+                 << "ComponentIndex: " << ComponentIndex << "\n"
+                 << "CurrentIndexWithinComponent: "
                  << CurrentIndexWithinComponent << "\n";
 #endif
   }
@@ -162,11 +168,11 @@ public:
   void dump(SILGenFunction &) const override {
 #ifndef NDEBUG
     llvm::errs() << "PartialDestroyTupleCleanup\n"
-                 << "State:" << getState() << "\n"
-                 << "Addr:" << Addr << "\n"
-                 << "InducedPackType:" << InducedPackType << "\n"
-                 << "ComponentIndex:" << ComponentIndex << "\n"
-                 << "LimitWithinComponent:" << LimitWithinComponent << "\n";
+                 << "State: " << getState() << "\n"
+                 << "Addr: " << Addr << "InducedPackType: " << InducedPackType
+                 << "\n"
+                 << "ComponentIndex: " << ComponentIndex << '\n'
+                 << "LimitWithinComponent: " << LimitWithinComponent << '\n';
 #endif
   }
 };
@@ -197,12 +203,42 @@ public:
   void dump(SILGenFunction &) const override {
 #ifndef NDEBUG
     llvm::errs() << "PartialDestroyRemainingTupleCleanup\n"
-                 << "State:" << getState() << "\n"
-                 << "Addr:" << Addr << "\n"
-                 << "InducedPackType:" << InducedPackType << "\n"
-                 << "ComponentIndex:" << ComponentIndex << "\n"
-                 << "CurrentIndexWithinComponent:"
-                 << CurrentIndexWithinComponent << "\n";
+                 << "State: " << getState() << "\n"
+                 << "Addr: " << Addr << "InducedPackType: " << InducedPackType
+                 << "\n"
+                 << "ComponentIndex: " << ComponentIndex << "\n"
+                 << "CurrentIndexWithinComponent: "
+                 << CurrentIndexWithinComponent;
+#endif
+  }
+};
+
+/// Cleanup to destroy the remaining elements in a tuple following a
+/// particular value.
+class DestroyRemainingTupleElementsCleanup : public Cleanup {
+  SILValue Addr;
+  unsigned ComponentIndex;
+  CanPackType InducedPackType;
+public:
+  DestroyRemainingTupleElementsCleanup(SILValue tupleAddr,
+                                       CanPackType inducedPackType,
+                                       unsigned componentIndex)
+    : Addr(tupleAddr), ComponentIndex(componentIndex),
+      InducedPackType(inducedPackType) {}
+
+  void emit(SILGenFunction &SGF, CleanupLocation l,
+            ForUnwind_t forUnwind) override {
+    SGF.emitDestroyRemainingTupleElements(l, Addr, InducedPackType,
+                                          ComponentIndex);
+  }
+
+  void dump(SILGenFunction &) const override {
+#ifndef NDEBUG
+    llvm::errs() << "DestroyRemainingTupleElementsCleanup\n"
+                 << "State: " << getState() << "\n"
+                 << "Addr: " << Addr << "InducedPackType: " << InducedPackType
+                 << "\n"
+                 << "ComponentIndex: " << ComponentIndex << "\n";
 #endif
   }
 };
@@ -261,7 +297,17 @@ CleanupHandle SILGenFunction::enterDeallocPackCleanup(SILValue temp) {
 
 CleanupHandle SILGenFunction::enterDestroyPackCleanup(SILValue addr,
                                                    CanPackType formalPackType) {
-  Cleanups.pushCleanup<DestroyPackCleanup>(addr, formalPackType);
+  Cleanups.pushCleanup<DestroyPackCleanup>(addr, formalPackType,
+                                           0, formalPackType->getNumElements());
+  return Cleanups.getTopCleanup();
+}
+
+CleanupHandle
+SILGenFunction::enterDestroyPrecedingPackComponentsCleanup(SILValue addr,
+                                                   CanPackType formalPackType,
+                                                   unsigned componentIndex) {
+  Cleanups.pushCleanup<DestroyPackCleanup>(addr, formalPackType,
+                                           0, componentIndex);
   return Cleanups.getTopCleanup();
 }
 
@@ -270,10 +316,10 @@ SILGenFunction::enterDestroyRemainingPackComponentsCleanup(SILValue addr,
                                                    CanPackType formalPackType,
                                                    unsigned componentIndex) {
   Cleanups.pushCleanup<DestroyPackCleanup>(addr, formalPackType,
-                                           componentIndex);
+                                           componentIndex,
+                                           formalPackType->getNumElements());
   return Cleanups.getTopCleanup();
 }
-
 
 CleanupHandle
 SILGenFunction::enterPartialDestroyPackCleanup(SILValue addr,
@@ -322,14 +368,28 @@ SILGenFunction::enterPartialDestroyRemainingTupleCleanup(SILValue addr,
   return Cleanups.getTopCleanup();
 }
 
+CleanupHandle
+SILGenFunction::enterDestroyRemainingTupleElementsCleanup(SILValue addr,
+                                                   CanPackType formalPackType,
+                                                   unsigned componentIndex) {
+  Cleanups.pushCleanup<DestroyRemainingTupleElementsCleanup>(addr,
+                                            formalPackType,
+                                            componentIndex);
+  return Cleanups.getTopCleanup();
+}
+
+
 void SILGenFunction::emitDestroyPack(SILLocation loc, SILValue packAddr,
                                      CanPackType formalPackType,
-                                     unsigned firstComponentIndex) {
+                                     unsigned beginIndex,
+                                     unsigned endIndex) {
   auto packTy = packAddr->getType().castTo<SILPackType>();
 
+  assert(beginIndex <= endIndex);
+  assert(endIndex <= packTy->getNumElements());
+
   // Destroy each of the elements of the pack.
-  for (auto componentIndex :
-         range(firstComponentIndex, packTy->getNumElements())) {
+  for (auto componentIndex : range(beginIndex, endIndex)) {
     auto eltTy = packTy->getSILElementType(componentIndex);
 
     // We can skip this if the whole thing is trivial.
@@ -518,6 +578,87 @@ void SILGenFunction::emitPartialDestroyRemainingTuple(SILLocation loc,
     auto eltAddr =
       B.createTuplePackElementAddr(loc, packIndex, tupleAddr, elementTy);
     B.createDestroyAddr(loc, eltAddr);
+  });
+}
+
+void SILGenFunction::emitDestroyRemainingTupleElements(
+       SILLocation loc, SILValue tupleAddr,
+       CanPackType inducedPackType, unsigned firstComponentIndex) {
+  auto tupleTy = tupleAddr->getType().castTo<TupleType>();
+  bool containsExpansions = tupleTy->containsPackExpansionType();
+  assert(!containsExpansions || inducedPackType);
+
+  // Destroy each of the elements of the pack.
+  for (auto componentIndex :
+         range(firstComponentIndex, tupleTy->getNumElements())) {
+    auto eltTy = tupleAddr->getType().getTupleElementType(componentIndex);
+
+    // We can skip this if the whole thing is trivial.
+    auto &eltTL = getTypeLowering(eltTy);
+    if (eltTL.isTrivial()) continue;
+
+    // If it's an expansion component, emit a "partial"-destroy loop.
+    if (auto expansion = eltTy.getAs<PackExpansionType>()) {
+      emitPartialDestroyRemainingTuple(loc, tupleAddr, inducedPackType,
+                                       componentIndex, /*limit*/ nullptr);
+
+    // If it's a scalar component, project and destroy it.
+    } else {
+      SILValue eltAddr;
+      if (containsExpansions) {
+        auto packIndex =
+          B.createScalarPackIndex(loc, componentIndex, inducedPackType);
+        eltAddr =
+          B.createTuplePackElementAddr(loc, packIndex, tupleAddr, eltTy);
+      } else {
+        eltAddr =
+          B.createTupleElementAddr(loc, tupleAddr, componentIndex, eltTy);
+      }
+      B.createDestroyAddr(loc, eltAddr);
+    }
+  }
+}
+
+void SILGenFunction::copyPackElementsToTuple(SILLocation loc,
+                                             SILValue tupleAddr,
+                                             SILValue pack,
+                                             CanPackType formalPackType) {
+  auto pair = createOpenedElementValueEnvironment(
+    tupleAddr->getType().getTupleElementType(/*componentIndex=*/0));
+  auto elementEnv = pair.first;
+  auto elementTy = pair.second;
+
+  emitDynamicPackLoop(
+    loc, formalPackType, /*componentIndex=*/0, elementEnv,
+    [&](SILValue indexWithinComponent,
+        SILValue packExpansionIndex,
+        SILValue packIndex) {
+      auto packEltAddr = B.createPackElementGet(
+          loc, packIndex, pack, elementTy);
+      auto tupleEltAddr = B.createTuplePackElementAddr(
+          loc, packIndex, tupleAddr, elementTy);
+      B.createCopyAddr(loc, packEltAddr, tupleEltAddr,
+                       IsNotTake, IsInitialization);
+  });
+}
+
+void SILGenFunction::projectTupleElementsToPack(SILLocation loc,
+                                                SILValue tupleAddr,
+                                                SILValue pack,
+                                                CanPackType formalPackType) {
+  auto pair = createOpenedElementValueEnvironment(
+    tupleAddr->getType().getTupleElementType(/*componentIndex=*/0));
+  auto elementEnv = pair.first;
+  auto elementTy = pair.second;
+
+  emitDynamicPackLoop(
+    loc, formalPackType, /*componentIndex=*/0, elementEnv,
+    [&](SILValue indexWithinComponent,
+        SILValue packExpansionIndex,
+        SILValue packIndex) {
+      auto tupleEltAddr = B.createTuplePackElementAddr(
+          loc, packIndex, tupleAddr, elementTy);
+      B.createPackElementSet(loc, tupleEltAddr, packIndex, pack);
   });
 }
 
@@ -860,14 +1001,14 @@ SILGenFunction::emitPackTransform(SILLocation loc,
                                   CanPackType outputFormalPackType,
                                   unsigned outputComponentIndex,
                                   bool isSimpleProjection,
-                                  bool outputIsPlusOne,
+                                  bool canForwardOutput,
                llvm::function_ref<ManagedValue(ManagedValue input,
                                                SILType outputEltTy,
                                                SGFContext context)> emitBody) {
 
   // This is an inherent limitation of the representation; we need pack
   // coroutines to get around it.
-  assert((isSimpleProjection || outputIsPlusOne) &&
+  assert((isSimpleProjection || canForwardOutput) &&
          "we cannot support complex transformations that yield borrows");
 
   CleanupCloner inputCloner(*this, inputPackMV);
@@ -890,7 +1031,7 @@ SILGenFunction::emitPackTransform(SILLocation loc,
                       {&inputEltTy, &outputEltTy});
 
   auto &outputEltTL = getTypeLowering(outputEltTy);
-  bool outputNeedsCleanup = (outputIsPlusOne && !outputEltTL.isTrivial());
+  bool outputNeedsCleanup = (canForwardOutput && !outputEltTL.isTrivial());
 
   // If the transformation is not a simple projection, we need to
   // create a tuple to hold the transformed values.
@@ -947,10 +1088,10 @@ SILGenFunction::emitPackTransform(SILLocation loc,
     // Apply the transform.
     ManagedValue outputElt =
       emitBody(inputElt, outputEltTy,
-               outputIsPlusOne ? SGFContext(outputEltInit.get())
+               canForwardOutput ? SGFContext(outputEltInit.get())
                                : SGFContext::AllowGuaranteedPlusZero);
-    assert(outputIsPlusOne == (outputElt.isInContext() ||
-                               outputElt.isPlusOne(*this)) &&
+    assert(canForwardOutput == (outputElt.isInContext() ||
+                               outputElt.isPlusOneOrTrivial(*this)) &&
            "transformation produced a value of the wrong ownership");
     assert((outputElt.isInContext() ||
             outputElt.getType() == outputEltTy) &&
@@ -991,7 +1132,7 @@ SILGenFunction::emitPackTransform(SILLocation loc,
                                                   outputComponentIndex,
                                                   /*limit*/ SILValue());
     return ManagedValue::forOwnedAddressRValue(outputPackAddr, cleanup);
-  } else if (outputIsPlusOne) {
+  } else if (canForwardOutput) {
     return ManagedValue::forTrivialAddressRValue(outputPackAddr);
   } else {
     return ManagedValue::forBorrowedAddressRValue(outputPackAddr);

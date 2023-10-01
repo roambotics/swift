@@ -46,6 +46,7 @@
 #include "swift/Subsystems.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -74,6 +75,8 @@
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/Mutex.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/VirtualOutputBackend.h"
+#include "llvm/Support/VirtualOutputConfig.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
@@ -189,7 +192,7 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
                                      llvm::Module *Module,
                                      llvm::TargetMachine *TargetMachine,
                                      llvm::raw_pwrite_stream *out) {
-  Optional<PGOOptions> PGOOpt;
+  llvm::Optional<PGOOptions> PGOOpt;
 
   PipelineTuningOptions PTO;
 
@@ -366,8 +369,6 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
     MPM.addPass(InlineTreePrinterPass());
 
   // Add bitcode/ll output passes to pass manager.
-  ModulePassManager EmptyPassManager;
-  auto &PassManagerToRun = Opts.DisableLLVMOptzns ? EmptyPassManager : MPM;
 
   switch (Opts.OutputKind) {
   case IRGenOutputKind::LLVMAssemblyBeforeOptimization:
@@ -377,7 +378,7 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
   case IRGenOutputKind::Module:
     break;
   case IRGenOutputKind::LLVMAssemblyAfterOptimization:
-    PassManagerToRun.addPass(PrintModulePass(*out, "", false));
+    MPM.addPass(PrintModulePass(*out, "", false));
     break;
   case IRGenOutputKind::LLVMBitcode: {
     // Emit a module summary by default for Regular LTO except ld64-based ones
@@ -386,7 +387,7 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
         TargetMachine->getTargetTriple().getVendor() != llvm::Triple::Apple;
 
     if (Opts.LLVMLTOKind == IRGenLLVMLTOKind::Thin) {
-      PassManagerToRun.addPass(ThinLTOBitcodeWriterPass(*out, nullptr));
+      MPM.addPass(ThinLTOBitcodeWriterPass(*out, nullptr));
     } else {
       if (EmitRegularLTOSummary) {
         Module->addModuleFlag(llvm::Module::Error, "ThinLTO", uint32_t(0));
@@ -396,14 +397,14 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
         Module->addModuleFlag(llvm::Module::Error, "EnableSplitLTOUnit",
                               uint32_t(1));
       }
-      PassManagerToRun.addPass(BitcodeWriterPass(
+      MPM.addPass(BitcodeWriterPass(
           *out, /*ShouldPreserveUseListOrder*/ false, EmitRegularLTOSummary));
     }
     break;
   }
   }
 
-  PassManagerToRun.run(*Module, MAM);
+  MPM.run(*Module, MAM);
 
   if (AlignModuleToPageSize) {
     align(Module);
@@ -534,6 +535,7 @@ bool swift::performLLVM(const IRGenOptions &Opts,
                         llvm::Module *Module,
                         llvm::TargetMachine *TargetMachine,
                         StringRef OutputFilename,
+                        llvm::vfs::OutputBackend &Backend,
                         UnifiedStatsReporter *Stats) {
 
   if (Opts.UseIncrementalLLVMCodeGen && HashGlobal) {
@@ -552,7 +554,7 @@ bool swift::performLLVM(const IRGenOptions &Opts,
     ArrayRef<uint8_t> HashData(reinterpret_cast<uint8_t *>(&hash),
                                sizeof(hash));
     if (Opts.OutputKind == IRGenOutputKind::ObjectFile &&
-        !Opts.PrintInlineTree &&
+        !Opts.PrintInlineTree && !Opts.AlwaysCompile &&
         !needsRecompile(OutputFilename, HashData, HashGlobal, DiagMutex)) {
       // The llvm IR did not change. We don't need to re-create the object file.
       return false;
@@ -564,23 +566,28 @@ bool swift::performLLVM(const IRGenOptions &Opts,
     HashGlobal->setInitializer(HashConstant);
   }
 
-  Optional<raw_fd_ostream> RawOS;
+  llvm::Optional<llvm::vfs::OutputFile> OutputFile;
+  SWIFT_DEFER {
+    if (!OutputFile)
+      return;
+    if (auto E = OutputFile->keep()) {
+      diagnoseSync(Diags, DiagMutex, SourceLoc(), diag::error_closing_output,
+                   OutputFilename, toString(std::move(E)));
+    }
+  };
   if (!OutputFilename.empty()) {
     // Try to open the output file.  Clobbering an existing file is fine.
     // Open in binary mode if we're doing binary output.
-    llvm::sys::fs::OpenFlags OSFlags = llvm::sys::fs::OF_None;
-    std::error_code EC;
-    RawOS.emplace(OutputFilename, EC, OSFlags);
-
-    if (RawOS->has_error() || EC) {
-      diagnoseSync(Diags, DiagMutex,
-                   SourceLoc(), diag::error_opening_output,
-                   OutputFilename, EC.message());
-      RawOS->clear_error();
+    llvm::vfs::OutputConfig Config;
+    if (auto E =
+            Backend.createFile(OutputFilename, Config).moveInto(OutputFile)) {
+      diagnoseSync(Diags, DiagMutex, SourceLoc(), diag::error_opening_output,
+                   OutputFilename, toString(std::move(E)));
       return true;
     }
+
     if (Opts.OutputKind == IRGenOutputKind::LLVMAssemblyBeforeOptimization) {
-      Module->print(RawOS.value(), nullptr);
+      Module->print(*OutputFile, nullptr);
       return false;
     }
   } else {
@@ -588,7 +595,7 @@ bool swift::performLLVM(const IRGenOptions &Opts,
   }
 
   performLLVMOptimizations(Opts, Module, TargetMachine,
-                           RawOS ? &*RawOS : nullptr);
+                           OutputFile ? &OutputFile->getOS() : nullptr);
 
   if (Stats) {
     if (DiagMutex)
@@ -598,11 +605,11 @@ bool swift::performLLVM(const IRGenOptions &Opts,
       DiagMutex->unlock();
   }
 
-  if (!RawOS)
+  if (OutputFilename.empty())
     return false;
 
-  return compileAndWriteLLVM(Module, TargetMachine, Opts, Stats, Diags, *RawOS,
-                             DiagMutex);
+  return compileAndWriteLLVM(Module, TargetMachine, Opts, Stats, Diags,
+                                    *OutputFile, DiagMutex);
 }
 
 bool swift::compileAndWriteLLVM(llvm::Module *module,
@@ -728,6 +735,21 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
   opts.ProtocolConformanceDescriptors =
       PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Decl);
   opts.ProtocolConformanceDescriptorsAsArguments =
+      PointerAuthSchema(dataKey, /*address*/ false, Discrimination::Decl);
+
+  opts.ProtocolDescriptorsAsArguments =
+      PointerAuthSchema(dataKey, /*address*/ false, Discrimination::Decl);
+
+  opts.OpaqueTypeDescriptorsAsArguments =
+      PointerAuthSchema(dataKey, /*address*/ false, Discrimination::Decl);
+
+  opts.ContextDescriptorsAsArguments =
+      PointerAuthSchema(dataKey, /*address*/ false, Discrimination::Decl);
+
+  opts.OpaqueTypeDescriptorsAsArguments =
+      PointerAuthSchema(dataKey, /*address*/ false, Discrimination::Decl);
+
+  opts.ContextDescriptorsAsArguments =
       PointerAuthSchema(dataKey, /*address*/ false, Discrimination::Decl);
 
   // Coroutine resumption functions are never stored globally in the ABI,
@@ -861,7 +883,7 @@ swift::createTargetMachine(const IRGenOptions &Opts, ASTContext &Ctx) {
   // On Cygwin 64 bit, dlls are loaded above the max address for 32 bits.
   // This means that the default CodeModel causes generated code to segfault
   // when run.
-  Optional<CodeModel::Model> cmodel = None;
+  llvm::Optional<CodeModel::Model> cmodel = llvm::None;
   if (EffectiveTriple.isArch64Bit() && EffectiveTriple.isWindowsCygwinEnvironment())
     cmodel = CodeModel::Large;
 
@@ -1041,10 +1063,10 @@ struct SymbolSourcesToEmit {
   IREntitiesToEmit irEntitiesToEmit;
 };
 
-static Optional<SymbolSourcesToEmit>
+static llvm::Optional<SymbolSourcesToEmit>
 getSymbolSourcesToEmit(const IRGenDescriptor &desc) {
   if (!desc.SymbolsToEmit)
-    return None;
+    return llvm::None;
 
   assert(!desc.SILMod && "Already emitted SIL?");
 
@@ -1053,7 +1075,7 @@ getSymbolSourcesToEmit(const IRGenDescriptor &desc) {
   auto &ctx = desc.getParentModule()->getASTContext();
   auto tbdDesc = desc.getTBDGenDescriptor();
   tbdDesc.getOptions().PublicSymbolsOnly = false;
-  auto symbolMap =
+  const auto *symbolMap =
       llvm::cantFail(ctx.evaluator(SymbolSourceMapRequest{std::move(tbdDesc)}));
 
   // Then split up the symbols so they can be emitted by the appropriate part
@@ -1061,17 +1083,19 @@ getSymbolSourcesToEmit(const IRGenDescriptor &desc) {
   SILRefsToEmit silRefsToEmit;
   IREntitiesToEmit irEntitiesToEmit;
   for (const auto &symbol : *desc.SymbolsToEmit) {
-    auto source = symbolMap.find(symbol);
-    assert(source && "Couldn't find symbol");
-    switch (source->kind) {
+    auto itr = symbolMap->find(symbol);
+    assert(itr != symbolMap->end() && "Couldn't find symbol");
+    const auto &source = itr->getValue();
+    switch (source.kind) {
     case SymbolSource::Kind::SIL:
-      silRefsToEmit.push_back(source->getSILDeclRef());
+      silRefsToEmit.push_back(source.getSILDeclRef());
       break;
     case SymbolSource::Kind::IR:
-      irEntitiesToEmit.push_back(source->getIRLinkEntity());
+      irEntitiesToEmit.push_back(source.getIRLinkEntity());
       break;
     case SymbolSource::Kind::LinkerDirective:
     case SymbolSource::Kind::Unknown:
+    case SymbolSource::Kind::Global:
       llvm_unreachable("Not supported");
     }
   }
@@ -1097,9 +1121,8 @@ GeneratedModule IRGenRequest::evaluate(Evaluator &evaluator,
   // SIL for the file or module.
   auto SILMod = std::unique_ptr<SILModule>(desc.SILMod);
   if (!SILMod) {
-    auto loweringDesc = ASTLoweringDescriptor{
-        desc.Ctx, desc.Conv, desc.SILOpts, nullptr,
-        symsToEmit.transform([](const auto &x) { return x.silRefsToEmit; })};
+    auto loweringDesc = ASTLoweringDescriptor{desc.Ctx, desc.Conv, desc.SILOpts,
+                                              nullptr, llvm::None};
     SILMod = llvm::cantFail(Ctx.evaluator(LoweredSILRequest{loweringDesc}));
 
     // If there was an error, bail.
@@ -1161,7 +1184,6 @@ GeneratedModule IRGenRequest::evaluate(Evaluator &evaluator,
       IGM.emitAccessibleFunctions();
       IGM.emitBuiltinReflectionMetadata();
       IGM.emitReflectionMetadataVersion();
-      IGM.emitRuntimeDiscoverableAttributes(filesToEmit);
       irgen.emitEagerClassInitialization();
       irgen.emitObjCActorsNeedingSuperclassSwizzle();
       irgen.emitDynamicReplacements();
@@ -1241,7 +1263,8 @@ struct LLVMCodeGenThreads {
         embedBitcode(IGM->getModule(), parent.irgen->Opts);
         performLLVM(parent.irgen->Opts, IGM->Context.Diags, diagMutex,
                     IGM->ModuleHash, IGM->getModule(), IGM->TargetMachine.get(),
-                    IGM->OutputFilename, IGM->Context.Stats);
+                    IGM->OutputFilename, IGM->Context.getOutputBackend(),
+                    IGM->Context.Stats);
         if (IGM->Context.Diags.hadAnyError())
           return;
       }
@@ -1359,10 +1382,9 @@ static void performParallelIRGeneration(IRGenDescriptor desc) {
     if (!targetMachine) continue;
 
     // Create the IR emitter.
-    IRGenModule *IGM =
-        new IRGenModule(irgen, std::move(targetMachine), nextSF,
-                        desc.ModuleName, *OutputIter++, nextSF->getFilename(),
-                        nextSF->getPrivateDiscriminator().str());
+    IRGenModule *IGM = new IRGenModule(
+        irgen, std::move(targetMachine), nextSF, desc.ModuleName, *OutputIter++,
+        nextSF->getFilename(), nextSF->getPrivateDiscriminator().str());
     IGMcreated = true;
 
     initLLVMModule(*IGM, *SILMod);
@@ -1536,7 +1558,7 @@ GeneratedModule swift::performIRGeneration(
   const auto &SILOpts = SILModPtr->getOptions();
   auto desc = IRGenDescriptor::forWholeModule(
       M, Opts, TBDOpts, SILOpts, SILModPtr->Types, std::move(SILMod),
-      ModuleName, PSPs, /*symsToEmit*/ None, parallelOutputFilenames,
+      ModuleName, PSPs, /*symsToEmit*/ llvm::None, parallelOutputFilenames,
       outModuleHash);
 
   if (Opts.shouldPerformIRGenerationInParallel() &&
@@ -1562,14 +1584,13 @@ performIRGeneration(FileUnit *file, const IRGenOptions &Opts,
   const auto &SILOpts = SILModPtr->getOptions();
   auto desc = IRGenDescriptor::forFile(
       file, Opts, TBDOpts, SILOpts, SILModPtr->Types, std::move(SILMod),
-      ModuleName, PSPs, PrivateDiscriminator, /*symsToEmit*/ None,
-      outModuleHash);
+      ModuleName, PSPs, PrivateDiscriminator,
+      /*symsToEmit*/ llvm::None, outModuleHash);
   return llvm::cantFail(file->getASTContext().evaluator(IRGenRequest{desc}));
 }
 
-void
-swift::createSwiftModuleObjectFile(SILModule &SILMod, StringRef Buffer,
-                                   StringRef OutputPath) {
+void swift::createSwiftModuleObjectFile(SILModule &SILMod, StringRef Buffer,
+                                        StringRef OutputPath) {
   auto &Ctx = SILMod.getASTContext();
   assert(!Ctx.hadError());
 
@@ -1620,7 +1641,7 @@ swift::createSwiftModuleObjectFile(SILModule &SILMod, StringRef Buffer,
   ASTSym->setAlignment(llvm::MaybeAlign(serialization::SWIFTMODULE_ALIGNMENT));
   ::performLLVM(Opts, Ctx.Diags, nullptr, nullptr, IGM.getModule(),
                 IGM.TargetMachine.get(),
-                OutputPath, Ctx.Stats);
+                OutputPath, Ctx.getOutputBackend(), Ctx.Stats);
 }
 
 bool swift::performLLVM(const IRGenOptions &Opts, ASTContext &Ctx,
@@ -1636,8 +1657,8 @@ bool swift::performLLVM(const IRGenOptions &Opts, ASTContext &Ctx,
 
   embedBitcode(Module, Opts);
   if (::performLLVM(Opts, Ctx.Diags, nullptr, nullptr, Module,
-                    TargetMachine.get(),
-                    OutputFilename, Ctx.Stats))
+                    TargetMachine.get(), OutputFilename, Ctx.getOutputBackend(),
+                    Ctx.Stats))
     return true;
   return false;
 }

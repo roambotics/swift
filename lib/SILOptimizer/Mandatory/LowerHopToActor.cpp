@@ -15,6 +15,7 @@
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
+#include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "llvm/ADT/ScopedHashTable.h"
 
@@ -56,12 +57,16 @@ class LowerHopToActor {
   bool processHop(HopToExecutorInst *hop);
   bool processExtract(ExtractExecutorInst *extract);
 
-  SILValue emitGetExecutor(SILBuilderWithScope &B, SILLocation loc,
+  SILValue emitGetExecutor(SILBuilderWithScope &B,
+                           SILLocation loc,
                            SILValue actor, bool makeOptional);
 
 public:
-  LowerHopToActor(SILFunction *f, DominanceInfo *dominance)
-    : F(f), Dominance(dominance) { }
+  LowerHopToActor(SILFunction *f,
+                  DominanceInfo *dominance)
+    : F(f),
+      Dominance(dominance)
+      { }
 
   /// The entry point to the transformation.
   bool run();
@@ -177,6 +182,9 @@ SILValue LowerHopToActor::emitGetExecutor(SILBuilderWithScope &B,
   // If the actor type is a default actor, go ahead and devirtualize here.
   auto module = F->getModule().getSwiftModule();
   SILValue unmarkedExecutor;
+
+  // Determine if the actor is a "default actor" in which case we'll build a default
+  // actor executor ref inline, rather than calling out to the user-provided executor function.
   if (isDefaultActorType(actorType, module, F->getResilienceExpansion())) {
     auto builtinName = ctx.getIdentifier(
       getBuiltinName(BuiltinValueKind::BuildDefaultActorExecutorRef));
@@ -186,7 +194,7 @@ SILValue LowerHopToActor::emitGetExecutor(SILBuilderWithScope &B,
     unmarkedExecutor =
       B.createBuiltin(loc, builtinName, resultType, subs, {actor});
 
-  // Otherwise, go through Actor.unownedExecutor.
+    // Otherwise, go through (Distributed)Actor.unownedExecutor.
   } else {
     auto actorKind = actorType->isDistributedActor() ?
                      KnownProtocolKind::DistributedActor :

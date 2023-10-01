@@ -211,8 +211,8 @@ public:
   /// opportunity to generate the initial value directly at the proper
   /// abstraction level, avoiding the need for a conversion in some
   /// circumstances.
-  virtual Optional<AbstractionPattern> getAbstractionPattern() const {
-    return None;
+  virtual llvm::Optional<AbstractionPattern> getAbstractionPattern() const {
+    return llvm::None;
   }
 
 protected:
@@ -323,7 +323,8 @@ public:
   CleanupHandle getInitializedCleanup() const { return Cleanup; }
 
   ManagedValue getManagedAddress() const  {
-    return ManagedValue(getAddress(), getInitializedCleanup());
+    return ManagedValue::forOwnedAddressRValue(getAddress(),
+                                               getInitializedCleanup());
   }
 };
 
@@ -490,6 +491,15 @@ public:
     }
     return buf;
   }
+
+  bool canPerformPackExpansionInitialization() const override {
+    return true;
+  }
+
+  void performPackExpansionInitialization(SILGenFunction &SGF,
+                                          SILLocation loc,
+                                          SILValue indexWithinComponent,
+                llvm::function_ref<void(Initialization *into)> fn) override;
 
   void copyOrInitValueInto(SILGenFunction &SGF, SILLocation loc,
                            ManagedValue value, bool isInit) override;

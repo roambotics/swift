@@ -25,22 +25,90 @@
 
 using namespace swift;
 
+/// FV(PackExpansionType(Pattern, Count), N) = FV(Pattern, N+1)
+/// FV(PackElementType(Param, M), N) = FV(Param, 0) if M >= N, {} otherwise
+/// FV(Param, N) = {Param}
+static Type transformTypeParameterPacksRec(
+    Type t, llvm::function_ref<llvm::Optional<Type>(SubstitutableType *)> fn,
+    unsigned expansionLevel) {
+  return t.transformWithPosition(
+      TypePosition::Invariant,
+      [&](TypeBase *t, TypePosition p) -> llvm::Optional<Type> {
+
+    // If we're already inside N levels of PackExpansionType,  and we're
+    // walking into another PackExpansionType, a type parameter pack
+    // reference now needs level (N+1) to be free.
+    if (auto *expansionType = dyn_cast<PackExpansionType>(t)) {
+      auto countType = expansionType->getCountType();
+      auto patternType = expansionType->getPatternType();
+      auto newPatternType = transformTypeParameterPacksRec(
+          patternType, fn, expansionLevel + 1);
+      if (patternType.getPointer() != newPatternType.getPointer())
+        return Type(PackExpansionType::get(patternType, countType));
+
+      return Type(expansionType);
+    }
+
+    // A PackElementType with level N reaches past N levels of
+    // nested PackExpansionType. So a type parameter pack reference
+    // therein is free if N is greater than or equal to our current
+    // expansion level.
+    if (auto *eltType = dyn_cast<PackElementType>(t)) {
+      if (eltType->getLevel() >= expansionLevel) {
+        return transformTypeParameterPacksRec(eltType->getPackType(), fn,
+                                              /*expansionLevel=*/0);
+      }
+
+      return Type(eltType);
+    }
+
+    // A bare type parameter pack is like a PackElementType with level 0.
+    if (auto *paramType = dyn_cast<SubstitutableType>(t)) {
+      if (expansionLevel == 0 &&
+          (isa<PackArchetypeType>(paramType) ||
+           paramType->isRootParameterPack())) {
+        return fn(paramType);
+      }
+
+      return Type(paramType);
+    }
+
+    return llvm::None;
+  });
+}
+
+Type Type::transformTypeParameterPacks(
+    llvm::function_ref<llvm::Optional<Type>(SubstitutableType *)> fn) const {
+  return transformTypeParameterPacksRec(*this, fn, /*expansionLevel=*/0);
+}
+
 namespace {
 
 /// Collects all unique pack type parameters referenced from the pattern type,
 /// skipping those captured by nested pack expansion types.
-struct PackTypeParameterCollector: TypeWalker {
-  llvm::SetVector<Type> typeParams;
+struct PackReferenceCollector: TypeWalker {
+  llvm::function_ref<bool (Type)> fn;
+  unsigned expansionLevel;
+  SmallVector<unsigned, 2> elementLevel;
+
+  PackReferenceCollector(llvm::function_ref<bool (Type)> fn)
+    : fn(fn), expansionLevel(0) {
+    elementLevel.push_back(0);
+  }
 
   Action walkToTypePre(Type t) override {
-    if (t->is<PackExpansionType>())
-      return Action::SkipChildren;
+    if (t->is<PackExpansionType>()) {
+      ++expansionLevel;
+      return Action::Continue;
+    }
 
     if (auto *boundGenericType = dyn_cast<BoundGenericType>(t.getPointer())) {
       if (auto parentType = boundGenericType->getParent())
         parentType.walk(*this);
 
-      Type(boundGenericType->getExpandedGenericArgsPack()).walk(*this);
+      for (auto type : boundGenericType->getExpandedGenericArgs())
+        type.walk(*this);
+
       return Action::SkipChildren;
     }
 
@@ -49,17 +117,32 @@ struct PackTypeParameterCollector: TypeWalker {
         if (auto parentType = typeAliasType->getParent())
           parentType.walk(*this);
 
-        Type(typeAliasType->getExpandedGenericArgsPack()).walk(*this);
+        for (auto type : typeAliasType->getExpandedGenericArgs())
+          type.walk(*this);
+
         return Action::SkipChildren;
       }
     }
 
-    if (auto *paramTy = t->getAs<GenericTypeParamType>()) {
-      if (paramTy->isParameterPack())
-        typeParams.insert(paramTy);
-    } else if (auto *archetypeTy = t->getAs<PackArchetypeType>()) {
-      typeParams.insert(archetypeTy->getRoot());
+    if (auto *eltType = t->getAs<PackElementType>()) {
+      elementLevel.push_back(eltType->getLevel());
+      return Action::Continue;
     }
+
+    if (elementLevel.back() == expansionLevel) {
+      if (fn(t))
+        return Action::Stop;
+    }
+
+    return Action::Continue;
+  }
+
+  Action walkToTypePost(Type t) override {
+    if (t->is<PackExpansionType>())
+      --expansionLevel;
+
+    if (t->is<PackElementType>())
+      elementLevel.pop_back();
 
     return Action::Continue;
   }
@@ -67,13 +150,23 @@ struct PackTypeParameterCollector: TypeWalker {
 
 }
 
+void TypeBase::walkPackReferences(
+    llvm::function_ref<bool (Type)> fn) {
+  Type(this).walk(PackReferenceCollector(fn));
+}
+
 void TypeBase::getTypeParameterPacks(
     SmallVectorImpl<Type> &rootParameterPacks) {
-  PackTypeParameterCollector collector;
-  Type(this).walk(collector);
+  walkPackReferences([&](Type t) {
+    if (auto *paramTy = t->getAs<GenericTypeParamType>()) {
+      if (paramTy->isParameterPack())
+        rootParameterPacks.push_back(paramTy);
+    } else if (auto *archetypeTy = t->getAs<PackArchetypeType>()) {
+      rootParameterPacks.push_back(archetypeTy->getRoot());
+    }
 
-  rootParameterPacks.append(collector.typeParams.begin(),
-                            collector.typeParams.end());
+    return false;
+  });
 }
 
 bool GenericTypeParamType::isParameterPack() const {
@@ -86,6 +179,22 @@ bool GenericTypeParamType::isParameterPack() const {
          GenericTypeParamType::TYPE_SEQUENCE_BIT;
 }
 
+bool TypeBase::isParameterPack() {
+  Type t(this);
+
+  while (auto *memberTy = t->getAs<DependentMemberType>())
+    t = memberTy->getBase();
+
+  return t->isRootParameterPack();
+}
+
+bool TypeBase::isRootParameterPack() {
+  Type t(this);
+
+  return t->is<GenericTypeParamType>() &&
+         t->castTo<GenericTypeParamType>()->isParameterPack();
+}
+
 PackType *TypeBase::getPackSubstitutionAsPackType() {
   if (auto pack = getAs<PackType>()) {
     return pack;
@@ -94,58 +203,43 @@ PackType *TypeBase::getPackSubstitutionAsPackType() {
   }
 }
 
-/// G<{X1, ..., Xn}, {Y1, ..., Yn}>... => {G<X1, Y1>, ..., G<Xn, Yn>}...
-PackExpansionType *PackExpansionType::expand() {
-  auto countType = getCountType();
-  auto *countPack = countType->getAs<PackType>();
-  if (countPack == nullptr)
-    return this;
+static Type increasePackElementLevelImpl(
+    Type type, unsigned level, unsigned outerLevel) {
+  assert(level > 0);
 
-  auto patternType = getPatternType();
-  if (patternType->is<PackType>())
-    return this;
+  return type.transformRec([&](TypeBase *t) -> llvm::Optional<Type> {
+    if (auto *elementType = dyn_cast<PackElementType>(t)) {
+      if (elementType->getLevel() >= outerLevel) {
+        elementType = PackElementType::get(elementType->getPackType(),
+                                           elementType->getLevel() + level);
+      }
 
-  unsigned j = 0;
-  SmallVector<Type, 4> expandedTypes;
-  for (auto type : countPack->getElementTypes()) {
-    Type expandedCount;
-    if (auto *expansion = type->getAs<PackExpansionType>())
-      expandedCount = expansion->getCountType();
-
-    auto expandedPattern = patternType.transformRec(
-      [&](Type t) -> Optional<Type> {
-        if (t->is<PackExpansionType>())
-          return t;
-
-        if (auto *nestedPack = t->getAs<PackType>()) {
-          auto nestedPackElts = nestedPack->getElementTypes();
-          if (j < nestedPackElts.size()) {
-            if (expandedCount) {
-              if (auto *expansion = nestedPackElts[j]->getAs<PackExpansionType>())
-                return expansion->getPatternType();
-            } else {
-              return nestedPackElts[j];
-            }
-          }
-
-          return ErrorType::get(t->getASTContext());
-        }
-
-        return None;
-      });
-
-    if (expandedCount) {
-      expandedTypes.push_back(PackExpansionType::get(expandedPattern,
-                                                     expandedCount));
-    } else {
-      expandedTypes.push_back(expandedPattern);
+      return Type(elementType);
     }
 
-    ++j;
-  }
+    if (auto *expansionType = dyn_cast<PackExpansionType>(t)) {
+      return Type(PackExpansionType::get(
+          increasePackElementLevelImpl(expansionType->getPatternType(),
+                                       level, outerLevel + 1),
+          expansionType->getCountType()));
+    }
 
-  auto *packType = PackType::get(getASTContext(), expandedTypes);
-  return PackExpansionType::get(packType, countType);
+    if (t->isParameterPack() || isa<PackArchetypeType>(t)) {
+      if (outerLevel == 0)
+        return Type(PackElementType::get(t, level));
+
+      return Type(t);
+    }
+
+    return llvm::None;
+  });
+}
+
+Type TypeBase::increasePackElementLevel(unsigned level) {
+  if (level == 0)
+    return Type(this);
+
+  return increasePackElementLevelImpl(Type(this), level, 0);
 }
 
 CanType PackExpansionType::getReducedShape() {
@@ -156,9 +250,22 @@ CanType PackExpansionType::getReducedShape() {
   return CanType(PackExpansionType::get(reducedShape, reducedShape));
 }
 
-bool TupleType::containsPackExpansionType() const {
+unsigned TupleType::getNumScalarElements() const {
+  unsigned n = 0;
   for (auto elt : getElements()) {
-    if (elt.getType()->is<PackExpansionType>())
+    if (!elt.getType()->is<PackExpansionType>())
+      ++n;
+  }
+
+  return n;
+}
+
+bool TupleType::containsPackExpansionType() const {
+  assert(!hasTypeVariable());
+  for (auto elt : getElements()) {
+    auto eltTy = elt.getType();
+    assert(!eltTy->hasTypeVariable());
+    if (eltTy->is<PackExpansionType>())
       return true;
   }
 
@@ -174,105 +281,15 @@ bool CanTupleType::containsPackExpansionTypeImpl(CanTupleType tuple) {
   return false;
 }
 
-/// (W, {X, Y}..., Z) => (W, X, Y, Z)
-Type TupleType::flattenPackTypes() {
-  bool anyChanged = false;
-  SmallVector<TupleTypeElt, 4> elts;
-
-  for (unsigned i = 0, e = getNumElements(); i < e; ++i) {
-    auto elt = getElement(i);
-
-    if (auto *expansionType = elt.getType()->getAs<PackExpansionType>()) {
-      if (auto *packType = expansionType->getPatternType()->getAs<PackType>()) {
-        if (!anyChanged) {
-          elts.append(getElements().begin(), getElements().begin() + i);
-          anyChanged = true;
-        }
-
-        bool first = true;
-        for (auto packElt : packType->getElementTypes()) {
-          if (first) {
-            elts.push_back(TupleTypeElt(packElt, elt.getName()));
-            first = false;
-            continue;
-          }
-          elts.push_back(TupleTypeElt(packElt));
-        }
-
-        continue;
-      }
-    }
-
-    if (anyChanged)
-      elts.push_back(elt);
-  }
-
-  if (!anyChanged)
-    return this;
-
-  // If pack substitution yields a single-element tuple, the tuple
-  // structure is flattened to produce the element type.
-  if (elts.size() == 1) {
-    auto type = elts.front().getType();
-    if (!type->is<PackExpansionType>() && !type->is<TypeVariableType>()) {
-      return type;
-    }
-  }
-
-  return TupleType::get(elts, getASTContext());
-}
-
 bool AnyFunctionType::containsPackExpansionType(ArrayRef<Param> params) {
   for (auto param : params) {
-    if (param.getPlainType()->is<PackExpansionType>())
+    auto paramTy = param.getPlainType();
+    assert(!paramTy->hasTypeVariable());
+    if (paramTy->is<PackExpansionType>())
       return true;
   }
 
   return false;
-}
-
-/// (W, {X, Y}..., Z) -> T => (W, X, Y, Z) -> T
-AnyFunctionType *AnyFunctionType::flattenPackTypes() {
-  bool anyChanged = false;
-  SmallVector<AnyFunctionType::Param, 4> params;
-
-  for (unsigned i = 0, e = getParams().size(); i < e; ++i) {
-    auto param = getParams()[i];
-
-    if (auto *expansionType = param.getPlainType()->getAs<PackExpansionType>()) {
-      if (auto *packType = expansionType->getPatternType()->getAs<PackType>()) {
-        if (!anyChanged) {
-          params.append(getParams().begin(), getParams().begin() + i);
-          anyChanged = true;
-        }
-
-        bool first = true;
-        for (auto packElt : packType->getElementTypes()) {
-          if (first) {
-            params.push_back(param.withType(packElt));
-            first = false;
-            continue;
-          }
-          params.push_back(param.withType(packElt).getWithoutLabels());
-        }
-
-        continue;
-      }
-    }
-
-    if (anyChanged)
-      params.push_back(param);
-  }
-
-  if (!anyChanged)
-    return this;
-
-  if (auto *genericFuncType = getAs<GenericFunctionType>()) {
-    return GenericFunctionType::get(genericFuncType->getGenericSignature(),
-                                    params, getResult(), getExtInfo());
-  } else {
-    return FunctionType::get(params, getResult(), getExtInfo());
-  }
 }
 
 bool PackType::containsPackExpansionType() const {
@@ -282,39 +299,6 @@ bool PackType::containsPackExpansionType() const {
   }
 
   return false;
-}
-
-/// {W, {X, Y}..., Z} => {W, X, Y, Z}
-PackType *PackType::flattenPackTypes() {
-  bool anyChanged = false;
-  SmallVector<Type, 4> elts;
-
-  for (unsigned i = 0, e = getNumElements(); i < e; ++i) {
-    auto elt = getElementType(i);
-
-    if (auto *expansionType = elt->getAs<PackExpansionType>()) {
-      if (auto *packType = expansionType->getPatternType()->getAs<PackType>()) {
-        if (!anyChanged) {
-          elts.append(getElementTypes().begin(), getElementTypes().begin() + i);
-          anyChanged = true;
-        }
-
-        for (auto packElt : packType->getElementTypes()) {
-          elts.push_back(packElt);
-        }
-
-        continue;
-      }
-    }
-
-    if (anyChanged)
-      elts.push_back(elt);
-  }
-
-  if (!anyChanged)
-    return this;
-
-  return PackType::get(getASTContext(), elts);
 }
 
 template <class T>
@@ -413,35 +397,34 @@ unsigned ParameterList::getOrigParamIndex(SubstitutionMap subMap,
 }
 
 /// <T...> Foo<T, Pack{Int, String}> => Pack{T..., Int, String}
-PackType *BoundGenericType::getExpandedGenericArgsPack() {
+SmallVector<Type, 2> BoundGenericType::getExpandedGenericArgs() {
   // It would be nicer to use genericSig.getInnermostGenericParams() here,
   // but that triggers a request cycle if we're in the middle of computing
   // the generic signature already.
-  SmallVector<Type, 2> params;
+  SmallVector<GenericTypeParamType *, 2> params;
   for (auto *paramDecl : getDecl()->getGenericParams()->getParams()) {
-    params.push_back(paramDecl->getDeclaredInterfaceType());
+    params.push_back(paramDecl->getDeclaredInterfaceType()
+                         ->castTo<GenericTypeParamType>());
   }
 
-  return PackType::get(getASTContext(),
-                       TypeArrayView<GenericTypeParamType>(params),
-                       getGenericArgs());
+  return PackType::getExpandedGenericArgs(params, getGenericArgs());
 }
 
 /// <T...> Foo<T, Pack{Int, String}> => Pack{T..., Int, String}
-PackType *TypeAliasType::getExpandedGenericArgsPack() {
+SmallVector<Type, 2> TypeAliasType::getExpandedGenericArgs() {
   if (!getDecl()->isGeneric())
-    return nullptr;
+    return SmallVector<Type, 2>();
 
   auto genericSig = getGenericSignature();
-  return PackType::get(getASTContext(),
+  return PackType::getExpandedGenericArgs(
                        genericSig.getInnermostGenericParams(),
                        getDirectGenericArgs());
 }
 
-/// <T...> Pack{T, Pack{Int, String}} => Pack{T..., Int, String}
-PackType *PackType::get(const ASTContext &C,
-                        TypeArrayView<GenericTypeParamType> params,
-                        ArrayRef<Type> args) {
+/// <T...> Pack{T, Pack{Int, String}} => {T..., Int, String}
+SmallVector<Type, 2>
+PackType::getExpandedGenericArgs(ArrayRef<GenericTypeParamType *> params,
+                                 ArrayRef<Type> args) {
   SmallVector<Type, 2> wrappedArgs;
 
   assert(params.size() == args.size());
@@ -449,15 +432,24 @@ PackType *PackType::get(const ASTContext &C,
     auto arg = args[i];
 
     if (params[i]->isParameterPack()) {
-      wrappedArgs.push_back(PackExpansionType::get(
-          arg, arg->getReducedShape()));
+      // FIXME: A temporary fix to make it possible to debug expressions
+      // with partially resolved variadic generic types. The issue stems
+      // from the fact that `BoundGenericType` is allowed to have pack
+      // parameters directly represented by type variables, as soon as
+      // that is no longer the case this check should be removed.
+      if (arg->is<TypeVariableType>()) {
+        wrappedArgs.push_back(arg);
+      } else {
+        auto argPackElements = arg->castTo<PackType>()->getElementTypes();
+        wrappedArgs.append(argPackElements.begin(), argPackElements.end());
+      }
       continue;
     }
 
     wrappedArgs.push_back(arg);
   }
 
-  return get(C, wrappedArgs)->flattenPackTypes();
+  return wrappedArgs;
 }
 
 PackType *PackType::getSingletonPackExpansion(Type param) {
@@ -466,7 +458,24 @@ PackType *PackType::getSingletonPackExpansion(Type param) {
 }
 
 CanPackType CanPackType::getSingletonPackExpansion(CanType param) {
-  return CanPackType(PackType::getSingletonPackExpansion(param));
+  // Note: You can't just wrap the result in CanPackType() here because
+  // PackExpansionType has the additional requirement that the count type
+  // must be a reduced shape.
+  return cast<PackType>(
+    PackType::getSingletonPackExpansion(param)
+      ->getCanonicalType());
+}
+
+PackExpansionType *PackType::unwrapSingletonPackExpansion() const {
+  if (getNumElements() == 1) {
+    if (auto expansion = getElementTypes()[0]->getAs<PackExpansionType>()) {
+      auto pattern = expansion->getPatternType();
+      if (pattern->isParameterPack() || pattern->is<PackArchetypeType>())
+        return expansion;
+    }
+  }
+
+  return nullptr;
 }
 
 bool SILPackType::containsPackExpansionType() const {
@@ -504,8 +513,8 @@ static CanPackType getApproximateFormalPackType(const ASTContext &ctx,
                                                 Collection loweredEltTypes) {
   // Build an array of formal element types, but be lazy about it:
   // use the original array unless we see an element type that doesn't
-  // work as a legal format type.
-  Optional<SmallVector<CanType, 4>> formalEltTypes;
+  // work as a legal formal type.
+  llvm::Optional<SmallVector<CanType, 4>> formalEltTypes;
   for (auto i : indices(loweredEltTypes)) {
     auto loweredEltType = loweredEltTypes[i];
     bool isLegal = loweredEltType->isLegalFormalType();
@@ -530,7 +539,7 @@ static CanPackType getApproximateFormalPackType(const ASTContext &ctx,
       formalEltTypes->push_back(formalEltType);
     }
 
-    assert(isLegal || formalEltTypes.hasValue());
+    assert(isLegal || formalEltTypes.has_value());
   }
 
   // Use the array we built if we made one (if we ever saw a non-legal

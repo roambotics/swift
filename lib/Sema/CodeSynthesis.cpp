@@ -46,7 +46,7 @@ Expr *swift::buildSelfReference(VarDecl *selfDecl,
                                 SelfAccessorKind selfAccessorKind,
                                 bool isLValue, Type convertTy) {
   auto &ctx = selfDecl->getASTContext();
-  auto selfTy = selfDecl->getType();
+  auto selfTy = selfDecl->getTypeInContext();
 
   switch (selfAccessorKind) {
   case SelfAccessorKind::Peer:
@@ -112,7 +112,7 @@ ArgumentList *swift::buildForwardingArgumentList(ArrayRef<ParamDecl *> params,
                                                  ASTContext &ctx) {
   SmallVector<Argument, 4> args;
   for (auto *param : params) {
-    auto type = param->getType();
+    auto type = param->getTypeInContext();
 
     Expr *ref = new (ctx) DeclRefExpr(param, DeclNameLoc(), /*implicit*/ true);
     ref->setType(param->isInOut() ? LValueType::get(type) : type);
@@ -294,16 +294,8 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
   if (ICK == ImplicitConstructorKind::Memberwise) {
     assert(isa<StructDecl>(decl) && "Only struct have memberwise constructor");
 
-    for (auto member : decl->getMembers()) {
-      auto var = dyn_cast<VarDecl>(member);
-      if (!var)
-        continue;
-
-      if (!var->isMemberwiseInitialized(/*preferDeclaredProperties=*/true))
-        continue;
-
+    for (auto var : decl->getMemberwiseInitProperties()) {
       accessLevel = std::min(accessLevel, var->getFormalAccess());
-
       params.push_back(createMemberwiseInitParameter(decl, Loc, var));
     }
   } else if (ICK == ImplicitConstructorKind::DefaultDistributedActor) {
@@ -337,6 +329,7 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
                               /*Failable=*/false, /*FailabilityLoc=*/SourceLoc(),
                               /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
                               /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                              /*ThrownType=*/TypeLoc(),
                               paramList, /*GenericParams=*/nullptr, decl);
 
   // Mark implicit.
@@ -551,8 +544,8 @@ configureInheritedDesignatedInitAttributes(ClassDecl *classDecl,
 
   // If the superclass constructor is @objc but the subclass constructor is
   // not representable in Objective-C, add @nonobjc implicitly.
-  Optional<ForeignAsyncConvention> asyncConvention;
-  Optional<ForeignErrorConvention> errorConvention;
+  llvm::Optional<ForeignAsyncConvention> asyncConvention;
+  llvm::Optional<ForeignErrorConvention> errorConvention;
   if (superclassCtor->isObjC() &&
       !isRepresentableInObjC(ctor, ObjCReason::MemberOfObjCSubclass,
                              asyncConvention, errorConvention))
@@ -717,6 +710,11 @@ createDesignatedInitOverride(ClassDecl *classDecl,
     bodyParam->setInterfaceType(substTy);
   }
 
+  Type thrownType;
+  if (auto superThrownType = superclassCtor->getThrownInterfaceType()) {
+    thrownType = superThrownType.subst(subMap);
+  }
+
   // Create the initializer declaration, inheriting the name,
   // failability, and throws from the superclass initializer.
   auto implCtx = classDecl->getImplementationContext()->getAsGenericContext();
@@ -729,6 +727,7 @@ createDesignatedInitOverride(ClassDecl *classDecl,
                               /*AsyncLoc=*/SourceLoc(),
                               /*Throws=*/superclassCtor->hasThrows(),
                               /*ThrowsLoc=*/SourceLoc(),
+                              TypeLoc::withoutLoc(thrownType),
                               bodyParams, genericParams, implCtx);
 
   ctor->setImplicit();
@@ -849,47 +848,115 @@ static void diagnoseMissingRequiredInitializer(
                      diag::required_initializer_here);
 }
 
+/// FIXME: This is temporary until we come up with a way to overcome circularity
+/// issues.
+///
+/// This method is intended to be used only in places that expect
+/// lazy and property wrapper backing storage synthesis has happened
+/// or can tolerate absence of such properties.
+///
+/// \param typeDecl The nominal type to enumerate current properties and their
+/// auxiliary vars for.
+///
+/// \param callback The callback to be called for each property and auxiliary
+/// var associated with the given type. The callback should return `true` to
+/// indicate that enumeration should continue and `false` otherwise.
+///
+/// \returns true which indicates "failure" if callback returns `false`
+/// at least once.
+static bool enumerateCurrentPropertiesAndAuxiliaryVars(
+    NominalTypeDecl *typeDecl, llvm::function_ref<bool(VarDecl *)> callback) {
+  for (auto *member :
+       typeDecl->getImplementationContext()->getCurrentMembers()) {
+    if (auto *var = dyn_cast<VarDecl>(member)) {
+      if (!callback(var))
+        return true;
+    }
+
+    bool hadErrors = false;
+    member->visitAuxiliaryDecls([&](Decl *auxDecl) {
+      if (auto *auxVar = dyn_cast<VarDecl>(auxDecl)) {
+        hadErrors |= !callback(auxVar);
+      }
+    });
+
+    if (hadErrors)
+      return true;
+  }
+
+  return false;
+}
+
 bool AreAllStoredPropertiesDefaultInitableRequest::evaluate(
     Evaluator &evaluator, NominalTypeDecl *decl) const {
   assert(!hasClangImplementation(decl));
 
-  for (auto member : decl->getImplementationContext()->getMembers()) {
-    // If a stored property lacks an initial value and if there is no way to
-    // synthesize an initial value (e.g. for an optional) then we suppress
-    // generation of the default initializer.
-    if (auto pbd = dyn_cast<PatternBindingDecl>(member)) {
-      // Static variables are irrelevant.
-      if (pbd->isStatic()) {
-        continue;
-      }
+  std::multimap<VarDecl *, VarDecl *> initializedViaInitAccessor;
+  decl->collectPropertiesInitializableByInitAccessors(
+      initializedViaInitAccessor);
 
-      for (auto idx : range(pbd->getNumPatternEntries())) {
-        bool HasStorage = false;
-        bool CheckDefaultInitializer = true;
-        pbd->getPattern(idx)->forEachVariable(
-            [&HasStorage, &CheckDefaultInitializer](VarDecl *VD) {
-              // If one of the bound variables is @NSManaged, go ahead no matter
-              // what.
-              if (VD->getAttrs().hasAttribute<NSManagedAttr>())
-                CheckDefaultInitializer = false;
+  llvm::SmallPtrSet<PatternBindingDecl *, 4> checked;
+  return !enumerateCurrentPropertiesAndAuxiliaryVars(
+      decl, [&](VarDecl *property) {
+        auto *pbd = property->getParentPatternBinding();
+        if (!pbd || !checked.insert(pbd).second)
+          return true;
 
-              if (VD->hasStorageOrWrapsStorage())
-                HasStorage = true;
-            });
+        // If a stored property lacks an initial value and if there is no way to
+        // synthesize an initial value (e.g. for an optional) then we suppress
+        // generation of the default initializer.
 
-        if (!HasStorage) continue;
+        // Static variables are irrelevant.
+        if (pbd->isStatic())
+          return true;
 
-        if (pbd->isInitialized(idx)) continue;
+        for (auto idx : range(pbd->getNumPatternEntries())) {
+          bool HasStorage = false;
+          bool CheckDefaultInitializer = true;
+          pbd->getPattern(idx)->forEachVariable([&HasStorage,
+                                                 &CheckDefaultInitializer,
+                                                 &initializedViaInitAccessor](
+                                                    VarDecl *VD) {
+            // If one of the bound variables is @NSManaged, go ahead no matter
+            // what.
+            if (VD->getAttrs().hasAttribute<NSManagedAttr>())
+              CheckDefaultInitializer = false;
 
-        // If we cannot default initialize the property, we cannot
-        // synthesize a default initializer for the class.
-        if (CheckDefaultInitializer && !pbd->isDefaultInitializable())
-          return false;
-      }
-    }
-  }
+            // If this property is covered by one or more init accessor(s)
+            // check whether at least one of them is initializable.
+            auto initAccessorProperties =
+                llvm::make_range(initializedViaInitAccessor.equal_range(VD));
+            if (llvm::any_of(initAccessorProperties, [&](const auto &entry) {
+                  auto *property = entry.second->getParentPatternBinding();
+                  return property->isInitialized(0) ||
+                         property->isDefaultInitializable();
+                }))
+              return;
 
-  return true;
+            if (VD->hasStorageOrWrapsStorage())
+              HasStorage = true;
+
+            // Treat an init accessor property that doesn't initialize other
+            // properties  as stored for initialization purposes.
+            if (auto *initAccessor = VD->getAccessor(AccessorKind::Init)) {
+              HasStorage |= initAccessor->getInitializedProperties().empty();
+            }
+          });
+
+          if (!HasStorage)
+            return true;
+
+          if (pbd->isInitialized(idx))
+            return true;
+
+          // If we cannot default initialize the property, we cannot
+          // synthesize a default initializer for the class.
+          if (CheckDefaultInitializer && !pbd->isDefaultInitializable()) {
+            return false;
+          }
+        }
+        return true;
+      });
 }
 
 static bool areAllStoredPropertiesDefaultInitializable(Evaluator &eval,
@@ -937,6 +1004,29 @@ static bool canInheritDesignatedInits(Evaluator &eval, ClassDecl *decl) {
          areAllStoredPropertiesDefaultInitializable(eval, decl);
 }
 
+static ValueDecl *findImplementedObjCDecl(ValueDecl *VD) {
+  // If VD has an ObjC name...
+  if (auto vdSelector = VD->getObjCRuntimeName()) {
+    // and it's in an extension...
+    if (auto implED = dyn_cast<ExtensionDecl>(VD->getDeclContext())) {
+      // and that extension is the @objcImplementation of a class's main body...
+      if (auto interfaceCD =
+              dyn_cast_or_null<ClassDecl>(implED->getImplementedObjCDecl())) {
+        // Find the initializer in the class's main body that matches VD.
+        for (auto interfaceVD : interfaceCD->getAllMembers()) {
+          if (auto interfaceCtor = dyn_cast<ConstructorDecl>(interfaceVD)) {
+            if (vdSelector == interfaceCtor->getObjCRuntimeName()) {
+              return interfaceCtor;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return VD;
+}
+
 static void collectNonOveriddenSuperclassInits(
     ClassDecl *subclass, SmallVectorImpl<ConstructorDecl *> &results) {
   auto *superclassDecl = subclass->getSuperclassDecl();
@@ -965,9 +1055,19 @@ static void collectNonOveriddenSuperclassInits(
   SmallVector<ValueDecl *, 4> lookupResults;
   subclass->lookupQualified(
       superclassDecl, DeclNameRef::createConstructor(),
+      subclass->getStartLoc(),
       subOptions, lookupResults);
 
   for (auto decl : lookupResults) {
+    // HACK: If an @objcImplementation extension declares an initializer, its
+    // interface usually also has a declaration. We need the interface decl for
+    // access control computations, but the name lookup returns the
+    // implementation decl because it's in the Swift module. Go find the
+    // matching interface decl.
+    // (Note that this is necessary for both newly-declared inits and overrides,
+    // even implicit ones.)
+    decl = findImplementedObjCDecl(decl);
+
     auto superclassCtor = cast<ConstructorDecl>(decl);
 
     // Skip invalid superclass initializers.
@@ -996,8 +1096,6 @@ static void addImplicitInheritedConstructorsToClass(ClassDecl *decl) {
     if (member->isRecursiveValidation())
       return;
   }
-
-  decl->setAddedImplicitInitializers();
 
   // We can only inherit initializers if we have a superclass.
   if (!decl->getSuperclassDecl() || !decl->getSuperclass())
@@ -1141,10 +1239,10 @@ void TypeChecker::addImplicitConstructors(NominalTypeDecl *decl) {
   if (decl->addedImplicitInitializers())
     return;
 
-  if (!shouldAttemptInitializerSynthesis(decl)) {
-    decl->setAddedImplicitInitializers();
+  decl->setAddedImplicitInitializers();
+
+  if (!shouldAttemptInitializerSynthesis(decl))
     return;
-  }
 
   if (auto *classDecl = dyn_cast<ClassDecl>(decl)) {
     addImplicitInheritedConstructorsToClass(classDecl);
@@ -1259,17 +1357,76 @@ HasMemberwiseInitRequest::evaluate(Evaluator &evaluator,
   if (hasUserDefinedDesignatedInit(evaluator, decl))
     return false;
 
-  for (auto *member : decl->getMembers()) {
-    if (auto *var = dyn_cast<VarDecl>(member)) {
-      // If this is a backing storage property for a property wrapper,
-      // skip it.
-      if (var->getOriginalWrappedProperty())
-        continue;
+  std::multimap<VarDecl *, VarDecl *> initializedViaAccessor;
+  decl->collectPropertiesInitializableByInitAccessors(initializedViaAccessor);
 
-      if (var->isMemberwiseInitialized(/*preferDeclaredProperties=*/true))
-        return true;
+  llvm::SmallPtrSet<VarDecl *, 4> initializedProperties;
+  llvm::SmallVector<std::pair<VarDecl *, Identifier>> invalidOrderings;
+
+  if (enumerateCurrentPropertiesAndAuxiliaryVars(decl, [&](VarDecl *var) {
+        if (var->isStatic())
+          return true;
+
+        if (var->getOriginalWrappedProperty())
+          return true;
+
+        if (!var->isMemberwiseInitialized(/*preferDeclaredProperties=*/true))
+          return true;
+
+        // Check whether use of init accessors results in access to
+        // uninitialized properties.
+        if (auto *initAccessor = var->getAccessor(AccessorKind::Init)) {
+          // Make sure that all properties accessed by init accessor
+          // are previously initialized.
+          for (auto *property : initAccessor->getAccessedProperties()) {
+            if (!initializedProperties.count(property))
+              invalidOrderings.push_back({var, property->getName()});
+          }
+
+          // Record all of the properties initialized by calling init accessor.
+          auto properties = initAccessor->getInitializedProperties();
+          initializedProperties.insert(var);
+          initializedProperties.insert(properties.begin(), properties.end());
+          return true;
+        }
+
+        switch (initializedViaAccessor.count(var)) {
+        // Not covered by an init accessor.
+        case 0:
+          initializedProperties.insert(var);
+          return true;
+
+        // Covered by a single init accessor, we'll handle that
+        // once we get to the property with init accessor.
+        case 1:
+          return true;
+
+        // Covered by more than one init accessor which means that we
+        // cannot synthesize memberwise initializer due to intersecting
+        // initializations.
+        default:
+          return false;
+        }
+      }))
+    return false;
+
+  if (invalidOrderings.empty())
+    return !initializedProperties.empty();
+
+  {
+    auto &diags = decl->getASTContext().Diags;
+
+    diags.diagnose(
+        decl, diag::cannot_synthesize_memberwise_due_to_property_init_order);
+
+    for (const auto &invalid : invalidOrderings) {
+      auto *accessor = invalid.first->getAccessor(AccessorKind::Init);
+      diags.diagnose(accessor->getLoc(),
+                     diag::out_of_order_access_in_init_accessor,
+                     invalid.first->getName(), invalid.second);
     }
   }
+
   return false;
 }
 
@@ -1299,8 +1456,7 @@ ResolveEffectiveMemberwiseInitRequest::evaluate(Evaluator &evaluator,
   auto accessLevel = AccessLevel::Public;
   for (auto *member : decl->getMembers()) {
     auto *var = dyn_cast<VarDecl>(member);
-    if (!var ||
-        !var->isMemberwiseInitialized(/*preferDeclaredProperties*/ true))
+    if (!var || !var->isMemberwiseInitialized(/*preferDeclaredProperties=*/true))
       continue;
     accessLevel = std::min(accessLevel, var->getFormalAccess());
   }
@@ -1392,6 +1548,12 @@ HasDefaultInitRequest::evaluate(Evaluator &evaluator,
   if (hasUserDefinedDesignatedInit(evaluator, decl))
     return false;
 
+  // Regardless of whether all of the properties are initialized or
+  // not distributed actors always get a special "default" init based
+  // on `id` and `actorSystem` synthesized properties.
+  if (decl->isDistributedActor())
+    return true;
+
   // We can only synthesize a default init if all the stored properties have an
   // initial value.
   return areAllStoredPropertiesDefaultInitializable(evaluator, decl);
@@ -1461,4 +1623,16 @@ bool swift::addNonIsolatedToSynthesized(NominalTypeDecl *nominal,
   ASTContext &ctx = nominal->getASTContext();
   value->getAttrs().add(new (ctx) NonisolatedAttr(/*isImplicit=*/true));
   return true;
+}
+
+void swift::applyInferredSPIAccessControlAttr(Decl *decl,
+                                              const Decl *inferredFromDecl,
+                                              ASTContext &ctx) {
+  auto spiGroups = inferredFromDecl->getSPIGroups();
+  if (spiGroups.empty())
+    return;
+
+  auto spiAttr =
+      SPIAccessControlAttr::create(ctx, SourceLoc(), SourceRange(), spiGroups);
+  decl->getAttrs().add(spiAttr);
 }

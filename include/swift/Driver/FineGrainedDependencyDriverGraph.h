@@ -20,11 +20,14 @@
 #include "swift/Basic/OptionSet.h"
 #include "swift/Driver/Job.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/PointerLikeTypeTraits.h"
+#include "llvm/Support/VirtualOutputBackend.h"
+#include "llvm/Support/VirtualOutputBackends.h"
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -50,15 +53,15 @@ class ModuleDepGraphNode : public DepGraphNode {
   /// The swiftDeps file that holds this entity iff this is a provides node.
   /// If more than one source file has the same DependencyKey, then there
   /// will be one node for each in the driver, distinguished by this field.
-  Optional<std::string> swiftDeps;
+  llvm::Optional<std::string> swiftDeps;
 
   /// When finding transitive dependents, this node has been traversed.
   bool hasBeenTracedAsADependent = false;
 
 public:
   ModuleDepGraphNode(const DependencyKey &key,
-                     Optional<Fingerprint> fingerprint,
-                     Optional<std::string> swiftDeps)
+                     llvm::Optional<Fingerprint> fingerprint,
+                     llvm::Optional<std::string> swiftDeps)
       : DepGraphNode(key, fingerprint), swiftDeps(swiftDeps) {}
 
   bool getHasBeenTraced() const { return hasBeenTracedAsADependent; }
@@ -80,7 +83,7 @@ public:
            getSwiftDeps() == other.getSwiftDeps();
   }
 
-  const Optional<std::string> &getSwiftDeps() const { return swiftDeps; }
+  const llvm::Optional<std::string> &getSwiftDeps() const { return swiftDeps; }
 
   std::string getSwiftDepsOrEmpty() const {
     return getSwiftDeps().value_or(std::string());
@@ -98,7 +101,7 @@ public:
 
   /// Nodes can move from file to file when the driver reads the result of a
   /// compilation.
-  void setSwiftDeps(Optional<std::string> s) { swiftDeps = s; }
+  void setSwiftDeps(llvm::Optional<std::string> s) { swiftDeps = s; }
 
   bool getIsProvides() const { return getSwiftDeps().has_value(); }
 
@@ -193,13 +196,16 @@ public:
 private:
   /// If tracing dependencies, holds a vector used to hold the current path
   /// def - use/def - use/def - ...
-  Optional<std::vector<const ModuleDepGraphNode *>> currentPathIfTracing;
+  llvm::Optional<std::vector<const ModuleDepGraphNode *>> currentPathIfTracing;
 
   /// If tracing dependencies, holds the sequence of defs used to get to the job
   /// that is the key
   std::unordered_multimap<const driver::Job *,
                           std::vector<const ModuleDepGraphNode *>>
       dependencyPathsToJobs;
+
+  /// VirtualOutputBackend for emitting graphs.
+  llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> backend;
 
   /// For helping with performance tuning, may be null:
   UnifiedStatsReporter *stats;
@@ -221,7 +227,7 @@ private:
   /// which file the name was found.) In such a case, it is necessary to move
   /// the node to the proper collection.
   void moveNodeToDifferentFile(ModuleDepGraphNode *n,
-                               Optional<std::string> newFile) {
+                               llvm::Optional<std::string> newFile) {
     eraseNodeFromMap(n);
     n->setSwiftDeps(newFile);
     addToMap(n);
@@ -275,7 +281,7 @@ private:
         file_types::TY_SwiftDeps);
   }
 
-  const driver::Job *getJob(Optional<std::string> swiftDeps) const {
+  const driver::Job *getJob(llvm::Optional<std::string> swiftDeps) const {
     assert(swiftDeps.has_value() && "Don't call me for expats.");
     auto iter = jobsBySwiftDeps.find(swiftDeps.value());
     assert(iter != jobsBySwiftDeps.end() && "All jobs should be tracked.");
@@ -303,9 +309,13 @@ public:
             shouldTraceDependencies
                 ? llvm::Optional<std::vector<const ModuleDepGraphNode *>>(
                       std::vector<const ModuleDepGraphNode *>())
-                : None),
+                : llvm::None),
         stats(stats) {
     assert(verify() && "ModuleDepGraph should be fine when created");
+
+    // Create a OnDiskOutputBackend for emitting graphs. Currently, this is
+    // only used by driver so the backend is not shared with a CompilerInstance.
+    backend = llvm::makeIntrusiveRefCnt<llvm::vfs::OnDiskOutputBackend>();
   }
 
   /// For unit tests.
@@ -318,7 +328,7 @@ public:
   // MARK: ModuleDepGraph - updating from a switdeps file
   //============================================================================
 public:
-  using Changes = Optional<std::unordered_set<ModuleDepGraphNode *>>;
+  using Changes = llvm::Optional<std::unordered_set<ModuleDepGraphNode *>>;
 
   /// Unlike the standard \c CoarseGrainedDependencyGraph, returns \c
   /// CoarseGrainedDependencyGraphImpl::LoadResult::AffectsDownstream when
@@ -348,7 +358,8 @@ private:
 
   enum class LocationOfPreexistingNode { nowhere, here, elsewhere };
 
-  typedef Optional<std::pair<LocationOfPreexistingNode, ModuleDepGraphNode *>>
+  typedef llvm::Optional<
+      std::pair<LocationOfPreexistingNode, ModuleDepGraphNode *>>
       PreexistingNodeIfAny;
 
   /// Find the preexisting node here that best matches the integrand.
@@ -359,7 +370,7 @@ private:
   /// Integrate the \p integrand into the receiver.
   /// If an illegal value was found, return \c None, otherwise
   /// return the changed node if any..
-  Optional<NullablePtr<ModuleDepGraphNode>>
+  llvm::Optional<NullablePtr<ModuleDepGraphNode>>
   integrateSourceFileDepGraphNode(const SourceFileDepGraph &g,
                                   const SourceFileDepGraphNode *integrand,
                                   const PreexistingNodeIfAny preexistingMatch,
@@ -380,7 +391,7 @@ private:
   /// Create a brand-new ModuleDepGraphNode to integrate \p integrand.
   ModuleDepGraphNode *
   integrateByCreatingANewNode(const SourceFileDepGraphNode *integrand,
-                              Optional<std::string> swiftDepsForNewNode);
+                              llvm::Optional<std::string> swiftDepsForNewNode);
 
   /// After importing a provides node from the frontend, record its
   /// dependencies.
@@ -467,7 +478,8 @@ public:
   void printPath(raw_ostream &out, const driver::Job *node) const;
 
   /// Get a printable filename, given a node's swiftDeps.
-  StringRef getProvidingFilename(const Optional<std::string> &swiftDeps) const;
+  StringRef
+  getProvidingFilename(const llvm::Optional<std::string> &swiftDeps) const;
 
   /// Print one node on the dependency path.
   static void printOneNodeOfPath(raw_ostream &out, const DependencyKey &key,

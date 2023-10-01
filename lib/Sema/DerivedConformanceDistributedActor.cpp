@@ -51,6 +51,15 @@ bool DerivedConformance::canDeriveDistributedActor(
 bool DerivedConformance::canDeriveDistributedActorSystem(
     NominalTypeDecl *nominal, DeclContext *dc) {
   auto &C = nominal->getASTContext();
+
+  // Make sure ad-hoc requirements that we'll use in synthesis are present, before we try to use them.
+  // This leads to better error reporting because we already have errors happening (missing witnesses).
+  if (auto handlerType = getDistributedActorSystemResultHandlerType(nominal)) {
+    if (!C.getOnReturnOnDistributedTargetInvocationResultHandler(
+        handlerType->getAnyNominal()))
+      return false;
+  }
+
   return C.getLoadedModule(C.Id_Distributed);
 }
 
@@ -99,6 +108,7 @@ static FuncDecl *deriveDistributedActor_resolve(DerivedConformance &derived) {
                                name, SourceLoc(),
                                /*async=*/false,
                                /*throws=*/true,
+                               /*ThrownType=*/Type(),
                                /*genericParams=*/nullptr,
                                params,
                                /*returnType*/decl->getDeclaredInterfaceType(),
@@ -248,7 +258,9 @@ static FuncDecl* createLocalFunc_doInvokeOnReturn(
       DeclName(C, doInvokeLocalFuncIdent, doInvokeParamsList),
       sloc,
       /*async=*/true,
-      /*throws=*/true, doInvokeGenericParamList, doInvokeParamsList,
+      /*throws=*/true, 
+      /*ThrownType=*/Type(),
+      doInvokeGenericParamList, doInvokeParamsList,
       /*returnType=*/C.TheEmptyTupleType, parentFunc);
   doInvokeOnReturnFunc->setImplicit();
   doInvokeOnReturnFunc->setSynthesized();
@@ -410,6 +422,7 @@ static FuncDecl *deriveDistributedActorSystem_invokeHandlerOnReturn(
       FuncDecl::createImplicit(C, StaticSpellingKind::None, name, SourceLoc(),
                                /*async=*/true,
                                /*throws=*/true,
+                               /*ThrownType=*/Type(),
                                /*genericParams=*/nullptr, params,
                                /*returnType*/ TupleType::getEmpty(C), system);
   funcDecl->setSynthesized(true);
@@ -624,6 +637,9 @@ static std::pair<BraceStmt *, bool>
 deriveBodyDistributedActor_unownedExecutor(AbstractFunctionDecl *getter, void *) {
   // var unownedExecutor: UnownedSerialExecutor {
   //   get {
+  //     guard __isLocalActor(self) else {
+  //       return buildDefaultDistributedRemoteActorExecutor(self)
+  //     }
   //     return Builtin.buildDefaultActorExecutorRef(self)
   //   }
   // }
@@ -637,36 +653,105 @@ deriveBodyDistributedActor_unownedExecutor(AbstractFunctionDecl *getter, void *)
   };
 
   // Build a reference to self.
-  Type selfType = getter->getImplicitSelfDecl()->getType();
+  Type selfType = getter->getImplicitSelfDecl()->getTypeInContext();
   Expr *selfArg = DerivedConformance::createSelfDeclRef(getter);
   selfArg->setType(selfType);
+
+  // Prepare the builtin call, we'll use it after the guard, but want to take the type
+  // of its return type earlier, so we prepare it here.
 
   // The builtin call gives us a Builtin.Executor.
   auto builtinCall =
       DerivedConformance::createBuiltinCall(ctx,
                                             BuiltinValueKind::BuildDefaultActorExecutorRef,
                                             {selfType}, {}, {selfArg});
-
   // Turn that into an UnownedSerialExecutor.
   auto initCall = constructDistributedUnownedSerialExecutor(ctx, builtinCall);
   if (!initCall) return failure();
 
-  auto ret = new (ctx) ReturnStmt(SourceLoc(), initCall, /*implicit*/ true);
+  // guard __isLocalActor(self) else {
+  //   return buildDefaultDistributedRemoteActorExecutor(self)
+  // }
+  auto isLocalActorDecl = ctx.getIsLocalDistributedActor();
+  DeclRefExpr *isLocalActorExpr =
+      new (ctx) DeclRefExpr(ConcreteDeclRef(isLocalActorDecl), DeclNameLoc(), /*implicit=*/true,
+                            AccessSemantics::Ordinary,
+                            FunctionType::get({AnyFunctionType::Param(ctx.getAnyObjectType())},
+                                              ctx.getBoolType()));
+  Expr *selfForIsLocalArg = DerivedConformance::createSelfDeclRef(getter);
+  selfForIsLocalArg->setType(selfType);
+  auto *argListForIsLocal =
+      ArgumentList::forImplicitSingle(ctx, Identifier(),
+                                      ErasureExpr::create(ctx, selfForIsLocalArg, ctx.getAnyObjectType(), {}, {}));
+  CallExpr *isLocalActorCall = CallExpr::createImplicit(ctx, isLocalActorExpr, argListForIsLocal);
+  isLocalActorCall->setType(ctx.getBoolType());
+  isLocalActorCall->setThrows(false);
+
+  GuardStmt* guardElseRemoteReturnExec;
+  {
+    // Find the buildDefaultDistributedRemoteActorExecutor method
+    auto buildRemoteExecutorDecl =
+        ctx.getBuildDefaultDistributedRemoteActorUnownedExecutor();
+    assert(buildRemoteExecutorDecl && "cannot find buildDefaultDistributedRemoteActorExecutor");
+    auto substitutions = SubstitutionMap::get(
+        buildRemoteExecutorDecl->getGenericSignature(),
+        [&](SubstitutableType *dependentType) {
+          if (auto gp = dyn_cast<GenericTypeParamType>(dependentType)) {
+            if (gp->getDepth() == 0 && gp->getIndex() == 0) {
+              return getter->getImplicitSelfDecl()->getTypeInContext();
+            }
+          }
+
+          return Type();
+        },
+        LookUpConformanceInModule(getter->getParentModule())
+    );
+    DeclRefExpr *buildRemoteExecutorExpr =
+        new (ctx) DeclRefExpr(
+            ConcreteDeclRef(buildRemoteExecutorDecl, substitutions),
+            DeclNameLoc(),/*implicit=*/true,
+            AccessSemantics::Ordinary);
+    buildRemoteExecutorExpr->setType(
+        buildRemoteExecutorDecl->getInterfaceType()
+         .subst(substitutions)
+        );
+
+    Expr *selfForBuildRemoteExecutor = DerivedConformance::createSelfDeclRef(getter);
+    selfForBuildRemoteExecutor->setType(selfType);
+    auto *argListForBuildRemoteExecutor =
+        ArgumentList::forImplicitCallTo(buildRemoteExecutorDecl->getParameters(),
+                                        /*argExprs=*/{selfForBuildRemoteExecutor}, ctx);
+    CallExpr *buildRemoteExecutorCall = CallExpr::createImplicit(ctx, buildRemoteExecutorExpr,
+                                                                 argListForBuildRemoteExecutor);
+    buildRemoteExecutorCall->setType(ctx.getUnownedSerialExecutorType());
+    buildRemoteExecutorCall->setThrows(false);
+
+    SmallVector<ASTNode, 1> statements = {
+        new(ctx) ReturnStmt(SourceLoc(), buildRemoteExecutorCall)
+    };
+
+    SmallVector<StmtConditionElement, 1> conditions = {
+        isLocalActorCall
+    };
+
+    // Build and return the complete guard statement.
+    guardElseRemoteReturnExec =
+        new(ctx) GuardStmt(SourceLoc(), ctx.AllocateCopy(conditions),
+                           BraceStmt::create(ctx, SourceLoc(), statements, SourceLoc()));
+  }
+
+  // Finalize preparing the unowned executor for returning.
+  // auto wrappedCall = new (ctx) InjectIntoOptionalExpr(initCall, initCall->getType());
+  auto returnDefaultExec = new (ctx) ReturnStmt(SourceLoc(), initCall, /*implicit=*/true);
 
   auto body = BraceStmt::create(
-      ctx, SourceLoc(), { ret }, SourceLoc(), /*implicit=*/true);
+      ctx, SourceLoc(), { guardElseRemoteReturnExec, returnDefaultExec }, SourceLoc(), /*implicit=*/true);
   return { body, /*isTypeChecked=*/true };
 }
 
 /// Derive the declaration of DistributedActor's unownedExecutor property.
 static ValueDecl *deriveDistributedActor_unownedExecutor(DerivedConformance &derived) {
   ASTContext &ctx = derived.Context;
-
-  if (auto classDecl = dyn_cast<ClassDecl>(derived.Nominal)) {
-    if (auto existing = classDecl->getUnownedExecutorProperty()) {
-      return const_cast<VarDecl*>(existing);
-    }
-  }
 
   // Retrieve the types and declarations we'll need to form this operation.
   auto executorDecl = ctx.getUnownedSerialExecutorDecl();
@@ -677,6 +762,17 @@ static ValueDecl *deriveDistributedActor_unownedExecutor(DerivedConformance &der
   }
   Type executorType = executorDecl->getDeclaredInterfaceType();
 
+  if (auto classDecl = dyn_cast<ClassDecl>(derived.Nominal)) {
+    if (auto existing = classDecl->getUnownedExecutorProperty()) {
+      if (existing->getInterfaceType()->isEqual(executorType)) {
+        return const_cast<VarDecl *>(existing);
+      } else {
+        // bad type, should be diagnosed elsewhere
+        return nullptr;
+      }
+    }
+  }
+
   auto propertyPair = derived.declareDerivedProperty(
       DerivedConformance::SynthesizedIntroducer::Var, ctx.Id_unownedExecutor,
       executorType, executorType,
@@ -685,7 +781,7 @@ static ValueDecl *deriveDistributedActor_unownedExecutor(DerivedConformance &der
   property->setSynthesized(true);
   property->getAttrs().add(new (ctx) SemanticsAttr(SEMANTICS_DEFAULT_ACTOR,
                                                    SourceLoc(), SourceRange(),
-      /*implicit*/ true));
+                                                   /*implicit*/ true));
   property->getAttrs().add(new (ctx) NonisolatedAttr(/*IsImplicit=*/true));
 
   // Make the property implicitly final.

@@ -28,6 +28,7 @@
 #include "MoveOnlyBorrowToDestructureUtils.h"
 #include "MoveOnlyDiagnostics.h"
 #include "MoveOnlyObjectCheckerUtils.h"
+#include "MoveOnlyTypeUtils.h"
 
 #include "swift/Basic/BlotSetVector.h"
 #include "swift/Basic/Defer.h"
@@ -182,14 +183,14 @@ void AvailableValues::dump() const { print(llvm::dbgs(), nullptr); }
 struct borrowtodestructure::Implementation {
   BorrowToDestructureTransform &interface;
 
-  Optional<AvailableValueStore> blockToAvailableValues;
+  llvm::Optional<AvailableValueStore> blockToAvailableValues;
 
   /// The liveness that we use for all borrows or for individual switch_enum
   /// arguments.
   FieldSensitiveSSAPrunedLiveRange liveness;
 
-  /// The copy_value we insert upon our mark_must_check or switch_enum argument
-  /// so that we have an independent owned value.
+  /// The copy_value we insert upon our mark_unresolved_non_copyable_value or
+  /// switch_enum argument so that we have an independent owned value.
   SILValue initialValue;
 
   using InterestingUser = FieldSensitivePrunedLiveness::InterestingUser;
@@ -239,17 +240,19 @@ struct borrowtodestructure::Implementation {
 
   AvailableValues &computeAvailableValues(SILBasicBlock *block);
 
-  /// Returns mark_must_check if we are processing borrows or the enum argument
-  /// if we are processing switch_enum.
+  /// Returns mark_unresolved_non_copyable_value if we are processing borrows or
+  /// the enum argument if we are processing switch_enum.
   SILValue getRootValue() const { return liveness.getRootValue(); }
 
   DiagnosticEmitter &getDiagnostics() const {
     return interface.diagnosticEmitter;
   }
 
-  /// Always returns the actual root mark_must_check for both switch_enum args
-  /// and normal borrow user checks.
-  MarkMustCheckInst *getMarkedValue() const { return interface.mmci; }
+  /// Always returns the actual root mark_unresolved_non_copyable_value for both
+  /// switch_enum args and normal borrow user checks.
+  MarkUnresolvedNonCopyableValueInst *getMarkedValue() const {
+    return interface.mmci;
+  }
 
   PostOrderFunctionInfo *getPostOrderFunctionInfo() {
     return interface.getPostOrderFunctionInfo();
@@ -316,9 +319,10 @@ bool Implementation::gatherUses(SILValue value) {
       }
 
       LLVM_DEBUG(llvm::dbgs() << "        Found non lifetime ending use!\n");
-      blocksToUses.insert(
-          nextUse->getParentBlock(),
-          {nextUse, {*leafRange, false /*is lifetime ending*/}});
+      blocksToUses.insert(nextUse->getParentBlock(),
+                          {nextUse,
+                           {liveness.getNumSubElements(), *leafRange,
+                            false /*is lifetime ending*/}});
       liveness.updateForUse(nextUse->getUser(), *leafRange,
                             false /*is lifetime ending*/);
       instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
@@ -340,26 +344,73 @@ bool Implementation::gatherUses(SILValue value) {
         return false;
       }
 
+      // Check if our use type is trivial. In such a case, just treat this as a
+      // liveness use.
+      SILType type = nextUse->get()->getType();
+      if (type.isTrivial(nextUse->getUser()->getFunction())) {
+        LLVM_DEBUG(llvm::dbgs() << "        Found non lifetime ending use!\n");
+        blocksToUses.insert(nextUse->getParentBlock(),
+                            {nextUse,
+                             {liveness.getNumSubElements(), *leafRange,
+                              false /*is lifetime ending*/}});
+        liveness.updateForUse(nextUse->getUser(), *leafRange,
+                              false /*is lifetime ending*/);
+        instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
+        continue;
+      }
+
       LLVM_DEBUG(llvm::dbgs() << "        Found lifetime ending use!\n");
       destructureNeedingUses.push_back(nextUse);
       blocksToUses.insert(nextUse->getParentBlock(),
-                          {nextUse, {*leafRange, true /*is lifetime ending*/}});
+                          {nextUse,
+                           {liveness.getNumSubElements(), *leafRange,
+                            true /*is lifetime ending*/}});
       liveness.updateForUse(nextUse->getUser(), *leafRange,
                             true /*is lifetime ending*/);
       instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
       continue;
     }
 
-    case OperandOwnership::GuaranteedForwarding:
-      // Look through guaranteed forwarding.
+    case OperandOwnership::GuaranteedForwarding: {
+      // Look through guaranteed forwarding if we have at least one non-trivial
+      // value. If we have all non-trivial values, treat this as a liveness use.
+      SmallVector<SILValue, 8> forwardedValues;
+      auto *fn = nextUse->getUser()->getFunction();
       ForwardingOperand(nextUse).visitForwardedValues([&](SILValue value) {
-        for (auto *use : value->getUses()) {
-          useWorklist.push_back(use);
-        }
+        if (value->getType().isTrivial(fn))
+          return true;
+        forwardedValues.push_back(value);
         return true;
       });
-      continue;
 
+      if (forwardedValues.empty()) {
+        auto leafRange =
+          TypeTreeLeafTypeRange::get(nextUse->get(), getRootValue());
+        if (!leafRange) {
+          LLVM_DEBUG(llvm::dbgs() << "        Failed to compute leaf range?!\n");
+          return false;
+        }
+
+        LLVM_DEBUG(llvm::dbgs() << "        Found non lifetime ending use!\n");
+        blocksToUses.insert(nextUse->getParentBlock(),
+                            {nextUse,
+                             {liveness.getNumSubElements(), *leafRange,
+                              false /*is lifetime ending*/}});
+        liveness.updateForUse(nextUse->getUser(), *leafRange,
+                              false /*is lifetime ending*/);
+        instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
+        continue;
+      }
+
+      // If we had at least one forwarded value that is non-trivial, we need to
+      // visit those uses.
+      while (!forwardedValues.empty()) {
+        for (auto *use : forwardedValues.pop_back_val()->getUses()) {
+          useWorklist.push_back(use);
+        }
+      }
+      continue;
+    }
     case OperandOwnership::Borrow: {
       // Look through borrows.
       if (auto *bbi = dyn_cast<BeginBorrowInst>(nextUse->getUser())) {
@@ -380,9 +431,10 @@ bool Implementation::gatherUses(SILValue value) {
       // Otherwise, treat it as a normal use.
       LLVM_DEBUG(llvm::dbgs() << "        Treating non-begin_borrow borrow as "
                                  "a non lifetime ending use!\n");
-      blocksToUses.insert(
-          nextUse->getParentBlock(),
-          {nextUse, {*leafRange, false /*is lifetime ending*/}});
+      blocksToUses.insert(nextUse->getParentBlock(),
+                          {nextUse,
+                           {liveness.getNumSubElements(), *leafRange,
+                            false /*is lifetime ending*/}});
       liveness.updateForUse(nextUse->getUser(), *leafRange,
                             false /*is lifetime ending*/);
       instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
@@ -412,7 +464,7 @@ void Implementation::checkForErrorsOnSameInstruction() {
     // First loop through our uses and handle any consuming twice errors. We
     // also setup usedBits to check for non-consuming uses that may overlap.
     Operand *badOperand = nullptr;
-    Optional<TypeTreeLeafTypeRange> badRange;
+    llvm::Optional<TypeTreeLeafTypeRange> badRange;
     for (auto *use : instRangePair.second) {
       if (!use->isConsuming())
         continue;
@@ -544,239 +596,9 @@ void Implementation::checkDestructureUsesOnBoundary() const {
   }
 }
 
-static StructDecl *getFullyReferenceableStruct(SILType ktypeTy) {
-  auto structDecl = ktypeTy.getStructOrBoundGenericStruct();
-  if (!structDecl || structDecl->hasUnreferenceableStorage())
-    return nullptr;
-  return structDecl;
-}
-
-namespace {
-
-struct TypeOffsetSizePair {
-  SubElementOffset startOffset = 0;
-  TypeSubElementCount size = 0;
-
-  TypeOffsetSizePair() : startOffset(0), size(0) {}
-  TypeOffsetSizePair(SILType baseType, SILFunction *fn)
-      : startOffset(0), size(baseType, fn) {}
-  TypeOffsetSizePair(SubElementOffset offset, TypeSubElementCount size)
-      : startOffset(offset), size(size) {}
-  TypeOffsetSizePair(SILValue projection, SILValue base)
-      : startOffset(*SubElementOffset::compute(projection, base)),
-        size(TypeSubElementCount(projection)) {}
-
-  IntRange<unsigned> getRange() const {
-    return range(startOffset, getEndOffset());
-  }
-
-  SubElementOffset getEndOffset() const {
-    return SubElementOffset(startOffset + size);
-  }
-
-  bool operator==(const TypeOffsetSizePair &other) const {
-    return startOffset == other.startOffset && size == other.size;
-  }
-
-  bool operator!=(const TypeOffsetSizePair &other) const {
-    return !(*this == other);
-  }
-
-  /// Given an ancestor offset \p ancestorOffset and a type called \p
-  /// ancestorType, walk one level towards this current type which is assumed to
-  /// be a child type of \p ancestorType.
-  Optional<std::pair<TypeOffsetSizePair, SILType>>
-  walkOneLevelTowardsChild(TypeOffsetSizePair ancestorOffsetSize,
-                           SILType ancestorType, SILFunction *fn) const {
-    assert(ancestorOffsetSize.size >= size &&
-           "Too large to be a child of ancestorType");
-    assert((ancestorOffsetSize.startOffset <= startOffset &&
-            startOffset <
-                (ancestorOffsetSize.startOffset + ancestorOffsetSize.size)) &&
-           "Not within the offset range of ancestor");
-
-    if (auto tupleType = ancestorType.getAs<TupleType>()) {
-      // Before we do anything, see if we have a single element tuple. If we do,
-      // just return that.
-      if (tupleType->getNumElements() == 1) {
-        return {{ancestorOffsetSize, ancestorType.getTupleElementType(0)}};
-      }
-
-      assert(ancestorOffsetSize.size > size &&
-             "Too large to be a child of ancestorType");
-
-      unsigned childOffset = ancestorOffsetSize.startOffset;
-
-      for (auto index : indices(tupleType->getElementTypes())) {
-        SILType newType = ancestorType.getTupleElementType(index);
-        unsigned newSize = TypeSubElementCount(newType, fn);
-
-        // childOffset + size(tupleChild) is the offset of the next tuple
-        // element. If our target offset is less than that, then we know that
-        // the target type must be a descendent of this tuple element type.
-        if (childOffset + newSize > startOffset) {
-          return {{{childOffset, newSize}, newType}};
-        }
-
-        // Otherwise, add the new size of this field to iterOffset so we visit
-        // our sibling type next.
-        childOffset += newSize;
-      }
-
-      // At this point, we know that our type is not a subtype of this
-      // type. Some sort of logic error occurred.
-      llvm_unreachable("Not a child of this type?!");
-    }
-
-    if (auto *structDecl = getFullyReferenceableStruct(ancestorType)) {
-      // Before we do anything, see if we have a single element struct. If we
-      // do, just return that.
-      auto storedProperties = structDecl->getStoredProperties();
-      if (storedProperties.size() == 1) {
-        return {{ancestorOffsetSize,
-                 ancestorType.getFieldType(storedProperties[0], fn)}};
-      }
-
-      assert(ancestorOffsetSize.size > size &&
-             "Too large to be a child of ancestorType");
-
-      unsigned childOffset = ancestorOffsetSize.startOffset;
-      for (auto *fieldDecl : storedProperties) {
-        SILType newType = ancestorType.getFieldType(fieldDecl, fn);
-        unsigned newSize = TypeSubElementCount(newType, fn);
-
-        // iterOffset + size(tupleChild) is the offset of the next tuple
-        // element. If our target offset is less than that, then we know that
-        // the target type must be a child of this tuple element type.
-        if (childOffset + newSize > startOffset) {
-          return {{{childOffset, newSize}, newType}};
-        }
-
-        // Otherwise, add the new size of this field to iterOffset so we visit
-        // our sibling type next.
-        childOffset += newSize;
-      }
-
-      // At this point, we know that our type is not a subtype of this
-      // type. Some sort of logic error occurred.
-      llvm_unreachable("Not a child of this type?!");
-    }
-
-    if (auto *enumDecl = ancestorType.getEnumOrBoundGenericEnum()) {
-      llvm_unreachable("Cannot find child type of enum!\n");
-    }
-
-    llvm_unreachable("Hit a leaf type?! Should have handled it earlier");
-  }
-
-  /// Given an ancestor offset \p ancestorOffset and a type called \p
-  /// ancestorType, walk one level towards this current type inserting on value,
-  /// the relevant projection.
-  Optional<std::pair<TypeOffsetSizePair, SILValue>>
-  walkOneLevelTowardsChild(SILBuilderWithScope &builder, SILLocation loc,
-                           TypeOffsetSizePair ancestorOffsetSize,
-                           SILValue ancestorValue) const {
-    auto *fn = ancestorValue->getFunction();
-    SILType ancestorType = ancestorValue->getType();
-
-    assert(ancestorOffsetSize.size >= size &&
-           "Too large to be a child of ancestorType");
-    assert((ancestorOffsetSize.startOffset <= startOffset &&
-            startOffset <
-                (ancestorOffsetSize.startOffset + ancestorOffsetSize.size)) &&
-           "Not within the offset range of ancestor");
-    if (auto tupleType = ancestorType.getAs<TupleType>()) {
-      // Before we do anything, see if we have a single element tuple. If we do,
-      // just return that.
-      if (tupleType->getNumElements() == 1) {
-        auto *newValue = builder.createTupleExtract(loc, ancestorValue, 0);
-        return {{ancestorOffsetSize, newValue}};
-      }
-
-      assert(ancestorOffsetSize.size > size &&
-             "Too large to be a child of ancestorType");
-
-      unsigned childOffset = ancestorOffsetSize.startOffset;
-
-      for (auto index : indices(tupleType->getElementTypes())) {
-        SILType newType = ancestorType.getTupleElementType(index);
-        unsigned newSize = TypeSubElementCount(newType, fn);
-
-        // childOffset + size(tupleChild) is the offset of the next tuple
-        // element. If our target offset is less than that, then we know that
-        // the target type must be a descendent of this tuple element type.
-        if (childOffset + newSize > startOffset) {
-          auto *newValue =
-              builder.createTupleExtract(loc, ancestorValue, index);
-          return {{{childOffset, newSize}, newValue}};
-        }
-
-        // Otherwise, add the new size of this field to iterOffset so we visit
-        // our sibling type next.
-        childOffset += newSize;
-      }
-
-      // At this point, we know that our type is not a subtype of this
-      // type. Some sort of logic error occurred.
-      llvm_unreachable("Not a child of this type?!");
-    }
-
-    if (auto *structDecl = getFullyReferenceableStruct(ancestorType)) {
-      // Before we do anything, see if we have a single element struct. If we
-      // do, just return that.
-      auto storedProperties = structDecl->getStoredProperties();
-      if (storedProperties.size() == 1) {
-        auto *newValue = builder.createStructExtract(loc, ancestorValue,
-                                                     storedProperties[0]);
-        return {{ancestorOffsetSize, newValue}};
-      }
-
-      assert(ancestorOffsetSize.size > size &&
-             "Too large to be a child of ancestorType");
-
-      unsigned childOffset = ancestorOffsetSize.startOffset;
-      for (auto *fieldDecl : structDecl->getStoredProperties()) {
-        SILType newType = ancestorType.getFieldType(fieldDecl, fn);
-        unsigned newSize = TypeSubElementCount(newType, fn);
-
-        // iterOffset + size(tupleChild) is the offset of the next tuple
-        // element. If our target offset is less than that, then we know that
-        // the target type must be a child of this tuple element type.
-        if (childOffset + newSize > startOffset) {
-          auto *newValue =
-              builder.createStructExtract(loc, ancestorValue, fieldDecl);
-          return {{{childOffset, newSize}, newValue}};
-        }
-
-        // Otherwise, add the new size of this field to iterOffset so we visit
-        // our sibling type next.
-        childOffset += newSize;
-      }
-
-      // At this point, we know that our type is not a subtype of this
-      // type. Some sort of logic error occurred.
-      llvm_unreachable("Not a child of this type?!");
-    }
-
-    if (auto *enumDecl = ancestorType.getEnumOrBoundGenericEnum()) {
-      llvm_unreachable("Cannot find child type of enum!\n");
-    }
-
-    llvm_unreachable("Hit a leaf type?! Should have handled it earlier");
-  }
-};
-
-llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
-                              const TypeOffsetSizePair &other) {
-  return os << "(startOffset: " << other.startOffset << ", size: " << other.size
-            << ")";
-}
-
-} // anonymous namespace
-
 #ifndef NDEBUG
 static void dumpSmallestTypeAvailable(
-    SmallVectorImpl<Optional<std::pair<TypeOffsetSizePair, SILType>>>
+    SmallVectorImpl<llvm::Optional<std::pair<TypeOffsetSizePair, SILType>>>
         &smallestTypeAvailable) {
   LLVM_DEBUG(llvm::dbgs() << "            Dumping smallest type available!\n");
   for (auto pair : llvm::enumerate(smallestTypeAvailable)) {
@@ -870,11 +692,11 @@ AvailableValues &Implementation::computeAvailableValues(SILBasicBlock *block) {
         : targetBlockRPO(*pofi->getRPONumber(block)), pe(block->pred_end()),
           pofi(pofi) {}
 
-    Optional<SILBasicBlock *> operator()(SILBasicBlock *predBlock) const {
+    llvm::Optional<SILBasicBlock *> operator()(SILBasicBlock *predBlock) const {
       // If our predecessor block has a larger RPO number than our target block,
       // then their edge must be a backedge.
       if (targetBlockRPO < *pofi->getRPONumber(predBlock))
-        return None;
+        return llvm::None;
       return predBlock;
     }
   };
@@ -906,7 +728,7 @@ AvailableValues &Implementation::computeAvailableValues(SILBasicBlock *block) {
   LLVM_DEBUG(llvm::dbgs() << "        Computing smallest type available for "
                              "available values for block bb"
                           << block->getDebugID() << '\n');
-  SmallVector<Optional<std::pair<TypeOffsetSizePair, SILType>>, 8>
+  SmallVector<llvm::Optional<std::pair<TypeOffsetSizePair, SILType>>, 8>
       smallestTypeAvailable;
   {
     auto pi = predsSkippingBackEdges.begin();
@@ -933,7 +755,7 @@ AvailableValues &Implementation::computeAvailableValues(SILBasicBlock *block) {
               {{TypeOffsetSizePair(predAvailableValues[i], getRootValue()),
                 predAvailableValues[i]->getType()}});
         else
-          smallestTypeAvailable.emplace_back(None);
+          smallestTypeAvailable.emplace_back(llvm::None);
       }
       LLVM_DEBUG(llvm::dbgs() << "        Finished computing initial smallest "
                                  "type available for block bb"
@@ -951,11 +773,11 @@ AvailableValues &Implementation::computeAvailableValues(SILBasicBlock *block) {
                  << "        Recursively loading its available values!\n");
       auto &predAvailableValues = computeAvailableValues(bb);
       for (unsigned i : range(predAvailableValues.size())) {
-        if (!smallestTypeAvailable[i].hasValue())
+        if (!smallestTypeAvailable[i].has_value())
           continue;
 
         if (!predAvailableValues[i]) {
-          smallestTypeAvailable[i] = None;
+          smallestTypeAvailable[i] = llvm::None;
           continue;
         }
 
@@ -1218,13 +1040,13 @@ void Implementation::rewriteUses(InstructionDeleter *deleter) {
     if (auto operandList = blocksToUses.find(block)) {
       // If we do, gather up the bits that we need.
       for (auto operand : *operandList) {
-        auto &subEltSpan = operand.second.subEltSpan;
+        auto &liveBits = operand.second.liveBits;
         LLVM_DEBUG(llvm::dbgs() << "    Found need operand "
                                 << operand.first->getOperandNumber()
-                                << " of inst: " << *operand.first->getUser()
-                                << "    Needs bits: " << subEltSpan << '\n');
-        bitsNeededInBlock.set(subEltSpan.startEltOffset,
-                              subEltSpan.endEltOffset);
+                                << " of inst: " << *operand.first->getUser());
+        for (auto bit : liveBits.set_bits()) {
+          bitsNeededInBlock.set(bit);
+        }
         seenOperands.insert(operand.first);
       }
     }
@@ -1412,6 +1234,14 @@ void Implementation::rewriteUses(InstructionDeleter *deleter) {
               SILBuilderWithScope endBuilder(inst);
               endBuilder.createEndBorrow(getSafeLoc(inst), borrow);
               continue;
+            } else {
+              // Otherwise, put the end_borrow.
+              for (auto *succBlock : ti->getSuccessorBlocks()) {
+                auto *nextInst = &succBlock->front();
+                SILBuilderWithScope endBuilder(nextInst);
+                endBuilder.createEndBorrow(getSafeLoc(nextInst), borrow);
+              }
+              continue;
             }
           }
 
@@ -1507,7 +1337,6 @@ void Implementation::cleanup() {
   // not actually completely consume.
   auto *fn = getMarkedValue()->getFunction();
   SmallVector<SILBasicBlock *, 8> discoveredBlocks;
-  SSAPrunedLiveness liveness(&discoveredBlocks);
   PrunedLivenessBoundary boundary;
   while (!interface.createdDestructures.empty()) {
     auto *inst = interface.createdDestructures.pop_back_val();
@@ -1515,8 +1344,8 @@ void Implementation::cleanup() {
     for (auto result : inst->getResults()) {
       if (result->getType().isTrivial(*fn))
         continue;
+      SSAPrunedLiveness liveness(fn, &discoveredBlocks);
       SWIFT_DEFER {
-        liveness.clear();
         discoveredBlocks.clear();
         boundary.clear();
       };
@@ -1533,8 +1362,8 @@ void Implementation::cleanup() {
     if (arg->getType().isTrivial(*fn))
       continue;
 
+    SSAPrunedLiveness liveness(fn, &discoveredBlocks);
     SWIFT_DEFER {
-      liveness.clear();
       discoveredBlocks.clear();
       boundary.clear();
     };
@@ -1542,6 +1371,7 @@ void Implementation::cleanup() {
   }
 
   // And finally do the same thing for our initial copy_value.
+  SSAPrunedLiveness liveness(fn, &discoveredBlocks);
   addCompensatingDestroys(liveness, boundary, initialValue);
 }
 
@@ -1555,8 +1385,8 @@ void Implementation::cleanup() {
 /// that the caller will fail in such a case.
 static bool gatherBorrows(SILValue rootValue,
                           StackList<BeginBorrowInst *> &borrowWorklist) {
-  // If we have a no implicit copy mark_must_check, we do not run the borrow to
-  // destructure transform since:
+  // If we have a no implicit copy mark_unresolved_non_copyable_value, we do not
+  // run the borrow to destructure transform since:
   //
   // 1. If we have a move only type, we should have emitted an earlier error
   //    saying that move only types should not be marked as no implicit copy.
@@ -1868,7 +1698,6 @@ bool BorrowToDestructureTransform::transform() {
       // copy_value in each destination block that we originally inserted.
       {
         SmallVector<SILBasicBlock *, 8> discoveredBlocks;
-        SSAPrunedLiveness liveness(&discoveredBlocks);
         PrunedLivenessBoundary boundary;
 
         SILBuilderWithScope builder(s);
@@ -1887,8 +1716,8 @@ bool BorrowToDestructureTransform::transform() {
 
             // If we have a copyable type, we need to insert compensating
             // destroys.
+            SSAPrunedLiveness liveness(fn, &discoveredBlocks);
             SWIFT_DEFER {
-              liveness.clear();
               discoveredBlocks.clear();
               boundary.clear();
             };

@@ -254,19 +254,22 @@ namespace irgen {
 
   void emitAsyncReturn(
       IRGenFunction &IGF, AsyncContextLayout &layout, CanSILFunctionType fnType,
-      Optional<ArrayRef<llvm::Value *>> nativeResultArgs = llvm::None);
+      llvm::Optional<ArrayRef<llvm::Value *>> nativeResultArgs = llvm::None);
 
   void emitAsyncReturn(IRGenFunction &IGF, AsyncContextLayout &layout,
                        SILType funcResultTypeInContext,
                        CanSILFunctionType fnType, Explosion &result,
                        Explosion &error);
 
-  Address emitAutoDiffCreateLinearMapContext(
-      IRGenFunction &IGF, llvm::Value *topLevelSubcontextSize);
+  Address emitAutoDiffCreateLinearMapContextWithType(
+      IRGenFunction &IGF, llvm::Value *topLevelSubcontextMetatype);
+
   Address emitAutoDiffProjectTopLevelSubcontext(
       IRGenFunction &IGF, Address context);
-  Address emitAutoDiffAllocateSubcontext(
-      IRGenFunction &IGF, Address context, llvm::Value *size);
+
+  Address
+  emitAutoDiffAllocateSubcontextWithType(IRGenFunction &IGF, Address context,
+                                         llvm::Value *subcontextMetatype);
 
   FunctionPointer getFunctionPointerForDispatchCall(IRGenModule &IGM,
                                                     const FunctionPointer &fn);

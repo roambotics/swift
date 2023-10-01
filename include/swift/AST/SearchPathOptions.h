@@ -14,6 +14,7 @@
 #define SWIFT_AST_SEARCHPATHOPTIONS_H
 
 #include "swift/Basic/ArrayRefView.h"
+#include "swift/Basic/ExternalUnion.h"
 #include "swift/Basic/PathRemapper.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
@@ -34,7 +35,6 @@ enum class ModuleSearchPathKind {
   Framework,
   DarwinImplicitFramework,
   RuntimeLibrary,
-  CompilerPlugin,
 };
 
 /// A single module search path that can come from different sources, e.g.
@@ -174,11 +174,110 @@ public:
                             llvm::vfs::FileSystem *FS, bool IsOSDarwin);
 };
 
+/// Pair of a plugin path and the module name that the plugin provides.
+struct PluginExecutablePathAndModuleNames {
+  std::string ExecutablePath;
+  std::vector<std::string> ModuleNames;
+};
+
 /// Pair of a plugin search path and the corresponding plugin server executable
 /// path.
 struct ExternalPluginSearchPathAndServerPath {
   std::string SearchPath;
   std::string ServerPath;
+};
+
+class PluginSearchOption {
+public:
+  struct LoadPluginLibrary {
+    std::string LibraryPath;
+  };
+  struct LoadPluginExecutable {
+    std::string ExecutablePath;
+    std::vector<std::string> ModuleNames;
+  };
+  struct PluginPath {
+    std::string SearchPath;
+  };
+  struct ExternalPluginPath {
+    std::string SearchPath;
+    std::string ServerPath;
+  };
+
+  enum class Kind : uint8_t {
+    LoadPluginLibrary,
+    LoadPluginExecutable,
+    PluginPath,
+    ExternalPluginPath,
+  };
+
+private:
+  using Members = ExternalUnionMembers<LoadPluginLibrary, LoadPluginExecutable,
+                                       PluginPath, ExternalPluginPath>;
+  static Members::Index getIndexForKind(Kind kind) {
+    switch (kind) {
+    case Kind::LoadPluginLibrary:
+      return Members::indexOf<LoadPluginLibrary>();
+    case Kind::LoadPluginExecutable:
+      return Members::indexOf<LoadPluginExecutable>();
+    case Kind::PluginPath:
+      return Members::indexOf<PluginPath>();
+    case Kind::ExternalPluginPath:
+      return Members::indexOf<ExternalPluginPath>();
+    }
+  };
+  using Storage = ExternalUnion<Kind, Members, getIndexForKind>;
+
+  Kind kind;
+  Storage storage;
+
+public:
+  PluginSearchOption(const LoadPluginLibrary &v)
+      : kind(Kind::LoadPluginLibrary) {
+    storage.emplace<LoadPluginLibrary>(kind, v);
+  }
+  PluginSearchOption(const LoadPluginExecutable &v)
+      : kind(Kind::LoadPluginExecutable) {
+    storage.emplace<LoadPluginExecutable>(kind, v);
+  }
+  PluginSearchOption(const PluginPath &v) : kind(Kind::PluginPath) {
+    storage.emplace<PluginPath>(kind, v);
+  }
+  PluginSearchOption(const ExternalPluginPath &v)
+      : kind(Kind::ExternalPluginPath) {
+    storage.emplace<ExternalPluginPath>(kind, v);
+  }
+  PluginSearchOption(const PluginSearchOption &o) : kind(o.kind) {
+    storage.copyConstruct(o.kind, o.storage);
+  }
+  PluginSearchOption(PluginSearchOption &&o) : kind(o.kind) {
+    storage.moveConstruct(o.kind, std::move(o.storage));
+  }
+  ~PluginSearchOption() { storage.destruct(kind); }
+  PluginSearchOption &operator=(const PluginSearchOption &o) {
+    storage.copyAssign(kind, o.kind, o.storage);
+    kind = o.kind;
+    return *this;
+  }
+  PluginSearchOption &operator=(PluginSearchOption &&o) {
+    storage.moveAssign(kind, o.kind, std::move(o.storage));
+    kind = o.kind;
+    return *this;
+  }
+
+  Kind getKind() const { return kind; }
+
+  template <typename T>
+  const T *dyn_cast() const {
+    if (Members::indexOf<T>() != getIndexForKind(kind))
+      return nullptr;
+    return &storage.get<T>(kind);
+  }
+
+  template <typename T>
+  const T &get() const {
+    return storage.get<T>(kind);
+  }
 };
 
 /// Options for controlling search path behavior.
@@ -242,8 +341,7 @@ private:
   std::vector<std::string> CompilerPluginLibraryPaths;
 
   /// Compiler plugin executable paths and providing module names.
-  /// Format: '<path>#<module names>'
-  std::vector<std::string> CompilerPluginExecutablePaths;
+  std::vector<PluginExecutablePathAndModuleNames> CompilerPluginExecutablePaths;
 
   /// Add a single import search path. Must only be called from
   /// \c ASTContext::addSearchPath.
@@ -252,14 +350,6 @@ private:
     Lookup.searchPathAdded(FS, ImportSearchPaths.back(),
                            ModuleSearchPathKind::Import, /*isSystem=*/false,
                            ImportSearchPaths.size() - 1);
-  }
-
-  void addCompilerPluginLibraryPath(StringRef Path, llvm::vfs::FileSystem *FS) {
-    CompilerPluginLibraryPaths.push_back(Path.str());
-    Lookup.searchPathAdded(FS, CompilerPluginLibraryPaths.back(),
-                           ModuleSearchPathKind::CompilerPlugin,
-                           /*isSystem=*/false,
-                           CompilerPluginLibraryPaths.size() - 1);
   }
 
   /// Add a single framework search path. Must only be called from
@@ -350,26 +440,6 @@ public:
     Lookup.searchPathsDidChange();
   }
 
-  void setCompilerPluginLibraryPaths(
-      std::vector<std::string> NewCompilerPluginLibraryPaths) {
-    CompilerPluginLibraryPaths = NewCompilerPluginLibraryPaths;
-    Lookup.searchPathsDidChange();
-  }
-
-  ArrayRef<std::string> getCompilerPluginLibraryPaths() const {
-    return CompilerPluginLibraryPaths;
-  }
-
-  void setCompilerPluginExecutablePaths(
-      std::vector<std::string> NewCompilerPluginExecutablePaths) {
-    CompilerPluginExecutablePaths = NewCompilerPluginExecutablePaths;
-    Lookup.searchPathsDidChange();
-  }
-
-  ArrayRef<std::string> getCompilerPluginExecutablePaths() const {
-    return CompilerPluginExecutablePaths;
-  }
-
   /// Path(s) to virtual filesystem overlay YAML files.
   std::vector<std::string> VFSOverlayFiles;
 
@@ -385,15 +455,8 @@ public:
   /// preference.
   std::vector<std::string> RuntimeLibraryPaths;
 
-  /// Paths that contain compiler plugins loaded on demand for, e.g.,
-  /// macro implementations.
-  std::vector<std::string> PluginSearchPaths;
-
-  /// Pairs of external compiler plugin search paths and the corresponding
-  /// plugin server executables.
-  /// e.g. {"/path/to/usr/lib/swift/host/plugins",
-  ///       "/path/to/usr/bin/plugin-server"}
-  std::vector<ExternalPluginSearchPathAndServerPath> ExternalPluginSearchPaths;
+  /// Plugin search path options.
+  std::vector<PluginSearchOption> PluginSearchOpts;
 
   /// Don't look in for compiler-provided modules.
   bool SkipRuntimeLibraryImportPaths = false;

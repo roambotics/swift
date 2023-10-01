@@ -297,7 +297,7 @@ func r18800223(_ i : Int) {
 }
 
 // <rdar://problem/21883806> Bogus "'_' can only appear in a pattern or on the left side of an assignment" is back
-_ = { $0 }  // expected-error {{unable to infer type of a closure parameter '$0' in the current context}}
+_ = { $0 }  // expected-error {{cannot infer type of closure parameter '$0' without a type annotation}}
 
 
 
@@ -661,10 +661,7 @@ example21890157.property = "confusing"  // expected-error {{value of optional ty
 
 
 struct UnaryOp {}
-
 _ = -UnaryOp() // expected-error {{unary operator '-' cannot be applied to an operand of type 'UnaryOp'}}
-// expected-note@-1 {{overloads for '-' exist with these partially matching parameter lists: (Double), (Float)}}
-
 
 // <rdar://problem/23433271> Swift compiler segfault in failure diagnosis
 func f23433271(_ x : UnsafePointer<Int>) {}
@@ -1041,18 +1038,6 @@ class C2_47269 {
   private func f(x: Int, y: Bool) {
   }
 }
-
-// rdar://problem/32101765 - Keypath diagnostics are not actionable/helpful
-
-struct R32101765 { let prop32101765 = 0 }
-let _: KeyPath<R32101765, Float> = \.prop32101765
-// expected-error@-1 {{key path value type 'Int' cannot be converted to contextual type 'Float'}}
-let _: KeyPath<R32101765, Float> = \R32101765.prop32101765
-// expected-error@-1 {{key path value type 'Int' cannot be converted to contextual type 'Float'}}
-let _: KeyPath<R32101765, Float> = \.prop32101765.unknown
-// expected-error@-1 {{type 'Int' has no member 'unknown'}}
-let _: KeyPath<R32101765, Float> = \R32101765.prop32101765.unknown
-// expected-error@-1 {{type 'Int' has no member 'unknown'}}
 
 // rdar://problem/32390726 - Bad Diagnostic: Don't suggest `var` to `let` when binding inside for-statement
 for var i in 0..<10 { // expected-warning {{variable 'i' was never mutated; consider removing 'var' to make it constant}} {{5-9=}}
@@ -1550,4 +1535,36 @@ func issue63746() {
 func rdar86611718(list: [Int]) {
   String(list.count())
   // expected-error@-1 {{cannot call value of non-function type 'Int'}}
+}
+
+// rdar://108977234 - failed to produce diagnostic when argument to AnyHashable parameter doesn't conform to Hashable protocol
+do {
+  struct NonHashable {}
+
+  func test(result: inout [AnyHashable], value: NonHashable) {
+    result.append(value) // expected-error {{argument type 'NonHashable' does not conform to expected type 'Hashable'}}
+  }
+}
+
+// https://github.com/apple/swift/issues/66206
+func testNilCoalescingOperatorRemoveFix() {
+  let _ = "" ?? "" // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{13-19=}}
+  let _ = ""     ?? "" // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{13-23=}}
+  let _ = "" /* This is a comment */ ?? "" // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{13-43=}}
+
+  let _ = "" // This is a comment
+    ?? "" // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{1555:13-1556:10=}}
+
+  let _ = "" // This is a comment
+    /*
+     * The blank line below is part of the test case, do not delete it
+     */
+
+    ?? "" // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{1558:13-1563:10=}}
+
+  if ("" ?? // This is a comment // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{9-1566:9=}}
+      "").isEmpty {}
+
+  if ("" // This is a comment
+      ?? "").isEmpty {} // expected-warning {{left side of nil coalescing operator '??' has non-optional type 'String', so the right side is never used}} {{1568:9-1569:12=}}
 }

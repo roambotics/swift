@@ -31,6 +31,7 @@
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/SourceLoc.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -406,9 +407,10 @@ public:
   /// \c nullptr if the source location isn't in this module.
   SourceFile *getSourceFileContainingLocation(SourceLoc loc);
 
-  /// Whether the given location is inside a generated buffer, \c false if
-  /// the given location isn't in this module.
-  bool isInGeneratedBuffer(SourceLoc loc);
+  // Retrieve the buffer ID and source location of the outermost location that
+  // caused the generation of the buffer containing \p loc. \p loc and its
+  // buffer if it isn't in a generated buffer or has no original location.
+  std::pair<unsigned, SourceLoc> getOriginalLocation(SourceLoc loc) const;
 
   /// Creates a map from \c #filePath strings to corresponding \c #fileID
   /// strings, diagnosing any conflicts.
@@ -521,7 +523,8 @@ private:
 
   /// A cache of this module's underlying module and required bystander if it's
   /// an underscored cross-import overlay.
-  Optional<std::pair<ModuleDecl *, Identifier>> declaringModuleAndBystander;
+  llvm::Optional<std::pair<ModuleDecl *, Identifier>>
+      declaringModuleAndBystander;
 
   /// If this module is an underscored cross import overlay, gets the underlying
   /// module that declared it (which may itself be a cross-import overlay),
@@ -653,6 +656,22 @@ public:
     Bits.ModuleDecl.HasHermeticSealAtLink = enabled;
   }
 
+  /// Returns true if this module was built with embedded Swift
+  bool isEmbeddedSwiftModule() const {
+    return Bits.ModuleDecl.IsEmbeddedSwiftModule;
+  }
+  void setIsEmbeddedSwiftModule(bool enabled = true) {
+    Bits.ModuleDecl.IsEmbeddedSwiftModule = enabled;
+  }
+
+  /// Returns true if this module was built with C++ interoperability enabled.
+  bool hasCxxInteroperability() const {
+    return Bits.ModuleDecl.HasCxxInteroperability;
+  }
+  void setHasCxxInteroperability(bool enabled = true) {
+    Bits.ModuleDecl.HasCxxInteroperability = enabled;
+  }
+
   /// \returns true if this module is a system module; note that the StdLib is
   /// considered a system module.
   bool isSystemModule() const {
@@ -661,15 +680,9 @@ public:
   void setIsSystemModule(bool flag = true);
 
   /// \returns true if this module is part of the stdlib or contained within
-  /// the SDK. If no SDK was specified, also falls back to whether the module
-  /// was specified as a system module (ie. it's on the system search path).
-  bool isNonUserModule() const { return Bits.ModuleDecl.IsNonUserModule; }
-
-private:
-  /// Update whether this module is a non-user module, see \c isNonUserModule.
-  /// \p newUnit is the added unit that caused this update, or \c nullptr if
-  /// the update wasn't caused by adding a new unit.
-  void updateNonUserModule(FileUnit *newUnit);
+  /// the SDK. If no SDK was specified, falls back to whether the module was
+  /// specified as a system module (ie. it's on the system search path).
+  bool isNonUserModule() const;
 
 public:
   /// Returns true if the module was rebuilt from a module interface instead
@@ -734,7 +747,18 @@ public:
   ///
   /// This does a simple local lookup, not recursively looking through imports.
   void lookupValue(DeclName Name, NLKind LookupKind,
+                   OptionSet<ModuleLookupFlags> Flags,
                    SmallVectorImpl<ValueDecl*> &Result) const;
+
+  /// Look up a (possibly overloaded) value set at top-level scope
+  /// (but with the specified access path, which may come from an import decl)
+  /// within the current module.
+  ///
+  /// This does a simple local lookup, not recursively looking through imports.
+  void lookupValue(DeclName Name, NLKind LookupKind,
+                   SmallVectorImpl<ValueDecl*> &Result) const {
+    lookupValue(Name, LookupKind, {}, Result);
+  }
 
   /// Look up a local type declaration by its mangled name.
   ///
@@ -857,19 +881,47 @@ public:
     Exported = 1 << 0,
     /// Include "regular" imports with an access-level of `public`.
     Default = 1 << 1,
-    /// Include imports declared with `@_implementationOnly` or with an
-    /// access-level of `package` or less.
+    /// Include imports declared with `@_implementationOnly`.
     ImplementationOnly = 1 << 2,
     /// Include imports declared with `package import`.
     PackageOnly = 1 << 3,
+    /// Include imports marked `internal` or lower. These differs form
+    /// implementation-only imports by stricter type-checking and loading
+    /// policies. At this moment, we can group them under the same category
+    /// as they have the same loading behavior.
+    InternalOrBelow = 1 << 4,
     /// Include imports declared with `@_spiOnly`.
-    SPIOnly = 1 << 4,
+    SPIOnly = 1 << 5,
     /// Include imports shadowed by a cross-import overlay. Unshadowed imports
     /// are included whether or not this flag is specified.
-    ShadowedByCrossImportOverlay = 1 << 5
+    ShadowedByCrossImportOverlay = 1 << 6
   };
   /// \sa getImportedModules
   using ImportFilter = OptionSet<ImportFilterKind>;
+
+  /// Returns an \c ImportFilter with all elements of \c ImportFilterKind.
+  constexpr static ImportFilter getImportFilterAll() {
+    return {ImportFilterKind::Exported,
+            ImportFilterKind::Default,
+            ImportFilterKind::ImplementationOnly,
+            ImportFilterKind::PackageOnly,
+            ImportFilterKind::InternalOrBelow,
+            ImportFilterKind::SPIOnly,
+            ImportFilterKind::ShadowedByCrossImportOverlay};
+  }
+
+  /// Import kinds visible to the module declaring them.
+  ///
+  /// This leaves out \c ShadowedByCrossImportOverlay as even if present in
+  /// the sources it's superseded by the cross-overlay as the local import.
+  constexpr static ImportFilter getImportFilterLocal() {
+    return {ImportFilterKind::Exported,
+            ImportFilterKind::Default,
+            ImportFilterKind::ImplementationOnly,
+            ImportFilterKind::PackageOnly,
+            ImportFilterKind::InternalOrBelow,
+            ImportFilterKind::SPIOnly};
+  }
 
   /// Looks up which modules are imported by this module.
   ///
@@ -1009,7 +1061,7 @@ public:
   ///
   /// \returns true if there was a problem adding this file.
   bool registerEntryPointFile(FileUnit *file, SourceLoc diagLoc,
-                              Optional<ArtificialMainKind> kind);
+                              llvm::Optional<ArtificialMainKind> kind);
 
   /// \returns true if this module has a main entry point.
   bool hasEntryPoint() const {

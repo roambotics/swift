@@ -1,4 +1,7 @@
 // RUN: %target-swift-frontend -strict-concurrency=complete -swift-version 5 -parse-as-library -emit-sil -verify %s
+// RUN: %target-swift-frontend -strict-concurrency=complete -swift-version 5 -parse-as-library -emit-sil -verify %s -enable-experimental-feature SendNonSendable
+
+// REQUIRES: asserts
 
 func randomBool() -> Bool { return false }
 func logTransaction(_ i: Int) {}

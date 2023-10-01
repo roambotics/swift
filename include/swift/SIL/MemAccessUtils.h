@@ -237,8 +237,8 @@ inline bool accessKindMayConflict(SILAccessKind a, SILAccessKind b) {
   return !(a == SILAccessKind::Read && b == SILAccessKind::Read);
 }
 
-/// Whether \p instruction accesses storage whose representation is unidentified
-/// such as by reading a pointer.
+/// Whether \p instruction accesses storage whose representation is either (1)
+/// unidentified such as by reading a pointer or (2) global.
 bool mayAccessPointer(SILInstruction *instruction);
 
 /// Whether this instruction loads or copies a value whose storage does not
@@ -945,7 +945,7 @@ struct RelativeAccessStorageWithBase {
   AccessStorageWithBase storageWithBase;
   /// The most transformative cast that was seen between when walking from
   /// address to storage.base;
-  Optional<AccessStorageCast> cast;
+  llvm::Optional<AccessStorageCast> cast;
 
   AccessStorage getStorage() const { return storageWithBase.storage; }
 };
@@ -1592,6 +1592,9 @@ inline bool isAccessStorageTypeCast(SingleValueInstruction *svi) {
   default:
     return false;
   // Simply pass-thru the incoming address.  But change its type!
+  case SILInstructionKind::MoveOnlyWrapperToCopyableAddrInst:
+  case SILInstructionKind::CopyableToMoveOnlyWrapperAddrInst:
+  // Simply pass-thru the incoming address.  But change its type!
   case SILInstructionKind::UncheckedAddrCastInst:
   // Casting to RawPointer does not affect the AccessPath. When converting
   // between address types, they must be layout compatible (with truncation).
@@ -1631,7 +1634,8 @@ inline bool isAccessStorageIdentityCast(SingleValueInstruction *svi) {
 
   // Simply pass-thru the incoming address.
   case SILInstructionKind::MarkUninitializedInst:
-  case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::MarkUnresolvedNonCopyableValueInst:
+  case SILInstructionKind::DropDeinitInst:
   case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
   case SILInstructionKind::MarkDependenceInst:
   case SILInstructionKind::CopyValueInst:

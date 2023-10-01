@@ -228,11 +228,12 @@ private:
       auto zeroVal = emitZeroDirect(val.getSwiftType(), loc);
       return zeroVal;
     }
-    case AdjointValueKind::Aggregate:
-      llvm_unreachable(
-          "Tuples and structs are not supported in forward mode yet.");
     case AdjointValueKind::Concrete:
       return val.getConcreteValue();
+    case AdjointValueKind::Aggregate:
+    case AdjointValueKind::AddElement:
+      llvm_unreachable(
+          "Tuples and structs are not supported in forward mode yet.");
     }
     llvm_unreachable("Invalid adjoint value kind"); // silences MSVC C4715
   }
@@ -343,7 +344,7 @@ private:
   }
 
   /// Find the tangent space of a given canonical type.
-  Optional<TangentSpace> getTangentSpace(CanType type) {
+  llvm::Optional<TangentSpace> getTangentSpace(CanType type) {
     // Use witness generic signature to remap types.
     type = witness->getDerivativeGenericSignature().getReducedType(
         type);
@@ -1673,7 +1674,7 @@ void JVPCloner::Implementation::prepareForDifferentialGeneration() {
   auto *diffGenericEnv = diffGenericSig.getGenericEnvironment();
   auto diffType = SILFunctionType::get(
       diffGenericSig, SILExtInfo::getThin(), origTy->getCoroutineKind(),
-      origTy->getCalleeConvention(), dfParams, {}, dfResults, None,
+      origTy->getCalleeConvention(), dfParams, {}, dfResults, llvm::None,
       origTy->getPatternSubstitutions(), origTy->getInvocationSubstitutions(),
       original->getASTContext());
 

@@ -7,6 +7,7 @@ handle_gyb_sources(
 
 add_swift_unittest(SwiftBasicTests
   BlotMapVectorTest.cpp
+  BlocklistTest.cpp
   CacheTest.cpp
   ClangImporterOptionsTest.cpp
   ClusteredBitVectorTest.cpp
@@ -49,6 +50,6 @@ target_link_libraries(SwiftBasicTests
   LLVMTestingSupport
   )
 
-if(SWIFT_HOST_VARIANT STREQUAL windows)
+if(SWIFT_HOST_VARIANT STREQUAL "windows")
   target_link_libraries(SwiftBasicTests PRIVATE Synchronization)
 endif()

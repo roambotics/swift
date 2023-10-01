@@ -88,6 +88,7 @@ UniversalLinkageInfo::UniversalLinkageInfo(const llvm::Triple &triple,
                                            bool forcePublicDecls,
                                            bool isStaticLibrary)
     : IsELFObject(triple.isOSBinFormatELF()),
+      IsMSVCEnvironment(triple.isWindowsMSVCEnvironment()),
       UseDLLStorage(useDllStorage(triple)), Internalize(isStaticLibrary),
       HasMultipleIGMs(hasMultipleIGMs), ForcePublicDecls(forcePublicDecls) {}
 
@@ -536,11 +537,6 @@ std::string LinkEntity::mangleAsString() const {
     return mangler.mangleExtendedExistentialTypeShapeSymbol(
                      genSig, existentialType, isUnique);
   }
-
-  case Kind::RuntimeDiscoverableAttributeRecord: {
-    auto *attr = cast<NominalTypeDecl>(getDecl());
-    return mangler.mangleRuntimeAccessibleAttributeRecord(attr);
-  }
   }
   llvm_unreachable("bad entity kind!");
 }
@@ -747,16 +743,17 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
   case Kind::OpaqueTypeDescriptor: {
     auto *opaqueType = cast<OpaqueTypeDecl>(getDecl());
 
-    // The opaque result type descriptor with availability conditions
-    // has to be emitted into a client module when associated with
+    // With conditionally available substitutions, the opaque result type
+    // descriptor has to be emitted into a client module when associated with
     // `@_alwaysEmitIntoClient` declaration which means it's linkage
     // has to be "shared".
-    if (opaqueType->hasConditionallyAvailableSubstitutions()) {
-      if (auto *srcDecl = opaqueType->getNamingDecl()) {
-        if (srcDecl->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>())
-          return SILLinkage::Shared;
-      }
-    }
+    //
+    // If we don't have conditionally available substitutions, we won't emit
+    // the descriptor at all, but still make sure we report "shared" linkage
+    // so that TBD files don't include a bogus symbol.
+    auto *srcDecl = opaqueType->getNamingDecl();
+    if (srcDecl->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>())
+      return SILLinkage::Shared;
 
     return getSILLinkage(getDeclLinkage(opaqueType), forDefinition);
   }
@@ -802,15 +799,15 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
 
   case Kind::ProtocolWitnessTableLazyAccessFunction:
   case Kind::ProtocolWitnessTableLazyCacheVariable: {
-    auto ty = getType();
-    ValueDecl *nominal = nullptr;
-    if (auto *otat = ty->getAs<OpaqueTypeArchetypeType>()) {
-      nominal = otat->getDecl();
+    TypeDecl *typeDecl = nullptr;
+    if (auto *otat = getType()->getAs<OpaqueTypeArchetypeType>()) {
+      typeDecl = otat->getDecl();
     } else {
-      nominal = ty->getAnyNominal();
+      typeDecl = getProtocolConformance()->getDeclContext()
+          ->getSelfNominalTypeDecl();
     }
-    assert(nominal);
-    if (getDeclLinkage(nominal) == FormalLinkage::Private ||
+    assert(typeDecl);
+    if (getDeclLinkage(typeDecl) == FormalLinkage::Private ||
         getLinkageAsConformance() == SILLinkage::Private) {
       return SILLinkage::Private;
     } else {
@@ -887,9 +884,6 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
   case Kind::ExtendedExistentialTypeShape:
     return (isExtendedExistentialTypeShapeShared()
               ? SILLinkage::Shared : SILLinkage::Private);
-  case Kind::RuntimeDiscoverableAttributeRecord:
-    return SILLinkage::Private;
-
   }
   llvm_unreachable("bad link entity kind");
 }
@@ -984,7 +978,6 @@ bool LinkEntity::isContextDescriptor() const {
   case Kind::DistributedAccessor:
   case Kind::AccessibleFunctionRecord:
   case Kind::ExtendedExistentialTypeShape:
-  case Kind::RuntimeDiscoverableAttributeRecord:
     return false;
   }
   llvm_unreachable("invalid descriptor");
@@ -1112,8 +1105,6 @@ llvm::Type *LinkEntity::getDefaultDeclarationType(IRGenModule &IGM) const {
     return IGM.AccessibleFunctionRecordTy;
   case Kind::ExtendedExistentialTypeShape:
     return IGM.RelativeAddressTy;
-  case Kind::RuntimeDiscoverableAttributeRecord:
-    return IGM.RuntimeDiscoverableAttributeTy;
   default:
     llvm_unreachable("declaration LLVM type not specified");
   }
@@ -1146,7 +1137,6 @@ Alignment LinkEntity::getAlignment(IRGenModule &IGM) const {
   case Kind::OpaqueTypeDescriptorRecord:
   case Kind::AccessibleFunctionRecord:
   case Kind::ExtendedExistentialTypeShape:
-  case Kind::RuntimeDiscoverableAttributeRecord:
     return Alignment(4);
   case Kind::AsyncFunctionPointer:
   case Kind::DispatchThunkAsyncFunctionPointer:
@@ -1311,7 +1301,6 @@ bool LinkEntity::isWeakImported(ModuleDecl *module) const {
   case Kind::DifferentiabilityWitness:
   case Kind::AccessibleFunctionRecord:
   case Kind::ExtendedExistentialTypeShape:
-  case Kind::RuntimeDiscoverableAttributeRecord:
     return false;
 
   case Kind::AsyncFunctionPointer:
@@ -1457,10 +1446,6 @@ DeclContext *LinkEntity::getDeclContextForEmission() const {
   case Kind::DistributedAccessor:
   case Kind::AccessibleFunctionRecord: {
     return getSILFunction()->getParentModule();
-  }
-
-  case Kind::RuntimeDiscoverableAttributeRecord: {
-    return nullptr;
   }
   }
   llvm_unreachable("invalid decl kind");

@@ -164,20 +164,23 @@ auto SILGenFunction::emitSourceLocationArgs(SourceLoc sourceLoc,
   SourceLocArgs result;
   SILValue literal = B.createStringLiteral(emitLoc, StringRef(filename),
                                            StringLiteralInst::Encoding::UTF8);
-  result.filenameStartPointer = ManagedValue::forUnmanaged(literal);
+  result.filenameStartPointer =
+      ManagedValue::forObjectRValueWithoutOwnership(literal);
   // File length
   literal = B.createIntegerLiteral(emitLoc, wordTy, filename.size());
-  result.filenameLength = ManagedValue::forUnmanaged(literal);
+  result.filenameLength =
+      ManagedValue::forObjectRValueWithoutOwnership(literal);
   // File is ascii
   literal = B.createIntegerLiteral(emitLoc, i1Ty, isASCII);
-  result.filenameIsAscii = ManagedValue::forUnmanaged(literal);
+  result.filenameIsAscii =
+      ManagedValue::forObjectRValueWithoutOwnership(literal);
   // Line
   literal = B.createIntegerLiteral(emitLoc, wordTy, line);
-  result.line = ManagedValue::forUnmanaged(literal);
+  result.line = ManagedValue::forObjectRValueWithoutOwnership(literal);
   // Column
   literal = B.createIntegerLiteral(emitLoc, wordTy, column);
-  result.column = ManagedValue::forUnmanaged(literal);
-  
+  result.column = ManagedValue::forObjectRValueWithoutOwnership(literal);
+
   return result;
 }
 
@@ -225,8 +228,8 @@ SILGenFunction::emitPreconditionOptionalHasValue(SILLocation loc,
     auto isImplicitUnwrapLiteral =
       B.createIntegerLiteral(loc, i1Ty, isImplicitUnwrap);
     auto isImplicitUnwrapValue =
-      ManagedValue::forUnmanaged(isImplicitUnwrapLiteral);
-    
+        ManagedValue::forObjectRValueWithoutOwnership(isImplicitUnwrapLiteral);
+
     emitApplyOfLibraryIntrinsic(loc, diagnoseFailure, SubstitutionMap(),
                                 {
                                   args.filenameStartPointer,
@@ -259,7 +262,7 @@ SILGenFunction::emitPreconditionOptionalHasValue(SILLocation loc,
     return ManagedValue::forLValue(result.forward(*this));
   }
 
-  return ManagedValue::forUnmanaged(result.forward(*this));
+  return ManagedValue::forBorrowedRValue(result.forward(*this));
 }
 
 SILValue SILGenFunction::emitDoesOptionalHaveValue(SILLocation loc,
@@ -783,7 +786,7 @@ ManagedValue SILGenFunction::emitExistentialErasure(
       B.createInitExistentialMetatype(loc, metatype,
                       existentialTL.getLoweredType(),
                       conformances);
-    return ManagedValue::forUnmanaged(upcast);
+    return ManagedValue::forObjectRValueWithoutOwnership(upcast);
   }
   case ExistentialRepresentation::Class: {
     assert(existentialTL.isLoadable());
@@ -956,7 +959,7 @@ SILGenFunction::emitOpenExistential(
       SILValue archetypeValue =
         B.createOpenExistentialAddr(loc, existentialValue.getValue(),
                                     loweredOpenedType, allowedAccess);
-      return ManagedValue::forUnmanaged(archetypeValue);
+      return ManagedValue::forBorrowedAddressRValue(archetypeValue);
     } else {
       // borrow the existential and return an unmanaged opened value.
       return B.createOpenExistentialValue(
@@ -999,7 +1002,7 @@ ManagedValue SILGenFunction::manageOpaqueValue(ManagedValue value,
                                                SGFContext C) {
   // If the opaque value is consumable, we can just return the
   // value with a cleanup. There is no need to retain it separately.
-  if (value.isPlusOne(*this))
+  if (value.isPlusOneOrTrivial(*this))
     return value;
 
   // If the context wants a +0 value, guaranteed or immediate, we can
@@ -1235,12 +1238,12 @@ ConvertingInitialization::emitWithAdjustedConversion(SILGenFunction &SGF,
   return ManagedValue::forInContext();
 }
 
-Optional<AbstractionPattern>
+llvm::Optional<AbstractionPattern>
 ConvertingInitialization::getAbstractionPattern() const {
   if (TheConversion.isReabstraction()) {
     return TheConversion.getReabstractionOrigType();
   }
-  return None;
+  return llvm::None;
 }
 
 ManagedValue Conversion::emit(SILGenFunction &SGF, SILLocation loc,
@@ -1295,16 +1298,16 @@ ManagedValue Conversion::emit(SILGenFunction &SGF, SILLocation loc,
   llvm_unreachable("bad kind");
 }
 
-Optional<Conversion>
+llvm::Optional<Conversion>
 Conversion::adjustForInitialOptionalConversions(CanType newSourceType) const {
   switch (getKind()) {
   case SubstToOrig:
   case OrigToSubst:
     // TODO: handle reabstraction conversions here, too.
-    return None;
+    return llvm::None;
 
   case ForceAndBridgeToObjC:
-    return None;
+    return llvm::None;
 
   case AnyErasure:
   case BridgeToObjC:
@@ -1318,7 +1321,7 @@ Conversion::adjustForInitialOptionalConversions(CanType newSourceType) const {
   llvm_unreachable("bad kind");
 }
 
-Optional<Conversion> Conversion::adjustForInitialForceValue() const {
+llvm::Optional<Conversion> Conversion::adjustForInitialForceValue() const {
   switch (getKind()) {
   case SubstToOrig:
   case OrigToSubst:
@@ -1326,7 +1329,7 @@ Optional<Conversion> Conversion::adjustForInitialForceValue() const {
   case BridgeFromObjC:
   case BridgeResultFromObjC:
   case ForceAndBridgeToObjC:
-    return None;
+    return llvm::None;
 
   case BridgeToObjC: {
     auto sourceOptType =
@@ -1466,7 +1469,7 @@ static bool isMatchedAnyToAnyObjectConversion(CanType from, CanType to) {
   return false;
 }
 
-Optional<ConversionPeepholeHint>
+llvm::Optional<ConversionPeepholeHint>
 Lowering::canPeepholeConversions(SILGenFunction &SGF,
                                  const Conversion &outerConversion,
                                  const Conversion &innerConversion) {
@@ -1492,14 +1495,14 @@ Lowering::canPeepholeConversions(SILGenFunction &SGF,
       break;
     }
 
-    return None;
+    return llvm::None;
 
   case Conversion::AnyErasure:
   case Conversion::BridgeFromObjC:
   case Conversion::BridgeResultFromObjC:
     // TODO: maybe peephole bridging through a Swift type?
     // This isn't actually something that happens in normal code generation.
-    return None;
+    return llvm::None;
 
   case Conversion::ForceAndBridgeToObjC:
   case Conversion::BridgeToObjC:
@@ -1513,7 +1516,7 @@ Lowering::canPeepholeConversions(SILGenFunction &SGF,
       // Never peephole if both conversions are explicit; there might be
       // something the user's trying to do which we don't understand.
       if (outerExplicit && innerExplicit)
-        return None;
+        return llvm::None;
 
       // Otherwise, we can peephole if we understand the resulting conversion
       // and applying the peephole doesn't change semantics.
@@ -1529,7 +1532,8 @@ Lowering::canPeepholeConversions(SILGenFunction &SGF,
         outerConversion.getKind() == Conversion::ForceAndBridgeToObjC;
       if (forced) {
         sourceType = sourceType.getOptionalObjectType();
-        if (!sourceType) return None;
+        if (!sourceType)
+          return llvm::None;
         intermediateType = intermediateType.getOptionalObjectType();
         assert(intermediateType);
       }
@@ -1561,7 +1565,7 @@ Lowering::canPeepholeConversions(SILGenFunction &SGF,
       // TODO: use special SILGen to preserve semantics in this case,
       // e.g. by making a copy.
       if (!outerExplicit && !innerExplicit) {
-        return None;
+        return llvm::None;
       }
 
       // Okay, now we're in the domain of the bridging peephole: an
@@ -1594,13 +1598,12 @@ Lowering::canPeepholeConversions(SILGenFunction &SGF,
         }
       }
 
-      return None;
+      return llvm::None;
     }
 
     default:
-      return None;
+      return llvm::None;
     }
   }
   llvm_unreachable("bad kind");
 }
-

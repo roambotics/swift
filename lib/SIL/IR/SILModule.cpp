@@ -412,9 +412,8 @@ bool SILModule::loadFunction(SILFunction *F, LinkingMode LinkMode) {
   return true;
 }
 
-SILFunction *SILModule::loadFunction(StringRef name,
-                                     LinkingMode LinkMode,
-                                     Optional<SILLinkage> linkage) {
+SILFunction *SILModule::loadFunction(StringRef name, LinkingMode LinkMode,
+                                     llvm::Optional<SILLinkage> linkage) {
   SILFunction *func = lookUpFunction(name);
   if (!func)
     func = getSILLoader()->lookupSILFunction(name, linkage);
@@ -545,6 +544,15 @@ SILMoveOnlyDeinit *SILModule::lookUpMoveOnlyDeinit(const NominalTypeDecl *C,
   // If we succeeded, map C -> VTbl in the table and return VTbl.
   MoveOnlyDeinitMap[C] = tbl;
   return tbl;
+}
+
+SILVTable *SILModule::lookUpSpecializedVTable(SILType classTy) {
+  // First try to look up R from the lookup table.
+  auto R = SpecializedVTableMap.find(classTy);
+  if (R != SpecializedVTableMap.end())
+    return R->second;
+
+  return nullptr;
 }
 
 SerializedSILLoader *SILModule::getSILLoader() {
@@ -865,12 +873,42 @@ void SILModule::installSILRemarkStreamer() {
   silRemarkStreamer = SILRemarkStreamer::create(*this);
 }
 
+void SILModule::promoteLinkages() {
+  for (auto &Fn : functions) {
+    // Ignore functions with shared linkage
+    if (Fn.getLinkage() == SILLinkage::Shared)
+      continue;
+
+    if (Fn.isDefinition())
+      Fn.setLinkage(SILLinkage::Public);
+    else
+      Fn.setLinkage(SILLinkage::PublicExternal);
+  }
+
+  for (auto &Global : silGlobals) {
+    // Ignore globals with shared linkage
+    if (Global.getLinkage() == SILLinkage::Shared)
+      continue;
+
+    if (Global.isDefinition())
+      Global.setLinkage(SILLinkage::Public);
+    else
+      Global.setLinkage(SILLinkage::PublicExternal);
+  }
+
+  // TODO: Promote linkage of other SIL entities
+}
+
 bool SILModule::isStdlibModule() const {
   return TheSwiftModule->isStdlibModule();
 }
 void SILModule::performOnceForPrespecializedImportedExtensions(
     llvm::function_ref<void(AbstractFunctionDecl *)> action) {
   if (prespecializedFunctionDeclsImported)
+    return;
+
+  // No prespecitalizations in embedded Swift
+  if (getASTContext().LangOpts.hasFeature(Feature::Embedded))
     return;
 
   SmallVector<ModuleDecl *, 8> importedModules;
@@ -905,10 +943,9 @@ void SILModule::performOnceForPrespecializedImportedExtensions(
   prespecializedFunctionDeclsImported = true;
 }
 
-SILProperty *SILProperty::create(SILModule &M,
-                                 bool Serialized,
-                                 AbstractStorageDecl *Decl,
-                                 Optional<KeyPathPatternComponent> Component) {
+SILProperty *
+SILProperty::create(SILModule &M, bool Serialized, AbstractStorageDecl *Decl,
+                    llvm::Optional<KeyPathPatternComponent> Component) {
   auto prop = new (M) SILProperty(Serialized, Decl, Component);
   M.properties.push_back(prop);
   return prop;

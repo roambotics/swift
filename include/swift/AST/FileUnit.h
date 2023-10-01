@@ -65,6 +65,7 @@ public:
   ///
   /// This does a simple local lookup, not recursively looking through imports.
   virtual void lookupValue(DeclName name, NLKind lookupKind,
+                           OptionSet<ModuleLookupFlags> Flags,
                            SmallVectorImpl<ValueDecl*> &result) const = 0;
 
   /// Look up a local type declaration by its mangled name.
@@ -134,8 +135,10 @@ public:
     return false;
   }
 
-  virtual Optional<Fingerprint>
-  loadFingerprint(const IterableDeclContext *IDC) const { return None; }
+  virtual llvm::Optional<Fingerprint>
+  loadFingerprint(const IterableDeclContext *IDC) const {
+    return llvm::None;
+  }
 
 protected:
   /// Look up an operator declaration. Do not call directly, use
@@ -160,35 +163,35 @@ public:
   ///
   /// This function is an implementation detail for comment serialization.
   /// If you just want to get a comment attached to a decl, use
-  /// \c Decl::getRawComment() or \c Decl::getBriefComment().
-  virtual Optional<CommentInfo>
-  getCommentForDecl(const Decl *D) const {
-    return None;
+  /// \c Decl::getRawComment() or \c Decl::getSemanticBriefComment().
+  virtual llvm::Optional<CommentInfo> getCommentForDecl(const Decl *D) const {
+    return llvm::None;
   }
 
-  virtual Optional<StringRef>
-  getGroupNameForDecl(const Decl *D) const {
-    return None;
+  /// For a serialized AST file, returns \c true if an adjacent swiftdoc has been
+  /// loaded. Otherwise, returns \c false.
+  virtual bool hasLoadedSwiftDoc() const { return false; }
+
+  virtual llvm::Optional<StringRef> getGroupNameForDecl(const Decl *D) const {
+    return llvm::None;
   }
 
-  virtual Optional<StringRef>
+  virtual llvm::Optional<StringRef>
   getSourceFileNameForDecl(const Decl *D) const {
-    return None;
+    return llvm::None;
   }
 
-  virtual Optional<unsigned>
-  getSourceOrderForDecl(const Decl *D) const {
-    return None;
+  virtual llvm::Optional<unsigned> getSourceOrderForDecl(const Decl *D) const {
+    return llvm::None;
   }
 
-  virtual Optional<StringRef>
-  getGroupNameByUSR(StringRef USR) const {
-    return None;
+  virtual llvm::Optional<StringRef> getGroupNameByUSR(StringRef USR) const {
+    return llvm::None;
   }
 
-  virtual Optional<ExternalSourceLocs::RawLocs>
+  virtual llvm::Optional<ExternalSourceLocs::RawLocs>
   getExternalRawLocsForDecl(const Decl *D) const {
-    return None;
+    return llvm::None;
   }
 
   virtual void collectAllGroups(SmallVectorImpl<StringRef> &Names) const {}
@@ -200,7 +203,7 @@ public:
   /// Since this value is used in name mangling, it should be a valid ASCII-only
   /// identifier.
   virtual Identifier
-  getDiscriminatorForPrivateValue(const ValueDecl *D) const = 0;
+  getDiscriminatorForPrivateDecl(const Decl *D) const = 0;
 
   virtual bool shouldCollectDisplayDecls() const { return true; }
 
@@ -294,6 +297,9 @@ public:
   virtual void
   collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const {}
 
+  /// Load extra dependencies of this module to satisfy a testable import.
+  virtual void loadDependenciesForTestable(SourceLoc diagLoc) const {}
+
   /// Returns the path of the file or directory that defines the module
   /// represented by this \c FileUnit, or empty string if there is none.
   /// Cross-import overlay specifiers are found relative to this path.
@@ -378,6 +384,7 @@ public:
   explicit BuiltinUnit(ModuleDecl &M);
 
   virtual void lookupValue(DeclName name, NLKind lookupKind,
+                           OptionSet<ModuleLookupFlags> Flags,
                            SmallVectorImpl<ValueDecl*> &result) const override;
 
   /// Find all Objective-C methods with the given selector.
@@ -386,7 +393,7 @@ public:
          SmallVectorImpl<AbstractFunctionDecl *> &results) const override;
 
   Identifier
-  getDiscriminatorForPrivateValue(const ValueDecl *D) const override {
+  getDiscriminatorForPrivateDecl(const Decl *D) const override {
     llvm_unreachable("no private values in the Builtin module");
   }
 
@@ -428,7 +435,7 @@ public:
     return getModuleDefiningPath();
   }
 
-  virtual StringRef getFilenameForPrivateDecl(const ValueDecl *decl) const {
+  virtual StringRef getFilenameForPrivateDecl(const Decl *decl) const {
     return StringRef();
   }
 

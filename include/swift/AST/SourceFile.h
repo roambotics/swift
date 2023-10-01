@@ -46,7 +46,7 @@ enum class RestrictedImportKind {
 };
 
 /// Import that limits the access level of imported entities.
-using ImportAccessLevel = Optional<AttributedImport<ImportedModule>>;
+using ImportAccessLevel = llvm::Optional<AttributedImport<ImportedModule>>;
 
 /// A file containing Swift source code.
 ///
@@ -90,6 +90,12 @@ public:
     /// Whether to suppress warnings when parsing. This is set for secondary
     /// files, as they get parsed multiple times.
     SuppressWarnings = 1 << 4,
+
+    /// Ensure that the SwiftSyntax tree round trips correctly.
+    RoundTrip = 1 << 5,
+
+    /// Validate the new SwiftSyntax parser diagnostics.
+    ValidateNewParserDiagnostics = 1 << 6,
   };
   using ParsingOptions = OptionSet<ParsingFlags>;
 
@@ -103,11 +109,15 @@ private:
   /// This is the list of modules that are imported by this module.
   ///
   /// This is \c None until it is filled in by the import resolution phase.
-  Optional<ArrayRef<AttributedImport<ImportedModule>>> Imports;
+  llvm::Optional<ArrayRef<AttributedImport<ImportedModule>>> Imports;
 
   /// Which imports have made use of @preconcurrency.
   llvm::SmallDenseSet<AttributedImport<ImportedModule>>
       PreconcurrencyImportsUsed;
+
+  /// The highest access level of declarations referencing each import.
+  llvm::DenseMap<AttributedImport<ImportedModule>, AccessLevel>
+      ImportsUseAccessLevel;
 
   /// A unique identifier representing this file; used to mark private decls
   /// within the file to keep them from conflicting with other files in the
@@ -160,15 +170,19 @@ private:
   /// if it were done from OpaqueResultTypeRequest.
   llvm::SetVector<OpaqueTypeDecl *> UnvalidatedOpaqueReturnTypes;
 
-  /// The set of declarations with valid runtime discoverable attributes
-  /// located in the source file.
-  llvm::SetVector<ValueDecl *> DeclsWithRuntimeDiscoverableAttrs;
+  /// The list of functions defined in this file whose bodies have yet to be
+  /// typechecked. They must be held in this list instead of eagerly validated
+  /// because their bodies may force us to perform semantic checks of arbitrary
+  /// complexity, and we currently cannot handle those checks in isolation. E.g.
+  /// we cannot, in general, perform witness matching on singular requirements
+  /// unless the entire conformance has been evaluated.
+  std::vector<AbstractFunctionDecl *> DelayedFunctions;
 
   /// The list of top-level items in the source file. This is \c None if
   /// they have not yet been parsed.
   /// FIXME: Once addTopLevelDecl/prependTopLevelDecl
   /// have been removed, this can become an optional ArrayRef.
-  Optional<std::vector<ASTNode>> Items;
+  llvm::Optional<std::vector<ASTNode>> Items;
 
   /// The list of hoisted declarations. See Decl::isHoisted().
   /// This is only used by lldb.
@@ -223,10 +237,6 @@ public:
   /// Add a hoisted declaration. See Decl::isHoisted().
   void addHoistedDecl(Decl *d);
 
-  /// Add a declaration with any number of runtime disoverable attributes
-  /// associated with it.
-  void addDeclWithRuntimeDiscoverableAttrs(ValueDecl *);
-
   /// Retrieves an immutable view of the list of top-level items in this file.
   ArrayRef<ASTNode> getTopLevelItems() const;
 
@@ -239,15 +249,11 @@ public:
   /// See Decl::isHoisted().
   ArrayRef<Decl *> getHoistedDecls() const;
 
-  /// Retrieves an immutable view of the set of all declaration with runtime
-  /// discoverable attributes located in this file.
-  ArrayRef<ValueDecl *> getDeclsWithRuntimeDiscoverableAttrs() const;
-
   /// Retrieves an immutable view of the top-level items if they have already
   /// been parsed, or \c None if they haven't. Should only be used for dumping.
-  Optional<ArrayRef<ASTNode>> getCachedTopLevelItems() const {
+  llvm::Optional<ArrayRef<ASTNode>> getCachedTopLevelItems() const {
     if (!Items)
-      return None;
+      return llvm::None;
     return llvm::makeArrayRef(*Items);
   }
 
@@ -258,16 +264,18 @@ public:
   /// code for it. Note this method returns \c false in WMO.
   bool isPrimary() const { return IsPrimary; }
 
+  /// Retrieve the \c ExportedSourceFile instance produced by ASTGen, which
+  /// includes the SourceFileSyntax node corresponding to this source file.
+  void *getExportedSourceFile() const;
+
   /// The list of local type declarations in the source file.
   llvm::SetVector<TypeDecl *> LocalTypeDecls;
 
-  /// The list of functions defined in this file whose bodies have yet to be
-  /// typechecked. They must be held in this list instead of eagerly validated
-  /// because their bodies may force us to perform semantic checks of arbitrary
-  /// complexity, and we currently cannot handle those checks in isolation. E.g.
-  /// we cannot, in general, perform witness matching on singular requirements
-  /// unless the entire conformance has been evaluated.
-  std::vector<AbstractFunctionDecl *> DelayedFunctions;
+  /// Defer type checking of `AFD` to the end of `Sema`
+  void addDelayedFunction(AbstractFunctionDecl *AFD);
+
+  /// Typecheck the bodies of all lazily checked functions
+  void typeCheckDelayedFunctions();
 
   /// A mapping from Objective-C selectors to the methods that have
   /// those selectors.
@@ -330,16 +338,12 @@ public:
   /// this source file.
   llvm::SmallVector<Located<StringRef>, 0> VirtualFilePaths;
 
-  /// The \c ExportedSourceFile instance produced by ASTGen, which includes
-  /// the SourceFileSyntax node corresponding to this source file.
-  void *exportedSourceFile = nullptr;
-
   /// Returns information about the file paths used for diagnostics and magic
   /// identifiers in this source file, including virtual filenames introduced by
   /// \c #sourceLocation(file:) declarations.
   llvm::StringMap<SourceFilePathInfo> getInfoForUsedFilePaths() const;
 
-  SourceFile(ModuleDecl &M, SourceFileKind K, Optional<unsigned> bufferID,
+  SourceFile(ModuleDecl &M, SourceFileKind K, llvm::Optional<unsigned> bufferID,
              ParsingOptions parsingOpts = {}, bool isPrimary = false);
 
   ~SourceFile();
@@ -364,6 +368,15 @@ public:
   /// Note that the given import has used @preconcurrency/
   void setImportUsedPreconcurrency(
       AttributedImport<ImportedModule> import);
+
+  /// Return the highest access level of the declarations referencing
+  /// this import in signature or inlinable code.
+  AccessLevel
+  getMaxAccessLevelUsingImport(AttributedImport<ImportedModule> import) const;
+
+  /// Register the use of \p import from an API with \p accessLevel.
+  void registerAccessLevelUsingImport(AttributedImport<ImportedModule> import,
+                                      AccessLevel accessLevel);
 
   enum ImportQueryKind {
     /// Return the results for testable or private imports.
@@ -442,6 +455,7 @@ public:
   const SmallVectorImpl<ValueDecl *> &getCachedVisibleDecls() const;
 
   virtual void lookupValue(DeclName name, NLKind lookupKind,
+                           OptionSet<ModuleLookupFlags> Flags,
                            SmallVectorImpl<ValueDecl*> &result) const override;
 
   virtual void lookupVisibleDecls(ImportPath::Access accessPath,
@@ -490,18 +504,18 @@ public:
   virtual void
   collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const override;
 
-  Identifier getDiscriminatorForPrivateValue(const ValueDecl *D) const override;
-  Identifier getPrivateDiscriminator() const { return PrivateDiscriminator; }
-  Optional<ExternalSourceLocs::RawLocs>
+  Identifier getDiscriminatorForPrivateDecl(const Decl *D) const override;
+  Identifier getPrivateDiscriminator(bool createIfMissing = false) const;
+  llvm::Optional<ExternalSourceLocs::RawLocs>
   getExternalRawLocsForDecl(const Decl *D) const override;
 
   virtual bool walk(ASTWalker &walker) override;
 
   /// The buffer ID for the file that was imported, or None if there
   /// is no associated buffer.
-  Optional<unsigned> getBufferID() const {
+  llvm::Optional<unsigned> getBufferID() const {
     if (BufferID == -1)
-      return None;
+      return llvm::None;
     return BufferID;
   }
 
@@ -530,7 +544,7 @@ public:
   ///
   /// \Returns the fulfilled macro role, or \c None if this source file is not
   /// for a macro expansion.
-  Optional<MacroRole> getFulfilledMacroRole() const;
+  llvm::Optional<MacroRole> getFulfilledMacroRole() const;
 
   /// When this source file is enclosed within another source file, for example
   /// because it describes a macro expansion, return the source file it was
@@ -695,7 +709,7 @@ private:
 
   /// If not \c None, the underlying vector contains the parsed tokens of this
   /// source file.
-  Optional<ArrayRef<Token>> AllCollectedTokens;
+  llvm::Optional<ArrayRef<Token>> AllCollectedTokens;
 };
 
 inline SourceFile::ParsingOptions operator|(SourceFile::ParsingFlags lhs,

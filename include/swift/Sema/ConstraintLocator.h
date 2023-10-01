@@ -18,11 +18,12 @@
 #ifndef SWIFT_SEMA_CONSTRAINTLOCATOR_H
 #define SWIFT_SEMA_CONSTRAINTLOCATOR_H
 
-#include "swift/Basic/Debug.h"
-#include "swift/Basic/LLVM.h"
 #include "swift/AST/ASTNode.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Debug.h"
+#include "swift/Basic/LLVM.h"
+#include "swift/Basic/NullablePtr.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/PointerIntPair.h"
@@ -53,7 +54,7 @@ enum ContextualTypePurpose : uint8_t {
   CTP_YieldByValue,     ///< By-value yield operand.
   CTP_YieldByReference, ///< By-reference yield operand.
   CTP_ThrowStmt,        ///< Value specified to a 'throw' statement.
-  CTP_ForgetStmt,        ///< Value specified to a 'forget' statement.
+  CTP_DiscardStmt,      ///< Value specified to a 'discard' statement.
   CTP_EnumCaseRawValue, ///< Raw value specified for "case X = 42" in enum.
   CTP_DefaultParameter, ///< Default value in parameter 'foo(a : Int = 42)'.
 
@@ -102,8 +103,14 @@ enum class ConversionRestrictionKind;
 
 /// The kind of SingleValueStmtExpr branch the locator identifies.
 enum class SingleValueStmtBranchKind {
-  Regular,
-  InSingleExprClosure
+  /// Explicitly written 'then <expr>'.
+  Explicit,
+
+  /// Implicitly written '<expr>'.
+  Implicit,
+
+  /// Implicitly written '<expr>' in a single expr closure body.
+  ImplicitInSingleExprClosure
 };
 
 /// Locates a given constraint within the expression being
@@ -168,10 +175,10 @@ public:
     /// Attempts to cast the path element to a specific \c LocatorPathElt
     /// subclass, returning \c None if unsuccessful.
     template <class T>
-    Optional<T> getAs() const {
+    llvm::Optional<T> getAs() const {
       if (auto *result = dyn_cast<T>(this))
         return *result;
-      return None;
+      return llvm::None;
     }
 
     /// Cast the path element to a specific \c LocatorPathElt subclass.
@@ -253,7 +260,7 @@ public:
 
   /// Determine whether given locator points to the keypath value
   bool isKeyPathValue() const;
-  
+
   /// Determine whether given locator points to the choice picked as
   /// as result of the key path dynamic member lookup operation.
   bool isResultOfKeyPathDynamicMemberLookup() const;
@@ -273,6 +280,9 @@ public:
   /// Determine whether this locator points to a result type of
   /// a key path component.
   bool isForKeyPathComponentResult() const;
+
+  /// Determine whether this locator points to a key path component.
+  bool isForKeyPathComponent() const;
 
   /// Determine whether this locator points to the generic parameter.
   bool isForGenericParameter() const;
@@ -309,9 +319,25 @@ public:
   /// SingleValueStmtExpr.
   bool isForSingleValueStmtConjunction() const;
 
+  /// Whether this locator identifies a conjunction for the branches of a
+  /// SingleValueStmtExpr, or a conjunction for one of the BraceStmts itself.
+  bool isForSingleValueStmtConjunctionOrBrace() const;
+
   /// Whether this locator identifies a conversion for a SingleValueStmtExpr
   /// branch, and if so, the kind of branch.
-  Optional<SingleValueStmtBranchKind> isForSingleValueStmtBranch() const;
+  llvm::Optional<SingleValueStmtBranchKind> isForSingleValueStmtBranch() const;
+
+  /// If the locator in question is for a pattern match, returns the pattern,
+  /// otherwise \c nullptr.
+  NullablePtr<Pattern> getPatternMatch() const;
+
+  /// Whether the locator in question is for a pattern match.
+  bool isForPatternMatch() const;
+
+  /// Returns true if \p locator is ending with either of the following
+  ///  - Member
+  ///  - Member -> KeyPathDynamicMember
+  bool isMemberRef() const;
 
   /// Determine whether this locator points directly to a given expression.
   template <typename E> bool directlyAt() const {
@@ -332,10 +358,10 @@ public:
   /// \c LocatorPathElt subclass, returning \c None if either unsuccessful or
   /// the locator has no path elements.
   template <class T>
-  Optional<T> getFirstElementAs() const {
+  llvm::Optional<T> getFirstElementAs() const {
     auto path = getPath();
     if (path.empty())
-      return None;
+      return llvm::None;
 
     return path[0].getAs<T>();
   }
@@ -361,10 +387,10 @@ public:
   /// \c LocatorPathElt subclass, returning \c None if either unsuccessful or
   /// the locator has no path elements.
   template <class T>
-  Optional<T> getLastElementAs() const {
+  llvm::Optional<T> getLastElementAs() const {
     auto path = getPath();
     if (path.empty())
-      return None;
+      return llvm::None;
 
     return path.back().getAs<T>();
   }
@@ -388,7 +414,7 @@ public:
   /// \param iter A reference to an iterator which will be used to iterate
   /// over the locator's path.
   template <class T>
-  Optional<T> findFirst(PathIterator &iter) const {
+  llvm::Optional<T> findFirst(PathIterator &iter) const {
     auto path = getPath();
     auto end = path.end();
     assert(iter >= path.begin() && iter <= end);
@@ -396,14 +422,14 @@ public:
     for (; iter != end; ++iter)
       if (auto elt = iter->getAs<T>())
         return elt;
-    return None;
+    return llvm::None;
   }
 
   /// Attempts to find the first element in the locator's path that is a
   /// specific \c LocatorPathElt subclass, returning \c None if no such element
   /// exists.
   template <class T>
-  Optional<T> findFirst() const {
+  llvm::Optional<T> findFirst() const {
     auto iter = getPath().begin();
     return findFirst<T>(iter);
   }
@@ -415,7 +441,7 @@ public:
   /// \param iter A reference to a reverse iterator which will be used to
   /// iterate over the locator's path.
   template <class T>
-  Optional<T> findLast(PathReverseIterator &iter) const {
+  llvm::Optional<T> findLast(PathReverseIterator &iter) const {
     auto path = getPath();
     auto end = path.rend();
     assert(iter >= path.rbegin() && iter <= end);
@@ -423,14 +449,14 @@ public:
     for (; iter != end; ++iter)
       if (auto elt = iter->getAs<T>())
         return elt;
-    return None;
+    return llvm::None;
   }
 
   /// Attempts to find the last element in the locator's path that is a
   /// specific \c LocatorPathElt subclass, returning \c None if no such element
   /// exists.
   template <class T>
-  Optional<T> findLast() const {
+  llvm::Optional<T> findLast() const {
     auto iter = getPath().rbegin();
     return findLast<T>(iter);
   }
@@ -918,19 +944,19 @@ public:
   }
 };
 
-/// The branch of a SingleValueStmtExpr. Note the stored index corresponds to
-/// the expression branches, i.e it skips statement branch indices.
-class LocatorPathElt::SingleValueStmtBranch final
+/// A particular result of a ThenStmt at a given index in a SingleValueStmtExpr.
+/// The stored index corresponds to the \c getResultExprs array.
+class LocatorPathElt::SingleValueStmtResult final
     : public StoredIntegerElement<1> {
 public:
-  SingleValueStmtBranch(unsigned exprIdx)
-      : StoredIntegerElement(ConstraintLocator::SingleValueStmtBranch,
+  SingleValueStmtResult(unsigned exprIdx)
+      : StoredIntegerElement(ConstraintLocator::SingleValueStmtResult,
                              exprIdx) {}
 
-  unsigned getExprBranchIndex() const { return getValue(); }
+  unsigned getIndex() const { return getValue(); }
 
   static bool classof(const LocatorPathElt *elt) {
-    return elt->getKind() == ConstraintLocator::SingleValueStmtBranch;
+    return elt->getKind() == ConstraintLocator::SingleValueStmtResult;
   }
 };
 
@@ -1045,22 +1071,6 @@ public:
   }
 };
 
-class LocatorPathElt::KeyPathType final
-    : public StoredPointerElement<TypeBase> {
-public:
-  KeyPathType(Type valueType)
-      : StoredPointerElement(PathElementKind::KeyPathType,
-                             valueType.getPointer()) {
-    assert(valueType);
-  }
-
-  Type getValueType() const { return getStoredPointer(); }
-
-  static bool classof(const LocatorPathElt *elt) {
-    return elt->getKind() == PathElementKind::KeyPathType;
-  }
-};
-
 class LocatorPathElt::ConstructorMemberType final
     : public StoredIntegerElement<1> {
 public:
@@ -1172,6 +1182,22 @@ public:
   }
 };
 
+class LocatorPathElt::PackExpansionType final
+    : public StoredPointerElement<swift::PackExpansionType> {
+public:
+  PackExpansionType(swift::PackExpansionType *openedPackExpansionTy)
+      : StoredPointerElement(PathElementKind::PackExpansionType,
+                             openedPackExpansionTy) {
+    assert(openedPackExpansionTy);
+  }
+
+  swift::PackExpansionType *getOpenedType() const { return getStoredPointer(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == PathElementKind::PackExpansionType;
+  }
+};
+
 namespace details {
   template <typename CustomPathElement>
   class PathElement {
@@ -1214,7 +1240,7 @@ class ConstraintLocatorBuilder {
     previous;
 
   /// The current path element, if there is one.
-  Optional<LocatorPathElt> element;
+  llvm::Optional<LocatorPathElt> element;
 
   /// The current set of flags.
   unsigned summaryFlags;
@@ -1242,7 +1268,16 @@ public:
     return ConstraintLocatorBuilder(this, newElt, newFlags);
   }
 
-  /// Determine whether this builder has an empty path.
+  /// Determine whether this locator builder points directly to a
+  /// given expression.
+  template <typename E>
+  bool directlyAt() const {
+    if (auto *expr = getAnchor().dyn_cast<Expr *>())
+      return isa<E>(expr) && !last();
+    return false;
+  }
+
+  /// Determine whether this builder has an empty path (no new elements).
   bool hasEmptyPath() const {
     return !element;
   }
@@ -1340,7 +1375,7 @@ public:
   Expr *trySimplifyToExpr() const;
 
   /// Retrieve the last element in the path, if there is one.
-  Optional<LocatorPathElt> last() const {
+  llvm::Optional<LocatorPathElt> last() const {
     // If we stored a path element here, grab it.
     if (element) return *element;
 
@@ -1351,11 +1386,12 @@ public:
     // Next, check the constraint locator itself.
     if (auto locator = previous.dyn_cast<ConstraintLocator *>()) {
       auto path = locator->getPath();
-      if (path.empty()) return None;
+      if (path.empty())
+        return llvm::None;
       return path.back();
     }
 
-    return None;
+    return llvm::None;
   }
 
   /// Check whether this locator has the given locator path element

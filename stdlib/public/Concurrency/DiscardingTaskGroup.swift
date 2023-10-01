@@ -35,7 +35,7 @@ import Swift
 /// before returning from this function:
 ///
 /// ```
-/// await withDiscardingTaskGroup { group in
+/// await withDiscardingTaskGroup(...) { group in
 ///   group.addTask { /* slow-task */ }
 ///   // slow-task executes...
 /// }
@@ -67,7 +67,7 @@ import Swift
 /// use the `withThrowingDiscardingTaskGroup(returning:body:)` method instead.
 ///
 /// - SeeAlso: ``withThrowingDiscardingTaskGroup(returning:body:)
-@available(SwiftStdlib 5.8, *)
+@available(SwiftStdlib 5.9, *)
 @inlinable
 @_unsafeInheritExecutor
 public func withDiscardingTaskGroup<GroupResult>(
@@ -139,7 +139,7 @@ public func withDiscardingTaskGroup<GroupResult>(
 /// - SeeAlso: ``TaskGroup``
 /// - SeeAlso: ``ThrowingTaskGroup``
 /// - SeeAlso: ``ThrowingDiscardingTaskGroup``
-@available(SwiftStdlib 5.8, *)
+@available(SwiftStdlib 5.9, *)
 @frozen
 public struct DiscardingTaskGroup {
 
@@ -179,13 +179,13 @@ public struct DiscardingTaskGroup {
     let flags = taskCreateFlags(
       priority: priority, isChildTask: true, copyTaskLocals: false,
       inheritContext: false, enqueueJob: false,
-      addPendingGroupTaskUnconditionally: true
+      addPendingGroupTaskUnconditionally: true, isDiscardingTask: true
     )
 #else
     let flags = taskCreateFlags(
       priority: priority, isChildTask: true, copyTaskLocals: false,
       inheritContext: false, enqueueJob: true,
-      addPendingGroupTaskUnconditionally: true
+      addPendingGroupTaskUnconditionally: true, isDiscardingTask: true
     )
 #endif
 
@@ -220,13 +220,13 @@ public struct DiscardingTaskGroup {
     let flags = taskCreateFlags(
       priority: priority, isChildTask: true, copyTaskLocals: false,
       inheritContext: false, enqueueJob: false,
-      addPendingGroupTaskUnconditionally: false
+      addPendingGroupTaskUnconditionally: false, isDiscardingTask: true
     )
 #else
     let flags = taskCreateFlags(
       priority: priority, isChildTask: true, copyTaskLocals: false,
       inheritContext: false, enqueueJob: true,
-      addPendingGroupTaskUnconditionally: false
+      addPendingGroupTaskUnconditionally: false, isDiscardingTask: true
     )
 #endif
 
@@ -243,7 +243,7 @@ public struct DiscardingTaskGroup {
     let flags = taskCreateFlags(
       priority: nil, isChildTask: true, copyTaskLocals: false,
       inheritContext: false, enqueueJob: true,
-      addPendingGroupTaskUnconditionally: true
+      addPendingGroupTaskUnconditionally: true, isDiscardingTask: true
     )
 
     // Create the task in this group.
@@ -274,7 +274,7 @@ public struct DiscardingTaskGroup {
     let flags = taskCreateFlags(
       priority: nil, isChildTask: true, copyTaskLocals: false,
       inheritContext: false, enqueueJob: true,
-      addPendingGroupTaskUnconditionally: false
+      addPendingGroupTaskUnconditionally: false, isDiscardingTask: true
     )
 
     // Create the task in this group.
@@ -331,7 +331,7 @@ public struct DiscardingTaskGroup {
   }
 }
 
-@available(SwiftStdlib 5.8, *)
+@available(SwiftStdlib 5.9, *)
 @available(*, unavailable)
 extension DiscardingTaskGroup: Sendable { }
 
@@ -357,7 +357,7 @@ extension DiscardingTaskGroup: Sendable { }
 /// before returning from this function:
 ///
 /// ```
-/// try await withThrowingDiscardingTaskGroup { group in
+/// try await withThrowingDiscardingTaskGroup(of: Void.self) { group in
 ///   group.addTask { /* slow-task */ }
 ///   // slow-task executes...
 /// }
@@ -390,7 +390,7 @@ extension DiscardingTaskGroup: Sendable { }
 ///
 /// ```
 /// // ThrowingTaskGroup, pattern not applicable to ThrowingDiscardingTaskGroup
-/// try await withThrowingTaskGroup { group in
+/// try await withThrowingTaskGroup(of: Void.self) { group in
 ///   group.addTask { try boom() }
 ///   try await group.next() // re-throws "boom"
 /// }
@@ -407,28 +407,33 @@ extension DiscardingTaskGroup: Sendable { }
 /// out of the `withThrowingDiscardingTaskGroup` method when it returns.
 ///
 /// ```
-/// try await withThrowingDiscardingTaskGroup() { group in
+/// try await withThrowingDiscardingTaskGroup { group in
 ///   group.addTask { try boom(1) }
 ///   group.addTask { try boom(2, after: .seconds(5)) }
 ///   group.addTask { try boom(3, after: .seconds(5)) }
 /// }
 /// ```
 ///
+/// Generally, this suits the typical use cases of a
+/// discarding task group well, however, if you want to prevent specific
+/// errors from canceling the group you can catch them inside the child
+/// task's body like this:
 ///
-///
-/// Generally, this suits the typical use-cases of a
-/// discarding task group well, however, if you wanted to prevent specific
-/// errors from cancelling the group
-///
-///
-///
-///
-/// Throwing an error in one of the child tasks of a task group
-/// doesn't immediately cancel the other tasks in that group.
-/// However,
-/// throwing out of the `body` of the `withThrowingTaskGroup` method does cancel
-/// the group, and all of its child tasks.
-@available(SwiftStdlib 5.8, *)
+/// ```
+/// try await withThrowingDiscardingTaskGroup { group in
+///   group.addTask {
+///     do {
+///       try boom(1)
+///     } catch is HarmlessError {
+///       return
+///     }
+///   }
+///   group.addTask {
+///     try boom(2, after: .seconds(5))
+///   }
+/// }
+/// ```
+@available(SwiftStdlib 5.9, *)
 @inlinable
 @_unsafeInheritExecutor
 public func withThrowingDiscardingTaskGroup<GroupResult>(
@@ -490,7 +495,7 @@ public func withThrowingDiscardingTaskGroup<GroupResult>(
 /// A throwing discarding task group becomes cancelled in one of the following ways:
 ///
 /// - when ``cancelAll()`` is invoked on it,
-/// - when an error is thrown out of the `withThrowingDiscardingTaskGroup(...) { }` closure,
+/// - when an error is thrown out of the `withThrowingDiscardingTaskGroup { ... }` closure,
 /// - when the ``Task`` running this task group is cancelled.
 ///
 /// But also, and uniquely in *discarding* task groups:
@@ -524,7 +529,7 @@ public func withThrowingDiscardingTaskGroup<GroupResult>(
 /// - SeeAlso: ``TaskGroup``
 /// - SeeAlso: ``ThrowingTaskGroup``
 /// - SeeAlso: ``DiscardingTaskGroup``
-@available(SwiftStdlib 5.8, *)
+@available(SwiftStdlib 5.9, *)
 @frozen
 public struct ThrowingDiscardingTaskGroup<Failure: Error> {
 
@@ -555,7 +560,7 @@ public struct ThrowingDiscardingTaskGroup<Failure: Error> {
     let flags = taskCreateFlags(
       priority: priority, isChildTask: true, copyTaskLocals: false,
       inheritContext: false, enqueueJob: true,
-      addPendingGroupTaskUnconditionally: true
+      addPendingGroupTaskUnconditionally: true, isDiscardingTask: true
     )
 
     // Create the task in this group.
@@ -584,7 +589,7 @@ public struct ThrowingDiscardingTaskGroup<Failure: Error> {
     let flags = taskCreateFlags(
       priority: priority, isChildTask: true, copyTaskLocals: false,
       inheritContext: false, enqueueJob: true,
-      addPendingGroupTaskUnconditionally: false
+      addPendingGroupTaskUnconditionally: false, isDiscardingTask: true
     )
 
     // Create the task in this group.
@@ -598,7 +603,7 @@ public struct ThrowingDiscardingTaskGroup<Failure: Error> {
 
   /// A Boolean value that indicates whether the group has any remaining tasks.
   ///
-  /// At the start of the body of a `withThrowingDiscardingTaskGroup(of:returning:body:)` call,
+  /// At the start of the body of a `withThrowingDiscardingTaskGroup(returning:body:)` call,
   /// the task group is always empty.
   ///
   /// It's guaranteed to be empty when returning from that body
@@ -641,7 +646,7 @@ public struct ThrowingDiscardingTaskGroup<Failure: Error> {
   }
 }
 
-@available(SwiftStdlib 5.8, *)
+@available(SwiftStdlib 5.9, *)
 @available(*, unavailable)
 extension ThrowingDiscardingTaskGroup: Sendable { }
 
@@ -649,7 +654,7 @@ extension ThrowingDiscardingTaskGroup: Sendable { }
 // MARK: Runtime functions
 
 /// Always returns `nil`.
-@available(SwiftStdlib 5.8, *)
+@available(SwiftStdlib 5.9, *)
 @usableFromInline
 @discardableResult
 @_silgen_name("swift_taskGroup_waitAll")

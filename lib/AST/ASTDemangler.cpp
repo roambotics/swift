@@ -31,6 +31,7 @@
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -327,18 +328,25 @@ Type ASTBuilder::createBoundGenericType(GenericTypeDecl *decl,
   return aliasDecl->getDeclaredInterfaceType().subst(subMap);
 }
 
-Type ASTBuilder::createTupleType(ArrayRef<Type> eltTypes, StringRef labels) {
+Type ASTBuilder::createTupleType(ArrayRef<Type> eltTypes, ArrayRef<StringRef> labels) {
+  // Unwrap unlabeled one-element tuples.
+  //
+  // FIXME: The behavior of one-element labeled tuples is inconsistent
+  // throughout the different re-implementations of type substitution
+  // and pack expansion.
+  if (eltTypes.size() == 1 &&
+      !eltTypes[0]->is<PackExpansionType>() &&
+      labels[0].empty()) {
+    return eltTypes[0];
+  }
+
   SmallVector<TupleTypeElt, 4> elements;
   elements.reserve(eltTypes.size());
-  for (auto eltType : eltTypes) {
+  for (unsigned i : indices(eltTypes)) {
     Identifier label;
-    if (!labels.empty()) {
-      auto split = labels.split(' ');
-      if (!split.first.empty())
-        label = Ctx.getIdentifier(split.first);
-      labels = split.second;
-    }
-    elements.emplace_back(eltType, label);
+    if (!labels[i].empty())
+      label = Ctx.getIdentifier(labels[i]);
+    elements.emplace_back(eltTypes[i], label);
   }
 
   return TupleType::get(elements, Ctx);
@@ -359,8 +367,24 @@ Type ASTBuilder::createSILPackType(ArrayRef<Type> eltTypes,
   return SILPackType::get(Ctx, extInfo, elements);
 }
 
-Type ASTBuilder::createPackExpansionType(Type patternType, Type countType) {
+size_t ASTBuilder::beginPackExpansion(Type countType) {
+  ActivePackExpansions.push_back(countType);
+
+  return 1;
+}
+
+void ASTBuilder::advancePackExpansion(size_t index) {
+  assert(index == 0);
+}
+
+Type ASTBuilder::createExpandedPackElement(Type patternType) {
+  assert(!ActivePackExpansions.empty());
+  auto countType = ActivePackExpansions.back();
   return PackExpansionType::get(patternType, countType);
+}
+
+void ASTBuilder::endPackExpansion() {
+  ActivePackExpansions.pop_back();
 }
 
 Type ASTBuilder::createFunctionType(
@@ -430,10 +454,13 @@ Type ASTBuilder::createFunctionType(
     clangFunctionType = Ctx.getClangFunctionType(funcParams, output,
                                                  representation);
 
+  // FIXME: Populate thrownError
+  Type thrownError;
+
   auto einfo =
       FunctionType::ExtInfoBuilder(representation, noescape, flags.isThrowing(),
-                                   resultDiffKind, clangFunctionType,
-                                   globalActor)
+                                   thrownError, resultDiffKind,
+                                   clangFunctionType, globalActor)
           .withAsync(flags.isAsync())
           .withConcurrent(flags.isSendable())
           .build();
@@ -513,7 +540,7 @@ Type ASTBuilder::createImplFunctionType(
     Demangle::ImplParameterConvention calleeConvention,
     ArrayRef<Demangle::ImplFunctionParam<Type>> params,
     ArrayRef<Demangle::ImplFunctionResult<Type>> results,
-    Optional<Demangle::ImplFunctionResult<Type>> errorResult,
+    llvm::Optional<Demangle::ImplFunctionResult<Type>> errorResult,
     ImplFunctionTypeFlags flags) {
   GenericSignature genericSig;
 
@@ -562,10 +589,14 @@ Type ASTBuilder::createImplFunctionType(
   #undef SIMPLE_CASE
   }
 
+  // There's no representation of this in the mangling because it can't
+  // occur in well-formed programs.
+  bool unimplementable = false;
+
   llvm::SmallVector<SILParameterInfo, 8> funcParams;
   llvm::SmallVector<SILYieldInfo, 8> funcYields;
   llvm::SmallVector<SILResultInfo, 8> funcResults;
-  Optional<SILResultInfo> funcErrorResult;
+  llvm::Optional<SILResultInfo> funcErrorResult;
 
   for (const auto &param : params) {
     auto type = param.getType()->getCanonicalType();
@@ -592,13 +623,14 @@ Type ASTBuilder::createImplFunctionType(
     assert(funcResults.size() <= 1 && funcYields.size() == 0 &&
            "C functions and blocks have at most 1 result and 0 yields.");
     auto result =
-        funcResults.empty() ? Optional<SILResultInfo>() : funcResults[0];
+        funcResults.empty() ? llvm::Optional<SILResultInfo>() : funcResults[0];
     clangFnType = getASTContext().getCanonicalClangFunctionType(
         funcParams, result, representation);
   }
   auto einfo = SILFunctionType::ExtInfoBuilder(
                    representation, flags.isPseudogeneric(), !flags.isEscaping(),
-                   flags.isSendable(), flags.isAsync(), diffKind, clangFnType)
+                   flags.isSendable(), flags.isAsync(),
+                   unimplementable, diffKind, clangFnType)
                    .build();
 
   return SILFunctionType::get(genericSig, einfo, funcCoroutineKind,
@@ -642,8 +674,8 @@ getMetatypeRepresentation(ImplMetatypeRepresentation repr) {
   llvm_unreachable("covered switch");
 }
 
-Type ASTBuilder::createExistentialMetatypeType(Type instance,
-                          Optional<Demangle::ImplMetatypeRepresentation> repr) {
+Type ASTBuilder::createExistentialMetatypeType(
+    Type instance, llvm::Optional<Demangle::ImplMetatypeRepresentation> repr) {
   if (auto existential = instance->getAs<ExistentialType>())
     instance = existential->getConstraintType();
   if (!instance->isAnyExistentialType())
@@ -674,8 +706,7 @@ Type ASTBuilder::createConstrainedExistentialType(
 
     case RequirementKind::SameType:
       if (auto *DMT = req.getFirstType()->getAs<DependentMemberType>())
-        if (baseDecl->getAssociatedType(DMT->getName()))
-          cmap[DMT->getName()] = req.getSecondType();
+        cmap[DMT->getName()] = req.getSecondType();
     }
   }
   llvm::SmallVector<Type, 4> args;
@@ -696,31 +727,36 @@ Type ASTBuilder::createSymbolicExtendedExistentialType(NodePointer shapeNode,
   return Type();
 }
 
-Type ASTBuilder::createMetatypeType(Type instance,
-                         Optional<Demangle::ImplMetatypeRepresentation> repr) {
+Type ASTBuilder::createMetatypeType(
+    Type instance, llvm::Optional<Demangle::ImplMetatypeRepresentation> repr) {
   if (!repr)
     return MetatypeType::get(instance);
 
   return MetatypeType::get(instance, getMetatypeRepresentation(*repr));
 }
 
+void ASTBuilder::pushGenericParams(ArrayRef<std::pair<unsigned, unsigned>> parameterPacks) {
+  ParameterPackStack.push_back(ParameterPacks);
+  ParameterPacks.clear();
+  ParameterPacks.append(parameterPacks.begin(), parameterPacks.end());
+}
+
+void ASTBuilder::popGenericParams() {
+  ParameterPacks = ParameterPackStack.back();
+  ParameterPackStack.pop_back();
+}
+
 Type ASTBuilder::createGenericTypeParameterType(unsigned depth,
                                                 unsigned index) {
-  // If we have a generic signature, find the parameter with the matching
-  // depth and index and return it, to get the correct value for the
-  // isParameterPack() bit.
-  if (GenericSig) {
-    for (auto paramTy : GenericSig.getGenericParams()) {
-      if (paramTy->getDepth() == depth && paramTy->getIndex() == index) {
-        return paramTy;
+  if (!ParameterPacks.empty()) {
+    for (auto pair : ParameterPacks) {
+      if (pair.first == depth && pair.second == index) {
+        return GenericTypeParamType::get(/*isParameterPack*/ true,
+                                         depth, index, Ctx);
       }
     }
-
-    return Type();
   }
 
-  // Otherwise, just assume we're not working with variadic generics.
-  // FIXME: Should we always require a generic signature in this case?
   return GenericTypeParamType::get(/*isParameterPack*/ false,
                                    depth, index, Ctx);
 }
@@ -881,7 +917,7 @@ Type ASTBuilder::createParenType(Type base) {
 GenericSignature
 ASTBuilder::createGenericSignature(ArrayRef<BuiltType> builtParams,
                                    ArrayRef<BuiltRequirement> requirements) {
-  std::vector<BuiltGenericTypeParam> params;
+  std::vector<GenericTypeParamType *> params;
   for (auto &param : builtParams) {
     auto paramTy = param->getAs<GenericTypeParamType>();
     if (!paramTy)
@@ -984,19 +1020,19 @@ ASTBuilder::findModuleNode(NodePointer node) {
   return child;
 }
 
-Optional<ASTBuilder::ForeignModuleKind>
+llvm::Optional<ASTBuilder::ForeignModuleKind>
 ASTBuilder::getForeignModuleKind(NodePointer node) {
   if (node->getKind() == Demangle::Node::Kind::DeclContext)
     return getForeignModuleKind(node->getFirstChild());
 
   if (node->getKind() != Demangle::Node::Kind::Module)
-    return None;
+    return llvm::None;
 
-  return llvm::StringSwitch<Optional<ForeignModuleKind>>(node->getText())
+  return llvm::StringSwitch<llvm::Optional<ForeignModuleKind>>(node->getText())
       .Case(MANGLING_MODULE_OBJC, ForeignModuleKind::Imported)
       .Case(MANGLING_MODULE_CLANG_IMPORTER,
             ForeignModuleKind::SynthesizedByImporter)
-      .Default(None);
+      .Default(llvm::None);
 }
 
 LayoutConstraint ASTBuilder::getLayoutConstraint(LayoutConstraintKind kind) {
@@ -1012,15 +1048,25 @@ LayoutConstraint ASTBuilder::getLayoutConstraintWithSizeAlign(
 CanGenericSignature ASTBuilder::demangleGenericSignature(
     NominalTypeDecl *nominalDecl,
     NodePointer node) {
-  llvm::SaveAndRestore<GenericSignature> savedSignature(
-      GenericSig, nominalDecl->getGenericSignature());
+  auto baseGenericSig = nominalDecl->getGenericSignature();
 
+  // The generic signature is for a constrained extension of nominalDecl, so
+  // we introduce the parameter packs from the nominal's generic signature.
+  ParameterPackStack.push_back(ParameterPacks);
+  ParameterPacks.clear();
+  for (auto *paramTy : baseGenericSig.getGenericParams()) {
+    if (paramTy->isParameterPack())
+      ParameterPacks.emplace_back(paramTy->getDepth(), paramTy->getIndex());
+  }
+  SWIFT_DEFER { popGenericParams(); };
+
+  // Constrained extensions mangle the subset of requirements not satisfied
+  // by the nominal's generic signature.
   SmallVector<Requirement, 2> requirements;
-
   decodeRequirement<BuiltType, BuiltRequirement, BuiltLayoutConstraint,
                     ASTBuilder>(node, requirements, *this);
-  return buildGenericSignature(Ctx, nominalDecl->getGenericSignature(),
-                               {}, std::move(requirements))
+
+  return buildGenericSignature(Ctx, baseGenericSig, {}, std::move(requirements))
       .getCanonicalSignature();
 }
 
@@ -1194,7 +1240,7 @@ ASTBuilder::findTypeDecl(DeclContext *dc,
   return result;
 }
 
-static Optional<ClangTypeKind>
+static llvm::Optional<ClangTypeKind>
 getClangTypeKindForNodeKind(Demangle::Node::Kind kind) {
   switch (kind) {
   case Demangle::Node::Kind::Protocol:
@@ -1207,7 +1253,7 @@ getClangTypeKindForNodeKind(Demangle::Node::Kind kind) {
   case Demangle::Node::Kind::Enum:
     return ClangTypeKind::Tag;
   default:
-    return None;
+    return llvm::None;
   }
 }
 
@@ -1248,7 +1294,7 @@ GenericTypeDecl *ASTBuilder::findForeignTypeDecl(StringRef name,
     consumer.foundDecl(found, DeclVisibilityKind::VisibleAtTopLevel);
   };
 
-  Optional<ClangTypeKind> lookupKind = getClangTypeKindForNodeKind(kind);
+  llvm::Optional<ClangTypeKind> lookupKind = getClangTypeKindForNodeKind(kind);
   if (!lookupKind)
     return nullptr;
 

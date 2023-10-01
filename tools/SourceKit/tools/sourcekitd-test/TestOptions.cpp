@@ -153,6 +153,8 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
         .Case("diags", SourceKitRequest::Diagnostics)
         .Case("compile", SourceKitRequest::Compile)
         .Case("compile.close", SourceKitRequest::CompileClose)
+        .Case("syntactic-expandmacro", SourceKitRequest::SyntacticMacroExpansion)
+        .Case("index-to-store", SourceKitRequest::IndexToStore)
 #define SEMANTIC_REFACTORING(KIND, NAME, ID) .Case("refactoring." #ID, SourceKitRequest::KIND)
 #include "swift/Refactoring/RefactoringKinds.def"
         .Default(SourceKitRequest::None);
@@ -203,6 +205,8 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
                      << "- collect-type\n"
                      << "- global-config\n"
                      << "- dependency-updated\n"
+                     << "- syntactic-expandmacro\n"
+                     << "- index-to-store\n"
 #define SEMANTIC_REFACTORING(KIND, NAME, ID) << "- refactoring." #ID "\n"
 #include "swift/Refactoring/RefactoringKinds.def"
                         "\n";
@@ -424,6 +428,14 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
 
     case OPT_vfs_name:
       VFSName = InputArg->getValue();
+      break;
+
+    case OPT_index_store_path:
+      IndexStorePath = InputArg->getValue();
+      break;
+
+    case OPT_index_unit_output_path:
+      IndexUnitOutputPath = InputArg->getValue();
       break;
 
     case OPT_module_cache_path:

@@ -2,7 +2,7 @@
 // RUN: not %target-swift-frontend -typecheck %s -debug-generic-signatures 2>&1 | %FileCheck %s
 
 protocol Fooable {
-  associatedtype Foo // expected-note{{protocol requires nested type 'Foo'; do you want to add it?}}
+  associatedtype Foo // expected-note{{protocol requires nested type 'Foo'; add nested type 'Foo' for conformance}}
 
   var foo: Foo { get }
 }
@@ -362,7 +362,7 @@ func testSameTypeCommutativity4<U, T>(_ t: T, _ u: U)
 // expected-warning@-2{{same-type requirement makes generic parameter 'T' non-generic}}
 
 // CHECK-LABEL: same_types.(file).testSameTypeCommutativity5@
-// CHECK-NEXT: Generic signature: <U, T where T : P1, T.[P1]Assoc == P3 & PPP>
+// CHECK-NEXT: Generic signature: <U, T where T : P1, T.[P1]Assoc == any P3 & PPP>
 func testSameTypeCommutativity5<U, T: P1>(_ t: T, _ u: U)
   where PPP & P3 == T.Assoc { } // Ok, equivalent to T.Assoc == PPP & P3
 

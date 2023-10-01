@@ -483,7 +483,7 @@ public:
   // set needs to continue to be updated (by this handler) when deleting
   // instructions. This assumes that DeadFunctionValSet::erase() is stable.
   void cleanupDeadClosures(SILFunction *F) {
-    for (Optional<SILInstruction *> I : deadFunctionVals) {
+    for (llvm::Optional<SILInstruction *> I : deadFunctionVals) {
       if (!I.has_value() || I.value()->isDeleted())
         continue;
 
@@ -732,6 +732,10 @@ getCalleeFunction(SILFunction *F, FullApplySite AI, bool &IsThick,
   case SILFunctionTypeRepresentation::Method:
   case SILFunctionTypeRepresentation::Closure:
   case SILFunctionTypeRepresentation::WitnessMethod:
+  case SILFunctionTypeRepresentation::KeyPathAccessorGetter:
+  case SILFunctionTypeRepresentation::KeyPathAccessorSetter:
+  case SILFunctionTypeRepresentation::KeyPathAccessorEquals:
+  case SILFunctionTypeRepresentation::KeyPathAccessorHash:
     break;
     
   case SILFunctionTypeRepresentation::CFunctionPointer:

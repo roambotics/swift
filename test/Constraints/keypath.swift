@@ -136,8 +136,8 @@ func test_mismatch_with_contextual_optional_result() {
     var arr: [Int] = []
   }
 
-  let _ = A(B(), keyPath: \.arr)
-  // expected-error@-1 {{key path value type '[Int]' cannot be converted to contextual type '[Int]?'}}
+  let _ = A(B(), keyPath: \.arr) // expected-error {{cannot convert value of type 'KeyPath<B, [Int]>' to expected argument type 'KeyPath<B, [Int]?>'}}
+  // expected-note@-1 {{arguments to generic parameter 'Value' ('[Int]' and '[Int]?') are expected to be equal}}
 }
 
 // https://github.com/apple/swift/issues/53581
@@ -180,6 +180,20 @@ func key_path_root_mismatch<T>(_ base: KeyPathBase?, subBase: KeyPathBaseSubtype
 
 }
 
+func key_path_value_mismatch() {
+  struct S {
+    var member: Int
+  }
+	
+  func test(_: KeyPath<S, String>) {}
+  // expected-note@-1 {{found candidate with type 'KeyPath<S, Int>'}}
+  func test(_: KeyPath<S, Float>) {}
+  // expected-note@-1 {{found candidate with type 'KeyPath<S, Int>'}}
+	
+  test(\.member)
+  // expected-error@-1 {{no exact matches in call to local function 'test'}}
+}
+
 // https://github.com/apple/swift/issues/55884
 func f_55884() {
   func f<T>(_ x: KeyPath<String?, T>) -> T { "1"[keyPath: x] }
@@ -205,4 +219,47 @@ func rdar85458997() {
 
   _ = S(\.name)
   // expected-error@-1 {{cannot infer key path type from context; consider explicitly specifying a root type}} {{10-10=<#Root#>}}
+}
+
+// https://github.com/apple/swift/issues/65965 - failed to produce correct types for key path capability mismatch
+func issue_65965() {
+  struct S {
+	  var s: String
+	  let v: String
+  }
+	
+  let refKP: ReferenceWritableKeyPath<S, String>
+  refKP = \.s
+  // expected-error@-1 {{key path value type 'WritableKeyPath<S, String>' cannot be converted to contextual type 'ReferenceWritableKeyPath<S, String>'}}
+	
+  let writeKP: WritableKeyPath<S, String>
+  writeKP = \.v
+  // expected-error@-1 {{key path value type 'KeyPath<S, String>' cannot be converted to contextual type 'WritableKeyPath<S, String>'}}
+}
+
+func test_any_key_path() {
+  struct S {
+    var v: String
+  }
+  
+  var anyKP: AnyKeyPath
+  anyKP = \S.v
+  anyKP = \.v
+  // expected-error@-1 {{cannot infer key path type from context; consider explicitly specifying a root type}}
+}
+
+// rdar://problem/32101765 - Keypath diagnostics are not actionable/helpful
+func rdar32101765() {
+  struct R32101765 {
+    let prop32101765 = 0
+  }
+  
+  let _: KeyPath<R32101765, Float> = \.prop32101765
+  // expected-error@-1 {{key path value type 'Int' cannot be converted to contextual type 'Float'}}
+  let _: KeyPath<R32101765, Float> = \R32101765.prop32101765
+  // expected-error@-1 {{key path value type 'Int' cannot be converted to contextual type 'Float'}}
+  let _: KeyPath<R32101765, Float> = \.prop32101765.unknown
+  // expected-error@-1 {{type 'Int' has no member 'unknown'}}
+  let _: KeyPath<R32101765, Float> = \R32101765.prop32101765.unknown
+  // expected-error@-1 {{type 'Int' has no member 'unknown'}}
 }

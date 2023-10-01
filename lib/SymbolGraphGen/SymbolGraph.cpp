@@ -31,9 +31,9 @@ using namespace swift;
 using namespace symbolgraphgen;
 
 SymbolGraph::SymbolGraph(SymbolGraphASTWalker &Walker, ModuleDecl &M,
-                         Optional<ModuleDecl *> ExtendedModule,
+                         llvm::Optional<ModuleDecl *> ExtendedModule,
                          markup::MarkupContext &Ctx,
-                         Optional<llvm::VersionTuple> ModuleVersion,
+                         llvm::Optional<llvm::VersionTuple> ModuleVersion,
                          bool IsForSingleNode)
     : Walker(Walker), M(M), ExtendedModule(ExtendedModule), Ctx(Ctx),
       ModuleVersion(ModuleVersion), IsForSingleNode(IsForSingleNode) {
@@ -63,12 +63,13 @@ PrintOptions SymbolGraph::getDeclarationFragmentsPrintOptions() const {
   Opts.PrintFunctionRepresentationAttrs =
     PrintOptions::FunctionRepresentationMode::None;
   Opts.PrintUserInaccessibleAttrs = false;
-  Opts.SkipPrivateStdlibDecls = true;
-  Opts.SkipUnderscoredStdlibProtocols = true;
+  Opts.SkipPrivateStdlibDecls = !Walker.Options.PrintPrivateStdlibSymbols;
+  Opts.SkipUnderscoredStdlibProtocols = !Walker.Options.PrintPrivateStdlibSymbols;
   Opts.PrintGenericRequirements = true;
   Opts.PrintInherited = false;
   Opts.ExplodeEnumCaseDecls = true;
   Opts.PrintFactoryInitializerComment = false;
+  Opts.PrintMacroDefinitions = false;
 
   Opts.ExclusiveAttrList.clear();
 
@@ -190,15 +191,6 @@ SymbolGraph::isRequirementOrDefaultImplementation(const ValueDecl *VD) const {
 // MARK: - Symbols (Nodes)
 
 void SymbolGraph::recordNode(Symbol S) {
-  if (Walker.Options.SkipProtocolImplementations && S.getInheritedDecl()) {
-    const auto *DocCommentProvidingDecl =
-      getDocCommentProvidingDecl(S.getLocalSymbolDecl(), /*AllowSerialized=*/true);
-
-    // allow implementation symbols to remain if they have their own comment
-    if (DocCommentProvidingDecl != S.getLocalSymbolDecl())
-      return;
-  }
-
   Nodes.insert(S);
 
   // Record all of the possible relationships (edges) originating
@@ -284,15 +276,21 @@ void SymbolGraph::recordMemberRelationship(Symbol S) {
 
 bool SymbolGraph::synthesizedMemberIsBestCandidate(const ValueDecl *VD,
     const NominalTypeDecl *Owner) const {
-  const auto *FD = dyn_cast<FuncDecl>(VD);
-  if (!FD) {
+  DeclName Name;
+  if (const auto *FD = dyn_cast<FuncDecl>(VD)) {
+    Name = FD->getEffectiveFullName();
+  } else {
+    Name = VD->getName();
+  }
+
+  if (!Name) {
     return true;
   }
+
   auto *DC = const_cast<DeclContext*>(Owner->getDeclContext());
 
   ResolvedMemberResult Result =
-    resolveValueMember(*DC, Owner->getSelfTypeInContext(),
-                       FD->getEffectiveFullName());
+    resolveValueMember(*DC, Owner->getSelfTypeInContext(), Name);
 
   const auto ViableCandidates =
     Result.getMemberDecls(InterestedMemberKind::All);
@@ -391,7 +389,7 @@ void
 SymbolGraph::recordInheritanceRelationships(Symbol S) {
   const auto VD = S.getLocalSymbolDecl();
   if (const auto *NTD = dyn_cast<NominalTypeDecl>(VD)) {
-    for (const auto &InheritanceLoc : NTD->getInherited()) {
+    for (const auto &InheritanceLoc : NTD->getInherited().getEntries()) {
       auto Ty = InheritanceLoc.getType();
       if (!Ty) {
         continue;
@@ -495,6 +493,13 @@ void SymbolGraph::recordConformanceRelationships(Symbol S) {
       });
     } else {
       for (const auto *Conformance : NTD->getAllConformances()) {
+        // Check to make sure that this conformance wasn't declared via an
+        // unconditionally-unavailable extension. If so, don't add that to the graph.
+        if (const auto *ED = dyn_cast_or_null<ExtensionDecl>(Conformance->getDeclContext())) {
+          if (isUnconditionallyUnavailableOnAllPlatforms(ED)) {
+            continue;
+          }
+        }
         recordEdge(
             S, Symbol(this, Conformance->getProtocol(), nullptr),
             RelationshipKind::ConformsTo(),
@@ -636,6 +641,19 @@ SymbolGraph::serializeDeclarationFragments(StringRef Key, Type T,
   T->print(Printer, Options);
 }
 
+namespace {
+
+const ValueDecl *getProtocolRequirement(const ValueDecl *VD) {
+  auto reqs = VD->getSatisfiedProtocolRequirements();
+
+  if (!reqs.empty())
+    return reqs.front();
+  else
+    return nullptr;
+}
+
+}
+
 bool SymbolGraph::isImplicitlyPrivate(const Decl *D,
                                       bool IgnoreContext) const {
   // Don't record unconditionally private declarations
@@ -697,9 +715,20 @@ bool SymbolGraph::isImplicitlyPrivate(const Decl *D,
 
     // Special cases below.
 
+    // If we've been asked to skip protocol implementations, filter them out here.
+    if (Walker.Options.SkipProtocolImplementations && getProtocolRequirement(VD)) {
+      // Allow them to stay if they have their own doc comment
+      const auto *DocCommentProvidingDecl = getDocCommentProvidingDecl(VD);
+      if (DocCommentProvidingDecl != VD)
+        return true;
+    }
+
     // Symbols from exported-imported modules should only be included if they
     // were originally public.
-    if (Walker.isFromExportedImportedModule(D) &&
+    // We force compiler-equality here to ensure that the presence of an underlying
+    // Clang module does not prevent internal Swift symbols from being emitted when
+    // MinimumAccessLevel is set to `internal` or below.
+    if (Walker.isFromExportedImportedModule(D, /*countUnderlyingClangModule*/false) &&
         VD->getFormalAccess() < AccessLevel::Public) {
       return true;
     }

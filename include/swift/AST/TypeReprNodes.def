@@ -65,6 +65,7 @@ TYPEREPR(Protocol, TypeRepr)
 TYPEREPR(OpaqueReturn, TypeRepr)
 TYPEREPR(NamedOpaqueReturn, TypeRepr)
 TYPEREPR(Existential, TypeRepr)
+TYPEREPR(Inverse, TypeRepr)
 TYPEREPR(Pack, TypeRepr)
 TYPEREPR(PackElement, TypeRepr)
 TYPEREPR(Placeholder, TypeRepr)
@@ -74,7 +75,8 @@ ABSTRACT_TYPEREPR(Specifier, TypeRepr)
   SPECIFIER_TYPEREPR(CompileTimeConst, SpecifierTypeRepr)
 TYPEREPR(Fixed, TypeRepr)
 TYPEREPR(SILBox, TypeRepr)
-LAST_TYPEREPR(SILBox)
+TYPEREPR(Self, TypeRepr)
+LAST_TYPEREPR(Self)
 
 #undef SPECIFIER_TYPEREPR
 #undef ABSTRACT_TYPEREPR

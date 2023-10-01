@@ -59,12 +59,18 @@ static void emitObjCConditional(raw_ostream &out,
 
 static void writePtrauthPrologue(raw_ostream &os) {
   emitCxxConditional(os, [&]() {
-    os << "#if __has_include(<ptrauth.h>)\n";
+    os << "#if defined(__arm64e__) && __has_include(<ptrauth.h>)\n";
     os << "# include <ptrauth.h>\n";
     os << "#else\n";
-    os << "# ifndef __ptrauth_swift_value_witness_function_pointer\n";
-    os << "#  define __ptrauth_swift_value_witness_function_pointer(x)\n";
-    os << "# endif\n";
+    ClangSyntaxPrinter(os).printIgnoredDiagnosticBlock(
+        "reserved-macro-identifier", [&]() {
+          os << "# ifndef __ptrauth_swift_value_witness_function_pointer\n";
+          os << "#  define __ptrauth_swift_value_witness_function_pointer(x)\n";
+          os << "# endif\n";
+          os << "# ifndef __ptrauth_swift_class_method_pointer\n";
+          os << "#  define __ptrauth_swift_class_method_pointer(x)\n";
+          os << "# endif\n";
+        });
     os << "#endif\n";
   });
 }
@@ -442,6 +448,7 @@ writeImports(raw_ostream &out, llvm::SmallPtrSetImpl<ImportModuleTy> &imports,
   bool includeUnderlying = false;
   StringRef importDirective =
       useCxxImport ? "#pragma clang module import" : "@import";
+  StringRef importDirectiveLineEnd = useCxxImport ? "\n" : ";\n";
   for (auto import : sortedImports) {
     if (auto *swiftModule = import.dyn_cast<ModuleDecl *>()) {
       if (useCxxImport) {
@@ -458,7 +465,7 @@ writeImports(raw_ostream &out, llvm::SmallPtrSetImpl<ImportModuleTy> &imports,
         continue;
       }
       if (seenImports.insert(Name).second) {
-        out << importDirective << ' ' << Name.str() << ";\n";
+        out << importDirective << ' ' << Name.str() << importDirectiveLineEnd;
         if (frontendOpts.EmitClangHeaderWithNonModularIncludes) {
           if (const clang::Module *underlyingClangModule =
                   swiftModule->findUnderlyingClangModule()) {
@@ -481,8 +488,7 @@ writeImports(raw_ostream &out, llvm::SmallPtrSetImpl<ImportModuleTy> &imports,
              "top-level modules should use a normal swift::ModuleDecl");
       out << importDirective << ' ';
       ModuleDecl::ReverseFullNameIterator(clangModule).printForward(out);
-      out << ";\n";
-
+      out << importDirectiveLineEnd;
       if (frontendOpts.EmitClangHeaderWithNonModularIncludes) {
         collectClangModuleHeaderIncludes(
             clangModule, fileManager, requiredTextualIncludes, visitedModules,
@@ -536,14 +542,19 @@ static void writePostImportPrologue(raw_ostream &os, ModuleDecl &M) {
         "#endif\n\n";
 }
 
+static void writeObjCEpilogue(raw_ostream &os) {
+  // Pop out of `external_source_symbol` attribute
+  // before emitting the C++ section as the C++ section
+  // might include other files in it.
+  os << "#if __has_attribute(external_source_symbol)\n"
+        "# pragma clang attribute pop\n"
+        "#endif\n";
+}
+
 static void writeEpilogue(raw_ostream &os) {
-  os <<
-      "#if __has_attribute(external_source_symbol)\n"
-      "# pragma clang attribute pop\n"
-      "#endif\n"
-      "#pragma clang diagnostic pop\n"
-      // For the macro guard against recursive definition
-      "#endif\n";
+  os << "#pragma clang diagnostic pop\n"
+        // For the macro guard against recursive definition
+        "#endif\n";
 }
 
 static std::string computeMacroGuard(const ModuleDecl *M) {
@@ -571,6 +582,7 @@ bool swift::printAsClangHeader(raw_ostream &os, ModuleDecl *M,
   });
   writePostImportPrologue(os, *M);
   emitObjCConditional(os, [&] { os << objcModuleContents.str(); });
+  writeObjCEpilogue(os);
   emitCxxConditional(os, [&] {
     // FIXME: Expose Swift with @expose by default.
     bool enableCxx = frontendOpts.ClangHeaderExposedDecls.has_value() ||

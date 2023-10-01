@@ -14,7 +14,7 @@
 
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
-#include "swift/SIL/SILBridgingUtils.h"
+#include "swift/SIL/SILBridging.h"
 #include "swift/SIL/SILCloner.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILFunction.h"
@@ -92,20 +92,16 @@ void SILFunction::removeSpecializeAttr(SILSpecializeAttr *attr) {
                           SpecializeAttrSet.end());
 }
 
-SILFunction *
-SILFunction::create(SILModule &M, SILLinkage linkage, StringRef name,
-                    CanSILFunctionType loweredType,
-                    GenericEnvironment *genericEnv, Optional<SILLocation> loc,
-                    IsBare_t isBareSILFunction, IsTransparent_t isTrans,
-                    IsSerialized_t isSerialized, ProfileCounter entryCount,
-                    IsDynamicallyReplaceable_t isDynamic,
-                    IsDistributed_t isDistributed,
-                    IsRuntimeAccessible_t isRuntimeAccessible,
-                    IsExactSelfClass_t isExactSelfClass,
-                    IsThunk_t isThunk,
-                    SubclassScope classSubclassScope, Inline_t inlineStrategy,
-                    EffectsKind E, SILFunction *insertBefore,
-                    const SILDebugScope *debugScope) {
+SILFunction *SILFunction::create(
+    SILModule &M, SILLinkage linkage, StringRef name,
+    CanSILFunctionType loweredType, GenericEnvironment *genericEnv,
+    llvm::Optional<SILLocation> loc, IsBare_t isBareSILFunction,
+    IsTransparent_t isTrans, IsSerialized_t isSerialized,
+    ProfileCounter entryCount, IsDynamicallyReplaceable_t isDynamic,
+    IsDistributed_t isDistributed, IsRuntimeAccessible_t isRuntimeAccessible,
+    IsExactSelfClass_t isExactSelfClass, IsThunk_t isThunk,
+    SubclassScope classSubclassScope, Inline_t inlineStrategy, EffectsKind E,
+    SILFunction *insertBefore, const SILDebugScope *debugScope) {
   // Get a StringMapEntry for the function.  As a sop to error cases,
   // allow the name to have an empty string.
   llvm::StringMapEntry<SILFunction*> *entry = nullptr;
@@ -144,13 +140,13 @@ SILFunction::create(SILModule &M, SILLinkage linkage, StringRef name,
 }
 
 static SwiftMetatype functionMetatype;
-static FunctionRegisterFn initFunction = nullptr;
-static FunctionRegisterFn destroyFunction = nullptr;
-static FunctionWriteFn writeFunction = nullptr;
-static FunctionParseFn parseFunction = nullptr;
-static FunctionCopyEffectsFn copyEffectsFunction = nullptr;
-static FunctionGetEffectInfoFn getEffectInfoFunction = nullptr;
-static FunctionGetMemBehviorFn getMemBehvaiorFunction = nullptr;
+static BridgedFunction::RegisterFn initFunction = nullptr;
+static BridgedFunction::RegisterFn destroyFunction = nullptr;
+static BridgedFunction::WriteFn writeFunction = nullptr;
+static BridgedFunction::ParseFn parseFunction = nullptr;
+static BridgedFunction::CopyEffectsFn copyEffectsFunction = nullptr;
+static BridgedFunction::GetEffectInfoFn getEffectInfoFunction = nullptr;
+static BridgedFunction::GetMemBehaviorFn getMemBehvaiorFunction = nullptr;
 
 SILFunction::SILFunction(
     SILModule &Module, SILLinkage Linkage, StringRef Name,
@@ -186,6 +182,10 @@ void SILFunction::init(
     IsExactSelfClass_t isExactSelfClass, IsDistributed_t isDistributed,
     IsRuntimeAccessible_t isRuntimeAccessible) {
   setName(Name);
+
+  assert(!LoweredType->hasTypeParameter() &&
+         "function type has open type parameters");
+
   this->LoweredType = LoweredType;
   this->GenericEnv = genericEnv;
   this->SpecializationInfo = nullptr;
@@ -200,12 +200,14 @@ void SILFunction::init(
   this->InlineStrategy = inlineStrategy;
   this->Linkage = unsigned(Linkage);
   this->HasCReferences = false;
+  this->MarkedAsUsed = false;
   this->IsAlwaysWeakImported = false;
   this->IsDynamicReplaceable = isDynamic;
   this->ExactSelfClass = isExactSelfClass;
   this->IsDistributed = isDistributed;
   this->IsRuntimeAccessible = isRuntimeAccessible;
   this->ForceEnableLexicalLifetimes = DoNotForceEnableLexicalLifetimes;
+  this->UseStackForPackMetadata = DoUseStackForPackMetadata;
   this->stackProtection = false;
   this->Inlined = false;
   this->Zombie = false;
@@ -276,11 +278,13 @@ void SILFunction::createSnapshot(int id) {
   newSnapshot->ObjCReplacementFor = ObjCReplacementFor;
   newSnapshot->SemanticsAttrSet = SemanticsAttrSet;
   newSnapshot->SpecializeAttrSet = SpecializeAttrSet;
+  newSnapshot->Section = Section;
   newSnapshot->Availability = Availability;
   newSnapshot->specialPurpose = specialPurpose;
   newSnapshot->perfConstraints = perfConstraints;
   newSnapshot->GlobalInitFlag = GlobalInitFlag;
   newSnapshot->HasCReferences = HasCReferences;
+  newSnapshot->MarkedAsUsed = MarkedAsUsed;
   newSnapshot->IsAlwaysWeakImported = IsAlwaysWeakImported;
   newSnapshot->HasOwnership = HasOwnership;
   newSnapshot->IsWithoutActuallyEscapingThunk = IsWithoutActuallyEscapingThunk;
@@ -444,7 +448,8 @@ SILType GenericEnvironment::mapTypeIntoContext(SILModule &M,
   return type.subst(M,
                     QueryInterfaceTypeSubstitutions(this),
                     LookUpConformanceInSignature(genericSig.getPointer()),
-                    genericSig);
+                    genericSig,
+                    SubstFlags::PreservePackExpansionLevel);
 }
 
 bool SILFunction::isNoReturnFunction(TypeExpansionContext context) const {
@@ -529,6 +534,13 @@ bool SILFunction::isWeakImported(ModuleDecl *module) const {
 
 SILBasicBlock *SILFunction::createBasicBlock() {
   SILBasicBlock *newBlock = new (getModule()) SILBasicBlock(this);
+  BlockList.push_back(newBlock);
+  return newBlock;
+}
+
+SILBasicBlock *SILFunction::createBasicBlock(llvm::StringRef debugName) {
+  SILBasicBlock *newBlock = new (getModule()) SILBasicBlock(this);
+  newBlock->setDebugName(debugName);
   BlockList.push_back(newBlock);
   return newBlock;
 }
@@ -847,6 +859,9 @@ SILFunction::isPossiblyUsedExternally() const {
   if (isRuntimeAccessible())
     return true;
 
+  if (markedAsUsed())
+    return true;
+
   // Declaration marked as `@_alwaysEmitIntoClient` that
   // returns opaque result type with availability conditions
   // has to be kept alive to emit opaque type metadata descriptor.
@@ -951,12 +966,12 @@ void SILFunction::forEachSpecializeAttrTargetFunction(
   }
 }
 
-void Function_register(SwiftMetatype metatype,
-            FunctionRegisterFn initFn, FunctionRegisterFn destroyFn,
-            FunctionWriteFn writeFn, FunctionParseFn parseFn,
-            FunctionCopyEffectsFn copyEffectsFn,
-            FunctionGetEffectInfoFn effectInfoFn,
-            FunctionGetMemBehviorFn memBehaviorFn) {
+void BridgedFunction::registerBridging(SwiftMetatype metatype,
+            RegisterFn initFn, RegisterFn destroyFn,
+            WriteFn writeFn, ParseFn parseFn,
+            CopyEffectsFn copyEffectsFn,
+            GetEffectInfoFn effectInfoFn,
+            GetMemBehaviorFn memBehaviorFn) {
   functionMetatype = metatype;
   initFunction = initFn;
   destroyFunction = destroyFn;
@@ -970,8 +985,8 @@ void Function_register(SwiftMetatype metatype,
 std::pair<const char *, int>  SILFunction::
 parseArgumentEffectsFromSource(StringRef effectStr, ArrayRef<StringRef> paramNames) {
   if (parseFunction) {
-    BridgedParsingError error = parseFunction(
-        {this}, effectStr, ParseArgumentEffectsFromSource, -1,
+    auto error = parseFunction(
+        {this}, effectStr, BridgedFunction::ParseEffectsMode::argumentEffectsFromSource, -1,
         {(const unsigned char *)paramNames.data(), paramNames.size()});
     return {(const char *)error.message, (int)error.position};
   }
@@ -981,8 +996,8 @@ parseArgumentEffectsFromSource(StringRef effectStr, ArrayRef<StringRef> paramNam
 std::pair<const char *, int>  SILFunction::
 parseArgumentEffectsFromSIL(StringRef effectStr, int argumentIndex) {
   if (parseFunction) {
-    BridgedParsingError error = parseFunction(
-        {this}, effectStr, ParseArgumentEffectsFromSIL, argumentIndex, {nullptr, 0});
+    auto error = parseFunction(
+        {this}, effectStr, BridgedFunction::ParseEffectsMode::argumentEffectsFromSIL, argumentIndex, {nullptr, 0});
     return {(const char *)error.message, (int)error.position};
   }
   return {nullptr, 0};
@@ -990,8 +1005,8 @@ parseArgumentEffectsFromSIL(StringRef effectStr, int argumentIndex) {
 
 std::pair<const char *, int>  SILFunction::parseGlobalEffectsFromSIL(StringRef effectStr) {
   if (parseFunction) {
-    BridgedParsingError error = parseFunction(
-        {this}, effectStr, ParseGlobalEffectsFromSIL, -1, {nullptr, 0});
+    auto error = parseFunction(
+        {this}, effectStr, BridgedFunction::ParseEffectsMode::globalEffectsFromSIL, -1, {nullptr, 0});
     return {(const char *)error.message, (int)error.position};
   }
   return {nullptr, 0};
@@ -1000,8 +1015,8 @@ std::pair<const char *, int>  SILFunction::parseGlobalEffectsFromSIL(StringRef e
 std::pair<const char *, int>  SILFunction::
 parseMultipleEffectsFromSIL(StringRef effectStr) {
   if (parseFunction) {
-    BridgedParsingError error = parseFunction(
-        {this}, effectStr, ParseMultipleEffectsFromSIL, -1, {nullptr, 0});
+    auto error = parseFunction(
+        {this}, effectStr, BridgedFunction::ParseEffectsMode::multipleEffectsFromSIL, -1, {nullptr, 0});
     return {(const char *)error.message, (int)error.position};
   }
   return {nullptr, 0};
@@ -1035,7 +1050,7 @@ visitArgEffects(std::function<void(int, int, bool)> c) const {
   int idx = 0;
   BridgedFunction bridgedFn = {const_cast<SILFunction *>(this)};
   while (true) {
-    BridgedEffectInfo ei = getEffectInfoFunction(bridgedFn, idx);
+    BridgedFunction::EffectInfo ei = getEffectInfoFunction(bridgedFn, idx);
     if (!ei.isValid)
       return;
     if (!ei.isEmpty) {
@@ -1045,10 +1060,10 @@ visitArgEffects(std::function<void(int, int, bool)> c) const {
   }
 }
 
-SILInstruction::MemoryBehavior SILFunction::getMemoryBehavior(bool observeRetains) {
+MemoryBehavior SILFunction::getMemoryBehavior(bool observeRetains) {
   if (!getMemBehvaiorFunction)
-    return SILInstruction::MemoryBehavior::MayHaveSideEffects;
+    return MemoryBehavior::MayHaveSideEffects;
 
   auto b = getMemBehvaiorFunction({this}, observeRetains);
-  return (SILInstruction::MemoryBehavior)b;
+  return (MemoryBehavior)b;
 }

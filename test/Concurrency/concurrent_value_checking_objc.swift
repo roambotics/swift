@@ -1,7 +1,9 @@
-// RUN: %target-typecheck-verify-swift  -disable-availability-checking -warn-concurrency
+// RUN: %target-swift-frontend  -disable-availability-checking -warn-concurrency %s -emit-sil -o /dev/null -verify
+// RUN: %target-swift-frontend  -disable-availability-checking -warn-concurrency %s -emit-sil -o /dev/null -verify -enable-experimental-feature SendNonSendable
 
 // REQUIRES: concurrency
 // REQUIRES: objc_interop
+// REQUIRES: asserts
 
 import Foundation
 

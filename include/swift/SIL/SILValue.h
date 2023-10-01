@@ -271,6 +271,17 @@ struct ValueOwnershipKind {
 
   explicit operator bool() const { return value != OwnershipKind::Any; }
 
+#ifndef __cpp_impl_three_way_comparison
+  // C++20 (more precisely P1185) introduced more overload candidates for
+  // comparison operator calls. With that in place the following definitions are
+  // redundant and actually cause compilation errors because of ambiguity.
+  // P1630 explains the rationale behind introducing this backward
+  // incompatibility.
+  //
+  // References:
+  // https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2019/p1185r2.html
+  // https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2019/p1630r1.html
+
   bool operator==(ValueOwnershipKind other) const {
     return value == other.value;
   }
@@ -280,6 +291,7 @@ struct ValueOwnershipKind {
 
   bool operator==(innerty other) const { return value == other; }
   bool operator!=(innerty other) const { return !(value == other); }
+#endif
 
   /// We merge by moving down the lattice.
   ValueOwnershipKind merge(ValueOwnershipKind rhs) const {
@@ -466,8 +478,14 @@ public:
   /// entire use list.
   inline bool hasTwoUses() const;
 
-  /// Helper struct for DowncastUserFilterRange
+  /// Helper struct for DowncastUserFilterRange and UserRange
   struct UseToUser;
+
+  using UserRange =
+      llvm::iterator_range<llvm::mapped_iterator<swift::ValueBaseUseIterator,
+                                                 swift::ValueBase::UseToUser,
+                                                 swift::SILInstruction *>>;
+  inline UserRange getUsers() const;
 
   template <typename Subclass>
   using DowncastUserFilterRange =
@@ -556,7 +574,7 @@ public:
 
   /// Return the instruction that defines this value and the appropriate
   /// result index, or None if it is not defined by an instruction.
-  Optional<DefiningInstructionResult> getDefiningInstructionResult();
+  llvm::Optional<DefiningInstructionResult> getDefiningInstructionResult();
 
   /// Returns the ValueOwnershipKind that describes this SILValue's ownership
   /// semantics if the SILValue has ownership semantics. Returns is a value
@@ -570,16 +588,23 @@ public:
 
   bool isLexical() const;
 
+  bool isGuaranteedForwarding() const;
+
   /// Unsafely eliminate moveonly from this value's type. Returns true if the
   /// value's underlying type was move only and thus was changed. Returns false
   /// otherwise.
   ///
   /// NOTE: Please do not use this directly! It is only meant to be used by the
   /// optimizer pass: SILMoveOnlyWrappedTypeEliminator.
-  bool unsafelyEliminateMoveOnlyWrapper() {
-    if (!Type.isMoveOnlyWrapped())
+  bool unsafelyEliminateMoveOnlyWrapper(const SILFunction *fn) {
+    if (!Type.isMoveOnlyWrapped() && !Type.isBoxedMoveOnlyWrappedType(fn))
       return false;
-    Type = Type.removingMoveOnlyWrapper();
+    if (Type.isMoveOnlyWrapped()) {
+      Type = Type.removingMoveOnlyWrapper();
+    } else {
+      assert(Type.isBoxedMoveOnlyWrappedType(fn));
+      Type = Type.removingMoveOnlyWrapperToBoxedType(fn);
+    }
     return true;
   }
 
@@ -1431,6 +1456,10 @@ struct ValueBase::UseToUser {
   SILInstruction *operator()(Operand *use) { return use->getUser(); }
   SILInstruction *operator()(Operand &use) { return use.getUser(); }
 };
+
+inline ValueBase::UserRange ValueBase::getUsers() const {
+  return llvm::map_range(getUses(), ValueBase::UseToUser());
+}
 
 template <typename T>
 inline ValueBase::DowncastUserFilterRange<T> ValueBase::getUsersOfType() const {

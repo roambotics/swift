@@ -164,8 +164,9 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     if (auto *typeRepr = ED->getExtendedTypeRepr())
       if (doIt(typeRepr))
         return true;
-    for (auto &Inherit : ED->getInherited()) {
-      if (auto *const TyR = Inherit.getTypeRepr())
+    auto inheritedTypes = ED->getInherited();
+    for (auto i : inheritedTypes.getIndices()) {
+      if (auto *const TyR = inheritedTypes.getTypeRepr(i))
         if (doIt(TyR))
           return true;
     }
@@ -276,7 +277,7 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   }
 
   bool visitGenericTypeParamDecl(GenericTypeParamDecl *GTPD) {
-    for (const auto &Inherit: GTPD->getInherited()) {
+    for (const auto &Inherit : GTPD->getInherited().getEntries()) {
       if (auto *const TyR = Inherit.getTypeRepr())
         if (doIt(TyR))
           return true;
@@ -285,7 +286,7 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   }
 
   bool visitAssociatedTypeDecl(AssociatedTypeDecl *ATD) {
-    for (const auto &Inherit: ATD->getInherited()) {
+    for (const auto &Inherit : ATD->getInherited().getEntries()) {
       if (auto *const TyR = Inherit.getTypeRepr())
         if (doIt(TyR))
           return true;
@@ -310,9 +311,10 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
 
     bool WalkGenerics = visitGenericParamListIfNeeded(NTD);
 
-    for (const auto &Inherit : NTD->getInherited()) {
-      if (auto *const TyR = Inherit.getTypeRepr())
-        if (doIt(Inherit.getTypeRepr()))
+    auto inheritedTypes = NTD->getInherited();
+    for (auto i : inheritedTypes.getIndices()) {
+      if (auto *const TyR = inheritedTypes.getTypeRepr(i))
+        if (doIt(TyR))
           return true;
     }
 
@@ -422,6 +424,19 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
         return true;
     }
 
+    if (auto def = MD->definition) {
+      // Don't walk into unchecked definitions.
+      if (auto expansion = dyn_cast<MacroExpansionExpr>(def)) {
+        if (!expansion->getType().isNull() ||
+            Walker.shouldWalkIntoUncheckedMacroDefinitions()) {
+          if (auto newDef = doIt(def))
+            MD->definition = newDef;
+          else
+            return true;
+        }
+      }
+    }
+
     // Visit trailing requirements
     if (WalkGenerics && visitTrailingRequirements(MD))
        return true;
@@ -429,31 +444,47 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     return false;
   }
 
+  bool visitFreestandingMacroArgs(FreestandingMacroExpansion *ME) {
+    for (TypeRepr *genArg : ME->getGenericArgs()) {
+      if (doIt(genArg))
+        return true;
+    }
+
+    if (ME->getArgs()) {
+      ArgumentList *args = doIt(ME->getArgs());
+      if (!args)
+        return true;
+      ME->setArgs(args);
+    }
+
+    return false;
+  }
+
   bool visitMacroExpansionDecl(MacroExpansionDecl *MED) {
+#ifndef NDEBUG
+    PrettyStackTraceDecl debugStack("walking into", MED);
+#endif
+
     bool shouldWalkArguments, shouldWalkExpansion;
     std::tie(shouldWalkArguments, shouldWalkExpansion) =
         Walker.shouldWalkMacroArgumentsAndExpansion();
-    if (shouldWalkArguments && MED->getArgs()) {
-      if (auto *argList = doIt(MED->getArgs()))
-        MED->setArgs(argList);
-      else
-        return true;
-    }
-    // Visit auxiliary decls, which may be decls from macro expansions.
+
+    if (shouldWalkArguments && visitFreestandingMacroArgs(MED))
+      return true;
+
     bool alreadyFailed = false;
     if (shouldWalkExpansion) {
-      MED->visitAuxiliaryDecls([&](Decl *decl) {
+      MED->forEachExpandedNode([&](ASTNode expandedNode) {
         if (alreadyFailed) return;
-        alreadyFailed = inherited::visit(decl);
-      });
-      MED->forEachExpandedExprOrStmt([&](ASTNode expandedNode) {
-        if (alreadyFailed) return;
+
         if (auto *expr = expandedNode.dyn_cast<Expr *>()) {
-          if (!doIt(expr))
-            alreadyFailed = true;
+          alreadyFailed = doIt(expr) == nullptr;
         } else if (auto *stmt = expandedNode.dyn_cast<Stmt *>()) {
-          if (!doIt(stmt))
-            alreadyFailed = true;
+          alreadyFailed = doIt(stmt) == nullptr;
+        } else {
+          auto decl = expandedNode.get<Decl *>();
+          if (!isa<VarDecl>(decl))
+            alreadyFailed = doIt(decl);
         }
       });
     }
@@ -475,6 +506,11 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     }
     if (visit(AFD->getParameters()))
       return true;
+
+    if (auto *const ThrownTyR = AFD->getThrownTypeRepr()) {
+      if (doIt(ThrownTyR))
+        return true;
+    }
 
     if (auto *FD = dyn_cast<FuncDecl>(AFD)) {
       if (!isa<AccessorDecl>(FD))
@@ -674,6 +710,23 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     }
     return nullptr;
   }
+
+  Expr *visitCopyExpr(CopyExpr *E) {
+    if (Expr *subExpr = doIt(E->getSubExpr())) {
+      E->setSubExpr(subExpr);
+      return E;
+    }
+    return nullptr;
+  }
+
+  Expr *visitConsumeExpr(ConsumeExpr *E) {
+    if (Expr *subExpr = doIt(E->getSubExpr())) {
+      E->setSubExpr(subExpr);
+      return E;
+    }
+    return nullptr;
+  }
+
   Expr *visitTupleExpr(TupleExpr *E) {
     for (unsigned i = 0, e = E->getNumElements(); i != e; ++i)
       if (E->getElement(i)) {
@@ -948,6 +1001,11 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     if (visit(expr->getParameters()))
       return nullptr;
 
+    if (auto thrownTypeRepr = expr->getExplicitThrownTypeRepr()) {
+      if (doIt(thrownTypeRepr))
+        return nullptr;
+    }
+
     if (expr->hasExplicitResultType()) {
       if (doIt(expr->getExplicitResultTypeRepr()))
         return nullptr;
@@ -1037,6 +1095,11 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
       Args = doIt(Args);
       if (!Args) return nullptr;
       E->setArgsExpr(Args);
+    }
+    if (Expr *Thrown = E->getThrownTypeExpr()) {
+      Thrown = doIt(Thrown);
+      if (!Thrown) return nullptr;
+      E->setThrownTypeExpr(Thrown);
     }
     if (Expr *Result = E->getResultExpr()) {
       Result = doIt(Result);
@@ -1329,11 +1392,16 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     std::tie(shouldWalkArguments, shouldWalkExpansion) =
         Walker.shouldWalkMacroArgumentsAndExpansion();
 
-    if (shouldWalkArguments && E->getArgs()) {
-      ArgumentList *args = doIt(E->getArgs());
-      if (!args) return nullptr;
-      E->setArgs(args);
+    if (auto *substituteDecl = E->getSubstituteDecl()) {
+      if (doIt(substituteDecl))
+        return nullptr;
+      // Visiting the substitute macro expansion decl will visit the same
+      // argument list. Skip visiting it again.
+      shouldWalkArguments = false;
     }
+
+    if (shouldWalkArguments && visitFreestandingMacroArgs(E))
+      return nullptr;
 
     if (shouldWalkExpansion) {
       Expr *rewritten = nullptr;
@@ -1458,7 +1526,7 @@ public:
   
   bool shouldSkip(Decl *D) {
     if (!Walker.shouldWalkMacroArgumentsAndExpansion().second &&
-        D->isInGeneratedBuffer())
+        D->isInMacroExpansionInContext() && !Walker.Parent.isNull())
       return true;
 
     if (auto *VD = dyn_cast<VarDecl>(D)) {
@@ -1585,11 +1653,25 @@ public:
   }
 
   [[nodiscard]]
+  bool doIt(ArgumentList *ArgList, unsigned Idx) {
+    auto Arg = ArgList->get(Idx);
+    return traverse(
+        Walker.walkToArgumentPre(Arg),
+        [&]() {
+          auto *E = doIt(Arg.getExpr());
+          if (!E)
+            return true;
+          ArgList->setExpr(Idx, E);
+          return false;
+        },
+        [&]() { return Walker.walkToArgumentPost(Arg); });
+  }
+
+  [[nodiscard]]
   ArgumentList *visit(ArgumentList *ArgList) {
     for (auto Idx : indices(*ArgList)) {
-      auto *E = doIt(ArgList->getExpr(Idx));
-      if (!E) return nullptr;
-      ArgList->setExpr(Idx, E);
+      if (doIt(ArgList, Idx))
+        return nullptr;
     }
     return ArgList;
   }
@@ -1631,10 +1713,10 @@ Stmt *Traversal::visitThrowStmt(ThrowStmt *TS) {
   return nullptr;
 }
 
-Stmt *Traversal::visitForgetStmt(ForgetStmt *FS) {
-  if (Expr *E = doIt(FS->getSubExpr())) {
-    FS->setSubExpr(E);
-    return FS;
+Stmt *Traversal::visitDiscardStmt(DiscardStmt *DS) {
+  if (Expr *E = doIt(DS->getSubExpr())) {
+    DS->setSubExpr(E);
+    return DS;
   }
   return nullptr;
 }
@@ -1705,6 +1787,15 @@ Stmt *Traversal::visitYieldStmt(YieldStmt *YS) {
       return nullptr;
   }
   return YS;
+}
+
+Stmt *Traversal::visitThenStmt(ThenStmt *TS) {
+  auto *E = doIt(TS->getResult());
+  if (!E)
+    return nullptr;
+
+  TS->setResult(E);
+  return TS;
 }
 
 Stmt *Traversal::visitDeferStmt(DeferStmt *DS) {
@@ -2134,11 +2225,19 @@ bool Traversal::visitExistentialTypeRepr(ExistentialTypeRepr *T) {
   return doIt(T->getConstraint());
 }
 
+bool Traversal::visitInverseTypeRepr(InverseTypeRepr *T) {
+  return doIt(T->getConstraint());
+}
+
 bool Traversal::visitPlaceholderTypeRepr(PlaceholderTypeRepr *T) {
   return false;
 }
 
 bool Traversal::visitFixedTypeRepr(FixedTypeRepr *T) {
+  return false;
+}
+
+bool Traversal::visitSelfTypeRepr(SelfTypeRepr *T) {
   return false;
 }
 

@@ -22,6 +22,7 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeWalker.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Platform.h"
 #include <map>
 
 using namespace swift;
@@ -43,10 +44,10 @@ namespace {
 struct InferredAvailability {
   PlatformAgnosticAvailabilityKind PlatformAgnostic
     = PlatformAgnosticAvailabilityKind::None;
-  
-  Optional<llvm::VersionTuple> Introduced;
-  Optional<llvm::VersionTuple> Deprecated;
-  Optional<llvm::VersionTuple> Obsoleted;
+
+  llvm::Optional<llvm::VersionTuple> Introduced;
+  llvm::Optional<llvm::VersionTuple> Deprecated;
+  llvm::Optional<llvm::VersionTuple> Obsoleted;
   bool IsSPI = false;
 };
 
@@ -59,8 +60,8 @@ typedef const llvm::VersionTuple &(*MergeFunction)(
 /// Apply a merge function to two optional versions, returning the result
 /// in Inferred.
 static bool
-mergeIntoInferredVersion(const Optional<llvm::VersionTuple> &Version,
-                         Optional<llvm::VersionTuple> &Inferred,
+mergeIntoInferredVersion(const llvm::Optional<llvm::VersionTuple> &Version,
+                         llvm::Optional<llvm::VersionTuple> &Inferred,
                          MergeFunction Merge) {
   if (Version.has_value()) {
     if (Inferred.has_value()) {
@@ -108,15 +109,6 @@ static AvailableAttr *createAvailableAttr(PlatformKind Platform,
       Inferred.Deprecated.value_or(llvm::VersionTuple());
   llvm::VersionTuple Obsoleted =
       Inferred.Obsoleted.value_or(llvm::VersionTuple());
-
-  // If a decl is unavailable then it cannot have any introduced, deprecated, or
-  // obsoleted version.
-  if (Inferred.PlatformAgnostic ==
-      PlatformAgnosticAvailabilityKind::Unavailable) {
-    Introduced = llvm::VersionTuple();
-    Deprecated = llvm::VersionTuple();
-    Obsoleted = llvm::VersionTuple();
-  }
 
   return new (Context)
       AvailableAttr(SourceLoc(), SourceRange(), Platform,
@@ -168,27 +160,6 @@ void AvailabilityInference::applyInferredAvailableAttrs(
 
   DeclAttributes &Attrs = ToDecl->getAttrs();
 
-  // Some kinds of platform agnostic availability supersede any platform
-  // specific availability.
-  auto InferredAgnostic = Inferred.find(PlatformKind::none);
-  if (InferredAgnostic != Inferred.end()) {
-    switch (InferredAgnostic->second.PlatformAgnostic) {
-    case PlatformAgnosticAvailabilityKind::Deprecated:
-    case PlatformAgnosticAvailabilityKind::UnavailableInSwift:
-    case PlatformAgnosticAvailabilityKind::Unavailable:
-      Attrs.add(createAvailableAttr(PlatformKind::none,
-                                    InferredAgnostic->second, Message, Rename,
-                                    RenameDecl, Context));
-      return;
-
-    case PlatformAgnosticAvailabilityKind::None:
-    case PlatformAgnosticAvailabilityKind::SwiftVersionSpecific:
-    case PlatformAgnosticAvailabilityKind::PackageDescriptionVersionSpecific:
-    case PlatformAgnosticAvailabilityKind::NoAsync:
-      break;
-    }
-  }
-
   // Create an availability attribute for each observed platform and add
   // to ToDecl.
   for (auto &Pair : Inferred) {
@@ -210,6 +181,16 @@ AvailabilityInference::parentDeclForInferredAvailability(const Decl *D) {
     if (auto *NTD = ED->getExtendedNominal())
       return NTD;
   }
+
+  if (auto *PBD = dyn_cast<PatternBindingDecl>(D)) {
+    if (PBD->getNumPatternEntries() < 1)
+      return nullptr;
+
+    return PBD->getAnchoringVarDecl(0);
+  }
+
+  if (auto *OTD = dyn_cast<OpaqueTypeDecl>(D))
+    return OTD->getNamingDecl();
 
   // Clang decls may be inaccurately parented rdar://53956555
   if (D->hasClangNode())
@@ -244,6 +225,8 @@ AvailabilityInference::attrForAnnotatedAvailableRange(const Decl *D,
                                                       ASTContext &Ctx) {
   const AvailableAttr *bestAvailAttr = nullptr;
 
+  D = abstractSyntaxDeclForAvailableAttribute(D);
+
   for (auto Attr : D->getAttrs()) {
     auto *AvailAttr = dyn_cast<AvailableAttr>(Attr);
     if (AvailAttr == nullptr || !AvailAttr->Introduced.has_value() ||
@@ -260,7 +243,7 @@ AvailabilityInference::attrForAnnotatedAvailableRange(const Decl *D,
   return bestAvailAttr;
 }
 
-Optional<AvailableAttrDeclPair>
+llvm::Optional<AvailableAttrDeclPair>
 SemanticAvailableRangeAttrRequest::evaluate(Evaluator &evaluator,
                                             const Decl *decl) const {
   if (auto attr = AvailabilityInference::attrForAnnotatedAvailableRange(
@@ -271,19 +254,21 @@ SemanticAvailableRangeAttrRequest::evaluate(Evaluator &evaluator,
           AvailabilityInference::parentDeclForInferredAvailability(decl))
     return parent->getSemanticAvailableRangeAttr();
 
-  return None;
+  return llvm::None;
 }
 
-Optional<AvailableAttrDeclPair> Decl::getSemanticAvailableRangeAttr() const {
+llvm::Optional<AvailableAttrDeclPair>
+Decl::getSemanticAvailableRangeAttr() const {
   auto &eval = getASTContext().evaluator;
-  return evaluateOrDefault(eval, SemanticAvailableRangeAttrRequest{this}, None);
+  return evaluateOrDefault(eval, SemanticAvailableRangeAttrRequest{this},
+                           llvm::None);
 }
 
-Optional<AvailabilityContext>
+llvm::Optional<AvailabilityContext>
 AvailabilityInference::annotatedAvailableRange(const Decl *D, ASTContext &Ctx) {
   auto bestAvailAttr = attrForAnnotatedAvailableRange(D, Ctx);
   if (!bestAvailAttr)
-    return None;
+    return llvm::None;
 
   return availableRange(bestAvailAttr, Ctx);
 }
@@ -293,7 +278,7 @@ bool Decl::isAvailableAsSPI() const {
     .isAvailableAsSPI();
 }
 
-Optional<AvailableAttrDeclPair>
+llvm::Optional<AvailableAttrDeclPair>
 SemanticUnavailableAttrRequest::evaluate(Evaluator &evaluator,
                                          const Decl *decl) const {
   // Directly marked unavailable.
@@ -304,12 +289,43 @@ SemanticUnavailableAttrRequest::evaluate(Evaluator &evaluator,
           AvailabilityInference::parentDeclForInferredAvailability(decl))
     return parent->getSemanticUnavailableAttr();
 
-  return None;
+  return llvm::None;
 }
 
-Optional<AvailableAttrDeclPair> Decl::getSemanticUnavailableAttr() const {
+llvm::Optional<AvailableAttrDeclPair> Decl::getSemanticUnavailableAttr() const {
   auto &eval = getASTContext().evaluator;
-  return evaluateOrDefault(eval, SemanticUnavailableAttrRequest{this}, None);
+  return evaluateOrDefault(eval, SemanticUnavailableAttrRequest{this},
+                           llvm::None);
+}
+
+static bool isUnconditionallyUnavailable(const Decl *D) {
+  if (auto unavailableAttrAndDecl = D->getSemanticUnavailableAttr())
+    return unavailableAttrAndDecl->first->isUnconditionallyUnavailable();
+
+  return false;
+}
+
+bool Decl::isAvailableDuringLowering() const {
+  // Unconditionally unavailable declarations should be skipped during lowering
+  // when -unavailable-decl-optimization=complete is specified.
+  if (getASTContext().LangOpts.UnavailableDeclOptimizationMode !=
+      UnavailableDeclOptimization::Complete)
+    return true;
+
+  if (hasClangNode())
+    return true;
+
+  return !isUnconditionallyUnavailable(this);
+}
+
+bool Decl::requiresUnavailableDeclABICompatibilityStubs() const {
+  // Code associated with unavailable declarations should trap at runtime if
+  // -unavailable-decl-optimization=stub is specified.
+  if (getASTContext().LangOpts.UnavailableDeclOptimizationMode !=
+      UnavailableDeclOptimization::Stub)
+    return false;
+
+  return isUnconditionallyUnavailable(this);
 }
 
 bool UnavailabilityReason::requiresDeploymentTargetOrEarlier(
@@ -346,7 +362,7 @@ AvailabilityInference::annotatedAvailableRangeForAttr(const SpecializeAttr* attr
 
 AvailabilityContext AvailabilityInference::availableRange(const Decl *D,
                                                           ASTContext &Ctx) {
-  Optional<AvailabilityContext> AnnotatedRange =
+  llvm::Optional<AvailabilityContext> AnnotatedRange =
       annotatedAvailableRange(D, Ctx);
   if (AnnotatedRange.has_value()) {
     return AnnotatedRange.value();
@@ -509,8 +525,16 @@ AvailabilityContext ASTContext::getConcurrencyAvailability() {
   return getSwift55Availability();
 }
 
+AvailabilityContext ASTContext::getConcurrencyDiscardingTaskGroupAvailability() {
+  return getSwift59Availability();
+}
+
 AvailabilityContext ASTContext::getBackDeployedConcurrencyAvailability() {
   return getSwift51Availability();
+}
+
+AvailabilityContext ASTContext::getConcurrencyDistributedActorWithCustomExecutorAvailability() {
+  return getSwift59Availability();
 }
 
 AvailabilityContext ASTContext::getDifferentiationAvailability() {
@@ -534,6 +558,26 @@ AvailabilityContext
 ASTContext::getImmortalRefCountSymbolsAvailability() {
   // TODO: replace this with a concrete swift version once we have it.
   // rdar://94185998
+  return getSwiftFutureAvailability();
+}
+
+AvailabilityContext
+ASTContext::getVariadicGenericTypeAvailability() {
+  return getSwift59Availability();
+}
+
+AvailabilityContext
+ASTContext::getSignedConformsToProtocolAvailability() {
+  return getSwift59Availability();
+}
+
+AvailabilityContext
+ASTContext::getSignedDescriptorAvailability() {
+  return getSwift59Availability();
+}
+
+AvailabilityContext
+ASTContext::getInitRawStructMetadataAvailability() {
   return getSwiftFutureAvailability();
 }
 
@@ -666,6 +710,40 @@ AvailabilityContext ASTContext::getSwift57Availability() {
   }
 }
 
+AvailabilityContext ASTContext::getSwift58Availability() {
+  auto target = LangOpts.Target;
+
+  if (target.isMacOSX()) {
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(13, 3, 0)));
+  } else if (target.isiOS()) {
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(16, 4, 0)));
+  } else if (target.isWatchOS()) {
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(9, 4, 0)));
+  } else {
+    return AvailabilityContext::alwaysAvailable();
+  }
+}
+
+AvailabilityContext ASTContext::getSwift59Availability() {
+  auto target = LangOpts.Target;
+
+  if (target.isMacOSX()) {
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(14, 0, 0)));
+  } else if (target.isiOS()) {
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(17, 0, 0)));
+  } else if (target.isWatchOS()) {
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(10, 0, 0)));
+  } else {
+    return AvailabilityContext::alwaysAvailable();
+  }
+}
+
 AvailabilityContext ASTContext::getSwiftFutureAvailability() {
   auto target = LangOpts.Target;
 
@@ -695,10 +773,46 @@ ASTContext::getSwift5PlusAvailability(llvm::VersionTuple swiftVersion) {
     case 5: return getSwift55Availability();
     case 6: return getSwift56Availability();
     case 7: return getSwift57Availability();
+    case 8: return getSwift58Availability();
+    case 9: return getSwift59Availability();
     default: break;
     }
   }
   llvm::report_fatal_error(
       Twine("Missing call to getSwiftXYAvailability for Swift ") +
       swiftVersion.getAsString());
+}
+
+bool ASTContext::supportsVersionedAvailability() const {
+  return minimumAvailableOSVersionForTriple(LangOpts.Target).has_value();
+}
+
+// FIXME: Rename abstractSyntaxDeclForAvailableAttribute since it's useful
+// for more attributes than `@available`.
+const Decl *
+swift::abstractSyntaxDeclForAvailableAttribute(const Decl *ConcreteSyntaxDecl) {
+  // This function needs to be kept in sync with its counterpart,
+  // concreteSyntaxDeclForAvailableAttribute().
+
+  if (auto *PBD = dyn_cast<PatternBindingDecl>(ConcreteSyntaxDecl)) {
+    // Existing @available attributes in the AST are attached to VarDecls
+    // rather than PatternBindingDecls, so we return the first VarDecl for
+    // the pattern binding declaration.
+    // This is safe, even though there may be multiple VarDecls, because
+    // all parsed attribute that appear in the concrete syntax upon on the
+    // PatternBindingDecl are added to all of the VarDecls for the pattern
+    // binding.
+    for (auto index : range(PBD->getNumPatternEntries())) {
+      if (auto VD = PBD->getAnchoringVarDecl(index))
+        return VD;
+    }
+  } else if (auto *ECD = dyn_cast<EnumCaseDecl>(ConcreteSyntaxDecl)) {
+    // Similar to the PatternBindingDecl case above, we return the
+    // first EnumElementDecl.
+    if (auto *Elem = ECD->getFirstElement()) {
+      return Elem;
+    }
+  }
+
+  return ConcreteSyntaxDecl;
 }

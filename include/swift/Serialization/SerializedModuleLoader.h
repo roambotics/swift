@@ -20,6 +20,8 @@
 
 namespace swift {
 class ModuleFile;
+class PathObfuscator;
+enum class ModuleLoadingBehavior;
 namespace file_types {
   enum ID : uint8_t;
 }
@@ -31,6 +33,15 @@ enum class ModuleLoadingMode {
   PreferSerialized,
   OnlyInterface,
   OnlySerialized
+};
+
+/// How a dependency should be loaded.
+///
+/// \sa getTransitiveLoadingBehavior
+enum class ModuleLoadingBehavior {
+  Required,
+  Optional,
+  Ignored
 };
 
 /// Helper type used to pass and compute the sets of related filenames used by
@@ -84,7 +95,8 @@ protected:
       std::unique_ptr<llvm::MemoryBuffer> *moduleBuffer,
       std::unique_ptr<llvm::MemoryBuffer> *moduleDocBuffer,
       std::unique_ptr<llvm::MemoryBuffer> *moduleSourceInfoBuffer,
-      bool skipBuildingInterface, bool &isFramework, bool &isSystemModule);
+      bool skipBuildingInterface, bool isTestableDependencyLookup,
+      bool &isFramework, bool &isSystemModule);
 
   /// Attempts to search the provided directory for a loadable serialized
   /// .swiftmodule with the provided `ModuleFilename`. Subclasses must
@@ -105,7 +117,8 @@ protected:
       std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
       std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
       std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-      bool skipBuildingInterface, bool IsFramework) = 0;
+      bool SkipBuildingInterface, bool IsFramework,
+      bool isTestableDependencyLookup = false) = 0;
 
   std::error_code
   openModuleFile(
@@ -146,6 +159,21 @@ protected:
   /// Scan the given serialized module file to determine dependencies.
   llvm::ErrorOr<ModuleDependencyInfo> scanModuleFile(Twine modulePath, bool isFramework);
 
+  struct BinaryModuleImports {
+    llvm::StringSet<> moduleImports;
+    llvm::StringSet<> headerImports;
+  };
+
+  static llvm::ErrorOr<BinaryModuleImports>
+  getImportsOfModule(Twine modulePath,
+                     ModuleLoadingBehavior transitiveBehavior,
+                     bool isFramework,
+                     bool isRequiredOSSAModules,
+                     StringRef SDKName,
+                     StringRef packageName,
+                     llvm::vfs::FileSystem *fileSystem,
+                     PathObfuscator &recoverer);
+
   /// Load the module file into a buffer and also collect its module name.
   static std::unique_ptr<llvm::MemoryBuffer>
   getModuleName(ASTContext &Ctx, StringRef modulePath, std::string &Name);
@@ -161,7 +189,7 @@ public:
   /// If the AST cannot be loaded and \p diagLoc is present, a diagnostic is
   /// printed. (Note that \p diagLoc is allowed to be invalid.)
   LoadedFile *
-  loadAST(ModuleDecl &M, Optional<SourceLoc> diagLoc,
+  loadAST(ModuleDecl &M, llvm::Optional<SourceLoc> diagLoc,
           StringRef moduleInterfacePath, StringRef moduleInterfaceSourcePath,
           std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
           std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
@@ -179,7 +207,8 @@ public:
   /// If a non-null \p versionInfo is provided, the module version will be
   /// parsed and populated.
   virtual bool canImportModule(ImportPath::Module named,
-                               ModuleVersionInfo *versionInfo) override;
+                               ModuleVersionInfo *versionInfo,
+                               bool isTestableDependencyLookup = false) override;
 
   /// Import a module with the given module path.
   ///
@@ -212,9 +241,13 @@ public:
 
   virtual void verifyAllModules() override;
 
-  virtual Optional<const ModuleDependencyInfo*> getModuleDependencies(
-      StringRef moduleName, ModuleDependenciesCache &cache,
-      InterfaceSubContextDelegate &delegate) override;
+  virtual llvm::SmallVector<std::pair<ModuleDependencyID, ModuleDependencyInfo>, 1>
+  getModuleDependencies(StringRef moduleName, StringRef moduleOutputPath,
+                        llvm::IntrusiveRefCntPtr<llvm::cas::CachingOnDiskFileSystem> CacheFS,
+                        const llvm::DenseSet<clang::tooling::dependencies::ModuleID> &alreadySeenClangModules,
+                        clang::tooling::dependencies::DependencyScanningTool &clangScanningTool,
+                        InterfaceSubContextDelegate &delegate,
+                        bool isTestableImport) override;
 };
 
 /// Imports serialized Swift modules into an ASTContext.
@@ -232,7 +265,8 @@ class ImplicitSerializedModuleLoader : public SerializedModuleLoaderBase {
       std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
       std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
       std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-      bool skipBuildingInterface, bool IsFramework) override;
+      bool SkipBuildingInterface, bool IsFramework,
+      bool isTestableDependencyLookup = false) override;
 
   bool maybeDiagnoseTargetMismatch(
       SourceLoc sourceLocation,
@@ -286,7 +320,8 @@ class MemoryBufferSerializedModuleLoader : public SerializedModuleLoaderBase {
       std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
       std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
       std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-      bool skipBuildingInterface, bool IsFramework) override;
+      bool SkipBuildingInterface, bool IsFramework,
+      bool IsTestableDependencyLookup = false) override;
 
   bool maybeDiagnoseTargetMismatch(
       SourceLoc sourceLocation,
@@ -298,7 +333,8 @@ public:
   virtual ~MemoryBufferSerializedModuleLoader();
 
   bool canImportModule(ImportPath::Module named,
-                       ModuleVersionInfo *versionInfo) override;
+                       ModuleVersionInfo *versionInfo,
+                       bool isTestableDependencyLookup = false) override;
 
   ModuleDecl *
   loadModule(SourceLoc importLoc,
@@ -360,10 +396,11 @@ public:
   virtual bool isSystemModule() const override;
 
   virtual void lookupValue(DeclName name, NLKind lookupKind,
+                           OptionSet<ModuleLookupFlags> Flags,
                            SmallVectorImpl<ValueDecl*> &results) const override;
 
   virtual StringRef
-  getFilenameForPrivateDecl(const ValueDecl *decl) const override;
+  getFilenameForPrivateDecl(const Decl *decl) const override;
 
   virtual TypeDecl *lookupLocalType(StringRef MangledName) const override;
   
@@ -400,7 +437,7 @@ public:
          ObjCSelector selector,
          SmallVectorImpl<AbstractFunctionDecl *> &results) const override;
 
-  Optional<Fingerprint>
+  llvm::Optional<Fingerprint>
   loadFingerprint(const IterableDeclContext *IDC) const override;
 
   virtual void
@@ -408,18 +445,20 @@ public:
                 const ModuleDecl *importedModule,
                 llvm::SmallSetVector<Identifier, 4> &spiGroups) const override;
 
-  Optional<CommentInfo> getCommentForDecl(const Decl *D) const override;
+  llvm::Optional<CommentInfo> getCommentForDecl(const Decl *D) const override;
 
-  Optional<StringRef> getGroupNameForDecl(const Decl *D) const override;
+  bool hasLoadedSwiftDoc() const override;
 
+  llvm::Optional<StringRef> getGroupNameForDecl(const Decl *D) const override;
 
-  Optional<StringRef> getSourceFileNameForDecl(const Decl *D) const override;
+  llvm::Optional<StringRef>
+  getSourceFileNameForDecl(const Decl *D) const override;
 
-  Optional<unsigned> getSourceOrderForDecl(const Decl *D) const override;
+  llvm::Optional<unsigned> getSourceOrderForDecl(const Decl *D) const override;
 
-  Optional<StringRef> getGroupNameByUSR(StringRef USR) const override;
+  llvm::Optional<StringRef> getGroupNameByUSR(StringRef USR) const override;
 
-  Optional<ExternalSourceLocs::RawLocs>
+  llvm::Optional<ExternalSourceLocs::RawLocs>
   getExternalRawLocsForDecl(const Decl *D) const override;
 
   void collectAllGroups(SmallVectorImpl<StringRef> &Names) const override;
@@ -454,7 +493,9 @@ public:
   virtual void
   collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const override;
 
-  Identifier getDiscriminatorForPrivateValue(const ValueDecl *D) const override;
+  virtual void loadDependenciesForTestable(SourceLoc diagLoc) const override;
+
+  Identifier getDiscriminatorForPrivateDecl(const Decl *D) const override;
 
   virtual StringRef getFilename() const override;
 

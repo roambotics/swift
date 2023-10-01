@@ -57,10 +57,16 @@ internal final class __EmptyArrayStorage
 
   /// A type that every element in the array is.
   @inlinable
+  @_unavailableInEmbedded
   override internal var staticElementType: Any.Type {
     return Void.self
   }
 }
+
+#if $Embedded
+public var _swiftEmptyArrayStorage: (Int, Int, Int, Int) =
+    (/*isa*/0, /*refcount*/-1, /*count*/0, /*flags*/1)
+#endif
 
 /// The empty array prototype.  We use the same object for all empty
 /// `[Native]Array<Element>`s.
@@ -240,6 +246,7 @@ internal final class _ContiguousArrayStorage<
 
   /// A type that every element in the array is.
   @inlinable
+  @_unavailableInEmbedded
   internal override var staticElementType: Any.Type {
     return Element.self
   }
@@ -295,12 +302,23 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
       self = _ContiguousArrayBuffer<Element>()
     }
     else {
+      let storageType: _ContiguousArrayStorage<Element>.Type
+      #if !$Embedded
+      storageType = getContiguousArrayStorageType(for: Element.self)
+      #else
+      storageType = _ContiguousArrayStorage<Element>.self
+      #endif
       _storage = Builtin.allocWithTailElems_1(
-         getContiguousArrayStorageType(for: Element.self),
-         realMinimumCapacity._builtinWordValue, Element.self)
+         storageType, realMinimumCapacity._builtinWordValue, Element.self)
 
       let storageAddr = UnsafeMutableRawPointer(Builtin.bridgeToRawPointer(_storage))
-      if let allocSize = _mallocSize(ofAllocation: storageAddr) {
+      let allocSize: Int?
+      #if !$Embedded
+      allocSize = _mallocSize(ofAllocation: storageAddr)
+      #else
+      allocSize = nil
+      #endif
+      if let allocSize {
         let endAddr = storageAddr + allocSize
         let realCapacity = endAddr.assumingMemoryBound(to: Element.self) - firstElementAddress
         _initStorageHeader(
@@ -682,8 +700,13 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   @inlinable
   internal subscript(bounds: Range<Int>) -> _SliceBuffer<Element> {
     get {
+      #if $Embedded
+      let storage = Builtin.castToNativeObject(_storage)
+      #else
+      let storage = _storage
+      #endif
       return _SliceBuffer(
-        owner: _storage,
+        owner: storage,
         subscriptBaseAddress: firstElementAddress,
         indices: bounds,
         hasNativeBuffer: true)
@@ -831,16 +854,24 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   }
 #endif
 
+  #if $Embedded
+  public typealias AnyObject = Builtin.NativeObject
+  #endif
+
   /// An object that keeps the elements stored in this buffer alive.
   @inlinable
   internal var owner: AnyObject {
+    #if !$Embedded
     return _storage
+    #else
+    return Builtin.castToNativeObject(_storage)
+    #endif
   }
 
   /// An object that keeps the elements stored in this buffer alive.
   @inlinable
   internal var nativeOwner: AnyObject {
-    return _storage
+    return owner
   }
 
   /// A value that identifies the storage used by the buffer.
@@ -865,6 +896,7 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   ///
   /// - Complexity: O(*n*)
   @inlinable
+  @_unavailableInEmbedded
   internal func storesOnlyElementsOfType<U>(
     _: U.Type
   ) -> Bool {

@@ -1,11 +1,11 @@
 // RUN: %empty-directory(%t)
 // RUN: split-file %s %t
 
-// RUN: %target-swift-frontend -typecheck %t/use-cxx-types.swift -typecheck -module-name UseCxxTy -emit-clang-header-path %t/UseCxxTy.h -I %t -enable-experimental-cxx-interop -clang-header-expose-decls=all-public
+// RUN: %target-swift-frontend -typecheck %t/use-cxx-types.swift -typecheck -module-name UseCxxTy -emit-clang-header-path %t/UseCxxTy.h -I %t -enable-experimental-cxx-interop -clang-header-expose-decls=all-public -disable-availability-checking
 
 // RUN: %FileCheck %s < %t/UseCxxTy.h
 
-// RUN: %target-swift-frontend -typecheck %t/use-cxx-types.swift -typecheck -module-name UseCxxTy -emit-clang-header-path %t/UseCxxTyExposeOnly.h -I %t -enable-experimental-cxx-interop -clang-header-expose-decls=has-expose-attr
+// RUN: %target-swift-frontend -typecheck %t/use-cxx-types.swift -typecheck -module-name UseCxxTy -emit-clang-header-path %t/UseCxxTyExposeOnly.h -I %t -enable-experimental-cxx-interop -clang-header-expose-decls=has-expose-attr -disable-availability-checking
 
 // RUN: %FileCheck %s < %t/UseCxxTyExposeOnly.h
 
@@ -15,7 +15,12 @@
 
 // RUN: %check-interop-cxx-header-in-clang(%t/full-cxx-swift-cxx-bridging.h -Wno-reserved-identifier)
 
-// FIXME: test in C++ with modules (but libc++ modularization is preventing this)
+// Check that the generated header can be
+// built with Clang modules enabled in C++.
+
+// RUN: %target-interop-build-clangxx -fsyntax-only -x c++-header %t/full-cxx-swift-cxx-bridging.h -std=gnu++20 -c -fmodules -fcxx-modules -I %t
+
+// XFAIL: OS=linux-android, OS=linux-androideabi
 
 //--- header.h
 
@@ -34,7 +39,7 @@ namespace ns {
         T x;
 
         NonTrivialTemplate();
-        NonTrivialTemplate(const NonTrivialTemplate<T> &) = default;
+        NonTrivialTemplate(const NonTrivialTemplate<T> &other) : x(other.x) {}
         NonTrivialTemplate(NonTrivialTemplate<T> &&) = default;
         ~NonTrivialTemplate() {}
     };
@@ -43,6 +48,8 @@ namespace ns {
 
     struct NonTrivialImplicitMove {
         NonTrivialTemplate<int> member;
+
+        NonTrivialImplicitMove(const NonTrivialImplicitMove &other) : member(other.member) {}
     };
 
     #define IMMORTAL_REF                                \
@@ -74,6 +81,14 @@ namespace ns {
 }
 
 using SimpleTypedef = int;
+
+typedef struct { float column; } anonymousStruct;
+
+namespace ns {
+
+using anonStructInNS = struct { float row; };
+
+}
 
 //--- module.modulemap
 module CxxTest {
@@ -144,12 +159,18 @@ public func takeTrivial(_ x: Trivial) {
 public func takeTrivialInout(_ x: inout Trivial) {
 }
 
+@_expose(Cxx)
+public struct Strct {
+    public let transform: anonymousStruct
+    public let transform2: ns.anonStructInNS
+}
+
 // CHECK: #if __has_feature(objc_modules)
 // CHECK: #if __has_feature(objc_modules)
 // CHECK-NEXT: #if __has_warning("-Watimport-in-framework-header")
 // CHECK-NEXT: #pragma clang diagnostic ignored "-Watimport-in-framework-header"
 // CHECK-NEXT:#endif
-// CHECK-NEXT: #pragma clang module import CxxTest;
+// CHECK-NEXT: #pragma clang module import CxxTest
 // CHECK-NEXT: #endif
 
 
@@ -279,3 +300,9 @@ public func takeTrivialInout(_ x: inout Trivial) {
 // CHECK: SWIFT_INLINE_THUNK void takeTrivialInout(Trivial& x) noexcept SWIFT_SYMBOL({{.*}}) {
 // CHECK-NEXT:   return _impl::$s8UseCxxTy16takeTrivialInoutyySo0E0VzF(swift::_impl::getOpaquePointer(x));
 // CHECK-NEXT: }
+
+// CHECK: SWIFT_INLINE_THUNK anonymousStruct Strct::getTransform() const {
+// CHECK-NEXT: alignas(alignof(anonymousStruct)) char storage[sizeof(anonymousStruct)];
+
+// CHECK: SWIFT_INLINE_THUNK ns::anonStructInNS Strct::getTransform2() const {
+// CHECK-NEXT: alignas(alignof(ns::anonStructInNS)) char storage[sizeof(ns::anonStructInNS)];

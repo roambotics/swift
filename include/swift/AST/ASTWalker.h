@@ -20,6 +20,7 @@
 
 namespace swift {
 
+class Argument;
 class ArgumentList;
 class Decl;
 class Expr;
@@ -48,17 +49,17 @@ struct ReferenceMetaData {
   SemaReferenceKind Kind;
   llvm::Optional<AccessKind> AccKind;
   bool isImplicit = false;
+  bool isImplicitCtorType = false;
 
   /// When non-none, this is a custom attribute reference.
-  Optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef;
+  llvm::Optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef;
 
-  ReferenceMetaData(
-      SemaReferenceKind Kind, llvm::Optional<AccessKind> AccKind,
-      bool isImplicit = false,
-      Optional<std::pair<const CustomAttr *, Decl *>> customAttrRef
-        = None
-  ) : Kind(Kind), AccKind(AccKind), isImplicit(isImplicit),
-      CustomAttrRef(customAttrRef) {}
+  ReferenceMetaData(SemaReferenceKind Kind, llvm::Optional<AccessKind> AccKind,
+                    bool isImplicit = false,
+                    llvm::Optional<std::pair<const CustomAttr *, Decl *>>
+                        customAttrRef = llvm::None)
+      : Kind(Kind), AccKind(AccKind), isImplicit(isImplicit),
+        CustomAttrRef(customAttrRef) {}
 };
 
 /// Specifies how the initialization expression of a \c lazy variable should be
@@ -318,7 +319,7 @@ public:
   template <typename T>
   struct PreWalkResult {
     PreWalkAction Action;
-    Optional<T> Value;
+    llvm::Optional<T> Value;
 
     template <typename U,
               typename std::enable_if<std::is_convertible<U, T>::value>::type
@@ -352,7 +353,7 @@ public:
           Value(std::move(Result.Value)) {}
 
     PreWalkResult(_Detail::StopWalkAction)
-        : Action(PreWalkAction::Stop), Value(None) {}
+        : Action(PreWalkAction::Stop), Value(llvm::None) {}
   };
 
   /// Do not construct directly, use \c Action::<action> instead.
@@ -363,7 +364,7 @@ public:
   template <typename T>
   struct PostWalkResult {
     PostWalkAction Action;
-    Optional<T> Value;
+    llvm::Optional<T> Value;
 
     template <typename U,
               typename std::enable_if<std::is_convertible<U, T>::value>::type
@@ -391,7 +392,7 @@ public:
           Value(std::move(Result.Value)) {}
 
     PostWalkResult(_Detail::StopWalkAction)
-        : Action(PostWalkAction::Stop), Value(None) {}
+        : Action(PostWalkAction::Stop), Value(llvm::None) {}
   };
 
   /// This method is called when first visiting an expression
@@ -591,6 +592,10 @@ public:
   /// TODO: Consider changing this to false by default.
   virtual bool shouldWalkSerializedTopLevelInternalDecls() { return true; }
 
+  /// Whether to walk into the definition of a \c MacroDecl if it hasn't been
+  /// type-checked yet.
+  virtual bool shouldWalkIntoUncheckedMacroDefinitions() { return false; }
+
   /// walkToParameterListPre - This method is called when first visiting a
   /// ParameterList, before walking into its parameters.
   ///
@@ -637,6 +642,27 @@ public:
   virtual PostWalkResult<ArgumentList *>
   walkToArgumentListPost(ArgumentList *ArgList) {
     return Action::Continue(ArgList);
+  }
+
+  /// This method is called when first visiting an argument in an argument list,
+  /// before walking into its expression.
+  ///
+  /// \param Arg The argument to walk.
+  ///
+  /// \returns The walking action to perform.
+  ///
+  /// The default implementation returns \c Action::Continue().
+  virtual PreWalkAction walkToArgumentPre(const Argument &Arg) {
+    return Action::Continue();
+  }
+
+  /// This method is called after visiting an argument in an argument list.
+  ///
+  /// \returns The walking action to perform.
+  ///
+  /// The default implementation returns \c Action::Continue().
+  virtual PostWalkAction walkToArgumentPost(const Argument &Arg) {
+    return Action::Continue();
   }
 
 protected:

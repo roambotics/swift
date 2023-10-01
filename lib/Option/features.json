@@ -31,7 +31,10 @@
       "name": "emit-extension-block-symbols"
     },
     {
-      "name": "package-name"
+      "name": "package-name-if-supported"
+    },
+    {
+      "name": "const-extract-complete-metadata"
     }
   ]
 }

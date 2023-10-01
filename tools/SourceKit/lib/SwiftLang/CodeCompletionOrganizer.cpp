@@ -142,8 +142,7 @@ bool SourceKit::CodeCompletion::addCustomCompletions(
     auto *swiftResult = new (sink.allocator) CodeCompletion::SwiftResult(
         *contextFreeResult, SemanticContextKind::Local,
         CodeCompletionFlairBit::ExpressionSpecific,
-        /*NumBytesToErase=*/0, /*TypeContext=*/nullptr, /*DC=*/nullptr,
-        /*USRTypeContext=*/nullptr, /*CanCurrDeclContextHandleAsync=*/false,
+        /*NumBytesToErase=*/0, CodeCompletionResultTypeRelation::Unrelated,
         ContextualNotRecommendedReason::None);
 
     CompletionBuilder builder(sink, *swiftResult);
@@ -1167,9 +1166,9 @@ Completion *CompletionBuilder::finish() {
         new (sink.allocator) ContextFreeCodeCompletionResult(
             contextFreeBase.getKind(),
             contextFreeBase.getOpaqueAssociatedKind(), opKind,
-            contextFreeBase.isSystem(), contextFreeBase.isAsync(),
-            contextFreeBase.hasAsyncAlternative(), newCompletionString,
-            contextFreeBase.getModuleName(),
+            contextFreeBase.getMacroRoles(), contextFreeBase.isSystem(),
+            contextFreeBase.isAsync(), contextFreeBase.hasAsyncAlternative(),
+            newCompletionString, contextFreeBase.getModuleName(),
             contextFreeBase.getBriefDocComment(),
             contextFreeBase.getAssociatedUSRs(),
             contextFreeBase.getResultType(),

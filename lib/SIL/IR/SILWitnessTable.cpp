@@ -43,8 +43,8 @@ ProtocolDecl *SILWitnessTable::getProtocol() const {
   return getConformance()->getProtocol();
 }
 
-CanType SILWitnessTable::getConformingType() const {
-  return getConformance()->getType()->getCanonicalType();
+NominalTypeDecl *SILWitnessTable::getConformingNominal() const {
+  return getConformance()->getDeclContext()->getSelfNominalTypeDecl();
 }
 
 void SILWitnessTable::addWitnessTable() {
@@ -174,7 +174,7 @@ bool SILWitnessTable::conformanceIsSerialized(
   if (conformance->getProtocol()->getEffectiveAccess() < AccessLevel::Public)
     return false;
 
-  auto *nominal = conformance->getType()->getAnyNominal();
+  auto *nominal = conformance->getDeclContext()->getSelfNominalTypeDecl();
   return nominal->getEffectiveAccess() >= AccessLevel::Public;
 }
 

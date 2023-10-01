@@ -22,8 +22,9 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <atomic>
 #include <condition_variable>
-#include <thread>
+#include <optional>
 
 #ifndef SWIFT_DEBUG_RUNTIME
 #define SWIFT_DEBUG_RUNTIME 0
@@ -174,7 +175,8 @@ class LockingConcurrentMapStorage {
   // TargetGenericMetadataInstantiationCache::PrivateData. On 32-bit archs, that
   // space is not large enough to accommodate a Mutex along with everything
   // else. There, use a SmallMutex to squeeze into the available space.
-  using MutexTy = std::conditional_t<sizeof(void *) == 8, Mutex, SmallMutex>;
+  using MutexTy = std::conditional_t<sizeof(void *) == 8 && sizeof(Mutex) <= 56,
+                                     Mutex, SmallMutex>;
   StableAddressConcurrentReadableHashMap<EntryType,
                                          TaggedMetadataAllocator<Tag>, MutexTy>
       Map;
@@ -296,9 +298,10 @@ public:
 
   /// If an entry already exists, await it; otherwise report failure.
   template <class KeyType, class... ArgTys>
-  llvm::Optional<Status> tryAwaitExisting(KeyType key, ArgTys &&... args) {
+  std::optional<Status> tryAwaitExisting(KeyType key, ArgTys &&...args) {
     EntryType *entry = Storage.find(key);
-    if (!entry) return None;
+    if (!entry)
+      return std::nullopt;
     return entry->await(Storage.getConcurrency(),
                         std::forward<ArgTys>(args)...);
   }
@@ -380,8 +383,8 @@ public:
   }
 
   template <class... ArgTys>
-  llvm::Optional<Status> beginAllocation(WaitQueue::Worker &worker,
-                                         ArgTys &&... args) {
+  std::optional<Status> beginAllocation(WaitQueue::Worker &worker,
+                                        ArgTys &&...args) {
 
     // Delegate to the implementation class.
     ValueType origValue =
@@ -462,7 +465,9 @@ struct GenericSignatureLayout {
       }
     }
 
+#ifndef NDEBUG
     assert(packIdx == NumPacks);
+#endif
   }
 
   size_t sizeInWords() const {
@@ -502,6 +507,7 @@ class MetadataCacheKey {
   GenericSignatureLayout<InProcess> Layout;
   uint32_t Hash;
 
+public:
   /// Compare two witness tables, which may involving checking the
   /// contents of their conformance descriptors.
   static bool areWitnessTablesEqual(const WitnessTable *awt,
@@ -520,7 +526,10 @@ class MetadataCacheKey {
     return areConformanceDescriptorsEqual(aDescription, bDescription);
   }
 
-public:
+  static void installGenericArguments(uint16_t numKeyArguments, uint16_t numPacks,
+                                      const GenericPackShapeDescriptor *packShapeDescriptors,
+                                      const void **dst, const void * const *src);
+
   /// Compare two conformance descriptors, checking their contents if necessary.
   static bool areConformanceDescriptorsEqual(
       const ProtocolConformanceDescriptor *aDescription,
@@ -548,7 +557,8 @@ private:
     MetadataPackPointer lhs(lhsPtr);
     MetadataPackPointer rhs(rhsPtr);
 
-    assert(lhs.getLifetime() == PackLifetime::OnHeap);
+    // lhs is the user-supplied key, which might be on the stack.
+    // rhs is the stored key in the cache.
     assert(rhs.getLifetime() == PackLifetime::OnHeap);
 
     auto *lhsElt = lhs.getElements();
@@ -568,7 +578,8 @@ private:
     WitnessTablePackPointer lhs(lhsPtr);
     WitnessTablePackPointer rhs(rhsPtr);
 
-    assert(lhs.getLifetime() == PackLifetime::OnHeap);
+    // lhs is the user-supplied key, which might be on the stack.
+    // rhs is the stored key in the cache.
     assert(rhs.getLifetime() == PackLifetime::OnHeap);
 
     auto *lhsElt = lhs.getElements();
@@ -591,7 +602,7 @@ public:
                    const void *const *data, uint32_t hash)
       : Data(data), Layout(layout), Hash(hash) {}
 
-  bool operator==(MetadataCacheKey rhs) const {
+  bool operator==(const MetadataCacheKey &rhs) const {
     // Compare the hashes.
     if (hash() != rhs.hash()) return false;
 
@@ -682,8 +693,11 @@ public:
   unsigned size() const { return Layout.sizeInWords(); }
 
   void installInto(const void **buffer) const {
-    // FIXME: variadic-parameter-packs
-    memcpy(buffer, Data, size() * sizeof(const void *));
+    MetadataCacheKey::installGenericArguments(
+        Layout.sizeInWords(),
+        Layout.NumPacks,
+        Layout.PackShapeDescriptors,
+        buffer, Data);
   }
 
 private:
@@ -1114,9 +1128,9 @@ public:
 
   /// Perform the allocation operation.
   template <class... Args>
-  llvm::Optional<Status> beginAllocation(MetadataWaitQueue::Worker &worker,
-                                         MetadataRequest request,
-                                         Args &&... args) {
+  std::optional<Status> beginAllocation(MetadataWaitQueue::Worker &worker,
+                                        MetadataRequest request,
+                                        Args &&...args) {
     // Returning a non-None value here will preempt initialization, so we
     // should only do it if we're reached PrivateMetadataState::Complete.
 
@@ -1138,7 +1152,7 @@ public:
 
       // Otherwise, go directly to the initialization phase.
       assert(worker.isWorkerThread());
-      return None;
+      return std::nullopt;
     }
 
     assert(worker.isWorkerThread());
@@ -1182,7 +1196,7 @@ public:
       verifyMangledNameRoundtrip(value);
 #endif
 
-    return None;
+    return std::nullopt;
   }
 
   template <class... Args>
@@ -1571,6 +1585,8 @@ public:
   bool matchesKey(const MetadataCacheKey &key) const {
     return key == getKey();
   }
+
+  friend struct StaticAssertGenericMetadataCacheEntryValueOffset;
 };
 
 template <class EntryType, uint16_t Tag>

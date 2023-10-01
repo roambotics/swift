@@ -48,7 +48,8 @@ void ASTScopeImpl::unqualifiedLookup(
 const ASTScopeImpl *ASTScopeImpl::findStartingScopeForLookup(
     SourceFile *sourceFile, const SourceLoc loc) {
   auto *const fileScope = sourceFile->getScope().impl;
-  const auto *innermost = fileScope->findInnermostEnclosingScope(loc, nullptr);
+  const auto *innermost = fileScope->findInnermostEnclosingScope(
+      sourceFile->getParentModule(), loc, nullptr);
   ASTScopeAssert(innermost->getWasExpanded(),
                  "If looking in a scope, it must have been expanded.");
 
@@ -56,22 +57,23 @@ const ASTScopeImpl *ASTScopeImpl::findStartingScopeForLookup(
 }
 
 ASTScopeImpl *
-ASTScopeImpl::findInnermostEnclosingScope(SourceLoc loc,
+ASTScopeImpl::findInnermostEnclosingScope(ModuleDecl *parentModule,
+                                          SourceLoc loc,
                                           NullablePtr<raw_ostream> os) {
-  return findInnermostEnclosingScopeImpl(loc, os, getSourceManager(),
-                                         getScopeCreator());
+  return findInnermostEnclosingScopeImpl(parentModule, loc, os,
+                                         getSourceManager(), getScopeCreator());
 }
 
 ASTScopeImpl *ASTScopeImpl::findInnermostEnclosingScopeImpl(
-    SourceLoc loc, NullablePtr<raw_ostream> os, SourceManager &sourceMgr,
-    ScopeCreator &scopeCreator) {
+    ModuleDecl *parentModule, SourceLoc loc, NullablePtr<raw_ostream> os,
+    SourceManager &sourceMgr, ScopeCreator &scopeCreator) {
   if (!getWasExpanded())
     expandAndBeCurrent(scopeCreator);
-  auto child = findChildContaining(loc, sourceMgr);
+  auto child = findChildContaining(parentModule, loc, sourceMgr);
   if (!child)
     return this;
-  return child.get()->findInnermostEnclosingScopeImpl(loc, os, sourceMgr,
-                                                      scopeCreator);
+  return child.get()->findInnermostEnclosingScopeImpl(parentModule, loc, os,
+                                                      sourceMgr, scopeCreator);
 }
 
 /// If the \p loc is in a new buffer but \p range is not, consider the location
@@ -89,10 +91,10 @@ static SourceLoc translateLocForReplacedRange(SourceManager &sourceMgr,
 }
 
 NullablePtr<ASTScopeImpl>
-ASTScopeImpl::findChildContaining(SourceLoc loc,
+ASTScopeImpl::findChildContaining(ModuleDecl *parentModule,
+                                  SourceLoc loc,
                                   SourceManager &sourceMgr) const {
-  auto *moduleDecl = this->getSourceFile()->getParentModule();
-  auto *locSourceFile = moduleDecl->getSourceFileContainingLocation(loc);
+  auto *locSourceFile = parentModule->getSourceFileContainingLocation(loc);
 
   // Use binary search to find the child that contains this location.
   auto *const *child = llvm::lower_bound(
@@ -109,7 +111,7 @@ ASTScopeImpl::findChildContaining(SourceLoc loc,
         // Note that `scope->getSourceFile()` returns the root of the source tree,
         // not the source file containing the location of the ASTScope.
         auto scopeStart = scope->getSourceRangeOfThisASTNode().Start;
-        auto *scopeSourceFile = moduleDecl->getSourceFileContainingLocation(scopeStart);
+        auto *scopeSourceFile = parentModule->getSourceFileContainingLocation(scopeStart);
 
         if (scopeSourceFile != locSourceFile) {
           // To compare a source location that is possibly inside a macro expansion
@@ -160,7 +162,8 @@ ASTScopeImpl::findChildContaining(SourceLoc loc,
 
             auto generatedInfo =
                 sourceMgr.getGeneratedSourceInfo(*potentialLCA->getBufferID());
-            expansionLoc = generatedInfo->originalSourceRange.getStart();
+            if (generatedInfo)
+              expansionLoc = generatedInfo->originalSourceRange.getStart();
             potentialLCA = potentialLCA->getEnclosingSourceFile();
           }
         }
@@ -258,6 +261,17 @@ NullablePtr<const GenericParamList> ExtensionScope::genericParams() const {
 }
 NullablePtr<const GenericParamList> MacroDeclScope::genericParams() const {
   return decl->getParsedGenericParams();
+}
+
+bool MacroDeclScope::lookupLocalsOrMembers(
+    DeclConsumer consumer) const {
+  if (auto *paramList = decl->parameterList) {
+    for (auto *paramDecl : *paramList)
+      if (consumer.consume({paramDecl}))
+        return true;
+  }
+
+  return false;
 }
 
 #pragma mark lookInMyGenericParameters
@@ -612,7 +626,8 @@ llvm::SmallVector<LabeledStmt *, 4>
 ASTScopeImpl::lookupLabeledStmts(SourceFile *sourceFile, SourceLoc loc) {
   // Find the innermost scope from which to start our search.
   auto *const fileScope = sourceFile->getScope().impl;
-  const auto *innermost = fileScope->findInnermostEnclosingScope(loc, nullptr);
+  const auto *innermost = fileScope->findInnermostEnclosingScope(
+      sourceFile->getParentModule(), loc, nullptr);
   ASTScopeAssert(innermost->getWasExpanded(),
                  "If looking in a scope, it must have been expanded.");
 
@@ -640,7 +655,8 @@ std::pair<CaseStmt *, CaseStmt *> ASTScopeImpl::lookupFallthroughSourceAndDest(
     SourceFile *sourceFile, SourceLoc loc) {
   // Find the innermost scope from which to start our search.
   auto *const fileScope = sourceFile->getScope().impl;
-  const auto *innermost = fileScope->findInnermostEnclosingScope(loc, nullptr);
+  const auto *innermost = fileScope->findInnermostEnclosingScope(
+      sourceFile->getParentModule(), loc, nullptr);
   ASTScopeAssert(innermost->getWasExpanded(),
                  "If looking in a scope, it must have been expanded.");
 
@@ -662,4 +678,38 @@ std::pair<CaseStmt *, CaseStmt *> ASTScopeImpl::lookupFallthroughSourceAndDest(
   }
 
   return { nullptr, nullptr };
+}
+
+void ASTScopeImpl::lookupEnclosingMacroScope(
+    SourceFile *sourceFile, SourceLoc loc,
+    llvm::function_ref<bool(ASTScope::PotentialMacro)> consume) {
+  if (!sourceFile || sourceFile->Kind == SourceFileKind::Interface)
+    return;
+
+  if (loc.isInvalid())
+    return;
+
+  auto *fileScope = sourceFile->getScope().impl;
+  auto *scope = fileScope->findInnermostEnclosingScope(
+      sourceFile->getParentModule(), loc, nullptr);
+  do {
+    auto *freestanding = scope->getFreestandingMacro().getPtrOrNull();
+    if (freestanding && consume(freestanding))
+      return;
+
+    auto *attr = scope->getDeclAttributeIfAny().getPtrOrNull();
+    auto *potentialAttached = dyn_cast_or_null<CustomAttr>(attr);
+    if (potentialAttached && consume(potentialAttached))
+      return;
+
+    // If we've reached a source file scope, we can't be inside of
+    // a macro argument. Either this is a top-level source file, or
+    // it's macro expansion buffer. We have to check for this because
+    // macro expansion buffers for freestanding macros are children of
+    // MacroExpansionDeclScope, and child scopes of freestanding macros
+    // are otherwise inside the macro argument.
+    if (scope->getClassName() == "ASTSourceFileScope")
+      return;
+
+  } while ((scope = scope->getParent().getPtrOrNull()));
 }

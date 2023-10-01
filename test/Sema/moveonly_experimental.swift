@@ -4,7 +4,7 @@
 
 struct SomeValue {}
 
-@_moveOnly class NoncopyableClass {} // expected-error {{'moveOnly' only applies to structs or enums}}
+@_moveOnly class NoncopyableClass {} // expected-error {{'@_moveOnly' attribute is only valid on structs or enums}}
 
 func checkOldConsumeName() {
   let x = SomeValue()
@@ -31,6 +31,14 @@ func checkNoImplicitCopy2(_ x: SomeValue) {
   checkNoImplicitCopy2(y)
 }
 
+// coverage to ensure the feature flag is working
+#if $MoveOnly
+  func guardedFn() {}
+#endif
+
+func caller() {
+  guardedFn()
+}
 
 
 

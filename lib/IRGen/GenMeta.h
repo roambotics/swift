@@ -59,6 +59,11 @@ namespace irgen {
                          const ClassLayout &fragileLayout,
                          const ClassLayout &resilientLayout);
 
+  /// Emit "embedded Swift" class metadata (a simple vtable) for the given class
+  /// declaration.
+  void emitEmbeddedClassMetadata(IRGenModule &IGM, ClassDecl *theClass,
+                                 const ClassLayout &fragileLayout);
+
   /// Emit the constant initializer of the type metadata candidate for
   /// the given foreign class declaration.
   llvm::Constant *emitForeignTypeMetadataInitializer(IRGenModule &IGM,
@@ -77,6 +82,8 @@ namespace irgen {
 
   /// Emit the type metadata accessor for a type for which it might be used.
   void emitLazyMetadataAccessor(IRGenModule &IGM, NominalTypeDecl *type);
+
+  void emitLazySpecializedClassMetadata(IRGenModule &IGM, CanType classType);
 
   void emitLazyCanonicalSpecializedMetadataAccessor(IRGenModule &IGM,
                                                     CanType theType);
@@ -238,6 +245,15 @@ namespace irgen {
                                           ConstantStructBuilder &B,
                                           GenericSignature sig,
                                           ArrayRef<Requirement> requirements);
+
+  /// Add generic pack shape descriptors to the given constant struct builder.
+  ///
+  /// These appear in generic type metadata, and conformance descriptors with
+  /// conditional pack requirements.
+  void addGenericPackShapeDescriptors(IRGenModule &IGM,
+                                      ConstantStructBuilder &B,
+                                      ArrayRef<CanType> shapes,
+                                      ArrayRef<GenericPackArgument> packArgs);
 
   llvm::GlobalValue *emitAsyncFunctionPointer(IRGenModule &IGM,
                                               llvm::Function *function,

@@ -20,6 +20,8 @@ namespace swift {
 
 bool isIterator(const clang::CXXRecordDecl *clangDecl);
 
+bool isUnsafeStdMethod(const clang::CXXMethodDecl *methodDecl);
+
 /// If the decl is a C++ input iterator, synthesize a conformance to the
 /// UnsafeCxxInputIterator protocol, which is defined in the Cxx module.
 void conformToCxxIteratorIfNeeded(ClangImporter::Implementation &impl,
@@ -56,6 +58,12 @@ void conformToCxxPairIfNeeded(ClangImporter::Implementation &impl,
 void conformToCxxDictionaryIfNeeded(ClangImporter::Implementation &impl,
                                     NominalTypeDecl *decl,
                                     const clang::CXXRecordDecl *clangDecl);
+
+/// If the decl is an instantiation of C++ `std::vector`, synthesize a
+/// conformance to CxxVector, which is defined in the Cxx module.
+void conformToCxxVectorIfNeeded(ClangImporter::Implementation &impl,
+                                NominalTypeDecl *decl,
+                                const clang::CXXRecordDecl *clangDecl);
 
 } // namespace swift
 

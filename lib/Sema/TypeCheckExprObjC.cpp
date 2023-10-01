@@ -20,14 +20,15 @@
 
 using namespace swift;
 
-Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
-                                                 KeyPathExpr *expr,
-                                                 bool requireResultType) {
+llvm::Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
+                                                       KeyPathExpr *expr,
+                                                       bool requireResultType) {
   // TODO: Native keypaths
   assert(expr->isObjC() && "native keypaths not type-checked this way");
   
   // If there is already a semantic expression, do nothing.
-  if (expr->getObjCStringLiteralExpr() && !requireResultType) return None;
+  if (expr->getObjCStringLiteralExpr() && !requireResultType)
+    return llvm::None;
 
   // ObjC #keyPath only makes sense when we have the Objective-C runtime.
   auto &Context = dc->getASTContext();
@@ -38,7 +39,7 @@ Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
     expr->setObjCStringLiteralExpr(
       new (Context) StringLiteralExpr("", expr->getSourceRange(),
                                       /*Implicit=*/true));
-    return None;
+    return llvm::None;
   }
 
   // The key path string we're forming.
@@ -312,7 +313,7 @@ Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
 
       for (auto result : lookup) {
         diags.diagnose(result.getValueDecl(), diag::decl_declared_here,
-                       result.getValueDecl()->getName());
+                       result.getValueDecl());
       }
       isInvalid = true;
       break;
@@ -410,8 +411,7 @@ Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
     }
 
     // Declarations that cannot be part of a key-path.
-    diags.diagnose(componentNameLoc, diag::expr_keypath_not_property,
-                   found->getDescriptiveKind(), found->getName(),
+    diags.diagnose(componentNameLoc, diag::expr_keypath_not_property, found,
                    /*isForDynamicKeyPathMemberLookup=*/false);
     isInvalid = true;
     break;
@@ -434,6 +434,7 @@ Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
                                       /*Implicit=*/true));
   }
 
-  if (!currentType) return None;
+  if (!currentType)
+    return llvm::None;
   return currentType;
 }

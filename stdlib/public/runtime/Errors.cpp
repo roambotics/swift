@@ -404,6 +404,12 @@ swift::warning(uint32_t flags, const char *format, ...)
   warningv(flags, format, args);
 }
 
+/// Report a warning to the system console and stderr.  This is exported,
+/// unlike the swift::warning() function above.
+void swift::swift_reportWarning(uint32_t flags, const char *message) {
+  warning(flags, "%s", message);
+}
+
 // Crash when a deleted method is called by accident.
 SWIFT_RUNTIME_EXPORT SWIFT_NORETURN void swift_deletedMethodError() {
   swift::fatalError(/* flags = */ 0,
@@ -465,3 +471,18 @@ void swift::swift_abortDisabledUnicodeSupport() {
                     "Unicode normalization data is disabled on this platform");
 
 }
+
+#if defined(_WIN32)
+// On Windows, exceptions may be swallowed in some cases and the
+// process may not terminate as expected on crashes. For example,
+// illegal instructions used by llvm.trap. Disable the exception
+// swallowing so that the error handling works as expected.
+__attribute__((__constructor__))
+static void ConfigureExceptionPolicy() {
+  BOOL Suppress = FALSE;
+  SetUserObjectInformationA(GetCurrentProcess(),
+                            UOI_TIMERPROC_EXCEPTION_SUPPRESSION,
+                            &Suppress, sizeof(Suppress));
+}
+
+#endif

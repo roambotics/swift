@@ -93,6 +93,15 @@ valid_type_ref:
 /// Load and normalize a mangled name so it can be matched with string equality.
 llvm::Optional<std::string>
 TypeRefBuilder::normalizeReflectionName(RemoteRef<char> reflectionName) {
+  const auto reflectionNameRemoteAddress = reflectionName.getAddressData();
+
+  if (const auto found =
+          NormalizedReflectionNameCache.find(reflectionNameRemoteAddress);
+      found != NormalizedReflectionNameCache.end()) {
+    return found->second;
+  }
+
+  ScopedNodeFactoryCheckpoint checkpoint(this);
   // Remangle the reflection name to resolve symbolic references.
   if (auto node = demangleTypeRef(reflectionName,
                                   /*useOpaqueTypeSymbolicReferences*/ false)) {
@@ -101,19 +110,27 @@ TypeRefBuilder::normalizeReflectionName(RemoteRef<char> reflectionName) {
     case Node::Kind::ProtocolSymbolicReference:
     case Node::Kind::OpaqueTypeDescriptorSymbolicReference:
       // Symbolic references cannot be mangled, return a failure.
+      NormalizedReflectionNameCache.insert(std::make_pair(
+          reflectionNameRemoteAddress, llvm::Optional<std::string>()));
       return {};
     default:
       auto mangling = mangleNode(node);
-      clearNodeFactory();
       if (!mangling.isSuccess()) {
+        NormalizedReflectionNameCache.insert(std::make_pair(
+            reflectionNameRemoteAddress, llvm::Optional<std::string>()));
         return {};
       }
+      NormalizedReflectionNameCache.insert(
+          std::make_pair(reflectionNameRemoteAddress, mangling.result()));
       return std::move(mangling.result());
     }
   }
 
   // Fall back to the raw string.
-  return getTypeRefString(reflectionName).str();
+  const auto manglingResult = getTypeRefString(reflectionName).str();
+  NormalizedReflectionNameCache.insert(
+      std::make_pair(reflectionNameRemoteAddress, manglingResult));
+  return std::move(manglingResult);
 }
 
 /// Determine whether the given reflection protocol name matches.
@@ -159,11 +176,11 @@ lookupTypeWitness(const std::string &MangledTypeName,
             0)
           continue;
 
+        ScopedNodeFactoryCheckpoint checkpoint(this);
         auto SubstitutedTypeName = readTypeRef(AssocTy,
                                                AssocTy->SubstitutedTypeName);
         auto Demangled = demangleTypeRef(SubstitutedTypeName);
         auto *TypeWitness = decodeMangledType(Demangled);
-        clearNodeFactory();
 
         AssociatedTypeCache.insert(std::make_pair(key, TypeWitness));
         return TypeWitness;
@@ -181,9 +198,9 @@ const TypeRef *TypeRefBuilder::lookupSuperclass(const TypeRef *TR) {
   if (!FD->hasSuperclass())
     return nullptr;
 
+  ScopedNodeFactoryCheckpoint checkpoint(this);
   auto Demangled = demangleTypeRef(readTypeRef(FD, FD->Superclass));
   auto Unsubstituted = decodeMangledType(Demangled);
-  clearNodeFactory();
   if (!Unsubstituted)
     return nullptr;
 
@@ -367,20 +384,21 @@ bool TypeRefBuilder::getFieldTypeRefs(
       continue;
     }
 
+    ScopedNodeFactoryCheckpoint checkpoint(this);
     auto Demangled = demangleTypeRef(readTypeRef(Field,Field->MangledTypeName));
     auto Unsubstituted = decodeMangledType(Demangled);
-    clearNodeFactory();
     if (!Unsubstituted)
       return false;
 
-    auto Substituted = Unsubstituted->subst(*this, *Subs);
+    // We need this for enums; an enum case "is generic" if any generic type
+    // parameter substitutions occurred on the payload.  E.g.,
+    // `case a([T?])` is generic, but `case a([Int?])` is not.
+    bool IsGeneric = false;
+    auto Substituted = Unsubstituted->subst(*this, *Subs, IsGeneric);
+    bool IsIndirect = FD->isEnum() && Field->isIndirectCase();
 
-    if (FD->isEnum() && Field->isIndirectCase()) {
-      Fields.push_back(FieldTypeInfo::forIndirectCase(FieldName.str(), FieldValue, Substituted));
-      continue;
-    }
-
-    Fields.push_back(FieldTypeInfo::forField(FieldName.str(), FieldValue, Substituted));
+    auto FieldTI = FieldTypeInfo(FieldName.str(), FieldValue, Substituted, IsIndirect, IsGeneric);
+    Fields.push_back(FieldTI);
   }
   return true;
 }
@@ -397,8 +415,12 @@ TypeRefBuilder::getBuiltinTypeInfo(const TypeRef *TR) {
   else
     return nullptr;
 
-  for (auto Info : ReflectionInfos) {
-    for (auto BuiltinTypeDescriptor : Info.Builtin) {
+  for (; NormalizedReflectionNameCacheLastReflectionInfoCache <
+         ReflectionInfos.size();
+       NormalizedReflectionNameCacheLastReflectionInfoCache++) {
+    for (auto BuiltinTypeDescriptor :
+         ReflectionInfos[NormalizedReflectionNameCacheLastReflectionInfoCache]
+             .Builtin) {
       if (BuiltinTypeDescriptor->Stride <= 0)
         continue;
       if (!BuiltinTypeDescriptor->hasMangledTypeName())
@@ -412,11 +434,19 @@ TypeRefBuilder::getBuiltinTypeInfo(const TypeRef *TR) {
         continue;
 
       auto CandidateMangledName =
-        readTypeRef(BuiltinTypeDescriptor, BuiltinTypeDescriptor->TypeName);
-      if (!reflectionNameMatches(CandidateMangledName, MangledName))
-        continue;
-      return BuiltinTypeDescriptor;
+          readTypeRef(BuiltinTypeDescriptor, BuiltinTypeDescriptor->TypeName);
+      auto CandidateNormalizedName =
+          normalizeReflectionName(CandidateMangledName);
+      if (CandidateNormalizedName) {
+        BuiltInTypeDescriptorCache.insert(
+            std::make_pair(*CandidateNormalizedName, BuiltinTypeDescriptor));
+      }
     }
+  }
+
+  if (const auto found = BuiltInTypeDescriptorCache.find(MangledName);
+      found != BuiltInTypeDescriptorCache.end()) {
+    return found->second;
   }
 
   return nullptr;
@@ -486,10 +516,10 @@ TypeRefBuilder::getClosureContextInfo(RemoteRef<CaptureDescriptor> CD) {
     auto CR = CD.getField(*i);
     
     if (CR->hasMangledTypeName()) {
+      ScopedNodeFactoryCheckpoint checkpoint(this);
       auto MangledName = readTypeRef(CR, CR->MangledTypeName);
       auto DemangleTree = demangleTypeRef(MangledName);
       TR = decodeMangledType(DemangleTree);
-      clearNodeFactory();
     }
     Info.CaptureTypes.push_back(TR);
   }
@@ -499,10 +529,10 @@ TypeRefBuilder::getClosureContextInfo(RemoteRef<CaptureDescriptor> CD) {
     auto MSR = CD.getField(*i);
     
     if (MSR->hasMangledTypeName()) {
+      ScopedNodeFactoryCheckpoint checkpoint(this);
       auto MangledName = readTypeRef(MSR, MSR->MangledTypeName);
       auto DemangleTree = demangleTypeRef(MangledName);
       TR = decodeMangledType(DemangleTree);
-      clearNodeFactory();
     }
 
     const MetadataSource *MS = nullptr;
@@ -526,11 +556,11 @@ TypeRefBuilder::getClosureContextInfo(RemoteRef<CaptureDescriptor> CD) {
 
 void TypeRefBuilder::dumpTypeRef(RemoteRef<char> MangledName,
                                  std::ostream &stream, bool printTypeName) {
+  ScopedNodeFactoryCheckpoint checkpoint(this);
   auto DemangleTree = demangleTypeRef(MangledName);
   auto TypeName = nodeToString(DemangleTree);
   stream << TypeName << "\n";
   auto Result = swift::Demangle::decodeMangledType(*this, DemangleTree);
-  clearNodeFactory();
   if (Result.isError()) {
     auto *Error = Result.getError();
     char *ErrorStr = Error->copyErrorString();
@@ -549,10 +579,14 @@ FieldTypeCollectionResult TypeRefBuilder::collectFieldTypes(
   FieldTypeCollectionResult result;
   for (const auto &sections : ReflectionInfos) {
     for (auto descriptor : sections.Field) {
-      auto typeRef = readTypeRef(descriptor, descriptor->MangledTypeName);
-      auto typeName = nodeToString(demangleTypeRef(typeRef));
-      auto optionalMangledTypeName = normalizeReflectionName(typeRef);
-      clearNodeFactory();
+      llvm::Optional<std::string> optionalMangledTypeName;
+      std::string typeName;
+      {
+        ScopedNodeFactoryCheckpoint checkpoint(this);
+        auto typeRef = readTypeRef(descriptor, descriptor->MangledTypeName);
+        typeName = nodeToString(demangleTypeRef(typeRef));
+        optionalMangledTypeName = normalizeReflectionName(typeRef);
+      }
       if (optionalMangledTypeName.has_value()) {
         auto mangledTypeName =
           optionalMangledTypeName.value();
@@ -618,10 +652,10 @@ void TypeRefBuilder::dumpFieldSection(std::ostream &stream) {
 void TypeRefBuilder::dumpBuiltinTypeSection(std::ostream &stream) {
   for (const auto &sections : ReflectionInfos) {
     for (auto descriptor : sections.Builtin) {
+      ScopedNodeFactoryCheckpoint checkpoint(this);
       auto typeNode =
           demangleTypeRef(readTypeRef(descriptor, descriptor->TypeName));
       auto typeName = nodeToString(typeNode);
-      clearNodeFactory();
 
       stream << "\n- " << typeName << ":\n";
       stream << "Size: " << descriptor->Size << "\n";
@@ -670,10 +704,10 @@ void TypeRefBuilder::dumpCaptureSection(std::ostream &stream) {
 void TypeRefBuilder::dumpMultiPayloadEnumSection(std::ostream &stream) {
   for (const auto &sections : ReflectionInfos) {
     for (const auto descriptor : sections.MultiPayloadEnum) {
+      ScopedNodeFactoryCheckpoint checkpoint(this);
       auto typeNode =
           demangleTypeRef(readTypeRef(descriptor, descriptor->TypeName));
       auto typeName = nodeToString(typeNode);
-      clearNodeFactory();
 
       stream << "\n- " << typeName << ":\n";
       stream << "  Descriptor Size: " << descriptor->getSizeInBytes() << "\n";

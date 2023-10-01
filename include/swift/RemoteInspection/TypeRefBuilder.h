@@ -288,21 +288,18 @@ struct FieldTypeInfo {
   int Value;
   const TypeRef *TR;
   bool Indirect;
+  bool Generic;
 
-  FieldTypeInfo() : Name(""), Value(0), TR(nullptr), Indirect(false) {}
-  FieldTypeInfo(const std::string &Name, int Value, const TypeRef *TR, bool Indirect)
-    : Name(Name), Value(Value), TR(TR), Indirect(Indirect) {}
+  FieldTypeInfo() : Name(""), Value(0), TR(nullptr), Indirect(false), Generic(false) {}
+  FieldTypeInfo(const std::string &Name, int Value, const TypeRef *TR, bool Indirect, bool Generic)
+    : Name(Name), Value(Value), TR(TR), Indirect(Indirect), Generic(Generic) {}
 
   static FieldTypeInfo forEmptyCase(std::string Name, int Value) {
-    return FieldTypeInfo(Name, Value, nullptr, false);
-  }
-
-  static FieldTypeInfo forIndirectCase(std::string Name, int Value, const TypeRef *TR) {
-    return FieldTypeInfo(Name, Value, TR, true);
+    return FieldTypeInfo(Name, Value, nullptr, false, false);
   }
 
   static FieldTypeInfo forField(std::string Name, int Value, const TypeRef *TR) {
-    return FieldTypeInfo(Name, Value, TR, false);
+    return FieldTypeInfo(Name, Value, TR, false, false);
   }
 };
 
@@ -427,6 +424,18 @@ private:
   /// Cache for field info lookups.
   std::unordered_map<std::string, RemoteRef<FieldDescriptor>> FieldTypeInfoCache;
 
+  /// Cache for normalized reflection name lookups.
+  std::unordered_map<uint64_t /* remote address */, llvm::Optional<std::string>>
+      NormalizedReflectionNameCache;
+
+  /// Cache for built-in type descriptor lookups.
+  std::unordered_map<std::string /* normalized name */,
+                     RemoteRef<BuiltinTypeDescriptor>>
+      BuiltInTypeDescriptorCache;
+
+  /// The index of the last ReflectionInfo cached by BuiltInTypeDescriptorCache.
+  uint32_t NormalizedReflectionNameCacheLastReflectionInfoCache = 0;
+
   std::vector<std::unique_ptr<const GenericSignatureRef>> SignatureRefPool;
 
   TypeConverter TC;
@@ -456,7 +465,26 @@ public:
 
   Demangle::NodeFactory &getNodeFactory() { return Dem; }
 
-  void clearNodeFactory() { Dem.clear(); }
+  NodeFactory::Checkpoint pushNodeFactoryCheckpoint() const {
+    return Dem.pushCheckpoint();
+  }
+
+  void popNodeFactoryCheckpoint(NodeFactory::Checkpoint checkpoint) {
+    Dem.popCheckpoint(checkpoint);
+  }
+
+  class ScopedNodeFactoryCheckpoint {
+    TypeRefBuilder *Builder;
+    NodeFactory::Checkpoint Checkpoint;
+
+  public:
+    ScopedNodeFactoryCheckpoint(TypeRefBuilder *Builder)
+        : Builder(Builder), Checkpoint(Builder->pushNodeFactoryCheckpoint()) {}
+
+    ~ScopedNodeFactoryCheckpoint() {
+      Builder->popNodeFactoryCheckpoint(Checkpoint);
+    }
+  };
 
   BuiltType decodeMangledType(Node *node, bool forRequirement = true);
 
@@ -548,65 +576,66 @@ public:
     return nullptr;
   }
 
-  const BoundGenericTypeRef *createBoundGenericTypeReconstructingParent(
-      const NodePointer node, const TypeRefDecl &decl, size_t shapeIndex,
-      const llvm::ArrayRef<const TypeRef *> &args, size_t argsIndex) {
-    if (!node || !node->hasChildren())
-      return nullptr;
-    
-    auto maybeGenericParamsPerLevel = decl.genericParamsPerLevel;
-    if (!maybeGenericParamsPerLevel)
-      return nullptr;
-
-    auto genericParamsPerLevel = *maybeGenericParamsPerLevel;
-
-    auto kind = node->getKind();
-    // Kinds who have a "BoundGeneric..." variant.
-    if (kind != Node::Kind::Class && kind != Node::Kind::Structure &&
-        kind != Node::Kind::Enum)
-      return nullptr;
-    auto mangling = Demangle::mangleNode(node);
-    if (!mangling.isSuccess())
-      return nullptr;
-
-    if (shapeIndex >= genericParamsPerLevel.size())
-      return nullptr;
-
-    auto numGenericArgs = genericParamsPerLevel[shapeIndex];
-
-    auto startOffsetFromEnd = argsIndex + numGenericArgs;
-    auto endOffsetFromEnd = argsIndex;
-    if (startOffsetFromEnd > args.size() || endOffsetFromEnd > args.size())
-      return nullptr;
-
-    std::vector<const TypeRef *> genericParams(
-        args.end() - startOffsetFromEnd, args.end() - endOffsetFromEnd);
-
-    const BoundGenericTypeRef *parent = nullptr;
-    if (node->hasChildren()) {
-      // Skip over nodes that are not of type class, enum or struct
-      auto parentNode = node->getFirstChild();
-      while (parentNode->getKind() != Node::Kind::Class &&
-             parentNode->getKind() != Node::Kind::Structure &&
-             parentNode->getKind() != Node::Kind::Enum) {
-        if (parentNode->hasChildren()) {
-          parentNode = parentNode->getFirstChild();
-        } else {
-          parentNode = nullptr;
-          break;
-        }
+  // Construct a bound generic type ref along with the parent type info
+  // The parent list contains every parent type with at least 1 generic
+  // type parameter.
+  const BoundGenericTypeRef *reconstructParentsOfBoundGenericType(
+      const NodePointer startNode,
+      const std::vector<size_t> &genericParamsPerLevel,
+      const llvm::ArrayRef<const TypeRef *> &args)
+  {
+    // Collect the first N parents that potentially have generic args
+    // (Ignore the last genericParamPerLevel, which
+    // applies to the startNode itself.)
+    std::vector<NodePointer> nodes;
+    NodePointer node = startNode;
+    while (nodes.size() < genericParamsPerLevel.size() - 1) {
+      if (!node || !node->hasChildren()) {
+	return nullptr;
       }
-      if (parentNode) {
-        if (shapeIndex > 0)
-          parent = createBoundGenericTypeReconstructingParent(
-              parentNode, decl, --shapeIndex, args, argsIndex + numGenericArgs);
-        else
-          return nullptr;
+      node = node->getFirstChild();
+      switch (node->getKind()) {
+      case Node::Kind::Class:
+      case Node::Kind::Structure:
+      case Node::Kind::Enum:
+	nodes.push_back(node);
+	break;
+      default:
+	break;
       }
     }
+    assert(nodes.size() == genericParamsPerLevel.size() - 1);
 
-    return BoundGenericTypeRef::create(*this, mangling.result(), genericParams,
-                                       parent);
+    // We're now going to build the type tree from the
+    // outermost parent in, which matches the order of
+    // the generic parameter list and genericParamsPerLevel.
+    std::reverse(nodes.begin(), nodes.end());
+
+    // Walk the list of parent types together with
+    // the generic argument list...
+    const BoundGenericTypeRef *typeref = nullptr;
+    auto argBegin = args.begin();
+    for (size_t i = 0; i < nodes.size(); i++) {
+      // Get the mangling for this node
+      auto mangling = Demangle::mangleNode(nodes[i]);
+      if (!mangling.isSuccess()) {
+	return nullptr;
+      }
+
+      // Use the next N params for this node
+      auto numGenericArgs = genericParamsPerLevel[i];
+      // Skip nodes that don't have any actual type params.
+      if (numGenericArgs == 0) {
+	continue;
+      }
+      auto argEnd = argBegin + numGenericArgs;
+      std::vector<const TypeRef *> params(argBegin, argEnd);
+      argBegin = argEnd;
+      
+      // Extend the typeref list towards the innermost type
+      typeref = BoundGenericTypeRef::create(*this, mangling.result(), params, typeref);
+    }
+    return typeref;
   }
 
   const BoundGenericTypeRef *
@@ -615,17 +644,58 @@ public:
     if (!builtTypeDecl)
       return nullptr;
 
-    if (!builtTypeDecl->genericParamsPerLevel)
+    // If there aren't generic params on the parent types, we just emit
+    // a single BG typeref with all the generic args
+    auto maybeGenericParamsPerLevel = builtTypeDecl->genericParamsPerLevel;
+    if (!maybeGenericParamsPerLevel) {
       return BoundGenericTypeRef::create(*this, builtTypeDecl->mangledName, args, nullptr);
+    }
 
-  
+    // Otherwise, work from a full demangle tree to produce a
+    // typeref that includes information about parent generic args
     auto node = Dem.demangleType(builtTypeDecl->mangledName);
-    if (!node || !node->hasChildren() || node->getKind() != Node::Kind::Type)
+    if (!node || !node->hasChildren() || node->getKind() != Node::Kind::Type) {
       return nullptr;
+    }
+    auto startNode = node->getFirstChild();
+    auto mangling = Demangle::mangleNode(startNode);
+    if (!mangling.isSuccess()) {
+      return nullptr;
+    }
 
-    auto type = node->getFirstChild();
-    return createBoundGenericTypeReconstructingParent(
-        type, *builtTypeDecl, builtTypeDecl->genericParamsPerLevel->size() - 1, args, 0);
+    // Sanity:  Verify that the generic params per level add
+    // up exactly to the number of args we were provided, and
+    // that we don't have a rediculous number of either one
+    auto genericParamsPerLevel = *maybeGenericParamsPerLevel;
+    if (genericParamsPerLevel.size() > 1000 || args.size() > 1000) {
+      return nullptr;
+    }
+    size_t totalParams = 0;
+    for (size_t i = 0; i < genericParamsPerLevel.size(); i++) {
+      if (genericParamsPerLevel[i] > args.size()) {
+	return nullptr;
+      }
+      totalParams += genericParamsPerLevel[i];
+    }
+    if (totalParams != args.size()) {
+      return nullptr;
+    }
+
+    // Reconstruct all parents that have non-zero generic params
+    auto parents = reconstructParentsOfBoundGenericType(startNode, genericParamsPerLevel, args);
+
+    // Collect the final set of generic params for the
+    // innermost type.  Note: This will sometimes be empty:
+    // consider `Foo<Int, String>.Bar.Baz<Double>.Quux`
+    // which has 2 parents in the parent list
+    // (`Foo<Int,String>`, `Baz<Double>`), and the
+    // startNode is `Quux` with no params.
+    auto numGenericArgs = genericParamsPerLevel[genericParamsPerLevel.size() - 1];
+    auto argBegin = args.end() - numGenericArgs;
+    std::vector<const TypeRef *> params(argBegin, args.end());
+
+    // Build and return the top typeref
+    return BoundGenericTypeRef::create(*this, mangling.result(), params, parents);
   }
 
   const BoundGenericTypeRef *
@@ -685,8 +755,9 @@ public:
   }
 
   const TupleTypeRef *createTupleType(llvm::ArrayRef<const TypeRef *> elements,
-                                      std::string &&labels) {
-    return TupleTypeRef::create(*this, elements, std::move(labels));
+                                      llvm::ArrayRef<StringRef> labels) {
+    std::vector<std::string> labelsVec(labels.begin(), labels.end());
+    return TupleTypeRef::create(*this, elements, labelsVec);
   }
 
   const TypeRef *createPackType(llvm::ArrayRef<const TypeRef *> elements) {
@@ -700,10 +771,22 @@ public:
     return nullptr;
   }
 
-  const TypeRef *createPackExpansionType(const TypeRef *patternType,
-                                         const TypeRef *countType) {
+  size_t beginPackExpansion(const TypeRef *countType) {
+    // FIXME: Remote mirrors support for variadic generics.
+    return 0;
+  }
+
+  void advancePackExpansion(size_t index) {
+    // FIXME: Remote mirrors support for variadic generics.
+  }
+
+  const TypeRef *createExpandedPackElement(const TypeRef *patternType) {
     // FIXME: Remote mirrors support for variadic generics.
     return nullptr;
+  }
+
+  void endPackExpansion() {
+    // FIXME: Remote mirrors support for variadic generics.
   }
 
   const FunctionTypeRef *createFunctionType(
@@ -767,7 +850,7 @@ public:
       break;
     }
 
-    auto result = createTupleType({}, "");
+    auto result = createTupleType({}, llvm::ArrayRef<llvm::StringRef>());
     return FunctionTypeRef::create(
         *this, {}, result, funcFlags, diffKind, nullptr);
   }
@@ -816,19 +899,23 @@ public:
 
   const ExistentialMetatypeTypeRef *createExistentialMetatypeType(
       const TypeRef *instance,
-      llvm::Optional<Demangle::ImplMetatypeRepresentation> repr = None) {
+      llvm::Optional<Demangle::ImplMetatypeRepresentation> repr = llvm::None) {
     return ExistentialMetatypeTypeRef::create(*this, instance);
   }
 
   const MetatypeTypeRef *createMetatypeType(
       const TypeRef *instance,
-      llvm::Optional<Demangle::ImplMetatypeRepresentation> repr = None) {
+      llvm::Optional<Demangle::ImplMetatypeRepresentation> repr = llvm::None) {
     bool WasAbstract = (repr && *repr != ImplMetatypeRepresentation::Thin);
     return MetatypeTypeRef::create(*this, instance, WasAbstract);
   }
 
+  void pushGenericParams(llvm::ArrayRef<std::pair<unsigned, unsigned>> parameterPacks) {}
+  void popGenericParams() {}
+
   const GenericTypeParameterTypeRef *
   createGenericTypeParameterType(unsigned depth, unsigned index) {
+    // FIXME: variadic generics
     return GenericTypeParameterTypeRef::create(*this, depth, index);
   }
 
@@ -1190,13 +1277,19 @@ public:
       for (auto descriptor : sections.AssociatedType) {
         // Read out the relevant info from the associated type descriptor:
         // The type's name and which protocol conformance it corresponds to
-        auto typeRef = readTypeRef(descriptor, descriptor->ConformingTypeName);
-        auto typeName = nodeToString(demangleTypeRef(typeRef));
-        auto optionalMangledTypeName = normalizeReflectionName(typeRef);
-        auto protocolNode = demangleTypeRef(
-            readTypeRef(descriptor, descriptor->ProtocolTypeName));
-        auto protocolName = nodeToString(protocolNode);
-        clearNodeFactory();
+        llvm::Optional<std::string> optionalMangledTypeName;
+        std::string typeName;
+        std::string protocolName;
+        {
+          ScopedNodeFactoryCheckpoint checkpoint(this);
+          auto typeRef =
+              readTypeRef(descriptor, descriptor->ConformingTypeName);
+          typeName = nodeToString(demangleTypeRef(typeRef));
+          optionalMangledTypeName = normalizeReflectionName(typeRef);
+          auto protocolNode = demangleTypeRef(
+              readTypeRef(descriptor, descriptor->ProtocolTypeName));
+          protocolName = nodeToString(protocolNode);
+        }
         if (optionalMangledTypeName.has_value()) {
           auto mangledTypeName = optionalMangledTypeName.value();
           if (forMangledTypeName.has_value()) {
@@ -2011,10 +2104,10 @@ public:
     std::unordered_map<std::string, std::string> typeNameToManglingMap;
     for (const auto &section : ReflectionInfos) {
       for (auto descriptor : section.Field) {
+        ScopedNodeFactoryCheckpoint checkpoint(this);
         auto TypeRef = readTypeRef(descriptor, descriptor->MangledTypeName);
         auto OptionalMangledTypeName = normalizeReflectionName(TypeRef);
         auto TypeName = nodeToString(demangleTypeRef(TypeRef));
-        clearNodeFactory();
         if (OptionalMangledTypeName.has_value()) {
           typeNameToManglingMap[TypeName] = OptionalMangledTypeName.value();
         }

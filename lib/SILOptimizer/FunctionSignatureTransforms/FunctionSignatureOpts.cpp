@@ -85,6 +85,10 @@ static bool isSpecializableRepresentation(SILFunctionTypeRepresentation Rep,
   case SILFunctionTypeRepresentation::Thick:
   case SILFunctionTypeRepresentation::CFunctionPointer:
   case SILFunctionTypeRepresentation::CXXMethod:
+  case SILFunctionTypeRepresentation::KeyPathAccessorGetter:
+  case SILFunctionTypeRepresentation::KeyPathAccessorSetter:
+  case SILFunctionTypeRepresentation::KeyPathAccessorEquals:
+  case SILFunctionTypeRepresentation::KeyPathAccessorHash:
     return true;
   case SILFunctionTypeRepresentation::WitnessMethod:
     return OptForPartialApply;
@@ -284,10 +288,11 @@ static bool usesGenerics(SILFunction *F,
 
 // Map the parameter, result and error types out of context to get the interface
 // type.
-static void mapInterfaceTypes(SILFunction *F,
-                              MutableArrayRef<SILParameterInfo> InterfaceParams,
-                              MutableArrayRef<SILResultInfo> InterfaceResults,
-                              Optional<SILResultInfo> &InterfaceErrorResult) {
+static void
+mapInterfaceTypes(SILFunction *F,
+                  MutableArrayRef<SILParameterInfo> InterfaceParams,
+                  MutableArrayRef<SILResultInfo> InterfaceResults,
+                  llvm::Optional<SILResultInfo> &InterfaceErrorResult) {
 
   for (auto &Param : InterfaceParams) {
     if (!Param.getInterfaceType()->hasArchetype())
@@ -396,7 +401,7 @@ FunctionSignatureTransformDescriptor::createOptimizedSILFunctionType() {
     witnessMethodConformance = ProtocolConformanceRef::forInvalid();
   }
 
-  Optional<SILResultInfo> InterfaceErrorResult;
+  llvm::Optional<SILResultInfo> InterfaceErrorResult;
   if (ExpectedFTy->hasErrorResult()) {
     InterfaceErrorResult = ExpectedFTy->getErrorResult();
   }

@@ -80,6 +80,12 @@ struct StructWithSubobjectMoveAssignment {
 };
 
 struct __attribute__((swift_attr("import_unsafe"))) StructWithDestructor {
+#if __is_target_os(windows)
+  // On windows, force this type to be address-only.
+  StructWithDestructor() {}
+  StructWithDestructor(const StructWithDestructor &other) {}
+#endif
+
   ~StructWithDestructor() {}
 };
 
@@ -110,6 +116,20 @@ struct StructWithInheritedPrivateDefaultedDestructor
 
 struct StructWithSubobjectPrivateDefaultedDestructor {
   StructWithPrivateDefaultedDestructor subobject;
+};
+
+struct StructWithDeletedCopyConstructor {
+  StructWithDeletedCopyConstructor(
+      const StructWithDeletedCopyConstructor &other) = delete;
+};
+
+struct StructWithMoveConstructorAndDeletedCopyConstructor {
+  StructWithMoveConstructorAndDeletedCopyConstructor() {}
+  StructWithMoveConstructorAndDeletedCopyConstructor(
+      const StructWithMoveConstructorAndDeletedCopyConstructor &other) = delete;
+  StructWithMoveConstructorAndDeletedCopyConstructor(
+      StructWithMoveConstructorAndDeletedCopyConstructor &&other) {}
+  ~StructWithMoveConstructorAndDeletedCopyConstructor(){};
 };
 
 struct StructWithDeletedDestructor {
@@ -146,6 +166,22 @@ struct StructNonCopyableTriviallyMovable {
   StructNonCopyableTriviallyMovable &
   operator=(StructNonCopyableTriviallyMovable &&) = default;
   ~StructNonCopyableTriviallyMovable() = default;
+};
+
+/// Similar to std::unique_ptr
+struct StructWithPointerNonCopyableTriviallyMovable {
+  int *ptr = nullptr;
+
+  StructWithPointerNonCopyableTriviallyMovable() = default;
+  StructWithPointerNonCopyableTriviallyMovable(
+      const StructWithPointerNonCopyableTriviallyMovable &other) = delete;
+  StructWithPointerNonCopyableTriviallyMovable(
+      StructWithPointerNonCopyableTriviallyMovable &&other) = default;
+  ~StructWithPointerNonCopyableTriviallyMovable() = default;
+};
+
+struct StructWithPointerNonCopyableTriviallyMovableField {
+  StructWithPointerNonCopyableTriviallyMovable p = {};
 };
 
 struct StructNonCopyableNonMovable {
@@ -202,6 +238,7 @@ struct __attribute__((swift_attr("import_iterator"))) Iterator {
 };
 
 struct HasMethodThatReturnsIterator {
+  HasMethodThatReturnsIterator(const HasMethodThatReturnsIterator&);
   Iterator getIterator() const;
 };
 
@@ -210,6 +247,7 @@ struct IteratorBox {
 };
 
 struct HasMethodThatReturnsIteratorBox {
+  HasMethodThatReturnsIteratorBox(const HasMethodThatReturnsIteratorBox&);
   IteratorBox getIteratorBox() const;
 };
 

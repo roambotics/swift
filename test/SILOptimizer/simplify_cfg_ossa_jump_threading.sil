@@ -1,4 +1,4 @@
-// RUN: %target-sil-opt -unit-test-runner -sil-infinite-jump-threading-budget %s 2>&1 
+// RUN: %target-sil-opt -test-runner -sil-infinite-jump-threading-budget %s 2>&1 
 
 import Builtin
 import Swift
@@ -16,9 +16,14 @@ enum FakeOptional<T> {
 
 sil @get_klass : $@convention(thin) () -> @owned Klass
 
+// This test is not optimized because the dest bb of the branch has a single predecessor
+// CHECK-LABEL: sil [ossa] @test_simplify_switch_enum_jump_threading1 :
+// CHECK: switch_enum
+// CHECK-NOT: switch_enum
+// CHECK-LABEL: } // end sil function 'test_simplify_switch_enum_jump_threading1'
 sil [ossa] @test_simplify_switch_enum_jump_threading1 : $@convention(thin) (@owned Klass) -> () {
 bb0(%0 : @owned $Klass):
-  test_specification "simplify-cfg-try-jump-threading @instruction[1]"
+  specify_test "simplify-cfg-try-jump-threading @instruction[1]"
   %1 = enum $FakeOptional<Klass>, #FakeOptional.some!enumelt, %0 : $Klass
   br bb1(%1 : $FakeOptional<Klass>)
 
@@ -37,18 +42,21 @@ bb4:
   return %t : $()
 }
 
-
+// CHECK-LABEL: sil [ossa] @test_simplify_switch_enum_jump_threading2 :
+// CHECK: switch_enum
+// CHECK: switch_enum
+// CHECK-LABEL: } // end sil function 'test_simplify_switch_enum_jump_threading2'
 sil [ossa] @test_simplify_switch_enum_jump_threading2 : $@convention(thin) (@owned Klass) -> () {
 bb0(%0 : @owned $Klass):
   cond_br undef, bb1, bb2
 
 bb1:
-  test_specification "simplify-cfg-try-jump-threading @instruction[2]"
+  specify_test "simplify-cfg-try-jump-threading @instruction[2]"
   %1 = enum $FakeOptional<Klass>, #FakeOptional.some!enumelt, %0 : $Klass
   br bb3(%1 : $FakeOptional<Klass>)
 
 bb2:
-  test_specification "simplify-cfg-try-jump-threading @instruction[5]"
+  specify_test "simplify-cfg-try-jump-threading @instruction[5]"
   destroy_value %0 : $Klass
   %2 = enum $FakeOptional<Klass>, #FakeOptional.none!enumelt
   br bb3(%2 : $FakeOptional<Klass>)
@@ -68,6 +76,10 @@ bb6:
   return %t : $()
 }
 
+// CHECK-LABEL: sil [ossa] @test_simplify_switch_enum_jump_threading3 :
+// CHECK: select_enum
+// CHECK: select_enum
+// CHECK-LABEL: } // end sil function 'test_simplify_switch_enum_jump_threading3'
 sil [ossa] @test_simplify_switch_enum_jump_threading3 : $@convention(thin) (@owned Klass) -> Builtin.Int1 {
 bb0(%0 : @owned $Klass):
   %t = integer_literal $Builtin.Int1, 1
@@ -75,7 +87,7 @@ bb0(%0 : @owned $Klass):
   cond_br undef, bb1, bb2
 
 bb1:
-  test_specification "simplify-cfg-try-jump-threading @instruction[4]"
+  specify_test "simplify-cfg-try-jump-threading @instruction[4]"
   %1 = enum $FakeOptional<Klass>, #FakeOptional.some!enumelt, %0 : $Klass
   br bb3(%1 : $FakeOptional<Klass>)
 
@@ -95,7 +107,7 @@ bb4:
 
 sil [ossa] @test_jump_thread_ref_ele_loop : $@convention(thin) () -> () {
 bb0:
-  test_specification "simplify-cfg-try-jump-threading @instruction[3]"
+  specify_test "simplify-cfg-try-jump-threading @instruction[3]"
   %f = function_ref @get_klass : $@convention(thin) () -> @owned Klass
   cond_br undef, bb1, bb2
 
@@ -128,12 +140,16 @@ bb5:
   return %z : $()
 }
 
+// CHECK-LABEL: sil [ossa] @test_jump_thread_checked_cast_value :
+// CHECK: select_enum
+// CHECK: select_enum
+// CHECK-LABEL: } // end sil function 'test_jump_thread_checked_cast_value'
 sil [ossa] @test_jump_thread_checked_cast_value : $@convention(thin) (@owned AnyKlass, @owned AnyKlass) -> () {
 bb0(%0 : @owned $AnyKlass, %1 : @owned $AnyKlass):
   cond_br undef, bb1, bb2
 
 bb1:
-  test_specification "simplify-cfg-try-jump-threading @instruction[2]"
+  specify_test "simplify-cfg-try-jump-threading @instruction[2]"
   %2 = copy_value %0 : $AnyKlass
   br bb6(%2 : $AnyKlass)
 
@@ -144,7 +160,7 @@ bb2:
 bb6(%4 : @owned $AnyKlass):
   destroy_value %0 : $AnyKlass
   destroy_value %1 : $AnyKlass
-  checked_cast_br %4 : $AnyKlass to Klass, bb7, bb8
+  checked_cast_br AnyKlass in %4 : $AnyKlass to Klass, bb7, bb8
 
 bb7(%k : @owned $Klass):
   destroy_value %k : $Klass

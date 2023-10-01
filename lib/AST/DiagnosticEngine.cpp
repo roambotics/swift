@@ -335,6 +335,16 @@ InFlightDiagnostic::warnUntilSwiftVersion(unsigned majorVersion) {
 }
 
 InFlightDiagnostic &
+InFlightDiagnostic::warnInSwiftInterface(const DeclContext *context) {
+  auto sourceFile = context->getParentSourceFile();
+  if (sourceFile && sourceFile->Kind == SourceFileKind::Interface) {
+    return limitBehavior(DiagnosticBehavior::Warning);
+  }
+
+  return *this;
+}
+
+InFlightDiagnostic &
 InFlightDiagnostic::wrapIn(const Diagnostic &wrapper) {
   // Save current active diagnostic into WrappedDiagnostics, ignoring state
   // so we don't get a None return or influence future diagnostics.
@@ -648,11 +658,79 @@ static void formatDiagnosticArgument(StringRef Modifier,
         << FormatOpts.ClosingQuotationMark;
     break;
 
-  case DiagnosticArgumentKind::ValueDecl:
-    Out << FormatOpts.OpeningQuotationMark;
-    Arg.getAsValueDecl()->getName().printPretty(Out);
-    Out << FormatOpts.ClosingQuotationMark;
+  case DiagnosticArgumentKind::Decl: {
+    auto D = Arg.getAsDecl();
+
+    if (Modifier == "select") {
+      formatSelectionArgument(ModifierArguments, Args, D ? 1 : 0, FormatOpts,
+                              Out);
+      break;
+    }
+
+    // Parse info out of modifier
+    bool includeKind = false;
+    bool includeName = true;
+    bool baseNameOnly = false;
+
+    if (Modifier == "kind") {
+      includeKind = true;
+    } else if (Modifier == "base") {
+      baseNameOnly = true;
+    } else if (Modifier == "kindbase") {
+      includeKind = true;
+      baseNameOnly = true;
+    } else if (Modifier == "kindonly") {
+      includeName = false;
+    } else {
+      assert(Modifier.empty() && "Improper modifier for ValueDecl argument");
+    }
+
+    // If it's an accessor, describe that and then switch to discussing its
+    // storage.
+    if (auto accessor = dyn_cast<AccessorDecl>(D)) {
+      Out << Decl::getDescriptiveKindName(D->getDescriptiveKind()) << " for ";
+      D = accessor->getStorage();
+    }
+
+    // If it's an extension, describe that and then switch to discussing its
+    // nominal type.
+    if (auto ext = dyn_cast<ExtensionDecl>(D)) {
+      Out << Decl::getDescriptiveKindName(D->getDescriptiveKind()) << " of ";
+      D = ext->getSelfNominalTypeDecl();
+    }
+
+    // Figure out the name we want to print.
+    DeclName name;
+    if (includeName) {
+      if (auto VD = dyn_cast<ValueDecl>(D))
+        name = VD->getName();
+      else if (auto PGD = dyn_cast<PrecedenceGroupDecl>(D))
+        name = PGD->getName();
+      else if (auto OD = dyn_cast<OperatorDecl>(D))
+        name = OD->getName();
+      else if (auto MMD = dyn_cast<MissingMemberDecl>(D))
+        name = MMD->getName();
+
+      if (baseNameOnly && name)
+        name = name.getBaseName();
+    }
+
+    // If the declaration is anonymous or we asked for a descriptive kind, print
+    // it.
+    if (!name || includeKind) {
+      Out << Decl::getDescriptiveKindName(D->getDescriptiveKind());
+      if (name)
+        Out << " ";
+    }
+
+    // Print the name.
+    if (name) {
+      Out << FormatOpts.OpeningQuotationMark;
+      name.printPretty(Out);
+      Out << FormatOpts.ClosingQuotationMark;
+    }
     break;
+  }
 
   case DiagnosticArgumentKind::FullyQualifiedType:
   case DiagnosticArgumentKind::Type: {
@@ -842,7 +920,7 @@ static void formatDiagnosticArgument(StringRef Modifier,
       break;
     }
 
-    case ActorIsolation::Independent:
+    case ActorIsolation::Nonisolated:
     case ActorIsolation::Unspecified:
       Out << "nonisolated";
       break;
@@ -1094,11 +1172,11 @@ static AccessLevel getBufferAccessLevel(const Decl *decl) {
   return level;
 }
 
-Optional<DiagnosticInfo>
+llvm::Optional<DiagnosticInfo>
 DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
   auto behavior = state.determineBehavior(diagnostic);
   if (behavior == DiagnosticBehavior::Ignore)
-    return None;
+    return llvm::None;
 
   // Figure out the source location.
   SourceLoc loc = diagnostic.getLoc();
@@ -1148,7 +1226,7 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
           // FIXME: Horrible, horrible hackaround. We're not getting a
           // DeclContext everywhere we should.
           if (!dc) {
-            return None;
+            return llvm::None;
           }
 
           while (!dc->isModuleContext()) {
@@ -1264,17 +1342,42 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
   else if (isNoUsageDiagnostic(diagnostic.getID()))
     Category = "no-usage";
 
+  auto fixIts = diagnostic.getFixIts();
+  if (loc.isValid()) {
+    // If the diagnostic is being emitted in a generated buffer, drop the
+    // fix-its, as the user will have no way of applying them.
+    auto bufferID = SourceMgr.findBufferContainingLoc(loc);
+    if (auto generatedInfo = SourceMgr.getGeneratedSourceInfo(bufferID)) {
+      switch (generatedInfo->kind) {
+      case GeneratedSourceInfo::ExpressionMacroExpansion:
+      case GeneratedSourceInfo::FreestandingDeclMacroExpansion:
+      case GeneratedSourceInfo::AccessorMacroExpansion:
+      case GeneratedSourceInfo::MemberAttributeMacroExpansion:
+      case GeneratedSourceInfo::MemberMacroExpansion:
+      case GeneratedSourceInfo::PeerMacroExpansion:
+      case GeneratedSourceInfo::ConformanceMacroExpansion:
+      case GeneratedSourceInfo::ExtensionMacroExpansion:
+      case GeneratedSourceInfo::PrettyPrinted:
+        fixIts = {};
+        break;
+      case GeneratedSourceInfo::ReplacedFunctionBody:
+        // A replaced function body is for user-written code, so fix-its are
+        // still valid.
+        break;
+      }
+    }
+  }
+
   return DiagnosticInfo(
       diagnostic.getID(), loc, toDiagnosticKind(behavior),
       diagnosticStringFor(diagnostic.getID(), getPrintDiagnosticNames()),
       diagnostic.getArgs(), Category, getDefaultDiagnosticLoc(),
-      /*child note info*/ {}, diagnostic.getRanges(), diagnostic.getFixIts(),
+      /*child note info*/ {}, diagnostic.getRanges(), fixIts,
       diagnostic.isChildNote());
 }
 
-std::vector<Diagnostic> DiagnosticEngine::getGeneratedSourceBufferNotes(
-    SourceLoc loc, Optional<unsigned> &lastBufferID
-) {
+std::vector<Diagnostic>
+DiagnosticEngine::getGeneratedSourceBufferNotes(SourceLoc loc) {
   // The set of child notes we're building up.
   std::vector<Diagnostic> childNotes;
 
@@ -1285,12 +1388,6 @@ std::vector<Diagnostic> DiagnosticEngine::getGeneratedSourceBufferNotes(
   // If we already emitted these notes for a prior part of the diagnostic,
   // don't do so again.
   auto currentBufferID = SourceMgr.findBufferContainingLoc(loc);
-  if (currentBufferID == lastBufferID)
-    return childNotes;
-
-  // Keep track of the last buffer ID we considered.
-  lastBufferID = currentBufferID;
-
   SourceLoc currentLoc = loc;
   do {
     auto generatedInfo = SourceMgr.getGeneratedSourceInfo(currentBufferID);
@@ -1307,12 +1404,27 @@ std::vector<Diagnostic> DiagnosticEngine::getGeneratedSourceBufferNotes(
     case GeneratedSourceInfo::MemberAttributeMacroExpansion:
     case GeneratedSourceInfo::MemberMacroExpansion:
     case GeneratedSourceInfo::PeerMacroExpansion:
-    case GeneratedSourceInfo::ConformanceMacroExpansion: {
-      SourceRange origRange = expansionNode.getSourceRange();
+    case GeneratedSourceInfo::ConformanceMacroExpansion:
+    case GeneratedSourceInfo::ExtensionMacroExpansion: {
       DeclName macroName = getGeneratedSourceInfoMacroName(*generatedInfo);
 
-      Diagnostic expansionNote(diag::in_macro_expansion, macroName);
-      expansionNote.setLoc(origRange.Start);
+      // If it was an expansion of an attached macro, increase the range to
+      // include the decl's attributes. Also add the name of the decl the macro
+      // is attached to.
+      CustomAttr *attachedAttr = generatedInfo->attachedMacroCustomAttr;
+      Decl *attachedDecl =
+          attachedAttr ? expansionNode.dyn_cast<Decl *>() : nullptr;
+      SourceRange origRange = attachedDecl
+                                  ? attachedDecl->getSourceRangeIncludingAttrs()
+                                  : expansionNode.getSourceRange();
+
+      Diagnostic expansionNote(diag::in_macro_expansion, macroName,
+                               attachedDecl);
+      if (attachedAttr) {
+        expansionNote.setLoc(attachedAttr->getLocation());
+      } else {
+        expansionNote.setLoc(origRange.Start);
+      }
       expansionNote.addRange(
           Lexer::getCharSourceRangeFromSourceRange(SourceMgr, origRange));
       expansionNote.setIsChildNote(true);
@@ -1337,7 +1449,6 @@ std::vector<Diagnostic> DiagnosticEngine::getGeneratedSourceBufferNotes(
 }
 
 void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
-  Optional<unsigned> lastBufferID;
 
   ArrayRef<Diagnostic> childNotes = diagnostic.getChildNotes();
   std::vector<Diagnostic> extendedChildNotes;
@@ -1345,7 +1456,11 @@ void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
   if (auto info = diagnosticInfoForDiagnostic(diagnostic)) {
     // If the diagnostic location is within a buffer containing generated
     // source code, add child notes showing where the generation occurred.
-    extendedChildNotes = getGeneratedSourceBufferNotes(info->Loc, lastBufferID);
+    // We need to avoid doing this if this is itself a child note, as otherwise
+    // we'd end up doubling up on notes.
+    if (!info->IsChildNote) {
+      extendedChildNotes = getGeneratedSourceBufferNotes(info->Loc);
+    }
     if (!extendedChildNotes.empty()) {
       extendedChildNotes.insert(extendedChildNotes.end(),
                                 childNotes.begin(), childNotes.end());
@@ -1476,22 +1591,6 @@ EncodedDiagnosticMessage::EncodedDiagnosticMessage(StringRef S)
                                              /*IsLastSegment=*/true,
                                              /*IndentToStrip=*/~0U)) {}
 
-std::pair<unsigned, DeclName>
-swift::getAccessorKindAndNameForDiagnostics(const ValueDecl *D) {
-  // This should always be one more than the last AccessorKind supported in
-  // the diagnostics. If you need to change it, change the assertion below as
-  // well.
-  static const unsigned NOT_ACCESSOR_INDEX = 2;
-
-  if (auto *accessor = dyn_cast<AccessorDecl>(D)) {
-    DeclName Name = accessor->getStorage()->getName();
-    assert(accessor->isGetterOrSetter());
-    return {static_cast<unsigned>(accessor->getAccessorKind()), Name};
-  }
-
-  return {NOT_ACCESSOR_INDEX, D->getName()};
-}
-
 DeclName
 swift::getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info) {
   ASTNode expansionNode = ASTNode::getFromOpaqueValue(info.astNode);
@@ -1502,7 +1601,8 @@ swift::getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info) {
   case GeneratedSourceInfo::MemberAttributeMacroExpansion:
   case GeneratedSourceInfo::MemberMacroExpansion:
   case GeneratedSourceInfo::PeerMacroExpansion:
-  case GeneratedSourceInfo::ConformanceMacroExpansion: {
+  case GeneratedSourceInfo::ConformanceMacroExpansion:
+  case GeneratedSourceInfo::ExtensionMacroExpansion: {
     DeclName macroName;
     if (auto customAttr = info.attachedMacroCustomAttr) {
       // FIXME: How will we handle deserialized custom attributes like this?

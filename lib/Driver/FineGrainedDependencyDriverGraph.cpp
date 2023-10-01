@@ -29,6 +29,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/VirtualOutputBackend.h"
 #include "llvm/Support/YAMLParser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <unordered_set>
@@ -76,7 +77,7 @@ ModuleDepGraph::Changes ModuleDepGraph::loadFromPath(const Job *Cmd,
 
   auto buffer = llvm::MemoryBuffer::getFile(path);
   if (!buffer)
-    return None;
+    return llvm::None;
   auto r = loadFromBuffer(Cmd, *buffer.get(), diags);
   assert(path == getSwiftDeps(Cmd) && "Should be reading the job's swiftdeps");
   assert(!r || !nodeMap[path.str()].empty() &&
@@ -88,10 +89,10 @@ ModuleDepGraph::Changes ModuleDepGraph::loadFromPath(const Job *Cmd,
 ModuleDepGraph::Changes
 ModuleDepGraph::loadFromBuffer(const Job *job, llvm::MemoryBuffer &buffer,
                                DiagnosticEngine &diags) {
-  Optional<SourceFileDepGraph> sourceFileDepGraph =
+  llvm::Optional<SourceFileDepGraph> sourceFileDepGraph =
       SourceFileDepGraph::loadFromBuffer(buffer);
   if (!sourceFileDepGraph)
-    return None;
+    return llvm::None;
   return loadFromSourceFileDepGraph(job, sourceFileDepGraph.value(), diags);
 }
 
@@ -116,10 +117,10 @@ ModuleDepGraph::Changes ModuleDepGraph::loadFromSwiftModuleBuffer(
       "loading fine-grained dependency graph from swiftmodule",
       buffer.getBufferIdentifier());
 
-   Optional<SourceFileDepGraph> sourceFileDepGraph =
+  llvm::Optional<SourceFileDepGraph> sourceFileDepGraph =
       SourceFileDepGraph::loadFromSwiftModuleBuffer(buffer);
   if (!sourceFileDepGraph)
-    return None;
+    return llvm::None;
   jobsBySwiftDeps[buffer.getBufferIdentifier().str()] = Cmd;
   auto changes = integrate(*sourceFileDepGraph, buffer.getBufferIdentifier());
   if (verifyFineGrainedDependencyGraphAfterEveryImport)
@@ -243,7 +244,7 @@ ModuleDepGraph::Changes ModuleDepGraph::integrate(const SourceFileDepGraph &g,
   // When done, changeDependencyKeys contains a list of keys that changed
   // as a result of this integration.
   // Or if the integration failed, None.
-  Optional<std::unordered_set<ModuleDepGraphNode *>> changedNodes =
+  llvm::Optional<std::unordered_set<ModuleDepGraphNode *>> changedNodes =
       std::unordered_set<ModuleDepGraphNode *>();
 
   g.forEachNode([&](const SourceFileDepGraphNode *integrand) {
@@ -253,19 +254,19 @@ ModuleDepGraph::Changes ModuleDepGraph::integrate(const SourceFileDepGraph &g,
         preexistingMatch.value().first == LocationOfPreexistingNode::here)
       disappearedNodes.erase(key); // Node was and still is. Do not erase it.
 
-    Optional<NullablePtr<ModuleDepGraphNode>> newNodeOrChangedNode =
+    llvm::Optional<NullablePtr<ModuleDepGraphNode>> newNodeOrChangedNode =
         integrateSourceFileDepGraphNode(g, integrand, preexistingMatch,
                                         swiftDepsOfJob);
 
     if (!newNodeOrChangedNode)
-      changedNodes = None;
+      changedNodes = llvm::None;
     else if (!changedNodes)
       ;
     else if (auto *n = newNodeOrChangedNode.value().getPtrOrNull())
       changedNodes.value().insert(n);
   });
   if (!changedNodes)
-    return None;
+    return llvm::None;
 
   for (auto &p : disappearedNodes) {
     changedNodes.value().insert(p.second);
@@ -284,7 +285,7 @@ ModuleDepGraph::PreexistingNodeIfAny ModuleDepGraph::findPreexistingMatch(
     const SourceFileDepGraphNode *integrand) const {
   const auto *matches = nodeMap.find(integrand->getKey()).getPtrOrNull();
   if (!matches)
-    return None;
+    return llvm::None;
   const auto &expatsIter = matches->find("");
   if (expatsIter != matches->end()) {
     assert(matches->size() == 1 &&
@@ -302,10 +303,10 @@ ModuleDepGraph::PreexistingNodeIfAny ModuleDepGraph::findPreexistingMatch(
   if (!matches->empty())
     return std::make_pair(LocationOfPreexistingNode::elsewhere,
                           matches->begin()->second);
-  return None;
+  return llvm::None;
 }
 
-Optional<NullablePtr<ModuleDepGraphNode>>
+llvm::Optional<NullablePtr<ModuleDepGraphNode>>
 ModuleDepGraph::integrateSourceFileDepGraphNode(
     const SourceFileDepGraph &g, const SourceFileDepGraphNode *integrand,
     const PreexistingNodeIfAny preexistingMatch,
@@ -363,7 +364,7 @@ ModuleDepGraph::integrateSourceFileDeclNode(
 
 ModuleDepGraphNode *ModuleDepGraph::integrateByCreatingANewNode(
     const SourceFileDepGraphNode *integrand,
-    const Optional<std::string> swiftDepsForNewNode) {
+    const llvm::Optional<std::string> swiftDepsForNewNode) {
   assert(integrand->getIsProvides() &&
          "Dependencies are arcs in the module graph");
   const auto &key = integrand->getKey();
@@ -529,11 +530,12 @@ void ModuleDepGraph::emitDotFileForJob(DiagnosticEngine &diags,
   emitDotFile(diags, getSwiftDeps(job));
 }
 
-void ModuleDepGraph::emitDotFile(DiagnosticEngine &diags, StringRef baseName) {
+void ModuleDepGraph::emitDotFile(DiagnosticEngine &diags,
+                                 StringRef baseName) {
   unsigned seqNo = dotFileSequenceNumber[baseName.str()]++;
   std::string fullName =
       baseName.str() + "-post-integration." + std::to_string(seqNo) + ".dot";
-  withOutputFile(diags, fullName, [&](llvm::raw_ostream &out) {
+  withOutputPath(diags, *backend, fullName, [&](llvm::raw_ostream &out) {
     emitDotFile(out);
     return false;
   });
@@ -624,8 +626,9 @@ void ModuleDepGraph::verifyNodeIsInRightEntryInNodeMap(
     const std::string &swiftDepsString, const DependencyKey &key,
     const ModuleDepGraphNode *const n) const {
   const DependencyKey &nodeKey = n->getKey();
-  const Optional<std::string> swiftDeps =
-      swiftDepsString.empty() ? None : Optional<std::string>(swiftDepsString);
+  const llvm::Optional<std::string> swiftDeps =
+      swiftDepsString.empty() ? llvm::None
+                              : llvm::Optional<std::string>(swiftDepsString);
   (void)nodeKey;
   (void)swiftDeps;
   assert(n->getSwiftDeps() == swiftDeps ||
@@ -684,7 +687,7 @@ void ModuleDepGraph::printPath(raw_ostream &out,
 }
 
 StringRef ModuleDepGraph::getProvidingFilename(
-    const Optional<std::string> &swiftDeps) const {
+    const llvm::Optional<std::string> &swiftDeps) const {
   if (!swiftDeps)
     return "<unknown";
   auto ext = llvm::sys::path::extension(*swiftDeps);

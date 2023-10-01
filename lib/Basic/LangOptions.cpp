@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2023 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -22,6 +22,7 @@
 #include "swift/Basic/Range.h"
 #include "swift/Config.h"
 #include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/raw_ostream.h"
@@ -63,6 +64,7 @@ static const SupportedConditionalValue SupportedConditionalCompilationOSs[] = {
   "Cygwin",
   "Haiku",
   "WASI",
+  "none",
 };
 
 static const SupportedConditionalValue SupportedConditionalCompilationArches[] = {
@@ -84,6 +86,11 @@ static const SupportedConditionalValue SupportedConditionalCompilationEndianness
   "big"
 };
 
+static const SupportedConditionalValue SupportedConditionalCompilationPointerBitWidths[] = {
+  "_32",
+  "_64"
+};
+
 static const SupportedConditionalValue SupportedConditionalCompilationRuntimes[] = {
   "_ObjC",
   "_Native",
@@ -100,6 +107,12 @@ static const SupportedConditionalValue SupportedConditionalCompilationPtrAuthSch
   "_arm64e",
 };
 
+static const SupportedConditionalValue SupportedConditionalCompilationAtomicBitWidths[] = {
+  "_32",
+  "_64",
+  "_128"
+};
+
 static const PlatformConditionKind AllPublicPlatformConditionKinds[] = {
 #define PLATFORM_CONDITION(LABEL, IDENTIFIER) PlatformConditionKind::LABEL,
 #define PLATFORM_CONDITION_(LABEL, IDENTIFIER)
@@ -114,6 +127,8 @@ ArrayRef<SupportedConditionalValue> getSupportedConditionalCompilationValues(con
     return SupportedConditionalCompilationArches;
   case PlatformConditionKind::Endianness:
     return SupportedConditionalCompilationEndianness;
+  case PlatformConditionKind::PointerBitWidth:
+    return SupportedConditionalCompilationPointerBitWidths;
   case PlatformConditionKind::Runtime:
     return SupportedConditionalCompilationRuntimes;
   case PlatformConditionKind::CanImport:
@@ -122,6 +137,8 @@ ArrayRef<SupportedConditionalValue> getSupportedConditionalCompilationValues(con
     return SupportedConditionalCompilationTargetEnvironments;
   case PlatformConditionKind::PtrAuth:
     return SupportedConditionalCompilationPtrAuthSchemes;
+  case PlatformConditionKind::AtomicBitWidth:
+    return SupportedConditionalCompilationAtomicBitWidths;
   }
   llvm_unreachable("Unhandled PlatformConditionKind in switch");
 }
@@ -181,9 +198,11 @@ checkPlatformConditionSupported(PlatformConditionKind Kind, StringRef Value,
   case PlatformConditionKind::OS:
   case PlatformConditionKind::Arch:
   case PlatformConditionKind::Endianness:
+  case PlatformConditionKind::PointerBitWidth:
   case PlatformConditionKind::Runtime:
   case PlatformConditionKind::TargetEnvironment:
   case PlatformConditionKind::PtrAuth:
+  case PlatformConditionKind::AtomicBitWidth:
     return isMatching(Kind, Value, suggestedKind, suggestedValues);
   case PlatformConditionKind::CanImport:
     // All importable names are valid.
@@ -256,6 +275,104 @@ bool LangOptions::hasFeature(llvm::StringRef featureName) const {
     return hasFeature(*feature);
 
   return false;
+}
+
+void LangOptions::setAtomicBitWidth(llvm::Triple triple) {
+  // We really want to use Clang's getMaxAtomicInlineWidth(), but that requires
+  // a Clang::TargetInfo and we're setting up lang opts very early in the
+  // pipeline before any ASTContext or any ClangImporter instance where we can
+  // access the target's info.
+
+  switch (triple.getArch()) {
+  // ARM is only a 32 bit arch and all archs besides the microcontroller profile
+  // ones have double word atomics.
+  case llvm::Triple::ArchType::arm:
+  case llvm::Triple::ArchType::thumb:
+    switch (triple.getSubArch()) {
+    case llvm::Triple::SubArchType::ARMSubArch_v6m:
+    case llvm::Triple::SubArchType::ARMSubArch_v7m:
+      addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_32");
+      break;
+
+    default:
+      addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_64");
+      break;
+    }
+    break;
+
+  // AArch64 (arm64) supports double word atomics on all archs besides the
+  // microcontroller profiles.
+  case llvm::Triple::ArchType::aarch64:
+    switch (triple.getSubArch()) {
+    case llvm::Triple::SubArchType::ARMSubArch_v8m_baseline:
+    case llvm::Triple::SubArchType::ARMSubArch_v8m_mainline:
+    case llvm::Triple::SubArchType::ARMSubArch_v8_1m_mainline:
+      addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_64");
+      break;
+
+    default:
+      addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_128");
+      break;
+    }
+    break;
+
+  // arm64_32 has 32 bit pointer words, but it has the same architecture as
+  // arm64 and supports 128 bit atomics.
+  case llvm::Triple::ArchType::aarch64_32:
+    addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_128");
+    break;
+
+  // PowerPC does not support double word atomics.
+  case llvm::Triple::ArchType::ppc:
+    addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_32");
+    break;
+
+  // All of the 64 bit PowerPC flavors do not support double word atomics.
+  case llvm::Triple::ArchType::ppc64:
+  case llvm::Triple::ArchType::ppc64le:
+    addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_64");
+    break;
+
+  // SystemZ (s390x) does not support double word atomics.
+  case llvm::Triple::ArchType::systemz:
+    addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_64");
+    break;
+
+  // Wasm32 supports double word atomics.
+  case llvm::Triple::ArchType::wasm32:
+    addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_64");
+    break;
+
+  // x86 supports double word atomics.
+  //
+  // Technically, this is incorrect. However, on all x86 platforms where Swift
+  // is deployed this is true.
+  case llvm::Triple::ArchType::x86:
+    addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_64");
+    break;
+
+  // x86_64 supports double word atomics.
+  //
+  // Technically, this is incorrect. However, on all x86_64 platforms where Swift
+  // is deployed this is true. If the ClangImporter ever stops unconditionally
+  // adding '-mcx16' to its Clang instance, then be sure to update this below.
+  case llvm::Triple::ArchType::x86_64:
+    addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_128");
+    break;
+
+  default:
+    // Some exotic architectures may not support atomics at all. If that's the
+    // case please update the switch with your flavor of arch. Otherwise assume
+    // every arch supports at least word atomics.
+
+    if (triple.isArch32Bit()) {
+      addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_32");
+    }
+
+    if (triple.isArch64Bit()) {
+      addPlatformConditionValue(PlatformConditionKind::AtomicBitWidth, "_64");
+    }
+  }
 }
 
 std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
@@ -380,29 +497,31 @@ std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
     break;
   default:
     UnsupportedArch = true;
+
+    if (Target.getOSName() == "none") {
+      if (Target.getArch() != llvm::Triple::ArchType::UnknownArch) {
+        auto ArchName = llvm::Triple::getArchTypeName(Target.getArch());
+        addPlatformConditionValue(PlatformConditionKind::Arch, ArchName);
+        UnsupportedArch = false;
+      }
+    }
   }
 
   if (UnsupportedOS || UnsupportedArch)
     return { UnsupportedOS, UnsupportedArch };
 
   // Set the "_endian" platform condition.
-  switch (Target.getArch()) {
-  default: llvm_unreachable("undefined architecture endianness");
-  case llvm::Triple::ArchType::arm:
-  case llvm::Triple::ArchType::thumb:
-  case llvm::Triple::ArchType::aarch64:
-  case llvm::Triple::ArchType::aarch64_32:
-  case llvm::Triple::ArchType::ppc64le:
-  case llvm::Triple::ArchType::wasm32:
-  case llvm::Triple::ArchType::x86:
-  case llvm::Triple::ArchType::x86_64:
-  case llvm::Triple::ArchType::riscv64:
+  if (Target.isLittleEndian()) {
     addPlatformConditionValue(PlatformConditionKind::Endianness, "little");
-    break;
-  case llvm::Triple::ArchType::ppc64:
-  case llvm::Triple::ArchType::systemz:
+  } else {
     addPlatformConditionValue(PlatformConditionKind::Endianness, "big");
-    break;
+  }
+
+  // Set the "_pointerBitWidth" platform condition.
+  if (Target.isArch32Bit()) {
+    addPlatformConditionValue(PlatformConditionKind::PointerBitWidth, "_32");
+  } else if (Target.isArch64Bit()) {
+    addPlatformConditionValue(PlatformConditionKind::PointerBitWidth, "_64");
   }
 
   // Set the "runtime" platform condition.
@@ -426,6 +545,9 @@ std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
   if (tripleIsMacCatalystEnvironment(Target))
     addPlatformConditionValue(PlatformConditionKind::TargetEnvironment,
                               "macabi");
+
+  // Set the "_atomicBitWidth" platform condition.
+  setAtomicBitWidth(triple);
 
   // If you add anything to this list, change the default size of
   // PlatformConditionValues to not require an extra allocation
@@ -458,7 +580,7 @@ bool swift::isFeatureAvailableInProduction(Feature feature) {
   switch (feature) {
 #define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)  \
   case Feature::FeatureName: return true;
-#define EXPERIMENTAL_FEATURE(FeatureName, AvailableInProd)            \
+#define EXPERIMENTAL_FEATURE(FeatureName, AvailableInProd) \
   case Feature::FeatureName: return AvailableInProd;
 #include "swift/Basic/Features.def"
   }
@@ -466,21 +588,21 @@ bool swift::isFeatureAvailableInProduction(Feature feature) {
 }
 
 llvm::Optional<Feature> swift::getUpcomingFeature(llvm::StringRef name) {
-  return llvm::StringSwitch<Optional<Feature>>(name)
+  return llvm::StringSwitch<llvm::Optional<Feature>>(name)
 #define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)
 #define UPCOMING_FEATURE(FeatureName, SENumber, Version) \
                    .Case(#FeatureName, Feature::FeatureName)
 #include "swift/Basic/Features.def"
-                   .Default(None);
+      .Default(llvm::None);
 }
 
 llvm::Optional<Feature> swift::getExperimentalFeature(llvm::StringRef name) {
-  return llvm::StringSwitch<Optional<Feature>>(name)
+  return llvm::StringSwitch<llvm::Optional<Feature>>(name)
 #define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)
-#define EXPERIMENTAL_FEATURE(FeatureName, AvailableInProd)                  \
+#define EXPERIMENTAL_FEATURE(FeatureName, AvailableInProd) \
                    .Case(#FeatureName, Feature::FeatureName)
 #include "swift/Basic/Features.def"
-                   .Default(None);
+      .Default(llvm::None);
 }
 
 llvm::Optional<unsigned> swift::getFeatureLanguageVersion(Feature feature) {
@@ -489,8 +611,20 @@ llvm::Optional<unsigned> swift::getFeatureLanguageVersion(Feature feature) {
 #define UPCOMING_FEATURE(FeatureName, SENumber, Version) \
   case Feature::FeatureName: return Version;
 #include "swift/Basic/Features.def"
-  default: return None;
+  default:
+    return llvm::None;
   }
+}
+
+bool swift::includeInModuleInterface(Feature feature) {
+  switch (feature) {
+#define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)  \
+  case Feature::FeatureName: return true;
+#define EXPERIMENTAL_FEATURE_EXCLUDED_FROM_MODULE_INTERFACE(FeatureName, AvailableInProd) \
+  case Feature::FeatureName: return false;
+#include "swift/Basic/Features.def"
+  }
+  llvm_unreachable("covered switch");
 }
 
 DiagnosticBehavior LangOptions::getAccessNoteFailureLimit() const {

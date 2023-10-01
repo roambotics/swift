@@ -99,17 +99,17 @@ TEST(TypeRefTest, UniqueTupleTypeRef) {
   auto N2 = Builder.createNominalType(XYZ_decl, nullptr);
 
   std::vector<const TypeRef *> Void;
-  auto Void1 = Builder.createTupleType(Void, "");
-  auto Void2 = Builder.createTupleType(Void, "");
+  auto Void1 = Builder.createTupleType(Void, ArrayRef<StringRef>());
+  auto Void2 = Builder.createTupleType(Void, ArrayRef<StringRef>());
 
   EXPECT_EQ(Void1, Void2);
 
   std::vector<const TypeRef *> Elements1 { N1, N2 };
   std::vector<const TypeRef *> Elements2 { N1, N2, N2 };
 
-  auto T1 = Builder.createTupleType(Elements1, "");
-  auto T2 = Builder.createTupleType(Elements1, "");
-  auto T3 = Builder.createTupleType(Elements2, "");
+  auto T1 = Builder.createTupleType(Elements1, ArrayRef<StringRef>());
+  auto T2 = Builder.createTupleType(Elements1, ArrayRef<StringRef>());
+  auto T3 = Builder.createTupleType(Elements2, ArrayRef<StringRef>());
 
   EXPECT_EQ(T1, T2);
   EXPECT_NE(T2, T3);
@@ -121,7 +121,7 @@ TEST(TypeRefTest, UniqueFunctionTypeRef) {
   TypeRefBuilder Builder(TypeRefBuilder::ForTesting);
 
   std::vector<const TypeRef *> Void;
-  auto VoidResult = Builder.createTupleType(Void, "");
+  auto VoidResult = Builder.createTupleType(Void, ArrayRef<StringRef>());
   Param Param1 = Builder.createNominalType(ABC_decl, nullptr);
   Param Param2 = Builder.createNominalType(XYZ_decl, nullptr);
 
@@ -130,7 +130,8 @@ TEST(TypeRefTest, UniqueFunctionTypeRef) {
   std::vector<Param> Parameters2{Param1, Param1};
 
   auto Result =
-      Builder.createTupleType({Param1.getType(), Param2.getType()}, "");
+      Builder.createTupleType({Param1.getType(), Param2.getType()},
+                              ArrayRef<StringRef>());
 
   auto F1 = Builder.createFunctionType(
       Parameters1, Result, FunctionTypeFlags(),
@@ -308,9 +309,9 @@ TEST(TypeRefTest, UniqueMetatypeTypeRef) {
   TypeRefBuilder Builder(TypeRefBuilder::ForTesting);
 
   auto N1 = Builder.createNominalType(ABC_decl, nullptr);
-  auto M1 = Builder.createMetatypeType(N1, None);
-  auto M2 = Builder.createMetatypeType(N1, None);
-  auto MM3 = Builder.createMetatypeType(M1, None);
+  auto M1 = Builder.createMetatypeType(N1, llvm::None);
+  auto M2 = Builder.createMetatypeType(N1, llvm::None);
+  auto MM3 = Builder.createMetatypeType(M1, llvm::None);
   auto M4 = Builder.createMetatypeType(N1, Demangle::ImplMetatypeRepresentation::Thick);
 
   EXPECT_EQ(M1, M2);
@@ -517,7 +518,8 @@ TEST(TypeRefTest, DeriveSubstitutions) {
   auto Nominal = Builder.createBoundGenericType(NominalName, NominalArgs,
                                                /*parent*/ nullptr);
 
-  auto Result = Builder.createTupleType({GTP00, GTP01}, "");
+  auto Result = Builder.createTupleType({GTP00, GTP01},
+                                        ArrayRef<StringRef>());
   auto Func = Builder.createFunctionType(
       {Nominal}, Result, FunctionTypeFlags(),
       FunctionMetadataDifferentiabilityKind::NonDifferentiable, nullptr);

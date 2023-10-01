@@ -38,6 +38,7 @@
 ///     fails. The default is the line number where `assert(_:_:file:line:)`
 ///     is called.
 @_transparent
+@_unavailableInEmbedded
 public func assert(
   _ condition: @autoclosure () -> Bool,
   _ message: @autoclosure () -> String = String(),
@@ -51,6 +52,23 @@ public func assert(
     }
   }
 }
+
+#if $Embedded
+@_transparent
+public func assert(
+  _ condition: @autoclosure () -> Bool,
+  _ message: @autoclosure () -> StaticString = StaticString(),
+  file: StaticString = #file, line: UInt = #line
+) {
+  // Only assert in debug mode.
+  if _isDebugAssertConfiguration() {
+    if !_fastPath(condition()) {
+      _assertionFailure("Assertion failed", message(), file: file, line: line,
+        flags: _fatalErrorFlags())
+    }
+  }
+}
+#endif
 
 /// Checks a necessary condition for making forward progress.
 ///
@@ -80,6 +98,7 @@ public func assert(
 ///     fails. The default is the line number where
 ///     `precondition(_:_:file:line:)` is called.
 @_transparent
+@_unavailableInEmbedded
 public func precondition(
   _ condition: @autoclosure () -> Bool,
   _ message: @autoclosure () -> String = String(),
@@ -97,6 +116,27 @@ public func precondition(
       StaticString("precondition failure").unsafeRawPointer)
   }
 }
+
+#if $Embedded
+@_transparent
+public func precondition(
+  _ condition: @autoclosure () -> Bool,
+  _ message: @autoclosure () -> StaticString = StaticString(),
+  file: StaticString = #file, line: UInt = #line
+) {
+  // Only check in debug and release mode. In release mode just trap.
+  if _isDebugAssertConfiguration() {
+    if !_fastPath(condition()) {
+      _assertionFailure("Precondition failed", message(), file: file, line: line,
+        flags: _fatalErrorFlags())
+    }
+  } else if _isReleaseAssertConfiguration() {
+    let error = !condition()
+    Builtin.condfail_message(error._value,
+      StaticString("precondition failure").unsafeRawPointer)
+  }
+}
+#endif
 
 /// Indicates that an internal sanity check failed.
 ///
@@ -121,6 +161,7 @@ public func precondition(
 ///     line number where `assertionFailure(_:file:line:)` is called.
 @inlinable
 @inline(__always)
+@_unavailableInEmbedded
 public func assertionFailure(
   _ message: @autoclosure () -> String = String(),
   file: StaticString = #file, line: UInt = #line
@@ -133,6 +174,23 @@ public func assertionFailure(
     _conditionallyUnreachable()
   }
 }
+
+#if $Embedded
+@inlinable
+@inline(__always)
+public func assertionFailure(
+  _ message: @autoclosure () -> StaticString = StaticString(),
+  file: StaticString = #file, line: UInt = #line
+) {
+  if _isDebugAssertConfiguration() {
+    _assertionFailure("Fatal error", message(), file: file, line: line,
+      flags: _fatalErrorFlags())
+  }
+  else if _isFastAssertConfiguration() {
+    _conditionallyUnreachable()
+  }
+}
+#endif
 
 /// Indicates that a precondition was violated.
 ///
@@ -162,6 +220,7 @@ public func assertionFailure(
 ///   - line: The line number to print along with `message`. The default is the
 ///     line number where `preconditionFailure(_:file:line:)` is called.
 @_transparent
+@_unavailableInEmbedded
 public func preconditionFailure(
   _ message: @autoclosure () -> String = String(),
   file: StaticString = #file, line: UInt = #line
@@ -177,6 +236,24 @@ public func preconditionFailure(
   _conditionallyUnreachable()
 }
 
+#if $Embedded
+@_transparent
+public func preconditionFailure(
+  _ message: @autoclosure () -> StaticString = StaticString(),
+  file: StaticString = #file, line: UInt = #line
+) -> Never {
+  // Only check in debug and release mode.  In release mode just trap.
+  if _isDebugAssertConfiguration() {
+    _assertionFailure("Fatal error", message(), file: file, line: line,
+      flags: _fatalErrorFlags())
+  } else if _isReleaseAssertConfiguration() {
+    Builtin.condfail_message(true._value,
+      StaticString("precondition failure").unsafeRawPointer)
+  }
+  _conditionallyUnreachable()
+}
+#endif
+
 /// Unconditionally prints a given message and stops execution.
 ///
 /// - Parameters:
@@ -186,6 +263,7 @@ public func preconditionFailure(
 ///   - line: The line number to print along with `message`. The default is the
 ///     line number where `fatalError(_:file:line:)` is called.
 @_transparent
+@_unavailableInEmbedded
 public func fatalError(
   _ message: @autoclosure () -> String = String(),
   file: StaticString = #file, line: UInt = #line
@@ -193,6 +271,17 @@ public func fatalError(
   _assertionFailure("Fatal error", message(), file: file, line: line,
     flags: _fatalErrorFlags())
 }
+
+#if $Embedded
+@_transparent
+public func fatalError(
+  _ message: @autoclosure () -> StaticString = StaticString(),
+  file: StaticString = #file, line: UInt = #line
+) -> Never {
+  _assertionFailure("Fatal error", message(), file: file, line: line,
+    flags: _fatalErrorFlags())
+}
+#endif
 
 /// Library precondition checks.
 ///
@@ -332,6 +421,7 @@ internal func _internalInvariant_5_1(
 /// **and** the current executable was built with a Swift Standard Library
 /// version equal to or greater than the supplied version.
 @_transparent
+@_unavailableInEmbedded
 internal func _precondition(
   ifLinkedOnOrAfter version: _SwiftStdlibVersion,
   _ condition: @autoclosure () -> Bool,

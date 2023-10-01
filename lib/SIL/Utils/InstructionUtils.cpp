@@ -39,6 +39,30 @@ SILValue swift::lookThroughOwnershipInsts(SILValue v) {
   }
 }
 
+bool swift::visitNonOwnershipUses(SILValue value,
+                                  function_ref<bool(Operand *)> visitor) {
+  // All ownership insts have a single operand, so a recursive walk is
+  // sufficient and cannot revisit operands.
+  for (Operand *use : value->getUses()) {
+    auto *user = use->getUser();
+    switch (user->getKind()) {
+    default:
+      if (!visitor(use))
+        return false;
+
+      break;
+    case SILInstructionKind::MoveValueInst:
+    case SILInstructionKind::CopyValueInst:
+    case SILInstructionKind::BeginBorrowInst:
+      if (!visitNonOwnershipUses(cast<SingleValueInstruction>(user), visitor))
+        return false;
+
+      break;
+    }
+  }
+  return true;
+}
+
 SILValue swift::lookThroughCopyValueInsts(SILValue val) {
   while (auto *cvi =
              dyn_cast_or_null<CopyValueInst>(val->getDefiningInstruction())) {
@@ -57,6 +81,14 @@ SILValue swift::getUnderlyingObject(SILValue v) {
     v2 = stripAddressProjections(v2);
     v2 = stripIndexingInsts(v2);
     v2 = lookThroughOwnershipInsts(v2);
+    if (auto *ecm = dyn_cast<EndCOWMutationInst>(v2)) {
+      v2 = ecm->getOperand();
+    } else if (auto *eir = dyn_cast<EndInitLetRefInst>(v2)) {
+      v2 = eir->getOperand();
+    } else if (auto *mvr = dyn_cast<MultipleValueInstructionResult>(v2)) {
+      if (auto *bci = dyn_cast<BeginCOWMutationInst>(mvr->getParent()))
+        v2 = bci->getOperand();
+    }
     if (v2 == v)
       return v2;
     v = v2;
@@ -116,7 +148,7 @@ SILValue swift::stripCastsWithoutMarkDependence(SILValue v) {
     if (auto *svi = dyn_cast<SingleValueInstruction>(v)) {
       if (isIdentityPreservingRefCast(svi) ||
           isa<UncheckedTrivialBitCastInst>(v) || isa<BeginAccessInst>(v) ||
-          isa<EndCOWMutationInst>(v)) {
+          isa<EndInitLetRefInst>(v) || isa<EndCOWMutationInst>(v)) {
         v = svi->getOperand(0);
         continue;
       }
@@ -244,8 +276,8 @@ SILValue swift::stripBorrow(SILValue V) {
 // This is guaranteed to handle all function-type conversions: ThinToThick,
 // ConvertFunction, and ConvertEscapeToNoEscapeInst.
 SingleValueInstruction *swift::getSingleValueCopyOrCast(SILInstruction *I) {
-  if (auto *convert = dyn_cast<ConversionInst>(I))
-    return convert;
+  if (auto convert = ConversionOperation(I))
+    return *convert;
 
   switch (I->getKind()) {
   default:
@@ -379,6 +411,25 @@ bool swift::onlyUsedByAssignByWrapper(PartialApplyInst *PAI) {
   return usedByAssignByWrapper;
 }
 
+bool swift::onlyUsedByAssignOrInit(PartialApplyInst *PAI) {
+  bool usedByAssignOrInit = false;
+  for (Operand *Op : PAI->getUses()) {
+    SILInstruction *user = Op->getUser();
+    if (isa<AssignOrInitInst>(user)) {
+      usedByAssignOrInit = true;
+      continue;
+    }
+
+    if (isa<DestroyValueInst>(user)) {
+      continue;
+    }
+
+    return false;
+  }
+
+  return usedByAssignOrInit;
+}
+
 static RuntimeEffect metadataEffect(SILType ty) {
   ClassDecl *cl = ty.getClassOrBoundGenericClass();
   if (cl && !cl->hasKnownSwiftImplementation())
@@ -435,13 +486,17 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::BridgeObjectToWordInst:
   case SILInstructionKind::ThinToThickFunctionInst:
   case SILInstructionKind::ThickToObjCMetatypeInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableAddrInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableBoxInst:
+  case SILInstructionKind::CopyableToMoveOnlyWrapperAddrInst:
   case SILInstructionKind::ObjCMetatypeToObjectInst:
   case SILInstructionKind::ObjCExistentialMetatypeToObjectInst:
   case SILInstructionKind::ClassifyBridgeObjectInst:
   case SILInstructionKind::ValueToBridgeObjectInst:
   case SILInstructionKind::MarkDependenceInst:
   case SILInstructionKind::MoveValueInst:
-  case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::DropDeinitInst:
+  case SILInstructionKind::MarkUnresolvedNonCopyableValueInst:
   case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
   case SILInstructionKind::CopyableToMoveOnlyWrapperValueInst:
   case SILInstructionKind::MoveOnlyWrapperToCopyableValueInst:
@@ -465,11 +520,6 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::UncheckedTakeEnumDataAddrInst:
   case SILInstructionKind::SelectEnumInst:
   case SILInstructionKind::SelectEnumAddrInst:
-  case SILInstructionKind::SelectValueInst:
-  case SILInstructionKind::OpenExistentialMetatypeInst:
-  case SILInstructionKind::OpenExistentialBoxInst:
-  case SILInstructionKind::OpenExistentialValueInst:
-  case SILInstructionKind::OpenExistentialBoxValueInst:
   case SILInstructionKind::ProjectBlockStorageInst:
   case SILInstructionKind::UnreachableInst:
   case SILInstructionKind::ReturnInst:
@@ -483,6 +533,9 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::DeallocStackInst:
   case SILInstructionKind::DeallocStackRefInst:
   case SILInstructionKind::DeallocPackInst:
+  // This instruction just destroys stack allocations where metadata pointers
+  // have been stored.
+  case SILInstructionKind::DeallocPackMetadataInst:
   case SILInstructionKind::AutoreleaseValueInst:
   case SILInstructionKind::BindMemoryInst:
   case SILInstructionKind::RebindMemoryInst:
@@ -490,6 +543,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::EndBorrowInst:
   case SILInstructionKind::AssignInst:
   case SILInstructionKind::AssignByWrapperInst:
+  case SILInstructionKind::AssignOrInitInst:
   case SILInstructionKind::MarkFunctionEscapeInst:
   case SILInstructionKind::EndLifetimeInst:
   case SILInstructionKind::EndApplyInst:
@@ -513,6 +567,12 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::PackLengthInst:
   case SILInstructionKind::DebugStepInst:
     return RuntimeEffect::NoEffect;
+      
+  case SILInstructionKind::OpenExistentialMetatypeInst:
+  case SILInstructionKind::OpenExistentialBoxInst:
+  case SILInstructionKind::OpenExistentialValueInst:
+  case SILInstructionKind::OpenExistentialBoxValueInst:
+    return RuntimeEffect::Existential;
 
   case SILInstructionKind::DebugValueInst:
     // Ignore runtime calls of debug_value
@@ -532,6 +592,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     return RuntimeEffect::Allocating | RuntimeEffect::Releasing |
            RuntimeEffect::MetaData;
 
+  case SILInstructionKind::TuplePackExtractInst:
   case SILInstructionKind::TuplePackElementAddrInst:
     return RuntimeEffect::MetaData;
 
@@ -579,10 +640,12 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::InitExistentialValueInst:
     impactType = inst->getOperand(0)->getType();
     return RuntimeEffect::Allocating | RuntimeEffect::Releasing |
-           RuntimeEffect::MetaData;
+           RuntimeEffect::MetaData | RuntimeEffect::Existential;
 
   case SILInstructionKind::InitExistentialRefInst:
   case SILInstructionKind::InitExistentialMetatypeInst:
+    impactType = inst->getOperand(0)->getType();
+    return RuntimeEffect::MetaData | RuntimeEffect::Existential;
   case SILInstructionKind::ObjCToThickMetatypeInst:
     impactType = inst->getOperand(0)->getType();
     return RuntimeEffect::MetaData;
@@ -598,18 +661,18 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::OpenExistentialAddrInst:
     if (cast<OpenExistentialAddrInst>(inst)->getAccessKind() ==
         OpenedExistentialAccess::Mutable)
-      return RuntimeEffect::Allocating;
-    return RuntimeEffect::NoEffect;
+      return RuntimeEffect::Allocating | RuntimeEffect::Existential;
+    return RuntimeEffect::Existential;
 
   case SILInstructionKind::OpenExistentialRefInst: {
     SILType opType = cast<OpenExistentialRefInst>(inst)->getOperand()->getType();
     impactType = opType;
     if (opType.getASTType()->isObjCExistentialType()) {
-      return RuntimeEffect::MetaData;
+      return RuntimeEffect::MetaData | RuntimeEffect::Existential;
     }
-    return RuntimeEffect::MetaData;
-    // TODO: should be NoEffect
-    //return RuntimeEffect::NoEffect;
+    return RuntimeEffect::MetaData | RuntimeEffect::Existential;
+    // TODO: should be Existential
+    //return RuntimeEffect::Existential;
   }
 
   case SILInstructionKind::UnconditionalCheckedCastInst:
@@ -629,6 +692,10 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
 
   case SILInstructionKind::AllocPackInst:
     // Just conservatively assume this has metadata impact.
+    return RuntimeEffect::MetaData;
+  case SILInstructionKind::AllocPackMetadataInst:
+    // Currently this instruction has no effect but in the fullness of time it
+    // will have a metadata effect.
     return RuntimeEffect::MetaData;
 
   case SILInstructionKind::AllocStackInst:
@@ -651,8 +718,11 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     }
     return RuntimeEffect::Allocating;
   }
-  case SILInstructionKind::AllocBoxInst:
   case SILInstructionKind::AllocExistentialBoxInst:
+    impactType = cast<SingleValueInstruction>(inst)->getType();
+    return RuntimeEffect::Allocating | RuntimeEffect::MetaData |
+           RuntimeEffect::Releasing | RuntimeEffect::Existential;
+  case SILInstructionKind::AllocBoxInst:
   case SILInstructionKind::AllocRefInst:
   case SILInstructionKind::AllocRefDynamicInst:
     impactType = cast<SingleValueInstruction>(inst)->getType();
@@ -738,11 +808,21 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     case ExistentialRepresentation::Opaque:
       return RuntimeEffect::MetaData;
     case ExistentialRepresentation::Class: {
+      if (opType.isAnyObject()) {
+        if (inst->getModule().getASTContext().LangOpts.EnableObjCInterop) {
+          return RuntimeEffect::MetaData | RuntimeEffect::Existential |
+                 RuntimeEffect::ObjectiveC;
+        } else {
+          return RuntimeEffect::MetaData | RuntimeEffect::Existential;
+        }
+      }
       auto *cl = opType.getClassOrBoundGenericClass();
-      bool usesObjCModel = cl->getObjectModel() == ReferenceCounting::ObjC;
-      if ((cl && usesObjCModel) || opType.isAnyObject())
-        return RuntimeEffect::MetaData | RuntimeEffect::ObjectiveC;
-      return RuntimeEffect::MetaData | RuntimeEffect::ObjectiveC;
+      bool usesObjCModel =
+          cl && cl->getObjectModel() == ReferenceCounting::ObjC;
+      if (usesObjCModel)
+        return RuntimeEffect::MetaData | RuntimeEffect::ObjectiveC |
+               RuntimeEffect::Existential;
+      return RuntimeEffect::MetaData | RuntimeEffect::Existential;
     }
     case ExistentialRepresentation::None:
       return RuntimeEffect::NoEffect;
@@ -756,7 +836,8 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::BeginCOWMutationInst:
   case SILInstructionKind::CopyValueInst:
   case SILInstructionKind::ExplicitCopyValueInst:
-  case SILInstructionKind::SetDeallocatingInst:
+  case SILInstructionKind::BeginDeallocRefInst:
+  case SILInstructionKind::EndInitLetRefInst:
   case SILInstructionKind::IsUniqueInst:
   case SILInstructionKind::IsEscapingClosureInst:
   case SILInstructionKind::CopyBlockInst:
@@ -788,10 +869,10 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
 #include "swift/AST/ReferenceStorage.def"
 #undef ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE
 
-#define UNCHECKED_REF_STORAGE(Name, ...)                                       \
-  case SILInstructionKind::StrongCopy##Name##ValueInst:                        \
+  case SILInstructionKind::UnownedCopyValueInst:
+  case SILInstructionKind::WeakCopyValueInst:
     return RuntimeEffect::RefCounting;
-#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)            \
+#define REF_STORAGE(Name, ...)                                                 \
   case SILInstructionKind::StrongCopy##Name##ValueInst:                        \
     return RuntimeEffect::RefCounting;
 #include "swift/AST/ReferenceStorage.def"
@@ -829,7 +910,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
       rt |= RuntimeEffect::ObjectiveC | RuntimeEffect::MetaData;
       break;
     case SILFunctionTypeRepresentation::WitnessMethod:
-      rt |= RuntimeEffect::MetaData;
+      rt |= RuntimeEffect::MetaData | RuntimeEffect::Existential;
       break;
     case SILFunctionTypeRepresentation::CFunctionPointer:
     case SILFunctionTypeRepresentation::CXXMethod:
@@ -837,6 +918,10 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     case SILFunctionTypeRepresentation::Method:
     case SILFunctionTypeRepresentation::Closure:
     case SILFunctionTypeRepresentation::Thick:
+    case SILFunctionTypeRepresentation::KeyPathAccessorGetter:
+    case SILFunctionTypeRepresentation::KeyPathAccessorSetter:
+    case SILFunctionTypeRepresentation::KeyPathAccessorEquals:
+    case SILFunctionTypeRepresentation::KeyPathAccessorHash:
       break;
     }
 
@@ -847,7 +932,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
       if (pa->isOnStack()) {
         for (SILValue arg : pa->getArguments()) {
           if (!arg->getType().isTrivial(*pa->getFunction()))
-            rt |= RuntimeEffect::RefCounting;
+            rt |= ifNonTrivial(arg->getType(), RuntimeEffect::RefCounting);
         }
       } else {
         rt |= RuntimeEffect::Allocating | RuntimeEffect::Releasing;
@@ -904,6 +989,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     case BuiltinValueKind::Swift3ImplicitObjCEntrypoint:
       return RuntimeEffect::ObjectiveC | RuntimeEffect::Allocating;
     case BuiltinValueKind::BuildOrdinarySerialExecutorRef:
+    case BuiltinValueKind::BuildComplexEqualitySerialExecutorRef:
     case BuiltinValueKind::BuildDefaultActorExecutorRef:
     case BuiltinValueKind::BuildMainActorExecutorRef:
     case BuiltinValueKind::StartAsyncLet:

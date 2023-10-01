@@ -1,63 +1,67 @@
 import CASTBridging
-import SwiftParser
+
+// Needed to use SyntaxTransformVisitor's visit method.
+@_spi(SyntaxTransformVisitor)
 import SwiftSyntax
+import SwiftDiagnostics
 
 extension ASTGenVisitor {
   public func visit(_ node: ClosureExprSyntax) -> ASTNode {
-    let statements = node.statements.map { self.visit($0).bridged() }
-    let body: UnsafeMutableRawPointer = statements.withBridgedArrayRef { ref in
-      let startLoc = self.base.advanced(by: node.leftBrace.position.utf8Offset).raw
-      let endLoc = self.base.advanced(by: node.rightBrace.position.utf8Offset).raw
-      return BraceStmt_create(ctx, startLoc, ref, endLoc)
-    }
+    let body = BraceStmt_create(
+      self.ctx,
+      node.leftBrace.bridgedSourceLoc(in: self),
+      self.visit(node.statements),
+      node.rightBrace.bridgedSourceLoc(in: self)
+    )
 
-    return .expr(ClosureExpr_create(ctx, body, declContext))
+    // FIXME: Translate the signature, capture list, 'in' location, etc.
+    return .expr(ClosureExpr_create(self.ctx, body, self.declContext))
   }
 
   public func visit(_ node: FunctionCallExprSyntax) -> ASTNode {
+    if !node.arguments.isEmpty || node.trailingClosure == nil {
+      if node.leftParen == nil {
+        self.diagnose(Diagnostic(node: node, message: MissingChildTokenError(parent: node, kindOfTokenMissing: .leftParen)))
+      }
+      if node.rightParen == nil {
+        self.diagnose(Diagnostic(node: node, message: MissingChildTokenError(parent: node, kindOfTokenMissing: .rightParen)))
+      }
+    }
+
+    var node = node
+
     // Transform the trailing closure into an argument.
     if let trailingClosure = node.trailingClosure {
-      let tupleElement = TupleExprElementSyntax(
+      let tupleElement = LabeledExprSyntax(
         label: nil, colon: nil, expression: ExprSyntax(trailingClosure), trailingComma: nil)
 
-      return visit(node.addArgument(tupleElement).with(\.trailingClosure, nil))
+      node.arguments.append(tupleElement)
+      node.trailingClosure = nil
     }
 
-    let args = visit(node.argumentList).rawValue
+    let argumentTuple = self.visit(node.arguments, leftParen: node.leftParen, rightParen: node.rightParen)
+      .rawValue
     let callee = visit(node.calledExpression).rawValue
 
-    return .expr(SwiftFunctionCallExpr_create(self.ctx, callee, args))
+    return .expr(FunctionCallExpr_create(self.ctx, callee, argumentTuple))
   }
 
-  public func visit(_ node: IdentifierExprSyntax) -> ASTNode {
-    let loc = self.base.advanced(by: node.position.utf8Offset).raw
+  public func visit(_ node: DeclReferenceExprSyntax) -> ASTNode {
+    let (name, nameLoc) = node.baseName.bridgedIdentifierAndSourceLoc(in: self)
 
-    var text = node.identifier.text
-    let id = text.withUTF8 { buf in
-      return SwiftASTContext_getIdentifier(ctx, buf.baseAddress, buf.count)
-    }
-
-    return .expr(SwiftIdentifierExpr_create(ctx, id, loc))
+    return .expr(IdentifierExpr_create(self.ctx, name, nameLoc))
   }
 
   public func visit(_ node: IdentifierPatternSyntax) -> ASTNode {
-    let loc = self.base.advanced(by: node.position.utf8Offset).raw
+    let (name, nameLoc) = node.identifier.bridgedIdentifierAndSourceLoc(in: self)
 
-    var text = node.identifier.text
-    let id = text.withUTF8 { buf in
-      return SwiftASTContext_getIdentifier(ctx, buf.baseAddress, buf.count)
-    }
-
-    return .expr(SwiftIdentifierExpr_create(ctx, id, loc))
+    return .expr(IdentifierExpr_create(self.ctx, name, nameLoc))
   }
 
   public func visit(_ node: MemberAccessExprSyntax) -> ASTNode {
-    let loc = self.base.advanced(by: node.position.utf8Offset).raw
+    let loc = node.bridgedSourceLoc(in: self)
     let base = visit(node.base!).rawValue
-    var nameText = node.name.text
-    let name = nameText.withUTF8 { buf in
-      return SwiftASTContext_getIdentifier(ctx, buf.baseAddress, buf.count)
-    }
+    let name = node.declName.baseName.bridgedIdentifier(in: self)
 
     return .expr(UnresolvedDotExpr_create(ctx, base, loc, name, loc))
   }
@@ -71,32 +75,37 @@ extension ASTGenVisitor {
     return .expr(sve)
   }
 
-  public func visit(_ node: TupleExprElementListSyntax) -> ASTNode {
-    let elements = node.map { self.visit($0).rawValue }
-    let labels: [BridgedIdentifier?] = node.map {
-      guard var name = $0.label?.text else {
-        return nil
-      }
-      return name.withUTF8 { buf in
-        SwiftASTContext_getIdentifier(ctx, buf.baseAddress, buf.count)
-      }
-    }
-    let labelLocs: [UnsafeMutableRawPointer] = node.map {
-      let pos = $0.label?.position ?? $0.position
-      return base.advanced(by: pos.utf8Offset).raw
-    }
+  public func visit(_ node: TupleExprSyntax) -> ASTNode {
+    self.visit(node.elements, leftParen: node.leftParen, rightParen: node.rightParen)
+  }
+}
 
-    let lParenLoc = self.base.advanced(by: node.position.utf8Offset).raw
-    let rParenLoc = self.base.advanced(by: node.endPosition.utf8Offset).raw
+extension ASTGenVisitor {
+  /// Generate a tuple expression from a ``LabeledExprListSyntax`` and parentheses.
+  func visit(_ node: LabeledExprListSyntax, leftParen: TokenSyntax?, rightParen: TokenSyntax?) -> ASTNode {
+    let expressions = node.lazy.map {
+      self.visit($0.expression).rawValue
+    }
+    let labels = node.lazy.map {
+      $0.label.bridgedIdentifier(in: self)
+    }
+    let labelLocations = node.lazy.map {
+      if let label = $0.label {
+        return label.bridgedSourceLoc(in: self)
+      }
+
+      return $0.bridgedSourceLoc(in: self)
+    }
 
     return .expr(
-      elements.withBridgedArrayRef { elementsRef in
-        labels.withBridgedArrayRef { labelsRef in
-          labelLocs.withBridgedArrayRef { labelLocRef in
-            SwiftTupleExpr_create(self.ctx, lParenLoc, elementsRef, labelsRef,
-                                  labelLocRef, rParenLoc)
-          }
-        }
-      })
+      TupleExpr_create(
+        self.ctx,
+        leftParen.bridgedSourceLoc(in: self),
+        expressions.bridgedArray(in: self),
+        labels.bridgedArray(in: self),
+        labelLocations.bridgedArray(in: self),
+        rightParen.bridgedSourceLoc(in: self)
+      )
+    )
   }
 }

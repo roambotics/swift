@@ -20,6 +20,7 @@
 #include "swift/AST/Stmt.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeRefinementContext.h"
 #include "swift/Basic/SourceManager.h"
 
@@ -46,10 +47,25 @@ TypeRefinementContext::createRoot(SourceFile *SF,
   assert(SF);
 
   ASTContext &Ctx = SF->getASTContext();
+
+  SourceRange range;
+  TypeRefinementContext *parentContext = nullptr;
+  AvailabilityContext availabilityContext = Info;
+  if (auto parentExpansion = SF->getMacroExpansion()) {
+    if (auto parentTRC =
+            SF->getEnclosingSourceFile()->getTypeRefinementContext()) {
+      auto charRange = Ctx.SourceMgr.getRangeForBuffer(*SF->getBufferID());
+      range = SourceRange(charRange.getStart(), charRange.getEnd());
+      parentContext = parentTRC->findMostRefinedSubContext(
+          parentExpansion.getStartLoc(), Ctx.SourceMgr);
+      availabilityContext = parentContext->getAvailabilityInfo();
+    }
+  }
+
   return new (Ctx)
-      TypeRefinementContext(Ctx, SF,
-                            /*Parent=*/nullptr, SourceRange(),
-                            Info, AvailabilityContext::alwaysAvailable());
+      TypeRefinementContext(Ctx, SF, parentContext, range,
+                            availabilityContext,
+                            AvailabilityContext::alwaysAvailable());
 }
 
 TypeRefinementContext *
@@ -147,13 +163,47 @@ TypeRefinementContext::createForWhileStmtBody(ASTContext &Ctx, WhileStmt *S,
       Ctx, S, Parent, S->getBody()->getSourceRange(), Info, /* ExplicitInfo */Info);
 }
 
+/// Determine whether the child location is somewhere within the parent
+/// range.
+static bool rangeContainsTokenLocWithGeneratedSource(
+    SourceManager &sourceMgr, SourceRange parentRange, SourceLoc childLoc) {
+  auto parentBuffer = sourceMgr.findBufferContainingLoc(parentRange.Start);
+  auto childBuffer = sourceMgr.findBufferContainingLoc(childLoc);
+  while (parentBuffer != childBuffer) {
+    auto info = sourceMgr.getGeneratedSourceInfo(childBuffer);
+    if (!info)
+      return false;
+
+    childLoc = info->originalSourceRange.getStart();
+    if (childLoc.isInvalid())
+      return false;
+
+    childBuffer = sourceMgr.findBufferContainingLoc(childLoc);
+  }
+
+  return sourceMgr.rangeContainsTokenLoc(parentRange, childLoc);
+}
+
 TypeRefinementContext *
 TypeRefinementContext::findMostRefinedSubContext(SourceLoc Loc,
                                                  SourceManager &SM) {
   assert(Loc.isValid());
   
-  if (SrcRange.isValid() && !SM.rangeContainsTokenLoc(SrcRange, Loc))
+  if (SrcRange.isValid() &&
+      !rangeContainsTokenLocWithGeneratedSource(SM, SrcRange, Loc))
     return nullptr;
+
+  // If this context is for a declaration, ensure that we've expanded the
+  // children of the declaration.
+  if (Node.getReason() == Reason::Decl ||
+      Node.getReason() == Reason::DeclImplicit) {
+    if (auto decl = Node.getAsDecl()) {
+      ASTContext &ctx = decl->getASTContext();
+      (void)evaluateOrDefault(
+          ctx.evaluator, ExpandChildTypeRefinementContextsRequest{decl, this},
+          false);
+    }
+  }
 
   // For the moment, we perform a linear search here, but we can and should
   // do something more efficient.
@@ -317,6 +367,10 @@ void TypeRefinementContext::print(raw_ostream &OS, SourceManager &SrcMgr,
       OS << "extension." << ED->getExtendedType().getString();
     } else if (isa<TopLevelCodeDecl>(D)) {
       OS << "<top-level-code>";
+    } else if (auto PBD = dyn_cast<PatternBindingDecl>(D)) {
+      if (auto VD = PBD->getAnchoringVarDecl(0)) {
+        OS << VD->getName();
+      }
     }
   }
 
@@ -373,4 +427,9 @@ StringRef TypeRefinementContext::getReasonName(Reason R) {
   }
 
   llvm_unreachable("Unhandled Reason in switch.");
+}
+
+void swift::simple_display(
+    llvm::raw_ostream &out, const TypeRefinementContext *trc) {
+  out << "TRC @" << trc;
 }

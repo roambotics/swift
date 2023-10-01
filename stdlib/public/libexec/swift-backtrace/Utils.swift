@@ -51,7 +51,7 @@ internal func parseUInt64<S: StringProtocol>(_ s: S) -> UInt64? {
   }
 }
 
-#if os(macOS)
+#if os(macOS) || os(Linux)
 
 struct PosixError: Error {
   var errno: Int32
@@ -140,3 +140,18 @@ internal func spawn(_ path: String, args: [String]) throws {
 }
 
 #endif // os(macOS)
+
+struct CFileStream: TextOutputStream {
+  var fp: UnsafeMutablePointer<FILE>
+
+  public func write(_ string: String) {
+    fputs(string, fp)
+  }
+
+  public func flush() {
+    fflush(fp)
+  }
+}
+
+var standardOutput = CFileStream(fp: stdout)
+var standardError = CFileStream(fp: stderr)

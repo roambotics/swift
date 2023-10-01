@@ -516,7 +516,7 @@ do {
   func set_via_closure<T, U>(_ closure: (inout T, U) -> ()) {} // expected-note {{in call to function 'set_via_closure'}}
   set_via_closure({ $0.number1 = $1 })
   // expected-error@-1 {{generic parameter 'T' could not be inferred}}
-  // expected-error@-2 {{unable to infer type of a closure parameter '$1' in the current context}}
+  // expected-error@-2 {{cannot infer type of closure parameter '$1' without a type annotation}}
 
   func f2<T>(_ item: T, _ update: (inout T) -> Void) {
     var x = item
@@ -624,7 +624,10 @@ extension P_47606 {
 let u = rdar33296619().element //expected-error {{cannot find 'rdar33296619' in scope}}
 
 [1].forEach { _ in
-  _ = "\(u)"
+  _ = "\(u)" // No diagnostic because `u` is already diagnosed and marked as invalid
+}
+
+[1].forEach { _ in
   _ = 1 + "hi" // expected-error {{binary operator '+' cannot be applied to operands of type 'Int' and 'String'}}
   // expected-note@-1 {{overloads for '+' exist with these partially matching parameter lists: (Int, Int), (String, String)}}
 }
@@ -1052,12 +1055,12 @@ overloaded_with_default_and_autoclosure { 42 } // Ok
 overloaded_with_default_and_autoclosure(42) // Ok
 
 /// https://github.com/apple/swift/issues/55261
-/// "error: type of expression is ambiguous without more context" in many cases
+/// "error: type of expression is ambiguous without a type annotation" in many cases
 /// where methods are missing.
 do {
   let _ = { a, b in }
-  // expected-error@-1 {{unable to infer type of a closure parameter 'a' in the current context}}
-  // expected-error@-2 {{unable to infer type of a closure parameter 'b' in the current context}}
+  // expected-error@-1 {{cannot infer type of closure parameter 'a' without a type annotation}}
+  // expected-error@-2 {{cannot infer type of closure parameter 'b' without a type annotation}}
 
   _ = .a { b in } // expected-error {{cannot infer contextual base in reference to member 'a'}}
 
@@ -1078,7 +1081,7 @@ let explicitUnboundResult2: (Array<Bool>) -> Array<Int> = {
 }
 // FIXME: Should we prioritize the contextual result type and infer Array<Int>
 // rather than using a type variable in these cases?
-// expected-error@+1 {{unable to infer closure type in the current context}}
+// expected-error@+1 {{unable to infer closure type without a type annotation}}
 let explicitUnboundResult3: (Array<Bool>) -> Array<Int> = {
   (arr: Array) -> Array in [true]
 }
@@ -1149,11 +1152,9 @@ struct R_76250381<Result, Failure: Error> {
 // rdar://77022842 - crash due to a missing argument to a ternary operator
 func rdar77022842(argA: Bool? = nil, argB: Bool? = nil) {
   if let a = argA ?? false, if let b = argB ?? {
-    // expected-error@-1 {{'if' may only be used as expression in return, throw, or as the source of an assignment}}
-    // expected-error@-2 {{initializer for conditional binding must have Optional type, not 'Bool'}}
-    // expected-error@-3 {{cannot convert value of type '() -> ()' to expected argument type 'Bool?'}}
-    // expected-error@-4 {{cannot convert value of type 'Void' to expected condition type 'Bool'}}
-    // expected-error@-5 {{'if' must have an unconditional 'else' to be used as expression}}
+    // expected-error@-1 {{initializer for conditional binding must have Optional type, not 'Bool'}}
+    // expected-error@-2 {{cannot convert value of type '() -> ()' to expected argument type 'Bool?'}}
+    // expected-error@-3 {{cannot convert value of type 'Void' to expected condition type 'Bool'}}
   } // expected-error {{expected '{' after 'if' condition}}
 }
 
@@ -1225,4 +1226,24 @@ func closureWithCaseArchetype<T>(_: T.Type) {
       return any
     }
   }
+}
+
+// rdar://112426330 - invalid diagnostic when closure argument is omitted
+do {
+  func test<T>(_: T, _: (T) -> Void) {}
+
+  test(42) { // expected-error {{contextual type for closure argument list expects 1 argument, which cannot be implicitly ignored}} {{13-13= _ in}}
+    print("")
+  }
+
+  func context(_: (Int) -> Void) {}
+  func context(_: () -> Void) {}
+
+  context {
+    test(42) { // expected-error {{contextual type for closure argument list expects 1 argument, which cannot be implicitly ignored}} {{15-15= _ in}}
+      print("")
+    }
+  }
+
+
 }

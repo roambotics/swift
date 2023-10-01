@@ -37,14 +37,17 @@ void AfterPoundExprCompletion::sawSolutionImpl(const constraints::Solution &S) {
   }
 }
 
-void AfterPoundExprCompletion::deliverResults(
-    ide::CodeCompletionContext &CompletionCtx,
-    CodeCompletionConsumer &Consumer) {
+void AfterPoundExprCompletion::collectResults(
+    ide::CodeCompletionContext &CompletionCtx) {
   ASTContext &Ctx = DC->getASTContext();
   CompletionLookup Lookup(CompletionCtx.getResultSink(), Ctx, DC,
                           &CompletionCtx);
 
   Lookup.shouldCheckForDuplicates(Results.size() > 1);
+
+  // The type context that is being used for global results.
+  ExpectedTypeContext UnifiedTypeContext;
+  UnifiedTypeContext.setPreferNonVoid(true);
 
   for (auto &Result : Results) {
     Lookup.setExpectedTypes({Result.ExpectedTy},
@@ -52,8 +55,11 @@ void AfterPoundExprCompletion::deliverResults(
                             /*expectsNonVoid=*/true);
     Lookup.addPoundAvailable(ParentStmtKind);
     Lookup.addObjCPoundKeywordCompletions(/*needPound=*/false);
-    Lookup.getMacroCompletions(/*needPound=*/false);
+    Lookup.getMacroCompletions(CodeCompletionMacroRole::Expression);
+
+    UnifiedTypeContext.merge(*Lookup.getExpectedTypeContext());
   }
 
-  deliverCompletionResults(CompletionCtx, Lookup, DC, Consumer);
+  collectCompletionResults(CompletionCtx, Lookup, DC, UnifiedTypeContext,
+                           /*CanCurrDeclContextHandleAsync=*/false);
 }

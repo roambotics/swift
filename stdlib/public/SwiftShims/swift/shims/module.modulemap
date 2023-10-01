@@ -1,6 +1,7 @@
 module SwiftShims {
   header "AssertionReporting.h"
   header "CoreFoundationShims.h"
+  header "EmbeddedShims.h"
   header "FoundationShims.h"
   header "GlobalObjects.h"
   header "HeapObject.h"
@@ -24,10 +25,6 @@ module SwiftShims {
 
 module _SwiftConcurrencyShims {
   header "_SwiftConcurrency.h"
-}
-
-module _SwiftBacktracingShims {
-  header "_SwiftBacktracing.h"
 }
 
 module SwiftOverlayShims {

@@ -508,11 +508,12 @@ public struct S5 {
 
 // rdar://problem/24329052 - QoI: call argument archetypes not lining up leads to ambiguity errors
 
-struct S_24329052<T> { // expected-note {{generic parameter 'T' of generic struct 'S_24329052' declared here}}
+struct S_24329052<T> { // expected-note {{generic parameter 'T' of generic struct 'S_24329052' declared here}} expected-note {{'T' previously declared here}}
   var foo: (T) -> Void
   // expected-note@+1 {{generic parameter 'T' of instance method 'bar(_:)' declared here}}
   func bar<T>(_ v: T) { foo(v) }
   // expected-error@-1 {{cannot convert value of type 'T' (generic parameter of instance method 'bar(_:)') to expected argument type 'T' (generic parameter of generic struct 'S_24329052')}}
+  // expected-warning@-2 {{generic parameter 'T' shadows generic parameter from outer scope with the same name; this is an error in Swift 6}}
 }
 
 extension Sequence {
@@ -943,7 +944,7 @@ do {
   struct Outer<T: P_eaf0300ff7a> {
     struct Inner<U> {}
 
-    func container<T>() -> Inner<T> {
+    func container<V>() -> Inner<V> {
       return Inner()
     }
   }
@@ -1016,6 +1017,7 @@ func test_requirement_failures_in_ambiguous_context() {
   func f1<T: Equatable>(_: T, _: T) {} // expected-note {{where 'T' = 'A'}}
 
   f1(A(), B()) // expected-error {{local function 'f1' requires that 'A' conform to 'Equatable'}}
+  // expected-error@-1 {{cannot convert value of type 'B' to expected argument type 'A'}}
 
   func f2<T: P_56173, U: P_56173>(_: T, _: U) {}
   // expected-note@-1 {{candidate requires that 'B' conform to 'P_56173' (requirement specified as 'U' : 'P_56173')}}

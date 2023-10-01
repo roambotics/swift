@@ -159,6 +159,7 @@ namespace sil_block {
     SIL_INST_INCREMENT_PROFILER_COUNTER,
     SIL_MOVEONLY_DEINIT,
     SIL_INST_HAS_SYMBOL,
+    SIL_OPEN_PACK_ELEMENT,
     SIL_PACK_ELEMENT_GET,
     SIL_PACK_ELEMENT_SET,
   };
@@ -411,23 +412,15 @@ namespace sil_block {
   >;
 
   // SIL instructions with one type. (alloc_stack)
-  using SILOneTypeLayout = BCRecordLayout<
-    SIL_ONE_TYPE,
-    SILInstOpCodeField,
-    BCFixed<3>,          // Optional attributes
-    TypeIDField,
-    SILTypeCategoryField
-  >;
+  using SILOneTypeLayout = BCRecordLayout<SIL_ONE_TYPE, SILInstOpCodeField,
+                                          BCFixed<4>, // Optional attributes
+                                          TypeIDField, SILTypeCategoryField>;
 
   // SIL instructions with one typed valueref. (dealloc_stack, return)
-  using SILOneOperandLayout = BCRecordLayout<
-    SIL_ONE_OPERAND,
-    SILInstOpCodeField,
-    BCFixed<2>,          // Optional attributes
-    TypeIDField,
-    SILTypeCategoryField,
-    ValueIDField
-  >;
+  using SILOneOperandLayout =
+      BCRecordLayout<SIL_ONE_OPERAND, SILInstOpCodeField,
+                     BCFixed<3>, // Optional attributes
+                     TypeIDField, SILTypeCategoryField, ValueIDField>;
 
   using SILOneOperandExtraAttributeLayout = BCRecordLayout<
     SIL_ONE_OPERAND_EXTRA_ATTR,
@@ -469,8 +462,18 @@ namespace sil_block {
   >;
 
   // The pack_element_get instruction.
+  using SILOpenPackElementLayout = BCRecordLayout<
+    SIL_OPEN_PACK_ELEMENT,
+    GenericEnvironmentIDField,
+    TypeIDField,
+    SILTypeCategoryField,
+    ValueIDField
+  >;
+
+  // The pack_element_get instruction.
   using SILPackElementGetLayout = BCRecordLayout<
     SIL_PACK_ELEMENT_GET,
+    SILInstOpCodeField,
     TypeIDField,            // element type
     SILTypeCategoryField,   // element type category
     TypeIDField,            // pack type

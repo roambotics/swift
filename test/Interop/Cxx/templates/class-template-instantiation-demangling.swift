@@ -8,5 +8,5 @@ public func returnInstantiation() -> WrappedMagicInt {
   return WrappedMagicInt()
 }
 
-// CHECK: $s4main20receiveInstantiationyySo0025MagicWrapperInt32_lsFCfibVzF(%TSo0025MagicWrapperInt32_lsFCfibV* ---> @$s4main20receiveInstantiationyySo0025MagicWrapperInt32_lsFCfibVzF(%TSo0025MagicWrapperInt32_lsFCfibV*
+// CHECK: $s4main20receiveInstantiationyySo0025MagicWrapperInt32_lsFCfibVzF(ptr ---> @$s4main20receiveInstantiationyySo0025MagicWrapperInt32_lsFCfibVzF(ptr
 // CHECK: $s4main19returnInstantiationSo0025MagicWrapperInt32_lsFCfibVyF() ---> @$s4main19returnInstantiationSo0025MagicWrapperInt32_lsFCfibVyF()

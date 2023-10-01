@@ -25,6 +25,7 @@
 #include "swift/Basic/OptimizationMode.h"
 #include "swift/Config.h"
 #include "clang/Basic/PointerAuthOptions.h"
+#include "llvm/IR/CallingConv.h"
 // FIXME: This include is just for llvm::SanitizerCoverageOptions. We should
 // split the header upstream so we don't include so much.
 #include "llvm/Transforms/Instrumentation.h"
@@ -145,6 +146,15 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
 
   /// Protocol conformance descriptors when passed as arguments.
   PointerAuthSchema ProtocolConformanceDescriptorsAsArguments;
+
+  /// Protocol descriptors when passed as arguments.
+  PointerAuthSchema ProtocolDescriptorsAsArguments;
+
+  /// Opaque type descriptors when passed as arguments.
+  PointerAuthSchema OpaqueTypeDescriptorsAsArguments;
+
+  /// Type context descriptors when passed as arguments.
+  PointerAuthSchema ContextDescriptorsAsArguments;
 
   /// Resumption functions from yield-once coroutines.
   PointerAuthSchema YieldOnceResumeFunctions;
@@ -318,6 +328,9 @@ public:
   /// Print the LLVM inline tree at the end of the LLVM pass pipeline.
   unsigned PrintInlineTree : 1;
 
+  /// Always recompile the output even if the module hash might match.
+  unsigned AlwaysCompile : 1;
+
   /// Whether we should embed the bitcode file.
   IRGenEmbedMode EmbedMode : 2;
 
@@ -379,6 +392,12 @@ public:
   /// Also force structs to be lowered to aligned group TypeLayouts rather than
   /// using TypeInfo entries.
   unsigned ForceStructTypeLayouts : 1;
+
+  /// Enable generation and use of layout string based value witnesses
+  unsigned EnableLayoutStringValueWitnesses : 1;
+
+  /// Enable runtime instantiation of value witness strings for generic types
+  unsigned EnableLayoutStringValueWitnessesInstantiation : 1;
 
   /// Instrument code to generate profiling information.
   unsigned GenerateProfile : 1;
@@ -456,9 +475,10 @@ public:
   TypeInfoDumpFilter TypeInfoFilter;
   
   /// Pull in runtime compatibility shim libraries by autolinking.
-  Optional<llvm::VersionTuple> AutolinkRuntimeCompatibilityLibraryVersion;
-  Optional<llvm::VersionTuple> AutolinkRuntimeCompatibilityDynamicReplacementLibraryVersion;
-  Optional<llvm::VersionTuple>
+  llvm::Optional<llvm::VersionTuple> AutolinkRuntimeCompatibilityLibraryVersion;
+  llvm::Optional<llvm::VersionTuple>
+      AutolinkRuntimeCompatibilityDynamicReplacementLibraryVersion;
+  llvm::Optional<llvm::VersionTuple>
       AutolinkRuntimeCompatibilityConcurrencyLibraryVersion;
   bool AutolinkRuntimeCompatibilityBytecodeLayoutsLibrary;
 
@@ -467,6 +487,9 @@ public:
   /// If not an empty string, trap intrinsics are lowered to calls to this
   /// function instead of to trap instructions.
   std::string TrapFuncName = "";
+
+  /// The calling convention used to perform non-swift calls.
+  llvm::CallingConv::ID PlatformCCallingConvention;
 
   IRGenOptions()
       : DWARFVersion(2),
@@ -481,7 +504,7 @@ public:
         DisableLLVMOptzns(false), DisableSwiftSpecificLLVMOptzns(false),
         Playground(false),
         EmitStackPromotionChecks(false), UseSingleModuleLLVMEmission(false),
-        FunctionSections(false), PrintInlineTree(false),
+        FunctionSections(false), PrintInlineTree(false), AlwaysCompile(false),
         EmbedMode(IRGenEmbedMode::None), LLVMLTOKind(IRGenLLVMLTOKind::None),
         SwiftAsyncFramePointer(SwiftAsyncFramePointerKind::Auto),
         HasValueNamesSetting(false), ValueNames(false),
@@ -493,6 +516,8 @@ public:
         CompactAbsoluteFunctionPointer(false), DisableLegacyTypeInfo(false),
         PrespecializeGenericMetadata(false), UseIncrementalLLVMCodeGen(true),
         UseTypeLayoutValueHandling(true), ForceStructTypeLayouts(false),
+        EnableLayoutStringValueWitnesses(false),
+        EnableLayoutStringValueWitnessesInstantiation(false),
         GenerateProfile(false), EnableDynamicReplacementChaining(false),
         DisableDebuggerShadowCopies(false),
         DisableConcreteTypeMetadataMangledNameAccessors(false),
@@ -506,7 +531,8 @@ public:
         ColocateTypeDescriptors(true),
         UseRelativeProtocolWitnessTables(false), CmdArgs(),
         SanitizeCoverage(llvm::SanitizerCoverageOptions()),
-        TypeInfoFilter(TypeInfoDumpFilter::All) {
+        TypeInfoFilter(TypeInfoDumpFilter::All),
+        PlatformCCallingConvention(llvm::CallingConv::C) {
 #ifndef NDEBUG
     DisableRoundTripDebugTypes = false;
 #else
@@ -549,12 +575,18 @@ public:
     return OptMode == OptimizationMode::ForSize;
   }
 
-  std::string getDebugFlags(StringRef PrivateDiscriminator) const {
+  std::string getDebugFlags(StringRef PrivateDiscriminator,
+                            bool EnableCXXInterop) const {
     std::string Flags = DebugFlags;
     if (!PrivateDiscriminator.empty()) {
       if (!Flags.empty())
         Flags += " ";
       Flags += ("-private-discriminator " + PrivateDiscriminator).str();
+    }
+    if (EnableCXXInterop) {
+      if (!Flags.empty())
+        Flags += " ";
+      Flags += "-enable-experimental-cxx-interop";
     }
     return Flags;
   }

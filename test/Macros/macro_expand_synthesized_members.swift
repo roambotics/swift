@@ -1,19 +1,29 @@
+// REQUIRES: swift_swift_parser, executable_test
+//
 // RUN: %empty-directory(%t)
-// RUN: %target-build-swift -swift-version 5 -I %swift-host-lib-dir -L %swift-host-lib-dir -emit-library -o %t/%target-library-name(MacroDefinition) -module-name=MacroDefinition %S/Inputs/syntax_macro_definitions.swift -g -no-toolchain-stdlib-rpath
-// RUNx: %target-swift-frontend -dump-ast -load-plugin-library %t/%target-library-name(MacroDefinition) -I %swift-host-lib-dir %s -module-name MacroUser 2>&1 | %FileCheck --check-prefix CHECK-AST %s
-// RUN: %target-typecheck-verify-swift -swift-version 5 -load-plugin-library %t/%target-library-name(MacroDefinition) -I %swift-host-lib-dir -module-name MacroUser -DTEST_DIAGNOSTICS -swift-version 5
-// RUN: %target-build-swift -g -swift-version 5 -load-plugin-library %t/%target-library-name(MacroDefinition) -I %swift-host-lib-dir -L %swift-host-lib-dir %s -o %t/main -module-name MacroUser -swift-version 5
+// RUN: %host-build-swift -swift-version 5 -emit-library -o %t/%target-library-name(MacroDefinition) -module-name=MacroDefinition %S/Inputs/syntax_macro_definitions.swift -g -no-toolchain-stdlib-rpath
+// RUN: %target-typecheck-verify-swift -swift-version 5 -load-plugin-library %t/%target-library-name(MacroDefinition) -module-name MacroUser -DTEST_DIAGNOSTICS -swift-version 5 -verify-ignore-unknown
+// RUN: %target-build-swift -g -swift-version 5 -load-plugin-library %t/%target-library-name(MacroDefinition) %s -o %t/main -module-name MacroUser -swift-version 5
+// RUN: %target-codesign %t/main
 // RUN: %target-run %t/main | %FileCheck %s
-// REQUIRES: executable_test
-
-// FIXME: Swift parser is not enabled on Linux CI yet.
-// REQUIRES: OS=macosx
 
 @attached(
   member,
-  names: named(Storage), named(storage), named(getStorage), named(method), named(`init`)
+  names: named(init), named(Storage), named(storage), named(getStorage()), named(method), named(init(other:))
 )
 macro addMembers() = #externalMacro(module: "MacroDefinition", type: "AddMembers")
+
+@attached(
+  member,
+  names: named(`init`), named(Storage), named(storage), named(getStorage()), named(method)
+)
+macro addMembersQuotedInit() = #externalMacro(module: "MacroDefinition", type: "AddMembers")
+
+#if TEST_DIAGNOSTICS
+@addMembers
+import Swift
+// expected-error@-2 {{'member' macro cannot be attached to import}}
+#endif
 
 @addMembers
 struct S {
@@ -23,11 +33,24 @@ struct S {
   }
 }
 
+@attached(
+  member,
+  names: named(extInstanceMethod), named(extStaticMethod)
+)
+macro addExtMembers() = #externalMacro(module: "MacroDefinition", type: "AddExtMembers")
+
+@addExtMembers
+extension S { }
+
 let s = S()
 
 // CHECK: synthesized method
 // CHECK: Storage
 s.useSynthesized()
+
+// Members added via extension.
+s.extInstanceMethod()
+S.extStaticMethod()
 
 @attached(member, names: arbitrary)
 macro addArbitraryMembers() = #externalMacro(module: "MacroDefinition", type: "AddArbitraryMembers")
@@ -44,7 +67,7 @@ print(MyType.MyType3.self)
 
 @attached(
   member,
-  names: named(RawValue), named(rawValue), named(`init`)
+  names: named(RawValue), named(rawValue), named(init)
 )
 public macro NewType<T>() = #externalMacro(module: "MacroDefinition", type: "NewTypeMacro")
 
@@ -78,3 +101,14 @@ enum ElementType {
 }
 
 print(ElementType.paper.unknown())
+
+#if TEST_DIAGNOSTICS
+@addMembersQuotedInit
+struct S2 {
+// expected-note@-2 {{in expansion of macro 'addMembersQuotedInit' on struct 'S2' here}}
+  func useSynthesized() {
+    S.method()
+    print(type(of: getStorage()))
+  }
+}
+#endif

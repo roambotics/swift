@@ -31,7 +31,7 @@ import SIL
 ///   br continue_bb(%5)
 /// continue_bb(%bridgedOptionalSwiftValue):
 /// ```
-let objCBridgingOptimization = FunctionPass(name: "objc-bridging-opt", {
+let objCBridgingOptimization = FunctionPass(name: "objc-bridging-opt") {
   (function: Function, context: FunctionPassContext) in
 
   if !function.hasOwnership { return }
@@ -54,7 +54,7 @@ let objCBridgingOptimization = FunctionPass(name: "objc-bridging-opt", {
       }
     }
   }
-})
+}
 
 //===----------------------------------------------------------------------===//
 //                      Top-level optimization functions
@@ -211,11 +211,11 @@ private func optimizeNonOptionalBridging(_ apply: ApplyInst,
 
   // In the some-case just forward the original NSString.
   let objCType = emptyObjCValue.type
-  let forwardedValue = someBlock.addBlockArgument(type: objCType, ownership: .owned, context)
+  let forwardedValue = someBlock.addArgument(type: objCType, ownership: .owned, context)
   let someBuilder = Builder(atEndOf: someBlock, location: bridgeToSwiftCall.location, context)
   someBuilder.createBranch(to: continueBlock, arguments: [forwardedValue])
 
-  let s = continueBlock.addBlockArgument(type: objCType, ownership: .owned, context)
+  let s = continueBlock.addArgument(type: objCType, ownership: .owned, context)
   
   // Now replace the bridged value with the original value in the destination block.
   let replacement = s.makeAvailable(in: bridgeToObjcCall.parentBlock, context)
@@ -246,10 +246,13 @@ private func removeBridgingCodeInPredecessors(of block: BasicBlock, _ context: F
 }
 
 private func lookThroughOwnershipInsts(_ value: Value) -> Value {
-  // Looks like it's sufficient to support begin_borrow for now.
-  // TODO: add copy_value if needed.
+  // Looks like it's sufficient to support begin_borrow and copy_value for now.
+  // TODO: add move_value if needed.
   if let bbi = value as? BeginBorrowInst {
     return bbi.borrowedValue
+  }
+  if let cvi = value as? CopyValueInst {
+    return cvi.fromValue
   }
   return value
 }
@@ -269,16 +272,13 @@ private func lookThroughOwnershipInsts(_ value: Value) -> Value {
 /// continue_bb(%value):         // passed value
 /// ```
 private func isOptionalBridging(of value: Value, isBridging: (Value) -> ApplyInst?) -> SwitchEnumInst? {
-  guard let arg = value as? BlockArgument,
-        arg.isPhiArgument else {
-    return nil
-  }
+  guard let phi = Phi(value) else { return nil }
   
   var noneSwitch: SwitchEnumInst?
   var someSwitch: SwitchEnumInst?
   
   // Check if one incoming value is the none-case and the other is the some-case.
-  for incomingVal in arg.incomingPhiValues {
+  for incomingVal in phi.incomingValues {
     // In both branches, the result must be an `enum` which is passed to the
     // continue_bb's phi-argument.
     guard let enumInst = incomingVal as? EnumInst,
@@ -335,10 +335,9 @@ private func isOptionalBridging(of value: Value, isBridging: (Value) -> ApplyIns
 /// Returns the `switch_enum` together with the enum case index, if `value` is
 /// the payload block argument of the `switch_enum`.
 private func isPayloadOfSwitchEnum(_ value: Value) -> (SwitchEnumInst, case: Int)? {
-  if let payloadArg = value as? BlockArgument,
-     let pred = payloadArg.parentBlock.singlePredecessor,
-     let se = pred.terminator as? SwitchEnumInst,
-     let caseIdx = se.getUniqueCase(forSuccessor: payloadArg.parentBlock) {
+  if let payloadArg = TerminatorResult(value),
+     let se = payloadArg.terminator as? SwitchEnumInst,
+     let caseIdx = se.getUniqueCase(forSuccessor: payloadArg.successor) {
     return (se, caseIdx)
   }
   return nil

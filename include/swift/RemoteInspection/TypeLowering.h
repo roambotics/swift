@@ -176,6 +176,16 @@ public:
   explicit BuiltinTypeInfo(TypeRefBuilder &builder,
                            RemoteRef<BuiltinTypeDescriptor> descriptor);
 
+  /// Construct an empty builtin type info.
+  BuiltinTypeInfo()
+      : TypeInfo(TypeInfoKind::Builtin,
+                 /*Size=*/0,
+                 /*Alignment=*/1,
+                 /*Stride=*/1,
+                 /*ExtraInhabitants=*/0,
+                 /*BitwiseTakable=*/true),
+        Name("") {}
+
   const std::string &getMangledTypeName() const {
     return Name;
   }
@@ -367,7 +377,7 @@ public:
   /// class.
   ///
   /// Not cached.
-  const TypeInfo *
+  const RecordTypeInfo *
   getClassInstanceTypeInfo(const TypeRef *TR, unsigned start,
                            remote::TypeInfoProvider *ExternalTypeInfo);
 

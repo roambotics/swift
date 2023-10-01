@@ -292,8 +292,10 @@ public:
 private:
   // Look up the flags and optionally the writeback address associated with the
   // cleanup at \p depth. If
-  std::tuple<Cleanup::Flags, Optional<SILValue>>
+  std::tuple<Cleanup::Flags, llvm::Optional<SILValue>>
   getFlagsAndWritebackBuffer(CleanupHandle depth);
+
+  bool isFormalAccessCleanup(CleanupHandle depth);
 };
 
 /// An RAII object that allows the state of a cleanup to be
@@ -327,7 +329,7 @@ private:
 /// writeback buffers.
 class CleanupCloner {
   SILGenFunction &SGF;
-  Optional<SILValue> writebackBuffer;
+  llvm::Optional<SILValue> writebackBuffer;
   bool hasCleanup;
   bool isLValue;
   bool isFormalAccess;
@@ -349,6 +351,9 @@ public:
   ManagedValue cloneForRemainingPackComponents(SILValue packAddr,
                                                CanPackType formalPackType,
                                                unsigned firstComponentIndex) const;
+  ManagedValue cloneForRemainingTupleComponents(SILValue tupleAddr,
+                                                CanPackType inducedPackType,
+                                                unsigned firstComponentIndex) const;
 
   static void
   getClonersForRValue(SILGenFunction &SGF, const RValue &rvalue,

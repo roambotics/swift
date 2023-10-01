@@ -131,6 +131,7 @@ static ValueDecl *deriveInitDecl(DerivedConformance &derived, Type paramType,
                             /*Failable=*/true, /*FailabilityLoc=*/SourceLoc(),
                             /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
                             /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                            /*ThrownType=*/TypeLoc(),
                             paramList,
                             /*GenericParams=*/nullptr, parentDC);
 
@@ -229,7 +230,7 @@ deriveBodyCodingKey_enum_stringValue(AbstractFunctionDecl *strValDecl, void *) {
       cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                        labelItem, SourceLoc(), SourceLoc(),
                                        caseBody,
-                                       /*case body var decls*/ None));
+                                       /*case body var decls*/ llvm::None));
     }
 
     auto *selfRef = DerivedConformance::createSelfDeclRef(strValDecl);
@@ -276,6 +277,11 @@ deriveBodyCodingKey_init_stringValue(AbstractFunctionDecl *initDecl, void *) {
   auto *selfRef = DerivedConformance::createSelfDeclRef(initDecl);
   SmallVector<ASTNode, 4> cases;
   for (auto *elt : elements) {
+    // Skip the cases that would return unavailable elements since those can't
+    // be instantiated at runtime.
+    if (elt->getAttrs().isUnavailable(C))
+      continue;
+
     auto *litExpr = new (C) StringLiteralExpr(elt->getNameStr(), SourceRange(),
                                               /*Implicit=*/true);
     auto *litPat = ExprPattern::createImplicit(C, litExpr, /*DC*/ initDecl);
@@ -293,7 +299,7 @@ deriveBodyCodingKey_init_stringValue(AbstractFunctionDecl *initDecl, void *) {
                                    SourceLoc());
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      labelItem, SourceLoc(), SourceLoc(), body,
-                                     /*case body var decls*/ None));
+                                     /*case body var decls*/ llvm::None));
   }
 
   auto *anyPat = AnyPattern::createImplicit(C);
@@ -305,7 +311,7 @@ deriveBodyCodingKey_init_stringValue(AbstractFunctionDecl *initDecl, void *) {
   cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                    dfltLabelItem, SourceLoc(), SourceLoc(),
                                    dfltBody,
-                                   /*case body var decls*/ None));
+                                   /*case body var decls*/ llvm::None));
 
   auto *stringValueDecl = initDecl->getParameters()->get(0);
   auto *stringValueRef = new (C) DeclRefExpr(stringValueDecl, DeclNameLoc(),
@@ -333,7 +339,7 @@ static bool canSynthesizeCodingKey(DerivedConformance &derived) {
     }
   }
 
-  auto inherited = enumDecl->getInherited();
+  auto inherited = enumDecl->getInherited().getEntries();
   if (!inherited.empty() && inherited.front().wasValidated() &&
       inherited.front().isError())
     return false;

@@ -1,5 +1,10 @@
-// RUN: %target-typecheck-verify-swift  -disable-availability-checking
+// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify
+// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=targeted
+// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=complete
+// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -enable-experimental-feature SendNonSendable
+
 // REQUIRES: concurrency
+// REQUIRES: asserts
 
 // expected-note@+2{{add 'async' to function 'missingAsync' to make it asynchronous}}
 @available(SwiftStdlib 5.1, *)

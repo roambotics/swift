@@ -29,6 +29,7 @@
 #include "swift/IDE/SyntaxModel.h"
 #include "swift/IDE/Utils.h"
 #include "swift/IDETool/IDEInspectionInstance.h"
+#include "swift/IDETool/SyntacticMacroExpansion.h"
 
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Preprocessor.h"
@@ -276,8 +277,7 @@ static void configureIDEInspectionInstance(
 SwiftLangSupport::SwiftLangSupport(SourceKit::Context &SKCtx)
     : NotificationCtr(SKCtx.getNotificationCenter()),
       SwiftExecutablePath(SKCtx.getSwiftExecutablePath()),
-      ReqTracker(SKCtx.getRequestTracker()), CCCache(new SwiftCompletionCache),
-      CompileManager(RuntimeResourcePath, DiagnosticDocumentationPath) {
+      ReqTracker(SKCtx.getRequestTracker()), CCCache(new SwiftCompletionCache) {
   llvm::SmallString<128> LibPath(SKCtx.getRuntimeLibPath());
   llvm::sys::path::append(LibPath, "swift");
   RuntimeResourcePath = std::string(LibPath.str());
@@ -285,17 +285,27 @@ SwiftLangSupport::SwiftLangSupport(SourceKit::Context &SKCtx)
 
   Stats = std::make_shared<SwiftStatistics>();
   EditorDocuments = std::make_shared<SwiftEditorDocumentFileMap>();
+
+  std::shared_ptr<PluginRegistry> Plugins = std::make_shared<PluginRegistry>();
+
   ASTMgr = std::make_shared<SwiftASTManager>(
       EditorDocuments, SKCtx.getGlobalConfiguration(), Stats, ReqTracker,
-      SwiftExecutablePath, RuntimeResourcePath, DiagnosticDocumentationPath);
+      Plugins, SwiftExecutablePath, RuntimeResourcePath,
+      DiagnosticDocumentationPath);
 
-  IDEInspectionInst = std::make_shared<IDEInspectionInstance>();
-
+  IDEInspectionInst = std::make_shared<IDEInspectionInstance>(Plugins);
   configureIDEInspectionInstance(IDEInspectionInst,
                                  SKCtx.getGlobalConfiguration());
 
+  CompileManager = std::make_shared<compile::SessionManager>(
+      SwiftExecutablePath, RuntimeResourcePath, DiagnosticDocumentationPath,
+      Plugins);
+
   // By default, just use the in-memory cache.
   CCCache->inMemory = std::make_unique<ide::CodeCompletionCache>();
+
+  SyntacticMacroExpansions =
+      std::make_shared<SyntacticMacroExpansion>(SwiftExecutablePath, Plugins);
 
   // Provide a default file system provider.
   setFileSystemProvider("in-memory-vfs", std::make_unique<InMemoryFileSystemProvider>());
@@ -363,6 +373,8 @@ UIdent SwiftLangSupport::getUIDForAccessor(const ValueDecl *D,
     return IsRef ? KindRefAccessorRead : KindDeclAccessorRead;
   case AccessorKind::Modify:
     return IsRef ? KindRefAccessorModify : KindDeclAccessorModify;
+  case AccessorKind::Init:
+    return IsRef ? KindRefAccessorInit : KindDeclAccessorInit;
   }
 
   llvm_unreachable("Unhandled AccessorKind in switch.");
@@ -759,7 +771,8 @@ swift::ide::NameKind SwiftLangSupport::getNameKindForUID(SourceKit::UIdent Id) {
   return swift::ide::NameKind::Swift;
 }
 
-Optional<UIdent> SwiftLangSupport::getUIDForDeclAttribute(const swift::DeclAttribute *Attr) {
+llvm::Optional<UIdent>
+SwiftLangSupport::getUIDForDeclAttribute(const swift::DeclAttribute *Attr) {
   // Check special-case names first.
   switch (Attr->getKind()) {
     case DAK_IBAction: {
@@ -826,7 +839,7 @@ Optional<UIdent> SwiftLangSupport::getUIDForDeclAttribute(const swift::DeclAttri
     case DAK_RawDocComment:
     case DAK_HasInitialValue:
     case DAK_HasStorage:
-      return None;
+      return llvm::None;
     default:
       break;
   }
@@ -842,7 +855,7 @@ Optional<UIdent> SwiftLangSupport::getUIDForDeclAttribute(const swift::DeclAttri
 #include "swift/AST/Attr.def"
   }
 
-  return None;
+  return llvm::None;
 }
 
 UIdent SwiftLangSupport::getUIDForFormalAccessScope(const swift::AccessScope Scope) {
@@ -990,8 +1003,8 @@ void SwiftLangSupport::setFileSystemProvider(
 }
 
 llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>
-SwiftLangSupport::getFileSystem(const Optional<VFSOptions> &vfsOptions,
-                                Optional<StringRef> primaryFile,
+SwiftLangSupport::getFileSystem(const llvm::Optional<VFSOptions> &vfsOptions,
+                                llvm::Optional<StringRef> primaryFile,
                                 std::string &error) {
   // First, try the specified vfsOptions.
   if (vfsOptions) {

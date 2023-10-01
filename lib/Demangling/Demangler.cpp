@@ -61,6 +61,7 @@ static bool isAnyGeneric(Node::Kind kind) {
     case Node::Kind::OtherNominalType:
     case Node::Kind::TypeAlias:
     case Node::Kind::TypeSymbolicReference:
+    case Node::Kind::BuiltinTupleType:
       return true;
     default:
       return false;
@@ -110,6 +111,8 @@ bool swift::Demangle::isContext(Node::Kind kind) {
     case Node::Kind::ID:
 #include "swift/Demangling/DemangleNodes.def"
       return true;
+    case Node::Kind::BuiltinTupleType:
+      return true;
     default:
       return false;
   }
@@ -148,7 +151,6 @@ bool swift::Demangle::isFunctionAttr(Node::Kind kind) {
     case Node::Kind::BackDeploymentThunk:
     case Node::Kind::BackDeploymentFallback:
     case Node::Kind::HasSymbolQuery:
-    case Node::Kind::RuntimeDiscoverableAttributeRecord:
       return true;
     default:
       return false;
@@ -505,9 +507,87 @@ void NodeFactory::clear() {
     // cycles.
     CurrentSlab->Previous = nullptr;
     CurPtr = (char *)(CurrentSlab + 1);
-    assert(End == CurPtr + SlabSize);
 #ifdef NODE_FACTORY_DEBUGGING
     allocatedMemory = 0;
+#endif
+  }
+}
+
+NodeFactory::Checkpoint NodeFactory::pushCheckpoint() const {
+  return {CurrentSlab, CurPtr, End};
+}
+
+void NodeFactory::popCheckpoint(NodeFactory::Checkpoint checkpoint) {
+  if (checkpoint.Slab == CurrentSlab) {
+    if (checkpoint.CurPtr > CurPtr) {
+      fatal(0,
+            "Popping checkpoint {%p, %p, %p} that is after the current "
+            "pointer.\n",
+            checkpoint.Slab, checkpoint.CurPtr, checkpoint.End);
+    }
+    if (checkpoint.End != End) {
+      fatal(0,
+            "Popping checkpoint {%p, %p, %p} with End that does not match "
+            "current End %p.\n",
+            checkpoint.Slab, checkpoint.CurPtr, checkpoint.End, End);
+    }
+#ifndef NDEBUG
+    // Scribble the newly freed area.
+    memset(checkpoint.CurPtr, 0xaa, CurPtr - checkpoint.CurPtr);
+#endif
+    CurPtr = checkpoint.CurPtr;
+  } else {
+    // We may want to keep using the current slab rather than destroying
+    // it, since over time this allows us to converge on a steady state
+    // with no allocation activity (see the comment above in
+    // NodeFactory::clear). Keep using the current slab if the free space in the
+    // checkpoint's slab is less than 1/16th of the current slab's space. We
+    // won't repeatedly allocate and deallocate the current slab. The size
+    // doubles each time so we'll quickly pass the threshold.
+    Slab *savedSlab = nullptr;
+    if (CurrentSlab) {
+      size_t checkpointSlabFreeSpace = checkpoint.End - checkpoint.CurPtr;
+      size_t currentSlabSize = End - (char *)(CurrentSlab + 1);
+      if (currentSlabSize / 16 > checkpointSlabFreeSpace) {
+        savedSlab = CurrentSlab;
+        CurrentSlab = CurrentSlab->Previous;
+        // No need to save End, as it will still be in place later.
+      }
+    }
+
+    // Free all slabs (possibly except the one we saved) until we find the end
+    // or we find the checkpoint.
+    while (CurrentSlab && checkpoint.Slab != CurrentSlab) {
+      auto Slab = CurrentSlab;
+      CurrentSlab = CurrentSlab->Previous;
+      free(Slab);
+    }
+
+    // If we ran to the end and the checkpoint actually has a slab pointer, then
+    // the checkpoint is invalid.
+    if (!CurrentSlab && checkpoint.Slab) {
+      fatal(0,
+            "Popping checkpoint {%p, %p, %p} with slab that is not within "
+            "the allocator's slab chain.\n",
+            checkpoint.Slab, checkpoint.CurPtr, checkpoint.End);
+    }
+
+    if (savedSlab) {
+      // Reinstall the saved slab.
+      savedSlab->Previous = CurrentSlab;
+      CurrentSlab = savedSlab;
+      CurPtr = (char *)(CurrentSlab + 1);
+      // End is still valid from before.
+    } else {
+      // Set CurPtr and End to match the checkpoint's position.
+      CurPtr = checkpoint.CurPtr;
+      End = checkpoint.End;
+    }
+
+#ifndef NDEBUG
+    // Scribble the now freed end of the slab.
+    if (CurPtr)
+      memset(CurPtr, 0xaa, End - CurPtr);
 #endif
   }
 }
@@ -866,7 +946,6 @@ recur:
     case 'H':
       switch (char c2 = nextChar()) {
       case 'A': return demangleDependentProtocolConformanceAssociated();
-      case 'a': return createNode(Node::Kind::RuntimeDiscoverableAttributeRecord);
       case 'C': return demangleConcreteProtocolConformance();
       case 'D': return demangleDependentProtocolConformanceRoot();
       case 'I': return demangleDependentProtocolConformanceInherited();
@@ -1347,6 +1426,13 @@ NodePointer Demangler::demangleBuiltinType() {
     case 'w':
       Ty = createNode(Node::Kind::BuiltinTypeName,
                                BUILTIN_TYPE_NAME_WORD);
+      break;
+    case 'P':
+      Ty = createNode(Node::Kind::BuiltinTypeName,
+                               BUILTIN_TYPE_NAME_PACKINDEX);
+      break;
+    case 'T':
+      Ty = createNode(Node::Kind::BuiltinTupleType);
       break;
     default:
       return nullptr;
@@ -1860,7 +1946,6 @@ bool Demangle::nodeConsumesGenericArgs(Node *node) {
     case Node::Kind::PropertyWrapperBackingInitializer:
     case Node::Kind::PropertyWrapperInitFromProjectedValue:
     case Node::Kind::Static:
-    case Node::Kind::RuntimeAttributeGenerator:
       return false;
     default:
       return true;
@@ -1990,7 +2075,7 @@ NodePointer Demangler::demangleImplParamConvention(Node::Kind ConvKind) {
     case 'y': attr = "@unowned"; break;
     case 'v': attr = "@pack_owned"; break;
     case 'p': attr = "@pack_guaranteed"; break;
-    case 'm': attr = "@pack_guaranteed"; break;
+    case 'm': attr = "@pack_inout"; break;
     default:
       pushBack();
       return nullptr;
@@ -2063,7 +2148,8 @@ NodePointer Demangler::demangleImplFunctionType() {
       return nullptr;
 
     auto subsNode = createNode(Node::Kind::ImplInvocationSubstitutions);
-    assert(Substitutions.size() == 1);
+    if (Substitutions.size() != 1)
+      return nullptr;
     subsNode->addChild(Substitutions[0], *this);
     if (SubstitutionRetroConformances)
       subsNode->addChild(SubstitutionRetroConformances, *this);
@@ -2432,6 +2518,17 @@ NodePointer Demangler::demangleArchetype() {
     NodePointer PackExpansionTy = createType(
           createWithChildren(Node::Kind::PackExpansion, PatternTy, CountTy));
     return PackExpansionTy;
+  }
+  case 'e': {
+    NodePointer PackTy = popTypeAndGetChild();
+    int level = demangleIndex();
+    if (level < 0)
+      return NULL;
+
+    NodePointer PackElementTy = createType(
+          createWithChildren(Node::Kind::PackElement, PackTy,
+              createNode(Node::Kind::PackElementLevel, level)));
+    return PackElementTy;
   }
   case 'P':
     return popPack();
@@ -3189,10 +3286,13 @@ NodePointer Demangler::addFuncSpecParamNumber(NodePointer Param,
 NodePointer Demangler::demangleSpecAttributes(Node::Kind SpecKind) {
   bool metatypeParamsRemoved = nextIf('m');
   bool isSerialized = nextIf('q');
+  bool asyncRemoved = nextIf('a');
 
   int PassID = (int)nextChar() - '0';
-  if (PassID < 0 || PassID > 9)
+  if (PassID < 0 || PassID >= MAX_SPECIALIZATION_PASS) {
+    assert(false && "unexpected pass id");
     return nullptr;
+  }
 
   NodePointer SpecNd = createNode(SpecKind);
 
@@ -3201,6 +3301,10 @@ NodePointer Demangler::demangleSpecAttributes(Node::Kind SpecKind) {
 
   if (isSerialized)
     SpecNd->addChild(createNode(Node::Kind::IsSerialized),
+                     *this);
+
+  if (asyncRemoved)
+    SpecNd->addChild(createNode(Node::Kind::AsyncRemoved),
                      *this);
 
   SpecNd->addChild(createNode(Node::Kind::SpecializationPassID, PassID),
@@ -3615,6 +3719,7 @@ NodePointer Demangler::demangleAccessor(NodePointer ChildNode) {
     case 'W': Kind = Node::Kind::DidSet; break;
     case 'r': Kind = Node::Kind::ReadAccessor; break;
     case 'M': Kind = Node::Kind::ModifyAccessor; break;
+    case 'i': Kind = Node::Kind::InitAccessor; break;
     case 'a':
       switch (nextChar()) {
         case 'O': Kind = Node::Kind::OwningMutableAddressor; break;
@@ -3664,10 +3769,6 @@ NodePointer Demangler::demangleFunctionEntity() {
     case 'U': Args = TypeAndIndex; Kind = Node::Kind::ExplicitClosure; break;
     case 'u': Args = TypeAndIndex; Kind = Node::Kind::ImplicitClosure; break;
     case 'A': Args = Index; Kind = Node::Kind::DefaultArgumentInitializer; break;
-    case 'a':
-      Args = ContextArg;
-      Kind = Node::Kind::RuntimeAttributeGenerator;
-      break;
     case 'm': return demangleEntity(Node::Kind::Macro);
     case 'M': return demangleMacroExpansion();
     case 'p': return demangleEntity(Node::Kind::GenericTypeParamDecl);
@@ -3978,48 +4079,87 @@ static bool isMacroExpansionNodeKind(Node::Kind kind) {
          kind == Node::Kind::FreestandingMacroExpansion ||
          kind == Node::Kind::MemberAttachedMacroExpansion ||
          kind == Node::Kind::PeerAttachedMacroExpansion ||
-         kind == Node::Kind::ConformanceAttachedMacroExpansion;
+         kind == Node::Kind::ConformanceAttachedMacroExpansion ||
+         kind == Node::Kind::ExtensionAttachedMacroExpansion;
 }
 
 NodePointer Demangler::demangleMacroExpansion() {
   Node::Kind kind;
+  bool isAttached;
+  bool isFreestanding;
   switch (nextChar()) {
   case 'a':
     kind = Node::Kind::AccessorAttachedMacroExpansion;
+    isAttached = true;
+    isFreestanding = false;
     break;
 
-  case 'A':
+  case 'r':
     kind = Node::Kind::MemberAttributeAttachedMacroExpansion;
+    isAttached = true;
+    isFreestanding = false;
     break;
 
   case 'f':
     kind = Node::Kind::FreestandingMacroExpansion;
+    isAttached = false;
+    isFreestanding = true;
     break;
 
   case 'm':
     kind = Node::Kind::MemberAttachedMacroExpansion;
+    isAttached = true;
+    isFreestanding = false;
     break;
 
   case 'p':
     kind = Node::Kind::PeerAttachedMacroExpansion;
+    isAttached = true;
+    isFreestanding = false;
     break;
 
   case 'c':
     kind = Node::Kind::ConformanceAttachedMacroExpansion;
+    isAttached = true;
+    isFreestanding = false;
+    break;
+
+  case 'e':
+    kind = Node::Kind::ExtensionAttachedMacroExpansion;
+    isAttached = true;
+    isFreestanding = false;
     break;
 
   case 'u':
     kind = Node::Kind::MacroExpansionUniqueName;
+    isAttached = false;
+    isFreestanding = false;
     break;
 
   default:
     return nullptr;
   }
 
-  NodePointer name = popNode(Node::Kind::Identifier);
+  NodePointer macroName = popNode(Node::Kind::Identifier);
+  NodePointer privateDiscriminator = nullptr;
+  if (isFreestanding)
+    privateDiscriminator = popNode(Node::Kind::PrivateDeclName);
+  NodePointer attachedName = nullptr;
+  if (isAttached)
+    attachedName = popNode(isDeclName);
+
   NodePointer context = popNode(isMacroExpansionNodeKind);
   if (!context)
     context = popContext();
   NodePointer discriminator = demangleIndexAsNode();
-  return createWithChildren(kind, context, name, discriminator);
+  NodePointer result;
+  if (isAttached) {
+    result = createWithChildren(
+        kind, context, attachedName, macroName, discriminator);
+  } else {
+    result = createWithChildren(kind, context, macroName, discriminator);
+  }
+  if (privateDiscriminator)
+    result->addChild(privateDiscriminator, *this);
+  return result;
 }

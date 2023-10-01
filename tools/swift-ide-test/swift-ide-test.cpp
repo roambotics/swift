@@ -23,6 +23,7 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/ImportCache.h"
 #include "swift/AST/NameLookupRequests.h"
+#include "swift/AST/PluginRegistry.h"
 #include "swift/AST/PrintOptions.h"
 #include "swift/AST/RawComment.h"
 #include "swift/AST/USRGeneration.h"
@@ -331,6 +332,22 @@ ImportObjCHeader("import-objc-header",
                  llvm::cl::desc("header to implicitly import"),
                  llvm::cl::cat(Category));
 
+static llvm::cl::list<std::string>
+PluginPath("plugin-path",
+               llvm::cl::desc("plugin-path"),
+               llvm::cl::cat(Category));
+
+static llvm::cl::list<std::string>
+LoadPluginLibrary("load-plugin-library",
+               llvm::cl::desc("load plugin library"),
+               llvm::cl::cat(Category));
+
+static llvm::cl::list<std::string>
+LoadPluginExecutable("load-plugin-executable",
+               llvm::cl::desc("load plugin executable"),
+               llvm::cl::cat(Category));
+
+
 static llvm::cl::opt<bool>
 EnableSourceImport("enable-source-import", llvm::cl::Hidden,
                    llvm::cl::cat(Category), llvm::cl::init(false));
@@ -380,6 +397,11 @@ DisableAccessControl("disable-access-control",
     llvm::cl::desc("Disables access control, like a debugger"),
     llvm::cl::cat(Category));
 
+static llvm::cl::opt<bool>
+EnableDeserializationSafety("enable-deserialization-safety",
+    llvm::cl::desc("Avoid reading potentially unsafe decls from swiftmodules"),
+    llvm::cl::cat(Category));
+
 static llvm::cl::opt<bool> CodeCompleteInitsInPostfixExpr(
     "code-complete-inits-in-postfix-expr",
     llvm::cl::desc(
@@ -416,7 +438,7 @@ PrintStats("print-stats",
            llvm::cl::cat(Category),
            llvm::cl::init(false));
 
-static llvm::cl::opt<std::string>
+static llvm::cl::list<std::string>
 DebugForbidTypecheckPrefix("debug-forbid-typecheck-prefix",
   llvm::cl::desc("Triggers llvm fatal_error if typechecker tries to typecheck "
                  "a decl with the provided prefix name"),
@@ -833,11 +855,6 @@ EnableExperimentalDistributed("enable-experimental-distributed",
                               llvm::cl::desc("Enable experimental distributed actors and functions"),
                               llvm::cl::init(false));
 
-static llvm::cl::opt<bool> EnableExperimentalStringProcessing(
-    "enable-experimental-string-processing",
-    llvm::cl::desc("Enable experimental string processing"),
-    llvm::cl::init(false));
-
 static llvm::cl::opt<bool> EnableBareSlashRegexLiterals(
     "enable-bare-slash-regex",
     llvm::cl::desc("Enable the ability to write '/.../' regex literals"),
@@ -876,8 +893,8 @@ struct CompletionTestToken {
   SmallVector<StringRef, 1> CheckPrefixes;
   StringRef Skip;
   StringRef Xfail;
-  Optional<bool> IncludeKeywords = None;
-  Optional<bool> IncludeComments = None;
+  llvm::Optional<bool> IncludeKeywords = llvm::None;
+  llvm::Optional<bool> IncludeComments = llvm::None;
 
   CompletionTestToken(unsigned Line, unsigned Column, unsigned Offset)
       : Line(Line), Column(Column), Offset(Offset){};
@@ -1166,10 +1183,10 @@ static int printTypeContextInfo(
             VD->getName().print(llvm::outs());
             llvm::outs() << "\n";
 
-            StringRef BriefDoc = VD->getBriefComment();
+            StringRef BriefDoc = VD->getSemanticBriefComment();
             if (!BriefDoc.empty()) {
               llvm::outs() << "     DocBrief: \"";
-              llvm::outs() << VD->getBriefComment();
+              llvm::outs() << VD->getSemanticBriefComment();
               llvm::outs() << "\"\n";
             }
           }
@@ -1188,7 +1205,8 @@ static int doTypeContextInfo(const CompilerInvocation &InitInvok,
       InitInvok, SourceFilename, SecondSourceFileName, CodeCompletionToken,
       CodeCompletionDiagnostics,
       [&](CompletionLikeOperationParams Params) -> bool {
-        IDEInspectionInstance IDEInspectionInst;
+        IDEInspectionInstance IDEInspectionInst(
+            std::make_shared<PluginRegistry>());
         int ExitCode = 2;
         IDEInspectionInst.typeContextInfo(
             Params.Invocation, Params.Args, Params.FileSystem,
@@ -1233,10 +1251,10 @@ static int printConformingMethodList(
           resultTy.print(llvm::outs());
           llvm::outs() << "\n";
 
-          StringRef BriefDoc = VD->getBriefComment();
+          StringRef BriefDoc = VD->getSemanticBriefComment();
           if (!BriefDoc.empty()) {
             llvm::outs() << "     DocBrief: \"";
-            llvm::outs() << VD->getBriefComment();
+            llvm::outs() << VD->getSemanticBriefComment();
             llvm::outs() << "\"\n";
           }
         }
@@ -1260,7 +1278,8 @@ doConformingMethodList(const CompilerInvocation &InitInvok,
       InitInvok, SourceFilename, SecondSourceFileName, CodeCompletionToken,
       CodeCompletionDiagnostics,
       [&](CompletionLikeOperationParams Params) -> bool {
-        IDEInspectionInstance IDEInspectionInst;
+        IDEInspectionInstance IDEInspectionInst(
+            std::make_shared<PluginRegistry>());
         int ExitCode = 2;
         IDEInspectionInst.conformingMethodList(
             Params.Invocation, Params.Args, Params.FileSystem,
@@ -1410,7 +1429,7 @@ doCodeCompletion(const CompilerInvocation &InitInvok, StringRef SourceFilename,
       InitInvok, SourceFilename, SecondSourceFileName, CodeCompletionToken,
       CodeCompletionDiagnostics,
       [&](CompletionLikeOperationParams Params) -> bool {
-        IDEInspectionInstance Inst;
+        IDEInspectionInstance Inst(std::make_shared<PluginRegistry>());
         int ExitCode = 2;
         Inst.codeComplete(
             Params.Invocation, Params.Args, Params.FileSystem,
@@ -1470,7 +1489,7 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
     // If `-code-completion-token` is specified, test only that token.
     // TODO: Multiple tokens.
     StringRef TargetTokName = options::CodeCompletionToken;
-    Optional<CompletionTestToken> FoundTok;
+    llvm::Optional<CompletionTestToken> FoundTok;
     for (auto Tok : CCTokens) {
       if (Tok.Name == TargetTokName) {
         FoundTok = Tok;
@@ -1504,7 +1523,7 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
   CompilerInvocation Invocation(InitInvok);
   auto FileSystem = llvm::vfs::getRealFileSystem();
 
-  IDEInspectionInstance IDEInspectionInst;
+  IDEInspectionInstance IDEInspectionInst(std::make_shared<PluginRegistry>());
 
   std::unique_ptr<ide::OnDiskCodeCompletionCache> OnDiskCache;
   if (!options::CompletionCachePath.empty())
@@ -1654,7 +1673,7 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
 
       int result =
           llvm::sys::ExecuteAndWait(options::FileCheckPath, FileCheckArgs,
-                                    /*Env=*/None,
+                                    /*Env=*/llvm::None,
                                     /*Redirects=*/{},
                                     /*SecondsToWait=*/0,
                                     /*MemoryLimit=*/0,
@@ -1749,7 +1768,8 @@ static int doREPLCodeCompletion(const CompilerInvocation &InitInvok,
   importInfo.StdlibKind = ImplicitStdlibKind::Stdlib;
   auto *M = ModuleDecl::create(ctx.getIdentifier(Invocation.getModuleName()),
                                ctx, importInfo);
-  auto *SF = new (ctx) SourceFile(*M, SourceFileKind::Main, /*BufferID*/ None);
+  auto *SF =
+      new (ctx) SourceFile(*M, SourceFileKind::Main, /*BufferID*/ llvm::None);
   M->addFile(*SF);
   performImportResolution(*SF);
 
@@ -1988,7 +2008,6 @@ static int doSyntaxColoring(const CompilerInvocation &InitInvok,
         Invocation.getTypeCheckerOptions(), Invocation.getSILOptions(),
         Invocation.getModuleName());
 
-    registerParseRequestFunctions(Parser.getParser().Context.evaluator);
     registerTypeCheckerRequestFunctions(Parser.getParser().Context.evaluator);
     registerClangImporterRequestFunctions(Parser.getParser().Context.evaluator);
 
@@ -2217,7 +2236,6 @@ static int doStructureAnnotation(const CompilerInvocation &InitInvok,
                     Invocation.getTypeCheckerOptions(),
                     Invocation.getSILOptions(), Invocation.getModuleName());
 
-  registerParseRequestFunctions(Parser.getParser().Context.evaluator);
   registerTypeCheckerRequestFunctions(
       Parser.getParser().Context.evaluator);
   registerClangImporterRequestFunctions(Parser.getParser().Context.evaluator);
@@ -2776,7 +2794,8 @@ class AnnotatingPrinter : public StreamPrinter {
 public:
   using StreamPrinter::StreamPrinter;
 
-  void printDeclPre(const Decl *D, Optional<BracketOptions> Bracket) override {
+  void printDeclPre(const Decl *D,
+                    llvm::Optional<BracketOptions> Bracket) override {
     StringRef HasDefault = "";
     if (isa<ProtocolDecl>(D)) {
       InProtocol = true;
@@ -2801,7 +2820,8 @@ public:
   void printDeclNameOrSignatureEndLoc(const Decl *D) override {
     OS << "</loc>";
   }
-  void printDeclPost(const Decl *D, Optional<BracketOptions> Bracket) override {
+  void printDeclPost(const Decl *D,
+                     llvm::Optional<BracketOptions> Bracket) override {
     if (isa<ProtocolDecl>(D)) {
       InProtocol = false;
     }
@@ -2809,25 +2829,24 @@ public:
   }
   void printStructurePre(PrintStructureKind Kind, const Decl *D) override {
     if (D)
-      printDeclPre(D, None);
+      printDeclPre(D, llvm::None);
   }
   void printStructurePost(PrintStructureKind Kind, const Decl *D) override {
     if (D)
-      printDeclPost(D, None);
+      printDeclPost(D, llvm::None);
   }
 
-  void printSynthesizedExtensionPre(const ExtensionDecl *ED,
-                                    TypeOrExtensionDecl Target,
-                                    Optional<BracketOptions> Bracket) override {
+  void printSynthesizedExtensionPre(
+      const ExtensionDecl *ED, TypeOrExtensionDecl Target,
+      llvm::Optional<BracketOptions> Bracket) override {
     if (Bracket.has_value() && !Bracket.value().shouldOpenExtension(ED))
       return;
     OS << "<synthesized>";
   }
 
-  void
-  printSynthesizedExtensionPost(const ExtensionDecl *ED,
-                                TypeOrExtensionDecl Target,
-                                Optional<BracketOptions> Bracket) override {
+  void printSynthesizedExtensionPost(
+      const ExtensionDecl *ED, TypeOrExtensionDecl Target,
+      llvm::Optional<BracketOptions> Bracket) override {
     if (Bracket.has_value() && !Bracket.value().shouldCloseExtension(ED))
       return;
     OS << "</synthesized>";
@@ -3409,6 +3428,9 @@ public:
       case AccessorKind::Modify:
         OS << "<modify accessor for ";
         break;
+      case AccessorKind::Init:
+        OS << "init accessor for ";
+        break;
       }
       printDeclName(storage);
       OS << ">";
@@ -3509,7 +3531,7 @@ public:
       OS << " ";
       printRawComment(D->getRawComment());
       OS << " ";
-      printBriefComment(D->getBriefComment());
+      printBriefComment(D->getSemanticBriefComment());
       OS << " ";
       printDocComment(D);
       OS << "\n";
@@ -3524,7 +3546,7 @@ public:
       OS << " ";
       printRawComment(D->getRawComment());
       OS << " ";
-      printBriefComment(D->getBriefComment());
+      printBriefComment(D->getSemanticBriefComment());
       OS << " ";
       printDocComment(D);
       OS << "\n";
@@ -4155,7 +4177,9 @@ static int doPrintUSRs(const CompilerInvocation &InitInvok,
   return 0;
 }
 
-static int doTestCreateCompilerInvocation(ArrayRef<const char *> Args, bool ForceNoOutputs) {
+static int doTestCreateCompilerInvocation(StringRef DriverPath,
+                                          ArrayRef<const char *> Args,
+                                          bool ForceNoOutputs) {
   PrintingDiagnosticConsumer PDC;
   SourceManager SM;
   DiagnosticEngine Diags(SM);
@@ -4163,14 +4187,16 @@ static int doTestCreateCompilerInvocation(ArrayRef<const char *> Args, bool Forc
 
   CompilerInvocation CI;
   bool HadError = driver::getSingleFrontendInvocationFromDriverArguments(
-      Args, Diags, [&](ArrayRef<const char *> FrontendArgs) {
-    llvm::outs() << "Frontend Arguments BEGIN\n";
-    for (const char *arg : FrontendArgs) {
-      llvm::outs() << arg << "\n";
-    }
-    llvm::outs() << "Frontend Arguments END\n";
-    return CI.parseArgs(FrontendArgs, Diags);
-  }, ForceNoOutputs);
+      DriverPath, Args, Diags,
+      [&](ArrayRef<const char *> FrontendArgs) {
+        llvm::outs() << "Frontend Arguments BEGIN\n";
+        for (const char *arg : FrontendArgs) {
+          llvm::outs() << arg << "\n";
+        }
+        llvm::outs() << "Frontend Arguments END\n";
+        return CI.parseArgs(FrontendArgs, Diags);
+      },
+      ForceNoOutputs);
 
   if (HadError) {
     llvm::errs() << "error: unable to create a CompilerInvocation\n";
@@ -4199,10 +4225,27 @@ static int doTestCompilerInvocationFromModule(StringRef ModuleFilePath) {
 // without being given the address of a function in the main executable).
 void anchorForGetMainExecutable() {}
 
+// Derive 'swiftc' path from 'swift-ide-test' path.
+std::string getDriverPath(StringRef MainExecutablePath) {
+  SmallString<256> driverPath(MainExecutablePath);
+  llvm::sys::path::remove_filename(driverPath); // remove 'swift-ide-test'.
+  llvm::sys::path::remove_filename(driverPath); // remove 'bin'.
+  if (llvm::sys::path::filename(driverPath) == "local") {
+    llvm::sys::path::remove_filename(driverPath); // remove 'local'.
+  }
+  llvm::sys::path::append(driverPath, "bin", "swiftc");
+  return std::string(driverPath);
+}
+
 int main(int argc, char *argv[]) {
   PROGRAM_START(argc, argv);
   INITIALIZE_LLVM();
   initializeSwiftModules();
+
+  std::string mainExecutablePath = llvm::sys::fs::getMainExecutable(
+      argv[0], reinterpret_cast<void *>(&anchorForGetMainExecutable));
+
+  std::string driverPath = getDriverPath(mainExecutablePath);
 
   if (argc > 1) {
     // Handle integrated test tools which do not use
@@ -4215,7 +4258,7 @@ int main(int argc, char *argv[]) {
         ForceNoOutputs = true;
         Args = Args.drop_front();
       }
-      return doTestCreateCompilerInvocation(Args, ForceNoOutputs);
+      return doTestCreateCompilerInvocation(driverPath, Args, ForceNoOutputs);
     }
   }
 
@@ -4244,10 +4287,8 @@ int main(int argc, char *argv[]) {
   }
 
   if (options::Action == ActionType::GenerateModuleAPIDescription) {
-    return doGenerateModuleAPIDescription(
-        llvm::sys::fs::getMainExecutable(
-            argv[0], reinterpret_cast<void *>(&anchorForGetMainExecutable)),
-        options::InputFilenames);
+    return doGenerateModuleAPIDescription(driverPath, mainExecutablePath,
+                                          options::InputFilenames);
   }
 
   if (options::Action == ActionType::DumpCompletionCache) {
@@ -4272,8 +4313,7 @@ int main(int argc, char *argv[]) {
         auto contextualResult = new CodeCompletionResult(
             *contextFreeResult, SemanticContextKind::OtherModule,
             CodeCompletionFlair(),
-            /*numBytesToErase=*/0, /*TypeContext=*/nullptr, /*DC=*/nullptr,
-            /*USRTypeContext=*/nullptr, /*CanCurrDeclContextHandleAsync=*/false,
+            /*numBytesToErase=*/0, CodeCompletionResultTypeRelation::Unrelated,
             ContextualNotRecommendedReason::None);
         contextualResults.push_back(contextualResult);
       }
@@ -4314,9 +4354,7 @@ int main(int argc, char *argv[]) {
   for (auto &File : options::InputFilenames)
     InitInvok.getFrontendOptions().InputsAndOutputs.addInputFile(File);
 
-  InitInvok.setMainExecutablePath(
-      llvm::sys::fs::getMainExecutable(argv[0],
-          reinterpret_cast<void *>(&anchorForGetMainExecutable)));
+  InitInvok.setMainExecutablePath(mainExecutablePath);
   InitInvok.setModuleName(options::ModuleName);
 
   InitInvok.setSDKPath(options::SDK);
@@ -4371,9 +4409,6 @@ int main(int argc, char *argv[]) {
 
   if (options::EnableExperimentalNamedOpaqueTypes) {
     InitInvok.getLangOptions().Features.insert(Feature::NamedOpaqueTypes);
-  }
-  if (options::EnableExperimentalStringProcessing) {
-    InitInvok.getLangOptions().EnableExperimentalStringProcessing = true;
   }
   if (options::EnableBareSlashRegexLiterals) {
     InitInvok.getLangOptions().Features.insert(Feature::BareSlashRegexLiterals);
@@ -4436,6 +4471,8 @@ int main(int argc, char *argv[]) {
     options::ImportObjCHeader;
   InitInvok.getLangOptions().EnableAccessControl =
     !options::DisableAccessControl;
+  InitInvok.getLangOptions().EnableDeserializationSafety =
+    options::EnableDeserializationSafety;
   InitInvok.getLangOptions().EnableSwift3ObjCInference =
     options::EnableSwift3ObjCInference;
   InitInvok.getClangImporterOptions().ImportForwardDeclarations |=
@@ -4448,8 +4485,10 @@ int main(int argc, char *argv[]) {
   }
   InitInvok.getLangOptions().EnableObjCAttrRequiresFoundation =
     !options::DisableObjCAttrRequiresFoundationModule;
-  InitInvok.getTypeCheckerOptions().DebugForbidTypecheckPrefix =
-    options::DebugForbidTypecheckPrefix;
+  for (auto prefix : options::DebugForbidTypecheckPrefix) {
+    InitInvok.getTypeCheckerOptions().DebugForbidTypecheckPrefixes.push_back(
+        prefix);
+  }
   InitInvok.getTypeCheckerOptions().DebugConstraintSolver =
       options::DebugConstraintSolver;
 
@@ -4476,6 +4515,33 @@ int main(int argc, char *argv[]) {
       llvm::errs() << "invalid module alias arguments\n";
       return 1;
     }
+  }
+
+  if (!options::LoadPluginLibrary.empty()) {
+    std::vector<std::string> paths;
+    for (auto path: options::LoadPluginLibrary) {
+      InitInvok.getSearchPathOptions().PluginSearchOpts.emplace_back(
+          PluginSearchOption::LoadPluginLibrary{path});
+    }
+  }
+  if (!options::LoadPluginExecutable.empty()) {
+    std::vector<PluginExecutablePathAndModuleNames> pairs;
+    for (auto arg: options::LoadPluginExecutable) {
+      StringRef path;
+      StringRef modulesStr;
+      std::tie(path, modulesStr) = StringRef(arg).rsplit('#');
+      std::vector<std::string> moduleNames;
+      for (auto name : llvm::split(modulesStr, ',')) {
+        moduleNames.emplace_back(name);
+      }
+      InitInvok.getSearchPathOptions().PluginSearchOpts.emplace_back(
+          PluginSearchOption::LoadPluginExecutable{std::string(path),
+                                                   std::move(moduleNames)});
+    }
+  }
+  for (auto path : options::PluginPath) {
+    InitInvok.getSearchPathOptions().PluginSearchOpts.emplace_back(
+        PluginSearchOption::PluginPath{path});
   }
 
   // Process the clang arguments last and allow them to override previously

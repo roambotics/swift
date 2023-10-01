@@ -42,8 +42,6 @@ class SwiftLookupTable;
 class ValueDecl;
 class VisibleDeclConsumer;
 
-void dumpSwiftLookupTable(SwiftLookupTable *table);
-
 /// Represents the different namespaces for types in C.
 ///
 /// A simplified version of clang::Sema::LookupKind.
@@ -126,7 +124,21 @@ protected:
   using ModuleLoader::ModuleLoader;
 
 public:
-  virtual clang::TargetInfo &getTargetInfo() const = 0;
+  /// This module loader's Clang instance may be configured with a different
+  /// (higher) OS version than the compilation target itself in order to be able
+  /// to load pre-compiled Clang modules that are aligned with the broader SDK,
+  /// and match the SDK deployment target against which Swift modules are also
+  /// built.
+  ///
+  /// In this case, we must use the Swift compiler's OS version triple when
+  /// performing codegen, and the importer's Clang instance OS version triple
+  /// during module loading. `getModuleAvailabilityTarget` is for module-loading
+  /// clients only, and uses the latter.
+  ///
+  /// (The implementing `ClangImporter` class maintains separate Target info
+  /// for use by IRGen/CodeGen clients)
+  virtual clang::TargetInfo &getModuleAvailabilityTarget() const = 0;
+
   virtual clang::ASTContext &getClangASTContext() const = 0;
   virtual clang::Preprocessor &getClangPreprocessor() const = 0;
   virtual clang::Sema &getClangSema() const = 0;
@@ -271,8 +283,9 @@ public:
 
   virtual bool isUnsafeCXXMethod(const FuncDecl *func) = 0;
 
-  virtual Type importFunctionReturnType(const clang::FunctionDecl *clangDecl,
-                                        DeclContext *dc) = 0;
+  virtual llvm::Optional<Type>
+  importFunctionReturnType(const clang::FunctionDecl *clangDecl,
+                           DeclContext *dc) = 0;
 
   virtual Type importVarDeclType(const clang::VarDecl *clangDecl,
                                  VarDecl *swiftDecl,

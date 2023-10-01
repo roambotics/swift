@@ -7,5 +7,5 @@ import MemberOutOfLine
 
 public func add(_ lhs: inout LoadableIntWrapper, _ rhs: LoadableIntWrapper) -> LoadableIntWrapper { lhs + rhs }
 
-// CHECK: call {{i32|i64}} [[NAME:@_ZNK18LoadableIntWrapperplES_]](%struct.LoadableIntWrapper* %{{[0-9]+}}, {{i32|\[1 x i32\]|i64|%struct.LoadableIntWrapper\* byval\(.*\)}}{{.*}})
-// CHECK: declare {{.*}}{{i32|i64}} [[NAME]](%struct.LoadableIntWrapper* {{.*}}, {{i32|\[1 x i32\]|i64|%struct.LoadableIntWrapper\* .*byval\(%struct.LoadableIntWrapper\)}}{{.*}})
+// CHECK: call {{i32|i64}} [[NAME:@_ZNK18LoadableIntWrapperplES_]](ptr %{{[0-9]+}}, {{i32|\[1 x i32\]|i64|%struct.LoadableIntWrapper\* byval\(.*\)}}{{.*}})
+// CHECK: declare {{.*}}{{i32|i64}} [[NAME]](ptr {{.*}}, {{i32|\[1 x i32\]|i64|%struct.LoadableIntWrapper\* .*byval\(%struct.LoadableIntWrapper\)}}{{.*}})

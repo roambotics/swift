@@ -14,14 +14,15 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Parse/Parser.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Attr.h"
 #include "swift/AST/GenericParamList.h"
 #include "swift/AST/SourceFile.h" // only for isMacroSignatureFile
 #include "swift/AST/TypeRepr.h"
-#include "swift/Parse/Lexer.h"
+#include "swift/Basic/Nullability.h"
 #include "swift/Parse/IDEInspectionCallbacks.h"
+#include "swift/Parse/Lexer.h"
+#include "swift/Parse/Parser.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Twine.h"
@@ -146,6 +147,7 @@ LayoutConstraint Parser::parseLayoutConstraint(Identifier LayoutConstraintID) {
 ///     type-simple '.Protocol'
 ///     type-simple '?'
 ///     type-simple '!'
+///     '~' type-simple
 ///     type-collection
 ///     type-array
 ///     '_'
@@ -164,6 +166,15 @@ ParserResult<TypeRepr> Parser::parseTypeSimple(
     // for construct like 'P1 & inout P2'.
     diagnose(Tok.getLoc(), diag::attr_only_on_parameters, Tok.getRawText());
     consumeToken();
+  }
+
+  // Eat any '~' preceding the type.
+  SourceLoc tildeLoc;
+  if (Tok.isTilde() && !isInSILMode()) {
+    tildeLoc = consumeToken();
+    if (!EnabledNoncopyableGenerics)
+      diagnose(tildeLoc, diag::cannot_suppress_here)
+          .fixItRemoveChars(tildeLoc, tildeLoc);
   }
 
   switch (Tok.getKind()) {
@@ -298,6 +309,12 @@ ParserResult<TypeRepr> Parser::parseTypeSimple(
     break;
   }
 
+  // Wrap in an InverseTypeRepr if needed.
+  if (EnabledNoncopyableGenerics && tildeLoc) {
+    ty = makeParserResult(ty,
+                          new(Context) InverseTypeRepr(tildeLoc, ty.get()));
+  }
+
   return ty;
 }
 
@@ -428,10 +445,12 @@ ParserResult<TypeRepr> Parser::parseTypeScalar(
   // useful diagnostic when parsing a function decl.
   SourceLoc asyncLoc;
   SourceLoc throwsLoc;
+  TypeRepr *thrownTy = nullptr;
   if (isAtFunctionTypeArrow()) {
     status |= parseEffectsSpecifiers(SourceLoc(),
                                      asyncLoc, /*reasync=*/nullptr,
-                                     throwsLoc, /*rethrows=*/nullptr);
+                                     throwsLoc, /*rethrows=*/nullptr,
+                                     thrownTy);
   }
 
   // Handle type-function if we have an arrow.
@@ -441,7 +460,8 @@ ParserResult<TypeRepr> Parser::parseTypeScalar(
     // Handle async/throws in the wrong place.
     parseEffectsSpecifiers(arrowLoc,
                            asyncLoc, /*reasync=*/nullptr,
-                           throwsLoc, /*rethrows=*/nullptr);
+                           throwsLoc, /*rethrows=*/nullptr,
+                           thrownTy);
 
     ParserResult<TypeRepr> SecondHalf =
         parseTypeScalar(diag::expected_type_function_result,
@@ -482,8 +502,9 @@ ParserResult<TypeRepr> Parser::parseTypeScalar(
     MutableArrayRef<TypeRepr *> patternSubsTypes;
     if (isInSILMode()) {
       auto parseSubstitutions =
-          [&](MutableArrayRef<TypeRepr*> &subs) -> Optional<bool> {
-        if (!consumeIf(tok::kw_for)) return None;
+          [&](MutableArrayRef<TypeRepr *> &subs) -> llvm::Optional<bool> {
+        if (!consumeIf(tok::kw_for))
+          return llvm::None;
 
         if (!startsWithLess(Tok)) {
           diagnose(Tok, diag::sil_function_subst_expected_l_angle);
@@ -535,7 +556,7 @@ ParserResult<TypeRepr> Parser::parseTypeScalar(
     }
 
     tyR = new (Context) FunctionTypeRepr(generics, argsTyR, asyncLoc, throwsLoc,
-                                         arrowLoc, SecondHalf.get(),
+                                         thrownTy, arrowLoc, SecondHalf.get(),
                                          patternGenerics, patternSubsTypes,
                                          invocationSubsTypes);
   } else if (auto firstGenerics = generics ? generics : patternGenerics) {
@@ -572,6 +593,14 @@ ParserResult<TypeRepr> Parser::parseTypeScalar(
                            constLoc));
 }
 
+/// Build a TypeRepr for AST node for the type at the given source location in the specified file.
+///
+/// \param sourceLoc The source location at which to start processing a type.
+/// \param endSourceLoc Will receive the source location immediately following the type.
+extern "C" TypeRepr *swift_ASTGen_buildTypeRepr(
+    void *diagEngine, void *sourceFile, const void *_Nullable sourceLoc,
+    void *declContext, void *astContext, const void *_Nullable *endSourceLoc);
+
 /// parseType
 ///   type:
 ///     type-scalar
@@ -582,6 +611,32 @@ ParserResult<TypeRepr> Parser::parseTypeScalar(
 ///
 ParserResult<TypeRepr> Parser::parseType(
     Diag<> MessageID, ParseTypeReason reason) {
+  #if SWIFT_BUILD_SWIFT_SYNTAX
+  auto astGenResult = parseASTFromSyntaxTree<TypeRepr>(
+      [&](void *exportedSourceFile, const void *sourceLoc) {
+        const void *endLocPtr = nullptr;
+        TypeRepr *typeRepr = swift_ASTGen_buildTypeRepr(
+            &Diags, exportedSourceFile, Tok.getLoc().getOpaquePointerValue(),
+            CurDeclContext, &Context, &endLocPtr);
+        return std::make_pair(typeRepr, endLocPtr);
+      });
+  if (astGenResult.isNonNull()) {
+    // Note: there is a representational difference between the swift-syntax
+    // tree and the C++ parser tree regarding variadic parameters. In the
+    // swift-syntax tree, the ellipsis is part of the parameter declaration.
+    // In the C++ parser tree, the ellipsis is part of the type. Account for
+    // this difference by consuming the ellipsis here.
+    if (Tok.isEllipsis()) {
+      Tok.setKind(tok::ellipsis);
+      SourceLoc ellipsisLoc = consumeToken();
+      return makeParserResult(astGenResult,
+          new (Context) VarargTypeRepr(astGenResult.get(), ellipsisLoc));
+    }
+
+    return astGenResult;
+  }
+  #endif
+
   // Parse pack expansion 'repeat T'
   if (Tok.is(tok::kw_repeat)) {
     SourceLoc repeatLoc = consumeToken(tok::kw_repeat);
@@ -812,7 +867,8 @@ ParserResult<IdentTypeRepr> Parser::parseTypeIdentifier() {
   // component.
   DeclNameLoc Loc;
   DeclNameRef Name =
-      parseDeclNameRef(Loc, diag::expected_identifier_in_dotted_type, {});
+      parseDeclNameRef(Loc, diag::expected_identifier_in_dotted_type,
+                       DeclNameFlag::AllowLowercaseAndUppercaseSelf);
   if (!Name)
     return makeParserError();
 
@@ -1601,8 +1657,14 @@ bool Parser::canParseType() {
   if (isAtFunctionTypeArrow()) {
     // Handle type-function if we have an '->' with optional
     // 'async' and/or 'throws'.
-    while (isEffectsSpecifier(Tok))
+    while (isEffectsSpecifier(Tok)) {
+      bool isThrows = isThrowsEffectSpecifier(Tok);
       consumeToken();
+
+      if (isThrows && Tok.is(tok::l_paren)) {
+        skipSingle();
+      }
+    }
 
     if (!consumeIf(tok::arrow))
       return false;
@@ -1734,6 +1796,12 @@ bool Parser::isAtFunctionTypeArrow() {
   if (isEffectsSpecifier(Tok)) {
     if (peekToken().is(tok::arrow))
       return true;
+    if (isThrowsEffectSpecifier(Tok) && peekToken().is(tok::l_paren)) {
+      BacktrackingScope backtrack(*this);
+      consumeToken();
+      skipSingle();
+      return isAtFunctionTypeArrow();
+    }
     if (isEffectsSpecifier(peekToken())) {
       BacktrackingScope backtrack(*this);
       consumeToken();

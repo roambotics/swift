@@ -40,6 +40,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/PrettyStackTrace.h"
@@ -86,8 +87,9 @@ struct SKEditorConsumerOptions {
 } // anonymous namespace
 
 static Optional<UIdent> getUIDForOperationKind(trace::OperationKind OpKind);
-static void fillDictionaryForDiagnosticInfo(ResponseBuilder::Dictionary Elem,
-                                            const DiagnosticEntryInfo &Info);
+static void fillDiagnosticInfo(ResponseBuilder::Dictionary ParentElem,
+                               ArrayRef<DiagnosticEntryInfo> Diags,
+                               Optional<UIdent> DiagStage);
 
 #define REQUEST(NAME, CONTENT) static LazySKDUID Request##NAME(CONTENT);
 #define KIND(NAME, CONTENT) static LazySKDUID Kind##NAME(CONTENT);
@@ -164,9 +166,8 @@ void sourcekitd::initializeService(
     Dict.set(KeyCompileID, std::to_string(OpId));
     if (auto OperationUID = getUIDForOperationKind(OpKind))
       Dict.set(KeyCompileOperation, OperationUID.value());
-    auto DiagArray = Dict.setArray(KeyDiagnostics);
-    for (const auto &DiagInfo : Diagnostics)
-      fillDictionaryForDiagnosticInfo(DiagArray.appendDictionary(), DiagInfo);
+
+    fillDiagnosticInfo(Dict, Diagnostics, /*DiagStage*/ None);
     postNotification(RespBuilder.createResponse());
   });
 }
@@ -204,13 +205,16 @@ static void reportRangeInfo(const RequestResult<RangeInfo> &Result, ResponseRece
 
 static void reportNameInfo(const RequestResult<NameTranslatingInfo> &Result, ResponseReceiver Rec);
 
-static void findRelatedIdents(StringRef Filename, int64_t Offset,
+static void findRelatedIdents(StringRef PrimaryFilePath,
+                              StringRef InputBufferName, int64_t Offset,
                               bool CancelOnSubsequentRequest,
                               ArrayRef<const char *> Args,
                               SourceKitCancellationToken CancellationToken,
                               ResponseReceiver Rec);
 
-static void findActiveRegions(StringRef Filename, ArrayRef<const char *> Args,
+static void findActiveRegions(StringRef PrimaryFilePath,
+                              StringRef InputBufferName,
+                              ArrayRef<const char *> Args,
                               SourceKitCancellationToken CancellationToken,
                               ResponseReceiver Rec);
 
@@ -401,6 +405,26 @@ void sourcekitd::disposeCancellationToken(
   getGlobalContext().getRequestTracker()->stopTracking(CancellationToken);
 }
 
+bool sourcekitd::requestIsBarrier(sourcekitd_object_t ReqObj) {
+  RequestDict Req(ReqObj);
+  sourcekitd_uid_t ReqUID = Req.getUID(KeyRequest);
+  return ReqUID == RequestEditorOpen || ReqUID == RequestEditorReplaceText ||
+         ReqUID == RequestEditorClose;
+}
+
+bool sourcekitd::requestIsEnableBarriers(sourcekitd_object_t ReqObj) {
+  RequestDict Req(ReqObj);
+  sourcekitd_uid_t ReqUID = Req.getUID(KeyRequest);
+  return ReqUID == RequestEnableRequestBarriers;
+}
+
+void sourcekitd::sendBarriersEnabledResponse(ResponseReceiver Receiver) {
+  ResponseBuilder RespBuilder;
+  auto Elem = RespBuilder.getDictionary();
+  Elem.setBool(KeyBarriersEnabled, true);
+  Receiver(RespBuilder.createResponse());
+}
+
 static std::unique_ptr<llvm::MemoryBuffer> getInputBufForRequest(
     Optional<StringRef> SourceFile, Optional<StringRef> SourceText,
     const Optional<VFSOptions> &vfsOptions, llvm::SmallString<64> &ErrBuf) {
@@ -454,34 +478,44 @@ getInputBufForRequestOrEmitError(const RequestDict &Req,
   return buf;
 }
 
-/// Get 'key.primary_file' value as a string. If it's missing, reply with an
-/// error and return \c None.
+/// Retrieves `key.primary_file` value as a string, or `key.sourcefile` if
+/// missing. If both are missing, reply with an error and return \c None.
 ///
-/// Fallsback to 'key.sourcefile' for compatibility.
+/// The "primary file" is the file to mark as `-primary-file` when building
+/// the corresponding AST for this request. The "input file" is the file to
+/// resolve any offset or line/column in. These were (prior to
+/// \c GeneratedSourceInfo) always the same, but the input file is now able to
+/// be a generated buffer name (where that buffer is created during the AST
+/// build).
 static Optional<StringRef>
-getPrimaryFileForRequestOrEmitError(const RequestDict &Req,
-                                    ResponseReceiver Rec) {
-  Optional<StringRef> PrimaryFile = Req.getString(KeyPrimaryFile);
-  if (!PrimaryFile) {
+getPrimaryFilePathForRequestOrEmitError(const RequestDict &Req,
+                                        ResponseReceiver Rec) {
+  Optional<StringRef> PrimaryFilePath = Req.getString(KeyPrimaryFile);
+  if (!PrimaryFilePath) {
     // Fallback to the old key.sourcefile
-    PrimaryFile = Req.getString(KeySourceFile);
-    if (!PrimaryFile) {
-      Rec(createErrorRequestInvalid("missing 'key.primary_file'"));
+    PrimaryFilePath = Req.getString(KeySourceFile);
+    if (!PrimaryFilePath) {
+      Rec(createErrorRequestInvalid(
+          "missing 'key.primary_file' and 'key.sourcefile'"));
     }
   }
-  return PrimaryFile;
+  return PrimaryFilePath;
 }
 
-/// Get 'key.source_file' value as a string. If it's missing, reply with an
-/// error and return \c None.
-static Optional<StringRef>
-getSourceFileForRequestOrEmitError(const RequestDict &Req,
-                                   ResponseReceiver Rec) {
-  Optional<StringRef> SourceFile = Req.getString(KeySourceFile);
-  if (!SourceFile) {
-    Rec(createErrorRequestInvalid("missing 'key.sourcefile'"));
-  }
-  return SourceFile;
+/// Retrieves `key.sourcefile` only if it is different to `key.primary_file`.
+/// Returns an empty string if it's the same or if it was missing. Callers are
+/// expected to pull the primary file from the AST if the input file is
+/// empty.
+///
+/// See \c getPrimaryFilePathForRequestOrEmitError for an explanation of primary
+/// vs input file.
+static StringRef getInputBufferNameForRequest(const RequestDict &Req,
+                                              ResponseReceiver Rec) {
+  Optional<StringRef> PrimaryFilePath = Req.getString(KeyPrimaryFile);
+  Optional<StringRef> InputBufferName = Req.getString(KeySourceFile);
+  if (!PrimaryFilePath || PrimaryFilePath == InputBufferName)
+    return "";
+  return InputBufferName.value_or("");
 }
 
 /// Get compiler arguments from 'key.compilerargs' in \p Req . If the key is
@@ -1227,11 +1261,8 @@ static void handleRequestCompile(const RequestDict &Req,
           ResponseBuilder builder;
 
           builder.getDictionary().set(KeyValue, info.ResultStatus);
-          auto diagsArray = builder.getDictionary().setArray(KeyDiagnostics);
-          for (auto diagInfo : info.Diagnostics) {
-            auto elem = diagsArray.appendDictionary();
-            fillDictionaryForDiagnosticInfo(elem, diagInfo);
-          }
+          fillDiagnosticInfo(builder.getDictionary(), info.Diagnostics,
+                             /*DiagStage*/ None);
           Rec(builder.createResponse());
         });
     return;
@@ -1378,15 +1409,59 @@ static void handleRequestIndex(const RequestDict &Req,
     return;
 
   handleSemanticRequest(Req, Rec, [Req, Rec]() {
-    auto SourceFile = getPrimaryFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
+    Optional<StringRef> PrimaryFilePath =
+        getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
     SmallVector<const char *, 8> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
-    return Rec(indexSource(*SourceFile, Args));
+    return Rec(indexSource(*PrimaryFilePath, Args));
   });
 }
+
+static void handleRequestIndexToStore(
+    const RequestDict &Req, SourceKitCancellationToken CancellationToken,
+    ResponseReceiver Rec) {
+  if (checkVFSNotSupported(Req, Rec))
+    return;
+
+  handleSemanticRequest(Req, Rec, [Req, Rec, CancellationToken]() {
+    Optional<StringRef> PrimaryFilePath =
+        getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
+      return;
+
+    IndexStoreOptions Opts;
+    if (auto IndexStorePath = Req.getString(KeyIndexStorePath))
+      Opts.IndexStorePath = IndexStorePath->str();
+    else
+      return Rec(createErrorRequestInvalid("'key.index_store_path' is required"));
+
+    if (auto IndexUnitOutputPath = Req.getString(KeyIndexUnitOutputPath))
+      Opts.IndexUnitOutputPath = IndexUnitOutputPath->str();
+    else
+      return Rec(createErrorRequestInvalid("'key.index_unit_output_path' is required"));
+
+    SmallVector<const char *, 0> Args;
+    if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
+      return;
+    LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
+    Lang.indexToStore(*PrimaryFilePath, Args, std::move(Opts),
+      CancellationToken,
+      [Rec](const RequestResult<IndexStoreInfo> &Result) {
+        if (Result.isCancelled())
+          return Rec(createErrorRequestCancelled());
+        if (Result.isError())
+          return Rec(createErrorRequestFailed(Result.getError()));
+
+        ResponseBuilder RespBuilder;
+        return Rec(RespBuilder.createResponse());
+      });
+  });
+}
+
 
 static void
 handleRequestCursorInfo(const RequestDict &Req,
@@ -1396,9 +1471,13 @@ handleRequestCursorInfo(const RequestDict &Req,
     LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
 
     Optional<VFSOptions> vfsOptions = getVFSOptions(Req);
-    auto SourceFile = getPrimaryFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
+    Optional<StringRef> PrimaryFilePath =
+        getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
+    StringRef InputBufferName = getInputBufferNameForRequest(Req, Rec);
+
     SmallVector<const char *, 8> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
@@ -1417,8 +1496,8 @@ handleRequestCursorInfo(const RequestDict &Req,
       int64_t SymbolGraph = false;
       Req.getInt64(KeyRetrieveSymbolGraph, SymbolGraph, /*isOptional=*/true);
       return Lang.getCursorInfo(
-          *SourceFile, Offset, Length, Actionables, SymbolGraph,
-          CancelOnSubsequentRequest, Args, std::move(vfsOptions),
+          *PrimaryFilePath, InputBufferName, Offset, Length, Actionables,
+          SymbolGraph, CancelOnSubsequentRequest, Args, std::move(vfsOptions),
           CancellationToken,
           [Rec](const RequestResult<CursorInfoData> &Result) {
             reportCursorInfo(Result, Rec);
@@ -1426,8 +1505,8 @@ handleRequestCursorInfo(const RequestDict &Req,
     }
     if (auto USR = Req.getString(KeyUSR)) {
       return Lang.getCursorInfoFromUSR(
-          *SourceFile, *USR, CancelOnSubsequentRequest, Args,
-          std::move(vfsOptions), CancellationToken,
+          *PrimaryFilePath, InputBufferName, *USR, CancelOnSubsequentRequest,
+          Args, std::move(vfsOptions), CancellationToken,
           [Rec](const RequestResult<CursorInfoData> &Result) {
             reportCursorInfo(Result, Rec);
           });
@@ -1446,12 +1525,18 @@ static void handleRequestRangeInfo(const RequestDict &Req,
 
   handleSemanticRequest(Req, Rec, [Req, CancellationToken, Rec]() {
     LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
-    auto SourceFile = getPrimaryFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
+
+    Optional<StringRef> PrimaryFilePath =
+        getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
+    StringRef InputBufferName = getInputBufferNameForRequest(Req, Rec);
+
     SmallVector<const char *, 8> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
+
     int64_t Offset;
     int64_t Length;
     // For backwards compatibility, the default is 1.
@@ -1460,11 +1545,12 @@ static void handleRequestRangeInfo(const RequestDict &Req,
                  /*isOptional=*/true);
     if (!Req.getInt64(KeyOffset, Offset, /*isOptional=*/false)) {
       if (!Req.getInt64(KeyLength, Length, /*isOptional=*/false)) {
-        return Lang.getRangeInfo(
-            *SourceFile, Offset, Length, CancelOnSubsequentRequest, Args,
-            CancellationToken, [Rec](const RequestResult<RangeInfo> &Result) {
-              reportRangeInfo(Result, Rec);
-            });
+        return Lang.getRangeInfo(*PrimaryFilePath, InputBufferName, Offset,
+                                 Length, CancelOnSubsequentRequest, Args,
+                                 CancellationToken,
+                                 [Rec](const RequestResult<RangeInfo> &Result) {
+                                   reportRangeInfo(Result, Rec);
+                                 });
       }
     }
 
@@ -1481,9 +1567,13 @@ handleRequestSemanticRefactoring(const RequestDict &Req,
     return;
 
   handleSemanticRequest(Req, Rec, [Req, CancellationToken, Rec]() {
-    auto PrimaryFile = getPrimaryFileForRequestOrEmitError(Req, Rec);
-    if (!PrimaryFile)
+    Optional<StringRef> PrimaryFilePath =
+        getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
+    StringRef InputBufferName = getInputBufferNameForRequest(Req, Rec);
+
     SmallVector<const char *, 8> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
@@ -1505,24 +1595,18 @@ handleRequestSemanticRefactoring(const RequestDict &Req,
     if (Info.Kind == SemanticRefactoringKind::None)
       return Rec(createErrorRequestInvalid("'key.actionuid' isn't recognized"));
 
-    auto SourceFile = getSourceFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
-      return;
-
     if (!Req.getInt64(KeyLine, Line, /*isOptional=*/false)) {
       if (!Req.getInt64(KeyColumn, Column, /*isOptional=*/false)) {
         Req.getInt64(KeyLength, Length, /*isOptional=*/true);
         if (auto N = Req.getString(KeyName))
           Info.PreferredName = *N;
         LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
-        if (*PrimaryFile != *SourceFile) {
-          Info.SourceFile = *SourceFile;
-        }
+        Info.InputBufferName = InputBufferName;
         Info.Line = Line;
         Info.Column = Column;
         Info.Length = Length;
         return Lang.semanticRefactoring(
-            *PrimaryFile, Info, Args, CancellationToken,
+            *PrimaryFilePath, Info, Args, CancellationToken,
             [Rec](const RequestResult<ArrayRef<CategorizedEdits>> &Result) {
               Rec(createCategorizedEditsResponse(Result));
             });
@@ -1541,9 +1625,14 @@ handleRequestCollectExpressionType(const RequestDict &Req,
 
   handleSemanticRequest(Req, Rec, [Req, CancellationToken, Rec]() {
     LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
-    auto SourceFile = getPrimaryFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
+
+    Optional<StringRef> PrimaryFilePath =
+        getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
+    StringRef InputBufferName = getInputBufferNameForRequest(Req, Rec);
+
     SmallVector<const char *, 8> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
@@ -1556,8 +1645,8 @@ handleRequestCollectExpressionType(const RequestDict &Req,
     int64_t CanonicalTy = false;
     Req.getInt64(KeyCanonicalizeType, CanonicalTy, /*isOptional=*/true);
     return Lang.collectExpressionTypes(
-        *SourceFile, Args, ExpectedProtocols, FullyQualified, CanonicalTy,
-        CancellationToken,
+        *PrimaryFilePath, InputBufferName, Args, ExpectedProtocols,
+        FullyQualified, CanonicalTy, CancellationToken,
         [Rec](const RequestResult<ExpressionTypesInFile> &Result) {
           reportExpressionTypeInfo(Result, Rec);
         });
@@ -1573,12 +1662,18 @@ handleRequestCollectVariableType(const RequestDict &Req,
 
   handleSemanticRequest(Req, Rec, [Req, CancellationToken, Rec]() {
     LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
-    auto SourceFile = getPrimaryFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
+
+    Optional<StringRef> PrimaryFilePath =
+        getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
+    StringRef InputBufferName = getInputBufferNameForRequest(Req, Rec);
+
     SmallVector<const char *, 8> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
+
     Optional<unsigned> Offset = Req.getOptionalInt64(KeyOffset).transform(
         [](int64_t v) -> unsigned { return v; });
     Optional<unsigned> Length = Req.getOptionalInt64(KeyLength).transform(
@@ -1586,7 +1681,8 @@ handleRequestCollectVariableType(const RequestDict &Req,
     int64_t FullyQualified = false;
     Req.getInt64(KeyFullyQualified, FullyQualified, /*isOptional=*/true);
     return Lang.collectVariableTypes(
-        *SourceFile, Args, Offset, Length, FullyQualified, CancellationToken,
+        *PrimaryFilePath, InputBufferName, Args, Offset, Length, FullyQualified,
+        CancellationToken,
         [Rec](const RequestResult<VariableTypesInFile> &Result) {
           reportVariableTypeInfo(Result, Rec);
         });
@@ -1601,12 +1697,14 @@ handleRequestFindLocalRenameRanges(const RequestDict &Req,
     return;
 
   handleSemanticRequest(Req, Rec, [Req, CancellationToken, Rec]() {
-    auto SourceFile = getPrimaryFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
+    auto PrimaryFilePath = getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
     SmallVector<const char *, 8> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
+
     int64_t Line = 0, Column = 0, Length = 0;
     if (Req.getInt64(KeyLine, Line, /*isOptional=*/false))
       return Rec(createErrorRequestInvalid("'key.line' is required"));
@@ -1616,7 +1714,7 @@ handleRequestFindLocalRenameRanges(const RequestDict &Req,
 
     LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
     return Lang.findLocalRenameRanges(
-        *SourceFile, Line, Column, Length, Args, CancellationToken,
+        *PrimaryFilePath, Line, Column, Length, Args, CancellationToken,
         [Rec](const RequestResult<ArrayRef<CategorizedRenameRanges>> &Result) {
           Rec(createCategorizedRenameRangesResponse(Result));
         });
@@ -1631,12 +1729,14 @@ handleRequestNameTranslation(const RequestDict &Req,
     return;
 
   handleSemanticRequest(Req, Rec, [Req, CancellationToken, Rec]() {
-    auto SourceFile = getPrimaryFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
+    auto PrimaryFilePath = getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
     SmallVector<const char *, 8> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
+
     LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
     int64_t Offset;
     if (Req.getInt64(KeyOffset, Offset, /*isOptional=*/false)) {
@@ -1677,7 +1777,7 @@ handleRequestNameTranslation(const RequestDict &Req,
     llvm::transform(Selectors, std::back_inserter(Input.ArgNames),
                     [](const char *C) { return StringRef(C); });
     return Lang.getNameInfo(
-        *SourceFile, Offset, Input, Args, CancellationToken,
+        *PrimaryFilePath, "", Offset, Input, Args, CancellationToken,
         [Rec](const RequestResult<NameTranslatingInfo> &Result) {
           reportNameInfo(Result, Rec);
         });
@@ -1692,12 +1792,17 @@ handleRequestRelatedIdents(const RequestDict &Req,
     return;
 
   handleSemanticRequest(Req, Rec, [Req, CancellationToken, Rec]() {
-    auto SourceFile = getPrimaryFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
+    Optional<StringRef> PrimaryFilePath =
+        getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
+    StringRef InputBufferName = getInputBufferNameForRequest(Req, Rec);
+
     SmallVector<const char *, 8> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
+
     int64_t Offset;
     if (Req.getInt64(KeyOffset, Offset, /*isOptional=*/false))
       return Rec(createErrorRequestInvalid("missing 'key.offset'"));
@@ -1707,8 +1812,9 @@ handleRequestRelatedIdents(const RequestDict &Req,
     Req.getInt64(KeyCancelOnSubsequentRequest, CancelOnSubsequentRequest,
                  /*isOptional=*/true);
 
-    return findRelatedIdents(*SourceFile, Offset, CancelOnSubsequentRequest,
-                             Args, CancellationToken, Rec);
+    return findRelatedIdents(*PrimaryFilePath, InputBufferName, Offset,
+                             CancelOnSubsequentRequest, Args, CancellationToken,
+                             Rec);
   });
 }
 
@@ -1720,14 +1826,19 @@ handleRequestActiveRegions(const RequestDict &Req,
     return;
 
   handleSemanticRequest(Req, Rec, [Req, CancellationToken, Rec]() {
-    auto SourceFile = getSourceFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
+    Optional<StringRef> PrimaryFilePath =
+        getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
+    StringRef InputBufferName = getInputBufferNameForRequest(Req, Rec);
+
     SmallVector<const char *> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
 
-    return findActiveRegions(*SourceFile, Args, CancellationToken, Rec);
+    return findActiveRegions(*PrimaryFilePath, InputBufferName, Args,
+                             CancellationToken, Rec);
   });
 }
 
@@ -1737,20 +1848,152 @@ handleRequestDiagnostics(const RequestDict &Req,
                          ResponseReceiver Rec) {
   handleSemanticRequest(Req, Rec, [Req, CancellationToken, Rec]() {
     Optional<VFSOptions> vfsOptions = getVFSOptions(Req);
-    auto SourceFile = getPrimaryFileForRequestOrEmitError(Req, Rec);
-    if (!SourceFile)
+    auto PrimaryFilePath = getPrimaryFilePathForRequestOrEmitError(Req, Rec);
+    if (!PrimaryFilePath)
       return;
+
     SmallVector<const char *, 8> Args;
     if (getCompilerArgumentsForRequestOrEmitError(Req, Args, Rec))
       return;
+
     LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
-    Lang.getDiagnostics(*SourceFile, Args, std::move(vfsOptions),
+    Lang.getDiagnostics(*PrimaryFilePath, Args, std::move(vfsOptions),
                         CancellationToken,
                         [Rec](const RequestResult<DiagnosticsResult> &Result) {
                           reportDiagnostics(Result, Rec);
                         });
     return;
   });
+}
+
+/// Expand macros in the specified source file syntactically.
+///
+/// Request would look like:
+///   {
+///     key.compilerargs: []
+///     key.sourcefile: <file name>
+///     key.sourcetext: <source text> (optional)
+///     key.expansions: [<expansion specifier>...]
+///   }
+/// 'compilerargs' is used for plugin search paths.
+/// 'expansion specifier' is
+///   {
+///     key.offset: <offset>
+///     key.modulename: <plugin module name>
+///     key.typename: <macro typename>
+///     key.macro_roles: [<macro role UID>...]
+///   }
+///
+/// Sends the results as a 'CategorizedEdits'. 
+/// Note that, unlike refactoring, each edit doesn't have 'key.buffer_name'.
+/// FIXME: Support nested expansion.
+static void handleRequestSyntacticMacroExpansion(
+    const RequestDict &req, SourceKitCancellationToken cancellationToken,
+    ResponseReceiver rec) {
+
+  Optional<VFSOptions> vfsOptions = getVFSOptions(req);
+  std::unique_ptr<llvm::MemoryBuffer> inputBuf =
+      getInputBufForRequestOrEmitError(req, vfsOptions, rec);
+  if (!inputBuf)
+    return;
+
+  SmallVector<const char *, 16> args;
+  if (getCompilerArgumentsForRequestOrEmitError(req, args, rec))
+    return;
+
+  // key.expansions: [
+  //   { key.offset: 42,
+  //     key.macro_roles: [source.lang.swift.macrorole.conformance,
+  //                      source.lang.swift.macrorole.member],
+  //     key.modulename: "MyMacroImpl",
+  //     key.typename: "StringifyMacro"},
+  //   { key.offset: 132,
+  //     key.sourceText: "foo(bar, baz)",
+  //     key.macro_roles: [source.lang.swift.macrorole.conformance,
+  //                      source.lang.swift.macrorole.member],
+  //     key.expandedmacro_replacements: [
+  //       {key.offset: 4, key.length: 3, key.argindex: 0},
+  //       {key.offset: 9, key.length: 3, key.argindex: 1}]}
+  // ]
+  std::vector<MacroExpansionInfo> expansions;
+  bool failed = req.dictionaryArrayApply(KeyExpansions, [&](RequestDict dict) {
+    // offset.
+    int64_t offset;
+    dict.getInt64(KeyOffset, offset, false);
+
+    // macro roles.
+    SmallVector<sourcekitd_uid_t, 1> macroRoleUIDs;
+    if (dict.getUIDArray(KeyMacroRoles, macroRoleUIDs, false)) {
+      rec(createErrorRequestInvalid(
+          "missing 'key.macro_roles' for expansion specifier"));
+      return true;
+    }
+    MacroRoles macroRoles;
+    for (auto uid : macroRoleUIDs) {
+      if (uid == KindMacroRoleExpression)
+        macroRoles |= MacroRole::Expression;
+      if (uid == KindMacroRoleDeclaration)
+        macroRoles |= MacroRole::Declaration;
+      if (uid == KindMacroRoleCodeItem)
+        macroRoles |= MacroRole::CodeItem;
+      if (uid == KindMacroRoleAccessor)
+        macroRoles |= MacroRole::Accessor;
+      if (uid == KindMacroRoleMemberAttribute)
+        macroRoles |= MacroRole::MemberAttribute;
+      if (uid == KindMacroRoleMember)
+        macroRoles |= MacroRole::Member;
+      if (uid == KindMacroRolePeer)
+        macroRoles |= MacroRole::Peer;
+      if (uid == KindMacroRoleConformance)
+        macroRoles |= MacroRole::Conformance;
+      if (uid == KindMacroRoleExtension)
+        macroRoles |= MacroRole::Extension;
+    }
+
+    // definition.
+    if (auto moduleName = dict.getString(KeyModuleName)) {
+      auto typeName = dict.getString(KeyTypeName);
+      if (!typeName) {
+        rec(createErrorRequestInvalid(
+            "missing 'key.typename' for external macro definition"));
+        return true;
+      }
+      MacroExpansionInfo::ExternalMacroReference definition(moduleName->str(),
+                                                            typeName->str());
+      expansions.emplace_back(offset, macroRoles, definition);
+    } else if (auto expandedText = dict.getString(KeySourceText)) {
+      MacroExpansionInfo::ExpandedMacroDefinition definition(*expandedText);
+      bool failed = dict.dictionaryArrayApply(
+          KeyExpandedMacroReplacements, [&](RequestDict dict) {
+            int64_t offset, length, paramIndex;
+            bool failed = false;
+            failed |= dict.getInt64(KeyOffset, offset, false);
+            failed |= dict.getInt64(KeyLength, length, false);
+            failed |= dict.getInt64(KeyArgIndex, paramIndex, false);
+            if (failed) {
+              rec(createErrorRequestInvalid(
+                  "macro replacement should have key.offset, key.length, and "
+                  "key.argindex"));
+              return true;
+            }
+            definition.replacements.emplace_back(
+                RawCharSourceRange{unsigned(offset), unsigned(length)},
+                paramIndex);
+            return false;
+          });
+      if (failed)
+        return true;
+      expansions.emplace_back(offset, macroRoles, definition);
+    }
+    return false;
+  });
+  if (failed)
+    return;
+
+  LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
+  Lang.expandMacroSyntactically(
+      inputBuf.get(), args, expansions,
+      [&](const auto &Result) { rec(createCategorizedEditsResponse(Result)); });
 }
 
 void handleRequestImpl(sourcekitd_object_t ReqObj,
@@ -1843,6 +2086,7 @@ void handleRequestImpl(sourcekitd_object_t ReqObj,
   HANDLE_REQUEST(RequestConformingMethodList, handleRequestConformingMethodList)
 
   HANDLE_REQUEST(RequestIndex, handleRequestIndex)
+  HANDLE_REQUEST(RequestIndexToStore, handleRequestIndexToStore)
   HANDLE_REQUEST(RequestCursorInfo, handleRequestCursorInfo)
   HANDLE_REQUEST(RequestRangeInfo, handleRequestRangeInfo)
   HANDLE_REQUEST(RequestSemanticRefactoring, handleRequestSemanticRefactoring)
@@ -1856,6 +2100,8 @@ void handleRequestImpl(sourcekitd_object_t ReqObj,
   HANDLE_REQUEST(RequestRelatedIdents, handleRequestRelatedIdents)
   HANDLE_REQUEST(RequestActiveRegions, handleRequestActiveRegions)
   HANDLE_REQUEST(RequestDiagnostics, handleRequestDiagnostics)
+  HANDLE_REQUEST(RequestSyntacticMacroExpansion,
+                 handleRequestSyntacticMacroExpansion)
 
   {
     SmallString<64> ErrBuf;
@@ -2115,7 +2361,7 @@ public:
 
   bool finishSourceEntity(UIdent Kind) override;
 
-  bool handleDiagnostic(const DiagnosticEntryInfo &Info) override;
+  bool handleDiagnostics(ArrayRef<DiagnosticEntryInfo> Diags) override;
 };
 } // end anonymous namespace
 
@@ -2286,13 +2532,11 @@ bool SKDocConsumer::finishSourceEntity(UIdent Kind) {
   return true;
 }
 
-bool SKDocConsumer::handleDiagnostic(const DiagnosticEntryInfo &Info) {
-  ResponseBuilder::Array &Arr = Diags;
-  if (Arr.isNull())
-    Arr = TopDict.setArray(KeyDiagnostics);
+bool SKDocConsumer::handleDiagnostics(ArrayRef<DiagnosticEntryInfo> Diags) {
+  if (Diags.empty())
+    return true;
 
-  auto Elem = Arr.appendDictionary();
-  fillDictionaryForDiagnosticInfo(Elem, Info);
+  fillDiagnosticInfo(TopDict, Diags, /*DiagStage*/ None);
   return true;
 }
 
@@ -2476,9 +2720,7 @@ static void reportDiagnostics(const RequestResult<DiagnosticsResult> &Result,
 
   ResponseBuilder RespBuilder;
   auto Dict = RespBuilder.getDictionary();
-  auto DiagArray = Dict.setArray(KeyDiagnostics);
-  for (const auto &DiagInfo : DiagResults)
-    fillDictionaryForDiagnosticInfo(DiagArray.appendDictionary(), DiagInfo);
+  fillDiagnosticInfo(Dict, DiagResults, /*DiagStage*/ None);
   Rec(RespBuilder.createResponse());
 }
 
@@ -2598,15 +2840,16 @@ reportVariableTypeInfo(const RequestResult<VariableTypesInFile> &Result,
 // FindRelatedIdents
 //===----------------------------------------------------------------------===//
 
-static void findRelatedIdents(StringRef Filename, int64_t Offset,
+static void findRelatedIdents(StringRef PrimaryFilePath,
+                              StringRef InputBufferName, int64_t Offset,
                               bool CancelOnSubsequentRequest,
                               ArrayRef<const char *> Args,
                               SourceKitCancellationToken CancellationToken,
                               ResponseReceiver Rec) {
   LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
   Lang.findRelatedIdentifiersInFile(
-      Filename, Offset, CancelOnSubsequentRequest, Args, CancellationToken,
-      [Rec](const RequestResult<RelatedIdentsInfo> &Result) {
+      PrimaryFilePath, InputBufferName, Offset, CancelOnSubsequentRequest, Args,
+      CancellationToken, [Rec](const RequestResult<RelatedIdentsInfo> &Result) {
         if (Result.isCancelled())
           return Rec(createErrorRequestCancelled());
         if (Result.isError())
@@ -2630,13 +2873,15 @@ static void findRelatedIdents(StringRef Filename, int64_t Offset,
 // FindActiveRegions
 //===----------------------------------------------------------------------===//
 
-static void findActiveRegions(StringRef Filename, ArrayRef<const char *> Args,
+static void findActiveRegions(StringRef PrimaryFilePath,
+                              StringRef InputBufferName,
+                              ArrayRef<const char *> Args,
                               SourceKitCancellationToken CancellationToken,
                               ResponseReceiver Rec) {
   LangSupport &Lang = getGlobalContext().getSwiftLangSupport();
 
   Lang.findActiveRegionsInFile(
-      Filename, Args, CancellationToken,
+      PrimaryFilePath, InputBufferName, Args, CancellationToken,
       [Rec](const RequestResult<ActiveRegionsInfo> &Result) {
         if (Result.isCancelled())
           return Rec(createErrorRequestCancelled());
@@ -3160,7 +3405,6 @@ public:
   TokenAnnotationsArrayBuilder SyntaxMap;
   TokenAnnotationsArrayBuilder SemanticAnnotations;
 
-  ResponseBuilder::Array Diags;
   sourcekitd_response_t Error = nullptr;
 
   SKEditorConsumerOptions Opts;
@@ -3221,9 +3465,8 @@ public:
 
   bool diagnosticsEnabled() override { return Opts.EnableDiagnostics; }
 
-  void setDiagnosticStage(UIdent DiagStage) override;
-  void handleDiagnostic(const DiagnosticEntryInfo &Info,
-                        UIdent DiagStage) override;
+  void handleDiagnostics(ArrayRef<DiagnosticEntryInfo> Diags,
+                         UIdent DiagStage) override;
 
   void handleSourceText(StringRef Text) override;
 
@@ -3458,39 +3701,80 @@ void SKEditorConsumer::recordFormattedText(StringRef Text) {
   Dict.set(KeySourceText, Text);
 }
 
-static void fillDictionaryForDiagnosticInfoBase(
-    ResponseBuilder::Dictionary Elem, const DiagnosticEntryInfoBase &Info);
+static void fillDictionaryForRange(ResponseBuilder::Dictionary Elem,
+                                   const RawCharSourceRange &R) {
+  Elem.set(KeyOffset, R.Offset);
+  Elem.set(KeyLength, R.Length);
+}
 
-static void fillDictionaryForDiagnosticInfo(
-    ResponseBuilder::Dictionary Elem, const DiagnosticEntryInfo &Info) {
+namespace {
+/// Buffer state that we need to persist when writing out diagnostics.
+struct GeneratedBuffersState {
+  /// The root dictionary.
+  ResponseBuilder::Dictionary ParentElem;
 
-  UIdent SeverityUID;
-  static UIdent UIDKindDiagWarning(KindDiagWarning.str());
-  static UIdent UIDKindDiagError(KindDiagError.str());
-  switch (Info.Severity) {
-  case DiagnosticSeverityKind::Warning:
-    SeverityUID = UIDKindDiagWarning;
-    break;
-  case DiagnosticSeverityKind::Error:
-    SeverityUID = UIDKindDiagError;
-    break;
-  }
+  /// The generated buffer array.
+  ResponseBuilder::Array GeneratedBuffersElem;
 
-  Elem.set(KeySeverity, SeverityUID);
-  fillDictionaryForDiagnosticInfoBase(Elem, Info);
+  /// The buffer names that have had their info written out.
+  llvm::StringSet<> BufferInfosWritten;
 
-  if (!Info.Notes.empty()) {
-    auto NotesArr = Elem.setArray(KeyDiagnostics);
-    for (auto &NoteDiag : Info.Notes) {
-      auto NoteElem = NotesArr.appendDictionary();
-      NoteElem.set(KeySeverity, KindDiagNote);
-      fillDictionaryForDiagnosticInfoBase(NoteElem, NoteDiag);
-    }
+  GeneratedBuffersState(ResponseBuilder::Dictionary ParentElem)
+      : ParentElem(ParentElem) {}
+};
+} // end anonymous namespace
+
+static void writeBufferInfoIfNeeded(const BufferInfo *Info,
+                                    GeneratedBuffersState &GeneratedBuffers);
+
+static void
+fillDictionaryForGeneratedBufferInfo(ResponseBuilder::Dictionary Elem,
+                                     const BufferInfo *Info,
+                                     GeneratedBuffersState &GeneratedBuffers) {
+  Elem.set(KeyBufferName, Info->BufferName);
+
+  if (auto &Contents = Info->Contents)
+    Elem.set(KeyBufferText, *Contents);
+
+  if (auto &OriginalLoc = Info->OrigLocation) {
+    // Write out the original buffer info if needed.
+    auto *OrigBufferInfo = OriginalLoc->OrigBufferInfo.get();
+    writeBufferInfoIfNeeded(OrigBufferInfo, GeneratedBuffers);
+
+    auto OrigLocElem = Elem.setDictionary(KeyOriginalLocation);
+    OrigLocElem.set(KeyBufferName, OrigBufferInfo->BufferName);
+    fillDictionaryForRange(OrigLocElem, OriginalLoc->Range);
   }
 }
 
-static void fillDictionaryForDiagnosticInfoBase(
-    ResponseBuilder::Dictionary Elem, const DiagnosticEntryInfoBase &Info) {
+/// If the given buffer info is for a generated buffer, and has not yet been
+/// written to the generated buffer info array, write it out.
+static void writeBufferInfoIfNeeded(const BufferInfo *Info,
+                                    GeneratedBuffersState &GeneratedBuffers) {
+  // No contents or original location, nothing interesting to write out.
+  if (!Info->Contents && !Info->OrigLocation)
+    return;
+
+  if (!GeneratedBuffers.BufferInfosWritten.insert(Info->BufferName).second)
+    return;
+
+  // Add the generated_buffers key to the parent dictionary if we don't already
+  // have it.
+  auto &GeneratedBuffersElem = GeneratedBuffers.GeneratedBuffersElem;
+  if (GeneratedBuffersElem.isNull()) {
+    GeneratedBuffersElem =
+        GeneratedBuffers.ParentElem.setArray(KeyGeneratedBuffers);
+  }
+
+  // Append the new element.
+  auto Elt = GeneratedBuffers.GeneratedBuffersElem.appendDictionary();
+  fillDictionaryForGeneratedBufferInfo(Elt, Info, GeneratedBuffers);
+}
+
+static void
+fillDictionaryForDiagnosticInfoBase(ResponseBuilder::Dictionary Elem,
+                                    const DiagnosticEntryInfoBase &Info,
+                                    GeneratedBuffersState &GeneratedBuffers) {
 
   if (!Info.ID.empty())
     Elem.set(KeyID, Info.ID);
@@ -3521,48 +3805,93 @@ static void fillDictionaryForDiagnosticInfoBase(
   } else {
     Elem.set(KeyOffset, Info.Offset);
   }
-  if (!Info.Filename.empty())
-    Elem.set(KeyFilePath, Info.Filename);
+  auto *BufferInfo = Info.FileInfo.get();
+  if (!BufferInfo->BufferName.empty())
+    Elem.set(KeyFilePath, Info.FileInfo->BufferName);
+
+  writeBufferInfoIfNeeded(BufferInfo, GeneratedBuffers);
 
   if (!Info.EducationalNotePaths.empty())
     Elem.set(KeyEducationalNotePaths, Info.EducationalNotePaths);
 
   if (!Info.Ranges.empty()) {
     auto RangesArr = Elem.setArray(KeyRanges);
-    for (auto R : Info.Ranges) {
-      auto RangeElem = RangesArr.appendDictionary();
-      RangeElem.set(KeyOffset, R.first);
-      RangeElem.set(KeyLength, R.second);
-    }
+    for (auto R : Info.Ranges)
+      fillDictionaryForRange(RangesArr.appendDictionary(), R);
   }
 
   if (!Info.Fixits.empty()) {
     auto FixitsArr = Elem.setArray(KeyFixits);
     for (auto F : Info.Fixits) {
       auto FixitElem = FixitsArr.appendDictionary();
-      FixitElem.set(KeyOffset, F.Offset);
-      FixitElem.set(KeyLength, F.Length);
+      fillDictionaryForRange(FixitElem, F.Range);
       FixitElem.set(KeySourceText, F.Text);
     }
   }
 }
 
-void SKEditorConsumer::setDiagnosticStage(UIdent DiagStage) {
-  Dict.set(KeyDiagnosticStage, DiagStage);
+static void
+fillDictionaryForDiagnosticInfo(ResponseBuilder::Dictionary Elem,
+                                const DiagnosticEntryInfo &Info,
+                                GeneratedBuffersState &GeneratedBuffers) {
+
+  UIdent SeverityUID;
+  static UIdent UIDKindDiagWarning(KindDiagWarning.str());
+  static UIdent UIDKindDiagError(KindDiagError.str());
+  switch (Info.Severity) {
+  case DiagnosticSeverityKind::Warning:
+    SeverityUID = UIDKindDiagWarning;
+    break;
+  case DiagnosticSeverityKind::Error:
+    SeverityUID = UIDKindDiagError;
+    break;
+  }
+
+  Elem.set(KeySeverity, SeverityUID);
+  fillDictionaryForDiagnosticInfoBase(Elem, Info, GeneratedBuffers);
+
+  if (!Info.Notes.empty()) {
+    auto NotesArr = Elem.setArray(KeyDiagnostics);
+    for (auto &NoteDiag : Info.Notes) {
+      auto NoteElem = NotesArr.appendDictionary();
+      NoteElem.set(KeySeverity, KindDiagNote);
+      fillDictionaryForDiagnosticInfoBase(NoteElem, NoteDiag, GeneratedBuffers);
+    }
+  }
 }
 
-void SKEditorConsumer::handleDiagnostic(const DiagnosticEntryInfo &Info,
-                                        UIdent DiagStage) {
-  if (!Opts.EnableDiagnostics)
+/// Fill in diagnostic info for the 'diagnostics' key in the given \p
+/// ParentElem.
+static void fillDiagnosticInfo(ResponseBuilder::Dictionary ParentElem,
+                               ArrayRef<DiagnosticEntryInfo> Diags,
+                               Optional<UIdent> DiagStage) {
+  // Add the key, and bail if the diags are empty.
+  auto DiagsElem = ParentElem.setArray(KeyDiagnostics);
+  if (Diags.empty())
     return;
 
-  ResponseBuilder::Array &Arr = Diags;
-  if (Arr.isNull())
-    Arr = Dict.setArray(KeyDiagnostics);
+  GeneratedBuffersState State(ParentElem);
+  for (auto &Diag : Diags) {
+    auto Elem = DiagsElem.appendDictionary();
+    if (DiagStage)
+      Elem.set(KeyDiagnosticStage, *DiagStage);
 
-  auto Elem = Arr.appendDictionary();
-  Elem.set(KeyDiagnosticStage, DiagStage);
-  fillDictionaryForDiagnosticInfo(Elem, Info);
+    fillDictionaryForDiagnosticInfo(Elem, Diag, State);
+  }
+}
+
+void SKEditorConsumer::handleDiagnostics(ArrayRef<DiagnosticEntryInfo> Diags,
+                                         UIdent DiagStage) {
+  // TODO: Setting the stage here matches the old behavior, but should we
+  // consider moving until after the below if check? Do we even need this key if
+  // each individual diagnostic has its stage set? Or should we remove those
+  // keys?
+  Dict.set(KeyDiagnosticStage, DiagStage);
+
+  if (!Opts.EnableDiagnostics || Diags.empty())
+    return;
+
+  fillDiagnosticInfo(Dict, Diags, DiagStage);
 }
 
 void SKEditorConsumer::handleSourceText(StringRef Text) {

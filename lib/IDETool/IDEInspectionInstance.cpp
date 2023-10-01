@@ -17,6 +17,7 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/PluginLoader.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/Basic/Defer.h"
@@ -443,7 +444,8 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
 }
 
 void IDEInspectionInstance::performNewOperation(
-    Optional<llvm::hash_code> ArgsHash, swift::CompilerInvocation &Invocation,
+    llvm::Optional<llvm::hash_code> ArgsHash,
+    swift::CompilerInvocation &Invocation,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
     llvm::MemoryBuffer *ideInspectionTargetBuffer, unsigned int Offset,
     DiagnosticConsumer *DiagC,
@@ -482,6 +484,7 @@ void IDEInspectionInstance::performNewOperation(
           InstanceSetupError));
       return;
     }
+    CI->getASTContext().getPluginLoader().setRegistry(Plugins.get());
     CI->getASTContext().CancellationFlag = CancellationFlag;
     registerIDERequestFunctions(CI->getASTContext().evaluator);
 
@@ -591,8 +594,7 @@ void swift::ide::IDEInspectionInstance::codeComplete(
     llvm::function_ref<void(CancellableResult<CodeCompleteResult>)> Callback) {
   using ResultType = CancellableResult<CodeCompleteResult>;
 
-  struct ConsumerToCallbackAdapter
-      : public SimpleCachingCodeCompletionConsumer {
+  struct ConsumerToCallbackAdapter : public CodeCompletionConsumer {
     SwiftCompletionInfo SwiftContext;
     ImportDepth ImportDep;
     std::shared_ptr<std::atomic<bool>> CancellationFlag;

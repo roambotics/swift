@@ -745,8 +745,6 @@ SILValue EagerDispatch::emitArgumentConversion(
 }
 
 namespace {
-// FIXME: This should be a function transform that pushes cloned functions on
-// the pass manager worklist.
 class EagerSpecializerTransform : public SILFunctionTransform {
   bool onlyCreatePrespecializations;
 public:
@@ -884,7 +882,7 @@ void EagerSpecializerTransform::run() {
               [&](const SILSpecializeAttr *SA, SILFunction *NewFunc,
                   const ReabstractionInfo &ReInfo) {
                 if (NewFunc) {
-                  NewFunc->verify();
+                  NewFunc->verify(getPassManager());
                   Changed = true;
                   EagerDispatch(&F, ReInfo).emitDispatchTo(NewFunc);
                 }
@@ -904,7 +902,7 @@ void EagerSpecializerTransform::run() {
   // If any specializations were created, reverify the original body now that it
   // has checks.
   if (!newFunctions.empty())
-    F.verify();
+    F.verify(getPassManager());
 
   for (SILFunction *newF : newFunctions) {
     addFunctionToPassManagerWorklist(newF, nullptr);

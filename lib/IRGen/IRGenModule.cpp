@@ -86,7 +86,7 @@ static llvm::StructType *createStructType(IRGenModule &IGM,
 }
 
 static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
-                                                 llvm::LLVMContext &LLVMContext,
+                                                      llvm::LLVMContext &LLVMContext,
                                                       const IRGenOptions &Opts,
                                                       StringRef ModuleName,
                                                       StringRef PD) {
@@ -95,7 +95,7 @@ static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
   assert(Importer && "No clang module loader!");
   auto &ClangContext = Importer->getClangASTContext();
 
-  auto &CGO = Importer->getClangCodeGenOpts();
+  auto &CGO = Importer->getCodeGenOpts();
   if (CGO.OpaquePointers) {
     LLVMContext.setOpaquePointers(true);
   } else {
@@ -124,13 +124,15 @@ static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
   case IRGenDebugInfoFormat::DWARF:
     CGO.DebugCompilationDir = Opts.DebugCompilationDir;
     CGO.DwarfVersion = Opts.DWARFVersion;
-    CGO.DwarfDebugFlags = Opts.getDebugFlags(PD);
+    CGO.DwarfDebugFlags =
+        Opts.getDebugFlags(PD, Context.LangOpts.EnableCXXInterop);
     break;
   case IRGenDebugInfoFormat::CodeView:
     CGO.EmitCodeView = true;
     CGO.DebugCompilationDir = Opts.DebugCompilationDir;
     // This actually contains the debug flags for codeview.
-    CGO.DwarfDebugFlags = Opts.getDebugFlags(PD);
+    CGO.DwarfDebugFlags =
+        Opts.getDebugFlags(PD, Context.LangOpts.EnableCXXInterop);
     break;
   }
   if (!Opts.TrapFuncName.empty()) {
@@ -193,6 +195,8 @@ static void sanityCheckStdlib(IRGenModule &IGM) {
 
   // Only run the sanity check when we're building the real stdlib.
   if (!lookupSimple(IGM.getSwiftModule(), { "String" })) return;
+
+  if (!IGM.ObjCInterop) return;
 
   checkPointerAuthAssociatedTypeDiscriminator(IGM, { "_ObjectiveCBridgeable", "_ObjectiveCType" }, SpecialPointerAuthDiscriminators::ObjectiveCTypeDiscriminator);
   checkPointerAuthWitnessDiscriminator(IGM, { "_ObjectiveCBridgeable", "_bridgeToObjectiveC" }, SpecialPointerAuthDiscriminators::bridgeToObjectiveCDiscriminator);
@@ -568,7 +572,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   InvariantNode = llvm::MDNode::get(getLLVMContext(), {});
   DereferenceableID = getLLVMContext().getMDKindID("dereferenceable");
   
-  C_CC = llvm::CallingConv::C;
+  C_CC = getOptions().PlatformCCallingConvention;
   // TODO: use "tinycc" on platforms that support it
   DefaultCC = SWIFT_DEFAULT_LLVM_CC;
   SwiftCC = llvm::CallingConv::Swift;
@@ -635,10 +639,6 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
       createStructType(*this, "swift.accessible_function",
                        {RelativeAddressTy, RelativeAddressTy, RelativeAddressTy,
                         RelativeAddressTy, Int32Ty});
-
-  RuntimeDiscoverableAttributeTy =
-    createStructType(*this, "swift.runtime_attr",
-                     {Int32Ty, RelativeAddressTy, Int32Ty});
 
   AsyncFunctionPointerTy = createStructType(*this, "swift.async_func_pointer",
                                             {RelativeAddressTy, Int32Ty}, true);
@@ -859,6 +859,15 @@ namespace RuntimeConstants {
     return RuntimeAvailability::AlwaysAvailable;
   }
 
+  RuntimeAvailability ConcurrencyDiscardingTaskGroupAvailability(ASTContext &context) {
+    auto featureAvailability =
+        context.getConcurrencyDiscardingTaskGroupAvailability();
+    if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
   RuntimeAvailability DifferentiationAvailability(ASTContext &context) {
     auto featureAvailability = context.getDifferentiationAvailability();
     if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
@@ -880,6 +889,24 @@ namespace RuntimeConstants {
   ObjCIsUniquelyReferencedAvailability(ASTContext &context) {
     auto featureAvailability =
         context.getObjCIsUniquelyReferencedAvailability();
+    if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
+  RuntimeAvailability SignedConformsToProtocolAvailability(ASTContext &context) {
+    auto featureAvailability =
+        context.getSignedConformsToProtocolAvailability();
+    if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
+  RuntimeAvailability SignedDescriptorAvailability(ASTContext &context) {
+    auto featureAvailability =
+        context.getSignedDescriptorAvailability();
     if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
       return RuntimeAvailability::ConditionallyAvailable;
     }
@@ -1255,10 +1282,7 @@ bool IRGenerator::canEmitWitnessTableLazily(SILWitnessTable *wt) {
   if (wt->getLinkage() == SILLinkage::Shared)
     return true;
 
-  NominalTypeDecl *ConformingTy =
-    wt->getConformingType()->getNominalOrBoundGenericNominal();
-
-  switch (ConformingTy->getEffectiveAccess()) {
+  switch (wt->getConformingNominal()->getEffectiveAccess()) {
     case AccessLevel::Private:
     case AccessLevel::FilePrivate:
       return true;
@@ -1273,6 +1297,8 @@ bool IRGenerator::canEmitWitnessTableLazily(SILWitnessTable *wt) {
 }
 
 void IRGenerator::addLazyWitnessTable(const ProtocolConformance *Conf) {
+  assert(!SIL.getASTContext().LangOpts.hasFeature(Feature::Embedded));
+
   if (auto *wt = SIL.lookUpWitnessTable(Conf)) {
     // Add it to the queue if it hasn't already been put there.
     if (canEmitWitnessTableLazily(wt) &&
@@ -1437,6 +1463,9 @@ void IRGenModule::addLinkLibrary(const LinkLibrary &linkLib) {
   // emit it into the IR of debugger expressions.
   if (Context.LangOpts.DebuggerSupport)
     return;
+
+  if (Context.LangOpts.hasFeature(Feature::Embedded))
+    return;
   
   switch (linkLib.getKind()) {
   case LibraryKind::Library: {
@@ -1573,8 +1602,7 @@ void AutolinkKind::collectEntriesFromLibraries(
   llvm::LLVMContext &ctx = IGM.getLLVMContext();
 
   switch (Value) {
-  case AutolinkKind::LLVMLinkerOptions:
-  case AutolinkKind::SwiftAutoLinkExtract: {
+  case AutolinkKind::LLVMLinkerOptions: {
     // On platforms that support autolinking, continue to use the metadata.
     for (LinkLibrary linkLib : AutolinkEntries) {
       switch (linkLib.getKind()) {
@@ -1590,6 +1618,24 @@ void AutolinkKind::collectEntriesFromLibraries(
         Entries.insert(llvm::MDNode::get(ctx, args));
         continue;
       }
+      }
+      llvm_unreachable("Unhandled LibraryKind in switch.");
+    }
+    return;
+  }
+  case AutolinkKind::SwiftAutoLinkExtract: {
+    // On platforms that support autolinking, continue to use the metadata.
+    for (LinkLibrary linkLib : AutolinkEntries) {
+      switch (linkLib.getKind()) {
+      case LibraryKind::Library: {
+        llvm::SmallString<32> opt =
+            getTargetDependentLibraryOption(IGM.Triple, linkLib.getName());
+        Entries.insert(llvm::MDNode::get(ctx, llvm::MDString::get(ctx, opt)));
+        continue;
+      }
+      case LibraryKind::Framework:
+        // Frameworks are not supported with Swift Autolink Extract.
+        continue;
       }
       llvm_unreachable("Unhandled LibraryKind in switch.");
     }
@@ -1978,7 +2024,7 @@ const llvm::StringRef IRGenerator::getClangDataLayoutString() {
 }
 
 TypeExpansionContext IRGenModule::getMaximalTypeExpansionContext() const {
-  return TypeExpansionContext::maximal(getSwiftModule(),
+  return TypeExpansionContext::maximal(getSILModule().getAssociatedContext(),
                                        getSILModule().isWholeModule());
 }
 
@@ -2034,7 +2080,6 @@ bool swift::writeEmptyOutputFilesFor(
   const ASTContext &Context,
   std::vector<std::string>& ParallelOutputFilenames,
   const IRGenOptions &IRGenOpts) {
-
   for (auto fileName : ParallelOutputFilenames) {
     // The first output file, was use for genuine output.
     if (fileName == ParallelOutputFilenames[0])

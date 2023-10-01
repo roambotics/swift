@@ -4,6 +4,10 @@ struct HasThreeFields {
   int c = 3;
 };
 
+struct DerivedWithSameField : HasThreeFields {
+  int a = 2;
+};
+
 struct DerivedWithOneField : HasThreeFields {
   int d = 4;
 };
@@ -26,6 +30,7 @@ struct DerivedFromOneField : OneField {};
 
 struct __attribute__((swift_attr("import_unsafe"))) NonTrivial {
   NonTrivial() {}
+  NonTrivial(const NonTrivial &) {}
   ~NonTrivial() {}
 };
 
@@ -41,6 +46,7 @@ struct NonTrivialDerivedWithOneField : NonTrivialHasThreeFields {
 
 struct __attribute__((swift_attr("import_unsafe"))) NonTrivialHasOneField {
   NonTrivialHasOneField() {}
+  NonTrivialHasOneField(const NonTrivialHasOneField &other) : e(other.e) {}
   ~NonTrivialHasOneField() {}
 
   int e = 5;

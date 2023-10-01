@@ -153,36 +153,6 @@ extractLinkerFlagsFromObjectFile(const llvm::object::ObjectFile *ObjectFile,
   return false;
 }
 
-/// Look inside the object file 'WasmObjectFile' and append any linker flags
-/// found in its ".swift1_autolink_entries" section to 'LinkerFlags'. Return
-/// 'true' if there was an error, and 'false' otherwise.
-static bool
-extractLinkerFlagsFromObjectFile(const llvm::object::WasmObjectFile *ObjectFile,
-                                 std::vector<std::string> &LinkerFlags,
-                                 std::unordered_map<std::string, bool> &SwiftRuntimeLibraries,
-                                 CompilerInstance &Instance) {
-  // Search for the data segment we hold autolink entries in
-  for (const llvm::object::WasmSegment &Segment : ObjectFile->dataSegments()) {
-    if (Segment.Data.Name == ".swift1_autolink_entries") {
-
-      StringRef SegmentData = llvm::toStringRef(Segment.Data.Content);
-      // entries are null-terminated, so extract them and push them into
-      // the set.
-      llvm::SmallVector<llvm::StringRef, 4> SplitFlags;
-      SegmentData.split(SplitFlags, llvm::StringRef("\0", 1), -1,
-                        /*KeepEmpty=*/false);
-      for (const auto &Flag : SplitFlags) {
-        auto RuntimeLibEntry = SwiftRuntimeLibraries.find(Flag.str());
-        if (RuntimeLibEntry == SwiftRuntimeLibraries.end())
-          LinkerFlags.emplace_back(Flag.str());
-        else
-          RuntimeLibEntry->second = true;
-      }
-    }
-  }
-  return false;
-}
-
 /// Look inside the binary 'Bin' and append any linker flags found in its
 /// ".swift1_autolink_entries" section to 'LinkerFlags'. If 'Bin' is an archive,
 /// recursively look inside all children within the archive. Return 'true' if
@@ -243,16 +213,50 @@ int autolink_extract_main(ArrayRef<const char *> Args, const char *Argv0,
   std::vector<std::string> LinkerFlags;
 
   // Keep track of whether we've already added the common
-  // Swift libraries that ususally have autolink directives
-  // in most object fiels
-  std::unordered_map<std::string, bool> SwiftRuntimeLibraries = {
-      {"-lswiftSwiftOnoneSupport", false},
-      {"-lswiftCore", false},
-      {"-lswift_Concurrency", false},
-      {"-lswift_StringProcessing", false},
-      {"-lswift_RegexParser", false},
-      {"-lswift_Backtracing", false},
+  // Swift libraries that usually have autolink directives
+  // in most object files
+
+  std::vector<std::string> SwiftRuntimeLibsOrdered = {
+      // Common Swift runtime libs
+      "-lswiftSwiftOnoneSupport",
+      "-lswiftCore",
+      "-lswift_Concurrency",
+      "-lswift_StringProcessing",
+      "-lswift_RegexBuilder",
+      "-lswift_RegexParser",
+      "-lswift_Backtracing",
+      "-lswiftGlibc",
+      "-lBlocksRuntime",
+      // Dispatch-specific Swift runtime libs
+      "-ldispatch",
+      "-lDispatchStubs",
+      "-lswiftDispatch",
+      // CoreFoundation and Foundation Swift runtime libs
+      "-lCoreFoundation",
+      "-lFoundation",
+      "-lFoundationNetworking",
+      "-lFoundationXML",
+      // Foundation support libs
+      "-lcurl",
+      "-lxml2",
+      "-luuid",
+      // XCTest runtime libs (must be first due to http://github.com/apple/swift-corelibs-xctest/issues/432)
+      "-lXCTest",
+      // ICU Swift runtime libs
+      "-licui18nswift",
+      "-licuucswift",
+      "-licudataswift",
+      // Common-use ordering-agnostic Linux system libs
+      "-lm",
+      "-lpthread",
+      "-lutil",
+      "-ldl",
+      "-lz",
   };
+  std::unordered_map<std::string, bool> SwiftRuntimeLibraries;
+  for (const auto &RuntimeLib : SwiftRuntimeLibsOrdered) {
+    SwiftRuntimeLibraries[RuntimeLib] = false;
+  }
 
   // Extract the linker flags from the objects.
   for (const auto &BinaryFileName : Invocation.getInputFilenames()) {
@@ -289,9 +293,11 @@ int autolink_extract_main(ArrayRef<const char *> Args, const char *Argv0,
     OutOS << Flag << '\n';
   }
 
-  for (const auto &RuntimeLib : SwiftRuntimeLibraries) {
-    if (RuntimeLib.second)
-      OutOS << RuntimeLib.first << '\n';
+  for (const auto &RuntimeLib : SwiftRuntimeLibsOrdered) {
+    auto entry = SwiftRuntimeLibraries.find(RuntimeLib);
+    if (entry != SwiftRuntimeLibraries.end() && entry->second) {
+      OutOS << entry->first << '\n';
+    }
   }
 
 

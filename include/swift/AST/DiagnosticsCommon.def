@@ -29,6 +29,9 @@ ERROR(not_implemented,none,
 ERROR(error_opening_output,none,
       "error opening '%0' for output: %1", (StringRef, StringRef))
 
+ERROR(error_closing_output,none,
+      "error closing '%0' for output: %1", (StringRef, StringRef))
+
 ERROR(cannot_find_group_info_file,none,
       "cannot find group info file at path: '%0'", (StringRef))
 
@@ -198,6 +201,9 @@ ERROR(scanner_find_cycle, none,
 ERROR(scanner_arguments_invalid, none,
       "dependencies scanner cannot be configured with arguments: '%0'", (StringRef))
 
+ERROR(error_scanner_extra, none,
+      "failed inside dependency scanner: '%0'", (StringRef))
+
 WARNING(warn_scanner_deserialize_failed, none,
         "Failed to load module scanning dependency cache from: '%0', re-building scanner cache from scratch.", (StringRef))
 
@@ -218,9 +224,9 @@ ERROR(unknown_attribute,none,
 // MARK: macro diagnostics
 //------------------------------------------------------------------------------
 NOTE(in_macro_expansion,none,
-     "in expansion of macro %0 here", (DeclName))
+     "in expansion of macro %0%select{| on %kind1}1 here", (DeclName, const Decl *))
 ERROR(macro_experimental,none,
-      "%0 macros are an experimental feature that is not enabled (%1)",
+      "%0 macros are an experimental feature that is not enabled %select{|(%1)}1",
       (StringRef, StringRef))
 ERROR(ambiguous_macro_reference,none,
       "ambiguous reference to macro %0", (DeclName))

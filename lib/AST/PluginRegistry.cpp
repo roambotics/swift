@@ -38,17 +38,21 @@
 #include <io.h>
 #endif
 
-extern "C" const void *swift_ASTGen_getCompilerPluginCapability(void *handle);
-extern "C" void swift_ASTGen_destroyCompilerPluginCapability(void *value);
-
 using namespace swift;
 
-llvm::Expected<void *> PluginRegistry::loadLibraryPlugin(StringRef path) {
-  auto found = LoadedPluginLibraries.find(path);
-  if (found != LoadedPluginLibraries.end()) {
+PluginRegistry::PluginRegistry() {
+  dumpMessaging = ::getenv("SWIFT_DUMP_PLUGIN_MESSAGING") != nullptr;
+}
+
+llvm::Expected<LoadedLibraryPlugin *>
+PluginRegistry::loadLibraryPlugin(StringRef path) {
+  std::lock_guard<std::mutex> lock(mtx);
+  auto &storage = LoadedPluginLibraries[path];
+  if (storage) {
     // Already loaded.
-    return found->second;
+    return storage.get();
   }
+
   void *lib = nullptr;
 #if defined(_WIN32)
   lib = LoadLibraryA(path.str().c_str());
@@ -62,8 +66,21 @@ llvm::Expected<void *> PluginRegistry::loadLibraryPlugin(StringRef path) {
     return llvm::createStringError(llvm::inconvertibleErrorCode(), dlerror());
   }
 #endif
-  LoadedPluginLibraries.insert({path, lib});
-  return lib;
+
+  storage = std::make_unique<LoadedLibraryPlugin>(lib);
+  return storage.get();
+}
+
+void *LoadedLibraryPlugin::getAddressOfSymbol(const char *symbolName) {
+  auto &cached = resolvedSymbols[symbolName];
+  if (cached)
+    return cached;
+#if defined(_WIN32)
+  cached = GetProcAddress(static_cast<HMODULE>(handle), symbolName);
+#else
+  cached = dlsym(handle, symbolName);
+#endif
+  return cached;
 }
 
 llvm::Expected<LoadedExecutablePlugin *>
@@ -73,15 +90,17 @@ PluginRegistry::loadExecutablePlugin(StringRef path) {
     return llvm::errorCodeToError(err);
   }
 
+  std::lock_guard<std::mutex> lock(mtx);
+
   // See if the plugin is already loaded.
-  auto &plugin = LoadedPluginExecutables[path];
-  if (plugin) {
+  auto &storage = LoadedPluginExecutables[path];
+  if (storage) {
     // See if the loaded one is still usable.
-    if (plugin->getLastModificationTime() == stat.getLastModificationTime())
-      return plugin.get();
+    if (storage->getLastModificationTime() == stat.getLastModificationTime())
+      return storage.get();
 
     // The plugin is updated. Close the previously opened plugin.
-    plugin = nullptr;
+    storage = nullptr;
   }
 
   if (!llvm::sys::fs::exists(stat)) {
@@ -94,8 +113,37 @@ PluginRegistry::loadExecutablePlugin(StringRef path) {
                                    "not executable");
   }
 
+  auto plugin = std::make_unique<LoadedExecutablePlugin>(
+      path, stat.getLastModificationTime());
+
+  plugin->setDumpMessaging(dumpMessaging);
+
+  // Launch here to see if it's actually executable, and diagnose (by returning
+  // an error) if necessary.
+  if (auto error = plugin->spawnIfNeeded()) {
+    return std::move(error);
+  }
+
+  storage = std::move(plugin);
+  return storage.get();
+}
+
+llvm::Error LoadedExecutablePlugin::spawnIfNeeded() {
+  if (Process) {
+    // See if the loaded one is still usable.
+    if (!Process->isStale)
+      return llvm::Error::success();
+
+    // NOTE: We don't check the mtime here because 'stat(2)' call is too heavy.
+    // PluginRegistry::loadExecutablePlugin() checks it and replace this object
+    // itself if the plugin is updated.
+
+    // The plugin is stale. Discard the previously opened process.
+    Process.reset();
+  }
+
   // Create command line arguments.
-  SmallVector<StringRef, 4> command{path};
+  SmallVector<StringRef, 4> command{ExecutablePath};
 
   // Apply sandboxing.
   llvm::BumpPtrAllocator Allocator;
@@ -107,29 +155,47 @@ PluginRegistry::loadExecutablePlugin(StringRef path) {
     return llvm::errorCodeToError(childInfo.getError());
   }
 
-  plugin = std::unique_ptr<LoadedExecutablePlugin>(new LoadedExecutablePlugin(
-      childInfo->Pid, stat.getLastModificationTime(),
-      childInfo->ReadFileDescriptor, childInfo->WriteFileDescriptor));
+  Process = std::make_unique<PluginProcess>(childInfo->ProcessInfo,
+                                            childInfo->Read, childInfo->Write);
 
-  return plugin.get();
+  // Call "on reconnect" callbacks.
+  for (auto *callback : onReconnect) {
+    (*callback)();
+  }
+
+  return llvm::Error::success();
 }
 
-LoadedExecutablePlugin::LoadedExecutablePlugin(
-    llvm::sys::procid_t pid, llvm::sys::TimePoint<> LastModificationTime,
-    int inputFileDescriptor, int outputFileDescriptor)
-    : pid(pid), LastModificationTime(LastModificationTime),
-      inputFileDescriptor(inputFileDescriptor),
-      outputFileDescriptor(outputFileDescriptor) {}
+LoadedExecutablePlugin::PluginProcess::~PluginProcess() {
+#if defined(_WIN32)
+  _close(input);
+  _close(output);
+  CloseHandle(process.Process);
+#else
+  close(input);
+  close(output);
+#endif
+}
 
 LoadedExecutablePlugin::~LoadedExecutablePlugin() {
-  close(inputFileDescriptor);
-  close(outputFileDescriptor);
-
   // Let ASTGen to cleanup things.
-  this->cleanup();
+  if (this->cleanup)
+    this->cleanup();
 }
 
-ssize_t LoadedExecutablePlugin::read(void *buf, size_t nbyte) const {
+ssize_t LoadedExecutablePlugin::PluginProcess::read(void *buf,
+                                                    size_t nbyte) const {
+#if defined(_WIN32)
+  size_t nread = 0;
+  while (nread < nbyte) {
+    int n = _read(input, static_cast<char*>(buf) + nread,
+                  std::min(static_cast<size_t>(UINT32_MAX), nbyte - nread));
+    if (n <= 0)
+      break;
+    nread += n;
+  }
+  return nread;
+#else
   ssize_t bytesToRead = nbyte;
   void *ptr = buf;
 
@@ -141,7 +207,7 @@ ssize_t LoadedExecutablePlugin::read(void *buf, size_t nbyte) const {
 
   while (bytesToRead > 0) {
     ssize_t readingSize = std::min(ssize_t(INT32_MAX), bytesToRead);
-    ssize_t readSize = ::read(inputFileDescriptor, ptr, readingSize);
+    ssize_t readSize = ::read(input, ptr, readingSize);
     if (readSize <= 0) {
       // 0: EOF (the plugin exited?), -1: error (e.g. broken pipe.)
       // FIXME: Mark the plugin 'stale' and relaunch later.
@@ -152,9 +218,22 @@ ssize_t LoadedExecutablePlugin::read(void *buf, size_t nbyte) const {
   }
 
   return nbyte - bytesToRead;
+#endif
 }
 
-ssize_t LoadedExecutablePlugin::write(const void *buf, size_t nbyte) const {
+ssize_t LoadedExecutablePlugin::PluginProcess::write(const void *buf,
+                                                     size_t nbyte) const {
+#if defined(_WIN32)
+  size_t nwritten = 0;
+  while (nwritten < nbyte) {
+    int n = _write(output, static_cast<const char *>(buf) + nwritten,
+                   std::min(static_cast<size_t>(UINT32_MAX), nbyte - nwritten));
+    if (n <= 0)
+      break;
+    nwritten += n;
+  }
+  return nwritten;
+#else
   ssize_t bytesToWrite = nbyte;
   const void *ptr = buf;
 
@@ -166,7 +245,7 @@ ssize_t LoadedExecutablePlugin::write(const void *buf, size_t nbyte) const {
 
   while (bytesToWrite > 0) {
     ssize_t writingSize = std::min(ssize_t(INT32_MAX), bytesToWrite);
-    ssize_t writtenSize = ::write(outputFileDescriptor, ptr, writingSize);
+    ssize_t writtenSize = ::write(output, ptr, writingSize);
     if (writtenSize <= 0) {
       // -1: error (e.g. broken pipe,)
       // FIXME: Mark the plugin 'stale' and relaunch later.
@@ -176,10 +255,15 @@ ssize_t LoadedExecutablePlugin::write(const void *buf, size_t nbyte) const {
     bytesToWrite -= writtenSize;
   }
   return nbyte - bytesToWrite;
+#endif
 }
 
 llvm::Error LoadedExecutablePlugin::sendMessage(llvm::StringRef message) const {
   ssize_t writtenSize = 0;
+
+  if (dumpMessaging) {
+    llvm::dbgs() << "->(plugin:" << Process->process.Pid << ") " << message << '\n';
+  }
 
   const char *data = message.data();
   size_t size = message.size();
@@ -187,15 +271,17 @@ llvm::Error LoadedExecutablePlugin::sendMessage(llvm::StringRef message) const {
   // Write header (message size).
   uint64_t header = llvm::support::endian::byte_swap(
       uint64_t(size), llvm::support::endianness::little);
-  writtenSize = write(&header, sizeof(header));
+  writtenSize = Process->write(&header, sizeof(header));
   if (writtenSize != sizeof(header)) {
+    setStale();
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    "failed to write plugin message header");
   }
 
   // Write message.
-  writtenSize = write(data, size);
+  writtenSize = Process->write(data, size);
   if (writtenSize != ssize_t(size)) {
+    setStale();
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    "failed to write plugin message data");
   }
@@ -208,9 +294,10 @@ llvm::Expected<std::string> LoadedExecutablePlugin::waitForNextMessage() const {
 
   // Read header (message size).
   uint64_t header;
-  readSize = read(&header, sizeof(header));
+  readSize = Process->read(&header, sizeof(header));
 
   if (readSize != sizeof(header)) {
+    setStale();
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    "failed to read plugin message header");
   }
@@ -224,13 +311,18 @@ llvm::Expected<std::string> LoadedExecutablePlugin::waitForNextMessage() const {
   auto sizeToRead = size;
   while (sizeToRead > 0) {
     char buffer[4096];
-    readSize = read(buffer, std::min(sizeof(buffer), sizeToRead));
+    readSize = Process->read(buffer, std::min(sizeof(buffer), sizeToRead));
     if (readSize == 0) {
+      setStale();
       return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                      "failed to read plugin message data");
     }
     sizeToRead -= readSize;
     message.append(buffer, readSize);
+  }
+
+  if (dumpMessaging) {
+    llvm::dbgs() << "<-(plugin:" << Process->process.Pid << ") " << message << "\n";
   }
 
   return message;

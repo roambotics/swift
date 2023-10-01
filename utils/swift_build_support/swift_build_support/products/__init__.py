@@ -10,12 +10,10 @@
 #
 # ----------------------------------------------------------------------------
 
-from .backdeployconcurrency import BackDeployConcurrency
 from .benchmarks import Benchmarks
 from .cmark import CMark
 from .curl import LibCurl
 from .earlyswiftdriver import EarlySwiftDriver
-from .earlyswiftsyntax import EarlySwiftSyntax
 from .foundation import Foundation
 from .indexstoredb import IndexStoreDB
 from .libcxx import LibCXX
@@ -25,6 +23,7 @@ from .libxml2 import LibXML2
 from .llbuild import LLBuild
 from .lldb import LLDB
 from .llvm import LLVM
+from .minimalstdlib import MinimalStdlib
 from .ninja import Ninja
 from .playgroundsupport import PlaygroundSupport
 from .skstresstester import SKStressTester
@@ -43,9 +42,7 @@ from .xctest import XCTest
 from .zlib import Zlib
 
 __all__ = [
-    'BackDeployConcurrency',
     'CMark',
-    'Ninja',
     'Foundation',
     'LibCXX',
     'LibDispatch',
@@ -56,6 +53,7 @@ __all__ = [
     'LLBuild',
     'LLDB',
     'LLVM',
+    'MinimalStdlib',
     'Ninja',
     'PlaygroundSupport',
     'Swift',
@@ -64,7 +62,6 @@ __all__ = [
     'SwiftPM',
     'SwiftDriver',
     'EarlySwiftDriver',
-    'EarlySwiftSyntax',
     'XCTest',
     'SwiftSyntax',
     'SKStressTester',

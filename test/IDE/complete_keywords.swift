@@ -1,5 +1,4 @@
-// RUN: %empty-directory(%t)
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion
 
 // KW_RETURN: Keyword[return]/None: return{{; name=.+$}}
 // KW_NO_RETURN-NOT: Keyword[return]
@@ -7,7 +6,6 @@
 // KW_IN: Keyword[in]/None: in{{; name=.+$}}
 // KW_NO_IN-NOT: Keyword[in]
 
-// KW_DECL: Begin completions
 // KW_DECL-DAG: Keyword[class]/None: class{{; name=.+$}}
 // KW_DECL-DAG: Keyword/None: actor{{; name=.+$}}
 // KW_DECL-DAG: Keyword/None: convenience{{; name=.+$}}
@@ -42,9 +40,7 @@
 // KW_DECL-DAG: Keyword/None: unowned{{; name=.+$}}
 // KW_DECL-DAG: Keyword[var]/None: var{{; name=.+$}}
 // KW_DECL-DAG: Keyword/None: weak{{; name=.+$}}
-// KW_DECL: End completions
 
-// KW_DECL_PROTOCOL: Begin completions
 // KW_DECL_PROTOCOL-DAG: Keyword[class]/None/Flair[RareKeyword]: class{{; name=.+$}}
 // KW_DECL_PROTOCOL-DAG: Keyword/None/Flair[RareKeyword]: actor{{; name=.+$}}
 // KW_DECL_PROTOCOL-DAG: Keyword/None: convenience{{; name=.+$}}
@@ -79,9 +75,7 @@
 // KW_DECL_PROTOCOL-DAG: Keyword/None: unowned{{; name=.+$}}
 // KW_DECL_PROTOCOL-DAG: Keyword[var]/None: var{{; name=.+$}}
 // KW_DECL_PROTOCOL-DAG: Keyword/None: weak{{; name=.+$}}
-// KW_DECL_PROTOCOL: End completions
 
-// KW_DECL_TYPECONTEXT: Begin completions
 // KW_DECL_TYPECONTEXT-DAG: Keyword[class]/None: class{{; name=.+$}}
 // KW_DECL_TYPECONTEXT-DAG: Keyword/None: actor{{; name=.+$}}
 // KW_DECL_TYPECONTEXT-DAG: Keyword/None: convenience{{; name=.+$}}
@@ -116,10 +110,8 @@
 // KW_DECL_TYPECONTEXT-DAG: Keyword/None: unowned{{; name=.+$}}
 // KW_DECL_TYPECONTEXT-DAG: Keyword[var]/None: var{{; name=.+$}}
 // KW_DECL_TYPECONTEXT-DAG: Keyword/None: weak{{; name=.+$}}
-// KW_DECL_TYPECONTEXT: End completions
 
 
-// KW_DECL_STMT_TOPLEVEL: Begin completions
 //
 // Declaration keywords.
 //
@@ -186,9 +178,7 @@
 // KW_DECL_STMT_TOPLEVEL-DAG: Literal[Boolean]/None: false[#Bool#]{{; name=.+$}}
 // KW_DECL_STMT_TOPLEVEL-DAG: Literal[Boolean]/None: true[#Bool#]{{; name=.+$}}
 // KW_DECL_STMT_TOPLEVEL-DAG: Literal[Nil]/None: nil{{; name=.+$}}
-// KW_DECL_STMT_TOPLEVEL: End completions
 
-// KW_DECL_STMT: Begin completions
 //
 // Declaration keywords.
 //
@@ -254,10 +244,8 @@
 // KW_DECL_STMT-DAG: Literal[Boolean]/None: false[#Bool#]{{; name=.+$}}
 // KW_DECL_STMT-DAG: Literal[Boolean]/None: true[#Bool#]{{; name=.+$}}
 // KW_DECL_STMT-DAG: Literal[Nil]/None: nil{{; name=.+$}}
-// KW_DECL_STMT: End completions
 
 
-// KW_EXPR: Begin completions
 //
 // Expressions
 //
@@ -267,17 +255,18 @@
 //
 // let and var
 //
-// KW_EXPR-DAG: Keyword[let]/None: let{{; name=.+$}}
-// KW_EXPR-DAG: Keyword[var]/None: var{{; name=.+$}}
+// KW_LETVAR-DAG: Keyword[let]/None: let{{; name=.+$}}
+// KW_LETVAR-DAG: Keyword[var]/None: var{{; name=.+$}}
+//
+// KW_LETVAR_NEG-NOT: Keyword[let]/None: let{{; name=.+$}}
+// KW_LETVAR_NEG-NOT: Keyword[var]/None: var{{; name=.+$}}
 //
 // Literals
 //
 // KW_EXPR-DAG: Literal[Boolean]/None{{(/TypeRelation\[Convertible\])?}}: false[#Bool#]{{; name=.+$}}
 // KW_EXPR-DAG: Literal[Boolean]/None{{(/TypeRelation\[Convertible\])?}}: true[#Bool#]{{; name=.+$}}
 // KW_EXPR-DAG: Literal[Nil]/None: nil{{; name=.+$}}
-// KW_EXPR: End completions
 
-// KW_EXPR_NEG: Begin completions
 //
 // Declaration keywords
 //
@@ -293,7 +282,6 @@
 // KW_EXPR_NEG-NOT: Keyword{{.*}}switch
 // KW_EXPR_NEG-NOT: Keyword{{.*}}catch
 // KW_EXPR_NEG-NOT: Keyword{{.*}}break
-// KW_EXPR_NEG: End completions
 
 #^TOP_LEVEL_1?check=KW_DECL_STMT_TOPLEVEL;check=KW_NO_RETURN;check=KW_NO_IN^#
 
@@ -437,24 +425,29 @@ extension SubClass {
 }
 
 func inExpr1() {
-  (#^EXPR_1?check=KW_EXPR;check=KW_EXPR_NEG^#)
+  (#^EXPR_1?check=KW_EXPR;check=KW_LETVAR;check=KW_EXPR_NEG^#)
 }
 func inExpr2() {
-  let x = #^EXPR_2?check=KW_EXPR;check=KW_EXPR_NEG^#
+  let x = #^EXPR_2?check=KW_EXPR;check=KW_LETVAR;check=KW_EXPR_NEG^#
 }
 func inExpr3() {
-  if #^EXPR_3?check=KW_EXPR;check=KW_EXPR_NEG^# {}
+  if #^EXPR_3?check=KW_EXPR;check=KW_LETVAR;check=KW_EXPR_NEG^# {}
 }
 func inExpr4() {
   let x = 1
-  x + #^EXPR_4?check=KW_EXPR;check=KW_EXPR_NEG^#
+  x + #^EXPR_4?check=KW_EXPR;check=KW_LETVAR;check=KW_EXPR_NEG^#
 }
 func inExpr5() {
   var x: Int
-  x = #^EXPR_5?check=KW_EXPR;check=KW_EXPR_NEG^#
+  x = #^EXPR_5?check=KW_EXPR;check=KW_LETVAR;check=KW_EXPR_NEG^#
 }
 func inExpr6() -> Int {
-  return #^EXPR_6?check=KW_EXPR;check=KW_EXPR_NEG^#
+  // Make sure we don't recommend 'let' and 'var' here.
+  return #^EXPR_6?check=KW_EXPR;check=KW_EXPR_NEG;check=KW_LETVAR_NEG^#
+}
+func inExpr7() {
+  // Make sure we don't recommend 'let' and 'var' here.
+  for x in #^EXPR_7?check=KW_EXPR;check=KW_EXPR_NEG;check=KW_LETVAR_NEG^#
 }
 
 func inSwitch(val: Int) {
@@ -464,10 +457,8 @@ func inSwitch(val: Int) {
     foo()
   #^SWITCH_IN_CASE?check=KW_CASE^#
   }
-// KW_CASE: Begin completions
 // KW_CASE-DAG: Keyword[case]/None:                 case; name=case
 // KW_CASE-DAG: Keyword[default]/None:              default; name=default
-// KW_CASE: End completions
 }
 func testContextualType() {
   let _: UInt32 = #^CONTEXT_UINT32^#
@@ -485,8 +476,6 @@ class Base {
 class Derivied: Base {
   override func foo() {
     #^OVERRIDE^#
-// OVERRIDE: Begin completions
 // OVERRIDE-DAG: Keyword[super]/CurrNominal/Flair[CommonKeyword]: super[#Base#]; name=super
-// OVERRIDE: End completions
   }
 }

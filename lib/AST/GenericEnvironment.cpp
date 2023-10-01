@@ -98,7 +98,7 @@ ArrayRef<Type> GenericEnvironment::getOpenedPackParams() const {
   return ArrayRef<Type>(begin, getNumOpenedPackParams());
 }
 
-TypeArrayView<GenericTypeParamType>
+ArrayRef<GenericTypeParamType *>
 GenericEnvironment::getGenericParams() const {
   return getGenericSignature().getGenericParams();
 }
@@ -152,7 +152,7 @@ namespace {
 
 struct FindOpenedElementParam {
   ArrayRef<Type> openedPacks;
-  TypeArrayView<GenericTypeParamType> packElementParams;
+  ArrayRef<GenericTypeParamType *> packElementParams;
 
   FindOpenedElementParam(const GenericEnvironment *env,
                          ArrayRef<Type> openedPacks)
@@ -320,8 +320,8 @@ void GenericEnvironment::addMapping(GenericParamKey key,
   getContextTypes()[index] = contextType;
 }
 
-Optional<Type> GenericEnvironment::getMappingIfPresent(
-                                                    GenericParamKey key) const {
+llvm::Optional<Type>
+GenericEnvironment::getMappingIfPresent(GenericParamKey key) const {
   // Find the index into the parallel arrays of generic parameters and
   // context types.
   auto genericParams = getGenericParams();
@@ -331,7 +331,7 @@ Optional<Type> GenericEnvironment::getMappingIfPresent(
   if (auto type = getContextTypes()[index])
     return type;
 
-  return None;
+  return llvm::None;
 }
 
 namespace {
@@ -432,7 +432,8 @@ Type TypeBase::mapTypeOutOfContext() {
   assert(!hasTypeParameter() && "already have an interface type");
   return Type(this).subst(MapTypeOutOfContext(),
     MakeAbstractConformanceForGenericType(),
-    SubstFlags::AllowLoweredTypes);
+    SubstFlags::AllowLoweredTypes |
+    SubstFlags::PreservePackExpansionLevel);
 }
 
 class GenericEnvironment::NestedTypeStorage
@@ -634,10 +635,10 @@ Type GenericEnvironment::mapTypeIntoContext(
   assert((!type->hasArchetype() || type->hasLocalArchetype()) &&
          "already have a contextual type");
 
-  type = maybeApplyOuterContextSubstitutions(type);
   Type result = type.subst(QueryInterfaceTypeSubstitutions(this),
                            lookupConformance,
-                           SubstFlags::AllowLoweredTypes);
+                           SubstFlags::AllowLoweredTypes |
+                           SubstFlags::PreservePackExpansionLevel);
   assert((!result->hasTypeParameter() || result->hasError() ||
           getKind() == Kind::Opaque) &&
          "not fully substituted");
@@ -658,6 +659,10 @@ Type GenericEnvironment::mapTypeIntoContext(GenericTypeParamType *type) const {
   return result;
 }
 
+/// So this expects a type written with the archetypes of the original generic
+/// environment, not 'this', the opened element environment, because it is the
+/// original PackArchetypes that become ElementArchetypes. Also this function
+/// does not apply outer substitutions, which might not be what you expect.
 Type
 GenericEnvironment::mapContextualPackTypeIntoElementContext(Type type) const {
   assert(getKind() == Kind::OpenedElement);
@@ -671,35 +676,16 @@ GenericEnvironment::mapContextualPackTypeIntoElementContext(Type type) const {
   FindElementArchetypeForOpenedPackParam
     findElementArchetype(this, getOpenedPackParams());
 
-  return type.transformRec([&](TypeBase *ty) -> Optional<Type> {
-    // We're only directly substituting pack archetypes.
-    auto archetype = ty->getAs<PackArchetypeType>();
-    if (!archetype) {
-      // Don't recurse into nested pack expansions.
-      if (ty->is<PackExpansionType>())
-        return Type(ty);
+  return type.transformTypeParameterPacks(
+      [&](SubstitutableType *ty) -> llvm::Optional<Type> {
+        if (auto *packArchetype = dyn_cast<PackArchetypeType>(ty)) {
+          auto interfaceType = packArchetype->getInterfaceType();
+          if (sig->haveSameShape(interfaceType, shapeClass))
+            return Type(findElementArchetype(interfaceType));
+        }
 
-      // Recurse into any other type.
-      return None;
-    }
-
-    auto rootArchetype = cast<PackArchetypeType>(archetype->getRoot());
-
-    // TODO: assert that the generic environment of the pack archetype
-    // matches the signature that was originally opened to make this
-    // environment.  Unfortunately, that isn't a trivial check because of
-    // the extra opened-element parameters.
-
-    // If the archetype isn't the shape that was opened by this
-    // environment, ignore it.
-    auto rootParam = cast<GenericTypeParamType>(
-      rootArchetype->getInterfaceType().getPointer());
-    assert(rootParam->isParameterPack());
-    if (!sig->haveSameShape(rootParam, shapeClass))
-      return Type(ty);
-
-    return Type(findElementArchetype(archetype->getInterfaceType()));
-  });
+        return llvm::None;
+      });
 }
 
 CanType
@@ -707,41 +693,23 @@ GenericEnvironment::mapContextualPackTypeIntoElementContext(CanType type) const 
   return CanType(mapContextualPackTypeIntoElementContext(Type(type)));
 }
 
+/// Unlike mapContextualPackTypeIntoElementContext(), this also applies outer
+/// substitutions, so it behaves like mapTypeIntoContext() in that respect.
 Type
 GenericEnvironment::mapPackTypeIntoElementContext(Type type) const {
   assert(getKind() == Kind::OpenedElement);
   assert(!type->hasArchetype());
 
-  auto sig = getGenericSignature();
-  auto shapeClass = getOpenedElementShapeClass();
+  if (!type->hasTypeParameter()) return type;
 
-  FindElementArchetypeForOpenedPackParam
-    findElementArchetype(this, getOpenedPackParams());
+  // Get a contextual type in the original generic environment, not the
+  // substituted one, which is what mapContextualPackTypeIntoElementContext()
+  // expects.
+  auto contextualType = getPackElementContextSubstitutions()
+    .getGenericSignature().getGenericEnvironment()->mapTypeIntoContext(type);
 
-  // Map the interface type to the element type by stripping
-  // away the isParameterPack bit before mapping type parameters
-  // to archetypes.
-  return type.transformRec([&](TypeBase *ty) -> Optional<Type> {
-    // We're only directly substituting pack parameters.
-    if (!ty->isTypeParameter()) {
-      // Don't recurse into nested pack expansions; just map it into
-      // context.
-      if (ty->is<PackExpansionType>())
-        return mapTypeIntoContext(ty);
-
-      // Recurse into any other type.
-      return None;
-    }
-
-    // Just do normal mapping for types that are not rooted in
-    // opened type parameters.
-    auto rootParam = ty->getRootGenericParam();
-    if (!rootParam->isParameterPack() ||
-        !sig->haveSameShape(rootParam, shapeClass))
-      return mapTypeIntoContext(ty);
-
-    return Type(findElementArchetype(ty));
-  });
+  contextualType = mapContextualPackTypeIntoElementContext(contextualType);
+  return maybeApplyOuterContextSubstitutions(contextualType);
 }
 
 Type
@@ -787,16 +755,19 @@ GenericEnvironment::mapElementTypeIntoPackContext(Type type) const {
   // Map element archetypes to the pack archetypes by converting
   // element types to interface types and adding the isParameterPack
   // bit. Then, map type parameters to archetypes.
-  return type.subst([&](SubstitutableType *type) {
-    auto *genericParam = type->getAs<GenericTypeParamType>();
-    if (!genericParam)
-      return Type();
+  return type.subst(
+      [&](SubstitutableType *type) {
+        auto *genericParam = type->getAs<GenericTypeParamType>();
+        if (!genericParam)
+          return Type();
 
-    if (auto *packParam = packParamForElement[{genericParam}])
-      return substitutions(packParam);
+        if (auto *packParam = packParamForElement[{genericParam}])
+          return substitutions(packParam);
 
-    return substitutions(genericParam);
-  }, LookUpConformanceInSignature(sig.getPointer()));
+        return substitutions(genericParam);
+      },
+      LookUpConformanceInSignature(sig.getPointer()),
+      SubstFlags::PreservePackExpansionLevel);
 }
 
 namespace {

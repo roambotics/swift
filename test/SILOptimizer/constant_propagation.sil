@@ -102,6 +102,25 @@ bb0:
 // CHECK-NEXT: return [[RES]] : $Builtin.Int64
 }
 
+// Compute an expression using a chain of arithmetic with non-overflowing instructions: 2 * (2 + 3) - 3
+sil @fold_arithmetic_without_overflow : $@convention(thin) () -> Builtin.Int64 {
+bb0:
+ %0 = integer_literal $Builtin.Int64, 2
+ %110 = integer_literal $Builtin.Int64, 3
+ %19 = builtin "add_Int64"(%0 : $Builtin.Int64, %110 : $Builtin.Int64) : $Builtin.Int64
+ %21 = builtin "mul_Int64"(%0 : $Builtin.Int64, %19 : $Builtin.Int64) : $Builtin.Int64
+ %23 = builtin "sub_Int64"(%21 : $Builtin.Int64, %110 : $Builtin.Int64) : $Builtin.Int64
+ return %23 : $Builtin.Int64
+
+// CHECK-LABEL: sil @fold_arithmetic_without_overflow
+// CHECK-NOT: integer_literal $Builtin.Int64, 2
+// CHECK-NOT: integer_literal $Builtin.Int64, 3
+// CHECK-NOT: integer_literal $Builtin.Int64, 0
+// CHECK-NOT: builtin
+// CHECK: [[RES:%.*]] = integer_literal $Builtin.Int64, 7
+// CHECK-NEXT: return [[RES]] : $Builtin.Int64
+}
+
 // Fold casts. (This test assumes that DCE does not run, otherwise the unreachable blocks will get removed.)
 sil @fold_trunc : $@convention(thin) () -> Builtin.Int64 {
 bb0:
@@ -1046,7 +1065,7 @@ class BClass : AClass {}
 sil @test_checked_cast_br_thick_class_type : $@convention(thin) (@thin P.Protocol) -> Builtin.Int1 {
 bb0(%0 : $@thin P.Protocol):
   %2 = metatype $@thick BClass.Type
-  checked_cast_br %2 : $@thick BClass.Type to AClass.Type, bb1, bb2
+  checked_cast_br BClass.Type in %2 : $@thick BClass.Type to AClass.Type, bb1, bb2
 
 bb1(%5 : $@thick AClass.Type):
   debug_value %5 : $@thick AClass.Type, let, name "type"

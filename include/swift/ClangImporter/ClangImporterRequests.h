@@ -296,7 +296,7 @@ private:
  public:
    // Separate caching.
    bool isCached() const { return true; }
-   Optional<ObjCInterfaceAndImplementation> getCachedResult() const;
+   llvm::Optional<ObjCInterfaceAndImplementation> getCachedResult() const;
    void cacheResult(ObjCInterfaceAndImplementation value) const;
 };
 
@@ -306,13 +306,8 @@ enum class CxxRecordSemanticsKind {
   MoveOnly,
   Reference,
   Iterator,
-  // An API that has be annotated as explicitly unsafe, but still importable.
-  // TODO: we should rename these APIs.
-  ExplicitlyUnsafe,
   // A record that is either not copyable or not destructible.
   MissingLifetimeOperation,
-  // A record that contains a pointer (aka non-trivial type).
-  UnsafePointerMember,
   // A C++ record that represents a Swift class type exposed to C++ from Swift.
   SwiftClassType
 };
@@ -413,12 +408,9 @@ SourceLoc extractNearestSourceLoc(SafeUseOfCxxDeclDescriptor desc);
 
 class IsSafeUseOfCxxDecl
     : public SimpleRequest<IsSafeUseOfCxxDecl, bool(SafeUseOfCxxDeclDescriptor),
-                           RequestFlags::Cached> {
+                           RequestFlags::Uncached> {
 public:
   using SimpleRequest::SimpleRequest;
-
-  // Caching
-  bool isCached() const { return true; }
 
   // Source location
   SourceLoc getNearestLoc() const { return SourceLoc(); };

@@ -477,7 +477,7 @@ public:
         // For @objc enums, we serialize the pre-type-checked integer
         // literal raw values, and thus when they are deserialized
         // they do not have a type on them.
-        if (!isa<IntegerLiteralExpr>(E)) {
+        if (!isa<IntegerLiteralExpr>(E) && !isa<MacroExpansionExpr>(E)) {
           Out << "expression has no type\n";
           E->dump(Out);
           abort();
@@ -486,7 +486,7 @@ public:
       return true;
     }
     bool shouldVerifyChecked(Stmt *S) { return true; }
-    bool shouldVerifyChecked(Pattern *S) { return S->hasType(); }
+    bool shouldVerifyChecked(Pattern *S) { return true; }
     bool shouldVerifyChecked(Decl *S) { return true; }
 
     // Only verify functions if they have bodies we can safely walk.
@@ -496,7 +496,6 @@ public:
       switch (afd->getBodyKind()) {
       case AbstractFunctionDecl::BodyKind::None:
       case AbstractFunctionDecl::BodyKind::TypeChecked:
-      case AbstractFunctionDecl::BodyKind::Skipped:
       case AbstractFunctionDecl::BodyKind::SILSynthesize:
       case AbstractFunctionDecl::BodyKind::Deserialized:
         return true;
@@ -582,8 +581,14 @@ public:
         return;
       }
     }
+    void verifyChecked(Pattern *P) {
+      if (!P->hasType()) {
+        Out << "pattern has no type\n";
+        P->dump(Out);
+        abort();
+      }
+    }
     void verifyChecked(Stmt *S) {}
-    void verifyChecked(Pattern *P) { }
     void verifyChecked(Decl *D) {}
 
     void verifyChecked(Type type) {
@@ -608,8 +613,7 @@ public:
         auto countType = expansion->getCountType();
         if (!(countType->is<PackType>() ||
               countType->is<PackArchetypeType>() ||
-              (countType->is<GenericTypeParamType>() &&
-               countType->castTo<GenericTypeParamType>()->isParameterPack()))) {
+              countType->isRootParameterPack())) {
           Out << "non-pack shape type" << countType->getString() << "\n";
           abort();
         }
@@ -769,6 +773,7 @@ public:
     FUNCTION_LIKE(FuncDecl)
     FUNCTION_LIKE(EnumElementDecl)
     FUNCTION_LIKE(SubscriptDecl)
+    FUNCTION_LIKE(MacroDecl)
     TYPE_LIKE(NominalTypeDecl)
     TYPE_LIKE(ExtensionDecl)
 
@@ -1008,9 +1013,15 @@ public:
     }
 
     void verifyChecked(ThrowStmt *S) {
-      checkSameType(S->getSubExpr()->getType(),
-                    checkExceptionTypeExists("throw expression"),
-                    "throw operand");
+      Type thrownError;
+      if (!Functions.empty()) {
+        if (auto fn = AnyFunctionRef::fromDeclContext(Functions.back()))
+          thrownError = fn->getThrownErrorType();
+      }
+
+      if (!thrownError)
+        thrownError = checkExceptionTypeExists("throw expression");
+      checkSameType(S->getSubExpr()->getType(), thrownError, "throw operand");
       verifyCheckedBase(S);
     }
 
@@ -1208,7 +1219,7 @@ public:
     void verifyChecked(SingleValueStmtExpr *E) {
       using Kind = IsSingleValueStmtResult::Kind;
       switch (E->getStmt()->mayProduceSingleValue(Ctx).getKind()) {
-      case Kind::NoExpressionBranches:
+      case Kind::NoResult:
         // These are allowed as long as the type is Void.
         checkSameType(
             E->getType(), Ctx.getVoidType(),

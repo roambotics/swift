@@ -24,6 +24,13 @@ import Swift
 /// operation is running code that never checks for cancellation, a cancellation
 /// handler still runs and provides a chance to run some cleanup code.
 ///
+/// Cancellation handlers which acquire locks must take care to avoid deadlock.
+/// The cancellation handler may be invoked while holding internal locks
+/// associated with the task or other tasks.  Other operations on the task, such
+/// as resuming a continuation, may acquire these same internal locks.
+/// Therefore, if a cancellation handler must acquire a lock, other code should
+/// not cancel tasks or resume continuations while holding that lock.
+///
 /// Doesn't check for cancellation, and always executes the passed `operation`.
 ///
 /// The `operation` executes on the calling execution context and does not suspend by itself,
@@ -38,7 +45,7 @@ import Swift
 /// the operation gets to run.
 @_unsafeInheritExecutor // the operation runs on the same executor as we start out with
 @available(SwiftStdlib 5.1, *)
-@_backDeploy(before: SwiftStdlib 5.8)
+@backDeployed(before: SwiftStdlib 5.8)
 public func withTaskCancellationHandler<T>(
   operation: () async throws -> T,
   onCancel handler: @Sendable () -> Void
@@ -46,14 +53,9 @@ public func withTaskCancellationHandler<T>(
   // unconditionally add the cancellation record to the task.
   // if the task was already cancelled, it will be executed right away.
   let record = _taskAddCancellationHandler(handler: handler)
-  do {
-    let result = try await operation()
-    _taskRemoveCancellationHandler(record: record)
-    return result
-  } catch {
-    _taskRemoveCancellationHandler(record: record)
-    throw error
-  }
+  defer { _taskRemoveCancellationHandler(record: record) }
+
+  return try await operation()
 }
 
 @available(SwiftStdlib 5.1, *)

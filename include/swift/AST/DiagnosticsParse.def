@@ -309,6 +309,9 @@ ERROR(observing_accessor_in_subscript,none,
 ERROR(getset_cannot_be_implied,none,
       "variable with implied type cannot have implied getter/setter", ())
 
+ERROR(init_accessor_expected_name,none,
+      "expected property name in init accessor effect", ())
+
 // Import
 ERROR(decl_expected_module_name,none,
       "expected module name in import declaration", ())
@@ -424,6 +427,8 @@ ERROR(initializer_result_type,PointsToFirstBadToken,
 // Destructor
 ERROR(destructor_decl_outside_class_or_noncopyable,none,
       "deinitializers may only be declared within a class, actor, or noncopyable type", ())
+ERROR(destructor_decl_on_noncopyable_enum,none,
+      "deinitializers are not yet supported on noncopyable enums", ())
 ERROR(destructor_decl_on_objc_enum,none,
       "deinitializers cannot be declared on an @objc enum type", ())
 ERROR(expected_lbrace_destructor,PointsToFirstBadToken,
@@ -459,7 +464,8 @@ ERROR(operator_decl_no_fixity,none,
       "operator must be declared as 'prefix', 'postfix', or 'infix'", ())
 ERROR(operator_decl_expected_precedencegroup, none,
       "expected precedence group name after ':' in operator declaration", ())
-
+ERROR(operator_decl_should_not_contain_other_attributes, none, 
+      "unexpected attribute %0 in operator declaration", (StringRef))
 WARNING(operator_decl_remove_designated_types,none,
         "designated types are no longer used by the compiler; please remove "
         "the designated type list from this operator declaration", ())
@@ -539,7 +545,7 @@ ERROR(expected_sil_profiler_counter_total,none,
       "expected profiler counter total", ())
 ERROR(expected_sil_profiler_counter_hash,none,
       "expected profiler counter hash", ())
-ERROR(expected_sil_test_specification_body,none,
+ERROR(expected_sil_specify_test_body,none,
       "expected a string consisting of the space-separated test arguments", ())
 
 // SIL Values
@@ -600,7 +606,11 @@ ERROR(sil_ref_inst_wrong_field,none,
 ERROR(sil_invalid_instr_operands,none,
       "invalid instruction operands", ())
 ERROR(sil_operand_not_address,none,
-      "%0 operand of '%1' must have address type", (StringRef, StringRef))
+      "%0 of '%1' must have address type", (StringRef, StringRef))
+ERROR(sil_operand_not_object,none,
+      "%0 of '%1' must have object type", (StringRef, StringRef))
+ERROR(sil_operand_has_incorrect_moveonlywrapped,none,
+      "%0 of '%1' %select{must|must not}2 be of moveonlywrapped type", (StringRef, StringRef, unsigned))
 ERROR(sil_operand_not_ref_storage_address,none,
       "%0 operand of '%1' must have address of %2 type",
       (StringRef, StringRef, ReferenceOwnership))
@@ -670,7 +680,7 @@ ERROR(sil_movevalue_invalid_optional_attribute,none,
 ERROR(sil_markmustcheck_invalid_attribute,none,
       "Attribute '[%0]' can not be applied to mark_value_as_moveonly", (StringRef))
 ERROR(sil_markmustcheck_requires_attribute,none,
-      "mark_must_check requires an attribute like 'noImplicitCopy'", ())
+      "mark_unresolved_non_copyable_value requires an attribute like 'noImplicitCopy'", ())
 ERROR(sil_moveonlytocopyable_invalid_attribute,none,
       "Attribute '[%0]' can not be applied to moveonlywrapper_to_copyable", (StringRef))
 ERROR(sil_moveonlytocopyable_requires_attribute,none,
@@ -908,6 +918,8 @@ ERROR(sil_box_expected_r_brace,none,
       "expected '}' to complete SIL box field type list", ())
 ERROR(sil_box_expected_r_angle,none,
       "expected '>' to complete SIL box generic argument list", ())
+ERROR(sil_box_expected,none,
+      "%0 expects its operand to be of SIL box field type", (StringRef))
 
 // SIL function types
 ERROR(sil_function_subst_expected_l_angle,none,
@@ -940,6 +952,19 @@ ERROR(expected_rparen_layout_constraint,none,
       "expected ')' to complete layout constraint", ())
 ERROR(layout_constraints_only_inside_specialize_attr,none,
       "layout constraints are only allowed inside '_specialize' attributes", ())
+
+//------------------------------------------------------------------------------
+// MARK: Conformance suppression diagnostics
+//------------------------------------------------------------------------------
+
+ERROR(cannot_suppress_here,none,
+      "cannot suppress conformances here", ())
+
+ERROR(only_suppress_copyable,none,
+      "can only suppress 'Copyable'", ())
+
+ERROR(already_suppressed,none,
+      "duplicate suppression of %0", (Identifier))
 
 //------------------------------------------------------------------------------
 // MARK: Pattern parsing diagnostics
@@ -1076,9 +1101,9 @@ NOTE(indent_expression_to_silence,none,
 ERROR(expected_expr_throw,PointsToFirstBadToken,
       "expected expression in 'throw' statement", ())
 
-// Forget Statement
-ERROR(expected_expr_forget,PointsToFirstBadToken,
-      "expected expression in 'forget' statement", ())
+// Discard Statement
+ERROR(expected_expr_discard,PointsToFirstBadToken,
+      "expected expression in 'discard' statement", ())
 
 // Await/Async
 ERROR(expected_await_not_async,none,
@@ -1219,8 +1244,9 @@ ERROR(case_stmt_without_body,none,
 // 'try' on statements
 ERROR(try_on_stmt,none,
       "'try' cannot be used with '%0'", (StringRef))
-ERROR(try_on_return_throw_yield,none,
-      "'try' must be placed on the %select{returned|thrown|yielded}0 expression",
+ERROR(try_must_come_after_stmt,none,
+      "'try' must be placed on the %select{returned|thrown|yielded|produced}0 "
+      "expression",
       (unsigned))
 ERROR(try_on_var_let,none,
       "'try' must be placed on the initial value expression", ())
@@ -1366,8 +1392,20 @@ ERROR(expected_expr_after_await, none,
       "expected expression after 'await'", ())
 ERROR(expected_expr_after_move, none,
       "expected expression after 'consume'", ())
+ERROR(expected_expr_after_copy, none,
+      "expected expression after 'copy'", ())
 ERROR(expected_expr_after_borrow, none,
       "expected expression after '_borrow'", ())
+ERROR(expected_expr_after_each, none,
+      "expected expression after 'each'", ())
+ERROR(expected_expr_after_repeat, none,
+      "expected expression after 'repeat'", ())
+ERROR(expected_expr_after_then,none,
+      "expected expression after 'then'", ())
+
+WARNING(unindented_code_after_then,none,
+        "expression following 'then' is treated as an argument of "
+        "the 'then'", ())
 
 WARNING(move_consume_final_spelling, none,
         "'_move' has been renamed to 'consume', and the '_move' spelling will be removed shortly", ())
@@ -1652,6 +1690,13 @@ ERROR(attr_type_eraser_expected_type_name,none,
 ERROR(attr_type_eraser_expected_rparen,none,
       "expected ')' after type name for @_typeEraser", ())
 
+ERROR(expected_thrown_error_type,none,
+      "expected thrown error type after 'throws('", ())
+ERROR(expected_rparen_after_thrown_error_type,none,
+      "expected ')' after thrown error type", ())
+ERROR(rethrows_with_thrown_error,none,
+      "'rethrows' cannot be combined with a specific thrown error type", ())
+
 ERROR(attr_private_import_expected_rparen,none,
       "expected ')' after function name for @_private", ())
 ERROR(attr_private_import_expected_sourcefile, none,
@@ -1810,6 +1855,17 @@ ERROR(documentation_attr_metadata_expected_text,none,
       ())
 ERROR(documentation_attr_duplicate_metadata,none,
       "cannot give more than one metadata argument to the same item", ())
+
+ERROR(attr_rawlayout_expected_label,none,
+      "expected %0 argument to @_rawLayout attribute", (StringRef))
+ERROR(attr_rawlayout_expected_integer_size,none,
+      "expected integer literal size in @_rawLayout attribute", ())
+ERROR(attr_rawlayout_expected_integer_alignment,none,
+      "expected integer literal alignment in @_rawLayout attribute", ())
+ERROR(attr_rawlayout_expected_integer_count,none,
+      "expected integer literal count in @_rawLayout attribute", ())
+ERROR(attr_rawlayout_expected_params,none,
+      "expected %1 argument after %0 argument in @_rawLayout attribute", (StringRef, StringRef))
 
 //------------------------------------------------------------------------------
 // MARK: Generics parsing diagnostics
@@ -2026,10 +2082,6 @@ ERROR(foreign_diagnostic,none,
 //------------------------------------------------------------------------------
 // MARK: macros
 //------------------------------------------------------------------------------
-ERROR(expected_macro_value_type,PointsToFirstBadToken,
-      "expected macro value type following ':'", ())
-ERROR(no_default_arg_macro,none,
-      "default arguments are not allowed in macros", ())
 ERROR(expected_lparen_macro,PointsToFirstBadToken,
       "expected '(' for macro parameters or ':' for a value-like macro", ())
 ERROR(expected_type_macro_result,PointsToFirstBadToken,
@@ -2041,29 +2093,32 @@ ERROR(macro_expansion_expr_expected_macro_identifier,PointsToFirstBadToken,
       "expected a macro identifier for a pound literal expression", ())
 ERROR(macro_expansion_decl_expected_macro_identifier,PointsToFirstBadToken,
       "expected a macro identifier for a pound literal declaration", ())
-
-ERROR(declaration_attr_expected_kind,PointsToFirstBadToken,
-      "expected a declaration macro kind ('freestanding' or 'attached')", ())
+ERROR(extra_whitespace_macro_expansion_identifier,PointsToFirstBadToken,
+      "extraneous whitespace between '#' and macro name is not permitted", ())
 
 ERROR(macro_role_attr_expected_kind,PointsToFirstBadToken,
       "expected %select{a freestanding|an attached}0 macro role such as "
       "%select{'expression'|'accessor'}0", (bool))
+ERROR(macro_role_attr_expected_attached_kind,PointsToFirstBadToken,
+      "expected an attached macro role such as 'peer'", ())
+ERROR(macro_role_attr_expected_freestanding_kind,PointsToFirstBadToken,
+      "expected a freestanding macro role such as 'expression'", ())
 ERROR(macro_role_syntax_mismatch,PointsToFirstBadToken,
-      "expected %select{a freestanding|an attached}0 macro cannot have "
-      "the %1 role", (bool, Identifier))
+      "%select{a freestanding|an attached}0 macro cannot have the %1 role",
+      (bool, Identifier))
 ERROR(macro_attribute_unknown_label,PointsToFirstBadToken,
       "@%select{freestanding|attached}0 has no argument with label %1",
       (bool, Identifier))
 ERROR(macro_attribute_duplicate_label,PointsToFirstBadToken,
       "@%select{freestanding|attached}0 already has an argument with "
-      "label %1", (bool, Identifier))
-ERROR(macro_attribute_missing_label,PointsToFirstBadToken,
+      "label %1", (bool, StringRef))
+ERROR(macro_attribute_missing_label,none,
       "@%select{freestanding|attached}0 argument is missing label '%1'",
       (bool, StringRef))
 ERROR(macro_attribute_unknown_name_kind,PointsToFirstBadToken,
       "unknown introduced name kind %0", (Identifier))
 ERROR(macro_attribute_unknown_argument_form,PointsToFirstBadToken,
-      "introduced name argument should be an identifier", ())
+      "introduced name argument should be a name", ())
 ERROR(macro_attribute_introduced_name_requires_argument,PointsToFirstBadToken,
       "introduced name kind %0 requires a single argument '(name)'", (Identifier))
 ERROR(macro_attribute_introduced_name_requires_no_argument,PointsToFirstBadToken,
@@ -2072,10 +2127,10 @@ WARNING(macro_expression_attribute_removed,PointsToFirstBadToken,
       "@expression has been removed in favor of @freestanding(expression)", ())
 
 ERROR(unexpected_attribute_expansion,PointsToFirstBadToken,
-      "unexpected token '%0' in expanded attribute list'",
+      "unexpected token '%0' in expanded attribute list",
       (StringRef))
 ERROR(unexpected_member_expansion,PointsToFirstBadToken,
-      "unexpected token '%0' in expanded member list'",
+      "unexpected token '%0' in expanded member list",
       (StringRef))
 
 ERROR(parser_round_trip_error,none,
@@ -2089,6 +2144,26 @@ ERROR(sil_markuncheckedreferencebinding_requires_attribute,none,
       "mark_unchecked_reference_binding requires an attribute like [inout]", ())
 ERROR(sil_markuncheckedreferencebinding_invalid_attribute,none,
       "Attribute '[%0]' can not be applied to mark_unchecked_reference_binding", (StringRef))
+
+//------------------------------------------------------------------------------
+// MARK: Init accessors
+//------------------------------------------------------------------------------
+
+ERROR(init_accessor_is_not_on_property,none,
+      "init accessors could only be associated with properties",
+      ())
+
+ERROR(missing_storage_restrictions_attr_label,none,
+      "missing label in @storageRestrictions attribute", ())
+
+ERROR(invalid_storage_restrictions_attr_label,none,
+      "unexpected label %0 in @storageRestrictions attribute", (Identifier))
+
+ERROR(duplicate_storage_restrictions_attr_label,none,
+      "duplicate label %0 in @storageRestrictions attribute", (Identifier))
+
+ERROR(storage_restrictions_attr_expected_name,none,
+      "expected property name in @storageRestrictions list", ())
 
 #define UNDEFINE_DIAGNOSTIC_MACROS
 #include "DefineDiagnosticMacros.h"

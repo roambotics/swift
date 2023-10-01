@@ -107,11 +107,11 @@ static StringRef getLinkerPlatformName(uint8_t Id) {
   }
 }
 
-static Optional<uint8_t> getLinkerPlatformId(StringRef Platform) {
-  return llvm::StringSwitch<Optional<uint8_t>>(Platform)
+static llvm::Optional<uint8_t> getLinkerPlatformId(StringRef Platform) {
+  return llvm::StringSwitch<llvm::Optional<uint8_t>>(Platform)
 #define LD_PLATFORM(Name, Id) .Case(#Name, Id)
 #include "ldPlatformKinds.def"
-    .Default(None);
+      .Default(llvm::None);
 }
 
 StringRef InstallNameStore::getInstallName(LinkerPlatformId Id) const {
@@ -156,7 +156,7 @@ parseEntry(ASTContext &Ctx,
       auto *MN = cast<MappingNode>(&*It);
       std::string ModuleName;
       std::string InstallName;
-      Optional<std::set<int8_t>> Platforms;
+      llvm::Optional<std::set<int8_t>> Platforms;
       for (auto &Pair: *MN) {
         auto Key = getScalaNodeText(Pair.getKey());
         auto* Value = Pair.getValue();
@@ -268,13 +268,13 @@ getLinkerPlatformName(OriginallyDefinedInAttr::ActiveVersion Ver) {
 
 /// Find the most relevant introducing version of the decl stack we have visited
 /// so far.
-static Optional<llvm::VersionTuple>
-getInnermostIntroVersion(ArrayRef<Decl*> DeclStack, PlatformKind Platform) {
+static llvm::Optional<llvm::VersionTuple>
+getInnermostIntroVersion(ArrayRef<Decl *> DeclStack, PlatformKind Platform) {
   for (auto It = DeclStack.rbegin(); It != DeclStack.rend(); ++ It) {
     if (auto Result = (*It)->getIntroducedOSVersion(Platform))
       return Result;
   }
-  return None;
+  return llvm::None;
 }
 
 /// Using the introducing version of a symbol as the start version to redirect
@@ -332,7 +332,7 @@ void TBDGenVisitor::addLinkerDirectiveSymbolsLdPrevious(StringRef name,
     OS << InstallName << "$";
     OS << ComptibleVersion << "$";
     OS << std::to_string((uint8_t)PlatformNumber) << "$";
-    static auto getMinor = [](Optional<unsigned> Minor) {
+    static auto getMinor = [](llvm::Optional<unsigned> Minor) {
       return Minor.has_value() ? *Minor : 0;
     };
     auto verStart = calculateLdPreviousVersionStart(Ctx, *IntroVer);
@@ -414,6 +414,9 @@ void TBDGenVisitor::addSymbol(StringRef name, SymbolSource source,
 }
 
 bool TBDGenVisitor::willVisitDecl(Decl *D) {
+  if (!D->isAvailableDuringLowering())
+    return false;
+
   // A @_silgen_name("...") function without a body only exists to
   // forward-declare a symbol from another library.
   if (auto AFD = dyn_cast<AbstractFunctionDecl>(D))
@@ -438,9 +441,8 @@ void TBDGenVisitor::addFunction(StringRef name, SILDeclRef declRef) {
 }
 
 void TBDGenVisitor::addGlobalVar(VarDecl *VD) {
-  // FIXME: We ought to have a symbol source for this.
   Mangle::ASTMangler mangler;
-  addSymbol(mangler.mangleEntity(VD), SymbolSource::forUnknown());
+  addSymbol(mangler.mangleEntity(VD), SymbolSource::forGlobal(VD));
 }
 
 void TBDGenVisitor::addLinkEntity(LinkEntity entity) {
@@ -469,9 +471,16 @@ void TBDGenVisitor::addProtocolWitnessThunk(RootProtocolConformance *C,
                                             ValueDecl *requirementDecl) {
   Mangle::ASTMangler Mangler;
 
+  std::string decorated = Mangler.mangleWitnessThunk(C, requirementDecl);
   // FIXME: We should have a SILDeclRef SymbolSource for this.
-  addSymbol(Mangler.mangleWitnessThunk(C, requirementDecl),
-            SymbolSource::forUnknown());
+  addSymbol(decorated, SymbolSource::forUnknown());
+
+  if (requirementDecl->isProtocolRequirement()) {
+    ValueDecl *PWT = C->getWitness(requirementDecl).getDecl();
+    if (const auto *AFD = dyn_cast<AbstractFunctionDecl>(PWT))
+      if (AFD->hasAsync())
+        addSymbol(decorated + "Tu", SymbolSource::forUnknown());
+  }
 }
 
 void TBDGenVisitor::addFirstFileSymbols() {
@@ -544,18 +553,18 @@ enum DylibVersionKind_t: unsigned {
 /// If an individual component is greater than the highest number that can be
 /// represented in its alloted space, it will be truncated to the maximum value
 /// that fits in the alloted space, which matches the behavior of the linker.
-static Optional<llvm::MachO::PackedVersion>
+static llvm::Optional<llvm::MachO::PackedVersion>
 parsePackedVersion(DylibVersionKind_t kind, StringRef versionString,
                    ASTContext &ctx) {
   if (versionString.empty())
-    return None;
+    return llvm::None;
 
   llvm::MachO::PackedVersion version;
   auto result = version.parse64(versionString);
   if (!result.first) {
     ctx.Diags.diagnose(SourceLoc(), diag::tbd_err_invalid_version,
                        (unsigned)kind, versionString);
-    return None;
+    return llvm::None;
   }
   if (result.second) {
     ctx.Diags.diagnose(SourceLoc(), diag::tbd_warn_truncating_version,
@@ -596,13 +605,14 @@ TBDFile GenerateTBDRequest::evaluate(Evaluator &evaluator,
 
   llvm::MachO::Target target(ctx.LangOpts.Target);
   file.addTarget(target);
+  llvm::MachO::TargetList targets{target};
   // Add target variant
   if (ctx.LangOpts.TargetVariant.has_value()) {
     llvm::MachO::Target targetVar(*ctx.LangOpts.TargetVariant);
     file.addTarget(targetVar);
+    targets.push_back(targetVar);
   }
 
-  llvm::MachO::TargetList targets{target};
   auto addSymbol = [&](StringRef symbol, SymbolKind kind, SymbolSource source) {
     file.addSymbol(kind, symbol, targets);
   };
@@ -844,24 +854,24 @@ void swift::writeAPIJSONFile(ModuleDecl *M, llvm::raw_ostream &os,
 
 /// NOTE: This is part of an incomplete experimental feature. There are
 /// currently no clients that depend on its output.
-SymbolSourceMap SymbolSourceMapRequest::evaluate(Evaluator &evaluator,
-                                                 TBDGenDescriptor desc) const {
-  using Map = SymbolSourceMap::Storage;
-  Map symbolSources;
+const SymbolSourceMap *
+SymbolSourceMapRequest::evaluate(Evaluator &evaluator,
+                                 TBDGenDescriptor desc) const {
 
-  auto addSymbol = [&](StringRef symbol, SymbolKind kind, SymbolSource source) {
-    symbolSources.insert({symbol, source});
+  // FIXME: Once the evaluator supports returning a reference to a cached value
+  // in storage, this won't be necessary.
+  auto &Ctx = desc.getParentModule()->getASTContext();
+  auto *SymbolSources = Ctx.Allocate<SymbolSourceMap>();
+
+  auto addSymbol = [=](StringRef symbol, SymbolKind kind, SymbolSource source) {
+    SymbolSources->insert({symbol, source});
   };
 
   SimpleAPIRecorder recorder(addSymbol);
   TBDGenVisitor visitor(desc, recorder);
   visitor.visit(desc);
 
-  // FIXME: Once the evaluator supports returning a reference to a cached value
-  // in storage, this won't be necessary.
-  auto &ctx = desc.getParentModule()->getASTContext();
-  auto *memory = ctx.Allocate<Map>();
-  *memory = std::move(symbolSources);
-  ctx.addCleanup([memory](){ memory->~Map(); });
-  return SymbolSourceMap(memory);
+  Ctx.addCleanup([SymbolSources]() { SymbolSources->~SymbolSourceMap(); });
+
+  return SymbolSources;
 }

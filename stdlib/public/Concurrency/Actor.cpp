@@ -295,14 +295,49 @@ JobPriority swift::swift_task_getCurrentThreadPriority() {
 #endif
 }
 
+// Implemented in Swift to avoid some annoying hard-coding about
+// SerialExecutor's protocol witness table.  We could inline this
+// with effort, though.
+extern "C" SWIFT_CC(swift)
+bool _task_serialExecutor_isSameExclusiveExecutionContext(
+    HeapObject *currentExecutor, HeapObject *executor,
+    const Metadata *selfType,
+    const SerialExecutorWitnessTable *wtable);
+
 SWIFT_CC(swift)
 static bool swift_task_isCurrentExecutorImpl(ExecutorRef executor) {
-  if (auto currentTracking = ExecutorTrackingInfo::current()) {
-    return currentTracking->getActiveExecutor() == executor;
+  auto current = ExecutorTrackingInfo::current();
+
+  if (!current) {
+    // TODO(ktoso): checking the "is main thread" is not correct, main executor can be not main thread, relates to rdar://106188692
+    return executor.isMainExecutor() && isExecutingOnMainThread();
   }
 
-  // TODO(ktoso): checking the "is main thread" is not correct, main executor can be not main thread, relates to rdar://106188692
-  return executor.isMainExecutor() && isExecutingOnMainThread();
+  auto currentExecutor = current->getActiveExecutor();
+  if (currentExecutor == executor) {
+    return true;
+  }
+
+  if (executor.isComplexEquality()) {
+    if (!swift_compareWitnessTables(
+        reinterpret_cast<const WitnessTable*>(currentExecutor.getSerialExecutorWitnessTable()),
+        reinterpret_cast<const  WitnessTable*>(executor.getSerialExecutorWitnessTable()))) {
+      // different witness table, we cannot invoke complex equality call
+      return false;
+    }
+    // Avoid passing nulls to Swift for the isSame check:
+    if (!currentExecutor.getIdentity() || !executor.getIdentity()) {
+      return false;
+    }
+
+    return _task_serialExecutor_isSameExclusiveExecutionContext(
+        currentExecutor.getIdentity(),
+        executor.getIdentity(),
+        swift_getObjectType(currentExecutor.getIdentity()),
+        executor.getSerialExecutorWitnessTable());
+  }
+
+  return false;
 }
 
 /// Logging level for unexpected executors:
@@ -759,7 +794,7 @@ public:
   }
 #endif
 
-  void traceStateChanged(HeapObject *actor) {
+  void traceStateChanged(HeapObject *actor, bool distributedActorIsRemote) {
     // Convert our state to a consistent raw value. These values currently match
     // the enum values, but this explicit conversion provides room for change.
     uint8_t traceState = 255;
@@ -779,7 +814,7 @@ public:
     }
     concurrency::trace::actor_state_changed(
         actor, getFirstJob().getRawJob(), getFirstJob().needsPreprocessing(),
-        traceState, swift_distributed_actor_is_remote((HeapObject *) actor),
+        traceState, distributedActorIsRemote,
         isMaxPriorityEscalated(), static_cast<uint8_t>(getMaxPriority()));
   }
 };
@@ -1000,9 +1035,6 @@ static DefaultActor *asAbstract(DefaultActorImpl *actor) {
 static NonDefaultDistributedActorImpl *asImpl(NonDefaultDistributedActor *actor) {
   return reinterpret_cast<NonDefaultDistributedActorImpl*>(actor);
 }
-static NonDefaultDistributedActor *asAbstract(NonDefaultDistributedActorImpl *actor) {
-  return reinterpret_cast<NonDefaultDistributedActor*>(actor);
-}
 
 /*****************************************************************************/
 /******************** NEW DEFAULT ACTOR IMPLEMENTATION ***********************/
@@ -1141,12 +1173,12 @@ static void traceJobQueue(DefaultActorImpl *actor, Job *first) {
 }
 
 static SWIFT_ATTRIBUTE_ALWAYS_INLINE void traceActorStateTransition(DefaultActorImpl *actor,
-    ActiveActorStatus oldState, ActiveActorStatus newState) {
+    ActiveActorStatus oldState, ActiveActorStatus newState, bool distributedActorIsRemote) {
 
   SWIFT_TASK_DEBUG_LOG("Actor %p transitioned from %#x to %#x (%s)", actor,
                        oldState.getOpaqueFlags(), newState.getOpaqueFlags(),
                        __FUNCTION__);
-  newState.traceStateChanged(actor);
+  newState.traceStateChanged(actor, distributedActorIsRemote);
 }
 
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
@@ -1171,6 +1203,7 @@ void DefaultActorImpl::enqueue(Job *job, JobPriority priority) {
   SWIFT_TASK_DEBUG_LOG("Enqueueing job %p onto actor %p at priority %#zx", job,
                        this, priority);
   concurrency::trace::actor_enqueue(this, job);
+  bool distributedActorIsRemote = swift_distributed_actor_is_remote(this);
   auto oldState = _status().load(std::memory_order_relaxed);
   while (true) {
     auto newState = oldState;
@@ -1198,7 +1231,7 @@ void DefaultActorImpl::enqueue(Job *job, JobPriority priority) {
     if (_status().compare_exchange_weak(oldState, newState,
                    /* success */ std::memory_order_release,
                    /* failure */ std::memory_order_relaxed)) {
-      traceActorStateTransition(this, oldState, newState);
+      traceActorStateTransition(this, oldState, newState, distributedActorIsRemote);
 
       if (!oldState.isScheduled() && newState.isScheduled()) {
         // We took responsibility to schedule the actor for the first time. See
@@ -1241,6 +1274,7 @@ void DefaultActorImpl::enqueueStealer(Job *job, JobPriority priority) {
 
   SWIFT_TASK_DEBUG_LOG("[Override] Escalating an actor %p due to job that is enqueued being escalated", this);
 
+  bool distributedActorIsRemote = swift_distributed_actor_is_remote(this);
   auto oldState = _status().load(std::memory_order_relaxed);
   while (true) {
     // Until we figure out how to safely enqueue a stealer and rendevouz with
@@ -1279,7 +1313,7 @@ void DefaultActorImpl::enqueueStealer(Job *job, JobPriority priority) {
     if (_status().compare_exchange_weak(oldState, newState,
                    /* success */ std::memory_order_relaxed,
                    /* failure */ std::memory_order_relaxed)) {
-      traceActorStateTransition(this, oldState, newState);
+      traceActorStateTransition(this, oldState, newState, distributedActorIsRemote);
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
       if (newState.isRunning()) {
         // Actor is running on a thread, escalate the thread running it
@@ -1309,6 +1343,7 @@ Job * DefaultActorImpl::drainOne() {
   SWIFT_TASK_DEBUG_LOG("Draining one job from default actor %p", this);
 
   // Pairs with the store release in DefaultActorImpl::enqueue
+  bool distributedActorIsRemote = swift_distributed_actor_is_remote(this);
   auto oldState = _status().load(SWIFT_MEMORY_ORDER_CONSUME);
   _swift_tsan_consume(this);
 
@@ -1332,7 +1367,7 @@ Job * DefaultActorImpl::drainOne() {
                             /* success */ std::memory_order_relaxed,
                             /* failure */ std::memory_order_relaxed)) {
       SWIFT_TASK_DEBUG_LOG("Drained first job %p from actor %p", firstJob, this);
-      traceActorStateTransition(this, oldState, newState);
+      traceActorStateTransition(this, oldState, newState, distributedActorIsRemote);
       concurrency::trace::actor_dequeue(this, firstJob);
       return firstJob;
     }
@@ -1521,6 +1556,7 @@ retry:;
   SWIFT_TASK_DEBUG_LOG("Thread attempting to jump onto %p, as drainer = %d", this, asDrainer);
 #endif
 
+  bool distributedActorIsRemote = swift_distributed_actor_is_remote(this);
   auto oldState = _status().load(std::memory_order_relaxed);
   while (true) {
 
@@ -1577,7 +1613,7 @@ retry:;
                                  std::memory_order_acquire,
                                  std::memory_order_relaxed)) {
       _swift_tsan_acquire(this);
-      traceActorStateTransition(this, oldState, newState);
+      traceActorStateTransition(this, oldState, newState, distributedActorIsRemote);
       return true;
     }
   }
@@ -1600,6 +1636,7 @@ bool DefaultActorImpl::unlock(bool forceUnlock)
   this->drainLock.unlock();
   return true;
 #else
+  bool distributedActorIsRemote = swift_distributed_actor_is_remote(this);
   auto oldState = _status().load(std::memory_order_relaxed);
   SWIFT_TASK_DEBUG_LOG("Try unlock-ing actor %p with forceUnlock = %d", this, forceUnlock);
 
@@ -1658,7 +1695,7 @@ bool DefaultActorImpl::unlock(bool forceUnlock)
                       /* success */ std::memory_order_release,
                       /* failure */ std::memory_order_relaxed)) {
       _swift_tsan_release(this);
-      traceActorStateTransition(this, oldState, newState);
+      traceActorStateTransition(this, oldState, newState, distributedActorIsRemote);
 
       if (newState.isScheduled()) {
         // See ownership rule (6) in DefaultActorImpl
@@ -1735,7 +1772,8 @@ static bool isDefaultActorClass(const ClassMetadata *metadata) {
   assert(metadata->isTypeMetadata());
   while (true) {
     // Trust the class descriptor if it says it's a default actor.
-    if (metadata->getDescription()->isDefaultActor()) {
+    if (!metadata->isArtificialSubclass() &&
+        metadata->getDescription()->isDefaultActor()) {
       return true;
     }
 

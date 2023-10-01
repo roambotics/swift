@@ -16,6 +16,9 @@
 // RUN: %target-swift-frontend -typecheck -sdk %t/sdk %t/PublicImports.swift \
 // RUN:   -F %t/sdk/System/Library/PrivateFrameworks/ -module-cache-path %t \
 // RUN:   -library-level api -verify -module-name MainLib
+// RUN: %target-swift-frontend -typecheck -sdk %t/sdk %t/PublicImports.swift \
+// RUN:   -F %t/sdk/System/Library/PrivateFrameworks/ -module-cache-path %t \
+// RUN:   -library-level=api -verify -module-name MainLib
 
 /// Expect no errors when building an SPI client.
 // RUN: %target-swift-frontend -typecheck -sdk %t/sdk %t/PublicImports.swift \
@@ -71,9 +74,14 @@ import LocalClang // expected-error{{private module 'LocalClang' is imported pub
 @_spiOnly import LocalClang
 
 /// Test error message on an unknown library level name.
-// RUN: not %target-swift-frontend -typecheck %s -library-level ThatsNotALibraryLevel 2>&1 \
+// RUN: not %target-swift-frontend -typecheck %t/Empty.swift \
+// RUN:   -library-level ThatsNotALibraryLevel 2>&1 \
+// RUN:   | %FileCheck %s --check-prefix CHECK-ARG
+// RUN: not %target-swift-frontend -typecheck %t/Empty.swift \
+// RUN:   -library-level=ThatsNotALibraryLevel 2>&1 \
 // RUN:   | %FileCheck %s --check-prefix CHECK-ARG
 // CHECK-ARG: error: unknown library level 'ThatsNotALibraryLevel', expected one of 'api', 'spi', 'ipi', or 'other'
+//--- Empty.swift
 
 /// Expect no errors in swiftinterfaces.
 // RUN: %target-swift-typecheck-module-from-interface(%t/Client.private.swiftinterface) \
@@ -142,10 +150,17 @@ private import LocalClang
 // RUN:   -library-level api -verify
 //--- ExplicitlyPublicImports.swift
 public import PublicSwift
+// expected-warning @-1 {{public import of 'PublicSwift' was not used in public declarations or inlinable code}}
 public import PrivateSwift // expected-error{{private module 'PrivateSwift' is imported publicly from the public module 'MainLib'}}
+// expected-warning @-1 {{public import of 'PrivateSwift' was not used in public declarations or inlinable code}}
 
 public import PublicClang
+// expected-warning @-1 {{public import of 'PublicClang' was not used in public declarations or inlinable code}}
 public import PublicClang_Private // expected-error{{private module 'PublicClang_Private' is imported publicly from the public module 'MainLib'}}
+// expected-warning @-1 {{public import of 'PublicClang_Private' was not used in public declarations or inlinable code}}
 public import FullyPrivateClang // expected-error{{private module 'FullyPrivateClang' is imported publicly from the public module 'MainLib'}}
+// expected-warning @-1 {{public import of 'FullyPrivateClang' was not used in public declarations or inlinable code}}
 public import LocalClang // expected-error{{private module 'LocalClang' is imported publicly from the public module 'MainLib'}}
+// expected-warning @-1 {{public import of 'LocalClang' was not used in public declarations or inlinable code}}
 @_exported public import MainLib // expected-warning{{private module 'MainLib' is imported publicly from the public module 'MainLib'}}
+// expected-warning @-1 {{public import of 'MainLib' was not used in public declarations or inlinable code}}

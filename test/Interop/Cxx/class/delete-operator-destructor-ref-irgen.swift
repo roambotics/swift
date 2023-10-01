@@ -24,6 +24,7 @@ public:
 class Container {
 public:
     Container() : pointer(new BaseClass) {}
+    Container(const Container &other) : pointer(new BaseClass) {}
     ~Container() { delete pointer; }
 
     inline int method() const {
@@ -33,6 +34,29 @@ private:
     BaseClass *pointer;
 };
 
+class ForwardClassDecl;
+
+template<class T>
+class ContainerWithForward {
+public:
+    inline ~ContainerWithForward() {
+        if (sizeof(T) > 0)
+            referencedSymbol();
+    }
+};
+
+class ClassWithOutOfLineDestructor {
+public:
+    ~ClassWithOutOfLineDestructor();
+
+    ContainerWithForward<ForwardClassDecl> field;
+};
+
+ClassWithOutOfLineDestructor *getClassWithOutOfLineDestructorValue();
+
+inline void testMethodDestructorFwdDecl() {
+    delete getClassWithOutOfLineDestructorValue();
+}
 
 //--- test.swift
 
@@ -41,6 +65,7 @@ import DestroyedUsingDelete
 public func test() {
   let i = Container()
   i.method()
+  testMethodDestructorFwdDecl()
 }
 
 // Make sure we reach destructor accessible from `delete` statement.

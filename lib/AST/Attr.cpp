@@ -306,7 +306,7 @@ DeclAttributes::getDeprecated(const ASTContext &ctx) const {
       if (AvAttr->isUnconditionallyDeprecated())
         return AvAttr;
 
-      Optional<llvm::VersionTuple> DeprecatedVersion = AvAttr->Deprecated;
+      llvm::Optional<llvm::VersionTuple> DeprecatedVersion = AvAttr->Deprecated;
       if (!DeprecatedVersion.has_value())
         continue;
 
@@ -344,7 +344,7 @@ DeclAttributes::getSoftDeprecated(const ASTContext &ctx) const {
           !AvAttr->isPackageDescriptionVersionSpecific())
         continue;
 
-      Optional<llvm::VersionTuple> DeprecatedVersion = AvAttr->Deprecated;
+      llvm::Optional<llvm::VersionTuple> DeprecatedVersion = AvAttr->Deprecated;
       if (!DeprecatedVersion.has_value())
         continue;
 
@@ -548,8 +548,7 @@ static void printShortFormBackDeployed(ArrayRef<const DeclAttribute *> Attrs,
                                        ASTPrinter &Printer,
                                        const PrintOptions &Options) {
   assert(!Attrs.empty());
-  // TODO: Print `@backDeployed` in swiftinterfaces (rdar://104920183)
-  Printer << "@_backDeploy(before: ";
+  Printer << "@backDeployed(before: ";
   bool isFirst = true;
 
   for (auto *DA : Attrs) {
@@ -790,6 +789,15 @@ void DeclAttributes::print(ASTPrinter &Printer, const PrintOptions &Options,
     if (Options.excludeAttrKind(DA->getKind()))
       continue;
 
+    // If we're supposed to suppress expanded macros, check whether this is
+    // a macro.
+    if (Options.SuppressExpandedMacros) {
+      if (auto customAttr = dyn_cast<CustomAttr>(DA)) {
+        if (D->getResolvedMacro(const_cast<CustomAttr *>(customAttr)))
+          continue;
+      }
+    }
+
     // If this attribute is only allowed because this is a Clang decl, don't
     // print it.
     if (D && D->hasClangNode()
@@ -851,12 +859,21 @@ SourceLoc DeclAttributes::getStartLoc(bool forModifiers) const {
   return lastAttr ? lastAttr->getRangeWithAt().Start : SourceLoc();
 }
 
-OrigDeclAttributes::OrigDeclAttributes(DeclAttributes allAttributes, ModuleDecl *mod) {
-  for (auto *attr : allAttributes) {
-    if (!mod->isInGeneratedBuffer(attr->AtLoc)) {
-      attributes.emplace_back(attr);
-    }
-  }
+llvm::Optional<const DeclAttribute *>
+OrigDeclAttrFilter::operator()(const DeclAttribute *Attr) const {
+  auto declLoc = decl->getStartLoc();
+  auto *mod = decl->getModuleContext();
+  auto *declFile = mod->getSourceFileContainingLocation(declLoc);
+  auto *attrFile = mod->getSourceFileContainingLocation(Attr->getLocation());
+  if (!declFile || !attrFile)
+    return Attr;
+
+  // Only attributes in the same buffer as the declaration they're attached to
+  // are part of the original attribute list.
+  if (declFile->getBufferID() != attrFile->getBufferID())
+    return llvm::None;
+
+  return Attr;
 }
 
 static void printAvailableAttr(const AvailableAttr *Attr, ASTPrinter &Printer,
@@ -1105,12 +1122,25 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     Printer << "@_cdecl(\"" << cast<CDeclAttr>(this)->Name << "\")";
     break;
 
-  case DAK_Expose:
+  case DAK_Expose: {
     Printer.printAttrName("@_expose");
-    Printer << "(Cxx";
+    auto Attr = cast<ExposeAttr>(this);
+    switch (Attr->getExposureKind()) {
+    case ExposureKind::Wasm:
+      Printer << "(wasm";
+      break;
+    case ExposureKind::Cxx:
+      Printer << "(Cxx";
+      break;
+    }
     if (!cast<ExposeAttr>(this)->Name.empty())
       Printer << ", \"" << cast<ExposeAttr>(this)->Name << "\"";
     Printer << ")";
+    break;
+  }
+  case DAK_Section:
+    Printer.printAttrName("@_section");
+    Printer << "(\"" << cast<SectionAttr>(this)->Name << "\")";
     break;
 
   case DAK_ObjC: {
@@ -1176,12 +1206,13 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
       }
     }
     SmallVector<Requirement, 4> requirementsScratch;
-    auto requirements = attr->getSpecializedSignature().getRequirements();
     auto *FnDecl = dyn_cast_or_null<AbstractFunctionDecl>(D);
+    auto specializedSig = attr->getSpecializedSignature(FnDecl);
+    auto requirements = specializedSig.getRequirements();
     if (FnDecl && FnDecl->getGenericSignature()) {
       auto genericSig = FnDecl->getGenericSignature();
 
-      if (auto sig = attr->getSpecializedSignature()) {
+      if (auto sig = specializedSig) {
         requirementsScratch = sig.requirementsNotSatisfiedBy(genericSig);
         requirements = requirementsScratch;
       }
@@ -1217,7 +1248,10 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     Printer.printAttrName("@_implements");
     Printer << "(";
     auto *attr = cast<ImplementsAttr>(this);
-    attr->getProtocolType().print(Printer, Options);
+    if (auto *proto = attr->getProtocol(D->getDeclContext()))
+      proto->getDeclaredInterfaceType()->print(Printer, Options);
+    else
+      attr->getProtocolTypeRepr()->print(Printer, Options);
     Printer << ", " << attr->getMemberName() << ")";
     break;
   }
@@ -1335,8 +1369,7 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
   }
 
   case DAK_BackDeployed: {
-    // TODO: Print `@backDeployed` in swiftinterfaces (rdar://104920183)
-    Printer.printAttrName("@_backDeploy");
+    Printer.printAttrName("@backDeployed");
     Printer << "(before: ";
     auto Attr = cast<BackDeployedAttr>(this);
     Printer << platformString(Attr->Platform) << " " <<
@@ -1348,10 +1381,9 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
   case DAK_MacroRole: {
     auto Attr = cast<MacroRoleAttr>(this);
 
-    if (Options.SuppressingFreestandingExpression &&
-        Attr->getMacroSyntax() == MacroSyntax::Freestanding &&
-        Attr->getMacroRole() == MacroRole::Expression) {
-      Printer.printAttrName("@expression");
+    // Suppress @attached(extension) if needed.
+    if (!Options.PrintExtensionMacroAttributes &&
+        Attr->getMacroRole() == MacroRole::Extension) {
       break;
     }
 
@@ -1366,6 +1398,23 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     }
     Printer << "(";
     Printer << getMacroRoleString(Attr->getMacroRole());
+
+    // Print conformances, if present.
+    auto conformances = evaluateOrDefault(
+        D->getASTContext().evaluator,
+        ResolveMacroConformances{Attr, D},
+        {});
+    if (!conformances.empty()) {
+      Printer << ", conformances: ";
+      interleave(conformances,
+                 [&](Type type) {
+                   type.print(Printer, Options);
+                 },
+                 [&] {
+                   Printer << ", ";
+                 });
+    }
+
     if (!Attr->getNames().empty()) {
       Printer << ", names: ";
       interleave(
@@ -1373,9 +1422,12 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
           [&](MacroIntroducedDeclName name) {
             Printer << getMacroIntroducedDeclNameString(name.getKind());
             if (macroIntroducedNameRequiresArgument(name.getKind())) {
-              StringRef nameText = name.getIdentifier().str();
-              bool shouldEscape = escapeKeywordInContext(
-                  nameText, PrintNameContext::Normal) || nameText == "$";
+              SmallString<32> buffer;
+              StringRef nameText = name.getName().getString(buffer);
+              bool shouldEscape =
+                  !name.getName().isSpecial() &&
+                  (escapeKeywordInContext(nameText, PrintNameContext::Normal) ||
+                   nameText == "$");
               Printer << "(";
               if (shouldEscape)
                 Printer << "`";
@@ -1389,6 +1441,80 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
             Printer << ", ";
           }
       );
+    }
+    Printer << ")";
+    break;
+  }
+
+  case DAK_Documentation: {
+    auto *attr = cast<DocumentationAttr>(this);
+
+    Printer.printAttrName("@_documentation");
+    Printer << "(";
+
+    bool needs_comma = !attr->Metadata.empty() && attr->Visibility;
+
+    if (attr->Visibility) {
+      Printer << "visibility: ";
+      Printer << getAccessLevelSpelling(*attr->Visibility);
+    }
+
+    if (needs_comma) {
+      Printer << ", ";
+    }
+
+    if (!attr->Metadata.empty()) {
+      Printer << "metadata: ";
+      Printer << attr->Metadata;
+    }
+
+    Printer << ")";
+    break;
+  }
+  
+  case DAK_RawLayout: {
+    auto *attr = cast<RawLayoutAttr>(this);
+    Printer.printAttrName("@_rawLayout");
+    Printer << "(";
+    
+    if (auto sizeAndAlign = attr->getSizeAndAlignment()) {
+      Printer << "size: " << sizeAndAlign->first
+              << ", alignment: " << sizeAndAlign->second;
+    } else if (auto type = attr->getScalarLikeType()) {
+      Printer << "like: ";
+      type->print(Printer, Options);
+    } else if (auto array = attr->getArrayLikeTypeAndCount()) {
+      Printer << "likeArrayOf: ";
+      array->first->print(Printer, Options);
+      Printer << ", count: " << array->second;
+    } else {
+      llvm_unreachable("unhandled @_rawLayout form");
+    }
+    Printer << ")";
+    break;
+  }
+
+  case DAK_StorageRestrictions: {
+    auto *attr = cast<StorageRestrictionsAttr>(this);
+    Printer.printAttrName("@storageRestrictions");
+    Printer << "(";
+
+    auto initializes = attr->getInitializesNames();
+    auto accesses = attr->getAccessesNames();
+
+    bool needsComma = !initializes.empty() && !accesses.empty();
+
+    if (!initializes.empty()) {
+      Printer << "initializes: ";
+      interleave(initializes, Printer, ", ");
+    }
+
+    if (needsComma)
+      Printer << ", ";
+
+    if (!accesses.empty()) {
+      Printer << "accesses: ";
+      interleave(accesses, Printer, ", ");
     }
     Printer << ")";
     break;
@@ -1544,6 +1670,8 @@ StringRef DeclAttribute::getAttrName() const {
     return "<<synthesized protocol>>";
   case DAK_Specialize:
     return "_specialize";
+  case DAK_StorageRestrictions:
+    return "storageRestrictions";
   case DAK_Implements:
     return "_implements";
   case DAK_ClangImporterSynthesizedType:
@@ -1566,6 +1694,8 @@ StringRef DeclAttribute::getAttrName() const {
     return "backDeployed";
   case DAK_Expose:
     return "_expose";
+  case DAK_Section:
+    return "_section";
   case DAK_Documentation:
     return "_documentation";
   case DAK_MacroRole:
@@ -1576,16 +1706,17 @@ StringRef DeclAttribute::getAttrName() const {
     case MacroSyntax::Attached:
       return "attached";
     }
+  case DAK_RawLayout:
+    return "_rawLayout";
   }
   llvm_unreachable("bad DeclAttrKind");
 }
 
 ObjCAttr::ObjCAttr(SourceLoc atLoc, SourceRange baseRange,
-                   Optional<ObjCSelector> name, SourceRange parenRange,
+                   llvm::Optional<ObjCSelector> name, SourceRange parenRange,
                    ArrayRef<SourceLoc> nameLocs)
-  : DeclAttribute(DAK_ObjC, atLoc, baseRange, /*Implicit=*/false),
-    NameData(nullptr)
-{
+    : DeclAttribute(DAK_ObjC, atLoc, baseRange, /*Implicit=*/false),
+      NameData(nullptr) {
   if (name) {
     // Store the name.
     assert(name->getNumSelectorPieces() == nameLocs.size());
@@ -1605,19 +1736,19 @@ ObjCAttr::ObjCAttr(SourceLoc atLoc, SourceRange baseRange,
   Bits.ObjCAttr.Swift3Inferred = false;
 }
 
-ObjCAttr *ObjCAttr::create(ASTContext &Ctx, Optional<ObjCSelector> name,
+ObjCAttr *ObjCAttr::create(ASTContext &Ctx, llvm::Optional<ObjCSelector> name,
                            bool isNameImplicit) {
   return new (Ctx) ObjCAttr(name, isNameImplicit);
 }
 
 ObjCAttr *ObjCAttr::createUnnamed(ASTContext &Ctx, SourceLoc AtLoc,
                                   SourceLoc ObjCLoc) {
-  return new (Ctx) ObjCAttr(AtLoc, SourceRange(ObjCLoc), None,
-                            SourceRange(), { });
+  return new (Ctx)
+      ObjCAttr(AtLoc, SourceRange(ObjCLoc), llvm::None, SourceRange(), {});
 }
 
 ObjCAttr *ObjCAttr::createUnnamedImplicit(ASTContext &Ctx) {
-  return new (Ctx) ObjCAttr(None, false);
+  return new (Ctx) ObjCAttr(llvm::None, false);
 }
 
 ObjCAttr *ObjCAttr::createNullary(ASTContext &Ctx, SourceLoc AtLoc, 
@@ -1785,6 +1916,14 @@ Type TypeEraserAttr::getResolvedType(const ProtocolDecl *PD) const {
                            ErrorType::get(ctx));
 }
 
+Type RawLayoutAttr::getResolvedLikeType(StructDecl *sd) const {
+  auto &ctx = sd->getASTContext();
+  return evaluateOrDefault(ctx.evaluator,
+                           ResolveRawLayoutLikeTypeRequest{sd,
+                               const_cast<RawLayoutAttr *>(this)},
+                           ErrorType::get(ctx));
+}
+
 AvailableAttr *
 AvailableAttr::createPlatformAgnostic(ASTContext &C,
                                    StringRef Message,
@@ -1838,7 +1977,7 @@ AvailableAttr *AvailableAttr::clone(ASTContext &C, bool implicit) const {
                                IsSPI);
 }
 
-Optional<OriginallyDefinedInAttr::ActiveVersion>
+llvm::Optional<OriginallyDefinedInAttr::ActiveVersion>
 OriginallyDefinedInAttr::isActivePlatform(const ASTContext &ctx) const {
   OriginallyDefinedInAttr::ActiveVersion Result;
   Result.Platform = Platform;
@@ -1857,7 +1996,7 @@ OriginallyDefinedInAttr::isActivePlatform(const ASTContext &ctx) const {
     Result.IsSimulator = ctx.LangOpts.TargetVariant->isSimulatorEnvironment();
     return Result;
   }
-  return None;
+  return llvm::None;
 }
 
 OriginallyDefinedInAttr *OriginallyDefinedInAttr::clone(ASTContext &C,
@@ -2070,6 +2209,14 @@ SpecializeAttr *SpecializeAttr::create(
 ValueDecl * SpecializeAttr::getTargetFunctionDecl(const ValueDecl *onDecl) const {
   return evaluateOrDefault(onDecl->getASTContext().evaluator,
                            SpecializeAttrTargetDeclRequest{
+                               onDecl, const_cast<SpecializeAttr *>(this)},
+                           nullptr);
+}
+
+GenericSignature SpecializeAttr::getSpecializedSignature(
+    const AbstractFunctionDecl *onDecl) const {
+  return evaluateOrDefault(onDecl->getASTContext().evaluator,
+                           SerializeAttrGenericSignatureRequest{
                                onDecl, const_cast<SpecializeAttr *>(this)},
                            nullptr);
 }
@@ -2316,38 +2463,65 @@ TransposeAttr *TransposeAttr::create(ASTContext &context, bool implicit,
                                  std::move(originalName), parameterIndices);
 }
 
+StorageRestrictionsAttr::StorageRestrictionsAttr(
+    SourceLoc AtLoc, SourceRange Range, ArrayRef<Identifier> initializes,
+    ArrayRef<Identifier> accesses, bool Implicit)
+    : DeclAttribute(DAK_StorageRestrictions, AtLoc, Range, Implicit),
+      NumInitializes(initializes.size()),
+      NumAccesses(accesses.size()) {
+  std::uninitialized_copy(initializes.begin(), initializes.end(),
+                          getTrailingObjects<Identifier>());
+  std::uninitialized_copy(accesses.begin(), accesses.end(),
+                          getTrailingObjects<Identifier>() + NumInitializes);
+}
+
+StorageRestrictionsAttr *
+StorageRestrictionsAttr::create(
+    ASTContext &ctx, SourceLoc atLoc, SourceRange range,
+    ArrayRef<Identifier> initializes, ArrayRef<Identifier> accesses) {
+  unsigned size =
+      totalSizeToAlloc<Identifier>(initializes.size() + accesses.size());
+  void *mem = ctx.Allocate(size, alignof(StorageRestrictionsAttr));
+  return new (mem) StorageRestrictionsAttr(atLoc, range, initializes, accesses,
+                                           /*implicit=*/false);
+}
+
 ImplementsAttr::ImplementsAttr(SourceLoc atLoc, SourceRange range,
-                               TypeExpr *ProtocolType,
+                               TypeRepr *TyR,
                                DeclName MemberName,
                                DeclNameLoc MemberNameLoc)
     : DeclAttribute(DAK_Implements, atLoc, range, /*Implicit=*/false),
-      ProtocolType(ProtocolType),
+      TyR(TyR),
       MemberName(MemberName),
       MemberNameLoc(MemberNameLoc) {
 }
 
-
 ImplementsAttr *ImplementsAttr::create(ASTContext &Ctx, SourceLoc atLoc,
                                        SourceRange range,
-                                       TypeExpr *ProtocolType,
+                                       TypeRepr *TyR,
                                        DeclName MemberName,
                                        DeclNameLoc MemberNameLoc) {
   void *mem = Ctx.Allocate(sizeof(ImplementsAttr), alignof(ImplementsAttr));
-  return new (mem) ImplementsAttr(atLoc, range, ProtocolType,
+  return new (mem) ImplementsAttr(atLoc, range, TyR,
                                   MemberName, MemberNameLoc);
 }
 
-void ImplementsAttr::setProtocolType(Type ty) {
-  assert(ty);
-  ProtocolType->setType(MetatypeType::get(ty));
+ImplementsAttr *ImplementsAttr::create(DeclContext *DC,
+                                       ProtocolDecl *Proto,
+                                       DeclName MemberName) {
+  auto &ctx = DC->getASTContext();
+  void *mem = ctx.Allocate(sizeof(ImplementsAttr), alignof(ImplementsAttr));
+  auto *attr = new (mem) ImplementsAttr(
+      SourceLoc(), SourceRange(), nullptr,
+      MemberName, DeclNameLoc());
+  ctx.evaluator.cacheOutput(ImplementsAttrProtocolRequest{attr, DC},
+                            std::move(Proto));
+  return attr;
 }
 
-Type ImplementsAttr::getProtocolType() const {
-  return ProtocolType->getInstanceType();
-}
-
-TypeRepr *ImplementsAttr::getProtocolTypeRepr() const {
-  return ProtocolType->getTypeRepr();
+ProtocolDecl *ImplementsAttr::getProtocol(DeclContext *dc) const {
+  return evaluateOrDefault(dc->getASTContext().evaluator,
+        ImplementsAttrProtocolRequest{this, dc}, nullptr);
 }
 
 CustomAttr::CustomAttr(SourceLoc atLoc, SourceRange range, TypeExpr *type,
@@ -2405,29 +2579,45 @@ MacroRoleAttr::MacroRoleAttr(SourceLoc atLoc, SourceRange range,
                              MacroSyntax syntax, SourceLoc lParenLoc,
                              MacroRole role,
                              ArrayRef<MacroIntroducedDeclName> names,
+                             ArrayRef<TypeExpr *> conformances,
                              SourceLoc rParenLoc, bool implicit)
     : DeclAttribute(DAK_MacroRole, atLoc, range, implicit),
-      syntax(syntax), role(role), numNames(names.size()), lParenLoc(lParenLoc),
+      syntax(syntax), role(role), numNames(names.size()),
+      numConformances(conformances.size()), lParenLoc(lParenLoc),
       rParenLoc(rParenLoc) {
   auto *trailingNamesBuffer = getTrailingObjects<MacroIntroducedDeclName>();
   std::uninitialized_copy(names.begin(), names.end(), trailingNamesBuffer);
+
+  auto *trailingConformancesBuffer = getTrailingObjects<TypeExpr *>();
+  std::uninitialized_copy(conformances.begin(), conformances.end(),
+                          trailingConformancesBuffer);
 }
 
 MacroRoleAttr *
 MacroRoleAttr::create(ASTContext &ctx, SourceLoc atLoc, SourceRange range,
                       MacroSyntax syntax, SourceLoc lParenLoc, MacroRole role,
                       ArrayRef<MacroIntroducedDeclName> names,
+                      ArrayRef<TypeExpr *> conformances,
                       SourceLoc rParenLoc, bool implicit) {
-  unsigned size = totalSizeToAlloc<MacroIntroducedDeclName>(names.size());
+  unsigned size =
+      totalSizeToAlloc<MacroIntroducedDeclName, TypeExpr *>(
+          names.size(), conformances.size());
   auto *mem = ctx.Allocate(size, alignof(MacroRoleAttr));
   return new (mem) MacroRoleAttr(atLoc, range, syntax, lParenLoc, role, names,
-                                 rParenLoc, implicit);
+                                 conformances, rParenLoc, implicit);
 }
 
 ArrayRef<MacroIntroducedDeclName> MacroRoleAttr::getNames() const {
   return {
     getTrailingObjects<MacroIntroducedDeclName>(),
     numNames
+  };
+}
+
+ArrayRef<TypeExpr *> MacroRoleAttr::getConformances() const {
+  return {
+    getTrailingObjects<TypeExpr *>(),
+    numConformances
   };
 }
 
@@ -2452,6 +2642,26 @@ DeclAttributes::getEffectiveSendableAttr() const {
     return sendableAttr;
 
   return assumedAttr;
+}
+
+ArrayRef<VarDecl *> StorageRestrictionsAttr::getInitializesProperties(
+    AccessorDecl *attachedTo) const {
+  auto &ctx = attachedTo->getASTContext();
+  return evaluateOrDefault(ctx.evaluator,
+                           InitAccessorReferencedVariablesRequest{
+                               const_cast<StorageRestrictionsAttr *>(this),
+                               attachedTo, getInitializesNames()},
+                           {});
+}
+
+ArrayRef<VarDecl *>
+StorageRestrictionsAttr::getAccessesProperties(AccessorDecl *attachedTo) const {
+  auto &ctx = attachedTo->getASTContext();
+  return evaluateOrDefault(ctx.evaluator,
+                           InitAccessorReferencedVariablesRequest{
+                               const_cast<StorageRestrictionsAttr *>(this),
+                               attachedTo, getAccessesNames()},
+                           {});
 }
 
 void swift::simple_display(llvm::raw_ostream &out, const DeclAttribute *attr) {

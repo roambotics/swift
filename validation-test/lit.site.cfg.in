@@ -29,8 +29,12 @@ config.variant_sdk = "@VARIANT_SDK@"
 config.swift_test_results_dir = \
     lit_config.params.get("swift_test_results_dir", "@SWIFT_TEST_RESULTS_DIR@")
 
+config.host_triple = "@SWIFT_HOST_TRIPLE@"
+config.host_sdkroot = "@SWIFT_HOST_SDKROOT@"
+
 config.swift_driver_test_options = "@SWIFT_DRIVER_TEST_OPTIONS@"
 config.swift_frontend_test_options = "@SWIFT_FRONTEND_TEST_OPTIONS@"
+config.swift_ide_test_test_options = "@SWIFT_IDE_TEST_TEST_OPTIONS@"
 
 # --- Darwin Configuration ---
 config.darwin_xcrun_toolchain = "@SWIFT_DARWIN_XCRUN_TOOLCHAIN@"
@@ -124,8 +128,6 @@ if "@SWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING@" == "TRUE":
     config.available_features.add('differentiable_programming')
 if "@SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY@" == "TRUE":
     config.available_features.add('concurrency')
-if "@SWIFT_BACK_DEPLOY_CONCURRENCY@" == "TRUE":
-    config.available_features.add('back_deploy_concurrency')
 if "@SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED@" == "TRUE":
     config.available_features.add('distributed')
 if "@SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING@" == "TRUE":
@@ -139,6 +141,9 @@ config.swift_enable_dispatch = "@SWIFT_ENABLE_DISPATCH@" == "TRUE"
 config.swift_stdlib_enable_objc_interop = "@SWIFT_STDLIB_ENABLE_OBJC_INTEROP@" == "TRUE"
 # Configured in DarwinSDKs.cmake
 config.freestanding_sdk_name = "@SWIFT_SDK_FREESTANDING_LIB_SUBDIR@"
+
+if "@BOOTSTRAPPING_MODE@" != "OFF":
+  config.available_features.add('swift_in_compiler')
 
 # Let the main config do the real work.
 config.test_exec_root = os.path.dirname(os.path.realpath(__file__))

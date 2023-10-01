@@ -21,6 +21,7 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringMap.h"
+#include "clang/CAS/CASOptions.h"
 
 #include <string>
 #include <vector>
@@ -51,7 +52,7 @@ public:
   /// An Objective-C header to import and make implicitly visible.
   std::string ImplicitObjCHeaderPath;
 
-  /// The map of aliases and underlying names of imported or referenced modules.
+  /// The map of aliases and real names of imported or referenced modules.
   llvm::StringMap<StringRef> ModuleAliasMap;
 
   /// The name of the module that the frontend is building.
@@ -90,6 +91,10 @@ public:
   /// binary module has already been built for use by the compiler.
   std::string PrebuiltModuleCachePath;
 
+  /// The path to output explicit module dependencies. Only relevant during
+  /// dependency scanning.
+  std::string ExplicitModulesOutputPath;
+
   /// The path to look in to find backup .swiftinterface files if those found
   /// from SDKs are failing.
   std::string BackupModuleInterfaceDir;
@@ -121,6 +126,27 @@ public:
 
   /// The module for which we should verify all of the generic signatures.
   std::string VerifyGenericSignaturesInModule;
+
+  /// Enable compiler caching.
+  bool EnableCaching = false;
+
+  /// Enable compiler caching remarks.
+  bool EnableCachingRemarks = false;
+
+  /// Skip replaying outputs from cache.
+  bool CacheSkipReplay = false;
+
+  /// CASOptions
+  clang::CASOptions CASOpts;
+
+  /// CASFS Root.
+  std::vector<std::string> CASFSRootIDs;
+
+  /// Clang Include Trees.
+  std::vector<std::string> ClangIncludeTrees;
+
+  /// CacheKey for input file.
+  std::string InputFileKey;
 
   /// Number of retry opening an input file if the previous opening returns
   /// bad file descriptor error.
@@ -198,7 +224,7 @@ public:
   /// When true, emitted module files will always contain options for the
   /// debugger to use. When unset, the options will only be present if the
   /// module appears to not be a public module.
-  Optional<bool> SerializeOptionsForDebugging;
+  llvm::Optional<bool> SerializeOptionsForDebugging;
 
   /// When true the debug prefix map entries will be applied to debugging
   /// options before serialization. These can be reconstructed at debug time by
@@ -240,7 +266,6 @@ public:
   ///
   /// \see ModuleDecl::arePrivateImportsEnabled
   bool EnablePrivateImports = false;
-
 
   /// Indicates whether we add implicit dynamic.
   ///
@@ -287,7 +312,7 @@ public:
   /// Specifies the collection mode for the intermodule dependency tracker.
   /// Note that if set, the dependency tracker will be enabled even if no
   /// output path is configured.
-  Optional<IntermoduleDepTrackingMode> IntermoduleDependencyTracking;
+  llvm::Optional<IntermoduleDepTrackingMode> IntermoduleDependencyTracking;
 
   /// Should we emit the cType when printing @convention(c) or no?
   bool PrintFullConvention = false;
@@ -295,6 +320,10 @@ public:
   /// Should we serialize the hashes of dependencies (vs. the modification
   /// times) when compiling a module interface?
   bool SerializeModuleInterfaceDependencyHashes = false;
+
+  /// Should we only serialize decls that may be referenced externally in the
+  /// binary module?
+  bool SerializeExternalDeclsOnly = false;
 
   /// Should we warn if an imported module needed to be rebuilt from a
   /// module interface file?
@@ -313,8 +342,8 @@ public:
   /// By default, we include ImplicitObjCHeaderPath directly.
   llvm::Optional<std::string> BridgingHeaderDirForPrint;
 
-  /// Disable implicitly built Swift modules because they are explicitly
-  /// built and given to the compiler invocation.
+  /// Disable implicitly-built Swift modules because they are explicitly
+  /// built and provided to the compiler invocation.
   bool DisableImplicitModules = false;
 
   /// Disable building Swift modules from textual interfaces. This should be
@@ -334,8 +363,12 @@ public:
   /// The path at which to either serialize or deserialize the dependency scanner cache.
   std::string SerializedDependencyScannerCachePath;
 
-  /// Emit remarks indicating use of the serialized module dependency scanning cache
+  /// Emit remarks indicating use of the serialized module dependency scanning cache.
   bool EmitDependencyScannerCacheRemarks = false;
+
+  /// Whether the dependency scanner invocation should resolve imports
+  /// to filesystem modules in parallel.
+  bool ParallelDependencyScan = false;
 
   /// When performing an incremental build, ensure that cross-module incremental
   /// build metadata is available in any swift modules emitted by this frontend
@@ -436,6 +469,9 @@ public:
   /// \return true if the given action requires input files to be provided.
   static bool doesActionPerformEndOfPipelineActions(ActionType action);
 
+  /// \return true if the given action supports caching.
+  static bool supportCompilationCaching(ActionType action);
+
   /// Return a hash code of any components from these options that should
   /// contribute to a Swift Bridging PCH hash.
   llvm::hash_code getPCHHashComponents() const {
@@ -445,7 +481,12 @@ public:
   /// Return a hash code of any components from these options that should
   /// contribute to a Swift Dependency Scanning hash.
   llvm::hash_code getModuleScanningHashComponents() const {
-    return llvm::hash_value(0);
+    return hash_combine(ModuleName,
+                        ModuleABIName,
+                        ModuleLinkName,
+                        ImplicitObjCHeaderPath,
+                        PrebuiltModuleCachePath,
+                        UserModuleVersion);
   }
 
   StringRef determineFallbackModuleName() const;
@@ -470,6 +511,9 @@ public:
   /// Whether we're configured to track system intermodule dependencies.
   bool shouldTrackSystemDependencies() const;
   
+  /// Whether we are configured with -typecheck or -typecheck-module-from-interface actuin
+  bool isTypeCheckAction() const;
+
   /// Whether to emit symbol graphs for the output module.
   bool EmitSymbolGraph = false;
 
@@ -498,6 +542,9 @@ public:
   /// to encode the actual paths into the .swiftmodule file.
   PathObfuscator serializedPathObfuscator;
 
+  /// Whether to run the job twice to check determinism.
+  bool DeterministicCheck = false;
+
   /// Avoid printing actual module content into the ABI descriptor file.
   /// This should only be used as a workaround when emitting ABI descriptor files
   /// crashes the compiler.
@@ -507,6 +554,8 @@ public:
   /// textual imports
   bool EmitClangHeaderWithNonModularIncludes = false;
 
+  /// All block list configuration files to be honored in this compilation.
+  std::vector<std::string> BlocklistConfigFilePaths;
 private:
   static bool canActionEmitDependencies(ActionType);
   static bool canActionEmitReferenceDependencies(ActionType);

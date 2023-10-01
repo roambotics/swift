@@ -17,35 +17,34 @@ public struct CalleeAnalysis {
   let bridged: BridgedCalleeAnalysis
 
   static func register() {
-    CalleeAnalysis_register(
+    BridgedCalleeAnalysis.registerAnalysis(
       // isDeinitBarrierFn:
       { (inst : BridgedInstruction, bca: BridgedCalleeAnalysis) -> Bool in
         return inst.instruction.isDeinitBarrier(bca.analysis)
       },
       // getMemBehaviorFn
-      { (bridgedCtxt: BridgedPassContext, bridgedApply: BridgedInstruction, observeRetains: Bool) -> BridgedMemoryBehavior in
-        let context = FunctionPassContext(_bridged: bridgedCtxt)
+      { (bridgedApply: BridgedInstruction, observeRetains: Bool, bca: BridgedCalleeAnalysis) -> swift.MemoryBehavior in
         let apply = bridgedApply.instruction as! ApplySite
-        let e = context.calleeAnalysis.getSideEffects(of: apply)
+        let e = bca.analysis.getSideEffects(ofApply: apply)
         return e.getMemBehavior(observeRetains: observeRetains)
       }
     )
   }
 
   public func getCallees(callee: Value) -> FunctionArray? {
-    let bridgedFuncs = CalleeAnalysis_getCallees(bridged, callee.bridged)
-    if bridgedFuncs.incomplete != 0 {
+    let bridgedFuncs = bridged.getCallees(callee.bridged)
+    if bridgedFuncs.isIncomplete() {
       return nil
     }
     return FunctionArray(bridged: bridgedFuncs)
   }
 
   public func getIncompleteCallees(callee: Value) -> FunctionArray {
-    return FunctionArray(bridged: CalleeAnalysis_getCallees(bridged, callee.bridged))
+    return FunctionArray(bridged: bridged.getCallees(callee.bridged))
   }
 
   public func getDestructor(ofExactType type: Type) -> Function? {
-    let destructors = FunctionArray(bridged: CalleeAnalysis_getDestructors(bridged, type.bridged, /*isExactType*/ 1))
+    let destructors = FunctionArray(bridged: bridged.getDestructors(type.bridged, /*isExactType*/ true))
     if destructors.count == 1 {
       return destructors[0]
     }
@@ -53,16 +52,20 @@ public struct CalleeAnalysis {
   }
 
   public func getDestructors(of type: Type) -> FunctionArray? {
-    let bridgedDtors = CalleeAnalysis_getDestructors(bridged, type.bridged, /*isExactType*/ 0)
-    if bridgedDtors.incomplete != 0 {
+    let bridgedDtors = bridged.getDestructors(type.bridged, /*isExactType*/ false)
+    if bridgedDtors.isIncomplete() {
       return nil
     }
     return FunctionArray(bridged: bridgedDtors)
   }
 
   /// Returns the global (i.e. not argument specific) side effects of an apply.
-  public func getSideEffects(of apply: ApplySite) -> SideEffects.GlobalEffects {
-    guard let callees = getCallees(callee: apply.callee) else {
+  public func getSideEffects(ofApply apply: ApplySite) -> SideEffects.GlobalEffects {
+    return getSideEffects(ofCallee: apply.callee)
+  }
+
+  public func getSideEffects(ofCallee callee: Value) -> SideEffects.GlobalEffects {
+    guard let callees = getCallees(callee: callee) else {
       return .worstEffects
     }
 
@@ -123,13 +126,13 @@ extension Instruction {
 }
 
 public struct FunctionArray : RandomAccessCollection, FormattedLikeArray {
-  fileprivate let bridged: BridgedCalleeList
+  fileprivate let bridged: swift.CalleeList
 
   public var startIndex: Int { 0 }
-  public var endIndex: Int { BridgedFunctionArray_size(bridged) }
+  public var endIndex: Int { Int(bridged.getCount()) }
 
   public subscript(_ index: Int) -> Function {
-    return BridgedFunctionArray_get(bridged, index).function
+    return BridgedCalleeAnalysis.getCallee(bridged, index).function
   }
 }
 // Bridging utilities

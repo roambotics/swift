@@ -13,12 +13,14 @@
 import os
 import platform
 import sys
+import lit.util
 
 config.cmake = "@CMAKE_COMMAND@"
 config.llvm_src_root = "@LLVM_MAIN_SRC_DIR@"
 config.llvm_obj_root = "@LLVM_BINARY_DIR@"
 config.llvm_tools_dir = "@LLVM_TOOLS_DIR@"
 config.llvm_libs_dir = "@LLVM_LIBS_DIR@"
+config.llvm_plugin_ext = "@LLVM_PLUGIN_EXT@"
 config.llvm_code_generators = "@LLVM_TARGETS_TO_BUILD@".split(";")
 config.lit_tools_dir = "@LLVM_LIT_TOOLS_DIR@"
 config.swift_src_root = lit_config.params.get("swift_src_root", "@SWIFT_SOURCE_DIR@")
@@ -31,12 +33,16 @@ config.swiftlib_dir = "@LIT_SWIFTLIB_DIR@"
 config.swift_test_results_dir = \
     lit_config.params.get("swift_test_results_dir", "@SWIFT_TEST_RESULTS_DIR@")
 
+config.host_triple = "@SWIFT_HOST_TRIPLE@"
+config.host_sdkroot = "@SWIFT_HOST_SDKROOT@"
+
 config.coverage_mode = "@SWIFT_ANALYZE_CODE_COVERAGE@"
 config.lldb_build_root = "@LLDB_BUILD_DIR@"
 config.libdispatch_build_path = "@SWIFT_PATH_TO_LIBDISPATCH_BUILD@"
 config.libdispatch_static_build_path = "@SWIFT_PATH_TO_LIBDISPATCH_STATIC_BUILD@"
 config.swift_driver_test_options = "@SWIFT_DRIVER_TEST_OPTIONS@"
 config.swift_frontend_test_options = "@SWIFT_FRONTEND_TEST_OPTIONS@"
+config.swift_ide_test_test_options = "@SWIFT_IDE_TEST_TEST_OPTIONS@"
 
 # --- Darwin ---
 config.darwin_xcrun_toolchain = "@SWIFT_DARWIN_XCRUN_TOOLCHAIN@"
@@ -130,8 +136,6 @@ if "@SWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING@" == "TRUE":
     config.available_features.add('differentiable_programming')
 if "@SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY@" == "TRUE":
     config.available_features.add('concurrency')
-if "@SWIFT_BACK_DEPLOY_CONCURRENCY@" == "TRUE":
-    config.available_features.add('back_deploy_concurrency')
 if "@SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED@" == "TRUE":
     config.available_features.add('distributed')
 if "@SWIFT_STDLIB_STATIC_PRINT@" == "TRUE":
@@ -155,9 +159,6 @@ config.freestanding_sdk_name = "@SWIFT_SDK_FREESTANDING_LIB_SUBDIR@"
 if "@BOOTSTRAPPING_MODE@" != "OFF":
   config.available_features.add('swift_in_compiler')
 
-if "@SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR@" != "":
-  config.available_features.add('swift_swift_parser')
-
 if "@BOOTSTRAPPING_MODE@" == 'HOSTTOOLS':
   config.available_features.add('hosttools_mode')
 elif "@BOOTSTRAPPING_MODE@" == 'BOOTSTRAPPING':
@@ -165,8 +166,11 @@ elif "@BOOTSTRAPPING_MODE@" == 'BOOTSTRAPPING':
 elif "@BOOTSTRAPPING_MODE@" == 'BOOTSTRAPPING-WITH-HOSTLIBS':
   config.available_features.add('bootstrapping_with_hostlibs_mode')
 
+if '@SWIFT_BUILD_SWIFT_SYNTAX@' == 'TRUE':
+  config.available_features.add('swift_swift_parser')
+
 # Let the main config do the real work.
 if config.test_exec_root is None:
-    config.test_exec_root = os.path.dirname(os.path.realpath(__file__))
+    config.test_exec_root = os.path.dirname(lit.util.abs_path_preserve_drive(__file__))
 lit_config.load_config(
     config, os.path.join(config.swift_src_root, "test", "lit.cfg"))
