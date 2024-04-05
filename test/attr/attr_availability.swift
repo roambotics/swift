@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -module-name Test
 
 @available(*, unavailable)
 func unavailable_func() {}
@@ -146,6 +146,15 @@ let _: Int
 @available(OSX, introduced: 1.0.0x4) // expected-error{{expected version number in 'available' attribute}}
 let _: Int
 
+@available(OSX, introduced: 0) // expected-warning{{expected version number in 'available' attribute; this is an error in the Swift 6 language mode}}
+let _: Int
+
+@available(OSX, introduced: 0.0) // expected-warning{{expected version number in 'available' attribute; this is an error in the Swift 6 language mode}}
+let _: Int
+
+@available(OSX, introduced: 0.0.0) // expected-warning{{expected version number in 'available' attribute; this is an error in the Swift 6 language mode}}
+let _: Int
+
 @available(*, renamed: "bad name") // expected-error{{'renamed' argument of 'available' attribute must be an operator, identifier, or full function name, optionally prefixed by a type name}}
 let _: Int
 
@@ -203,6 +212,9 @@ struct DeprecatedTypeWithRename { }
 func use_deprecated_with_renamed() {
   deprecated_func_with_renamed() // expected-warning{{'deprecated_func_with_renamed()' is deprecated: renamed to 'blarg'}}
   // expected-note@-1{{use 'blarg'}}{{3-31=blarg}}
+
+  Test.deprecated_func_with_renamed() // expected-warning{{'deprecated_func_with_renamed()' is deprecated: renamed to 'blarg'}}
+  // expected-note@-1{{use 'blarg' instead}}
 
   deprecated_func_with_message_renamed() //expected-warning{{'deprecated_func_with_message_renamed()' is deprecated: blarg is your friend}}
   // expected-note@-1{{use 'blarg'}}{{3-39=blarg}}

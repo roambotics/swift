@@ -18,7 +18,8 @@
 // Check that the generated header can be
 // built with Clang modules enabled in C++.
 
-// RUN: %target-interop-build-clangxx -fsyntax-only -x c++-header %t/full-cxx-swift-cxx-bridging.h -std=gnu++20 -c -fmodules -fcxx-modules -I %t
+// RUN: %target-interop-build-clangxx -fsyntax-only -x c++-header %t/full-cxx-swift-cxx-bridging.h -std=gnu++17 -c -fmodules -fcxx-modules -I %t 
+// FIXME: test c++20 (rdar://117419434)
 
 // XFAIL: OS=linux-android, OS=linux-androideabi
 
@@ -174,7 +175,7 @@ public struct Strct {
 // CHECK-NEXT: #endif
 
 
-// CHECK: SWIFT_EXTERN void $s8UseCxxTy13retNonTrivialSo2nsO0031NonTrivialTemplateInt32_fbGJhubVyF(SWIFT_INDIRECT_RESULT void * _Nonnull) SWIFT_NOEXCEPT SWIFT_CALL; // retNonTrivial()
+// CHECK: SWIFT_EXTERN void $s8UseCxxTy13retNonTrivialSo2nsO0030NonTrivialTemplateCInt_hHAFhrbVyF(SWIFT_INDIRECT_RESULT void * _Nonnull) SWIFT_NOEXCEPT SWIFT_CALL; // retNonTrivial()
 // CHECK: SWIFT_EXTERN struct swift_interop_returnStub_UseCxxTy_uint32_t_0_4 $s8UseCxxTy10retTrivialSo0E0VyF(void) SWIFT_NOEXCEPT SWIFT_CALL; // retTrivial()
 
 // CHECK: ns::Immortal *_Nonnull retImmortal() noexcept SWIFT_SYMBOL({{.*}}) SWIFT_WARN_UNUSED_RESULT {
@@ -182,7 +183,7 @@ public struct Strct {
 // CHECK-NEXT: }
 
 // CHECK:  ns::ImmortalTemplate<int> *_Nonnull retImmortalTemplate() noexcept SWIFT_SYMBOL({{.*}}) SWIFT_WARN_UNUSED_RESULT {
-// CHECK-NEXT: return _impl::$s8UseCxxTy19retImmortalTemplateSo2nsO0029ImmortalTemplateInt32_hEFAhqbVyF();
+// CHECK-NEXT: return _impl::$s8UseCxxTy19retImmortalTemplateSo2nsO0028ImmortalTemplateCInt_jBAGgnbVyF();
 // CHECK-NEXT: }
 
 // CHECK: } // end namespace
@@ -191,7 +192,7 @@ public struct Strct {
 // CHECK-NEXT: namespace _impl {
 // CHECK-EMPTY:
 // CHECK-NEXT: // Type metadata accessor for NonTrivialTemplateInt
-// CHECK-NEXT: SWIFT_EXTERN swift::_impl::MetadataResponseTy $sSo2nsO0031NonTrivialTemplateInt32_fbGJhubVMa(swift::_impl::MetadataRequestTy) SWIFT_NOEXCEPT SWIFT_CALL;
+// CHECK-NEXT: SWIFT_EXTERN swift::_impl::MetadataResponseTy $sSo2nsO0030NonTrivialTemplateCInt_hHAFhrbVMa(swift::_impl::MetadataRequestTy) SWIFT_NOEXCEPT SWIFT_CALL;
 // CHECK-EMPTY:
 // CHECK-EMPTY:
 // CHECK-NEXT: } // namespace _impl
@@ -202,8 +203,8 @@ public struct Strct {
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<ns::NonTrivialTemplateInt> = true;
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<ns::NonTrivialTemplateInt> {
-// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
-// CHECK-NEXT:     return _impl::$sSo2nsO0031NonTrivialTemplateInt32_fbGJhubVMa(0)._0;
+// CHECK-NEXT:   static SWIFT_INLINE_PRIVATE_HELPER void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:     return _impl::$sSo2nsO0030NonTrivialTemplateCInt_hHAFhrbVMa(0)._0;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
 // CHECK-NEXT: namespace _impl{
@@ -218,7 +219,7 @@ public struct Strct {
 // CHECK: SWIFT_INLINE_THUNK ns::NonTrivialTemplate<int> retNonTrivial() noexcept SWIFT_SYMBOL({{.*}}) SWIFT_WARN_UNUSED_RESULT {
 // CHECK-NEXT: alignas(alignof(ns::NonTrivialTemplate<int>)) char storage[sizeof(ns::NonTrivialTemplate<int>)];
 // CHECK-NEXT: auto * _Nonnull storageObjectPtr = reinterpret_cast<ns::NonTrivialTemplate<int> *>(storage);
-// CHECK-NEXT: _impl::$s8UseCxxTy13retNonTrivialSo2nsO0031NonTrivialTemplateInt32_fbGJhubVyF(storage);
+// CHECK-NEXT: _impl::$s8UseCxxTy13retNonTrivialSo2nsO0030NonTrivialTemplateCInt_hHAFhrbVyF(storage);
 // CHECK-NEXT: ns::NonTrivialTemplate<int> result(static_cast<ns::NonTrivialTemplate<int> &&>(*storageObjectPtr));
 // CHECK-NEXT: storageObjectPtr->~NonTrivialTemplate();
 // CHECK-NEXT: return result;
@@ -241,7 +242,7 @@ public struct Strct {
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<ns::NonTrivialTemplateTrivial> = true;
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<ns::NonTrivialTemplateTrivial> {
-// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_PRIVATE_HELPER void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return _impl::$sSo2nsO0037NonTrivialTemplateTrivialinNS_CsGGkdcVMa(0)._0;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -282,23 +283,23 @@ public struct Strct {
 // CHECK-NEXT: }
 
 // CHECK: void takeImmortal(ns::Immortal *_Nonnull x) noexcept SWIFT_SYMBOL({{.*}}) {
-// CHECK-NEXT: return _impl::$s8UseCxxTy12takeImmortalyySo2nsO0E0VF(x);
+// CHECK-NEXT: _impl::$s8UseCxxTy12takeImmortalyySo2nsO0E0VF(x);
 // CHECK-NEXT: }
 
 // CHECK: void takeImmortalTemplate(ns::ImmortalTemplate<int> *_Nonnull x) noexcept SWIFT_SYMBOL({{.*}}) {
-// CHECK-NEXT:   return _impl::$s8UseCxxTy20takeImmortalTemplateyySo2nsO0029ImmortalTemplateInt32_hEFAhqbVF(x);
+// CHECK-NEXT:   _impl::$s8UseCxxTy20takeImmortalTemplateyySo2nsO0028ImmortalTemplateCInt_jBAGgnbVF(x);
 // CHECK-NEXT: }
 
 // CHECK: SWIFT_INLINE_THUNK void takeNonTrivial2(const ns::NonTrivialTemplate<ns::TrivialinNS>& x) noexcept SWIFT_SYMBOL({{.*}}) {
-// CHECK-NEXT:   return _impl::$s8UseCxxTy15takeNonTrivial2yySo2nsO0037NonTrivialTemplateTrivialinNS_CsGGkdcVF(swift::_impl::getOpaquePointer(x));
+// CHECK-NEXT:   _impl::$s8UseCxxTy15takeNonTrivial2yySo2nsO0037NonTrivialTemplateTrivialinNS_CsGGkdcVF(swift::_impl::getOpaquePointer(x));
 // CHECK-NEXT: }
 
 // CHECK: SWIFT_INLINE_THUNK void takeTrivial(const Trivial& x) noexcept SWIFT_SYMBOL({{.*}}) {
-// CHECK-NEXT:   return _impl::$s8UseCxxTy11takeTrivialyySo0E0VF(_impl::swift_interop_passDirect_UseCxxTy_uint32_t_0_4(reinterpret_cast<const char *>(swift::_impl::getOpaquePointer(x))));
+// CHECK-NEXT:   _impl::$s8UseCxxTy11takeTrivialyySo0E0VF(_impl::swift_interop_passDirect_UseCxxTy_uint32_t_0_4(reinterpret_cast<const char *>(swift::_impl::getOpaquePointer(x))));
 // CHECK-NEXT: }
 
 // CHECK: SWIFT_INLINE_THUNK void takeTrivialInout(Trivial& x) noexcept SWIFT_SYMBOL({{.*}}) {
-// CHECK-NEXT:   return _impl::$s8UseCxxTy16takeTrivialInoutyySo0E0VzF(swift::_impl::getOpaquePointer(x));
+// CHECK-NEXT:   _impl::$s8UseCxxTy16takeTrivialInoutyySo0E0VzF(swift::_impl::getOpaquePointer(x));
 // CHECK-NEXT: }
 
 // CHECK: SWIFT_INLINE_THUNK anonymousStruct Strct::getTransform() const {

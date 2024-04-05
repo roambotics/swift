@@ -6,6 +6,9 @@
 // REQUIRES: executable_test
 // REQUIRES: objc_interop
 
+// UNSUPPORTED: use_os_stdlib
+// UNSUPPORTED: back_deployment_runtime
+
 import StdlibUnittest
 import Foundation
 
@@ -29,7 +32,12 @@ BridgeEquatableToObjC.test("Bridge equatable struct") {
   let objcResult = objcA.isEqual(objcB)
 
   expectEqual(swiftResult, true)
+#if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+  // Apple platforms use old semantics for now...
+  expectEqual(objcResult, false)
+#else
   expectEqual(objcResult, true)
+#endif
 }
 
 BridgeEquatableToObjC.test("Bridge non-equatable struct") {

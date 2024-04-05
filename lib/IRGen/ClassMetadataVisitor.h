@@ -67,6 +67,19 @@ protected:
     : super(IGM), Target(target), VTable(vtable) {}
 
 public:
+
+  // Layout in embedded mode while considering the class type.
+  // This is important for adding the right superclass pointer.
+  // The regular `layout` method can be used for layout tasks for which the
+  // actual superclass pointer is not relevant.
+  void layoutEmbedded(CanType classTy) {
+    asImpl().noteAddressPoint();
+    asImpl().addEmbeddedSuperclass(classTy);
+    asImpl().addDestructorFunction();
+    asImpl().addIVarDestroyer();
+    addEmbeddedClassMembers(Target);
+  }
+
   void layout() {
     static_assert(MetadataAdjustmentIndex::Class == 3,
                   "Adjustment index must be synchronized with this layout");
@@ -75,6 +88,7 @@ public:
       asImpl().noteAddressPoint();
       asImpl().addSuperclass();
       asImpl().addDestructorFunction();
+      asImpl().addIVarDestroyer();
       addEmbeddedClassMembers(Target);
       return;
     }

@@ -89,7 +89,7 @@ func invokedDeinit() {}
 // CHECK-LABEL: sil hidden [ossa] @$s4test11PointerTreeV10tryDestroy9doDiscardySb_tKF : $@convention(method) (Bool, @owned PointerTree) -> @error any Error {
 // CHECK:   bb0{{.*}}:
 // CHECK:     [[SELF_BOX:%.*]] = alloc_box ${ var PointerTree }, var, name "self"
-// CHECK:     [[SELF_BOX_LIFETIME:%.*]] = begin_borrow [lexical] [[SELF_BOX]]
+// CHECK:     [[SELF_BOX_LIFETIME:%.*]] = begin_borrow [lexical] [var_decl] [[SELF_BOX]]
 // CHECK:     [[SELF_PTR:%.*]] = project_box [[SELF_BOX_LIFETIME]] : ${ var PointerTree }, 0
 //            .. skip to the conditional test ..
 // CHECK:     [[SHOULD_FORGET:%.*]] = struct_extract {{.*}} : $Bool, #Bool._value
@@ -172,7 +172,7 @@ final class Wallet {
   // CHECK:    destroy_value [[DD]] : $Ticket
 
   // CHECK-SIL-LABEL: sil hidden @$s4test6TicketO06changeB08inWalletyAA0E0CSg_tF : $@convention(method) (@guaranteed Optional<Wallet>, @owned Ticket) -> () {
-  // CHECK-SIL:    [[SELF_REF:%.*]] = alloc_stack [lexical] $Ticket, var, name "self", implicit 
+  // CHECK-SIL:    [[SELF_REF:%.*]] = alloc_stack [lexical] [var_decl] $Ticket, var, name "self", implicit 
   // CHECK-SIL:    switch_enum {{.*}} : $Optional<Wallet>, case #Optional.some!enumelt: {{.*}}, case #Optional.none!enumelt: [[NO_WALLET_BB:bb[0-9]+]]
   //
   // >> now we begin the destruction sequence, which involves pattern matching on self to destroy its innards

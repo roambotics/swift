@@ -220,6 +220,8 @@ class DeadFunctionAndGlobalElimination {
     for (const SILInstruction &initInst : *global) {
       if (auto *fRef = dyn_cast<FunctionRefInst>(&initInst))
         ensureAlive(fRef->getReferencedFunction());
+      if (auto *gRef = dyn_cast<GlobalAddrInst>(&initInst))
+        ensureAlive(gRef->getReferencedGlobal());
     }
   }
 
@@ -407,6 +409,8 @@ class DeadFunctionAndGlobalElimination {
       linkage = SILLinkage::Hidden;
       break;
     case AccessLevel::Package:
+      linkage = SILLinkage::Package;
+      break;
     case AccessLevel::Public:
     case AccessLevel::Open:
       linkage = SILLinkage::Public;

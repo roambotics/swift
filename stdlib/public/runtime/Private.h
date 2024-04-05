@@ -280,12 +280,26 @@ public:
   Demangle::NodePointer _swift_buildDemanglingForMetadata(const Metadata *type,
                                                           Demangle::Demangler &Dem);
 
+  /// Build the demangling for the generic type that's created by specializing
+  /// the given type context descriptor with the given arguments.
+  Demangle::NodePointer
+  _buildDemanglingForGenericType(const TypeContextDescriptor *description,
+                                 const void *const *arguments,
+                                 Demangle::Demangler &Dem);
+
   /// Callback used to provide the substitution of a generic parameter
   /// (described by depth/index) to its metadata.
   ///
   /// The return type here is a lie; it's actually a MetadataOrPack.
   using SubstGenericParameterFn =
     std::function<const void *(unsigned depth, unsigned index)>;
+
+  /// Callback used to provide the substitution of a generic parameter
+  /// (described by the ordinal, or "flat index") to its metadata.
+  ///
+  /// The return type here is a lie; it's actually a MetadataOrPack.
+  using SubstGenericParameterOrdinalFn =
+    std::function<const void *(unsigned ordinal)>;
 
   /// Callback used to provide the substitution of a witness table based on
   /// its index into the enclosing generic environment.
@@ -446,6 +460,7 @@ public:
     const void * const *getGenericArgs() const { return genericArgs; }
 
     MetadataOrPack getMetadata(unsigned depth, unsigned index) const;
+    MetadataOrPack getMetadataOrdinal(unsigned ordinal) const;
     const WitnessTable *getWitnessTable(const Metadata *type,
                                         unsigned index) const;
   };
@@ -504,13 +519,27 @@ public:
                                      Demangler &BorrowFrom);
 
   /// Map depth/index to a flat index.
-  llvm::Optional<unsigned> _depthIndexToFlatIndex(
-                                          unsigned depth, unsigned index,
-                                          llvm::ArrayRef<unsigned> paramCounts);
+  std::optional<unsigned>
+  _depthIndexToFlatIndex(unsigned depth, unsigned index,
+                         llvm::ArrayRef<unsigned> paramCounts);
+
+  /// Gathers all of the written generic parameters needed for
+  /// '_gatherGenericParameters'. This takes a list of key arguments and fills
+  /// in the generic arguments with all generic arguments.
+  ///
+  /// \returns true if the operation succeeded.
+  bool _gatherWrittenGenericParameters(
+      const TypeContextDescriptor *descriptor,
+      llvm::ArrayRef<const void *> keyArgs,
+      llvm::SmallVectorImpl<MetadataOrPack> &genericArgs,
+      Demangle::Demangler &Dem);
 
   /// Check the given generic requirements using the given set of generic
   /// arguments, collecting the key arguments (e.g., witness tables) for
   /// the caller.
+  ///
+  /// \param genericParams The generic parameters corresponding to the
+  /// arguments.
   ///
   /// \param requirements The set of requirements to evaluate.
   ///
@@ -519,10 +548,12 @@ public:
   /// passed to an instantiation function) will be added to this vector.
   ///
   /// \returns the error if an error occurred, None otherwise.
-  llvm::Optional<TypeLookupError> _checkGenericRequirements(
+  std::optional<TypeLookupError> _checkGenericRequirements(
+      llvm::ArrayRef<GenericParamDescriptor> genericParams,
       llvm::ArrayRef<GenericRequirementDescriptor> requirements,
       llvm::SmallVectorImpl<const void *> &extraArguments,
       SubstGenericParameterFn substGenericParam,
+      SubstGenericParameterOrdinalFn substGenericParamOrdinal,
       SubstDependentWitnessTableFn substWitnessTable);
 
   /// A helper function which avoids performing a store if the destination
@@ -572,6 +603,12 @@ public:
 
   SWIFT_RETURNS_NONNULL SWIFT_NODISCARD
   void *allocateMetadata(size_t size, size_t align);
+
+  // Compare two pieces of metadata that should be identical. Returns true if
+  // they are, false if they are not equal. Dumps the metadata contents to
+  // stderr if they are not equal.
+  bool compareGenericMetadata(const Metadata *original,
+                              const Metadata *newMetadata);
 
   Demangle::NodePointer
   _buildDemanglingForContext(const ContextDescriptor *context,

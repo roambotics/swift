@@ -21,6 +21,7 @@
 #include "llvm/Support/Mutex.h"
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace llvm {
@@ -49,9 +50,8 @@ private:
   mutable llvm::sys::Mutex Mtx;
 
 public:
-  Settings
-  update(llvm::Optional<unsigned> IDEInspectionMaxASTContextReuseCount,
-         llvm::Optional<unsigned> IDEInspectionCheckDependencyInterval);
+  Settings update(std::optional<unsigned> IDEInspectionMaxASTContextReuseCount,
+                  std::optional<unsigned> IDEInspectionCheckDependencyInterval);
   Settings::IDEInspectionOptions getIDEInspectionOpts() const;
 };
 

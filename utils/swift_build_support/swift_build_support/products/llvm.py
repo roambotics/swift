@@ -185,6 +185,20 @@ class LLVM(cmake_product.CMakeProduct):
                         elif self.args.verbose_build:
                             print('no file exists at {}', host_sim_lib_path)
 
+                os.makedirs(os.path.join(dest_builtins_dir, 'macho_embedded'),
+                            exist_ok=True)
+                for _flavor in ['hard_pic', 'hard_static', 'soft_pic', 'soft_static']:
+                    # Copy over the macho_embedded .a when necessary
+                    lib_name = os.path.join('macho_embedded', 'libclang_rt.{}.a'.format(
+                        _flavor))
+                    host_lib_path = os.path.join(host_cxx_builtins_dir, lib_name)
+                    dest_lib_path = os.path.join(dest_builtins_dir, lib_name)
+                    if not os.path.isfile(dest_lib_path):
+                        if os.path.isfile(host_lib_path):
+                            shutil.copy(host_lib_path, dest_lib_path)
+                        elif self.args.verbose_build:
+                            print('no file exists at {}'.format(host_lib_path))
+
     def should_build(self, host_target):
         """should_build() -> Bool
 
@@ -216,20 +230,11 @@ class LLVM(cmake_product.CMakeProduct):
                 # space/time efficient than -g on that platform.
                 llvm_cmake_options.define('LLVM_USE_SPLIT_DWARF:BOOL', 'YES')
 
-        build_targets = ['all']
-
-        if self.args.llvm_ninja_targets_for_cross_compile_hosts and \
-           self.is_cross_compile_target(host_target):
-            build_targets = (self.args.llvm_ninja_targets_for_cross_compile_hosts)
-        elif self.args.llvm_ninja_targets:
-            build_targets = (self.args.llvm_ninja_targets)
-
-        # indicating we don't want to build LLVM should
-        # override any custom ninja target we specified
         if not self.args._build_llvm:
-            build_targets = ['clean']
-
-        if self.args.skip_build or not self.args.build_llvm:
+            # Indicating we don't want to build LLVM at all should
+            # override everything.
+            build_targets = []
+        elif self.args.skip_build or not self.args.build_llvm:
             # We can't skip the build completely because the standalone
             # build of Swift depends on these.
             build_targets = ['llvm-tblgen', 'clang-resource-headers',
@@ -248,6 +253,14 @@ class LLVM(cmake_product.CMakeProduct):
                     'llvm-nm',
                     'llvm-size'
                 ])
+        else:
+            build_targets = ['all']
+
+            if self.args.llvm_ninja_targets_for_cross_compile_hosts and \
+               self.is_cross_compile_target(host_target):
+                build_targets = (self.args.llvm_ninja_targets_for_cross_compile_hosts)
+            elif self.args.llvm_ninja_targets:
+                build_targets = (self.args.llvm_ninja_targets)
 
         if self.args.host_libtool:
             llvm_cmake_options.define('CMAKE_LIBTOOL', self.args.host_libtool)
@@ -282,17 +295,13 @@ class LLVM(cmake_product.CMakeProduct):
         if self.args.build_clang_tools_extra:
             llvm_enable_projects.append('clang-tools-extra')
 
-        # On non-Darwin platforms, build lld so we can always have a
+        # Always build lld -- on non-Darwin so we can always have a
         # linker that is compatible with the swift we are using to
-        # compile the stdlib.
+        # compile the stdlib, but on Darwin too for Embedded Swift use cases.
         #
         # This makes it easier to build target stdlibs on systems that
         # have old toolchains without more modern linker features.
-
-        target = targets.StdlibDeploymentTarget.get_target_for_name(host_target)
-
-        if not target.platform.is_darwin or self.args.build_lld:
-            llvm_enable_projects.append('lld')
+        llvm_enable_projects.append('lld')
 
         llvm_cmake_options.define('LLVM_ENABLE_PROJECTS',
                                   ';'.join(llvm_enable_projects))

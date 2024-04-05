@@ -18,6 +18,7 @@
 #define SWIFT_SERIALIZATION_SERIALIZATION_H
 
 #include "ModuleFormat.h"
+#include "swift/Basic/LLVMExtras.h"
 #include "swift/Serialization/SerializationOptions.h"
 #include "swift/Subsystems.h"
 #include "swift/AST/Identifier.h"
@@ -111,6 +112,10 @@ class Serializer : public SerializerBase {
 
   SmallVector<DeclID, 16> exportedPrespecializationDecls;
 
+  /// Will be set to true if any serialization step failed, for example due to
+  /// an error in the AST.
+  bool hadError = false;
+
   /// Helper for serializing entities in the AST block object graph.
   ///
   /// Keeps track of assigning IDs to newly-seen entities, and collecting
@@ -172,9 +177,9 @@ class Serializer : public SerializerBase {
     /// Returns the next entity to be written.
     ///
     /// If there is nothing left to serialize, returns None.
-    llvm::Optional<T> peekNext() const {
+    std::optional<T> peekNext() const {
       if (!hasMoreToSerialize())
-        return llvm::None;
+        return std::nullopt;
       return EntitiesToWrite.front();
     }
 
@@ -182,9 +187,9 @@ class Serializer : public SerializerBase {
     /// it so it can be written.
     ///
     /// If there is nothing left to serialize, returns None.
-    llvm::Optional<T> popNext(BitOffset offset) {
+    std::optional<T> popNext(BitOffset offset) {
       if (!hasMoreToSerialize())
-        return llvm::None;
+        return std::nullopt;
       T result = EntitiesToWrite.front();
       EntitiesToWrite.pop();
       Offsets.push_back(offset);
@@ -289,7 +294,7 @@ public:
   // constructed, and then converted to a `DerivativeFunctionConfigTableData`.
   using UniquedDerivativeFunctionConfigTable = llvm::MapVector<
       Identifier,
-      llvm::SmallSetVector<std::pair<Identifier, GenericSignature>, 4>>;
+      swift::SmallSetVector<std::pair<Identifier, GenericSignature>, 4>>;
 
   // In-memory representation of what will eventually be an on-disk
   // hash table of the fingerprint associated with a serialized
@@ -379,6 +384,11 @@ private:
 
   /// Writes a pack conformance.
   void writeASTBlockEntity(PackConformance *conformance);
+
+  /// Writes lifetime dependence info
+  void
+  writeLifetimeDependenceInfo(LifetimeDependenceInfo lifetimeDependenceInfo,
+                              bool skipImplicit = false);
 
   /// Registers the abbreviation for the given decl or type layout.
   template <typename Layout>
@@ -569,6 +579,19 @@ public:
   void writePrimaryAssociatedTypes(ArrayRef<AssociatedTypeDecl *> assocTypes);
 
   bool allowCompilerErrors() const;
+
+private:
+  /// If the declaration is invalid, records that an error occurred and returns
+  /// true if the decl should be skipped.
+  bool skipDeclIfInvalid(const Decl *decl);
+
+  /// If the type is invalid, records that an error occurred and returns
+  /// true if the type should be skipped.
+  bool skipTypeIfInvalid(Type ty, TypeRepr *tyRepr);
+
+  /// If the type is invalid, records that an error occurred and returns
+  /// true if the type should be skipped.
+  bool skipTypeIfInvalid(Type ty, SourceLoc loc);
 };
 
 } // end namespace serialization

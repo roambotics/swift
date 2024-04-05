@@ -114,6 +114,10 @@ static bool canSpecializeFunction(SILFunction *F,
   if (F->getConventions().hasIndirectSILResults())
     return false;
 
+  // For now ignore functions with indirect error results.
+  if (F->getConventions().hasIndirectSILErrorResults())
+    return false;
+
   // For now ignore coroutines.
   if (F->getLoweredFunctionType()->isCoroutine())
     return false;
@@ -136,6 +140,17 @@ static bool canSpecializeFunction(SILFunction *F,
   if (!isSpecializableRepresentation(F->getRepresentation(),
                                      OptForPartialApply))
     return false;
+
+  // Cannot specialize witnesses of distributed protocol requirements with
+  // ad-hoc `SerializationRequirement` because that erases information
+  // IRGen relies on to emit protocol conformances at runtime.
+  if (F->hasLocation()) {
+    if (auto *funcDecl =
+            dyn_cast_or_null<FuncDecl>(F->getLocation().getAsDeclContext())) {
+      if (funcDecl->isDistributedWitnessWithAdHocSerializationRequirement())
+        return false;
+    }
+  }
 
   return true;
 }
@@ -292,7 +307,7 @@ static void
 mapInterfaceTypes(SILFunction *F,
                   MutableArrayRef<SILParameterInfo> InterfaceParams,
                   MutableArrayRef<SILResultInfo> InterfaceResults,
-                  llvm::Optional<SILResultInfo> &InterfaceErrorResult) {
+                  std::optional<SILResultInfo> &InterfaceErrorResult) {
 
   for (auto &Param : InterfaceParams) {
     if (!Param.getInterfaceType()->hasArchetype())
@@ -401,7 +416,7 @@ FunctionSignatureTransformDescriptor::createOptimizedSILFunctionType() {
     witnessMethodConformance = ProtocolConformanceRef::forInvalid();
   }
 
-  llvm::Optional<SILResultInfo> InterfaceErrorResult;
+  std::optional<SILResultInfo> InterfaceErrorResult;
   if (ExpectedFTy->hasErrorResult()) {
     InterfaceErrorResult = ExpectedFTy->getErrorResult();
   }
@@ -546,7 +561,7 @@ void FunctionSignatureTransform::createFunctionSignatureOptimizedFunction() {
   // Array semantic clients rely on the signature being as in the original
   // version.
   for (auto &Attr : F->getSemanticsAttrs()) {
-    if (!StringRef(Attr).startswith("array."))
+    if (!StringRef(Attr).starts_with("array."))
       NewF->addSemanticsAttr(Attr);
   }
 

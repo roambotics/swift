@@ -14,15 +14,17 @@
 #define SWIFT_FRONTEND_FRONTENDOPTIONS_H
 
 #include "swift/Basic/FileTypes.h"
-#include "swift/Basic/Version.h"
 #include "swift/Basic/PathRemapper.h"
+#include "swift/Basic/Version.h"
 #include "swift/Frontend/FrontendInputsAndOutputs.h"
 #include "swift/Frontend/InputFile.h"
-#include "llvm/ADT/Hashing.h"
-#include "llvm/ADT/Optional.h"
-#include "llvm/ADT/StringMap.h"
 #include "clang/CAS/CASOptions.h"
+#include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/MC/MCTargetOptions.h"
+#include <optional>
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -127,26 +129,11 @@ public:
   /// The module for which we should verify all of the generic signatures.
   std::string VerifyGenericSignaturesInModule;
 
-  /// Enable compiler caching.
-  bool EnableCaching = false;
+  /// Emit a .casid file next to the object file if CAS Backend is used.
+  bool EmitCASIDFile = false;
 
-  /// Enable compiler caching remarks.
-  bool EnableCachingRemarks = false;
-
-  /// Skip replaying outputs from cache.
-  bool CacheSkipReplay = false;
-
-  /// CASOptions
-  clang::CASOptions CASOpts;
-
-  /// CASFS Root.
-  std::vector<std::string> CASFSRootIDs;
-
-  /// Clang Include Trees.
-  std::vector<std::string> ClangIncludeTrees;
-
-  /// CacheKey for input file.
-  std::string InputFileKey;
+  /// CacheReplay PrefixMap.
+  std::vector<std::string> CacheReplayPrefixMap;
 
   /// Number of retry opening an input file if the previous opening returns
   /// bad file descriptor error.
@@ -224,7 +211,7 @@ public:
   /// When true, emitted module files will always contain options for the
   /// debugger to use. When unset, the options will only be present if the
   /// module appears to not be a public module.
-  llvm::Optional<bool> SerializeOptionsForDebugging;
+  std::optional<bool> SerializeOptionsForDebugging;
 
   /// When true the debug prefix map entries will be applied to debugging
   /// options before serialization. These can be reconstructed at debug time by
@@ -293,6 +280,10 @@ public:
   /// termination.
   bool PrintClangStats = false;
 
+  /// Indicates whether or not the Clang importer should dump lookup tables
+  /// upon termination.
+  bool DumpClangLookupTables = false;
+
   /// Indicates whether standard help should be shown.
   bool PrintHelp = false;
 
@@ -312,7 +303,7 @@ public:
   /// Specifies the collection mode for the intermodule dependency tracker.
   /// Note that if set, the dependency tracker will be enabled even if no
   /// output path is configured.
-  llvm::Optional<IntermoduleDepTrackingMode> IntermoduleDependencyTracking;
+  std::optional<IntermoduleDepTrackingMode> IntermoduleDependencyTracking;
 
   /// Should we emit the cType when printing @convention(c) or no?
   bool PrintFullConvention = false;
@@ -320,10 +311,6 @@ public:
   /// Should we serialize the hashes of dependencies (vs. the modification
   /// times) when compiling a module interface?
   bool SerializeModuleInterfaceDependencyHashes = false;
-
-  /// Should we only serialize decls that may be referenced externally in the
-  /// binary module?
-  bool SerializeExternalDeclsOnly = false;
 
   /// Should we warn if an imported module needed to be rebuilt from a
   /// module interface file?
@@ -340,7 +327,7 @@ public:
 
   /// The directory path we should use when print #include for the bridging header.
   /// By default, we include ImplicitObjCHeaderPath directly.
-  llvm::Optional<std::string> BridgingHeaderDirForPrint;
+  std::optional<std::string> BridgingHeaderDirForPrint;
 
   /// Disable implicitly-built Swift modules because they are explicitly
   /// built and provided to the compiler invocation.
@@ -349,6 +336,9 @@ public:
   /// Disable building Swift modules from textual interfaces. This should be
   /// for testing purposes only.
   bool DisableBuildingInterface = false;
+
+  /// Is this frontend configuration of an interface dependency scan sub-invocation
+  bool DependencyScanningSubInvocation = false;
 
   /// When performing a dependency scanning action, only identify and output all imports
   /// of the main Swift module's source files.
@@ -402,6 +392,9 @@ public:
   /// are present at LTO time.
   bool HermeticSealAtLink = false;
 
+  /// Disable using the sandbox when executing subprocesses.
+  bool DisableSandbox = false;
+
   /// The different modes for validating TBD against the LLVM IR.
   enum class TBDValidationMode {
     Default,        ///< Do the default validation for the current platform.
@@ -444,7 +437,7 @@ public:
 
   /// Indicates which declarations should be exposed in the generated clang
   /// header.
-  llvm::Optional<ClangHeaderExposeBehavior> ClangHeaderExposedDecls;
+  std::optional<ClangHeaderExposeBehavior> ClangHeaderExposedDecls;
 
   struct ClangHeaderExposedImportedModule {
     std::string moduleName;
@@ -566,6 +559,7 @@ private:
   static bool canActionEmitModuleSummary(ActionType);
   static bool canActionEmitInterface(ActionType);
   static bool canActionEmitABIDescriptor(ActionType);
+  static bool canActionEmitAPIDescriptor(ActionType);
   static bool canActionEmitConstValues(ActionType);
   static bool canActionEmitModuleSemanticInfo(ActionType);
 
@@ -574,6 +568,7 @@ public:
   static bool doesActionGenerateIR(ActionType);
   static bool doesActionProduceOutput(ActionType);
   static bool doesActionProduceTextualOutput(ActionType);
+  static bool doesActionBuildModuleFromInterface(ActionType);
   static bool needsProperModuleName(ActionType);
   static file_types::ID formatForPrincipalOutputFileForAction(ActionType);
 };

@@ -437,6 +437,34 @@ the export name.
 
 It's the equivalent of clang's `__attribute__((export_name))`.
 
+## `@_extern(<language>)`
+
+Indicates that a particular declaration should be imported
+from the external environment.
+
+### `@_extern(wasm, module: <"moduleName">, name: <"fieldName">)`
+
+Indicates that a particular declaration should be imported
+through WebAssembly's import interface.
+
+It's the equivalent of clang's `__attribute__((import_module("module"), import_name("field")))`.
+
+### `@_extern(c, [, <"cName">])`
+
+Indicates that a particular declaration should refer to a
+C declaration with the given name. If the optional "cName"
+string is not specified, the Swift function name is used
+without Swift name mangling. Platform-specific mangling
+rules (leading underscore on Darwin) are still applied.
+
+Similar to `@_cdecl`, but this attribute is used to reference
+C declarations from Swift, while `@_cdecl` is used to define
+Swift functions that can be referenced from C.
+
+Also similar to `@_silgen_name`, but a function declared with
+`@_extern(c)` is assumed to use the C ABI, while `@_silgen_name`
+assumes the Swift ABI.
+
 ## `@_fixed_layout`
 
 Same as `@frozen` but also works for classes.
@@ -613,6 +641,15 @@ This is the default behavior, unless the type annotated is an aggregate that
 consists entirely of `@_eagerMove` or trivial values, in which case the
 attribute overrides the inferred type-level annotation.
 
+## `@_nonEscapable`
+
+Indicates that a type is non-escapable. All instances of this type are
+non-escaping values. A non-escaping value's lifetime must be confined
+to another "parent" lifetime.
+
+This is temporary until ~Escapable syntax is supported, which will
+also work as a generic type constraint.
+
 ## `@_marker`
 
 Indicates that a protocol is a marker protocol. Marker protocols represent some
@@ -742,6 +779,11 @@ of a header as non-`Sendable` so that you can make spot exceptions with
 
 ## `@_objcImplementation(CategoryName)`
 
+A pre-stable form of `@implementation`. The main difference between them is that
+many things that are errors with `@implementation` are warnings with
+`@_objcImplementation`, which permitted workarounds for compiler bugs and 
+changes in compiler behavior.
+
 Declares an extension that defines an implementation for the Objective-C
 category `CategoryName` on the class in question, or for the main `@interface`
 if the argument list is omitted.
@@ -804,12 +846,6 @@ Notes:
 
 * We don't currently plan to support ObjC generics.
 
-* Eventually, we want the main `@_objcImplementation` extension to be able to
-  declare stored properties that aren't in the interface. We also want
-  `final` stored properties to be allowed to be resilent Swift types, but
-  it's not clear how to achieve that without boxing them in `__SwiftValue`
-  (which we might do as a stopgap).
-     
 * We should think about ObjC "direct" members, but that would probably
   require a way to spell this in Swift. 
 
@@ -1098,7 +1134,7 @@ doing a textual search.
 
 Like `@available`, this attribute indicates a decl is available only as an SPI.
 This implies several behavioral changes comparing to regular `@available`:
-1. Type checker diagnoses when a client accidently exposes such a symbol in library APIs.
+1. Type checker diagnoses when a client accidentally exposes such a symbol in library APIs.
 2. When emitting public interfaces, `@_spi_available` is printed as `@available(platform, unavailable)`.
 3. ClangImporter imports ObjC macros `SPI_AVAILABLE` and `__SPI_AVAILABLE` to this attribute.
 

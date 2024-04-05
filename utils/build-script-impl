@@ -75,6 +75,7 @@ KNOWN_SETTINGS=(
     use-gold-linker                               ""                "Enable using the gold linker"
     workspace                                     "${HOME}/src"     "source directory containing llvm, clang, swift"
     dsymutil-jobs                                 "1"               "number of parallel invocations of dsymutil"
+    extra-dsymutil-args                           ""                "additional arguments to pass to dsymutil"
 
     ## Build Tools
     host-cc                                       ""                "the path to CC, the 'clang' compiler for the host platform. **This argument is required**"
@@ -116,6 +117,9 @@ KNOWN_SETTINGS=(
     darwin-toolchain-require-use-os-runtime       "0"               "When setting up a plist for a toolchain, require the users of the toolchain to link against the OS instead of the packaged toolchain runtime. 0 for false, 1 for true"
     darwin-xcrun-toolchain                        "default"         "the name of the toolchain to use on Darwin"
 
+    ## Runtime options
+    min-runtime-version                ""                "Used to specify the minimum host runtime version when building the compiler on non-Darwin platforms"
+
     ## WebAssembly/WASI Options
     wasi-sysroot                                  ""                "An absolute path to the wasi-sysroot that will be used as a libc implementation for Wasm builds"
 
@@ -143,6 +147,7 @@ KNOWN_SETTINGS=(
     ## Build ...
     build-llvm                                    "1"               "set to 1 to build LLVM and Clang"
     build-sil-debugging-stdlib                    "0"               "set to 1 to build the Swift standard library with -sil-based-debuginfo to enable debugging and profiling on SIL level"
+    build-swift-clang-overlays                    "1"               "set to 1 to build the Swift overlays for the clang builtin modules"
     build-swift-dynamic-sdk-overlay               ""                "set to 1 to build dynamic variants of the Swift SDK overlay"
     build-swift-dynamic-stdlib                    ""                "set to 1 to build dynamic variants of the Swift standard library"
     build-swift-examples                          "1"               "set to 1 to build examples"
@@ -218,9 +223,11 @@ KNOWN_SETTINGS=(
     swift-runtime-static-image-inspection         "0"               "whether to build stdlib assuming the runtime environment only supports a single runtime image with Swift code"
     swift-threading-package                       ""                "override the threading package for the host build; this is either a single package or a semicolon-separated list of sdk:package pairs.  Valid packages are empty string (no override), 'pthreads', 'darwin', 'linux', 'win32', 'c11', 'none'"
     swift-stdlib-single-threaded-concurrency      "0"               "build Swift concurrency in single-threaded mode"
+    swift-stdlib-task-to-thread-model-concurrency "0"               "build Swift concurrency with task-to-thread mode"
     swift-stdlib-tracing                          ""                "whether to enable tracing signposts for the stdlib; default is 1 on Darwin platforms, 0 otherwise"
     swift-stdlib-concurrency-tracing              ""                "whether to enable tracing signposts for concurrency; default is 1 on Darwin platforms, 0 otherwise"
     swift-stdlib-use-relative-protocol-witness-tables "0"            "whether to use relative protocol witness table"
+    swift-stdlib-use-fragile-resilient-protocol-witness-tables "0"            "whether to use fragile resilient protocol witness table"
     swift-enable-runtime-function-counters        ""                "whether to enable runtime function counters"
     swift-stdlib-os-versioning                    "1"               "whether to build stdlib with availability based on OS versions (Darwin only)"
     swift-stdlib-has-commandline                  "1"               "whether to build stdlib with the CommandLine enum and support for argv/argc"
@@ -245,6 +252,7 @@ KNOWN_SETTINGS=(
     swift-earlyswiftsyntax                        "0"               "use the early SwiftSyntax"
     swift-enable-backtracing                      "1"               "whether to build the backtracing support"
     swift-runtime-fixed-backtracer-path           ""                "if set, use a fixed path for the backtracer"
+    swift-stdlib-overridable-retain-release       "1"               "whether to allow retain/release functions to be overridden by indirecting through function pointers"
 
     ## FREESTANDING Stdlib Options
     swift-freestanding-flavor                     ""                "when building the FREESTANDING stdlib, which build style to use (options: apple, linux)"
@@ -744,6 +752,12 @@ function set_build_options_for_host() {
                 swift_cmake_options+=(
                     -DLLVM_ENABLE_MODULE_DEBUGGING:BOOL=NO
                     "-DSWIFT_PARALLEL_LINK_JOBS=${SWIFT_TOOLS_NUM_PARALLEL_LTO_LINK_JOBS}"
+                )
+            fi
+
+            if [[ ! -z "${MIN_RUNTIME_VERSION}" ]]; then
+                swift_cmake_options+=(
+                    -DSWIFT_MIN_RUNTIME_VERSION="${MIN_RUNTIME_VERSION}"
                 )
             fi
 
@@ -1425,95 +1439,6 @@ function cmake_config_opt() {
     fi
 }
 
-function copy_lib_stripping_architecture() {
-    local source="$1"
-    local dest="$2"
-    local arch="$3"
-
-    # An alternative approach would be to use || to first
-    # attempt the removal of the slice and fall back to the
-    # copy when failing.
-    # However, this would leave unneeded error messages in the logs
-    # that may hinder investigation; in addition, in this scenario
-    # the `call` function seems to not propagate correctly failure
-    # exit codes.
-    if lipo -archs "${source}" | grep -q "${arch}"; then
-        call lipo -remove "${arch}" "${source}" -output "${dest}"
-    else
-        call cp "${source}" "${dest}"
-    fi
-}
-
-function copy_embedded_compiler_rt_builtins_from_darwin_host_toolchain() {
-    local clang_dest_dir="$1"
-
-    HOST_CXX_DIR=$(dirname "${HOST_CXX}")
-    HOST_LIB_CLANG_DIR="${HOST_CXX_DIR}/../lib/clang"
-    DEST_LIB_CLANG_DIR="${clang_dest_dir}/lib/clang"
-
-    [ -d "${HOST_LIB_CLANG_DIR}" -a -d "${DEST_LIB_CLANG_DIR}" ] || return 0
-
-    DEST_CXX_BUILTINS_VERSION=$(ls -1 "${DEST_LIB_CLANG_DIR}")
-    DEST_BUILTINS_DIR="${clang_dest_dir}/lib/clang/${DEST_CXX_BUILTINS_VERSION}/lib/darwin"
-
-    if [[ -d "${DEST_BUILTINS_DIR}" ]]; then
-        for HOST_CXX_BUILTINS_PATH in "${HOST_LIB_CLANG_DIR}"/*; do
-            HOST_CXX_BUILTINS_DIR="${HOST_CXX_BUILTINS_PATH}/lib/darwin"
-            echo "copying compiler-rt embedded builtins from ${HOST_CXX_BUILTINS_DIR} into the local clang build directory ${DEST_BUILTINS_DIR}."
-
-            for OS in ios watchos tvos; do
-                # Copy over the device .a when necessary
-                LIB_NAME="libclang_rt.$OS.a"
-                HOST_LIB_PATH="$HOST_CXX_BUILTINS_DIR/$LIB_NAME"
-                DEST_LIB_PATH="${DEST_BUILTINS_DIR}/${LIB_NAME}"
-                if [[ ! -f "${DEST_LIB_PATH}" ]]; then
-                    if [[ -f "${HOST_LIB_PATH}" ]]; then
-                        if [[ "$OS" == "tvos" ]]; then
-                            # This is to avoid strip failures when generating a toolchain
-                            copy_lib_stripping_architecture "${HOST_LIB_PATH}" "${DEST_LIB_PATH}" i386
-                        else
-                           call cp "${HOST_LIB_PATH}" "${DEST_LIB_PATH}"
-                        fi
-                    elif [[ "${VERBOSE_BUILD}" ]]; then
-                        echo "no file exists at ${HOST_LIB_PATH}"
-                    fi
-                fi
-
-                # Copy over the simulator .a when necessary
-                SIM_LIB_NAME="libclang_rt.${OS}sim.a"
-                HOST_SIM_LIB_PATH="$HOST_CXX_BUILTINS_DIR/$SIM_LIB_NAME"
-                DEST_SIM_LIB_PATH="${DEST_BUILTINS_DIR}/${SIM_LIB_NAME}"
-                if [[ ! -f "${DEST_SIM_LIB_PATH}" ]]; then
-                    if [[ -f "${HOST_SIM_LIB_PATH}" ]]; then
-                        if [[ "$OS" == "tvos" ]]; then
-                            # This is to avoid strip failures when generating a toolchain
-                            copy_lib_stripping_architecture "${HOST_SIM_LIB_PATH}" "${DEST_SIM_LIB_PATH}" i386
-                        else
-                            call cp "${HOST_SIM_LIB_PATH}" "${DEST_SIM_LIB_PATH}"
-                        fi
-                    elif [[ -f "${HOST_LIB_PATH}" ]]; then
-                        # The simulator .a might not exist if the host
-                        # Xcode is old. In that case, copy over the
-                        # device library to the simulator location to allow
-                        # clang to find it. The device library has the simulator
-                        # slices in Xcode that doesn't have the simulator .a, so
-                        # the link is still valid.
-                        echo "copying over faux-sim library ${HOST_LIB_PATH} to ${SIM_LIB_NAME}"
-                        if [[ "$OS" == "tvos" ]]; then
-                            echo "Remove i386 from tvOS ${DEST_SIM_LIB_PATH}"
-                            call lipo -remove i386 "${HOST_LIB_PATH}" -output "${DEST_SIM_LIB_PATH}"
-                        else
-                            call cp "${HOST_LIB_PATH}" "${DEST_SIM_LIB_PATH}"
-                        fi
-                    elif [[ "${VERBOSE_BUILD}" ]]; then
-                        echo "no file exists at ${HOST_SIM_LIB_PATH}"
-                    fi
-                fi
-            done
-        done
-    fi
-}
-
 #
 # Configure and build each product
 #
@@ -1834,6 +1759,7 @@ for host in "${ALL_HOSTS[@]}"; do
                     -DSWIFT_IMPLICIT_CONCURRENCY_IMPORT:BOOL=$(true_false "${SWIFT_IMPLICIT_CONCURRENCY_IMPORT}")
                     -DSWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT:BOOL=$(true_false "${SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT}")
                     -DSWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY:BOOL=$(true_false "${SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY}")
+                    -DSWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY:BOOL=$(true_false "${SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY}")
                     -DSWIFT_ENABLE_RUNTIME_FUNCTION_COUNTERS:BOOL=$(true_false "${SWIFT_ENABLE_RUNTIME_FUNCTION_COUNTERS}")
                     -DSWIFT_STDLIB_HAS_DLADDR:BOOL=$(true_false "${SWIFT_STDLIB_HAS_DLADDR}")
                     -DSWIFT_STDLIB_HAS_DLSYM:BOOL=$(true_false "${SWIFT_STDLIB_HAS_DLSYM}")
@@ -1857,6 +1783,7 @@ for host in "${ALL_HOSTS[@]}"; do
                     -DSWIFT_NATIVE_CLANG_TOOLS_PATH:STRING="${native_clang_tools_path}"
                     -DSWIFT_NATIVE_SWIFT_TOOLS_PATH:STRING="${native_swift_tools_path}"
                     -DSWIFT_INCLUDE_TOOLS:BOOL=$(true_false "${BUILD_SWIFT_TOOLS}")
+                    -DSWIFT_BUILD_CLANG_OVERLAYS:BOOL=$(true_false "${BUILD_SWIFT_CLANG_OVERLAYS}")
                     -DSWIFT_BUILD_REMOTE_MIRROR:BOOL=$(true_false "${BUILD_SWIFT_REMOTE_MIRROR}")
                     -DSWIFT_STDLIB_SIL_DEBUGGING:BOOL=$(true_false "${BUILD_SIL_DEBUGGING_STDLIB}")
                     -DSWIFT_CHECK_INCREMENTAL_COMPILATION:BOOL=$(true_false "${CHECK_INCREMENTAL_COMPILATION}")
@@ -1876,6 +1803,7 @@ for host in "${ALL_HOSTS[@]}"; do
                     -DLIBDISPATCH_CMAKE_BUILD_TYPE:STRING="${LIBDISPATCH_BUILD_TYPE}"
                     -DSWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE:PATH="${SWIFT_SYNTAX_SOURCE_DIR}"
                     -DSWIFT_ENABLE_BACKTRACING:BOOL=$(true_false "${SWIFT_ENABLE_BACKTRACING}")
+                    -DSWIFT_STDLIB_OVERRIDABLE_RETAIN_RELEASE:BOOL=$(true_false "${SWIFT_STDLIB_OVERRIDABLE_RETAIN_RELEASE}")
                     "${swift_cmake_options[@]}"
                 )
 
@@ -2072,6 +2000,13 @@ for host in "${ALL_HOSTS[@]}"; do
                     cmake_options=(
                         "${cmake_options[@]}"
                         -DSWIFT_STDLIB_USE_RELATIVE_PROTOCOL_WITNESS_TABLES:BOOL=$(true_false "${SWIFT_STDLIB_USE_RELATIVE_PROTOCOL_WITNESS_TABLES}")
+                    )
+                fi
+
+                if [[ "${SWIFT_STDLIB_USE_FRAGILE_RESILIENT_PROTOCOL_WITNESS_TABLES}" ]] ; then
+                    cmake_options=(
+                        "${cmake_options[@]}"
+                        -DSWIFT_STDLIB_USE_FRAGILE_RESILIENT_PROTOCOL_WITNESS_TABLES:BOOL=$(true_false "${SWIFT_STDLIB_USE_FRAGILE_RESILIENT_PROTOCOL_WITNESS_TABLES}")
                     )
                 fi
 
@@ -2781,6 +2716,7 @@ for host in "${ALL_HOSTS[@]}"; do
                 fi
 
                 FILTER_SWIFT_OPTION="--filter=[sS]wift"
+                FILTER_SWIFT_API_OPTION="--filter=lang/swift"
                 LLVM_LIT_FILTER_ARG=""
                 if [[ "$(true_false ${LLDB_TEST_SWIFT_ONLY})" == "TRUE" ]]; then
                     LLVM_LIT_FILTER_ARG="${FILTER_SWIFT_OPTION}"
@@ -2789,19 +2725,32 @@ for host in "${ALL_HOSTS[@]}"; do
                 echo "--- Running LLDB unit tests ---"
                 with_pushd ${lldb_build_dir} \
                     call ${NINJA_BIN} -j ${BUILD_JOBS} unittests/LLDBUnitTests
-                echo "--- Running LLDB tests (Swift tests using ClangImporter) ---"
+                echo "--- Running LLDB tests (Swift Config: Precise/ClangImporter) ---"
                 with_pushd ${lldb_build_dir} \
                     call ${NINJA_BIN} -j ${BUILD_JOBS} lldb-test-deps
                 with_pushd ${results_dir} \
                     call "${llvm_build_dir}/bin/llvm-lit" \
                          "${lldb_build_dir}/test" \
-                         ${LLVM_LIT_ARGS} ${LLVM_LIT_FILTER_ARG}
-                echo "--- Rerun LLDB Swift tests (using only DWARFImporter) ---"
+                         ${LLVM_LIT_ARGS} ${LLVM_LIT_FILTER_ARG} \
+                         --param dotest-args="--setting symbols.use-swift-clangimporter=true --setting symbols.swift-precise-compiler-invocation=true"
+                echo "--- Rerun LLDB Swift API tests (Swift Config: Precise/DWARFImporter) ---"
                 with_pushd ${results_dir} \
                     call "${llvm_build_dir}/bin/llvm-lit" \
                          "${lldb_build_dir}/test" \
-                         ${LLVM_LIT_ARGS} ${FILTER_SWIFT_OPTION} \
-                         --param dotest-args="--setting symbols.use-swift-clangimporter=false"
+                         ${LLVM_LIT_ARGS} ${FILTER_SWIFT_API_OPTION} \
+                         --param dotest-args="--setting symbols.use-swift-clangimporter=false --setting symbols.swift-precise-compiler-invocation=true"
+                echo "--- Rerun LLDB Swift API tests (Swift Config: Classic/ClangImporter) ---"
+                with_pushd ${results_dir} \
+                    call "${llvm_build_dir}/bin/llvm-lit" \
+                         "${lldb_build_dir}/test" \
+                         ${LLVM_LIT_ARGS} ${FILTER_SWIFT_API_OPTION} \
+                         --param dotest-args="--setting symbols.use-swift-clangimporter=true --setting symbols.swift-precise-compiler-invocation=false"
+                echo "--- Rerun LLDB Swift API tests (Swift Config: Classic/DWARFImporter) ---"
+                with_pushd ${results_dir} \
+                    call "${llvm_build_dir}/bin/llvm-lit" \
+                         "${lldb_build_dir}/test" \
+                         ${LLVM_LIT_ARGS} ${FILTER_SWIFT_API_OPTION} \
+                         --param dotest-args="--setting symbols.use-swift-clangimporter=false --setting symbols.swift-precise-compiler-invocation=false"
 
                 if [[ -x "${LLDB_TEST_SWIFT_COMPATIBILITY}" ]] ; then
                     echo "Running LLDB swift compatibility tests against" \
@@ -2814,6 +2763,18 @@ for host in "${ALL_HOSTS[@]}"; do
                             --param dotest-args="${DOTEST_ARGS}" \
                             --filter=compat
                 fi
+
+                if [[ "$(true_false ${LLDB_TEST_SWIFT_ONLY})" == "FALSE" ]]; then
+                    echo "--- Rerun LLDB API tests (Config: Redecl completion) ---"
+                     with_pushd ${results_dir} \
+                        call "${llvm_build_dir}/bin/llvm-lit" \
+                             "${lldb_build_dir}/test/API" \
+                             ${LLVM_LIT_ARGS} \
+                             --param dotest-args="--setting plugin.typesystem.clang.experimental-redecl-completion=true" \
+                             --filter="lang|functionalities|types|commands"
+
+                    # FIXME: run shell-tests with new setting. LLDB doesn't support that yet.
+                 fi
                 continue
                 ;;
             llbuild)
@@ -3276,20 +3237,21 @@ for host in "${ALL_HOSTS[@]}"; do
             printJSONStartTimestamp dsymutil
             (cd "${host_symroot}" &&
              find ./"${CURRENT_PREFIX}" -perm -0111 -type f -not -name "*.a" -not -name "*.py" -print | \
-               xargs -n 1 -P ${DSYMUTIL_JOBS} ${dsymutil_path})
+               xargs -t -n 1 -P ${DSYMUTIL_JOBS} ${dsymutil_path} ${EXTRA_DSYMUTIL_ARGS[@]})
             printJSONEndTimestamp dsymutil
 
             # Strip executables, shared libraries and static libraries in
-            # `host_install_destdir`.
+            # `host_install_destdir`. Avoid touching clang builtins .a files.
             find "${CURRENT_INSTALL_DIR}${CURRENT_PREFIX}/" \
               '(' -perm -0111 -or -name "*.a" ')' -type f -print | \
-              xargs -n 1 -P ${BUILD_JOBS} $(xcrun_find_tool strip) -S
+              grep_that_allows_no_matches -v "/clang/lib/darwin/" | \
+              xargs -t -n 1 -P ${BUILD_JOBS} $(xcrun_find_tool strip) -S
 
             # Codesign dylibs and executables in usr/bin after strip tool
             # rdar://45388785
             find "${CURRENT_INSTALL_DIR}${CURRENT_PREFIX}/" \
               '(' '(' -path "*/usr/bin/*" -and -perm -0111 ')' -or -name "*.dylib" ')' -type f -print | \
-              xargs -n 1 -P ${BUILD_JOBS} $(xcrun_find_tool codesign) -f -s -
+              xargs -t -n 1 -P ${BUILD_JOBS} $(xcrun_find_tool codesign) -f -s -
         fi
 
         { set +x; } 2>/dev/null
@@ -3331,8 +3293,6 @@ function build_and_test_installable_package() {
           COMPATIBILITY_VERSION=2
           COMPATIBILITY_VERSION_DISPLAY_STRING="Xcode 8.0"
           DARWIN_TOOLCHAIN_CREATED_DATE="$(date -u +'%a %b %d %T GMT %Y')"
-          XCODE_DEFAULT_TOOLCHAIN_PLUGIN_SERVER_DESCRIPTOR='$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins#$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-plugin-server'
-          XCODE_DEFAULT_TOOLCHAIN_LOCAL_PLUGIN_SERVER_DESCRIPTOR='$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/local/lib/swift/host/plugins#$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-plugin-server'
 
           SWIFT_USE_DEVELOPMENT_TOOLCHAIN_RUNTIME="YES"
           if [[ "${DARWIN_TOOLCHAIN_REQUIRE_USE_OS_RUNTIME}" -eq "1" ]]; then
@@ -3367,8 +3327,6 @@ function build_and_test_installable_package() {
           call ${PLISTBUDDY_BIN} -c "Add OverrideBuildSettings:SWIFT_LINK_OBJC_RUNTIME string 'YES'" "${DARWIN_TOOLCHAIN_INFO_PLIST}"
           call ${PLISTBUDDY_BIN} -c "Add OverrideBuildSettings:SWIFT_DEVELOPMENT_TOOLCHAIN string 'YES'" "${DARWIN_TOOLCHAIN_INFO_PLIST}"
           call ${PLISTBUDDY_BIN} -c "Add OverrideBuildSettings:SWIFT_USE_DEVELOPMENT_TOOLCHAIN_RUNTIME string '${SWIFT_USE_DEVELOPMENT_TOOLCHAIN_RUNTIME}'" "${DARWIN_TOOLCHAIN_INFO_PLIST}"
-
-          call ${PLISTBUDDY_BIN} -c "Add OverrideBuildSettings:OTHER_SWIFT_FLAGS string '\$(inherited) -Xfrontend -external-plugin-path -Xfrontend ${XCODE_DEFAULT_TOOLCHAIN_PLUGIN_SERVER_DESCRIPTOR} -Xfrontend -external-plugin-path -Xfrontend ${XCODE_DEFAULT_TOOLCHAIN_LOCAL_PLUGIN_SERVER_DESCRIPTOR}'" "${DARWIN_TOOLCHAIN_INFO_PLIST}"
 
           call chmod a+r "${DARWIN_TOOLCHAIN_INFO_PLIST}"
 

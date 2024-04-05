@@ -16,6 +16,8 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/OptionSet.h"
 
+#include <optional>
+
 #include <string>
 #include <vector>
 
@@ -48,7 +50,7 @@ using ModuleTraversalOptions = OptionSet<ModuleTraversal>;
 
 void collectModuleGroups(ModuleDecl *M, SmallVectorImpl<StringRef> &Into);
 
-llvm::Optional<StringRef> findGroupNameForUSR(ModuleDecl *M, StringRef USR);
+std::optional<StringRef> findGroupNameForUSR(ModuleDecl *M, StringRef USR);
 
 bool printTypeInterface(ModuleDecl *M, Type Ty, ASTPrinter &Printer,
                         std::string &TypeName, std::string &Error);

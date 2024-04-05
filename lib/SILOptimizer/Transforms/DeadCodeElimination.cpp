@@ -384,9 +384,9 @@ void DCE::markTerminatorArgsLive(SILBasicBlock *Pred,
   switch (Term->getTermKind()) {
   case TermKind::ReturnInst:
   case TermKind::ThrowInst:
+  case TermKind::ThrowAddrInst:
   case TermKind::UnwindInst:
   case TermKind::YieldInst:
-
   case TermKind::UnreachableInst:
   case TermKind::SwitchValueInst:
   case TermKind::SwitchEnumAddrInst:
@@ -490,6 +490,7 @@ void DCE::propagateLiveness(SILInstruction *I) {
   case TermKind::BranchInst:
   case TermKind::UnreachableInst:
   case TermKind::UnwindInst:
+  case TermKind::ThrowAddrInst:
     return;
 
   case TermKind::ReturnInst:
@@ -550,7 +551,7 @@ void DCE::replaceBranchWithJump(SILInstruction *Inst, SILBasicBlock *Block) {
     auto E = Block->args_end();
     for (auto A = Block->args_begin(); A != E; ++A) {
       assert(!LiveArguments.contains(*A) && "Unexpected live block argument!");
-      Args.push_back(SILUndef::get((*A)->getType(), *(*A)->getFunction()));
+      Args.push_back(SILUndef::get(*A));
     }
     Branch =
         SILBuilderWithScope(Inst).createBranch(Inst->getLoc(), Block, Args);
@@ -657,7 +658,9 @@ bool DCE::removeDead() {
 
         endLifetimeOfLiveValue(phiArg->getIncomingPhiValue(pred), insertPt);
       }
-      erasePhiArgument(&BB, i);
+      erasePhiArgument(&BB, i, /*cleanupDeadPhiOps=*/true,
+                       InstModCallbacks().onCreateNewInst(
+                           [&](auto *inst) { markInstructionLive(inst); }));
       Changed = true;
       BranchesChanged = true;
     }

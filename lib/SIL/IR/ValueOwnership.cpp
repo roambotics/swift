@@ -10,9 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/SIL/SILVisitor.h"
+#include "swift/SIL/ApplySite.h"
 #include "swift/SIL/SILBuiltinVisitor.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/SIL/SILVisitor.h"
+#include "swift/SIL/Test.h"
 
 using namespace swift;
 
@@ -71,6 +73,8 @@ CONSTANT_OWNERSHIP_INST(Owned, WeakCopyValue)
 
 CONSTANT_OWNERSHIP_INST(Guaranteed, BeginBorrow)
 CONSTANT_OWNERSHIP_INST(Guaranteed, LoadBorrow)
+CONSTANT_OWNERSHIP_INST(Guaranteed, FunctionExtractIsolation)
+CONSTANT_OWNERSHIP_INST(None, GlobalValue)
 CONSTANT_OWNERSHIP_INST(Owned, AllocBox)
 CONSTANT_OWNERSHIP_INST(Owned, AllocExistentialBox)
 CONSTANT_OWNERSHIP_INST(Owned, AllocRef)
@@ -85,7 +89,6 @@ CONSTANT_OWNERSHIP_INST(Owned, EndInitLetRef)
 CONSTANT_OWNERSHIP_INST(Owned, BeginDeallocRef)
 CONSTANT_OWNERSHIP_INST(Owned, KeyPath)
 CONSTANT_OWNERSHIP_INST(Owned, InitExistentialValue)
-CONSTANT_OWNERSHIP_INST(Owned, GlobalValue) // TODO: is this correct?
 
 // One would think that these /should/ be unowned. In truth they are owned since
 // objc metatypes do not go through the retain/release fast path. In their
@@ -100,6 +103,7 @@ CONSTANT_OWNERSHIP_INST(Owned, ObjCMetatypeToObject)
 // not though.
 CONSTANT_OWNERSHIP_INST(None, AddressToPointer)
 CONSTANT_OWNERSHIP_INST(None, AllocStack)
+CONSTANT_OWNERSHIP_INST(None, AllocVector)
 CONSTANT_OWNERSHIP_INST(None, AllocPack)
 CONSTANT_OWNERSHIP_INST(None, AllocPackMetadata)
 CONSTANT_OWNERSHIP_INST(None, PackLength)
@@ -140,6 +144,7 @@ CONSTANT_OWNERSHIP_INST(None, ProjectExistentialBox)
 CONSTANT_OWNERSHIP_INST(None, RefElementAddr)
 CONSTANT_OWNERSHIP_INST(None, RefTailAddr)
 CONSTANT_OWNERSHIP_INST(None, RefToRawPointer)
+CONSTANT_OWNERSHIP_INST(None, SelectEnum)
 CONSTANT_OWNERSHIP_INST(None, SelectEnumAddr)
 CONSTANT_OWNERSHIP_INST(None, StringLiteral)
 CONSTANT_OWNERSHIP_INST(None, StructElementAddr)
@@ -171,6 +176,8 @@ CONSTANT_OWNERSHIP_INST(None, PackPackIndex)
 CONSTANT_OWNERSHIP_INST(None, ScalarPackIndex)
 CONSTANT_OWNERSHIP_INST(None, PackElementGet)
 CONSTANT_OWNERSHIP_INST(None, TuplePackElementAddr)
+CONSTANT_OWNERSHIP_INST(None, Object)
+CONSTANT_OWNERSHIP_INST(None, Vector)
 
 #undef CONSTANT_OWNERSHIP_INST
 
@@ -236,9 +243,9 @@ ValueOwnershipKindClassifier::visitForwardingInst(SILInstruction *i,
     return OwnershipKind::None;
 
   auto mergedValue = ValueOwnershipKind::merge(makeOptionalTransformRange(
-      ops, [&i](const Operand &op) -> llvm::Optional<ValueOwnershipKind> {
+      ops, [&i](const Operand &op) -> std::optional<ValueOwnershipKind> {
         if (i->isTypeDependentOperand(op))
-          return llvm::None;
+          return std::nullopt;
         return op.get()->getOwnershipKind();
       }));
 
@@ -266,7 +273,6 @@ FORWARDING_OWNERSHIP_INST(BridgeObjectToRef)
 FORWARDING_OWNERSHIP_INST(ConvertFunction)
 FORWARDING_OWNERSHIP_INST(OpenExistentialRef)
 FORWARDING_OWNERSHIP_INST(RefToBridgeObject)
-FORWARDING_OWNERSHIP_INST(Object)
 FORWARDING_OWNERSHIP_INST(Struct)
 FORWARDING_OWNERSHIP_INST(Tuple)
 FORWARDING_OWNERSHIP_INST(UncheckedRefCast)
@@ -274,8 +280,6 @@ FORWARDING_OWNERSHIP_INST(UnconditionalCheckedCast)
 FORWARDING_OWNERSHIP_INST(Upcast)
 FORWARDING_OWNERSHIP_INST(UncheckedValueCast)
 FORWARDING_OWNERSHIP_INST(UncheckedEnumData)
-FORWARDING_OWNERSHIP_INST(SelectEnum)
-FORWARDING_OWNERSHIP_INST(Enum)
 FORWARDING_OWNERSHIP_INST(MarkDependence)
 // NOTE: init_existential_ref from a reference counting perspective is not
 // considered to be "owned" since it doesn't affect reference counts. That being
@@ -295,6 +299,25 @@ FORWARDING_OWNERSHIP_INST(MoveOnlyWrapperToCopyableValue)
 FORWARDING_OWNERSHIP_INST(CopyableToMoveOnlyWrapperValue)
 FORWARDING_OWNERSHIP_INST(MoveOnlyWrapperToCopyableBox)
 #undef FORWARDING_OWNERSHIP_INST
+
+ValueOwnershipKind
+ValueOwnershipKindClassifier::visitEnumInst(EnumInst *I) {
+  if (!I->getModule().useLoweredAddresses() && I->getType().isAddressOnly(*I->getFunction())) {
+    // During address lowering, an address-only enum instruction will eventually
+    // be lowered to inject_enum_addr/init_enum_data_addr, initializing a
+    // non-trivial storage location.  So prior to AddressLowering (in opaque
+    // values mode) such an enum instruction produces a non-trivial value,
+    // without regard to whether it is in a trivial case.  Otherwise, non-trivial
+    // storage would fail to be destroy_addr'd.
+    assert(!I->getType().isTrivial(*I->getFunction()));
+    // An enum instruction is representation changing, so its address-only
+    // operand must be owned.
+    return OwnershipKind::Owned;
+  }
+  return I->getType().isTrivial(*I->getFunction())
+             ? ValueOwnershipKind(OwnershipKind::None)
+             : I->getForwardingOwnershipKind();
+}
 
 ValueOwnershipKind
 ValueOwnershipKindClassifier::visitUncheckedOwnershipConversionInst(
@@ -326,14 +349,18 @@ ValueOwnershipKind ValueOwnershipKindClassifier::visitSILFunctionArgument(
   return Arg->getOwnershipKind();
 }
 
-ValueOwnershipKind ValueOwnershipKindClassifier::visitApplyInst(ApplyInst *ai) {
-  auto *f = ai->getFunction();
-  bool isTrivial = ai->getType().isTrivial(*f);
+// We have to separate out ResultType here as `begin_apply` does not produce
+// normal results, `end_apply` does and there might be multiple `end_apply`'s
+// that correspond to a single `begin_apply`.
+static ValueOwnershipKind visitFullApplySite(FullApplySite fai,
+                                             SILType ResultType) {
+  auto *f = fai->getFunction();
+  bool isTrivial = ResultType.isTrivial(*f);
   // Quick is trivial check.
   if (isTrivial)
     return OwnershipKind::None;
 
-  SILFunctionConventions fnConv(ai->getSubstCalleeType(), f->getModule());
+  SILFunctionConventions fnConv(fai.getSubstCalleeType(), f->getModule());
   auto results = fnConv.getDirectSILResults();
   // No results => None.
   if (results.empty())
@@ -342,7 +369,7 @@ ValueOwnershipKind ValueOwnershipKindClassifier::visitApplyInst(ApplyInst *ai) {
   // Otherwise, map our results to their ownership kinds and then merge them!
   auto resultOwnershipKinds =
       makeTransformRange(results, [&](const SILResultInfo &info) {
-        return info.getOwnershipKind(*f, ai->getSubstCalleeType());
+        return info.getOwnershipKind(*f, fai.getSubstCalleeType());
       });
   auto mergedOwnershipKind = ValueOwnershipKind::merge(resultOwnershipKinds);
   if (!mergedOwnershipKind) {
@@ -350,6 +377,14 @@ ValueOwnershipKind ValueOwnershipKindClassifier::visitApplyInst(ApplyInst *ai) {
   }
 
   return mergedOwnershipKind;
+}
+
+ValueOwnershipKind ValueOwnershipKindClassifier::visitApplyInst(ApplyInst *ai) {
+  return visitFullApplySite(ai, ai->getType());
+}
+
+ValueOwnershipKind ValueOwnershipKindClassifier::visitEndApplyInst(EndApplyInst *eai) {
+  return visitFullApplySite(eai->getBeginApply(), eai->getType());
 }
 
 ValueOwnershipKind ValueOwnershipKindClassifier::visitLoadInst(LoadInst *LI) {
@@ -520,6 +555,7 @@ CONSTANT_OWNERSHIP_BUILTIN(None, UToSCheckedTrunc)
 CONSTANT_OWNERSHIP_BUILTIN(None, StackAlloc)
 CONSTANT_OWNERSHIP_BUILTIN(None, UnprotectedStackAlloc)
 CONSTANT_OWNERSHIP_BUILTIN(None, StackDealloc)
+CONSTANT_OWNERSHIP_BUILTIN(None, AllocVector)
 CONSTANT_OWNERSHIP_BUILTIN(None, SToSCheckedTrunc)
 CONSTANT_OWNERSHIP_BUILTIN(None, SToUCheckedTrunc)
 CONSTANT_OWNERSHIP_BUILTIN(None, UToUCheckedTrunc)
@@ -560,7 +596,6 @@ CONSTANT_OWNERSHIP_BUILTIN(None, AtomicStore)
 CONSTANT_OWNERSHIP_BUILTIN(None, Once)
 CONSTANT_OWNERSHIP_BUILTIN(None, OnceWithContext)
 CONSTANT_OWNERSHIP_BUILTIN(None, TSanInoutAccess)
-CONSTANT_OWNERSHIP_BUILTIN(None, Swift3ImplicitObjCEntrypoint)
 CONSTANT_OWNERSHIP_BUILTIN(None, PoundAssert)
 CONSTANT_OWNERSHIP_BUILTIN(None, TypePtrAuthDiscriminator)
 CONSTANT_OWNERSHIP_BUILTIN(None, TargetOSVersionAtLeast)
@@ -568,7 +603,6 @@ CONSTANT_OWNERSHIP_BUILTIN(None, GlobalStringTablePointer)
 CONSTANT_OWNERSHIP_BUILTIN(None, GetCurrentAsyncTask)
 CONSTANT_OWNERSHIP_BUILTIN(None, CancelAsyncTask)
 CONSTANT_OWNERSHIP_BUILTIN(Owned, CreateAsyncTask)
-CONSTANT_OWNERSHIP_BUILTIN(Owned, CreateAsyncTaskInGroup)
 CONSTANT_OWNERSHIP_BUILTIN(None, ConvertTaskToJob)
 CONSTANT_OWNERSHIP_BUILTIN(None, InitializeDefaultActor)
 CONSTANT_OWNERSHIP_BUILTIN(None, DestroyDefaultActor)
@@ -581,6 +615,7 @@ CONSTANT_OWNERSHIP_BUILTIN(None, GetCurrentExecutor)
 CONSTANT_OWNERSHIP_BUILTIN(None, ResumeNonThrowingContinuationReturning)
 CONSTANT_OWNERSHIP_BUILTIN(None, ResumeThrowingContinuationReturning)
 CONSTANT_OWNERSHIP_BUILTIN(None, ResumeThrowingContinuationThrowing)
+CONSTANT_OWNERSHIP_BUILTIN(None, BuildOrdinaryTaskExecutorRef)
 CONSTANT_OWNERSHIP_BUILTIN(None, BuildOrdinarySerialExecutorRef)
 CONSTANT_OWNERSHIP_BUILTIN(None, BuildComplexEqualitySerialExecutorRef)
 CONSTANT_OWNERSHIP_BUILTIN(None, BuildDefaultActorExecutorRef)
@@ -594,6 +629,11 @@ CONSTANT_OWNERSHIP_BUILTIN(None, CreateTaskGroupWithFlags)
 CONSTANT_OWNERSHIP_BUILTIN(None, DestroyTaskGroup)
 CONSTANT_OWNERSHIP_BUILTIN(None, TaskRunInline)
 CONSTANT_OWNERSHIP_BUILTIN(None, Copy)
+CONSTANT_OWNERSHIP_BUILTIN(None, GetEnumTag)
+CONSTANT_OWNERSHIP_BUILTIN(None, InjectEnumTag)
+CONSTANT_OWNERSHIP_BUILTIN(Owned, DistributedActorAsAnyActor)
+CONSTANT_OWNERSHIP_BUILTIN(Guaranteed, ExtractFunctionIsolation) // unreachable
+CONSTANT_OWNERSHIP_BUILTIN(None, AddressOfRawLayout)
 
 #undef CONSTANT_OWNERSHIP_BUILTIN
 
@@ -660,3 +700,17 @@ ValueOwnershipKind ValueBase::getOwnershipKind() const {
   assert(result && "Returned ownership kind invalid on values");
   return result;
 }
+
+namespace swift::test {
+// Arguments:
+// - SILValue: value
+// Dumps:
+// - message
+static FunctionTest GetOwnershipKind("get-ownership-kind", [](auto &function,
+                                                              auto &arguments,
+                                                              auto &test) {
+  SILValue value = arguments.takeValue();
+  llvm::outs() << value;
+  llvm::outs() << "OwnershipKind: " << value->getOwnershipKind() << "\n";
+});
+} // end namespace swift::test

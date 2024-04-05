@@ -50,11 +50,6 @@ static bool canDeriveConformance(DeclContext *DC,
                DC, structDecl, protocol).empty())
       return false;
 
-    // If the struct is actor-isolated, we cannot derive Equatable/Hashable
-    // conformance if any of the stored properties are mutable.
-    if (memberwiseAccessorsRequireActorIsolation(structDecl))
-      return false;
-
     return true;
   }
 
@@ -132,7 +127,7 @@ deriveBodyEquatable_enum_noAssociatedValues_eq(AbstractFunctionDecl *eqDecl,
     auto *callExpr = DotSyntaxCallExpr::create(
         C, ref, SourceLoc(), Argument::unlabeled(base), fnType);
     callExpr->setImplicit();
-    callExpr->setThrows(false);
+    callExpr->setThrows(nullptr);
     cmpFuncExpr = callExpr;
   } else {
     cmpFuncExpr = new (C) DeclRefExpr(cmpFunc, DeclNameLoc(),
@@ -144,8 +139,8 @@ deriveBodyEquatable_enum_noAssociatedValues_eq(AbstractFunctionDecl *eqDecl,
   auto *cmpExpr =
       BinaryExpr::create(C, aIndex, cmpFuncExpr, bIndex, /*implicit*/ true,
                          fnType->castTo<FunctionType>()->getResult());
-  cmpExpr->setThrows(false);
-  statements.push_back(new (C) ReturnStmt(SourceLoc(), cmpExpr));
+  cmpExpr->setThrows(nullptr);
+  statements.push_back(ReturnStmt::createImplicit(C, cmpExpr));
 
   BraceStmt *body = BraceStmt::create(C, SourceLoc(), statements, SourceLoc());
   return { body, /*isTypeChecked=*/true };
@@ -204,7 +199,7 @@ deriveBodyEquatable_enum_hasAssociatedValues_eq(AbstractFunctionDecl *eqDecl,
     rhsElemPat->setImplicit();
 
     auto hasBoundDecls = !lhsPayloadVars.empty();
-    llvm::Optional<MutableArrayRef<VarDecl *>> caseBodyVarDecls;
+    std::optional<MutableArrayRef<VarDecl *>> caseBodyVarDecls;
     if (hasBoundDecls) {
       // We allocated a direct copy of our lhs var decls for the case
       // body.
@@ -249,7 +244,7 @@ deriveBodyEquatable_enum_hasAssociatedValues_eq(AbstractFunctionDecl *eqDecl,
     // return true
     auto trueExpr = new (C) BooleanLiteralExpr(true, SourceLoc(),
                                                /*Implicit*/true);
-    auto returnStmt = new (C) ReturnStmt(SourceLoc(), trueExpr);
+    auto *returnStmt = ReturnStmt::createImplicit(C, trueExpr);
     statementsInCase.push_back(returnStmt);
 
     auto body = BraceStmt::create(C, SourceLoc(), statementsInCase,
@@ -268,13 +263,13 @@ deriveBodyEquatable_enum_hasAssociatedValues_eq(AbstractFunctionDecl *eqDecl,
     auto defaultItem = CaseLabelItem::getDefault(defaultPattern);
     auto falseExpr = new (C) BooleanLiteralExpr(false, SourceLoc(),
                                                 /*implicit*/ true);
-    auto returnStmt = new (C) ReturnStmt(SourceLoc(), falseExpr);
+    auto *returnStmt = ReturnStmt::createImplicit(C, falseExpr);
     auto body = BraceStmt::create(C, SourceLoc(), ASTNode(returnStmt),
                                   SourceLoc());
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      defaultItem, SourceLoc(), SourceLoc(),
                                      body,
-                                     /*case body var decls*/ llvm::None));
+                                     /*case body var decls*/ std::nullopt));
   }
 
   // switch (a, b) { <case statements> }
@@ -333,7 +328,7 @@ deriveBodyEquatable_struct_eq(AbstractFunctionDecl *eqDecl, void *) {
   // return true
   auto trueExpr = new (C) BooleanLiteralExpr(true, SourceLoc(),
                                              /*Implicit*/true);
-  auto returnStmt = new (C) ReturnStmt(SourceLoc(), trueExpr);
+  auto *returnStmt = ReturnStmt::createImplicit(C, trueExpr);
   statements.push_back(returnStmt);
 
   auto body = BraceStmt::create(C, SourceLoc(), statements, SourceLoc());
@@ -563,7 +558,8 @@ deriveHashable_hashInto(
   // The derived hash(into:) for an actor must be non-isolated.
   if (!addNonIsolatedToSynthesized(derived.Nominal, hashDecl) &&
       derived.Nominal->isActor())
-    hashDecl->getAttrs().add(new (C) NonisolatedAttr(/*IsImplicit*/ true));
+    hashDecl->getAttrs().add(
+        new (C) NonisolatedAttr(/*unsafe*/ false, /*implicit*/ true));
 
   derived.addMembersToConformanceContext({hashDecl});
 
@@ -742,7 +738,7 @@ deriveBodyHashable_enum_hasAssociatedValues_hashInto(
     }
 
     auto hasBoundDecls = !payloadVars.empty();
-    llvm::Optional<MutableArrayRef<VarDecl *>> caseBodyVarDecls;
+    std::optional<MutableArrayRef<VarDecl *>> caseBodyVarDecls;
     if (hasBoundDecls) {
       auto copy = C.Allocate<VarDecl *>(payloadVars.size());
       for (unsigned i : indices(payloadVars)) {
@@ -859,9 +855,9 @@ deriveBodyHashable_hashValue(AbstractFunctionDecl *hashValueDecl, void *) {
   auto *argList = ArgumentList::forImplicitSingle(C, C.Id_for, selfRef);
   auto *callExpr = CallExpr::createImplicit(C, hashExpr, argList);
   callExpr->setType(hashFuncResultType);
-  callExpr->setThrows(false);
+  callExpr->setThrows(nullptr);
 
-  auto returnStmt = new (C) ReturnStmt(SourceLoc(), callExpr);
+  auto *returnStmt = ReturnStmt::createImplicit(C, callExpr);
 
   auto body = BraceStmt::create(C, SourceLoc(), {returnStmt}, SourceLoc(),
                                 /*implicit*/ true);
@@ -911,7 +907,6 @@ static ValueDecl *deriveHashable_hashValue(DerivedConformance &derived) {
       C,
       /*FuncLoc=*/SourceLoc(), /*AccessorKeywordLoc=*/SourceLoc(),
       AccessorKind::Get, hashValueDecl,
-      /*StaticLoc=*/SourceLoc(), StaticSpellingKind::None,
       /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
       /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(), /*ThrownType=*/TypeLoc(),
       params, intType, parentDC);
@@ -928,7 +923,8 @@ static ValueDecl *deriveHashable_hashValue(DerivedConformance &derived) {
   // The derived hashValue of an actor must be nonisolated.
   if (!addNonIsolatedToSynthesized(derived.Nominal, hashValueDecl) &&
       derived.Nominal->isActor())
-    hashValueDecl->getAttrs().add(new (C) NonisolatedAttr(/*IsImplicit*/ true));
+    hashValueDecl->getAttrs().add(
+        new (C) NonisolatedAttr(/*unsafe*/ false, /*implicit*/ true));
 
   Pattern *hashValuePat =
       NamedPattern::createImplicit(C, hashValueDecl, intType);

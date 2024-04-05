@@ -20,9 +20,7 @@ extension ASTGenError {
     MessageID(domain: "ASTGen", id: "\(Self.self)")
   }
 
-  var severity: DiagnosticSeverity {
-    .error
-  }
+  var severity: DiagnosticSeverity { .error }
 }
 
 /// An error emitted when a token is of an unexpected kind.
@@ -76,7 +74,9 @@ struct DuplicateSyntaxError: ASTGenError {
   init(duplicate: some SyntaxProtocol, original: some SyntaxProtocol) {
     precondition(duplicate.kind == original.kind, "Expected duplicate and original to be of same kind")
 
-    guard let duplicateParent = duplicate.parent, let originalParent = original.parent, duplicateParent == originalParent, duplicateParent.kind.isSyntaxCollection else {
+    guard let duplicateParent = duplicate.parent, let originalParent = original.parent,
+      duplicateParent == originalParent, duplicateParent.kind.isSyntaxCollection
+    else {
       preconditionFailure("Expected a shared syntax collection parent")
     }
 
@@ -91,5 +91,22 @@ struct DuplicateSyntaxError: ASTGenError {
     previous syntax:
       \(original.debugDescription(indentString: "  "))
     """
+  }
+}
+
+struct NonTrivialPatternForAccessorError: ASTGenError {
+  var message: String {
+    "getter/setter can only be defined for a single variable"
+  }
+}
+
+struct UnknownAccessorSpecifierError: ASTGenError {
+  var specifier: TokenSyntax
+  init(_ specifier: TokenSyntax) {
+    self.specifier = specifier
+  }
+
+  var message: String {
+    "unknown accessor specifier '\(specifier.text)'"
   }
 }

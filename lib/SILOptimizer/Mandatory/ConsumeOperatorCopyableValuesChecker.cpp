@@ -55,8 +55,8 @@ namespace {
 
 struct CheckerLivenessInfo {
   GraphNodeWorklist<SILValue, 8> defUseWorklist;
-  SmallSetVector<Operand *, 8> consumingUse;
-  SmallSetVector<SILInstruction *, 8> nonLifetimeEndingUsesInLiveOut;
+  llvm::SmallSetVector<Operand *, 8> consumingUse;
+  llvm::SmallSetVector<SILInstruction *, 8> nonLifetimeEndingUsesInLiveOut;
   SmallVector<Operand *, 8> interiorPointerTransitiveUses;
   BitfieldRef<DiagnosticPrunedLiveness> liveness;
 
@@ -155,6 +155,8 @@ bool CheckerLivenessInfo::compute() {
             }
           }
         }
+        // FIXME: this ignores all other forms of Borrow ownership, such as
+        // partial_apply [onstack] and mark_dependence [nonescaping].
         break;
       }
       case OperandOwnership::GuaranteedForwarding:
@@ -250,8 +252,10 @@ void ConsumeOperatorCopyableValuesChecker::emitDiagnosticForMove(
   diagnose(astContext, getSourceLocFromValue(borrowedValue),
            diag::sil_movechecking_value_used_after_consume,
            borrowedValueName);
-  diagnose(astContext, mvi->getLoc().getSourceLoc(),
-           diag::sil_movechecking_consuming_use_here);
+  if (auto sourceLoc = mvi->getLoc().getSourceLoc()) {
+    diagnose(astContext, sourceLoc,
+             diag::sil_movechecking_consuming_use_here);
+  }
 
   // Then we do a bit of work to figure out where /all/ of the later uses than
   // mvi are so we can emit notes to the user telling them this is a problem
@@ -281,8 +285,10 @@ void ConsumeOperatorCopyableValuesChecker::emitDiagnosticForMove(
       case PrunedLiveness::NonLifetimeEndingUse:
       case PrunedLiveness::LifetimeEndingUse:
         LLVM_DEBUG(llvm::dbgs() << "Emitting note for in block use: " << inst);
-        diagnose(astContext, inst.getLoc().getSourceLoc(),
-                 diag::sil_movechecking_nonconsuming_use_here);
+        if (auto sourceLoc = inst.getLoc().getSourceLoc()) {
+          diagnose(astContext, sourceLoc,
+                   diag::sil_movechecking_nonconsuming_use_here);
+        }
         break;
       }
     }
@@ -340,8 +346,10 @@ void ConsumeOperatorCopyableValuesChecker::emitDiagnosticForMove(
         case PrunedLiveness::LifetimeEndingUse:
           LLVM_DEBUG(llvm::dbgs()
                      << "(3) Emitting diagnostic for user: " << inst);
-          diagnose(astContext, inst.getLoc().getSourceLoc(),
-                   diag::sil_movechecking_nonconsuming_use_here);
+          if (auto sourceLoc = inst.getLoc().getSourceLoc()) {
+            diagnose(astContext, sourceLoc,
+                     diag::sil_movechecking_nonconsuming_use_here);
+          }
           break;
         }
       }
@@ -366,8 +374,10 @@ void ConsumeOperatorCopyableValuesChecker::emitDiagnosticForMove(
       if (livenessInfo.nonLifetimeEndingUsesInLiveOut.contains(&inst)) {
         LLVM_DEBUG(llvm::dbgs()
                    << "(1) Emitting diagnostic for user: " << inst);
-        diagnose(astContext, inst.getLoc().getSourceLoc(),
-                 diag::sil_movechecking_nonconsuming_use_here);
+        if (auto sourceLoc = inst.getLoc().getSourceLoc()) {
+          diagnose(astContext, sourceLoc,
+                   diag::sil_movechecking_nonconsuming_use_here);
+        }
         continue;
       }
 
@@ -388,8 +398,10 @@ void ConsumeOperatorCopyableValuesChecker::emitDiagnosticForMove(
 
           LLVM_DEBUG(llvm::dbgs()
                      << "(2) Emitting diagnostic for user: " << inst);
-          diagnose(astContext, inst.getLoc().getSourceLoc(),
-                   diag::sil_movechecking_nonconsuming_use_here);
+          if (auto sourceLoc = inst.getLoc().getSourceLoc()) {
+            diagnose(astContext, sourceLoc,
+                     diag::sil_movechecking_nonconsuming_use_here);
+          }
         }
       }
     }
@@ -397,10 +409,12 @@ void ConsumeOperatorCopyableValuesChecker::emitDiagnosticForMove(
 }
 
 bool ConsumeOperatorCopyableValuesChecker::check() {
-  SmallSetVector<SILValue, 32> valuesToCheck;
+  llvm::SmallSetVector<SILValue, 32> valuesToCheck;
 
   for (auto *arg : fn->getEntryBlock()->getSILFunctionArguments()) {
-    if (arg->getOwnershipKind() == OwnershipKind::Owned &&
+    auto ownership = arg->getOwnershipKind();
+    if ((ownership == OwnershipKind::Owned ||
+         ownership == OwnershipKind::Guaranteed) &&
         !arg->getType().isMoveOnly()) {
       LLVM_DEBUG(llvm::dbgs() << "Found owned arg to check: " << *arg);
       valuesToCheck.insert(arg);
@@ -409,8 +423,15 @@ bool ConsumeOperatorCopyableValuesChecker::check() {
 
   for (auto &block : *fn) {
     for (auto &ii : block) {
+      if (auto *mvi = dyn_cast<MoveValueInst>(&ii)) {
+        if (mvi->isFromVarDecl() && !mvi->getType().isMoveOnly()) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "Found lexical lifetime to check: " << *mvi);
+          valuesToCheck.insert(mvi);
+        }
+      }
       if (auto *bbi = dyn_cast<BeginBorrowInst>(&ii)) {
-        if (bbi->isLexical() && !bbi->getType().isMoveOnly()) {
+        if (bbi->isFromVarDecl() && !bbi->getType().isMoveOnly()) {
           LLVM_DEBUG(llvm::dbgs()
                      << "Found lexical lifetime to check: " << *bbi);
           valuesToCheck.insert(bbi);
@@ -428,8 +449,7 @@ bool ConsumeOperatorCopyableValuesChecker::check() {
   LLVM_DEBUG(llvm::dbgs()
              << "Found at least one value to check, performing checking.\n");
   auto valuesToProcess =
-      llvm::makeArrayRef(valuesToCheck.begin(), valuesToCheck.end());
-  auto &mod = fn->getModule();
+      llvm::ArrayRef(valuesToCheck.begin(), valuesToCheck.end());
 
   // If we do not emit any diagnostics, we need to put in a break after each dbg
   // info carrying inst for a lexical value that we find a move on. This ensures
@@ -487,9 +507,8 @@ bool ConsumeOperatorCopyableValuesChecker::check() {
             // referring to the same "debug entity".
             builder.setCurrentDebugScope(dbgVarInst->getDebugScope());
             builder.createDebugValue(
-                dbgVarInst->getLoc(),
-                SILUndef::get(mvi->getOperand()->getType(), mod), *varInfo,
-                false /*poison*/, true /*moved*/);
+                dbgVarInst->getLoc(), SILUndef::get(mvi->getOperand()),
+                *varInfo, false /*poison*/, UsesMoveableValueDebugInfo);
           }
         }
         foundMove = true;
@@ -545,10 +564,6 @@ namespace {
 class ConsumeOperatorCopyableValuesCheckerPass : public SILFunctionTransform {
   void run() override {
     auto *fn = getFunction();
-
-    // Only run this pass if the move only language feature is enabled.
-    if (!fn->getASTContext().supportsMoveOnlyTypes())
-      return;
 
     // Don't rerun diagnostics on deserialized functions.
     if (fn->wasDeserializedCanonical())

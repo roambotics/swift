@@ -108,7 +108,6 @@ class FuncDecl;
 class IRGenOptions;
 class KeyPathPattern;
 class ModuleDecl;
-class SILUndef;
 class SourceFile;
 class SerializedSILLoader;
 class SILFunctionBuilder;
@@ -192,7 +191,6 @@ private:
   friend SILType;
   friend SILVTable;
   friend SILProperty;
-  friend SILUndef;
   friend SILWitnessTable;
   friend SILMoveOnlyDeinit;
   friend Lowering::SILGenModule;
@@ -315,9 +313,6 @@ private:
   /// This is a cache of builtin Function declarations to numeric ID mappings.
   llvm::DenseMap<Identifier, BuiltinInfo> BuiltinIDCache;
 
-  /// This is the set of undef values we've created, for uniquing purposes.
-  llvm::DenseMap<SILType, SILUndef *> UndefValues;
-
   llvm::DenseMap<std::pair<Decl *, VarDecl *>, unsigned> fieldIndices;
   llvm::DenseMap<EnumElementDecl *, unsigned> enumCaseIndices;
 
@@ -393,6 +388,10 @@ private:
   /// This gets set in OwnershipModelEliminator pass.
   bool regDeserializationNotificationHandlerForAllFuncOME;
 
+  // True if a DeserializationNotificationHandler is set for
+  // AccessMarkerElimination.
+  bool hasAccessMarkerHandler;
+
   bool prespecializedFunctionDeclsImported;
 
   /// Action to be executed for serializing the SILModule.
@@ -445,6 +444,13 @@ public:
     regDeserializationNotificationHandlerForAllFuncOME = true;
   }
 
+  bool checkHasAccessMarkerHandler() {
+    return hasAccessMarkerHandler;
+  }
+  void setHasAccessMarkerHandler() {
+    hasAccessMarkerHandler = true;
+  }
+
   /// Returns the instruction which defines the given root local archetype,
   /// e.g. an open_existential_addr.
   ///
@@ -462,7 +468,7 @@ public:
   SingleValueInstruction *
   getRootLocalArchetypeDefInst(CanLocalArchetypeType archetype,
                                SILFunction *inFunction) {
-    return cast<SingleValueInstruction>(
+    return dyn_cast<SingleValueInstruction>(
         getRootLocalArchetypeDef(archetype, inFunction));
   }
 
@@ -515,15 +521,15 @@ public:
     basicBlockNames[block] = name.str();
 #endif
   }
-  llvm::Optional<StringRef> getBasicBlockName(const SILBasicBlock *block) {
+  std::optional<StringRef> getBasicBlockName(const SILBasicBlock *block) {
 #ifndef NDEBUG
     auto Known = basicBlockNames.find(block);
     if (Known == basicBlockNames.end())
-      return llvm::None;
+      return std::nullopt;
 
     return StringRef(Known->second);
 #else
-    return llvm::None;
+    return std::nullopt;
 #endif
   }
 
@@ -780,7 +786,7 @@ public:
   /// If \p linkage is provided, the deserialized function is required to have
   /// that linkage. Returns null, if this is not the case.
   SILFunction *loadFunction(StringRef name, LinkingMode LinkMode,
-                            llvm::Optional<SILLinkage> linkage = llvm::None);
+                            std::optional<SILLinkage> linkage = std::nullopt);
 
   /// Update the linkage of the SILFunction with the linkage of the serialized
   /// function.
@@ -915,7 +921,7 @@ public:
 
   /// Run the SIL verifier to make sure that all Functions follow
   /// invariants.
-  void verify(SILPassManager *passManager,
+  void verify(CalleeCache *calleeCache,
               bool isCompleteOSSA = true,
               bool checkLinearLifetime = true) const;
 
@@ -927,19 +933,6 @@ public:
 
   /// Check linear OSSA lifetimes, assuming complete OSSA.
   void verifyOwnership() const;
-
-  /// Check if there are any leaking instructions.
-  ///
-  /// Aborts with an error if more instructions are allocated than contained in
-  /// the module.
-  void checkForLeaks() const;
-
-  /// Check if there are any leaking instructions after the SILModule is
-  /// destructed.
-  ///
-  /// The SILModule destructor already calls checkForLeaks(). This function is
-  /// useful to check if the destructor itself destroys all data structures.
-  static void checkForLeaksAfterDestruction();
 
   /// Pretty-print the module.
   void dump(bool Verbose = false) const;
@@ -1064,10 +1057,9 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, const SILModule &M){
 inline bool SILOptions::supportsLexicalLifetimes(const SILModule &mod) const {
   switch (mod.getStage()) {
   case SILStage::Raw:
-    // In raw SIL, lexical markers are used for diagnostics.  These markers are
-    // present as long as the lexical lifetimes feature is not disabled
-    // entirely.
-    return LexicalLifetimes != LexicalLifetimesOption::Off;
+    // In raw SIL, lexical markers are used for diagnostics and are always
+    // present.
+    return true;
   case SILStage::Canonical:
   case SILStage::Lowered:
     // In Canonical SIL, lexical markers are used to ensure that object

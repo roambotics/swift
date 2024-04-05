@@ -14,12 +14,10 @@ target_sources(swiftSILOptimizer PRIVATE
   CopyPropagation.cpp
   DeadCodeElimination.cpp
   DeadObjectElimination.cpp
-  DestroyHoisting.cpp
   Devirtualizer.cpp
   DifferentiabilityWitnessDevirtualizer.cpp
   EagerSpecializer.cpp
   GenericSpecializer.cpp
-  MoveOnlyDeinitDevirtualization.cpp
   Outliner.cpp
   AssemblyVisionRemarkGenerator.cpp
   PartialApplySimplification.cpp

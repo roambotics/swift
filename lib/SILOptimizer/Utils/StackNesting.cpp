@@ -207,10 +207,10 @@ static SILInstruction *createDealloc(SILInstruction *Alloc,
   SILBuilderWithScope B(InsertionPoint);
   switch (Alloc->getKind()) {
     case SILInstructionKind::PartialApplyInst:
+      assert(cast<PartialApplyInst>(Alloc)->isOnStack() && "wrong instruction");
+      LLVM_FALLTHROUGH;
     case SILInstructionKind::AllocStackInst:
-      assert((isa<AllocStackInst>(Alloc) ||
-              cast<PartialApplyInst>(Alloc)->isOnStack()) &&
-             "wrong instruction");
+    case SILInstructionKind::AllocVectorInst:
       return B.createDeallocStack(Location,
                                   cast<SingleValueInstruction>(Alloc));
     case SILInstructionKind::AllocRefDynamicInst:
@@ -241,7 +241,7 @@ static SILInstruction *createDealloc(SILInstruction *Alloc,
 bool StackNesting::insertDeallocs(const BitVector &AliveBefore,
                                   const BitVector &AliveAfter,
                                   SILInstruction *InsertionPoint,
-                                  llvm::Optional<SILLocation> Location) {
+                                  std::optional<SILLocation> Location) {
   if (!AliveBefore.test(AliveAfter))
     return false;
 
@@ -294,7 +294,7 @@ StackNesting::Changes StackNesting::insertDeallocsAtBlockBoundaries() {
       }
       if (insertDeallocs(bd.data.AliveStackLocsAtExit,
                          SuccBI.AliveStackLocsAtEntry, &InsertionBlock->front(),
-                         llvm::None)) {
+                         std::nullopt)) {
         if (changes == Changes::None)
           changes = Changes::Instructions;
       }

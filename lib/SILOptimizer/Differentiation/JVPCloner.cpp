@@ -344,7 +344,7 @@ private:
   }
 
   /// Find the tangent space of a given canonical type.
-  llvm::Optional<TangentSpace> getTangentSpace(CanType type) {
+  std::optional<TangentSpace> getTangentSpace(CanType type) {
     // Use witness generic signature to remap types.
     type = witness->getDerivativeGenericSignature().getReducedType(
         type);
@@ -777,7 +777,9 @@ public:
     auto &diffBuilder = getDifferentialBuilder();
     auto loc = bbi->getLoc();
     auto tanVal = materializeTangent(getTangentValue(bbi->getOperand()), loc);
-    auto tanValBorrow = diffBuilder.emitBeginBorrowOperation(loc, tanVal);
+    auto tanValBorrow = diffBuilder.emitBeginBorrowOperation(
+        loc, tanVal, bbi->isLexical(), bbi->hasPointerEscape(),
+        bbi->isFromVarDecl());
     setTangentValue(bbi->getParent(), bbi,
                     makeConcreteTangentValue(tanValBorrow));
   }
@@ -803,6 +805,17 @@ public:
     auto tanValCopy = diffBuilder.emitCopyValueOperation(cvi->getLoc(), tanVal);
     setTangentValue(cvi->getParent(), cvi,
                     makeConcreteTangentValue(tanValCopy));
+  }
+
+  CLONE_AND_EMIT_TANGENT(MoveValue, mvi) {
+    auto &diffBuilder = getDifferentialBuilder();
+    auto tan = getTangentValue(mvi->getOperand());
+    auto tanVal = materializeTangent(tan, mvi->getLoc());
+    auto tanValMove = diffBuilder.emitMoveValueOperation(
+        mvi->getLoc(), tanVal, mvi->isLexical(), mvi->hasPointerEscape(),
+        mvi->isFromVarDecl());
+    setTangentValue(mvi->getParent(), mvi,
+                    makeConcreteTangentValue(tanValMove));
   }
 
   /// Handle `load` instruction.
@@ -1312,7 +1325,8 @@ public:
         if (!origResult->getType().is<TupleType>()) {
           setTangentValue(bb, origResult,
                           makeConcreteTangentValue(differentialResult));
-        } else if (auto *dti = getSingleDestructureTupleUser(ai)) {
+        } else if (auto *dti =
+                       ai->getSingleUserOfType<DestructureTupleInst>()) {
           bool notSetValue = true;
           for (auto result : dti->getResults()) {
             if (activityInfo.isActive(result, getConfig())) {
@@ -1674,7 +1688,7 @@ void JVPCloner::Implementation::prepareForDifferentialGeneration() {
   auto *diffGenericEnv = diffGenericSig.getGenericEnvironment();
   auto diffType = SILFunctionType::get(
       diffGenericSig, SILExtInfo::getThin(), origTy->getCoroutineKind(),
-      origTy->getCalleeConvention(), dfParams, {}, dfResults, llvm::None,
+      origTy->getCalleeConvention(), dfParams, {}, dfResults, std::nullopt,
       origTy->getPatternSubstitutions(), origTy->getInvocationSubstitutions(),
       original->getASTContext());
 

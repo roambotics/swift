@@ -6,7 +6,7 @@
 
 import Foundation
 import ObjCConcurrency
-// expected-remark@-1{{add '@preconcurrency' to suppress 'Sendable'-related warnings from module 'ObjCConcurrency'}}
+// expected-warning@-1{{add '@preconcurrency' to suppress 'Sendable'-related warnings from module 'ObjCConcurrency'}}
 
 @available(SwiftStdlib 5.5, *)
 @MainActor func onlyOnMainActor() { }
@@ -210,7 +210,7 @@ class MyButton : NXButton {
   }
 
   @SomeGlobalActor func testOther() {
-    onButtonPress() // expected-error{{call to main actor-isolated instance method 'onButtonPress()' in a synchronous global actor 'SomeGlobalActor'-isolated context}}
+    onButtonPress() // expected-warning{{call to main actor-isolated instance method 'onButtonPress()' in a synchronous global actor 'SomeGlobalActor'-isolated context}}
   }
 
   func test() {
@@ -298,6 +298,7 @@ class BarFrame: PictureFrame {
 @available(SwiftStdlib 5.5, *)
 @SomeGlobalActor
 class BazFrame: NotIsolatedPictureFrame {
+// expected-warning@-1 {{global actor 'SomeGlobalActor'-isolated class 'BazFrame' has different actor isolation from nonisolated superclass 'NotIsolatedPictureFrame'; this is an error in the Swift 6 language mode}}
   init() {
     super.init(size: 0)
   }
@@ -353,8 +354,6 @@ func testSender(
   sender.sendSendableSubclasses(nonSendableObject)
   // expected-warning@-1 {{conformance of 'NonSendableClass' to 'Sendable' is unavailable}}
   sender.sendSendableSubclasses(sendableSubclassOfNonSendableObject)
-  // expected-warning@-1 {{conformance of 'NonSendableClass' to 'Sendable' is unavailable}}
-  // FIXME(rdar://89992569): Should allow for the possibility that NonSendableClass will have a Sendable subclass
 
   sender.sendProto(sendableProtos)
   sender.sendProto(nonSendableProtos)
@@ -366,11 +365,9 @@ func testSender(
 
   sender.sendAnyArray([sendableObject])
   sender.sendAnyArray([nonSendableObject])
-  // expected-warning@-1 {{conformance of 'NonSendableClass' to 'Sendable' is unavailable; this is an error in Swift 6}}
+  // expected-warning@-1 {{conformance of 'NonSendableClass' to 'Sendable' is unavailable; this is an error in the Swift 6 language mode}}
 
-  sender.sendGeneric(sendableGeneric)
-  // expected-warning@-1{{type 'GenericObject<SendableClass>' does not conform to the 'Sendable' protocol}}
-  // FIXME: Shouldn't warn
+  sender.sendGeneric(sendableGeneric) // no warning
 
   sender.sendGeneric(nonSendableGeneric)
   // expected-warning@-1 {{type 'GenericObject<SendableClass>' does not conform to the 'Sendable' protocol}}
@@ -396,7 +393,7 @@ extension SomeWrapper: Sendable where T: Sendable {}
   func makeCall(slowServer: SlowServer) {
     slowServer.doSomethingSlow("churn butter") { (_ : Int) in
       let _ = self.isolatedThing
-      // expected-warning@-1 {{main actor-isolated property 'isolatedThing' can not be referenced from a Sendable closure; this is an error in Swift 6}}
+      // expected-warning@-1 {{main actor-isolated property 'isolatedThing' can not be referenced from a Sendable closure; this is an error in the Swift 6 language mode}}
     }
   }
 }

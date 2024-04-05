@@ -40,9 +40,8 @@ __swift_size_t _swift_stdlib_fwrite_stdout(const void *ptr, __swift_size_t size,
 
 // General utilities <stdlib.h>
 // Memory management functions
-extern int posix_memalign(void *_Nullable *_Nonnull memptr, __swift_size_t alignment, __swift_size_t size);
-extern void free(void *_Nullable);
 static inline void _swift_stdlib_free(void *_Nullable ptr) {
+  extern void free(void *_Nullable);
   free(ptr);
 }
 
@@ -62,7 +61,7 @@ SWIFT_READONLY
 static inline int _swift_stdlib_memcmp(const void *s1, const void *s2,
                                        __swift_size_t n) {
 // FIXME: Is there a way to identify Glibc specifically?
-#if defined(__gnu_linux__)
+#if defined(__gnu_linux__) || defined(__ANDROID__)
   extern int memcmp(const void * _Nonnull, const void * _Nonnull, __swift_size_t);
 #else
   extern int memcmp(const void * _Null_unspecified, const void * _Null_unspecified, __swift_size_t);
@@ -105,7 +104,7 @@ static inline __swift_size_t _swift_stdlib_malloc_size(const void *ptr) {
 static inline __swift_size_t _swift_stdlib_malloc_size(const void *ptr) {
 #if defined(__ANDROID__)
 #if !defined(__ANDROID_API__) || __ANDROID_API__ >= 17
-  extern __swift_size_t malloc_usable_size(const void *ptr);
+  extern __swift_size_t malloc_usable_size(const void * _Nullable ptr);
 #endif
 #else
   extern __swift_size_t malloc_usable_size(void *ptr);

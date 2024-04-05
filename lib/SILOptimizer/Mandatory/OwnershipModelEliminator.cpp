@@ -31,6 +31,7 @@
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILVisitor.h"
+#include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/Analysis/SimplifyInstruction.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
@@ -208,7 +209,6 @@ struct OwnershipModelEliminatorVisitor
   HANDLE_FORWARDING_INST(Tuple)
   HANDLE_FORWARDING_INST(Enum)
   HANDLE_FORWARDING_INST(UncheckedEnumData)
-  HANDLE_FORWARDING_INST(SelectEnum)
   HANDLE_FORWARDING_INST(OpenExistentialRef)
   HANDLE_FORWARDING_INST(InitExistentialRef)
   HANDLE_FORWARDING_INST(MarkDependence)
@@ -219,6 +219,7 @@ struct OwnershipModelEliminatorVisitor
   HANDLE_FORWARDING_INST(LinearFunctionExtract)
   HANDLE_FORWARDING_INST(DifferentiableFunctionExtract)
   HANDLE_FORWARDING_INST(MarkUninitialized)
+  HANDLE_FORWARDING_INST(FunctionExtractIsolation)
 #undef HANDLE_FORWARDING_INST
 };
 
@@ -401,7 +402,7 @@ static void injectDebugPoison(DestroyValueInst *destroy) {
     const SILDebugScope *scope = debugVal->getDebugScope();
     auto loc = debugVal->getLoc();
 
-    llvm::Optional<SILDebugVariable> varInfo = debugVal->getVarInfo();
+    std::optional<SILDebugVariable> varInfo = debugVal->getVarInfo();
     if (!varInfo)
       continue;
 
@@ -450,7 +451,8 @@ bool OwnershipModelEliminatorVisitor::visitPartialApplyInst(
       }
       
       // If this is a nontrivial value argument, insert the mark_dependence.
-      auto mdi = b.createMarkDependence(loc, newValue, op);
+      auto mdi = b.createMarkDependence(loc, newValue, op,
+                                        MarkDependenceKind::Escaping);
       if (!firstNewMDI)
         firstNewMDI = mdi;
       newValue = mdi;
@@ -834,7 +836,8 @@ struct OwnershipModelEliminator : SILFunctionTransform {
           "Found verification error when verifying before lowering "
           "ownership. Please re-run with -sil-verify-all to identify the "
           "actual pass that introduced the verification error.");
-      f->verify(getPassManager());
+      f->verify(getAnalysis<BasicCalleeAnalysis>()->getCalleeCache());
+      getPassManager()->runSwiftFunctionVerification(f);
     }
 
     if (stripOwnership(*f)) {

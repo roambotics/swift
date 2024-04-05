@@ -14,6 +14,7 @@
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/BasicBlockBits.h"
 #include "swift/SIL/NodeBits.h"
+#include "swift/SIL/OperandBits.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
 #include "swift/SILOptimizer/PassManager/PassPipeline.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
@@ -24,6 +25,7 @@
 #include "llvm/Support/Chrono.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <vector>
+#include <bitset>
 
 #ifndef SWIFT_SILOPTIMIZER_PASSMANAGER_PASSMANAGER_H
 #define SWIFT_SILOPTIMIZER_PASSMANAGER_PASSMANAGER_H
@@ -72,21 +74,20 @@ class SwiftPassInvocation {
 
   SILSSAUpdater *ssaUpdater = nullptr;
 
-  /// IRGen module for passes that request it (e.g. simplification pass)
-  irgen::IRGenModule *irgenModule = nullptr;
-
-  /// IRGenerator used by IRGenModule above
-  irgen::IRGenerator *irgen = nullptr;
-
-  static constexpr int BlockSetCapacity = 8;
+  static constexpr int BlockSetCapacity = SILBasicBlock::numCustomBits;
   char blockSetStorage[sizeof(BasicBlockSet) * BlockSetCapacity];
   bool aliveBlockSets[BlockSetCapacity];
   int numBlockSetsAllocated = 0;
 
-  static constexpr int NodeSetCapacity = 8;
+  static constexpr int NodeSetCapacity = SILNode::numCustomBits;
   char nodeSetStorage[sizeof(NodeSet) * NodeSetCapacity];
   bool aliveNodeSets[NodeSetCapacity];
   int numNodeSetsAllocated = 0;
+
+  static constexpr int OperandSetCapacity = Operand::numCustomBits;
+  char operandSetStorage[sizeof(OperandSet) * OperandSetCapacity];
+  bool aliveOperandSets[OperandSetCapacity];
+  int numOperandSetsAllocated = 0;
 
   int numClonersAllocated = 0;
 
@@ -98,6 +99,10 @@ public:
   SwiftPassInvocation(SILPassManager *passManager, SILFunction *function,
                          SILCombiner *silCombiner) :
     passManager(passManager), function(function), silCombiner(silCombiner) {}
+
+  SwiftPassInvocation(SILPassManager *passManager, SILTransform *transform,
+                      SILFunction *function) :
+    passManager(passManager), transform(transform), function(function) {}
 
   SwiftPassInvocation(SILPassManager *passManager) :
     passManager(passManager) {}
@@ -123,6 +128,10 @@ public:
   NodeSet *allocNodeSet();
 
   void freeNodeSet(NodeSet *set);
+
+  OperandSet *allocOperandSet();
+
+  void freeOperandSet(OperandSet *set);
 
   /// The top-level API to erase an instruction, called from the Swift pass.
   void eraseInstruction(SILInstruction *inst);
@@ -152,16 +161,20 @@ public:
 
   void endTransformFunction();
 
+  void beginVerifyFunction(SILFunction *function);
+  void endVerifyFunction();
+
   void notifyNewCloner() { numClonersAllocated++; }
   void notifyClonerDestroyed() { numClonersAllocated--; }
 
   void setNeedFixStackNesting(bool newValue) { needFixStackNesting = newValue; }
   bool getNeedFixStackNesting() const { return needFixStackNesting; }
 
-  void initializeSSAUpdater(SILType type, ValueOwnershipKind ownership) {
+  void initializeSSAUpdater(SILFunction *fn, SILType type,
+                            ValueOwnershipKind ownership) {
     if (!ssaUpdater)
       ssaUpdater = new SILSSAUpdater;
-    ssaUpdater->initialize(type, ownership);
+    ssaUpdater->initialize(fn, type, ownership);
   }
 
   SILSSAUpdater *getSSAUpdater() const {
@@ -179,6 +192,7 @@ class SILPassManager {
 
   /// An optional IRGenModule associated with this PassManager.
   irgen::IRGenModule *IRMod;
+  irgen::IRGenerator *irgen;
 
   /// The list of transformations to run.
   llvm::SmallVector<SILTransform *, 16> Transformations;
@@ -211,6 +225,7 @@ class SILPassManager {
 
   unsigned maxNumPassesToRun = UINT_MAX;
   unsigned maxNumSubpassesToRun = UINT_MAX;
+  unsigned breakBeforePassCount = UINT_MAX;
 
   /// For invoking Swift passes.
   SwiftPassInvocation swiftPassInvocation;
@@ -285,7 +300,7 @@ public:
 
   /// \returns the associated IGenModule or null if this is not an IRGen
   /// pass manager.
-  irgen::IRGenModule *getIRGenModule() { return IRMod; }
+  irgen::IRGenModule *getIRGenModule();
 
   SwiftPassInvocation *getSwiftPassInvocation() {
     return &swiftPassInvocation;
@@ -417,7 +432,16 @@ public:
   static bool isInstructionPassDisabled(StringRef instName);
   static bool disablePassesForFunction(SILFunction *function);
 
+  /// Runs the SIL verifier which is implemented in the SwiftCompilerSources.
+  void runSwiftFunctionVerification(SILFunction *f);
+
+  /// Runs the SIL verifier which is implemented in the SwiftCompilerSources.
+  void runSwiftModuleVerification();
+
 private:
+  void parsePassesToRunCount(StringRef countsStr);
+  void parseBreakBeforePassCount(StringRef countsStr);
+
   bool doPrintBefore(SILTransform *T, SILFunction *F);
 
   bool doPrintAfter(SILTransform *T, SILFunction *F, bool PassChangedSIL);
@@ -448,6 +472,9 @@ private:
   /// A helper function that returns (based on SIL stage and debug
   /// options) whether we should continue running passes.
   bool continueTransforming();
+
+  /// Break before running a pass.
+  bool breakBeforeRunning(StringRef fnName, SILFunctionTransform *SFT);
 
   /// Return true if all analyses are unlocked.
   bool analysesUnlocked();

@@ -1,10 +1,9 @@
-// RUN: %target-swift-emit-ir %s %S/Inputs/print.swift -module-name main -Xcc -fno-builtin -enable-experimental-feature Embedded | %FileCheck %s
-// RUN: %target-swift-emit-ir %s %S/Inputs/print.swift -module-name main -Xcc -ffreestanding -enable-experimental-feature Embedded | %FileCheck %s
+// RUN: %target-swift-emit-ir %s -parse-as-library -module-name main -Xcc -fno-builtin -enable-experimental-feature Embedded | %FileCheck %s
+// RUN: %target-swift-emit-ir %s -parse-as-library -module-name main -Xcc -ffreestanding -enable-experimental-feature Embedded | %FileCheck %s
 
 // REQUIRES: swift_in_compiler
 // REQUIRES: optimized_stdlib
-// REQUIRES: VENDOR=apple
-// REQUIRES: OS=macosx
+// REQUIRES: OS=macosx || OS=linux-gnu
 
 public func foo() -> [Int] {
 	var a = [1, 2, 3]

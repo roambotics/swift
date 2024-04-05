@@ -151,7 +151,8 @@ static void updateSSAForUseOfValue(
   assert(Res->getType() == MappedValue->getType() && "The types must match");
 
   insertedPhis.clear();
-  updater.initialize(Res->getType(), Res->getOwnershipKind());
+  updater.initialize(MappedValue->getFunction(), Res->getType(),
+                     Res->getOwnershipKind());
   updater.addAvailableValue(Header, Res);
   updater.addAvailableValue(EntryCheckBlock, MappedValue);
 
@@ -288,7 +289,11 @@ static bool isSingleBlockLoop(SILLoop *L) {
          && "Loop not well formed");
 
   // Check whether the back-edge block is just a split-edge.
-  return ++BackEdge->begin() == BackEdge->end();
+  for (SILInstruction &inst : make_range(BackEdge->begin(), --BackEdge->end())) {
+    if (instructionInlineCost(inst) != InlineCost::Free)
+      return false;
+  }
+  return true;
 }
 
 /// We rotated a loop if it has the following properties.

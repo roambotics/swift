@@ -215,19 +215,6 @@ namespace irgen {
                               CanSILFunctionType coroutineType,
                               NativeCCEntryPointArgumentEmission &emission);
 
-  void emitTaskCancel(IRGenFunction &IGF, llvm::Value *task);
-
-  /// Emit a call to swift_task_create[_f] with the given flags, options, and
-  /// task function.
-  llvm::Value *emitTaskCreate(
-    IRGenFunction &IGF,
-    llvm::Value *flags,
-    llvm::Value *taskGroup,
-    llvm::Value *futureResultType,
-    llvm::Value *taskFunction,
-    llvm::Value *localContextInfo,
-    SubstitutionMap subs);
-
   /// Allocate task local storage for the provided dynamic size.
   Address emitAllocAsyncContext(IRGenFunction &IGF, llvm::Value *sizeValue);
   void emitDeallocAsyncContext(IRGenFunction &IGF, Address context);
@@ -254,12 +241,14 @@ namespace irgen {
 
   void emitAsyncReturn(
       IRGenFunction &IGF, AsyncContextLayout &layout, CanSILFunctionType fnType,
-      llvm::Optional<ArrayRef<llvm::Value *>> nativeResultArgs = llvm::None);
+      std::optional<ArrayRef<llvm::Value *>> nativeResultArgs = std::nullopt);
 
   void emitAsyncReturn(IRGenFunction &IGF, AsyncContextLayout &layout,
                        SILType funcResultTypeInContext,
                        CanSILFunctionType fnType, Explosion &result,
                        Explosion &error);
+  void emitYieldOnceCoroutineResult(IRGenFunction &IGF, Explosion &result,
+                                    SILType funcResultType, SILType returnResultType);
 
   Address emitAutoDiffCreateLinearMapContextWithType(
       IRGenFunction &IGF, llvm::Value *topLevelSubcontextMetatype);

@@ -22,10 +22,12 @@
 #include "../CompatibilityOverride/CompatibilityOverride.h"
 #include "swift/ABI/Actor.h"
 #include "swift/ABI/Task.h"
+#include "TaskPrivate.h"
 #include "swift/Basic/ListMerger.h"
 #include "swift/Concurrency/Actor.h"
 #include "swift/Runtime/AccessibleFunction.h"
 #include "swift/Runtime/Atomic.h"
+#include "swift/Runtime/Bincompat.h"
 #include "swift/Runtime/Casting.h"
 #include "swift/Runtime/DispatchShims.h"
 #include "swift/Threading/Mutex.h"
@@ -118,7 +120,12 @@ class ExecutorTrackingInfo {
       ActiveInfoInThread;
 
   /// The active executor.
-  ExecutorRef ActiveExecutor = ExecutorRef::generic();
+  SerialExecutorRef ActiveExecutor = SerialExecutorRef::generic();
+
+  /// The current task executor, if present, otherwise `undefined`.
+  /// The task executor should be used to execute code when the active executor
+  /// is `generic`.
+  TaskExecutorRef TaskExecutor = TaskExecutorRef::undefined();
 
   /// Whether this context allows switching.  Some contexts do not;
   /// for example, we do not allow switching from swift_job_run
@@ -139,8 +146,10 @@ public:
   /// Unconditionally initialize a fresh tracking state on the
   /// current state, shadowing any previous tracking state.
   /// leave() must be called before the object goes out of scope.
-  void enterAndShadow(ExecutorRef currentExecutor) {
+  void enterAndShadow(SerialExecutorRef currentExecutor,
+                      TaskExecutorRef taskExecutor) {
     ActiveExecutor = currentExecutor;
+    TaskExecutor = taskExecutor;
     SavedInfo = ActiveInfoInThread.get();
     ActiveInfoInThread.set(this);
   }
@@ -149,14 +158,16 @@ public:
 
   void restoreVoucher(AsyncTask *task) { voucherManager.restoreVoucher(task); }
 
-  ExecutorRef getActiveExecutor() const {
-    return ActiveExecutor;
-  }
-
-  void setActiveExecutor(ExecutorRef newExecutor) {
+  SerialExecutorRef getActiveExecutor() const { return ActiveExecutor; }
+  void setActiveExecutor(SerialExecutorRef newExecutor) {
     ActiveExecutor = newExecutor;
   }
 
+  TaskExecutorRef getTaskExecutor() const { return TaskExecutor; }
+
+  void setTaskExecutor(TaskExecutorRef newExecutor) {
+    TaskExecutor = newExecutor;
+  }
 
   bool allowsSwitching() const {
     return AllowsSwitching;
@@ -187,6 +198,9 @@ class ActiveTask {
 public:
   static void set(AsyncTask *task) { Value.set(task); }
   static AsyncTask *get() { return Value.get(); }
+  static AsyncTask *swap(AsyncTask *newTask) {
+    return Value.swap(newTask);
+  }
 };
 
 /// Define the thread-locals.
@@ -208,7 +222,7 @@ void swift::runJobInEstablishedExecutorContext(Job *job) {
 
   if (auto task = dyn_cast<AsyncTask>(job)) {
     // Update the active task in the current thread.
-    ActiveTask::set(task);
+    auto oldTask = ActiveTask::swap(task);
 
     // Update the task status to say that it's running on the
     // current thread.  If the task suspends somewhere, it should
@@ -222,6 +236,7 @@ void swift::runJobInEstablishedExecutorContext(Job *job) {
 
     assert(ActiveTask::get() == nullptr &&
            "active task wasn't cleared before suspending?");
+    if (oldTask) ActiveTask::set(oldTask);
   } else {
     // There's no extra bookkeeping to do for simple jobs besides swapping in
     // the voucher.
@@ -250,22 +265,18 @@ AsyncTask *swift::swift_task_getCurrent() {
 }
 
 AsyncTask *swift::_swift_task_clearCurrent() {
-  auto task = ActiveTask::get();
-  ActiveTask::set(nullptr);
-  return task;
+  return ActiveTask::swap(nullptr);
 }
 
 AsyncTask *swift::_swift_task_setCurrent(AsyncTask *new_task) {
-  auto task = ActiveTask::get();
-  ActiveTask::set(new_task);
-  return task;
+  return ActiveTask::swap(new_task);
 }
 
 SWIFT_CC(swift)
-static ExecutorRef swift_task_getCurrentExecutorImpl() {
+static SerialExecutorRef swift_task_getCurrentExecutorImpl() {
   auto currentTracking = ExecutorTrackingInfo::current();
   auto result = (currentTracking ? currentTracking->getActiveExecutor()
-                                 : ExecutorRef::generic());
+                                 : SerialExecutorRef::generic());
   SWIFT_TASK_DEBUG_LOG("getting current executor %p", result.getIdentity());
   return result;
 }
@@ -285,7 +296,7 @@ JobPriority swift::swift_task_getCurrentThreadPriority() {
   return JobPriority::UserInitiated;
 #elif SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
   return JobPriority::Unspecified;
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && SWIFT_CONCURRENCY_ENABLE_DISPATCH
   return static_cast<JobPriority>(qos_class_self());
 #else
   if (isExecutingOnMainThread())
@@ -304,39 +315,178 @@ bool _task_serialExecutor_isSameExclusiveExecutionContext(
     const Metadata *selfType,
     const SerialExecutorWitnessTable *wtable);
 
+// We currently still support "legacy mode" in which isCurrentExecutor is NOT
+// allowed to crash, because it is used to power "log warnings" data race
+// detector. This mode is going away in Swift 6, but until then we allow this.
+// This override exists primarily to be able to test both code-paths.
+enum IsCurrentExecutorCheckMode: unsigned {
+  /// The default mode when an app was compiled against "new" enough SDK.
+  /// It allows crashing in isCurrentExecutor, and calls into `checkIsolated`.
+  Default_UseCheckIsolated_AllowCrash,
+  /// Legacy mode; Primarily to support old applications which used data race
+  /// detector with "warning" mode, which is no longer supported. When such app
+  /// is re-compiled against a new SDK, it will see crashes in what was
+  /// previously warnings; however, until until recompiled, warnings will be
+  /// used, and `checkIsolated` cannot be invoked.
+  Legacy_NoCheckIsolated_NonCrashing,
+};
+static IsCurrentExecutorCheckMode isCurrentExecutorMode =
+    Default_UseCheckIsolated_AllowCrash;
+
+
+// Shimming call to Swift runtime because Swift Embedded does not have
+// these symbols defined
+bool swift_bincompat_useLegacyNonCrashingExecutorChecks() {
+#if !SWIFT_CONCURRENCY_EMBEDDED
+  swift::runtime::bincompat::
+      swift_bincompat_useLegacyNonCrashingExecutorChecks();
+#endif
+  return false;
+}
+
+// Check override of executor checking mode.
+static void checkIsCurrentExecutorMode(void *context) {
+  auto useLegacyMode =
+      swift_bincompat_useLegacyNonCrashingExecutorChecks();
+
+  // Potentially, override the platform detected mode, primarily used in tests.
+#if SWIFT_STDLIB_HAS_ENVIRON
+  const char *modeStr = getenv("SWIFT_IS_CURRENT_EXECUTOR_LEGACY_MODE_OVERRIDE");
+  if (!modeStr)
+    return;
+  
+  if (strcmp(modeStr, "nocrash") == 0) {
+    useLegacyMode = Legacy_NoCheckIsolated_NonCrashing;
+  } else if (strcmp(modeStr, "crash") == 0)  {
+    useLegacyMode = Default_UseCheckIsolated_AllowCrash;
+  } // else, just use the platform detected mode
+#endif // SWIFT_STDLIB_HAS_ENVIRON
+  isCurrentExecutorMode = useLegacyMode ? Legacy_NoCheckIsolated_NonCrashing
+                                        : Default_UseCheckIsolated_AllowCrash;
+}
+
 SWIFT_CC(swift)
-static bool swift_task_isCurrentExecutorImpl(ExecutorRef executor) {
+static bool swift_task_isCurrentExecutorImpl(SerialExecutorRef expectedExecutor) {
   auto current = ExecutorTrackingInfo::current();
 
+  // To support old applications on apple platforms which assumed this call
+  // does not crash, try to use a more compatible mode for those apps.
+  static swift::once_t checkModeToken;
+  swift::once(checkModeToken, checkIsCurrentExecutorMode, nullptr);
+
   if (!current) {
-    // TODO(ktoso): checking the "is main thread" is not correct, main executor can be not main thread, relates to rdar://106188692
-    return executor.isMainExecutor() && isExecutingOnMainThread();
+    // We have no current executor, i.e. we are running "outside" of Swift
+    // Concurrency. We could still be running on a thread/queue owned by
+    // the expected executor however, so we need to try a bit harder before
+    // we fail.
+
+    // Are we expecting the main executor and are using the main thread?
+    if (expectedExecutor.isMainExecutor() && isExecutingOnMainThread()) {
+      // Due to compatibility with pre-checkIsolated code, we cannot remove
+      // this special handling. CheckIsolated can handle this if the expected
+      // executor is the main queue / main executor, however, if we cannot call
+      // checkIsolated we cannot rely on it to handle this.
+      // TODO: consider removing this branch when `useCrashingCheckIsolated=true`
+      return true;
+    }
+
+    // Otherwise, as last resort, let the expected executor check using
+    // external means, as it may "know" this thread is managed by it etc.
+    if (isCurrentExecutorMode == Default_UseCheckIsolated_AllowCrash) {
+      swift_task_checkIsolated(expectedExecutor);
+      // checkIsolated did not crash, so we are on the right executor, after all!
+      return true;
+    }
+
+    assert(isCurrentExecutorMode == Legacy_NoCheckIsolated_NonCrashing);
+    return false;
   }
 
-  auto currentExecutor = current->getActiveExecutor();
-  if (currentExecutor == executor) {
+  SerialExecutorRef currentExecutor = current->getActiveExecutor();
+
+  // Fast-path: the executor is exactly the same memory address;
+  // We assume executors do not come-and-go appearing under the same address,
+  // and treat pointer equality of executors as good enough to assume the executor.
+  if (currentExecutor == expectedExecutor) {
     return true;
   }
 
-  if (executor.isComplexEquality()) {
+  // Fast-path, specialize the common case of comparing two main executors.
+  if (currentExecutor.isMainExecutor() && expectedExecutor.isMainExecutor()) {
+    return true;
+  }
+
+  // If the expected executor is "default" then we should have matched
+  // by pointer equality already with the current executor.
+  if (expectedExecutor.isDefaultActor()) {
+    // If the expected executor is a default actor, it makes no sense to try
+    // the 'checkIsolated' call, it must be equal to the other actor, or it is
+    // not the same isolation domain.
+    swift_Concurrency_fatalError(0, "Incorrect actor executor assumption");
+    return false;
+  }
+
+  if (expectedExecutor.isMainExecutor() && !currentExecutor.isMainExecutor()) {
+    // TODO: Invoke checkIsolated() on "main" SerialQueue once it implements `checkIsolated`, otherwise messages will be sub-par and hard to address
+    swift_Concurrency_fatalError(0, "Incorrect actor executor assumption; Expected MainActor executor");
+    return false;
+  } else if (!expectedExecutor.isMainExecutor() && currentExecutor.isMainExecutor()) {
+    // TODO: Invoke checkIsolated() on "main" SerialQueue once it implements `checkIsolated`, otherwise messages will be sub-par and hard to address
+    swift_Concurrency_fatalError(0, "Incorrect actor executor assumption; Expected not-MainActor executor");
+    return false;
+  }
+
+  if (expectedExecutor.isComplexEquality()) {
     if (!swift_compareWitnessTables(
         reinterpret_cast<const WitnessTable*>(currentExecutor.getSerialExecutorWitnessTable()),
-        reinterpret_cast<const  WitnessTable*>(executor.getSerialExecutorWitnessTable()))) {
+        reinterpret_cast<const  WitnessTable*>(expectedExecutor.getSerialExecutorWitnessTable()))) {
       // different witness table, we cannot invoke complex equality call
       return false;
     }
+
     // Avoid passing nulls to Swift for the isSame check:
-    if (!currentExecutor.getIdentity() || !executor.getIdentity()) {
+    if (!currentExecutor.getIdentity() || !expectedExecutor.getIdentity()) {
       return false;
     }
 
-    return _task_serialExecutor_isSameExclusiveExecutionContext(
+    auto result = _task_serialExecutor_isSameExclusiveExecutionContext(
         currentExecutor.getIdentity(),
-        executor.getIdentity(),
+        expectedExecutor.getIdentity(),
         swift_getObjectType(currentExecutor.getIdentity()),
-        executor.getSerialExecutorWitnessTable());
+        expectedExecutor.getSerialExecutorWitnessTable());
+
+    return result;
   }
 
+  // This provides a last-resort check by giving the expected SerialExecutor the
+  // chance to perform a check using some external knowledge if perhaps we are,
+  // after all, on this executor, but the Swift concurrency runtime was just not
+  // aware.
+  //
+  // Unless handled in `swift_task_checkIsolated` directly, this should call
+  // through to the executor's `SerialExecutor.checkIsolated`.
+  //
+  // This call is expected to CRASH, unless it has some way of proving that
+  // we're actually indeed running on this executor.
+  //
+  // For example, when running outside of Swift concurrency tasks, but trying to
+  // `MainActor.assumeIsolated` while executing DIRECTLY on the main dispatch
+  // queue, this allows Dispatch to check for this using its own tracking
+  // mechanism, and thus allow the assumeIsolated to work correctly, even though
+  // the code executing is not even running inside a Task.
+  //
+  // Note that this only works because the closure in assumeIsolated is
+  // synchronous, and will not cause suspensions, as that would require the
+  // presence of a Task.
+  // compat_invoke_swift_task_checkIsolated(expectedExecutor);
+  if (isCurrentExecutorMode == Default_UseCheckIsolated_AllowCrash) {
+    swift_task_checkIsolated(expectedExecutor);
+    // The checkIsolated call did not crash, so we are on the right executor.
+    return true;
+  }
+
+  // Using legacy mode, if no explicit executor match worked, we assume `false`
+  assert(isCurrentExecutorMode == Legacy_NoCheckIsolated_NonCrashing);
   return false;
 }
 
@@ -344,7 +494,14 @@ static bool swift_task_isCurrentExecutorImpl(ExecutorRef executor) {
 /// 0 - no logging
 /// 1 - warn on each instance
 /// 2 - fatal error
-static unsigned unexpectedExecutorLogLevel = 1;
+///
+/// NOTE: The default behavior on Apple platforms depends on the SDK version
+/// an application was linked to. Since Swift 6 the default is to crash,
+/// and the logging behavior is no longer available.
+static unsigned unexpectedExecutorLogLevel =
+    swift_bincompat_useLegacyNonCrashingExecutorChecks()
+        ? 1 // legacy apps default to the logging mode, and cannot use `checkIsolated`
+        : 2; // new apps will only crash upon concurrency violations, and will call into `checkIsolated`
 
 static void checkUnexpectedExecutorLogLevel(void *context) {
 #if SWIFT_STDLIB_HAS_ENVIRON
@@ -361,7 +518,7 @@ static void checkUnexpectedExecutorLogLevel(void *context) {
 SWIFT_CC(swift)
 void swift::swift_task_reportUnexpectedExecutor(
     const unsigned char *file, uintptr_t fileLength, bool fileIsASCII,
-    uintptr_t line, ExecutorRef executor) {
+    uintptr_t line, SerialExecutorRef executor) {
   // Make sure we have an appropriate log level.
   static swift::once_t logLevelToken;
   swift::once(logLevelToken, checkUnexpectedExecutorLogLevel, nullptr);
@@ -417,7 +574,10 @@ void swift::swift_task_reportUnexpectedExecutor(
   fflush(stderr);
 #endif
 #if SWIFT_STDLIB_HAS_ASL
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
   asl_log(nullptr, nullptr, ASL_LEVEL_ERR, "%s", message);
+#pragma clang diagnostic pop
 #elif defined(__ANDROID__)
   __android_log_print(ANDROID_LOG_FATAL, "SwiftRuntime", "%s", message);
 #endif
@@ -1437,7 +1597,9 @@ static void defaultActorDrain(DefaultActorImpl *actor) {
   // Setup a TSD for tracking current execution info
   ExecutorTrackingInfo trackingInfo;
   trackingInfo.enterAndShadow(
-    ExecutorRef::forDefaultActor(asAbstract(currentActor)));
+      SerialExecutorRef::forDefaultActor(asAbstract(currentActor)),
+      /*taskExecutor, will be replaced per each job. */
+      TaskExecutorRef::undefined());
 
   while (true) {
     if (shouldYieldThread()) {
@@ -1453,6 +1615,11 @@ static void defaultActorDrain(DefaultActorImpl *actor) {
         continue;
       }
       break;
+    }
+
+    if (AsyncTask *task = dyn_cast<AsyncTask>(job)) {
+      auto taskExecutor = task->getPreferredTaskExecutor();
+      trackingInfo.setTaskExecutor(taskExecutor);
     }
 
     // This thread is now going to follow the task on this actor. It may hop off
@@ -1723,7 +1890,7 @@ bool DefaultActorImpl::unlock(bool forceUnlock)
 }
 
 SWIFT_CC(swift)
-static void swift_job_runImpl(Job *job, ExecutorRef executor) {
+static void swift_job_runImpl(Job *job, SerialExecutorRef executor) {
   ExecutorTrackingInfo trackingInfo;
 
   // swift_job_run is a primary entrypoint for executors telling us to
@@ -1732,7 +1899,7 @@ static void swift_job_runImpl(Job *job, ExecutorRef executor) {
   // is generic.
   if (!executor.isGeneric()) trackingInfo.disallowSwitching();
 
-  trackingInfo.enterAndShadow(executor);
+  trackingInfo.enterAndShadow(executor, TaskExecutorRef::undefined());
 
   SWIFT_TASK_DEBUG_LOG("job %p", job);
   runJobInEstablishedExecutorContext(job);
@@ -1746,6 +1913,37 @@ static void swift_job_runImpl(Job *job, ExecutorRef executor) {
   if (trackingInfo.allowsSwitching() && currentExecutor.isDefaultActor()) {
     asImpl(currentExecutor.getDefaultActor())->unlock(true);
   }
+}
+
+SWIFT_CC(swift)
+static void swift_job_run_on_serial_and_task_executorImpl(Job *job,
+                                               SerialExecutorRef serialExecutor,
+                                               TaskExecutorRef taskExecutor) {
+  ExecutorTrackingInfo trackingInfo;
+
+  // TODO: we don't allow switching
+  trackingInfo.disallowSwitching();
+  trackingInfo.enterAndShadow(serialExecutor, taskExecutor);
+
+  SWIFT_TASK_DEBUG_LOG("job %p", job);
+  runJobInEstablishedExecutorContext(job);
+
+  trackingInfo.leave();
+
+  // Give up the current executor if this is a switching context
+  // (which, remember, only happens if we started out on a generic
+  // executor) and we've switched to a default actor.
+  auto currentExecutor = trackingInfo.getActiveExecutor();
+  if (trackingInfo.allowsSwitching() && currentExecutor.isDefaultActor()) {
+    asImpl(currentExecutor.getDefaultActor())->unlock(true);
+  }
+}
+
+SWIFT_CC(swift)
+static void swift_job_run_on_task_executorImpl(Job *job,
+                                               TaskExecutorRef taskExecutor) {
+  swift_job_run_on_serial_and_task_executor(
+      job, SerialExecutorRef::generic(), taskExecutor);
 }
 
 void swift::swift_defaultActor_initialize(DefaultActor *_actor) {
@@ -1807,7 +2005,7 @@ namespace swift {
 
 /// Can the current executor give up its thread?
 static bool canGiveUpThreadForSwitch(ExecutorTrackingInfo *trackingInfo,
-                                     ExecutorRef currentExecutor) {
+                                     SerialExecutorRef currentExecutor) {
   assert(trackingInfo || currentExecutor.isGeneric());
 
   // Some contexts don't allow switching at all.
@@ -1832,7 +2030,7 @@ static bool canGiveUpThreadForSwitch(ExecutorTrackingInfo *trackingInfo,
 ///
 /// Note that we don't update DefaultActorProcessingFrame here; we'll
 /// do that in runOnAssumedThread.
-static void giveUpThreadForSwitch(ExecutorRef currentExecutor) {
+static void giveUpThreadForSwitch(SerialExecutorRef currentExecutor) {
   if (currentExecutor.isGeneric()) {
     SWIFT_TASK_DEBUG_LOG("Giving up current generic executor %p",
                          currentExecutor.getIdentity());
@@ -1849,9 +2047,10 @@ static void giveUpThreadForSwitch(ExecutorRef currentExecutor) {
 ///
 /// Note that we don't update DefaultActorProcessingFrame here; we'll
 /// do that in runOnAssumedThread.
-static bool tryAssumeThreadForSwitch(ExecutorRef newExecutor) {
+static bool tryAssumeThreadForSwitch(SerialExecutorRef newExecutor,
+                                     TaskExecutorRef newTaskExecutor) {
   // If the new executor is generic, we don't need to do anything.
-  if (newExecutor.isGeneric()) {
+  if (newExecutor.isGeneric() && newTaskExecutor.isUndefined()) {
     return true;
   }
 
@@ -1863,10 +2062,28 @@ static bool tryAssumeThreadForSwitch(ExecutorRef newExecutor) {
   return false;
 }
 
+static bool mustSwitchToRun(SerialExecutorRef currentSerialExecutor,
+                            SerialExecutorRef newSerialExecutor,
+                            TaskExecutorRef currentTaskExecutor,
+                            TaskExecutorRef newTaskExecutor) {
+  if (currentSerialExecutor.getIdentity() != newSerialExecutor.getIdentity()) {
+    return true; // must switch, new isolation context
+  }
+
+  // else, we may have to switch if the preferred task executor is different
+  auto differentTaskExecutor =
+      currentTaskExecutor.getIdentity() != newTaskExecutor.getIdentity();
+  if (differentTaskExecutor) {
+    return true;
+  }
+
+  return false;
+}
+
 /// Given that we've assumed control of an executor on this thread,
 /// continue to run the given task on it.
 SWIFT_CC(swiftasync)
-static void runOnAssumedThread(AsyncTask *task, ExecutorRef executor,
+static void runOnAssumedThread(AsyncTask *task, SerialExecutorRef executor,
                                ExecutorTrackingInfo *oldTracking) {
   // Note that this doesn't change the active task and so doesn't
   // need to either update ActiveTask or flagAsRunning/flagAsSuspended.
@@ -1876,13 +2093,14 @@ static void runOnAssumedThread(AsyncTask *task, ExecutorRef executor,
   // potentially accumulate linearly.
   if (oldTracking) {
     oldTracking->setActiveExecutor(executor);
+    oldTracking->setTaskExecutor(task->getPreferredTaskExecutor());
 
     return task->runInFullyEstablishedContext(); // 'return' forces tail call
   }
 
   // Otherwise, set up tracking info.
   ExecutorTrackingInfo trackingInfo;
-  trackingInfo.enterAndShadow(executor);
+  trackingInfo.enterAndShadow(executor, task->getPreferredTaskExecutor());
 
   // Run the new task.
   task->runInFullyEstablishedContext();
@@ -1908,24 +2126,37 @@ static void runOnAssumedThread(AsyncTask *task, ExecutorRef executor,
 SWIFT_CC(swiftasync)
 static void swift_task_switchImpl(SWIFT_ASYNC_CONTEXT AsyncContext *resumeContext,
                                   TaskContinuationFunction *resumeFunction,
-                                  ExecutorRef newExecutor) SWIFT_OPTNONE {
+                                  SerialExecutorRef newExecutor) SWIFT_OPTNONE {
   auto task = swift_task_getCurrent();
   assert(task && "no current task!");
 
   auto trackingInfo = ExecutorTrackingInfo::current();
   auto currentExecutor =
     (trackingInfo ? trackingInfo->getActiveExecutor()
-                  : ExecutorRef::generic());
-  SWIFT_TASK_DEBUG_LOG("Task %p trying to switch from executor %p to %p %s", task,
-                       currentExecutor.getIdentity(),
+                  : SerialExecutorRef::generic());
+  auto currentTaskExecutor = (trackingInfo ? trackingInfo->getTaskExecutor()
+                                           : TaskExecutorRef::undefined());
+  auto newTaskExecutor = task->getPreferredTaskExecutor();
+  SWIFT_TASK_DEBUG_LOG("Task %p trying to switch executors: executor %p to "
+                       "%p%s; task executor: from %p%s to %p%s",
+                       task, currentExecutor.getIdentity(),
+                       currentExecutor.isMainExecutor() ? " (MainActorExecutor)"
+                       : currentExecutor.isGeneric()    ? " (GenericExecutor)"
+                                                        : "",
                        newExecutor.getIdentity(),
-                       newExecutor.isMainExecutor() ? " (MainActorExecutor)" :
-                       newExecutor.isGeneric() ? " (GenericExecutor)" : "");
+                       newExecutor.isMainExecutor() ? " (MainActorExecutor)"
+                       : newExecutor.isGeneric()    ? " (GenericExecutor)"
+                                                    : "",
+                       currentTaskExecutor.getIdentity(),
+                       currentTaskExecutor.isDefined() ? "" : " (undefined)",
+                       newTaskExecutor.getIdentity(),
+                       newTaskExecutor.isDefined() ? "" : " (undefined)");
 
   // If the current executor is compatible with running the new executor,
   // we can just immediately continue running with the resume function
   // we were passed in.
-  if (!currentExecutor.mustSwitchToRun(newExecutor)) {
+  if (!mustSwitchToRun(currentExecutor, newExecutor, currentTaskExecutor,
+                       newTaskExecutor)) {
     return resumeFunction(resumeContext); // 'return' forces tail call
   }
 
@@ -1937,9 +2168,10 @@ static void swift_task_switchImpl(SWIFT_ASYNC_CONTEXT AsyncContext *resumeContex
   // If the current executor can give up its thread, and the new executor
   // can take over a thread, try to do so; but don't do this if we've
   // been asked to yield the thread.
-  if (canGiveUpThreadForSwitch(trackingInfo, currentExecutor) &&
+  if (currentTaskExecutor.isUndefined() &&
+      canGiveUpThreadForSwitch(trackingInfo, currentExecutor) &&
       !shouldYieldThread() &&
-      tryAssumeThreadForSwitch(newExecutor)) {
+      tryAssumeThreadForSwitch(newExecutor, newTaskExecutor)) {
     SWIFT_TASK_DEBUG_LOG(
         "switch succeeded, task %p assumed thread for executor %p", task,
         newExecutor.getIdentity());
@@ -1950,8 +2182,9 @@ static void swift_task_switchImpl(SWIFT_ASYNC_CONTEXT AsyncContext *resumeContex
 
   // Otherwise, just asynchronously enqueue the task on the given
   // executor.
-  SWIFT_TASK_DEBUG_LOG("switch failed, task %p enqueued on executor %p", task,
-                       newExecutor.getIdentity());
+  SWIFT_TASK_DEBUG_LOG(
+      "switch failed, task %p enqueued on executor %p (task executor: %p)",
+      task, newExecutor.getIdentity(), currentTaskExecutor.getIdentity());
 
   task->flagAsAndEnqueueOnExecutor(newExecutor);
   _swift_task_clearCurrent();
@@ -1968,28 +2201,72 @@ extern "C" SWIFT_CC(swift)
 void _swift_task_enqueueOnExecutor(Job *job, HeapObject *executor,
                                    const Metadata *selfType,
                                    const SerialExecutorWitnessTable *wtable);
+extern "C" SWIFT_CC(swift) void _swift_task_enqueueOnTaskExecutor(
+    Job *job, HeapObject *executor, const Metadata *selfType,
+    const TaskExecutorWitnessTable *wtable);
+
+extern "C" SWIFT_CC(swift) void _swift_task_makeAnyTaskExecutor(
+    HeapObject *executor, const Metadata *selfType,
+    const TaskExecutorWitnessTable *wtable);
 
 SWIFT_CC(swift)
-static void swift_task_enqueueImpl(Job *job, ExecutorRef executor) {
-  SWIFT_TASK_DEBUG_LOG("enqueue job %p on executor %p", job,
+static void swift_task_enqueueImpl(Job *job, SerialExecutorRef executor) {
+  SWIFT_TASK_DEBUG_LOG("enqueue job %p on serial executor %p", job,
                        executor.getIdentity());
 
   assert(job && "no job provided");
 
   _swift_tsan_release(job);
 
-  if (executor.isGeneric())
+  if (executor.isGeneric()) {
+    // TODO: check the task for a flag if we need to look for task executor
+    if (auto task = dyn_cast<AsyncTask>(job)) {
+      auto taskExecutor = task->getPreferredTaskExecutor();
+      if (taskExecutor.isDefined()) {
+#if SWIFT_CONCURRENCY_EMBEDDED
+        swift_unreachable("task executors not supported in embedded Swift");
+#else
+        auto wtable = taskExecutor.getTaskExecutorWitnessTable();
+        auto taskExecutorObject = taskExecutor.getIdentity();
+        auto taskExecutorType = swift_getObjectType(taskExecutorObject);
+        return _swift_task_enqueueOnTaskExecutor(job, taskExecutorObject,
+                                                 taskExecutorType, wtable);
+#endif // SWIFT_CONCURRENCY_EMBEDDED
+      } // else, fall-through to the default global enqueue
+    }
     return swift_task_enqueueGlobal(job);
-
-  if (executor.isDefaultActor()) {
-    return swift_defaultActor_enqueue(job, executor.getDefaultActor());
   }
 
+  if (executor.isDefaultActor()) {
+    auto taskExecutor = TaskExecutorRef::undefined();
+    if (auto task = dyn_cast<AsyncTask>(job)) {
+      taskExecutor = task->getPreferredTaskExecutor();
+    }
+
+#if SWIFT_CONCURRENCY_EMBEDDED
+    swift_unreachable("task executors not supported in embedded Swift");
+#else
+    if (taskExecutor.isDefined()) {
+      auto wtable = taskExecutor.getTaskExecutorWitnessTable();
+      auto executorObject = taskExecutor.getIdentity();
+      auto executorType = swift_getObjectType(executorObject);
+      return _swift_task_enqueueOnTaskExecutor(job, executorObject,
+                                               executorType, wtable);
+    } else {
+      return swift_defaultActor_enqueue(job, executor.getDefaultActor());
+    }
+#endif // SWIFT_CONCURRENCY_EMBEDDED
+  }
+
+#if SWIFT_CONCURRENCY_EMBEDDED
+  swift_unreachable("custom executors not supported in embedded Swift");
+#else
   // For main actor or actors with custom executors
   auto wtable = executor.getSerialExecutorWitnessTable();
   auto executorObject = executor.getIdentity();
   auto executorType = swift_getObjectType(executorObject);
   _swift_task_enqueueOnExecutor(job, executorObject, executorType, wtable);
+#endif // SWIFT_CONCURRENCY_EMBEDDED
 }
 
 static void
@@ -2001,7 +2278,7 @@ swift_actor_escalate(DefaultActorImpl *actor, AsyncTask *task, JobPriority newPr
 }
 
 SWIFT_CC(swift)
-void swift::swift_executor_escalate(ExecutorRef executor, AsyncTask *task,
+void swift::swift_executor_escalate(SerialExecutorRef executor, AsyncTask *task,
   JobPriority newPriority) {
   if (executor.isGeneric()) {
     // TODO (rokhinip): We'd push a stealer job for the task on the executor.

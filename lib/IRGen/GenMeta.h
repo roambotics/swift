@@ -83,6 +83,8 @@ namespace irgen {
   /// Emit the type metadata accessor for a type for which it might be used.
   void emitLazyMetadataAccessor(IRGenModule &IGM, NominalTypeDecl *type);
 
+  void emitLazyClassMetadata(IRGenModule &IGM, CanType classType);
+
   void emitLazySpecializedClassMetadata(IRGenModule &IGM, CanType classType);
 
   void emitLazyCanonicalSpecializedMetadataAccessor(IRGenModule &IGM,
@@ -236,15 +238,28 @@ namespace irgen {
 
   /// Add generic requirements to the given constant struct builder.
   ///
+  /// This is a convenience implementation that passes along the generic
+  /// signature's requirements.
+  ///
+  /// \param sig The generic signature whose requirements should be added.
+  GenericArgumentMetadata addGenericRequirements(
+                                          IRGenModule &IGM,
+                                          ConstantStructBuilder &B,
+                                          GenericSignature sig);
+
+  /// Add generic requirements to the given constant struct builder.
+  ///
   /// \param sig The generic signature against which the requirements are
   /// described.
   ///
   /// \param requirements The requirements to add.
+  /// \param inverses The inverse requirements.
   GenericArgumentMetadata addGenericRequirements(
                                           IRGenModule &IGM,
                                           ConstantStructBuilder &B,
                                           GenericSignature sig,
-                                          ArrayRef<Requirement> requirements);
+                                          ArrayRef<Requirement> requirements,
+                                         ArrayRef<InverseRequirement> inverses);
 
   /// Add generic pack shape descriptors to the given constant struct builder.
   ///

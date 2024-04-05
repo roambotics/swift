@@ -58,7 +58,7 @@ enum TrailingSemi {
 // CHECK-AST-LABEL:   (func_decl{{.*}}"generic(_:)" "<T : Hashable>" interface type="<T where T : Hashable> (T) -> ()" access=internal captures=(<generic> )
 func generic<T: Hashable>(_: T) {}
 // CHECK-AST:       (pattern_binding_decl
-// CHECK-AST:         (processed_init=declref_expr type="(Int) -> ()" location={{.*}} range={{.*}} decl="main.(file).generic@{{.*}} [with (substitution_map generic_signature='<T where T : Hashable>' 'T -> Int')]" function_ref=unapplied))
+// CHECK-AST:         (processed_init=declref_expr type="(Int) -> ()" location={{.*}} range={{.*}} decl="main.(file).generic@{{.*}} [with (substitution_map generic_signature=<T where T : Hashable> T -> Int)]" function_ref=unapplied))
 let _: (Int) -> () = generic
 
 // Closures should be marked as escaping or not.
@@ -67,14 +67,14 @@ escaping({ $0 })
 // CHECK-AST:        (declref_expr type="(@escaping (Int) -> Int) -> ()"
 // CHECK-AST-NEXT:        (argument_list
 // CHECK-AST-NEXT:          (argument
-// CHECK-AST-NEXT:            (closure_expr type="(Int) -> Int" {{.*}} discriminator=0 escaping single_expression
+// CHECK-AST-NEXT:            (closure_expr type="(Int) -> Int" {{.*}} discriminator=0 nonisolated escaping single_expression
 
 func nonescaping(_: (Int) -> Int) {}
 nonescaping({ $0 })
 // CHECK-AST:        (declref_expr type="((Int) -> Int) -> ()"
 // CHECK-AST-NEXT:        (argument_list
 // CHECK-AST-NEXT:          (argument
-// CHECK-AST-NEXT:            (closure_expr type="(Int) -> Int" {{.*}} discriminator=1 single_expression
+// CHECK-AST-NEXT:            (closure_expr type="(Int) -> Int" {{.*}} discriminator=1 nonisolated single_expression
 
 // CHECK-LABEL: (struct_decl range=[{{.+}}] "MyStruct")
 struct MyStruct {}
@@ -114,7 +114,7 @@ struct SelfParam {
   // CHECK-NEXT:    (parameter "self")
   // CHECK-NEXT:    (parameter_list range=[{{.+}}])
   // CHECK-NEXT:    (result=type_optional
-  // CHECK-NEXT:      (type_ident id="SelfParam" unbound))
+  // CHECK-NEXT:      (type_unqualified_ident id="SelfParam" unbound))
   static func createOptional() -> SelfParam? {
 
     // CHECK-LABEL: (call_expr type="<null>"
@@ -126,8 +126,7 @@ struct SelfParam {
 
 // CHECK-LABEL: (func_decl range=[{{.+}}] "dumpMemberTypeRepr()"
 // CHECK-NEXT:    (parameter_list range=[{{.+}}])
-// CHECK-NEXT:    (result=type_member
-// CHECK-NEXT:      (type_ident id="Array" unbound
-// CHECK-NEXT:        (type_ident id="Bool" unbound))
-// CHECK-NEXT:      (type_ident id="Element" unbound))
+// CHECK-NEXT:    (result=type_qualified_ident id="Element" unbound
+// CHECK-NEXT:      (type_unqualified_ident id="Array" unbound
+// CHECK-NEXT:        (type_unqualified_ident id="Bool" unbound))
 func dumpMemberTypeRepr() -> Array<Bool>.Element { true }

@@ -4,9 +4,9 @@
 // RUN: %target-swift-frontend -emit-module -emit-module-path %t/OtherActors.swiftmodule -module-name OtherActors %S/Inputs/OtherActors.swift -disable-availability-checking
 
 // RUN: %target-swift-frontend  -I %t %s -emit-sil -o /dev/null -verify
-// RUN: %target-swift-frontend  -I %t %s -emit-sil -o /dev/null -verify -strict-concurrency=targeted
+// RUN: %target-swift-frontend  -I %t %s -emit-sil -o /dev/null -verify -strict-concurrency=targeted -disable-region-based-isolation-with-strict-concurrency
+// RUN: %target-swift-frontend  -I %t %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -disable-region-based-isolation-with-strict-concurrency
 // RUN: %target-swift-frontend  -I %t %s -emit-sil -o /dev/null -verify -strict-concurrency=complete
-// RUN: %target-swift-frontend  -I %t %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -enable-experimental-feature SendNonSendable
 
 // REQUIRES: concurrency
 // REQUIRES: asserts
@@ -14,7 +14,7 @@
 @preconcurrency import NonStrictModule
 @_predatesConcurrency import StrictModule // expected-warning{{'@_predatesConcurrency' has been renamed to '@preconcurrency'}}
 @preconcurrency import OtherActors
-// expected-remark@-1{{'@preconcurrency' attribute on module 'OtherActors' is unused}}{{1-17=}}
+// expected-warning@-1{{'@preconcurrency' attribute on module 'OtherActors' has no effect}}{{1-17=}}
 
 func acceptSendable<T: Sendable>(_: T) { }
 

@@ -26,10 +26,12 @@
 #include "swift/AST/SILOptions.h"
 #include "swift/AST/SearchPathOptions.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/Basic/CASOptions.h"
 #include "swift/Basic/DiagnosticOptions.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/ClangImporter/ClangImporter.h"
+#include "swift/Frontend/CASOutputBackends.h"
 #include "swift/Frontend/CachedDiagnostics.h"
 #include "swift/Frontend/DiagnosticVerifier.h"
 #include "swift/Frontend/FrontendOptions.h"
@@ -50,7 +52,7 @@
 #include "llvm/Option/ArgList.h"
 #include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/HashingOutputBackend.h"
-#include "llvm/Support/Host.h"
+#include "llvm/TargetParser/Host.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualOutputBackend.h"
 
@@ -101,6 +103,7 @@ class CompilerInvocation {
   IRGenOptions IRGenOpts;
   TBDGenOptions TBDGenOpts;
   ModuleInterfaceOptions ModuleInterfaceOpts;
+  CASOptions CASOpts;
   llvm::MemoryBuffer *IDEInspectionTargetBuffer = nullptr;
 
   /// The offset that IDEInspection wants to further examine in offset of bytes
@@ -153,7 +156,7 @@ public:
   /// Serialize the command line arguments for emitting them
   /// to DWARF or CodeView and inject SDKPath if necessary.
   static void buildDebugFlags(std::string &Output,
-                              const ArrayRef<const char*> &Args,
+                              const llvm::opt::ArgList &Args,
                               StringRef SDKPath,
                               StringRef ResourceDir);
 
@@ -162,6 +165,10 @@ public:
 
   StringRef getTargetTriple() const {
     return LangOpts.Target.str();
+  }
+
+  bool requiresCAS() const {
+    return CASOpts.EnableCaching || IRGenOpts.UseCASBackend;
   }
 
   void setClangModuleCachePath(StringRef Path) {
@@ -230,7 +237,7 @@ public:
   /// and SDK version. This function is also used by LLDB.
   static std::string
   computePrebuiltCachePath(StringRef RuntimeResourcePath, llvm::Triple target,
-                           llvm::Optional<llvm::VersionTuple> sdkVer);
+                           std::optional<llvm::VersionTuple> sdkVer);
 
   /// If we haven't explicitly passed -prebuilt-module-cache-path, set it to
   /// the default value of <resource-dir>/<platform>/prebuilt-modules.
@@ -268,6 +275,9 @@ public:
 
   FrontendOptions &getFrontendOptions() { return FrontendOpts; }
   const FrontendOptions &getFrontendOptions() const { return FrontendOpts; }
+
+  CASOptions &getCASOptions() { return CASOpts; }
+  const CASOptions &getCASOptions() const { return CASOpts; }
 
   TBDGenOptions &getTBDGenOptions() { return TBDGenOpts; }
   const TBDGenOptions &getTBDGenOptions() const { return TBDGenOpts; }
@@ -427,6 +437,12 @@ public:
   /// fail an assert if not in that mode.
   std::string getModuleInterfaceOutputPathForWholeModule() const;
   std::string getPrivateModuleInterfaceOutputPathForWholeModule() const;
+  std::string getPackageModuleInterfaceOutputPathForWholeModule() const;
+
+  /// APIDescriptorPath only makes sense in whole module compilation mode,
+  /// so return the APIDescriptorPath when in that mode and fail an assert
+  /// if not in that mode.
+  std::string getAPIDescriptorPathForWholeModule() const;
 
 public:
   /// Given the current configuration of this frontend invocation, a set of
@@ -456,7 +472,7 @@ class CompilerInstance {
   /// the file buffer provided by CAS needs to outlive the SourceMgr.
   std::shared_ptr<llvm::cas::ObjectStore> CAS;
   std::shared_ptr<llvm::cas::ActionCache> ResultCache;
-  llvm::Optional<llvm::cas::ObjectRef> CompileJobBaseKey;
+  std::optional<llvm::cas::ObjectRef> CompileJobBaseKey;
 
   SourceManager SourceMgr;
   DiagnosticEngine Diagnostics{SourceMgr};
@@ -477,6 +493,10 @@ class CompilerInstance {
 
   /// Virtual OutputBackend.
   llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> OutputBackend = nullptr;
+
+  /// CAS OutputBackend.
+  llvm::IntrusiveRefCntPtr<swift::cas::SwiftCASOutputBackend> CASOutputBackend =
+      nullptr;
 
   /// The verification output backend.
   using HashBackendTy = llvm::vfs::HashingOutputBackend<llvm::BLAKE3>;
@@ -532,6 +552,10 @@ public:
   llvm::vfs::OutputBackend &getOutputBackend() const {
     return *OutputBackend;
   }
+  swift::cas::SwiftCASOutputBackend &getCASOutputBackend() const {
+    return *CASOutputBackend;
+  }
+
   void
   setOutputBackend(llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> Backend) {
     OutputBackend = std::move(Backend);
@@ -547,7 +571,7 @@ public:
   std::shared_ptr<llvm::cas::ObjectStore> getSharedCASInstance() const {
     return CAS;
   }
-  llvm::Optional<llvm::cas::ObjectRef> getCompilerBaseKey() const {
+  std::optional<llvm::cas::ObjectRef> getCompilerBaseKey() const {
     return CompileJobBaseKey;
   }
   CachingDiagnosticsProcessor *getCachingDiagnosticsProcessor() const {
@@ -695,34 +719,33 @@ private:
   /// \return false if successful, true on error.
   bool setupDiagnosticVerifierIfNeeded();
 
-  llvm::Optional<unsigned> setUpIDEInspectionTargetBuffer();
+  std::optional<unsigned> setUpIDEInspectionTargetBuffer();
 
   /// Find a buffer for a given input file and ensure it is recorded in
   /// SourceMgr, PartialModules, or InputSourceCodeBufferIDs as appropriate.
   /// Return the buffer ID if it is not already compiled, or None if so.
   /// Set failed on failure.
 
-  llvm::Optional<unsigned> getRecordedBufferID(const InputFile &input,
-                                               const bool shouldRecover,
-                                               bool &failed);
+  std::optional<unsigned> getRecordedBufferID(const InputFile &input,
+                                              const bool shouldRecover,
+                                              bool &failed);
 
   /// Given an input file, return a buffer to use for its contents,
   /// and a buffer for the corresponding module doc file if one exists.
   /// On failure, return a null pointer for the first element of the returned
   /// pair.
-  llvm::Optional<ModuleBuffers>
-  getInputBuffersIfPresent(const InputFile &input);
+  std::optional<ModuleBuffers> getInputBuffersIfPresent(const InputFile &input);
 
   /// Try to open the module doc file corresponding to the input parameter.
   /// Return None for error, nullptr if no such file exists, or the buffer if
   /// one was found.
-  llvm::Optional<std::unique_ptr<llvm::MemoryBuffer>>
+  std::optional<std::unique_ptr<llvm::MemoryBuffer>>
   openModuleDoc(const InputFile &input);
 
   /// Try to open the module source info file corresponding to the input parameter.
   /// Return None for error, nullptr if no such file exists, or the buffer if
   /// one was found.
-  llvm::Optional<std::unique_ptr<llvm::MemoryBuffer>>
+  std::optional<std::unique_ptr<llvm::MemoryBuffer>>
   openModuleSourceInfo(const InputFile &input);
 
 public:
@@ -744,7 +767,7 @@ private:
   /// Creates a new source file for the main module.
   SourceFile *createSourceFileForMainModule(ModuleDecl *mod,
                                             SourceFileKind FileKind,
-                                            llvm::Optional<unsigned> BufferID,
+                                            std::optional<unsigned> BufferID,
                                             bool isMainBuffer = false) const;
 
   /// Creates all the files to be added to the main module, appending them to

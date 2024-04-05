@@ -20,8 +20,8 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/ForeignAsyncConvention.h"
 #include "swift/AST/ForeignErrorConvention.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PointerUnion.h"
+#include <optional>
 
 namespace swift {
 
@@ -71,6 +71,8 @@ public:
     ExplicitlyGKInspectable,
     /// Is it a member of an @objc extension of a class.
     MemberOfObjCExtension,
+    /// Is it a member of an \@\_objcImplementation extension.
+    MemberOfObjCImplementationExtension,
     /// Has an explicit '@objc' attribute added by an access note, rather than
     /// written in source code.
     ExplicitlyObjCByAccessNote,
@@ -108,6 +110,7 @@ private:
     case ExplicitlyNSManaged:
     case ExplicitlyIBInspectable:
     case ExplicitlyGKInspectable:
+    case MemberOfObjCImplementationExtension:
     case ExplicitlyObjCByAccessNote:
       return true;
 
@@ -182,8 +185,8 @@ unsigned getObjCDiagnosticAttrKind(ObjCReason reason);
 /// and figure out its foreign error convention (if any).
 bool isRepresentableInObjC(
     const AbstractFunctionDecl *AFD, ObjCReason Reason,
-    llvm::Optional<ForeignAsyncConvention> &asyncConvention,
-    llvm::Optional<ForeignErrorConvention> &errorConvention);
+    std::optional<ForeignAsyncConvention> &asyncConvention,
+    std::optional<ForeignErrorConvention> &errorConvention);
 
 /// Determine whether the given variable can be represented in Objective-C.
 bool isRepresentableInObjC(const VarDecl *VD, ObjCReason Reason);
@@ -210,8 +213,8 @@ bool fixDeclarationName(InFlightDiagnostic &diag, const ValueDecl *decl,
 /// For properties, the selector should be a zero-parameter selector of the
 /// given property's name.
 bool fixDeclarationObjCName(InFlightDiagnostic &diag, const ValueDecl *decl,
-                            llvm::Optional<ObjCSelector> nameOpt,
-                            llvm::Optional<ObjCSelector> targetNameOpt,
+                            std::optional<ObjCSelector> nameOpt,
+                            std::optional<ObjCSelector> targetNameOpt,
                             bool ignoreImpliedName = false);
 
 } // end namespace swift

@@ -53,13 +53,34 @@ public:
   }
 
   PreWalkAction walkToDeclPre(Decl *D) override {
-    if (auto *NTD = llvm::dyn_cast<NominalTypeDecl>(D))
-      if (!isa<ProtocolDecl>(NTD))
+    auto *NTD = llvm::dyn_cast<NominalTypeDecl>(D);
+    if (!NTD)
+      if (auto *ETD = dyn_cast<ExtensionDecl>(D))
+        NTD = ETD->getExtendedNominal();
+    if (NTD)
+      if (!isa<ProtocolDecl>(NTD) && CheckedDecls.insert(NTD).second) {
+        if (NTD->getAttrs().hasAttribute<ExtractConstantsFromMembersAttr>()) {
+          ConformanceTypeDecls.push_back(NTD);
+          goto visitAuxiliaryDecls;
+        }
+
         for (auto &Protocol : NTD->getAllProtocols())
-          if (Protocols.count(Protocol->getName().str().str()) != 0)
+          if (Protocol->getAttrs()
+                  .hasAttribute<ExtractConstantsFromMembersAttr>() ||
+              Protocols.count(Protocol->getName().str().str()) != 0) {
             ConformanceTypeDecls.push_back(NTD);
+            goto visitAuxiliaryDecls;
+          }
+      }
+  visitAuxiliaryDecls:
+    // Visit peers expanded from macros
+    D->visitAuxiliaryDecls([&](Decl *decl) { decl->walk(*this); },
+                           /*visitFreestandingExpanded=*/false);
     return Action::Continue();
   }
+
+private:
+  std::unordered_set<NominalTypeDecl *> CheckedDecls;
 };
 
 std::string toFullyQualifiedTypeNameString(const swift::Type &Type) {
@@ -168,7 +189,7 @@ extractFunctionArguments(const ArgumentList *args) {
   return parameters;
 }
 
-static llvm::Optional<std::string> extractRawLiteral(Expr *expr) {
+static std::optional<std::string> extractRawLiteral(Expr *expr) {
   if (expr) {
     switch (expr->getKind()) {
     case ExprKind::BooleanLiteral:
@@ -196,7 +217,7 @@ static llvm::Optional<std::string> extractRawLiteral(Expr *expr) {
       break;
     }
   }
-  return llvm::None;
+  return std::nullopt;
 }
 
 static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
@@ -246,17 +267,17 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
           auto elementExpr = std::get<0>(pair);
           auto elementName = std::get<1>(pair);
 
-          llvm::Optional<std::string> label =
+          std::optional<std::string> label =
               elementName.empty()
-                  ? llvm::None
-                  : llvm::Optional<std::string>(elementName.str().str());
+                  ? std::nullopt
+                  : std::optional<std::string>(elementName.str().str());
 
           elements.push_back({label, elementExpr->getType(),
                               extractCompileTimeValue(elementExpr)});
         }
       } else {
         for (auto elementExpr : tupleExpr->getElements()) {
-          elements.push_back({llvm::None, elementExpr->getType(),
+          elements.push_back({std::nullopt, elementExpr->getType(),
                               extractCompileTimeValue(elementExpr)});
         }
       }
@@ -295,7 +316,7 @@ static std::shared_ptr<CompileTimeValue> extractCompileTimeValue(Expr *expr) {
         auto declRefExpr = cast<DeclRefExpr>(fn);
         auto caseName =
             declRefExpr->getDecl()->getName().getBaseIdentifier().str().str();
-        return std::make_shared<EnumValue>(caseName, llvm::None);
+        return std::make_shared<EnumValue>(caseName, std::nullopt);
       }
 
       break;
@@ -412,11 +433,13 @@ extractTypePropertyInfo(VarDecl *propertyDecl) {
   }
 
   if (auto accessorDecl = propertyDecl->getAccessor(AccessorKind::Get)) {
-    auto node = accessorDecl->getTypecheckedBody()->getFirstElement();
-    if (auto *stmt = node.dyn_cast<Stmt *>()) {
-      if (stmt->getKind() == StmtKind::Return) {
-        return {propertyDecl,
-                extractCompileTimeValue(cast<ReturnStmt>(stmt)->getResult())};
+    if (auto body = accessorDecl->getTypecheckedBody()) {
+      auto node = body->getFirstElement();
+      if (auto *stmt = node.dyn_cast<Stmt *>()) {
+        if (stmt->getKind() == StmtKind::Return) {
+          return {propertyDecl,
+                  extractCompileTimeValue(cast<ReturnStmt>(stmt)->getResult())};
+        }
       }
     }
   }
@@ -424,23 +447,23 @@ extractTypePropertyInfo(VarDecl *propertyDecl) {
   return {propertyDecl, std::make_shared<RuntimeValue>()};
 }
 
-llvm::Optional<std::vector<EnumElementDeclValue>>
+std::optional<std::vector<EnumElementDeclValue>>
 extractEnumCases(NominalTypeDecl *Decl) {
   if (Decl->getKind() == DeclKind::Enum) {
     std::vector<EnumElementDeclValue> Elements;
     for (EnumCaseDecl *ECD : cast<EnumDecl>(Decl)->getAllCases()) {
       for (EnumElementDecl *EED : ECD->getElements()) {
         std::string Name = EED->getNameStr().str();
-        llvm::Optional<std::string> RawValue =
+        std::optional<std::string> RawValue =
             extractRawLiteral(EED->getRawValueExpr());
 
         std::vector<EnumElementParameterValue> Parameters;
         if (const ParameterList *Params = EED->getParameterList()) {
           for (const ParamDecl *Parameter : Params->getArray()) {
-            llvm::Optional<std::string> Label =
+            std::optional<std::string> Label =
                 Parameter->getParameterName().empty()
-                    ? llvm::None
-                    : llvm::Optional<std::string>(
+                    ? std::nullopt
+                    : std::optional<std::string>(
                           Parameter->getParameterName().str().str());
 
             Parameters.push_back({Label, Parameter->getInterfaceType()});
@@ -448,7 +471,7 @@ extractEnumCases(NominalTypeDecl *Decl) {
         }
 
         if (Parameters.empty()) {
-          Elements.push_back({Name, RawValue, llvm::None});
+          Elements.push_back({Name, RawValue, std::nullopt});
         } else {
           Elements.push_back({Name, RawValue, Parameters});
         }
@@ -457,40 +480,58 @@ extractEnumCases(NominalTypeDecl *Decl) {
     return Elements;
   }
 
-  return llvm::None;
+  return std::nullopt;
 }
 
-ConstValueTypeInfo
-ConstantValueInfoRequest::evaluate(Evaluator &Evaluator,
-                                   NominalTypeDecl *Decl) const {
-  // Use 'getStoredProperties' to get lowered lazy and wrapped properties
+ConstValueTypeInfo ConstantValueInfoRequest::evaluate(
+    Evaluator &Evaluator, NominalTypeDecl *Decl,
+    llvm::PointerUnion<const SourceFile *, ModuleDecl *> extractionScope)
+    const {
+
+  auto shouldExtract = [&](DeclContext *decl) {
+    if (auto SF = extractionScope.dyn_cast<const SourceFile *>())
+      return decl->getOutermostParentSourceFile() == SF;
+    return decl->getParentModule() == extractionScope.get<ModuleDecl *>();
+  };
+
+  std::vector<ConstValueTypePropertyInfo> Properties;
+  std::optional<std::vector<EnumElementDeclValue>> EnumCases;
+
+  // Use 'getStoredProperties' to get lowered lazy and wrapped properties.
+  // @_objcImplementation extensions might contain stored properties.
   auto StoredProperties = Decl->getStoredProperties();
   std::unordered_set<VarDecl *> StoredPropertiesSet(StoredProperties.begin(),
                                                     StoredProperties.end());
-
-  std::vector<ConstValueTypePropertyInfo> Properties;
   for (auto Property : StoredProperties) {
-    Properties.push_back(extractTypePropertyInfo(Property));
+    if (shouldExtract(Property->getDeclContext())) {
+      Properties.push_back(extractTypePropertyInfo(Property));
+    }
   }
 
-  for (auto Member : Decl->getMembers()) {
-    auto *VD = dyn_cast<VarDecl>(Member);
+  auto extract = [&](class Decl *Member) {
     // Ignore plain stored properties collected above,
     // instead gather up remaining static and computed properties.
-    if (!VD || StoredPropertiesSet.count(VD))
-      continue;
-    Properties.push_back(extractTypePropertyInfo(VD));
+    if (auto *VD = dyn_cast<VarDecl>(Member))
+      if (!StoredPropertiesSet.count(VD))
+        Properties.push_back(extractTypePropertyInfo(VD));
+  };
+
+  if (shouldExtract(Decl)) {
+    for (auto Member : Decl->getAllMembers()) {
+      extract(Member);
+    }
+    EnumCases = extractEnumCases(Decl);
   }
 
   for (auto Extension: Decl->getExtensions()) {
-    for (auto Member : Extension->getMembers()) {
-      if (auto *VD = dyn_cast<VarDecl>(Member)) {
-        Properties.push_back(extractTypePropertyInfo(VD));
+    if (shouldExtract(Extension)) {
+      for (auto Member : Extension->getAllMembers()) {
+        extract(Member);
       }
     }
   }
 
-  return ConstValueTypeInfo{Decl, Properties, extractEnumCases(Decl)};
+  return ConstValueTypeInfo{Decl, Properties, EnumCases};
 }
 
 std::vector<ConstValueTypeInfo>
@@ -504,7 +545,8 @@ gatherConstValuesForModule(const std::unordered_set<std::string> &Protocols,
   Module->walk(ConformanceCollector);
   for (auto *CD : ConformanceDecls)
     Result.emplace_back(evaluateOrDefault(CD->getASTContext().evaluator,
-                                          ConstantValueInfoRequest{CD}, {}));
+                                          ConstantValueInfoRequest{CD, Module},
+                                          {}));
   return Result;
 }
 
@@ -518,10 +560,15 @@ gatherConstValuesForPrimary(const std::unordered_set<std::string> &Protocols,
                                                        ConformanceDecls);
   for (auto D : SF->getTopLevelDecls())
     D->walk(ConformanceCollector);
+  // Visit macro expanded extensions
+  if (auto *synthesizedSF = SF->getSynthesizedFile())
+    for (auto D : synthesizedSF->getTopLevelDecls())
+      if (isa<ExtensionDecl>(D))
+        D->walk(ConformanceCollector);
 
   for (auto *CD : ConformanceDecls)
-    Result.emplace_back(evaluateOrDefault(CD->getASTContext().evaluator,
-                                          ConstantValueInfoRequest{CD}, {}));
+    Result.emplace_back(evaluateOrDefault(
+        CD->getASTContext().evaluator, ConstantValueInfoRequest{CD, SF}, {}));
   return Result;
 }
 
@@ -677,8 +724,7 @@ void writeAttributeInfo(llvm::json::OStream &JSON,
 }
 
 void writePropertyWrapperAttributes(
-    llvm::json::OStream &JSON,
-    llvm::Optional<AttrValueVector> PropertyWrappers,
+    llvm::json::OStream &JSON, std::optional<AttrValueVector> PropertyWrappers,
     const ASTContext &ctx) {
   if (!PropertyWrappers.has_value()) {
     return;
@@ -692,7 +738,7 @@ void writePropertyWrapperAttributes(
 
 void writeEnumCases(
     llvm::json::OStream &JSON,
-    llvm::Optional<std::vector<EnumElementDeclValue>> EnumElements) {
+    std::optional<std::vector<EnumElementDeclValue>> EnumElements) {
   if (!EnumElements.has_value()) {
     return;
   }
@@ -735,6 +781,10 @@ void writeResultBuilderInformation(llvm::json::OStream &JSON,
 
   for (ProtocolDecl *Decl :
        TypeDecl->getLocalProtocols(ConformanceLookupKind::All)) {
+    // FIXME(noncopyable_generics): Should these be included?
+    if (Decl->getInvertibleProtocolKind())
+      continue;
+
     for (auto Member : Decl->getMembers()) {
       if (auto *VD = dyn_cast<swift::VarDecl>(Member)) {
         if (VD->getName() != VarDecl->getName())
@@ -799,9 +849,16 @@ void writeSubstitutedOpaqueTypeAliasDetails(
       // Ignore requirements whose subject type is that of the owner decl
       if (!Requirement.getFirstType()->isEqual(OpaqueTy.getInterfaceType()))
         continue;
-      if (Requirement.getKind() == RequirementKind::Conformance)
-        JSON.value(
-            toFullyQualifiedProtocolNameString(*Requirement.getProtocolDecl()));
+
+      if (Requirement.getKind() != RequirementKind::Conformance)
+        continue;
+
+      // FIXME(noncopyable_generics): Should these be included?
+      if (Requirement.getProtocolDecl()->getInvertibleProtocolKind())
+        continue;
+
+      JSON.value(
+          toFullyQualifiedProtocolNameString(*Requirement.getProtocolDecl()));
     }
   });
 
@@ -879,7 +936,11 @@ void writeProperties(llvm::json::OStream &JSON,
 void writeConformances(llvm::json::OStream &JSON,
                        const NominalTypeDecl &NomTypeDecl) {
   JSON.attributeArray("conformances", [&] {
-    for (auto &Protocol : NomTypeDecl.getAllProtocols()) {
+    for (auto *Protocol : NomTypeDecl.getAllProtocols()) {
+      // FIXME(noncopyable_generics): Should these be included?
+      if (Protocol->getInvertibleProtocolKind())
+        continue;
+
       JSON.value(toFullyQualifiedProtocolNameString(*Protocol));
     }
   });

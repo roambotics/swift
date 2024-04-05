@@ -41,7 +41,7 @@ public func bar(t: T2) -> MyClass<T2> {
 // CHECK-SIL:   #MyClass.deinit!deallocator: @$s4main7MyClassCfDAA2T1V_Tg5  // specialized MyClass.__deallocating_deinit
 // CHECK-SIL: }
 
-// CHECK-SIL: sil_vtable MyClass {
+// CHECK-SIL: sil_vtable $MyClass<T2> {
 // CHECK-SIL:   #MyClass.t!getter: <T> (MyClass<T>) -> () -> T : @$s4main7MyClassC1txvgAA2T2V_Tg5 // specialized MyClass.t.getter
 // CHECK-SIL:   #MyClass.t!setter: <T> (MyClass<T>) -> (T) -> () : @$s4main7MyClassC1txvsAA2T2V_Tg5 // specialized MyClass.t.setter
 // CHECK-SIL:   #MyClass.t!modify: <T> (MyClass<T>) -> () -> () : @$s4main7MyClassC1txvMAA2T2V_Tg5  // specialized MyClass.t.modify
@@ -50,8 +50,8 @@ public func bar(t: T2) -> MyClass<T2> {
 // CHECK-SIL: }
 
 
-// CHECK-IR: @"$s4main7MyClassCyAA2T2VGN" = {{.*}}<{ ptr, ptr, ptr, ptr, ptr, ptr }> <{ ptr null, ptr @"$s4main7MyClassCfDAA2T2V_Tg5", ptr @"$s4main7MyClassC1txvgAA2T2V_Tg5", ptr @"$s4main7MyClassC1txvsAA2T2V_Tg5", ptr @"$s4main7MyClassC1txvMAA2T2V_Tg5", ptr @"$s4main7MyClassC1tACyxGx_tcfCAA2T2V_Tg5" }>
-// CHECK-IR: @"$s4main7MyClassCyAA2T1VGN" = {{.*}}<{ ptr, ptr, ptr, ptr, ptr, ptr }> <{ ptr null, ptr @"$s4main7MyClassCfDAA2T1V_Tg5", ptr @"$s4main7MyClassC1txvgAA2T1V_Tg5", ptr @"$s4main7MyClassC1txvsAA2T1V_Tg5", ptr @"$s4main7MyClassC1txvMAA2T1V_Tg5", ptr @"$s4main7MyClassC1tACyxGx_tcfCAA2T1V_Tg5" }>
+// CHECK-IR: @"$s4main7MyClassCyAA2T2VGN" = {{.*}}<{ ptr, ptr, ptr, ptr, ptr, ptr, ptr }> <{ ptr null, ptr @"$s4main7MyClassCfDAA2T2V_Tg5", ptr null, ptr @"$s4main7MyClassC1txvgAA2T2V_Tg5", ptr @"$s4main7MyClassC1txvsAA2T2V_Tg5", ptr @"$s4main7MyClassC1txvMAA2T2V_Tg5", ptr @"$s4main7MyClassC1tACyxGx_tcfCAA2T2V_Tg5" }>
+// CHECK-IR: @"$s4main7MyClassCyAA2T1VGN" = {{.*}}<{ ptr, ptr, ptr, ptr, ptr, ptr, ptr }> <{ ptr null, ptr @"$s4main7MyClassCfDAA2T1V_Tg5", ptr null, ptr @"$s4main7MyClassC1txvgAA2T1V_Tg5", ptr @"$s4main7MyClassC1txvsAA2T1V_Tg5", ptr @"$s4main7MyClassC1txvMAA2T1V_Tg5", ptr @"$s4main7MyClassC1tACyxGx_tcfCAA2T1V_Tg5" }>
 
 // CHECK-IR-DAG: define {{.*}}void @"$s4main7MyClassC1txvgAA2T1V_Tg5"(ptr swiftself %0)
 // CHECK-IR-DAG: define {{.*}}i1 @"$s4main7MyClassC1txvgAA2T2V_Tg5"(ptr swiftself %0)

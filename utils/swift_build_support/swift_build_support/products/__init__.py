@@ -32,12 +32,14 @@ from .swift import Swift
 from .swiftdocc import SwiftDocC
 from .swiftdoccrender import SwiftDocCRender
 from .swiftdriver import SwiftDriver
-from .swiftevolve import SwiftEvolve
 from .swiftformat import SwiftFormat
 from .swiftinspect import SwiftInspect
 from .swiftpm import SwiftPM
 from .swiftsyntax import SwiftSyntax
 from .tsan_libdispatch import TSanLibDispatch
+from .wasisysroot import WASILibc, WasmLLVMRuntimeLibs, WasmThreadsLLVMRuntimeLibs
+from .wasmkit import WasmKit
+from .wasmstdlib import WasmStdlib, WasmThreadsStdlib
 from .xctest import XCTest
 from .zlib import Zlib
 
@@ -65,11 +67,16 @@ __all__ = [
     'XCTest',
     'SwiftSyntax',
     'SKStressTester',
-    'SwiftEvolve',
     'IndexStoreDB',
     'SourceKitLSP',
     'Benchmarks',
     'TSanLibDispatch',
     'SwiftDocC',
-    'SwiftDocCRender'
+    'SwiftDocCRender',
+    'WASILibc',
+    'WasmLLVMRuntimeLibs',
+    'WasmKit',
+    'WasmStdlib',
+    'WasmThreadsLLVMRuntimeLibs',
+    'WasmThreadsStdlib',
 ]

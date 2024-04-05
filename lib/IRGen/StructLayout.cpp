@@ -42,10 +42,8 @@ static bool requiresHeapHeader(LayoutKind kind) {
 }
 
 /// Perform structure layout on the given types.
-StructLayout::StructLayout(IRGenModule &IGM,
-                           llvm::Optional<CanType> type,
-                           LayoutKind layoutKind,
-                           LayoutStrategy strategy,
+StructLayout::StructLayout(IRGenModule &IGM, std::optional<CanType> type,
+                           LayoutKind layoutKind, LayoutStrategy strategy,
                            ArrayRef<const TypeInfo *> types,
                            llvm::StructType *typeToFill) {
   NominalTypeDecl *decl = nullptr;
@@ -71,7 +69,7 @@ StructLayout::StructLayout(IRGenModule &IGM,
 
   auto deinit = (decl && decl->getValueTypeDestructor())
     ? IsNotTriviallyDestroyable : IsTriviallyDestroyable;
-  auto copyable = (decl && decl->isMoveOnly())
+  auto copyable = (decl && !decl->canBeCopyable())
     ? IsNotCopyable : IsCopyable;
 
   // Handle a raw layout specification on a struct.
@@ -180,10 +178,10 @@ StructLayout::StructLayout(IRGenModule &IGM,
       SpareBits.clear();
       IsFixedLayout = true;
       IsLoadable = true;
-      IsKnownTriviallyDestroyable = deinit;
-      IsKnownBitwiseTakable = IsBitwiseTakable;
-      IsKnownAlwaysFixedSize = IsFixedSize;
-      IsKnownCopyable = copyable;
+      IsKnownTriviallyDestroyable = deinit & builder.isTriviallyDestroyable();
+      IsKnownBitwiseTakable = builder.isBitwiseTakable();
+      IsKnownAlwaysFixedSize = builder.isAlwaysFixedSize();
+      IsKnownCopyable = copyable & builder.isCopyable();
       Ty = (typeToFill ? typeToFill : IGM.OpaqueTy);
     } else {
       MinimumAlign = builder.getAlignment();
@@ -387,6 +385,7 @@ bool StructLayoutBuilder::addField(ElementLayout &elt,
   IsKnownBitwiseTakable &= eltTI.isBitwiseTakable(ResilienceExpansion::Maximal);
   IsKnownAlwaysFixedSize &= eltTI.isFixedSize(ResilienceExpansion::Minimal);
   IsLoadable &= eltTI.isLoadable();
+  IsKnownCopyable &= eltTI.isCopyable(ResilienceExpansion::Maximal);
 
   if (eltTI.isKnownEmpty(ResilienceExpansion::Maximal)) {
     addEmptyElement(elt);
@@ -440,7 +439,7 @@ void StructLayoutBuilder::addFixedSizeElement(ElementLayout &elt) {
 
       // The padding can be used as spare bits by enum layout.
       auto numBits = Size(paddingRequired).getValueInBits();
-      auto mask = llvm::APInt::getAllOnesValue(numBits);
+      auto mask = llvm::APInt::getAllOnes(numBits);
       CurSpareBits.push_back(SpareBitVector::fromAPInt(mask));
     }
   }

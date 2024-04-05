@@ -20,7 +20,7 @@
 // CHECK-SAME:   i32 {{[0-9]+}},
 // CHECK-SAME:   $s4main5ValueOwug
 // CHECK-SAME:   $s4main5ValueOwup
-// CHECK-SAME    ptr {{[^@]*}}@"$s4main5ValueOwui{{[^}]+}}
+// CHECK-SAME:   ptr {{[^@]*}}@"$s4main5ValueOwui{{[^}]+}}
 // CHECK-SAME: }, align [[ALIGNMENT]]
 // CHECK: @"$s4main5ValueOyS2iGMf" = linkonce_odr hidden constant <{
 // CHECK-SAME:   ptr,
@@ -64,7 +64,7 @@ func doit() {
 }
 doit()
 
-// CHECK: ; Function Attrs: noinline nounwind readnone
+// CHECK: ; Function Attrs: noinline nounwind memory(none)
 // CHECK: define hidden swiftcc %swift.metadata_response @"$s4main5ValueOMa"([[INT]] %0, ptr %1, ptr %2) #{{[0-9]+}} {{(section)?.*}}{
 // CHECK: entry:
 // CHECK:   {{%[0-9]+}} = call swiftcc %swift.metadata_response @__swift_instantiateCanonicalPrespecializedGenericMetadata(

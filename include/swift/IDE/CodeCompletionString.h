@@ -20,6 +20,7 @@
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/TrailingObjects.h"
+#include <optional>
 
 namespace swift {
 namespace ide {
@@ -352,7 +353,7 @@ public:
   }
 
   StringRef getFirstTextChunk(bool includeLeadingPunctuation = false) const;
-  llvm::Optional<unsigned>
+  std::optional<unsigned>
   getFirstTextChunkIndex(bool includeLeadingPunctuation = false) const;
 
   /// Print a debug representation of the code completion string to \p OS.

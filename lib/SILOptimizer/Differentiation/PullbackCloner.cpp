@@ -15,6 +15,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/STLExtras.h"
 #define DEBUG_TYPE "differentiation"
 
 #include "swift/SILOptimizer/Differentiation/PullbackCloner.h"
@@ -29,6 +30,7 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/SIL/ApplySite.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/TypeSubstCloner.h"
@@ -110,7 +112,7 @@ private:
   /// Mapping from original basic blocks to local temporary values to be cleaned
   /// up. This is populated when pullback emission is run on one basic block and
   /// cleaned before processing another basic block.
-  llvm::DenseMap<SILBasicBlock *, SmallSetVector<SILValue, 64>>
+  llvm::DenseMap<SILBasicBlock *, llvm::SmallSetVector<SILValue, 32>>
       blockTemporaries;
 
   /// The scope cloner.
@@ -183,11 +185,11 @@ private:
 
   /// Returns the pullback tuple element value corresponding to the given
   /// original block and apply inst.
-  SILValue getPullbackTupleElement(ApplyInst *ai) {
-    unsigned idx = getPullbackInfo().lookUpLinearMapIndex(ai);
-    assert((idx > 0 || (idx == 0 && ai->getParentBlock()->isEntry())) &&
+  SILValue getPullbackTupleElement(FullApplySite fai) {
+    unsigned idx = getPullbackInfo().lookUpLinearMapIndex(fai);
+    assert((idx > 0 || (idx == 0 && fai.getParent()->isEntry())) &&
            "impossible linear map index");
-    auto values = pullbackTupleElements.lookup(ai->getParentBlock());
+    auto values = pullbackTupleElements.lookup(fai.getParent());
     assert(idx < values.size() &&
            "pullback tuple element for this apply does not exist!");
     return values[idx];
@@ -226,7 +228,7 @@ private:
     return getPullback().mapTypeIntoContext(remappedSILType);
   }
 
-  llvm::Optional<TangentSpace> getTangentSpace(CanType type) {
+  std::optional<TangentSpace> getTangentSpace(CanType type) {
     // Use witness generic signature to remap types.
     type =
         getWitness()->getDerivativeGenericSignature().getReducedType(
@@ -651,7 +653,7 @@ private:
     llvm::SmallString<32> adjName;
     auto *newBuf = createFunctionLocalAllocation(
         bufType, loc, /*zeroInitialize*/ true,
-        debugInfo.transform(
+        swift::transform(debugInfo,
           [&](AdjointValue::DebugInfo di) {
             llvm::raw_svector_ostream adjNameStream(adjName);
             SILDebugVariable &dv = di.second;
@@ -724,7 +726,7 @@ private:
   /// Helper for `getAdjointBuffer`.
   AllocStackInst *createFunctionLocalAllocation(
       SILType type, SILLocation loc, bool zeroInitialize = false,
-      llvm::Optional<SILDebugVariable> varInfo = llvm::None) {
+      std::optional<SILDebugVariable> varInfo = std::nullopt) {
     // Set insertion point for local allocation builder: before the last local
     // allocation, or at the start of the pullback function's entry if no local
     // allocations exist yet.
@@ -950,6 +952,7 @@ public:
     // `store` and `copy_addr` support.
     if (ArraySemanticsCall(ai, semantics::ARRAY_UNINITIALIZED_INTRINSIC))
       return;
+
     auto loc = ai->getLoc();
     auto *bb = ai->getParent();
     // Handle `array.finalize_intrinsic` applications.
@@ -964,33 +967,44 @@ public:
       addAdjointValue(bb, origArg, adjResult, loc);
       return;
     }
+
+    buildPullbackCall(ai);
+  }
+
+  void buildPullbackCall(FullApplySite fai) {
+    auto loc = fai->getLoc();
+    auto *bb = fai->getParent();
+
     // Replace a call to a function with a call to its pullback.
     auto &nestedApplyInfo = getContext().getNestedApplyInfo();
-    auto applyInfoLookup = nestedApplyInfo.find(ai);
+    auto applyInfoLookup = nestedApplyInfo.find(fai);
     // If no `NestedApplyInfo` was found, then this task doesn't need to be
     // differentiated.
     if (applyInfoLookup == nestedApplyInfo.end()) {
       // Must not be active.
-      assert(!getActivityInfo().isActive(ai, getConfig()));
+      // TODO: Do we need to check token result for begin_apply?
+      SILValue result = fai.getResult();
+      assert(!result || !getActivityInfo().isActive(result, getConfig()));
       return;
     }
-    auto applyInfo = applyInfoLookup->getSecond();
+    auto &applyInfo = applyInfoLookup->getSecond();
 
     // Get the original result of the `apply` instruction.
+    const auto &conv = fai.getSubstCalleeConv();
     SmallVector<SILValue, 8> origDirectResults;
-    forEachApplyDirectResult(ai, [&](SILValue directResult) {
+    forEachApplyDirectResult(fai, [&](SILValue directResult) {
       origDirectResults.push_back(directResult);
     });
     SmallVector<SILValue, 8> origAllResults;
-    collectAllActualResultsInTypeOrder(ai, origDirectResults, origAllResults);
+    collectAllActualResultsInTypeOrder(fai, origDirectResults, origAllResults);
     // Append semantic result arguments after original results.
     for (auto paramIdx : applyInfo.config.parameterIndices->getIndices()) {
-      auto paramInfo = ai->getSubstCalleeConv().getParamInfoForSILArg(
-          ai->getNumIndirectResults() + paramIdx);
+      unsigned argIdx = fai.getNumIndirectSILResults() + paramIdx;
+      auto paramInfo = conv.getParamInfoForSILArg(argIdx);
       if (!paramInfo.isAutoDiffSemanticResult())
         continue;
       origAllResults.push_back(
-          ai->getArgumentsWithoutIndirectResults()[paramIdx]);
+          fai.getArgumentsWithoutIndirectResults()[paramIdx]);
     }
 
     // Get callee pullback arguments.
@@ -998,7 +1012,7 @@ public:
 
     // Handle callee pullback indirect results.
     // Create local allocations for these and destroy them after the call.
-    auto pullback = getPullbackTupleElement(ai);
+    auto pullback = getPullbackTupleElement(fai);
     auto pullbackType =
         remapType(pullback->getType()).castTo<SILFunctionType>();
 
@@ -1015,7 +1029,12 @@ public:
     }
 
     // Collect callee pullback formal arguments.
+    unsigned firstSemanticParamResultIdx = conv.getResults().size();
+    unsigned firstYieldResultIndex = firstSemanticParamResultIdx +
+      conv.getNumAutoDiffSemanticResultParameters();
     for (auto resultIndex : applyInfo.config.resultIndices->getIndices()) {
+      if (resultIndex >= firstYieldResultIndex)
+        continue;
       assert(resultIndex < origAllResults.size());
       auto origResult = origAllResults[resultIndex];
       // Get the seed (i.e. adjoint value of the original result).
@@ -1033,22 +1052,40 @@ public:
 
     // If callee pullback was reabstracted in VJP, reabstract callee pullback.
     if (applyInfo.originalPullbackType) {
+      auto toType = *applyInfo.originalPullbackType;
       SILOptFunctionBuilder fb(getContext().getTransform());
-      pullback = reabstractFunction(
-          builder, fb, loc, pullback, *applyInfo.originalPullbackType,
+      if (toType->isCoroutine())
+        pullback = reabstractCoroutine(
+          builder, fb, loc, pullback, toType,
+          [this](SubstitutionMap subs) -> SubstitutionMap {
+            return this->remapSubstitutionMap(subs);
+          });
+      else
+        pullback = reabstractFunction(
+          builder, fb, loc, pullback, toType,
           [this](SubstitutionMap subs) -> SubstitutionMap {
             return this->remapSubstitutionMap(subs);
           });
     }
 
     // Call the callee pullback.
-    auto *pullbackCall = builder.createApply(loc, pullback, SubstitutionMap(),
-                                             args);
-    builder.emitDestroyValueOperation(loc, pullback);
-
-    // Extract all results from `pullbackCall`.
+    FullApplySite pullbackCall;
     SmallVector<SILValue, 8> dirResults;
-    extractAllElements(pullbackCall, builder, dirResults);
+    if (actualPullbackType->isCoroutine()) {
+      pullbackCall = builder.createBeginApply(loc, pullback, SubstitutionMap(),
+                                              args);
+      // Record pullback and begin_apply token: the pullback will be consumed
+      // after end_apply.
+      applyInfo.pullback = pullback;
+      applyInfo.beginApplyToken = cast<BeginApplyInst>(pullbackCall)->getTokenResult();
+    } else {
+      pullbackCall = builder.createApply(loc, pullback, SubstitutionMap(),
+                                         args);
+      builder.emitDestroyValueOperation(loc, pullback);
+      // Extract all results from `pullbackCall`.
+      extractAllElements(cast<ApplyInst>(pullbackCall), builder, dirResults);
+    }
+
     // Get all results in type-defined order.
     SmallVector<SILValue, 8> allResults;
     collectAllActualResultsInTypeOrder(pullbackCall, dirResults, allResults);
@@ -1062,10 +1099,10 @@ public:
     // Accumulate adjoints for original differentiation parameters.
     auto allResultsIt = allResults.begin();
     for (unsigned i : applyInfo.config.parameterIndices->getIndices()) {
-      auto origArg = ai->getArgument(ai->getNumIndirectResults() + i);
+      unsigned argIdx = fai.getNumIndirectSILResults() + i;
+      auto origArg = fai.getArgument(argIdx);
       // Skip adjoint accumulation for semantic results arguments.
-      auto paramInfo = ai->getSubstCalleeConv().getParamInfoForSILArg(
-          ai->getNumIndirectResults() + i);
+      auto paramInfo = fai.getSubstCalleeConv().getParamInfoForSILArg(argIdx);
       if (paramInfo.isAutoDiffSemanticResult())
         continue;
       auto tan = *allResultsIt++;
@@ -1085,6 +1122,22 @@ public:
         }
       }
     }
+
+    // Propagate adjoints for yields
+    if (actualPullbackType->isCoroutine()) {
+      auto originalYields = cast<BeginApplyInst>(fai)->getYieldedValues();
+      auto pullbackYields = cast<BeginApplyInst>(pullbackCall)->getYieldedValues();
+      assert(originalYields.size() == pullbackYields.size());
+
+      for (auto resultIndex : applyInfo.config.resultIndices->getIndices()) {
+        if (resultIndex < firstYieldResultIndex)
+          continue;
+
+        auto yieldResultIndex = resultIndex - firstYieldResultIndex;
+        setAdjointBuffer(bb, originalYields[yieldResultIndex], pullbackYields[yieldResultIndex]);
+      }
+    }
+
     // Destroy unused pullback direct results. Needed for pullback results from
     // VJPs extracted from `@differentiable` function callees, where the
     // `@differentiable` function's differentiation parameter indices are a
@@ -1095,6 +1148,7 @@ public:
         continue;
       builder.emitDestroyValueOperation(loc, unusedPullbackDirectResult);
     }
+
     // Destroy and deallocate pullback indirect results.
     for (auto *alloc : llvm::reverse(pullbackIndirectResults)) {
       builder.emitDestroyAddrAndFold(loc, alloc);
@@ -1102,15 +1156,55 @@ public:
     }
   }
 
-  void visitBeginApplyInst(BeginApplyInst *bai) {
-    // Diagnose `begin_apply` instructions.
-    // Coroutine differentiation is not yet supported.
+  void visitAbortApplyInst(AbortApplyInst *aai) {
+    BeginApplyInst *bai = aai->getBeginApply();
+    assert(getPullbackInfo().shouldDifferentiateApplySite(bai));
+
+    // abort_apply differentiation is not yet supported.
     getContext().emitNondifferentiabilityError(
         bai, getInvoker(), diag::autodiff_coroutines_not_supported);
     errorOccurred = true;
-    return;
   }
 
+  void visitEndApplyInst(EndApplyInst *eai) {
+    BeginApplyInst *bai = eai->getBeginApply();
+    assert(getPullbackInfo().shouldDifferentiateApplySite(bai));
+
+    // Replace a call to a function with a call to its pullback.
+    auto &nestedApplyInfo = getContext().getNestedApplyInfo();
+    auto applyInfoLookup = nestedApplyInfo.find(bai);
+    // If no `NestedApplyInfo` was found, then this task doesn't need to be
+    // differentiated.
+    if (applyInfoLookup == nestedApplyInfo.end()) {
+      // Must not be active.
+      assert(!getActivityInfo().isActive(bai->getTokenResult(), getConfig()));
+      assert(!getActivityInfo().isActive(eai, getConfig()));
+      return;
+    }
+
+    buildPullbackCall(bai);
+  }
+
+  void visitBeginApplyInst(BeginApplyInst *bai) {
+    assert(getPullbackInfo().shouldDifferentiateApplySite(bai));
+
+    auto &nestedApplyInfo = getContext().getNestedApplyInfo();
+    auto applyInfoLookup = nestedApplyInfo.find(bai);
+    // If no `NestedApplyInfo` was found, then this task doesn't need to be
+    // differentiated.
+    if (applyInfoLookup == nestedApplyInfo.end()) {
+      // Must not be active.
+      assert(!getActivityInfo().isActive(bai->getTokenResult(), getConfig()));
+      return;
+    }
+    auto applyInfo = applyInfoLookup->getSecond();
+
+    auto loc = bai->getLoc();
+    builder.createEndApply(loc, applyInfo.beginApplyToken,
+                           SILType::getEmptyTupleType(getASTContext()));
+    builder.emitDestroyValueOperation(loc, applyInfo.pullback);
+  }
+  
   /// Handle `struct` instruction.
   ///   Original: y = struct (x0, x1, x2, ...)
   ///    Adjoint: adj[x0] += struct_extract adj[y], #x0
@@ -1551,8 +1645,11 @@ public:
       auto adjVal = materializeAdjointDirect(getAdjointValue(bb, inst), loc);
       // Allocate a local buffer and store the adjoint value. This buffer will
       // be used for accumulation into the adjoint buffer.
-      auto adjBuf = builder.createAllocStack(
-          loc, adjVal->getType(), SILDebugVariable());
+      auto adjBuf = builder.createAllocStack(loc, adjVal->getType(), {},
+                                             DoesNotHaveDynamicLifetime,
+                                             IsNotLexical, IsNotFromVarDecl,
+                                             DoesNotUseMoveableValueDebugInfo,
+                                             /* skipVarDeclAssert = */ true);
       auto copy = builder.emitCopyValueOperation(loc, adjVal);
       builder.emitStoreValueOperation(loc, copy, adjBuf,
                                       StoreOwnershipQualifier::Init);
@@ -1878,6 +1975,7 @@ public:
   NO_ADJOINT(Return)
   NO_ADJOINT(Branch)
   NO_ADJOINT(CondBranch)
+  NO_ADJOINT(Yield)
 
   // Address projections.
   NO_ADJOINT(StructElementAddr)
@@ -2043,6 +2141,10 @@ bool PullbackCloner::Implementation::run() {
       if (Projection::isAddressProjection(v))
         return false;
 
+      // Co-routines borrow adjoint buffers for yields
+      if (isa_and_nonnull<BeginApplyInst>(v.getDefiningInstruction()))
+        return false;
+
       // Check that active values are differentiable. Otherwise we may crash
       // later when tangent space is required, but not available.
       if (!getTangentSpace(remapType(type).getASTType())) {
@@ -2086,7 +2188,10 @@ bool PullbackCloner::Implementation::run() {
       originalBlocks.push_back(BB);
 
       for (auto *nextBB : BB->getPredecessorBlocks()) {
-        workqueue.pushIfNotVisited(nextBB);
+        // If there is no linear map tuple for predecessor BB, then BB is
+        // unreachable from function entry. Do not run pullback cloner on it.
+        if (getPullbackInfo().getLinearMapTupleType(nextBB))
+          workqueue.pushIfNotVisited(nextBB);
       }
     }
   }
@@ -2208,8 +2313,9 @@ bool PullbackCloner::Implementation::run() {
 
   // The pullback function has type:
   // `(seed0, seed1, ..., (exit_pb_tuple_el0, ..., )|context_obj) -> (d_arg0, ..., d_argn)`.
+  auto conv = getOriginal().getConventions();
   auto pbParamArgs = pullback.getArgumentsWithoutIndirectResults();
-  assert(getConfig().resultIndices->getNumIndices() == pbParamArgs.size() - numVals &&
+  assert(getConfig().resultIndices->getNumIndices() - conv.getNumYields() == pbParamArgs.size() - numVals &&
          pbParamArgs.size() >= 1);
   // Assign adjoints for original result.
   builder.setCurrentDebugScope(
@@ -2217,7 +2323,15 @@ bool PullbackCloner::Implementation::run() {
   builder.setInsertionPoint(pullbackEntry,
                             getNextFunctionLocalAllocationInsertionPoint());
   unsigned seedIndex = 0;
+  unsigned firstSemanticParamResultIdx = conv.getResults().size();
+  unsigned firstYieldResultIndex = firstSemanticParamResultIdx +
+      conv.getNumAutoDiffSemanticResultParameters();
   for (auto resultIndex : getConfig().resultIndices->getIndices()) {
+    // Yields seed buffers are only to be touched in yield BB and required
+    // special handling
+    if (resultIndex >= firstYieldResultIndex)
+      continue;
+
     auto origResult = origFormalResults[resultIndex];
     auto *seed = pbParamArgs[seedIndex];
     if (seed->getType().isAddress()) {
@@ -2228,6 +2342,10 @@ bool PullbackCloner::Implementation::run() {
 
       if (seedParamInfo.isIndirectInOut()) {
         setAdjointBuffer(originalExitBlock, origResult, seed);
+        LLVM_DEBUG(getADDebugStream()
+                   << "Assigned seed buffer " << *seed
+                   << " as the adjoint of original indirect result "
+                   << origResult);
       }
       // Otherwise, assign a copy of the seed argument as the adjoint buffer of
       // the original result.
@@ -2282,7 +2400,6 @@ bool PullbackCloner::Implementation::run() {
   // This vector will identify the locations where initialization is needed.
   SmallBitVector outputsToInitialize;
 
-  auto conv = getOriginal().getConventions();
   auto origParams = getOriginal().getArgumentsWithoutIndirectResults();
 
   // Materializes the return element corresponding to the parameter
@@ -2711,6 +2828,27 @@ void PullbackCloner::Implementation::visitSILBasicBlock(SILBasicBlock *bb) {
   if (bb->isEntry())
     return;
 
+  // If the original block is a resume yield destination, then we need to yield
+  // the adjoint buffer and do everything else in the resume destination. Unwind
+  // destination is unreachable as the co-routine can never be aborted.
+  if (auto *predBB = bb->getSinglePredecessorBlock()) {
+    if (auto *yield = dyn_cast<YieldInst>(predBB->getTerminator())) {
+      auto *resumeBB = pbBB->split(builder.getInsertionPoint());
+      auto *unwindBB = getPullback().createBasicBlock();
+
+      SmallVector<SILValue, 1> adjYields;
+      for (auto yieldedVal : yield->getYieldedValues())
+        adjYields.push_back(getAdjointBuffer(bb, yieldedVal));
+
+      builder.createYield(yield->getLoc(), adjYields, resumeBB, unwindBB);
+      builder.setInsertionPoint(unwindBB);
+      builder.createUnreachable(SILLocation::invalid());
+
+      pbBB = resumeBB;
+      builder.setInsertionPoint(pbBB);
+    }
+  }
+
   // Otherwise, add a `switch_enum` terminator for non-exit
   // pullback blocks.
   // 1. Get the pullback struct pullback block argument.
@@ -2802,12 +2940,17 @@ void PullbackCloner::Implementation::visitSILBasicBlock(SILBasicBlock *bb) {
   SmallDenseMap<SILValue, TrampolineBlockSet> pullbackTrampolineBlockMap;
   SmallDenseMap<SILBasicBlock *, SILBasicBlock *> origPredpullbackSuccBBMap;
   for (auto *predBB : bb->getPredecessorBlocks()) {
+    // If there is no linear map tuple for predecessor BB, then BB is
+    // unreachable from function entry. There is no branch tracing enum for it
+    // as well, so we should not create any branching to it in the pullback.
+    if (!getPullbackInfo().getLinearMapTupleType(predBB))
+      continue;
     auto *pullbackSuccBB =
         buildPullbackSuccessor(bb, predBB, pullbackTrampolineBlockMap);
     origPredpullbackSuccBBMap[predBB] = pullbackSuccBB;
     auto *enumEltDecl =
         getPullbackInfo().lookUpBranchingTraceEnumElement(predBB, bb);
-    pullbackSuccessorCases.push_back({enumEltDecl, pullbackSuccBB});
+    pullbackSuccessorCases.emplace_back(enumEltDecl, pullbackSuccBB);
   }
   // Values are trampolined by only a subset of pullback successor blocks.
   // Other successors blocks should destroy the value.
@@ -2833,8 +2976,8 @@ void PullbackCloner::Implementation::visitSILBasicBlock(SILBasicBlock *bb) {
   // Branch to pullback successor blocks.
   assert(pullbackSuccessorCases.size() == predEnum->getNumElements());
   builder.createSwitchEnum(pbLoc, predEnumVal, /*DefaultBB*/ nullptr,
-                           pullbackSuccessorCases, llvm::None, ProfileCounter(),
-                           OwnershipKind::Owned);
+                           pullbackSuccessorCases, std::nullopt,
+                           ProfileCounter(), OwnershipKind::Owned);
 }
 
 //--------------------------------------------------------------------------//
@@ -2846,6 +2989,7 @@ bool PullbackCloner::Implementation::runForSemanticMemberAccessor() {
   auto *accessor = cast<AccessorDecl>(original.getDeclContext()->getAsDecl());
   switch (accessor->getAccessorKind()) {
   case AccessorKind::Get:
+  case AccessorKind::DistributedGet:
     return runForSemanticMemberGetter();
   case AccessorKind::Set:
     return runForSemanticMemberSetter();
@@ -3330,7 +3474,11 @@ void PullbackCloner::Implementation::
   builder.setCurrentDebugScope(remapScope(dti->getDebugScope()));
   builder.setInsertionPoint(arrayAdjoint->getParentBlock());
   for (auto use : dti->getResult(1)->getUses()) {
-    auto *ptai = dyn_cast<PointerToAddressInst>(use->getUser());
+    auto *mdi = dyn_cast<MarkDependenceInst>(use->getUser());
+    assert(mdi && "Expected mark_dependence user");
+    auto *ptai =
+        dyn_cast_or_null<PointerToAddressInst>(getSingleNonDebugUser(mdi));
+    assert(ptai && "Expected pointer_to_address user");
     auto adjBuf = getAdjointBuffer(origBB, ptai);
     auto *eltAdjBuf = getArrayAdjointElementBuffer(arrayAdjoint, 0, loc);
     builder.emitInPlaceAdd(loc, adjBuf, eltAdjBuf);

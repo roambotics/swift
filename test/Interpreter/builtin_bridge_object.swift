@@ -1,5 +1,5 @@
-// RUN: %target-run-simple-swift(-Onone -parse-stdlib -Xfrontend -enable-copy-propagation -Xfrontend -enable-lexical-borrow-scopes=false) | %FileCheck %s --check-prefixes=CHECK,CHECK-DBG
-// RUN: %target-run-simple-swift(-O -parse-stdlib -Xfrontend -enable-copy-propagation -Xfrontend -enable-lexical-borrow-scopes=false) | %FileCheck --check-prefixes=CHECK,CHECK-OPT %s
+// RUN: %target-run-simple-swift(-Onone -parse-stdlib -Xfrontend -enable-copy-propagation -target %target-swift-abi-5.6-triple) | %FileCheck %s --check-prefixes=CHECK,CHECK-DBG,CHECK-%target-ptrsize
+// RUN: %target-run-simple-swift(-O -parse-stdlib -Xfrontend -enable-copy-propagation -target %target-swift-abi-5.6-triple) | %FileCheck %s --check-prefixes=CHECK,CHECK-OPT,CHECK-%target-ptrsize
 
 // REQUIRES: executable_test
 // REQUIRES: objc_interop
@@ -70,7 +70,6 @@ if true {
   print(x === x1)
   // CHECK-NEXT: true
   print(x === x2)
-  // CHECK-OPT-NEXT: deallocated
 
   print(nonPointerBits(bo) == 0)
   // CHECK-NEXT: true
@@ -84,7 +83,7 @@ if true {
   _fixLifetime(bo3)
   _fixLifetime(bo4)
 }
-// CHECK-DBG-NEXT: deallocated
+// CHECK-NEXT: deallocated
 // CHECK-NEXT: deallocated
 
 // Try with all spare bits set.
@@ -99,7 +98,6 @@ if true {
   print(x === x1)
   // CHECK-NEXT: true
   print(x === x2)
-  // CHECK-OPT-NEXT: deallocated
   
   print(nonPointerBits(bo) == NATIVE_SPARE_BITS)
   // CHECK-NEXT: true
@@ -113,7 +111,7 @@ if true {
   _fixLifetime(bo3)
   _fixLifetime(bo4)
 }
-// CHECK-DBG-NEXT: deallocated
+// CHECK-NEXT: deallocated
 // CHECK-NEXT: deallocated
 
 
@@ -140,7 +138,16 @@ if true {
 
   var bo3 = nonNativeBridgeObject(NSNumber(value: 22))
   print(Bool(_builtinBooleanLiteral: Builtin.isUnique(&bo3)))
-  // CHECK-NEXT: false
+  // On 64-bit*, this will be an objc tagged pointer.  On 32-bit, there are no
+  // objc tagged pointers.  If it's an objc tagged pointer, it will never be
+  // unique. Otherwise, it will be unique--subject to any intering of NSNumbers
+  // that Foundation does.
+  // * Whether it's a tagged pointer doesn't actually depend on bit width--see
+  //   OBJC_TAGGED_POINTER_BITS for the various architectures at the top of the
+  //   file.  If those other architectures ever start being used in CI, this
+  //   test will need more involved updating.
+  // CHECK-32-NEXT: true
+  // CHECK-64-NEXT: false
   _fixLifetime(bo3)
 }
 
@@ -162,7 +169,7 @@ if true {
   
   var bo3 = nonNativeBridgeObject(unTaggedString)
   print(Bool(_builtinBooleanLiteral: Builtin.isUnique(&bo3)))
-  // CHECK-NEXT: false
+  // CHECK-NEXT: true
   _fixLifetime(bo3)
 }
 

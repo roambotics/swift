@@ -102,7 +102,6 @@ import LocalClang
 @_exported import MainLib
 
 // RUN: %target-swift-frontend -typecheck -sdk %t/sdk %t/InternalImports.swift \
-// RUN:   -enable-experimental-feature AccessLevelOnImport \
 // RUN:   -module-name MainLib -module-cache-path %t \
 // RUN:   -F %t/sdk/System/Library/PrivateFrameworks/ \
 // RUN:   -library-level api -verify
@@ -116,7 +115,6 @@ internal import FullyPrivateClang
 internal import LocalClang
 
 // RUN: %target-swift-frontend -typecheck -sdk %t/sdk %t/FileprivateImports.swift \
-// RUN:   -enable-experimental-feature AccessLevelOnImport \
 // RUN:   -module-name MainLib -module-cache-path %t \
 // RUN:   -F %t/sdk/System/Library/PrivateFrameworks/ \
 // RUN:   -library-level api -verify
@@ -130,7 +128,6 @@ fileprivate import FullyPrivateClang
 fileprivate import LocalClang
 
 // RUN: %target-swift-frontend -typecheck -sdk %t/sdk %t/PrivateImports.swift \
-// RUN:   -enable-experimental-feature AccessLevelOnImport \
 // RUN:   -module-name MainLib -module-cache-path %t \
 // RUN:   -F %t/sdk/System/Library/PrivateFrameworks/ \
 // RUN:   -library-level api -verify
@@ -144,7 +141,6 @@ private import FullyPrivateClang
 private import LocalClang
 
 // RUN: %target-swift-frontend -typecheck -sdk %t/sdk %t/ExplicitlyPublicImports.swift \
-// RUN:   -enable-experimental-feature AccessLevelOnImport \
 // RUN:   -module-name MainLib -module-cache-path %t \
 // RUN:   -F %t/sdk/System/Library/PrivateFrameworks/ \
 // RUN:   -library-level api -verify
@@ -163,4 +159,3 @@ public import FullyPrivateClang // expected-error{{private module 'FullyPrivateC
 public import LocalClang // expected-error{{private module 'LocalClang' is imported publicly from the public module 'MainLib'}}
 // expected-warning @-1 {{public import of 'LocalClang' was not used in public declarations or inlinable code}}
 @_exported public import MainLib // expected-warning{{private module 'MainLib' is imported publicly from the public module 'MainLib'}}
-// expected-warning @-1 {{public import of 'MainLib' was not used in public declarations or inlinable code}}

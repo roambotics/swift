@@ -214,7 +214,7 @@ func testAnyTypeExpr() {
   func test(_: (any P).Type) {}
   test((any P).self)
 
-  // expected-error@+2 {{expected member name or constructor call after type name}}
+  // expected-error@+2 {{expected member name or initializer call after type name}}
   // expected-note@+1 {{use '.self' to reference the type object}}
   let invalid = any P
   test(invalid)
@@ -305,11 +305,9 @@ func testAnyFixIt() {
       typealias HasAssocAlias = HasAssoc
     }
     let wrapperMeta: Wrapper.Type
-    // FIXME: Both of these fix-its are wrong.
-    // 1. 'any' is attached to 'HasAssocAlias' instead of 'Wrapper.HasAssocAlias'
-    // 2. What is the correct fix-it for the initializer?
+    // FIXME: What is the correct fix-it for the initializer?
     //
-    // expected-error@+2:20 {{use of 'Wrapper.HasAssocAlias' (aka 'HasAssoc') as a type must be written 'any Wrapper.HasAssocAlias' (aka 'any HasAssoc')}}{{20-33=(any HasAssocAlias)}}
+    // expected-error@+2:20 {{use of 'Wrapper.HasAssocAlias' (aka 'HasAssoc') as a type must be written 'any Wrapper.HasAssocAlias' (aka 'any HasAssoc')}}{{12-33=(any Wrapper.HasAssocAlias)}}
     // expected-error@+1:57 {{use of 'Wrapper.HasAssocAlias' (aka 'HasAssoc') as a type must be written 'any Wrapper.HasAssocAlias' (aka 'any HasAssoc')}}{{57-70=(any HasAssocAlias)}}
     let _: Wrapper.HasAssocAlias.Protocol = wrapperMeta.HasAssocAlias.self
   }
@@ -326,6 +324,16 @@ func testAnyFixIt() {
   let _: any HasAssoc? = nil
   // expected-error@+1 {{optional 'any' type must be written '(any HasAssoc.Type)?'}}{{10-28=(any HasAssoc.Type)?}}
   let _: any HasAssoc.Type? = nil
+
+  do {
+    struct Outer<T> {
+      struct Inner<U> {}
+    }
+
+    // expected-error@+2:18 {{must be written 'any HasAssoc'}}
+    // expected-error@+1:34 {{must be written 'any HasAssoc'}}
+    let _: Outer<HasAssoc>.Inner<HasAssoc>
+  }
 }
 
 func testNestedMetatype() {

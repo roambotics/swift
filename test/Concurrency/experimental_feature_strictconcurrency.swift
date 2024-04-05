@@ -1,6 +1,7 @@
-// RUN: %target-swift-frontend -disable-availability-checking -parse-as-library -enable-experimental-feature StrictConcurrency -enable-experimental-feature GlobalConcurrency -emit-sil -o /dev/null -verify %s
-// RUN: %target-swift-frontend -disable-availability-checking -parse-as-library -enable-experimental-feature StrictConcurrency=complete -enable-experimental-feature GlobalConcurrency -emit-sil -o /dev/null -verify %s
-// RUN: %target-swift-frontend -disable-availability-checking -parse-as-library -enable-experimental-feature StrictConcurrency=complete -enable-experimental-feature GlobalConcurrency -emit-sil -o /dev/null -verify -enable-experimental-feature SendNonSendable %s
+// RUN: %target-swift-frontend -disable-availability-checking -enable-experimental-feature StrictConcurrency -emit-sil -o /dev/null -verify %s -disable-region-based-isolation-with-strict-concurrency
+// RUN: %target-swift-frontend -disable-availability-checking -enable-experimental-feature StrictConcurrency=complete -emit-sil -o /dev/null -verify %s -disable-region-based-isolation-with-strict-concurrency
+// RUN: %target-swift-frontend -disable-availability-checking -enable-upcoming-feature StrictConcurrency -emit-sil -o /dev/null -verify %s -disable-region-based-isolation-with-strict-concurrency
+// RUN: %target-swift-frontend -disable-availability-checking -enable-upcoming-feature StrictConcurrency -emit-sil -o /dev/null -verify -verify-additional-prefix region-isolation- %s
 
 // REQUIRES: concurrency
 // REQUIRES: asserts
@@ -24,39 +25,20 @@ struct Test2: TestProtocol { // expected-warning{{conformance of 'C2' to 'Sendab
   typealias Value = C2
 }
 
-@globalActor
-actor TestGlobalActor {
-  static var shared = TestGlobalActor()
-}
+@MainActor
+func iterate(stream: AsyncStream<Int>) async {
+  nonisolated(unsafe) var it = stream.makeAsyncIterator()
+  // FIXME: Region isolation should consider a value from a 'nonisolated(unsafe)'
+  // declaration to be in a disconnected region
 
-@TestGlobalActor
-var mutableIsolatedGlobal = 1
+  // expected-region-isolation-warning @+3 {{transferring 'it' may cause a race}}
+  // expected-region-isolation-note @+2 {{transferring disconnected 'it' to nonisolated callee could cause races in between callee nonisolated and local main actor-isolated uses}}
+  // expected-region-isolation-note @+1 {{use here could race}}
+  while let element = await it.next() {
+    print(element)
+  }
 
-var mutableNonisolatedGlobal = 1 // expected-warning{{var 'mutableNonisolatedGlobal' is not concurrency-safe because it is non-isolated global shared mutable state}}
-// expected-note@-1{{isolate 'mutableNonisolatedGlobal' to a global actor, or convert it to a 'let' constant and conform it to 'Sendable'}}
-
-let immutableGlobal = 1
-
-final class TestSendable: Sendable {
-  init() {}
-}
-
-final class TestNonsendable {
-  init() {}
-}
-
-struct A {
-  static let immutableExplicitSendable = TestSendable()
-  static let immutableNonsendableGlobal = TestNonsendable() // expected-warning{{static property 'immutableNonsendableGlobal' is not concurrency-safe because it is not either conforming to 'Sendable' or isolated to a global actor}}
-  static let immutableInferredSendable = 0
-  static var mutable = 0 // expected-warning{{static property 'mutable' is not concurrency-safe because it is non-isolated global shared mutable state}}
-  // expected-note@-1{{isolate 'mutable' to a global actor, or convert it to a 'let' constant and conform it to 'Sendable'}}
-  // expected-note@-2{{static property declared here}}
-}
-
-@TestGlobalActor
-func f() {
-  print(A.immutableExplicitSendable)
-  print(A.immutableInferredSendable)
-  print(A.mutable) // expected-warning{{reference to static property 'mutable' is not concurrency-safe because it involves shared mutable state}}
+  for await x in stream {
+    print(x)
+  }
 }

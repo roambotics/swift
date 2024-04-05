@@ -59,19 +59,24 @@ static void emitObjCConditional(raw_ostream &out,
 
 static void writePtrauthPrologue(raw_ostream &os) {
   emitCxxConditional(os, [&]() {
-    os << "#if defined(__arm64e__) && __has_include(<ptrauth.h>)\n";
-    os << "# include <ptrauth.h>\n";
-    os << "#else\n";
     ClangSyntaxPrinter(os).printIgnoredDiagnosticBlock(
-        "reserved-macro-identifier", [&]() {
-          os << "# ifndef __ptrauth_swift_value_witness_function_pointer\n";
-          os << "#  define __ptrauth_swift_value_witness_function_pointer(x)\n";
-          os << "# endif\n";
-          os << "# ifndef __ptrauth_swift_class_method_pointer\n";
-          os << "#  define __ptrauth_swift_class_method_pointer(x)\n";
-          os << "# endif\n";
+        "non-modular-include-in-framework-module", [&] {
+          os << "#if defined(__arm64e__) && __has_include(<ptrauth.h>)\n";
+          os << "# include <ptrauth.h>\n";
+          os << "#else\n";
+          ClangSyntaxPrinter(os).printIgnoredDiagnosticBlock(
+              "reserved-macro-identifier", [&]() {
+                os << "# ifndef "
+                      "__ptrauth_swift_value_witness_function_pointer\n";
+                os << "#  define "
+                      "__ptrauth_swift_value_witness_function_pointer(x)\n";
+                os << "# endif\n";
+                os << "# ifndef __ptrauth_swift_class_method_pointer\n";
+                os << "#  define __ptrauth_swift_class_method_pointer(x)\n";
+                os << "# endif\n";
+              });
+          os << "#endif\n";
         });
-    os << "#endif\n";
   });
 }
 
@@ -279,7 +284,7 @@ static void collectClangModuleHeaderIncludes(
     llvm::SmallString<128> containingSearchDirPath;
 
     for (auto &includeDir : includeDirs) {
-      if (textualInclude.startswith(includeDir)) {
+      if (textualInclude.str().starts_with(includeDir)) {
         if (includeDir.size() > containingSearchDirPath.size()) {
           containingSearchDirPath = includeDir;
         }
@@ -309,14 +314,15 @@ static void collectClangModuleHeaderIncludes(
     requiredTextualIncludes.insert(textualInclude);
   };
 
-  if (clang::Module::Header umbrellaHeader = clangModule->getUmbrellaHeader()) {
-    addHeader(umbrellaHeader.Entry->tryGetRealPathName(),
-              umbrellaHeader.PathRelativeToRootModuleDirectory);
-  } else if (clang::Module::DirectoryName umbrellaDir =
-                 clangModule->getUmbrellaDir()) {
+  if (std::optional<clang::Module::Header> umbrellaHeader =
+          clangModule->getUmbrellaHeaderAsWritten()) {
+    addHeader(umbrellaHeader->Entry.getFileEntry().tryGetRealPathName(),
+        umbrellaHeader->PathRelativeToRootModuleDirectory);
+  } else if (std::optional<clang::Module::DirectoryName> umbrellaDir =
+                 clangModule->getUmbrellaDirAsWritten()) {
     SmallString<128> nativeUmbrellaDirPath;
     std::error_code errorCode;
-    llvm::sys::path::native(umbrellaDir.Entry->getName(),
+    llvm::sys::path::native(umbrellaDir->Entry.getName(),
                             nativeUmbrellaDirPath);
     llvm::vfs::FileSystem &fileSystem = fileManager.getVirtualFileSystem();
     for (llvm::vfs::recursive_directory_iterator
@@ -338,8 +344,8 @@ static void collectClangModuleHeaderIncludes(
           pathComponents.push_back(*pathIt);
         // Then append this to the path from module root to umbrella dir
         SmallString<128> relativeHeaderPath;
-        if (umbrellaDir.PathRelativeToRootModuleDirectory != ".")
-          relativeHeaderPath += umbrellaDir.PathRelativeToRootModuleDirectory;
+        if (umbrellaDir->PathRelativeToRootModuleDirectory != ".")
+          relativeHeaderPath += umbrellaDir->PathRelativeToRootModuleDirectory;
 
         for (auto it = pathComponents.rbegin(), end = pathComponents.rend();
              it != end; ++it) {
@@ -354,7 +360,7 @@ static void collectClangModuleHeaderIncludes(
          {clang::Module::HK_Normal, clang::Module::HK_Textual}) {
       for (const clang::Module::Header &header :
            clangModule->Headers[headerKind]) {
-        addHeader(header.Entry->tryGetRealPathName(),
+        addHeader(header.Entry.getFileEntry().tryGetRealPathName(),
                   header.PathRelativeToRootModuleDirectory);
       }
     }
@@ -527,6 +533,8 @@ static void writePostImportPrologue(raw_ostream &os, ModuleDecl &M) {
         "#pragma clang diagnostic ignored \"-Wnullability\"\n"
         "#pragma clang diagnostic ignored "
         "\"-Wdollar-in-identifier-extension\"\n"
+        "#pragma clang diagnostic ignored "
+        "\"-Wunsafe-buffer-usage\"\n"
         "\n"
         "#if __has_attribute(external_source_symbol)\n"
         "# pragma push_macro(\"any\")\n"

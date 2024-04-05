@@ -38,7 +38,9 @@ class SILFunctionBuilder;
 class SILProfiler;
 class BasicBlockBitfield;
 class NodeBitfield;
-class SILPassManager;
+class OperandBitfield;
+class CalleeCache;
+class SILUndef;
 
 namespace Lowering {
 class TypeLowering;
@@ -85,6 +87,9 @@ enum class PerformanceConstraints : uint8_t {
   None = 0,
   NoAllocation = 1,
   NoLocks = 2,
+  NoRuntime = 3,
+  NoExistentials = 4,
+  NoObjCBridging = 5
 };
 
 class SILSpecializeAttr final {
@@ -94,6 +99,9 @@ public:
     Full,
     Partial
   };
+
+  static GenericSignature buildTypeErasedSignature(
+      GenericSignature sig, ArrayRef<Type> typeErasedParams);
 
   static SILSpecializeAttr *create(SILModule &M,
                                    GenericSignature specializedSignature,
@@ -203,6 +211,8 @@ private:
   template <class, class> friend class SILBitfield;
   friend class BasicBlockBitfield;
   friend class NodeBitfield;
+  friend class OperandBitfield;
+  friend SILUndef;
 
   /// Module - The SIL module that the function belongs to.
   SILModule &Module;
@@ -278,10 +288,13 @@ private:
   /// The head of a single-linked list of currently alive NodeBitfield.
   NodeBitfield *newestAliveNodeBitfield = nullptr;
 
+  /// The head of a single-linked list of currently alive OperandBitfields.
+  OperandBitfield *newestAliveOperandBitfield = nullptr;
+
   /// A monotonically increasing ID which is incremented whenever a
-  /// BasicBlockBitfield or NodeBitfield is constructed.
-  /// For details see SILBitfield::bitfieldID;
-  int64_t currentBitfieldID = 1;
+  /// BasicBlockBitfield, NodeBitfield, or OperandBitfield is constructed.  For
+  /// details see SILBitfield::bitfieldID;
+  uint64_t currentBitfieldID = 1;
 
   /// Unique identifier for vector indexing and deterministic sorting.
   /// May be reused when zombie functions are recovered.
@@ -303,6 +316,9 @@ private:
   /// empty.
   StringRef WasmExportName;
 
+  /// Name of a Wasm import module and field if @_extern(wasm) attribute
+  std::optional<std::pair<StringRef, StringRef>> WasmImportModuleAndField;
+
   /// Has value if there's a profile for this function
   /// Contains Function Entry Count
   ProfileCounter EntryCount;
@@ -315,6 +331,13 @@ private:
 
   PerformanceConstraints perfConstraints = PerformanceConstraints::None;
 
+  /// This is the set of undef values we've created, for uniquing purposes.
+  ///
+  /// We use a SmallDenseMap since in most functions, we will have only one type
+  /// of undef if we have any at all. In that case, by staying small we avoid
+  /// needing a heap allocation.
+  llvm::SmallDenseMap<SILType, SILUndef *, 1> undefValues;
+
   /// This is the number of uses of this SILFunction inside the SIL.
   /// It does not include references from debug scopes.
   unsigned RefCount = 0;
@@ -323,6 +346,9 @@ private:
   /// This counter is incremented every time a BasicBlockData re-assigns new
   /// block indices.
   unsigned BlockListChangeIdx = 0;
+
+  /// The isolation of this function.
+  ActorIsolation actorIsolation = ActorIsolation::forUnspecified();
 
   /// The function's bare attribute. Bare means that the function is SIL-only
   /// and does not require debug info.
@@ -421,15 +447,26 @@ private:
   /// The function's effects attribute.
   unsigned EffectsKindAttr : NumEffectsKindBits;
 
-  /// The function is in a statically linked module.
-  unsigned IsStaticallyLinked : 1;
-
   /// If true, the function has lexical lifetimes even if the module does not.
   unsigned ForceEnableLexicalLifetimes : 1;
 
   /// If true, the function contains an instruction that prevents stack nesting
   /// from running with pack metadata markers in place.
   unsigned UseStackForPackMetadata : 1;
+
+  /// If true, the function returns a non-escapable value without any
+  /// lifetime-dependence on an argument.
+  unsigned HasUnsafeNonEscapableResult : 1;
+
+  unsigned HasResultDependsOnSelf : 1;
+
+  /// True, if this function or a caller (transitively) has a performance
+  /// constraint.
+  /// If true, optimizations must not introduce new runtime calls or metadata
+  /// creation, which are not there after SILGen.
+  /// Note that this flag is not serialized, because it's computed locally
+  /// within a module by the MandatoryOptimizations pass.
+  unsigned IsPerformanceConstraint : 1;
 
   static void
   validateSubclassScope(SubclassScope scope, IsThunk_t isThunk,
@@ -473,7 +510,7 @@ private:
   static SILFunction *
   create(SILModule &M, SILLinkage linkage, StringRef name,
          CanSILFunctionType loweredType, GenericEnvironment *genericEnv,
-         llvm::Optional<SILLocation> loc, IsBare_t isBareSILFunction,
+         std::optional<SILLocation> loc, IsBare_t isBareSILFunction,
          IsTransparent_t isTrans, IsSerialized_t isSerialized,
          ProfileCounter entryCount, IsDynamicallyReplaceable_t isDynamic,
          IsDistributed_t isDistributed,
@@ -691,12 +728,6 @@ public:
     WasDeserializedCanonical = val;
   }
 
-  bool isStaticallyLinked() const { return IsStaticallyLinked; }
-
-  void setIsStaticallyLinked(bool value) {
-    IsStaticallyLinked = value;
-  }
-
   ForceEnableLexicalLifetimes_t forceEnableLexicalLifetimes() const {
     return ForceEnableLexicalLifetimes_t(ForceEnableLexicalLifetimes);
   }
@@ -713,6 +744,19 @@ public:
     UseStackForPackMetadata = value;
   }
 
+  bool hasUnsafeNonEscapableResult() const {
+    return HasUnsafeNonEscapableResult;
+  }
+
+  void setHasUnsafeNonEscapableResult(bool value) {
+    HasUnsafeNonEscapableResult = value;
+  }
+
+  bool hasResultDependsOnSelf() const { return HasResultDependsOnSelf; }
+
+  void setHasResultDependsOnSelf(bool flag = true) {
+    HasResultDependsOnSelf = flag;
+  }
   /// Returns true if this is a reabstraction thunk of escaping function type
   /// whose single argument is a potentially non-escaping closure. i.e. the
   /// thunks' function argument may itself have @inout_aliasable parameters.
@@ -855,6 +899,10 @@ public:
   /// current SILModule.
   bool isPossiblyUsedExternally() const;
 
+  /// Helper method which returns whether this function should be preserved so
+  /// it can potentially be used in the debugger.
+  bool shouldBePreservedForDebugger() const;
+
   /// In addition to isPossiblyUsedExternally() it returns also true if this
   /// is a (private or internal) vtable method which can be referenced by
   /// vtables of derived classes outside the compilation unit.
@@ -931,7 +979,7 @@ public:
   /// TODO: This needs a better name.
   bool hasSemanticsAttrThatStartsWith(StringRef S) {
     return count_if(getSemanticsAttrs(), [&S](const std::string &Attr) -> bool {
-      return StringRef(Attr).startswith(S);
+      return StringRef(Attr).starts_with(S);
     });
   }
 
@@ -1004,6 +1052,13 @@ public:
 
   void setPerfConstraints(PerformanceConstraints perfConstr) {
     perfConstraints = perfConstr;
+  }
+
+  // see `IsPerformanceConstraint`
+  bool isPerformanceConstraint() const { return IsPerformanceConstraint; }
+
+  void setIsPerformanceConstraint(bool flag = true) {
+    IsPerformanceConstraint = flag;
   }
 
   /// \returns True if the function is optimizable (i.e. not marked as no-opt),
@@ -1125,6 +1180,9 @@ public:
   bool hasArgumentEffects() const;
   void visitArgEffects(std::function<void(int, int, bool)> c) const;
   MemoryBehavior getMemoryBehavior(bool observeRetains);
+
+  // Used by the MemoryLifetimeVerifier
+  bool argumentMayRead(Operand *argOp, SILValue addr);
 
   Purpose getSpecialPurpose() const { return specialPurpose; }
 
@@ -1278,6 +1336,24 @@ public:
   StringRef wasmExportName() const { return WasmExportName; }
   void setWasmExportName(StringRef value) { WasmExportName = value; }
 
+  /// Return Wasm import module name if @_extern(wasm) was used otherwise empty
+  StringRef wasmImportModuleName() const {
+    if (WasmImportModuleAndField)
+      return WasmImportModuleAndField->first;
+    return StringRef();
+  }
+
+  /// Return Wasm import field name if @_extern(wasm) was used otherwise empty
+  StringRef wasmImportFieldName() const {
+    if (WasmImportModuleAndField)
+      return WasmImportModuleAndField->second;
+    return StringRef();
+  }
+
+  void setWasmImportModuleAndField(StringRef module, StringRef field) {
+    WasmImportModuleAndField = std::make_pair(module, field);
+  }
+
   /// Returns true if this function belongs to a declaration that returns
   /// an opaque result type with one or more availability conditions that are
   /// allowed to produce a different underlying type at runtime.
@@ -1293,6 +1369,12 @@ public:
 
     return false;
   }
+
+  void setActorIsolation(ActorIsolation newActorIsolation) {
+    actorIsolation = newActorIsolation;
+  }
+
+  ActorIsolation getActorIsolation() const { return actorIsolation; }
 
   //===--------------------------------------------------------------------===//
   // Block List Access
@@ -1375,7 +1457,7 @@ public:
     return std::find_if(begin(), end(),
                         [](const SILBasicBlock &BB) -> bool {
                           const TermInst *TI = BB.getTerminator();
-                          return isa<ThrowInst>(TI);
+                          return isa<ThrowInst>(TI) || isa<ThrowAddrInst>(TI);
                         });
   }
   
@@ -1385,7 +1467,7 @@ public:
     return std::find_if(begin(), end(),
                         [](const SILBasicBlock &BB) -> bool {
                           const TermInst *TI = BB.getTerminator();
-                          return isa<ThrowInst>(TI);
+                          return isa<ThrowInst>(TI) || isa<ThrowAddrInst>(TI);
                         });
   }
 
@@ -1427,7 +1509,8 @@ public:
   ArrayRef<SILArgument *> getArgumentsWithoutIndirectResults() const {
     assert(!empty() && "Cannot get arguments of a function without a body");
     return begin()->getArguments().slice(
-        getConventions().getNumIndirectSILResults());
+        getConventions().getNumIndirectSILResults() +
+          getConventions().getNumIndirectSILErrorResults());
   }
 
   const SILArgument *getSelfArgument() const {
@@ -1463,7 +1546,7 @@ public:
 
   /// verify - Run the SIL verifier to make sure that the SILFunction follows
   /// invariants.
-  void verify(SILPassManager *passManager = nullptr,
+  void verify(CalleeCache *calleeCache = nullptr,
               bool SingleFunction = true,
               bool isCompleteOSSA = true,
               bool checkLinearLifetime = true) const;
@@ -1471,11 +1554,11 @@ public:
   /// Run the SIL verifier without assuming OSSA lifetimes end at dead end
   /// blocks.
   void verifyIncompleteOSSA() const {
-    verify(/*passManager*/nullptr, /*SingleFunction=*/true, /*completeOSSALifetimes=*/false);
+    verify(/*calleeCache*/nullptr, /*SingleFunction=*/true, /*completeOSSALifetimes=*/false);
   }
 
   /// Verifies the lifetime of memory locations in the function.
-  void verifyMemoryLifetime(SILPassManager *passManager);
+  void verifyMemoryLifetime(CalleeCache *calleeCache);
 
   /// Run the SIL ownership verifier to check that all values with ownership
   /// have a linear lifetime. Regular OSSA invariants are checked separately in
@@ -1492,6 +1575,12 @@ public:
   ///
   /// This is a fast subset of the checks performed in the SILVerifier.
   void verifyCriticalEdges() const;
+
+  /// Validate that all SILUndefs stored in the function's type -> SILUndef map
+  /// have this function as their parent function.
+  ///
+  /// Please only call this from the SILVerifier.
+  void verifySILUndefMap() const;
 
   /// Pretty-print the SILFunction.
   void dump(bool Verbose) const;

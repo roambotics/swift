@@ -18,7 +18,7 @@
 #include "swift/Driver/Action.h"
 #include "swift/Driver/Job.h"
 #include "swift/Option/Options.h"
-#include "llvm/ADT/Triple.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Option/Option.h"
 
 #include <memory>
@@ -248,7 +248,7 @@ protected:
   /// Gets the response file path and command line argument for an invocation
   /// if the tool supports response files and if the command line length would
   /// exceed system limits.
-  llvm::Optional<Job::ResponseFileInfo>
+  std::optional<Job::ResponseFileInfo>
   getResponseFileInfo(const Compilation &C, const char *executablePath,
                       const InvocationInfo &invocationInfo,
                       const JobContext &context) const;

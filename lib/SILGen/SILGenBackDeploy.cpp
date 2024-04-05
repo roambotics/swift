@@ -121,12 +121,14 @@ static void emitBackDeployForwardApplyAndReturnOrThrow(
 
     // Emit resume block.
     SGF.B.emitBlock(resumeBB);
-    SGF.B.createEndApply(loc, token);
+    SGF.B.createEndApply(loc, token,
+                         SILType::getEmptyTupleType(SGF.getASTContext()));
     SGF.B.createBranch(loc, SGF.ReturnDest.getBlock());
 
     // Emit unwind block.
     SGF.B.emitBlock(unwindBB);
-    SGF.B.createEndApply(loc, token);
+    SGF.B.createEndApply(loc, token,
+                         SILType::getEmptyTupleType(SGF.getASTContext()));
     SGF.B.createBranch(loc, SGF.CoroutineUnwindDest.getBlock());
     return;
   }
@@ -221,13 +223,17 @@ void SILGenFunction::emitBackDeploymentThunk(SILDeclRef thunk) {
   // Generate the thunk prolog by collecting parameters.
   SmallVector<ManagedValue, 4> params;
   SmallVector<ManagedValue, 4> indirectParams;
-  collectThunkParams(loc, params, &indirectParams);
+  SmallVector<ManagedValue, 4> indirectErrorResults;
+  collectThunkParams(loc, params, &indirectParams, &indirectErrorResults);
 
-  // Build up the list of arguments that we're going to invoke the the real
+  // Build up the list of arguments that we're going to invoke the real
   // function with.
   SmallVector<SILValue, 8> paramsForForwarding;
   for (auto indirectParam : indirectParams) {
     paramsForForwarding.emplace_back(indirectParam.getLValueAddress());
+  }
+  for (auto indirectErrorResult : indirectErrorResults) {
+    paramsForForwarding.emplace_back(indirectErrorResult.getLValueAddress());
   }
 
   for (auto param : params) {
@@ -237,8 +243,9 @@ void SILGenFunction::emitBackDeploymentThunk(SILDeclRef thunk) {
     paramsForForwarding.emplace_back(param.forward(*this));
   }
 
-  prepareEpilog(getResultInterfaceType(AFD),
-                AFD->getEffectiveThrownInterfaceType(),
+  prepareEpilog(AFD,
+                getResultInterfaceType(AFD),
+                AFD->getEffectiveThrownErrorType(),
                 CleanupLocation(AFD));
 
   SILBasicBlock *availableBB = createBasicBlock("availableBB");

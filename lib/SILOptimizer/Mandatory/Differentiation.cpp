@@ -156,6 +156,19 @@ static bool diagnoseUnsupportedControlFlow(ADContext &context,
         isa<CheckedCastBranchInst>(term) ||
         isa<CheckedCastAddrBranchInst>(term) || isa<TryApplyInst>(term))
       continue;
+
+    // We can differentiate only indirect yields.
+    if (auto *yi = dyn_cast<YieldInst>(term)) {
+#ifndef NDEBUG
+      for (const auto &val : yi->getAllOperands()) {
+        // This should be diagnosed earlier in VJPCloner.
+        assert(yi->getYieldInfoForOperand(val).isAutoDiffSemanticResult() &&
+               "unsupported result");
+      }
+#endif
+      continue;
+    }
+
     // If terminator is an unsupported branching terminator, emit an error.
     if (term->isBranch()) {
       context.emitNondifferentiabilityError(
@@ -445,7 +458,7 @@ static SILValue reapplyFunctionConversion(
 ///
 /// Returns `None` on failure, signifying that a diagnostic has been emitted
 /// using `invoker`.
-static llvm::Optional<std::pair<SILValue, AutoDiffConfig>>
+static std::optional<std::pair<SILValue, AutoDiffConfig>>
 emitDerivativeFunctionReference(
     DifferentiationTransformer &transformer, SILBuilder &builder,
     const AutoDiffConfig &desiredConfig, AutoDiffDerivativeFunctionKind kind,
@@ -475,7 +488,7 @@ emitDerivativeFunctionReference(
               original, invoker,
               diag::
                   autodiff_function_noderivative_parameter_not_differentiable);
-          return llvm::None;
+          return std::nullopt;
         }
       }
       auto borrowedDiffFunc =
@@ -526,7 +539,7 @@ emitDerivativeFunctionReference(
         context.emitNondifferentiabilityError(
             original, invoker,
             diag::autodiff_opaque_function_not_differentiable);
-        return llvm::None;
+        return std::nullopt;
       }
       // Check and diagnose non-differentiable arguments.
       auto originalFnTy = originalFn->getLoweredFunctionType();
@@ -537,14 +550,24 @@ emitDerivativeFunctionReference(
                  .isDifferentiable(context.getModule())) {
           auto diag = context.emitNondifferentiabilityError(
               original, invoker, diag::autodiff_nondifferentiable_argument);
-          return llvm::None;
+          return std::nullopt;
         }
       }
       // Check and diagnose non-differentiable results.
+      unsigned firstSemanticParamResultIdx = originalFnTy->getNumResults();
+      unsigned firstYieldResultIndex = originalFnTy->getNumResults() +
+        originalFnTy->getNumAutoDiffSemanticResultsParameters();
       for (auto resultIndex : desiredResultIndices->getIndices()) {
         SILType resultType;
-        if (resultIndex >= originalFnTy->getNumResults()) {
-          auto semanticResultParamIdx = resultIndex - originalFnTy->getNumResults();
+        if (resultIndex >= firstYieldResultIndex) {
+          auto yieldResultIndex = resultIndex - firstYieldResultIndex;
+          auto yield = originalFnTy->getYields()[yieldResultIndex];
+          // We can only differentiate indirect yields. This should be diagnosed
+          // earlier in VJPCloner.
+          assert(yield.isAutoDiffSemanticResult() && "unsupported result");
+          resultType = yield.getSILStorageInterfaceType();
+        } else if (resultIndex >= firstSemanticParamResultIdx) {
+          auto semanticResultParamIdx = resultIndex - firstSemanticParamResultIdx;
           auto semanticResultParam =
               *std::next(originalFnTy->getAutoDiffSemanticResultsParameters().begin(),
                          semanticResultParamIdx);
@@ -553,10 +576,10 @@ emitDerivativeFunctionReference(
           resultType = originalFnTy->getResults()[resultIndex]
                            .getSILStorageInterfaceType();
         }
-        if (!resultType.isDifferentiable(context.getModule())) {
+        if (!resultType || !resultType.isDifferentiable(context.getModule())) {
           context.emitNondifferentiabilityError(
               original, invoker, diag::autodiff_nondifferentiable_result);
-          return llvm::None;
+          return std::nullopt;
         }
       }
       // Check and diagnose external declarations.
@@ -564,9 +587,9 @@ emitDerivativeFunctionReference(
         context.emitNondifferentiabilityError(
             original, invoker,
             diag::autodiff_external_nondifferentiable_function);
-        return llvm::None;
+        return std::nullopt;
       }
-      // Sanity check passed. Create a new differentiability witness and
+      // Soundness check passed. Create a new differentiability witness and
       // canonicalize it.
       GenericSignature contextualDerivativeGenSig = GenericSignature();
       if (invoker.getKind() ==
@@ -576,7 +599,8 @@ emitDerivativeFunctionReference(
                 .second->getDerivativeGenericSignature();
       auto derivativeConstrainedGenSig =
           autodiff::getConstrainedDerivativeGenericSignature(
-              originalFn->getLoweredFunctionType(), desiredParameterIndices,
+              originalFn->getLoweredFunctionType(),
+              desiredParameterIndices, desiredResultIndices,
               contextualDerivativeGenSig,
               LookUpConformanceInModule(context.getModule().getSwiftModule()));
       minimalWitness = SILDifferentiabilityWitness::createDefinition(
@@ -586,7 +610,7 @@ emitDerivativeFunctionReference(
           /*vjp*/ nullptr, /*isSerialized*/ false);
       if (transformer.canonicalizeDifferentiabilityWitness(
               minimalWitness, invoker, IsNotSerialized))
-        return llvm::None;
+        return std::nullopt;
     }
     assert(minimalWitness);
     if (original->getFunction()->isSerialized() &&
@@ -603,7 +627,7 @@ emitDerivativeFunctionReference(
           fragileKind,
           isa_and_nonnull<AbstractClosureExpr>(
               originalFRI->getLoc().getAsASTNode<Expr>()));
-      return llvm::None;
+      return std::nullopt;
     }
     // TODO(TF-482): Move generic requirement checking logic to
     // `getExactDifferentiabilityWitness` and
@@ -623,7 +647,7 @@ emitDerivativeFunctionReference(
             context, original->getType().castTo<SILFunctionType>(),
             minimalWitness->getDerivativeGenericSignature(), substMap, invoker,
             original.getLoc().getSourceLoc()))
-      return llvm::None;
+      return std::nullopt;
     DifferentiabilityWitnessFunctionKind witnessKind;
     switch (kind) {
     case AutoDiffDerivativeFunctionKind::JVP:
@@ -657,7 +681,7 @@ emitDerivativeFunctionReference(
     if (requirementDecl->getDerivativeFunctionConfigurations().empty()) {
       context.emitNondifferentiabilityError(
           original, invoker, diag::autodiff_protocol_member_not_differentiable);
-      return llvm::None;
+      return std::nullopt;
     }
     // Find the minimal derivative configuration: minimal parameter indices and
     // corresponding derivative generic signature. If it does not exist, produce
@@ -670,7 +694,7 @@ emitDerivativeFunctionReference(
       context.emitNondifferentiabilityError(
           original, invoker,
           diag::autodiff_member_subset_indices_not_differentiable);
-      return llvm::None;
+      return std::nullopt;
     }
     // Emit a `witness_method` instruction for the derivative function.
     auto originalType = witnessMethod->getType().castTo<SILFunctionType>();
@@ -703,7 +727,7 @@ emitDerivativeFunctionReference(
     if (methodDecl->getDerivativeFunctionConfigurations().empty()) {
       context.emitNondifferentiabilityError(
           original, invoker, diag::autodiff_class_member_not_differentiable);
-      return llvm::None;
+      return std::nullopt;
     }
     // Find the minimal derivative configuration: minimal parameter indices and
     // corresponding derivative generic signature. If it does not exist, produce
@@ -715,7 +739,7 @@ emitDerivativeFunctionReference(
       context.emitNondifferentiabilityError(
           original, invoker,
           diag::autodiff_member_subset_indices_not_differentiable);
-      return llvm::None;
+      return std::nullopt;
     }
     // Emit a `class_method` instruction for the derivative function.
     auto originalType = classMethod->getType().castTo<SILFunctionType>();
@@ -739,7 +763,7 @@ emitDerivativeFunctionReference(
   // Emit the general opaque function error.
   context.emitNondifferentiabilityError(
       original, invoker, diag::autodiff_opaque_function_not_differentiable);
-  return llvm::None;
+  return std::nullopt;
 }
 
 //===----------------------------------------------------------------------===//
@@ -856,7 +880,7 @@ static void emitFatalError(ADContext &context, SILFunction *f,
       /*genericSig*/ nullptr, SILFunctionType::ExtInfo::getThin(),
       SILCoroutineKind::None, ParameterConvention::Direct_Unowned, {},
       /*interfaceYields*/ {}, neverResultInfo,
-      /*interfaceErrorResults*/ llvm::None, {}, {}, context.getASTContext());
+      /*interfaceErrorResults*/ std::nullopt, {}, {}, context.getASTContext());
   auto fnBuilder = SILOptFunctionBuilder(context.getTransform());
   auto *fatalErrorFn = fnBuilder.getOrCreateFunction(
       loc, fatalErrorFuncName, SILLinkage::PublicExternal, fatalErrorFnType,
@@ -1174,18 +1198,18 @@ SILValue DifferentiationTransformer::promoteToDifferentiableFunction(
     // If derivative function value's type is not ABI-compatible with the
     // expected derivative function type (i.e. parameter and result conventions
     // do not match), perform reabstraction.
-    auto abiCompatibility = expectedDerivativeFnTy->isABICompatibleWith(
-        derivativeFn->getType().castTo<SILFunctionType>(), *dfi->getFunction());
+    auto abiCompatibility =
+        derivativeFn->getType().castTo<SILFunctionType>()->isABICompatibleWith(
+          expectedDerivativeFnTy, *dfi->getFunction());
     if (!abiCompatibility.isCompatible()) {
       SILOptFunctionBuilder fb(context.getTransform());
       auto newDerivativeFn = reabstractFunction(
           builder, fb, loc, derivativeFn, expectedDerivativeFnTy,
           [](SubstitutionMap substMap) { return substMap; });
       derivativeFn = newDerivativeFn;
-      assert(expectedDerivativeFnTy
-                 ->isABICompatibleWith(
-                     derivativeFn->getType().castTo<SILFunctionType>(),
-                     *dfi->getFunction())
+      assert(derivativeFn->getType().castTo<SILFunctionType>()
+                 ->isABICompatibleWith(expectedDerivativeFnTy,
+                                       *dfi->getFunction())
                  .isCompatible());
     }
 
@@ -1220,7 +1244,7 @@ SILValue DifferentiationTransformer::promoteToLinearFunction(
       parameterIndices, context.getTypeConverter(),
       LookUpConformanceInModule(builder.getModule().getSwiftModule()));
   auto transposeType = SILType::getPrimitiveObjectType(transposeFnType);
-  auto transposeFn = SILUndef::get(transposeType, builder.getFunction());
+  auto transposeFn = SILUndef::get(builder.getFunction(), transposeType);
   auto *newLinearFn = context.createLinearFunction(
       builder, loc, parameterIndices, origFnOperand, SILValue(transposeFn));
   context.getLinearFunctionInstWorklist().push_back(lfi);

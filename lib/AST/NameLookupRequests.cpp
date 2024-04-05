@@ -10,16 +10,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/AST/NameLookup.h"
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/Evaluator.h"
 #include "swift/AST/GenericParamList.h"
+#include "swift/AST/Module.h"
+#include "swift/AST/NameLookup.h"
 #include "swift/AST/PotentialMacroExpansions.h"
 #include "swift/AST/ProtocolConformance.h"
-#include "swift/AST/Evaluator.h"
-#include "swift/AST/Module.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/ClangImporter/ClangImporterRequests.h"
 #include "swift/Subsystems.h"
 
@@ -60,7 +61,7 @@ void SuperclassDeclRequest::noteCycleStep(DiagnosticEngine &diags) const {
                  decl->getDescriptiveKind(), decl->getName());
 }
 
-llvm::Optional<ClassDecl *> SuperclassDeclRequest::getCachedResult() const {
+std::optional<ClassDecl *> SuperclassDeclRequest::getCachedResult() const {
   auto nominalDecl = std::get<0>(getStorage());
 
   if (auto *classDecl = dyn_cast<ClassDecl>(nominalDecl))
@@ -71,7 +72,7 @@ llvm::Optional<ClassDecl *> SuperclassDeclRequest::getCachedResult() const {
     if (protocolDecl->LazySemanticInfo.SuperclassDecl.getInt())
       return protocolDecl->LazySemanticInfo.SuperclassDecl.getPointer();
 
-  return llvm::None;
+  return std::nullopt;
 }
 
 void SuperclassDeclRequest::cacheResult(ClassDecl *value) const {
@@ -88,11 +89,11 @@ void SuperclassDeclRequest::cacheResult(ClassDecl *value) const {
 // InheritedProtocolsRequest computation.
 //----------------------------------------------------------------------------//
 
-llvm::Optional<ArrayRef<ProtocolDecl *>>
+std::optional<ArrayRef<ProtocolDecl *>>
 InheritedProtocolsRequest::getCachedResult() const {
   auto proto = std::get<0>(getStorage());
   if (!proto->areInheritedProtocolsValid())
-    return llvm::None;
+    return std::nullopt;
 
   return proto->InheritedProtocols;
 }
@@ -111,11 +112,11 @@ void InheritedProtocolsRequest::writeDependencySink(
   }
 }
 
-llvm::Optional<ArrayRef<ValueDecl *>>
+std::optional<ArrayRef<ValueDecl *>>
 ProtocolRequirementsRequest::getCachedResult() const {
   auto proto = std::get<0>(getStorage());
   if (!proto->areProtocolRequirementsValid())
-    return llvm::None;
+    return std::nullopt;
 
   return proto->ProtocolRequirements;
 }
@@ -130,7 +131,7 @@ void ProtocolRequirementsRequest::cacheResult(ArrayRef<ValueDecl *> PDs) const {
 // Missing designated initializers computation
 //----------------------------------------------------------------------------//
 
-llvm::Optional<bool>
+std::optional<bool>
 HasMissingDesignatedInitializersRequest::getCachedResult() const {
   auto classDecl = std::get<0>(getStorage());
   return classDecl->getCachedHasMissingDesignatedInitializers();
@@ -156,6 +157,13 @@ HasMissingDesignatedInitializersRequest::evaluate(Evaluator &evaluator,
   if (!scope.isPublic())
     return false;
 
+  // Make sure any implicit constructors are synthesized.
+  (void)evaluateOrDefault(
+      evaluator,
+      ResolveImplicitMemberRequest{subject,
+                                   ImplicitMemberAction::ResolveImplicitInit},
+      {});
+
   auto constructors = subject->lookupDirect(DeclBaseName::createConstructor());
   return llvm::any_of(constructors, [&](ValueDecl *decl) {
     auto init = cast<ConstructorDecl>(decl);
@@ -172,7 +180,7 @@ HasMissingDesignatedInitializersRequest::evaluate(Evaluator &evaluator,
 // Extended nominal computation.
 //----------------------------------------------------------------------------//
 
-llvm::Optional<NominalTypeDecl *>
+std::optional<NominalTypeDecl *>
 ExtendedNominalRequest::getCachedResult() const {
   // Note: if we fail to compute any nominal declaration, it's considered
   // a cache miss. This allows us to recompute the extended nominal types
@@ -183,7 +191,7 @@ ExtendedNominalRequest::getCachedResult() const {
   // fixed point.
   auto ext = std::get<0>(getStorage());
   if (!ext->hasBeenBound() || !ext->getExtendedNominal())
-    return llvm::None;
+    return std::nullopt;
   return ext->getExtendedNominal();
 }
 
@@ -210,11 +218,11 @@ void ExtendedNominalRequest::writeDependencySink(
 // Destructor computation.
 //----------------------------------------------------------------------------//
 
-llvm::Optional<DestructorDecl *> GetDestructorRequest::getCachedResult() const {
+std::optional<DestructorDecl *> GetDestructorRequest::getCachedResult() const {
   auto *classDecl = std::get<0>(getStorage());
   auto results = classDecl->lookupDirect(DeclBaseName::createDestructor());
   if (results.empty())
-    return llvm::None;
+    return std::nullopt;
 
   return cast<DestructorDecl>(results.front());
 }
@@ -228,7 +236,7 @@ void GetDestructorRequest::cacheResult(DestructorDecl *value) const {
 // GenericParamListRequest computation.
 //----------------------------------------------------------------------------//
 
-llvm::Optional<GenericParamList *>
+std::optional<GenericParamList *>
 GenericParamListRequest::getCachedResult() const {
   using GenericParamsState = GenericContext::GenericParamsState;
   auto *decl = std::get<0>(getStorage());
@@ -238,7 +246,7 @@ GenericParamListRequest::getCachedResult() const {
     return decl->GenericParamsAndState.getPointer();
 
   case GenericParamsState::Parsed:
-    return llvm::None;
+    return std::nullopt;
   }
 }
 
@@ -314,7 +322,7 @@ ArrayRef<FileUnit *> OperatorLookupDescriptor::getFiles() const {
     return module->getFiles();
 
   // Return an ArrayRef pointing to the FileUnit in the union.
-  return llvm::makeArrayRef(*fileOrModule.getAddrOfPtr1());
+  return llvm::ArrayRef(*fileOrModule.getAddrOfPtr1());
 }
 
 void swift::simple_display(llvm::raw_ostream &out,

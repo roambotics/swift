@@ -1,11 +1,8 @@
 include(macCatalystUtils)
 
 # Workaround a cmake bug, see the corresponding function in swift-syntax
-function(force_target_link_libraries TARGET)
-  target_link_libraries(${TARGET} ${ARGN})
-
-  cmake_parse_arguments(ARGS "PUBLIC;PRIVATE;INTERFACE" "" "" ${ARGN})
-  foreach(DEPENDENCY ${ARGS_UNPARSED_ARGUMENTS})
+function(force_add_dependencies TARGET)
+  foreach(DEPENDENCY ${ARGN})
     string(REGEX REPLACE [<>:\"/\\|?*] _ sanitized ${DEPENDENCY})
     add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forced-${sanitized}-dep.swift
       COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/forced-${sanitized}-dep.swift
@@ -15,6 +12,13 @@ function(force_target_link_libraries TARGET)
       ${CMAKE_CURRENT_BINARY_DIR}/forced-${sanitized}-dep.swift
     )
   endforeach()
+endfunction()
+
+function(force_target_link_libraries TARGET)
+  target_link_libraries(${TARGET} ${ARGN})
+
+  cmake_parse_arguments(ARGS "PUBLIC;PRIVATE;INTERFACE" "" "" ${ARGN})
+  force_add_dependencies(${TARGET} ${ARGS_UNPARSED_ARGUMENTS})
 endfunction()
 
 # Add compile options shared between libraries and executables.
@@ -31,6 +35,17 @@ function(_add_host_swift_compile_options name)
       "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xfrontend -disable-implicit-backtracing-module-import>")
   endif()
 
+   if(SWIFT_ANALYZE_CODE_COVERAGE)
+     set(_cov_flags $<$<COMPILE_LANGUAGE:Swift>:-profile-generate -profile-coverage-mapping>)
+     target_compile_options(${name} PRIVATE ${_cov_flags})
+     target_link_options(${name} PRIVATE ${_cov_flags})
+  endif()
+
+  if("${BRIDGING_MODE}" STREQUAL "PURE")
+    target_compile_options(${name} PRIVATE
+      "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xcc -DPURE_BRIDGING_MODE>")
+  endif()
+
   # The compat56 library is not available in current toolchains. The stage-0
   # compiler will build fine since the builder compiler is not aware of the 56
   # compat library, but the stage-1 and subsequent stage compilers will fail as
@@ -45,7 +60,21 @@ function(_add_host_swift_compile_options name)
     $<$<COMPILE_LANGUAGE:Swift>:none>)
 
   target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:Swift>:-target;${SWIFT_HOST_TRIPLE}>)
+  if(BOOTSTRAPPING_MODE STREQUAL "CROSSCOMPILE")
+    add_dependencies(${name} swift-stdlib-${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}-${SWIFT_HOST_VARIANT_ARCH})
+    target_compile_options(${name} PRIVATE
+      $<$<COMPILE_LANGUAGE:Swift>:-sdk;${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${SWIFT_HOST_VARIANT_ARCH}_PATH};>
+      $<$<COMPILE_LANGUAGE:Swift>:-resource-dir;${SWIFTLIB_DIR};>)
+    if(SWIFT_HOST_VARIANT_SDK STREQUAL "ANDROID" AND NOT "${SWIFT_ANDROID_NDK_PATH}" STREQUAL "")
+      swift_android_tools_path(${SWIFT_HOST_VARIANT_ARCH} tools_path)
+      target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:Swift>:-tools-directory;${tools_path};>)
+    endif()
+  endif()
   _add_host_variant_swift_sanitizer_flags(${name})
+
+  target_compile_options(${name} PRIVATE
+    $<$<COMPILE_LANGUAGE:Swift>:-color-diagnostics>
+  )
 endfunction()
 
 function(_set_pure_swift_link_flags name relpath_to_lib_dir)
@@ -160,6 +189,9 @@ function(add_pure_swift_host_library name)
     add_dependencies(${name} ${LLVM_COMMON_DEPENDS})
   endif()
 
+  # Depends on all '*.h' files in 'include/module.modulemap'.
+  force_add_dependencies(${name} importedHeaderDependencies)
+
   # Workaround to touch the library and its objects so that we don't
   # continually rebuild (again, see corresponding change in swift-syntax).
   add_custom_command(
@@ -192,6 +224,7 @@ function(add_pure_swift_host_library name)
     set(module_base "${module_dir}/${name}.swiftmodule")
     set(module_file "${module_base}/${module_triple}.swiftmodule")
     set(module_interface_file "${module_base}/${module_triple}.swiftinterface")
+    set(module_private_interface_file "${module_base}/${module_triple}.private.swiftinterface")
     set(module_sourceinfo_file "${module_base}/${module_triple}.swiftsourceinfo")
 
     set_target_properties(${name} PROPERTIES
@@ -216,14 +249,46 @@ function(add_pure_swift_host_library name)
         -enable-library-evolution;
         -emit-module-path;${module_file};
         -emit-module-source-info-path;${module_sourceinfo_file};
-        -emit-module-interface-path;${module_interface_file}
+        -emit-module-interface-path;${module_interface_file};
+        -emit-private-module-interface-path;${module_private_interface_file}
         >)
+  else()
+    # Emit a swiftmodule in the current directory.
+    set_target_properties(${name} PROPERTIES
+        Swift_MODULE_NAME ${name}
+        Swift_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    set(module_file "${CMAKE_CURRENT_BINARY_DIR}/${name}.swiftmodule")
+  endif()
+
+  # Downstream linking should include the swiftmodule in debug builds to allow lldb to
+  # work correctly. Only do this on Darwin since neither gold (currently used by default
+  # on Linux), nor the default Windows linker 'link' support '-add_ast_path'.
+  is_build_type_with_debuginfo("${CMAKE_BUILD_TYPE}" debuginfo)
+  if(debuginfo AND SWIFT_HOST_VARIANT_SDK IN_LIST SWIFT_DARWIN_PLATFORMS)
+    target_link_options(${name} PUBLIC "SHELL:-Xlinker -add_ast_path -Xlinker ${module_file}")
   endif()
 
   if(LLVM_USE_LINKER)
     target_link_options(${name} PRIVATE
       "-use-ld=${LLVM_USE_LINKER}"
     )
+  endif()
+
+  # This replicates he code existing in LLVM llvm/cmake/modules/HandleLLVMOptions.cmake
+  # The second part of the clause replicates the LINKER_IS_LLD_LINK of the
+  # original.
+  if(LLVM_BUILD_INSTRUMENTED AND NOT (SWIFT_COMPILER_IS_MSVC_LIKE AND SWIFT_USE_LINKER STREQUAL "lld"))
+    string(TOUPPER "${LLVM_BUILD_INSTRUMENTED}" uppercase_LLVM_BUILD_INSTRUMENTED)
+    if(LLVM_ENABLE_IR_PGO OR uppercase_LLVM_BUILD_INSTRUMENTED STREQUAL "IR")
+      target_link_options(${name} PRIVATE
+        "SHELL:-Xclang-linker -fprofile-generate=\"${LLVM_PROFILE_DATA_DIR}\"")
+    elseif(uppercase_LLVM_BUILD_INSTRUMENTED STREQUAL "CSIR")
+      target_link_options(${name} PRIVATE
+        "SHELL:-Xclang-linker -fcs-profile-generate=\"${LLVM_CSPROFILE_DATA_DIR}\"")
+    else()
+      target_link_options(${name} PRIVATE
+        "SHELL:-Xclang-linker -fprofile-instr-generate=\"${LLVM_PROFILE_FILE_PATTERN}\"")
+    endif()
   endif()
 
   # Export this target.
@@ -302,6 +367,9 @@ function(add_pure_swift_host_tool name)
   if (LLVM_COMMON_DEPENDS)
     add_dependencies(${name} ${LLVM_COMMON_DEPENDS})
   endif()
+
+  # Depends on all '*.h' files in 'include/module.modulemap'.
+  force_add_dependencies(${name} importedHeaderDependencies)
 
   # Link against dependencies.
   target_link_libraries(${name} PUBLIC

@@ -37,8 +37,8 @@ T getEmptyValue() {
   return T();
 }
 template <>
-ExecutorRef getEmptyValue() {
-  return ExecutorRef::generic();
+SerialExecutorRef getEmptyValue() {
+  return SerialExecutorRef::generic();
 }
 } // namespace
 
@@ -81,6 +81,13 @@ SWIFT_CC(swift)
 static void
 swift_task_enqueueGlobal_override(Job *job,
                                   swift_task_enqueueGlobal_original original) {
+  Ran = true;
+}
+
+SWIFT_CC(swift)
+static void
+swift_task_checkIsolated_override(SerialExecutorRef executor,
+                                      swift_task_checkIsolated_original original) {
   Ran = true;
 }
 
@@ -130,6 +137,8 @@ protected:
         swift_task_enqueueGlobalWithDelay_override;
     swift_task_enqueueMainExecutor_hook =
         swift_task_enqueueMainExecutor_override;
+    swift_task_checkIsolated_hook =
+        swift_task_checkIsolated_override;
 #ifdef RUN_ASYNC_MAIN_DRAIN_QUEUE_TEST
     swift_task_asyncMainDrainQueue_hook =
         swift_task_asyncMainDrainQueue_override_fn;
@@ -147,11 +156,22 @@ static Job fakeJob{{JobKind::DefaultActorInline},
                    nullptr};
 
 TEST_F(CompatibilityOverrideConcurrencyTest, test_swift_task_enqueue) {
-  swift_task_enqueue(&fakeJob, ExecutorRef::generic());
+  swift_task_enqueue(&fakeJob, SerialExecutorRef::generic());
 }
 
 TEST_F(CompatibilityOverrideConcurrencyTest, test_swift_job_run) {
-  swift_job_run(&fakeJob, ExecutorRef::generic());
+  swift_job_run(&fakeJob, SerialExecutorRef::generic());
+}
+
+TEST_F(CompatibilityOverrideConcurrencyTest,
+       test_swift_job_run_on_task_executor) {
+  swift_job_run_on_task_executor(&fakeJob, TaskExecutorRef::undefined());
+}
+
+TEST_F(CompatibilityOverrideConcurrencyTest,
+       test_swift_job_run_on_serial_and_task_executor) {
+  swift_job_run_on_serial_and_task_executor(
+      &fakeJob, SerialExecutorRef::generic(), TaskExecutorRef::undefined());
 }
 
 TEST_F(CompatibilityOverrideConcurrencyTest, test_swift_task_getCurrentExecutor) {
@@ -159,7 +179,7 @@ TEST_F(CompatibilityOverrideConcurrencyTest, test_swift_task_getCurrentExecutor)
 }
 
 TEST_F(CompatibilityOverrideConcurrencyTest, test_swift_task_switch) {
-  swift_task_switch(nullptr, nullptr, ExecutorRef::generic());
+  swift_task_switch(nullptr, nullptr, SerialExecutorRef::generic());
 }
 
 TEST_F(CompatibilityOverrideConcurrencyTest, test_swift_task_enqueueGlobal) {
@@ -169,6 +189,11 @@ TEST_F(CompatibilityOverrideConcurrencyTest, test_swift_task_enqueueGlobal) {
 TEST_F(CompatibilityOverrideConcurrencyTest,
        test_swift_task_enqueueGlobalWithDelay) {
   swift_task_enqueueGlobalWithDelay(0, &fakeJob);
+}
+
+TEST_F(CompatibilityOverrideConcurrencyTest,
+       test_swift_task_checkIsolated) {
+  swift_task_checkIsolated(SerialExecutorRef::generic());
 }
 
 TEST_F(CompatibilityOverrideConcurrencyTest,
@@ -275,6 +300,18 @@ TEST_F(CompatibilityOverrideConcurrencyTest, test_swift_task_localsCopyTo) {
 
 TEST_F(CompatibilityOverrideConcurrencyTest, task_hasTaskGroupStatusRecord) {
   swift_task_hasTaskGroupStatusRecord();
+}
+
+TEST_F(CompatibilityOverrideConcurrencyTest, task_getPreferredTaskExecutor) {
+  swift_task_getPreferredTaskExecutor();
+}
+
+TEST_F(CompatibilityOverrideConcurrencyTest, task_pushTaskExecutorPreference) {
+  swift_task_pushTaskExecutorPreference(TaskExecutorRef::undefined());
+}
+
+TEST_F(CompatibilityOverrideConcurrencyTest, task_popTaskExecutorPreference) {
+  swift_task_popTaskExecutorPreference(nullptr);
 }
 
 TEST_F(CompatibilityOverrideConcurrencyTest, test_swift_task_cancel) {

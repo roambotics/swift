@@ -100,11 +100,11 @@ public:
                  SILBuilder *Builder)
       : Loc(Loc), Builder(Builder), BeginApply(BeginApply) {}
 
-  static llvm::Optional<BeginApplySite> get(FullApplySite AI, SILLocation Loc,
-                                            SILBuilder *Builder) {
+  static std::optional<BeginApplySite> get(FullApplySite AI, SILLocation Loc,
+                                           SILBuilder *Builder) {
     auto *BeginApply = dyn_cast<BeginApplyInst>(AI);
     if (!BeginApply)
-      return llvm::None;
+      return std::nullopt;
     return BeginApplySite(BeginApply, Loc, Builder);
   }
 
@@ -207,13 +207,16 @@ public:
     // instructions in the caller.  That means this entire path is
     // unreachable.
     if (isa<ReturnInst>(terminator) || isa<UnwindInst>(terminator)) {
-      bool isNormal = isa<ReturnInst>(terminator);
-      auto returnBB = isNormal ? EndApplyReturnBB : AbortApplyReturnBB;
+      ReturnInst *retInst = dyn_cast<ReturnInst>(terminator);
+      auto *returnBB = retInst ? EndApplyReturnBB : AbortApplyReturnBB;
+      if (retInst && EndApply)
+        EndApply->replaceAllUsesWith(getMappedValue(retInst->getOperand()));
       if (returnBB) {
         Builder->createBranch(Loc, returnBB);
       } else {
         Builder->createUnreachable(Loc);
       }
+
       return true;
     }
 
@@ -245,8 +248,7 @@ public:
 
       // Replace all the yielded values in the callee with undef.
       for (auto calleeYield : BeginApply->getYieldedValues()) {
-        calleeYield->replaceAllUsesWith(
-            SILUndef::get(calleeYield->getType(), Builder->getFunction()));
+        calleeYield->replaceAllUsesWith(SILUndef::get(calleeYield));
       }
     }
 
@@ -276,7 +278,7 @@ class SILInlineCloner
   // The original, noninlined apply site. These become invalid after fixUp,
   // which is called as the last step in SILCloner::cloneFunctionBody.
   FullApplySite Apply;
-  llvm::Optional<BeginApplySite> BeginApply;
+  std::optional<BeginApplySite> BeginApply;
 
   InstructionDeleter &deleter;
 
@@ -626,6 +628,29 @@ void SILInlineCloner::visitTerminator(SILBasicBlock *BB) {
       return;
     }
   }
+
+  // Modify throw_addr terminators to branch to the error-return BB, rather than
+  // trying to clone the ThrowAddrInst.
+  if (auto *TAI = dyn_cast<ThrowAddrInst>(Terminator)) {
+    SILLocation Loc = getOpLocation(TAI->getLoc());
+    switch (Apply.getKind()) {
+    case FullApplySiteKind::ApplyInst:
+      assert(cast<ApplyInst>(Apply)->isNonThrowing()
+             && "apply of a function with error result must be non-throwing");
+      getBuilder().createUnreachable(Loc);
+      return;
+    case FullApplySiteKind::BeginApplyInst:
+      assert(cast<BeginApplyInst>(Apply)->isNonThrowing()
+             && "apply of a function with error result must be non-throwing");
+      getBuilder().createUnreachable(Loc);
+      return;
+    case FullApplySiteKind::TryApplyInst:
+      auto tryAI = cast<TryApplyInst>(Apply);
+      getBuilder().createBranch(Loc, tryAI->getErrorBB());
+      return;
+    }
+  }
+
   // Otherwise use normal visitor, which clones the existing instruction
   // but remaps basic blocks and values.
   visit(Terminator);
@@ -702,15 +727,15 @@ SILValue SILInlineCloner::borrowFunctionArgument(SILValue callArg,
                                : Scope::None;
   auto scope = scopeForArgument(scopeForOwnership, callArg, index,
                                 Apply.getFunction(), getCalleeFunction());
-  bool isLexical;
+  IsLexical_t isLexical;
   switch (scope) {
   case Scope::None:
     return SILValue();
   case Scope::Bare:
-    isLexical = false;
+    isLexical = IsNotLexical;
     break;
   case Scope::Lexical:
-    isLexical = true;
+    isLexical = IsLexical;
     break;
   }
   SILBuilderWithScope beginBuilder(Apply.getInstruction(), getBuilder());
@@ -721,16 +746,16 @@ SILValue SILInlineCloner::moveFunctionArgument(SILValue callArg,
                                                unsigned index) {
   auto scope = scopeForArgument(Scope::None, callArg, index,
                                 Apply.getFunction(), getCalleeFunction());
-  bool isLexical;
+  IsLexical_t isLexical;
   switch (scope) {
   case Scope::None:
     return SILValue();
   case Scope::Bare:
     assert(false && "Non-lexical move produced during inlining!?");
-    isLexical = false;
+    isLexical = IsNotLexical;
     break;
   case Scope::Lexical:
-    isLexical = true;
+    isLexical = IsLexical;
     break;
   }
   SILBuilderWithScope beginBuilder(Apply.getInstruction(), getBuilder());
@@ -881,7 +906,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
   case SILInstructionKind::CopyableToMoveOnlyWrapperValueInst:
   case SILInstructionKind::MoveOnlyWrapperToCopyableValueInst:
-  case SILInstructionKind::TestSpecificationInst:
+  case SILInstructionKind::SpecifyTestInst:
   case SILInstructionKind::MoveOnlyWrapperToCopyableAddrInst:
   case SILInstructionKind::CopyableToMoveOnlyWrapperAddrInst:
   case SILInstructionKind::MoveOnlyWrapperToCopyableBoxInst:
@@ -1000,6 +1025,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::UnreachableInst:
   case SILInstructionKind::ReturnInst:
   case SILInstructionKind::ThrowInst:
+  case SILInstructionKind::ThrowAddrInst:
   case SILInstructionKind::UnwindInst:
   case SILInstructionKind::YieldInst:
   case SILInstructionKind::EndCOWMutationInst:
@@ -1024,6 +1050,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::AllocRefInst:
   case SILInstructionKind::AllocRefDynamicInst:
   case SILInstructionKind::AllocStackInst:
+  case SILInstructionKind::AllocVectorInst:
   case SILInstructionKind::AllocPackInst:
   case SILInstructionKind::AllocPackMetadataInst:
   case SILInstructionKind::BeginApplyInst:
@@ -1042,6 +1069,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::CopyBlockWithoutEscapingInst:
   case SILInstructionKind::CopyAddrInst:
   case SILInstructionKind::ExplicitCopyAddrInst:
+  case SILInstructionKind::TupleAddrConstructorInst:
   case SILInstructionKind::MarkUnresolvedMoveAddrInst:
   case SILInstructionKind::RetainValueInst:
   case SILInstructionKind::RetainValueAddrInst:
@@ -1123,6 +1151,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::AwaitAsyncContinuationInst:
   case SILInstructionKind::HopToExecutorInst:
   case SILInstructionKind::ExtractExecutorInst:
+  case SILInstructionKind::FunctionExtractIsolationInst:
   case SILInstructionKind::HasSymbolInst:
   case SILInstructionKind::UnownedCopyValueInst:
   case SILInstructionKind::WeakCopyValueInst:
@@ -1163,6 +1192,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::MarkUninitializedInst:
     llvm_unreachable("not valid in canonical sil");
   case SILInstructionKind::ObjectInst:
+  case SILInstructionKind::VectorInst:
     llvm_unreachable("not valid in a function");
   }
 

@@ -17,9 +17,9 @@
 #ifndef SWIFT_SIL_SILVALUE_H
 #define SWIFT_SIL_SILVALUE_H
 
+#include "swift/Basic/ArrayRefView.h"
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/Range.h"
-#include "swift/Basic/ArrayRefView.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/SIL/SILAllocated.h"
 #include "swift/SIL/SILArgumentConvention.h"
@@ -27,10 +27,10 @@
 #include "swift/SIL/SILType.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Hashing.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/raw_ostream.h"
+#include <optional>
 
 namespace swift {
 
@@ -574,7 +574,7 @@ public:
 
   /// Return the instruction that defines this value and the appropriate
   /// result index, or None if it is not defined by an instruction.
-  llvm::Optional<DefiningInstructionResult> getDefiningInstructionResult();
+  std::optional<DefiningInstructionResult> getDefiningInstructionResult();
 
   /// Returns the ValueOwnershipKind that describes this SILValue's ownership
   /// semantics if the SILValue has ownership semantics. Returns is a value
@@ -1019,6 +1019,13 @@ ValueOwnershipKind::getForwardingOperandOwnership(bool allowUnowned) const {
 /// A formal SIL reference to a value, suitable for use as a stored
 /// operand.
 class Operand {
+public:
+  enum { numCustomBits = 8 };
+  enum { maxBitfieldID = std::numeric_limits<uint64_t>::max() >> numCustomBits };
+
+private:
+  template <class, class> friend class SILBitfield;
+
   /// The value used as this operand.
   SILValue TheValue;
 
@@ -1035,10 +1042,17 @@ class Operand {
   /// FIXME: this could be space-compressed.
   SILInstruction *Owner;
 
+  uint64_t customBits : numCustomBits;
+
+  // For details see SILNode::lastInitializedBitfieldID
+  uint64_t lastInitializedBitfieldID : (64 - numCustomBits);
+
 public:
-  Operand(SILInstruction *owner) : Owner(owner) {}
+  Operand(SILInstruction *owner)
+      : Owner(owner), customBits(0), lastInitializedBitfieldID(0) {}
   Operand(SILInstruction *owner, SILValue theValue)
-      : TheValue(theValue), Owner(owner) {
+      : TheValue(theValue), Owner(owner),
+        customBits(0), lastInitializedBitfieldID(0) {
     insertIntoCurrent();
   }
 
@@ -1135,16 +1149,26 @@ public:
   SILBasicBlock *getParentBlock() const;
   SILFunction *getParentFunction() const;
 
+  unsigned getCustomBits() const { return customBits; }
+  void setCustomBits(unsigned bits) {customBits = bits; }
+
+  // Called when transferring basic blocks from one function to another.
+  void resetBitfields() {
+    lastInitializedBitfieldID = 0;
+  }
+
+  SILFunction *getFunction() const;
+
   void print(llvm::raw_ostream &os) const;
   SWIFT_DEBUG_DUMP;
 
 private:
   void removeFromCurrent() {
     if (!Back)
-      return;
-    *Back = NextUse;
-    if (NextUse)
-      NextUse->Back = Back;
+       return;
+     *Back = NextUse;
+     if (NextUse)
+       NextUse->Back = Back;
   }
 
   void insertIntoCurrent() {
@@ -1196,7 +1220,7 @@ public:
 
   ValueBaseUseIterator &operator++() {
     assert(Cur && "incrementing past end()!");
-    Cur = Cur->NextUse;
+    Cur = Cur->getNextUse();
     return *this;
   }
 
@@ -1231,7 +1255,7 @@ public:
   ConsumingUseIterator &operator++() {
     assert(Cur && "incrementing past end()!");
     assert(Cur->isLifetimeEnding());
-    while ((Cur = Cur->NextUse)) {
+    while ((Cur = Cur->getNextUse())) {
       if (Cur->isLifetimeEnding())
         break;
     }
@@ -1249,7 +1273,7 @@ inline ValueBase::consuming_use_iterator
 ValueBase::consuming_use_begin() const {
   auto cur = FirstUse;
   while (cur && !cur->isLifetimeEnding()) {
-    cur = cur->NextUse;
+    cur = cur->getNextUse();
   }
   return ValueBase::consuming_use_iterator(cur);
 }
@@ -1264,7 +1288,7 @@ public:
   NonConsumingUseIterator &operator++() {
     assert(Cur && "incrementing past end()!");
     assert(!Cur->isLifetimeEnding());
-    while ((Cur = Cur->NextUse)) {
+    while ((Cur = Cur->getNextUse())) {
       if (!Cur->isLifetimeEnding())
         break;
     }
@@ -1282,7 +1306,7 @@ inline ValueBase::non_consuming_use_iterator
 ValueBase::non_consuming_use_begin() const {
   auto cur = FirstUse;
   while (cur && cur->isLifetimeEnding()) {
-    cur = cur->NextUse;
+    cur = cur->getNextUse();
   }
   return ValueBase::non_consuming_use_iterator(cur);
 }
@@ -1297,7 +1321,7 @@ public:
   explicit TypeDependentUseIterator(Operand *cur) : ValueBaseUseIterator(cur) {}
   TypeDependentUseIterator &operator++() {
     assert(Cur && "incrementing past end()!");
-    while ((Cur = Cur->NextUse)) {
+    while ((Cur = Cur->getNextUse())) {
       if (Cur->isTypeDependent())
         break;
     }
@@ -1315,7 +1339,7 @@ inline ValueBase::typedependent_use_iterator
 ValueBase::typedependent_use_begin() const {
   auto cur = FirstUse;
   while (cur && !cur->isTypeDependent()) {
-    cur = cur->NextUse;
+    cur = cur->getNextUse();
   }
   return ValueBase::typedependent_use_iterator(cur);
 }
@@ -1332,7 +1356,7 @@ public:
   NonTypeDependentUseIterator &operator++() {
     assert(Cur && "incrementing past end()!");
     assert(!Cur->isTypeDependent());
-    while ((Cur = Cur->NextUse)) {
+    while ((Cur = Cur->getNextUse())) {
       if (!Cur->isTypeDependent())
         break;
     }
@@ -1350,7 +1374,7 @@ inline ValueBase::non_typedependent_use_iterator
 ValueBase::non_typedependent_use_begin() const {
   auto cur = FirstUse;
   while (cur && cur->isTypeDependent()) {
-    cur = cur->NextUse;
+    cur = cur->getNextUse();
   }
   return ValueBase::non_typedependent_use_iterator(cur);
 }
@@ -1543,15 +1567,19 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, SILValue V) {
 
 /// Used internally in e.g. the SIL parser and deserializer to handle forward-
 /// referenced values.
+///
 /// A PlaceholderValue must not appear in valid SIL.
 class PlaceholderValue : public ValueBase {
+  SILFunction *parentFunction;
   static int numPlaceholderValuesAlive;
 
 public:
-  PlaceholderValue(SILType type);
+  PlaceholderValue(SILFunction *parentFunction, SILType type);
   ~PlaceholderValue();
 
   static int getNumPlaceholderValuesAlive() { return numPlaceholderValuesAlive; }
+
+  SILFunction *getParent() const { return parentFunction; }
 
   static bool classof(const SILArgument *) = delete;
   static bool classof(const SILInstruction *) = delete;
@@ -1606,6 +1634,15 @@ namespace llvm {
     enum { NumLowBitsAvailable = swift::SILValue::NumLowBitsAvailable };
   };
 
+  /// A SILValue can be checked if a value is present, so we can use it with
+  /// dyn_cast_or_null.
+  template <>
+  struct ValueIsPresent<swift::SILValue> {
+    using SILValue = swift::SILValue;
+    using UnwrappedType = SILValue;
+    static inline bool isPresent(const SILValue &t) { return bool(t); }
+    static inline decltype(auto) unwrapValue(SILValue &t) { return t; }
+  };
 } // end namespace llvm
 
 #endif

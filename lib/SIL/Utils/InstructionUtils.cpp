@@ -24,6 +24,8 @@
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILVisitor.h"
 
+#include "clang/AST/DeclObjC.h"
+
 using namespace swift;
 
 SILValue swift::lookThroughOwnershipInsts(SILValue v) {
@@ -509,6 +511,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::ProjectExistentialBoxInst:
   case SILInstructionKind::ObjCProtocolInst:
   case SILInstructionKind::ObjectInst:
+  case SILInstructionKind::VectorInst:
   case SILInstructionKind::TupleInst:
   case SILInstructionKind::TupleExtractInst:
   case SILInstructionKind::StructInst:
@@ -524,6 +527,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::UnreachableInst:
   case SILInstructionKind::ReturnInst:
   case SILInstructionKind::ThrowInst:
+  case SILInstructionKind::ThrowAddrInst:
   case SILInstructionKind::YieldInst:
   case SILInstructionKind::UnwindInst:
   case SILInstructionKind::BranchInst:
@@ -566,6 +570,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::PackElementSetInst:
   case SILInstructionKind::PackLengthInst:
   case SILInstructionKind::DebugStepInst:
+  case SILInstructionKind::FunctionExtractIsolationInst:
     return RuntimeEffect::NoEffect;
       
   case SILInstructionKind::OpenExistentialMetatypeInst:
@@ -577,7 +582,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::DebugValueInst:
     // Ignore runtime calls of debug_value
     return RuntimeEffect::NoEffect;
-  case SILInstructionKind::TestSpecificationInst:
+  case SILInstructionKind::SpecifyTestInst:
     // Ignore runtime calls of test-only instructions
     return RuntimeEffect::NoEffect;
 
@@ -699,6 +704,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     return RuntimeEffect::MetaData;
 
   case SILInstructionKind::AllocStackInst:
+  case SILInstructionKind::AllocVectorInst:
   case SILInstructionKind::ProjectBoxInst:
     if (!cast<SingleValueInstruction>(inst)->getType().
           isLoadable(*inst->getFunction())) {
@@ -740,11 +746,20 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
 
   case SILInstructionKind::CopyAddrInst: {
     auto *ca = cast<CopyAddrInst>(inst);
+    if (ca->getSrc()->getType().isTrivial(ca->getFunction()))
+      return RuntimeEffect::NoEffect;
     impactType = ca->getSrc()->getType();
     if (!ca->isInitializationOfDest())
       return RuntimeEffect::MetaData | RuntimeEffect::Releasing;
     if (!ca->isTakeOfSrc())
       return RuntimeEffect::MetaData | RuntimeEffect::RefCounting;
+    return RuntimeEffect::MetaData;
+  }
+  case SILInstructionKind::TupleAddrConstructorInst: {
+    auto *ca = cast<TupleAddrConstructorInst>(inst);
+    impactType = ca->getDest()->getType();
+    if (!ca->isInitializationOfDest())
+      return RuntimeEffect::MetaData | RuntimeEffect::Releasing;
     return RuntimeEffect::MetaData;
   }
   case SILInstructionKind::ExplicitCopyAddrInst: {
@@ -857,6 +872,12 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     impactType = inst->getOperand(0)->getType();
     if (impactType.isBlockPointerCompatible())
       return RuntimeEffect::ObjectiveC | RuntimeEffect::Releasing;
+    if (impactType.isMoveOnly() &&
+        !isa<DropDeinitInst>(lookThroughOwnershipInsts(inst->getOperand(0)))) {
+      // Not de-virtualized value type deinits can require metatype in case the
+      // deinit needs to be called via the value witness table.
+      return RuntimeEffect::MetaData | RuntimeEffect::Releasing;
+    }
     return ifNonTrivial(inst->getOperand(0)->getType(),
                         RuntimeEffect::Releasing);
 
@@ -906,6 +927,16 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
 
     switch (as.getSubstCalleeType()->getRepresentation()) {
     case SILFunctionTypeRepresentation::ObjCMethod:
+      if (auto *callee = as.getCalleeFunction()) {
+        if (auto *clangDecl = callee->getClangDecl()) {
+          if (auto clangMethodDecl = dyn_cast<clang::ObjCMethodDecl>(clangDecl)) {
+            if (clangMethodDecl->isDirectMethod()) {
+              break;
+            }
+          }
+        }
+      }
+      LLVM_FALLTHROUGH;
     case SILFunctionTypeRepresentation::Block:
       rt |= RuntimeEffect::ObjectiveC | RuntimeEffect::MetaData;
       break;
@@ -986,8 +1017,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     case BuiltinValueKind::AssignCopyArrayBackToFront:
     case BuiltinValueKind::AssignTakeArray:
       return RuntimeEffect::RefCounting | RuntimeEffect::Deallocating;
-    case BuiltinValueKind::Swift3ImplicitObjCEntrypoint:
-      return RuntimeEffect::ObjectiveC | RuntimeEffect::Allocating;
+    case BuiltinValueKind::BuildOrdinaryTaskExecutorRef:
     case BuiltinValueKind::BuildOrdinarySerialExecutorRef:
     case BuiltinValueKind::BuildComplexEqualitySerialExecutorRef:
     case BuiltinValueKind::BuildDefaultActorExecutorRef:
@@ -1157,7 +1187,7 @@ bool PolymorphicBuiltinSpecializedOverloadInfo::init(
   // we have an overload for its current operand type.
   StringRef name = getBuiltinName(builtinKind);
   StringRef prefix = "generic_";
-  assert(name.startswith(prefix) &&
+  assert(name.starts_with(prefix) &&
          "Invalid polymorphic builtin name! Prefix should be Generic$OP?!");
   SmallString<32> staticOverloadName;
   staticOverloadName.append(name.drop_front(prefix.size()));
@@ -1288,4 +1318,43 @@ swift::getStaticOverloadForSpecializedPolymorphicBuiltin(BuiltinInst *bi) {
   }
 
   return newBI;
+}
+
+//===----------------------------------------------------------------------===//
+//                          Exploded Tuple Visitors
+//===----------------------------------------------------------------------===//
+
+bool swift::visitExplodedTupleType(SILType inputType,
+                                   llvm::function_ref<bool(SILType)> callback) {
+  auto tupType = inputType.getAs<TupleType>();
+  if (!tupType || tupType.containsPackExpansionType()) {
+    return callback(inputType);
+  }
+
+  for (auto elt : tupType->getElementTypes()) {
+    auto eltSILTy = SILType::getPrimitiveType(elt->getCanonicalType(),
+                                              inputType.getCategory());
+    if (!visitExplodedTupleType(eltSILTy, callback))
+      return false;
+  }
+
+  return true;
+}
+
+bool swift::visitExplodedTupleValue(
+    SILValue inputValue,
+    llvm::function_ref<SILValue(SILValue, std::optional<unsigned>)> callback) {
+  SILType inputType = inputValue->getType();
+  auto tupType = inputType.getAs<TupleType>();
+  if (!tupType || tupType.containsPackExpansionType()) {
+    return callback(inputValue, {});
+  }
+
+  for (auto eltIndex : range(tupType->getNumElements())) {
+    auto elt = callback(inputValue, eltIndex);
+    if (!visitExplodedTupleValue(elt, callback))
+      return false;
+  }
+
+  return true;
 }

@@ -58,7 +58,7 @@ class AccessPhiVisitor
   UseDefVisitor &useDefVisitor;
   StorageCastTy storageCastTy;
 
-  llvm::Optional<SILValue> commonDefinition;
+  std::optional<SILValue> commonDefinition;
   SmallVector<SILValue, 8> pointerWorklist;
   SmallPtrSet<SILPhiArgument *, 4> nestedPhis;
 
@@ -276,12 +276,12 @@ protected:
   // If the optional baseVal is set, then a result was found. If the SILValue
   // within the optional is invalid, then there are multiple inconsistent base
   // addresses (this may currently happen with RawPointer phis).
-  llvm::Optional<SILValue> baseVal;
+  std::optional<SILValue> baseVal;
   // If the kind optional is set, then 'baseVal' is a valid
   // AccessBase. 'baseVal' may be a valid SILValue while kind optional has no
   // value if an invalid address producer was detected, via a call to
   // visitNonAccess.
-  llvm::Optional<AccessBase::Kind> kindVal;
+  std::optional<AccessBase::Kind> kindVal;
 
 public:
   FindAccessBaseVisitor(NestedAccessType nestedAccessTy,
@@ -316,12 +316,12 @@ public:
 
   void invalidateResult() {
     baseVal = SILValue();
-    kindVal = llvm::None;
+    kindVal = std::nullopt;
   }
 
-  llvm::Optional<SILValue> saveResult() const { return baseVal; }
+  std::optional<SILValue> saveResult() const { return baseVal; }
 
-  void restoreResult(llvm::Optional<SILValue> result) { baseVal = result; }
+  void restoreResult(std::optional<SILValue> result) { baseVal = result; }
 
   void addUnknownOffset() { return; }
 
@@ -330,7 +330,7 @@ public:
   SILValue visitBase(SILValue base, AccessStorage::Kind kind) {
     setResult(base);
     if (!baseVal.value()) {
-      kindVal = llvm::None;
+      kindVal = std::nullopt;
     } else {
       assert(!kindVal || kindVal.value() == kind);
       kindVal = kind;
@@ -340,7 +340,7 @@ public:
 
   SILValue visitNonAccess(SILValue value) {
     setResult(value);
-    kindVal = llvm::None;
+    kindVal = std::nullopt;
     return SILValue();
   }
 
@@ -375,10 +375,10 @@ static FunctionTest
     GetTypedAccessAddress("get_typed_access_address",
                           [](auto &function, auto &arguments, auto &test) {
                             auto address = arguments.takeValue();
-                            function.dump();
-                            llvm::dbgs() << "Address: " << address;
+                            function.print(llvm::outs());
+                            llvm::outs() << "Address: " << address;
                             auto access = getTypedAccessAddress(address);
-                            llvm::dbgs() << "Access: " << access;
+                            llvm::outs() << "Access: " << access;
                           });
 } // end namespace swift::test
 
@@ -404,10 +404,10 @@ static FunctionTest GetAccessBaseTest("get_access_base",
                                       [](auto &function, auto &arguments,
                                          auto &test) {
                                         auto address = arguments.takeValue();
-                                        function.dump();
-                                        llvm::dbgs() << "Address: " << address;
+                                        function.print(llvm::outs());
+                                        llvm::outs() << "Address: " << address;
                                         auto base = getAccessBase(address);
-                                        llvm::dbgs() << "Base: " << base;
+                                        llvm::outs() << "Base: " << base;
                                       });
 } // end namespace swift::test
 
@@ -437,8 +437,14 @@ bool swift::isLetAddress(SILValue address) {
 //===----------------------------------------------------------------------===//
 
 bool swift::mayAccessPointer(SILInstruction *instruction) {
+  assert(!FullApplySite::isa(instruction) && !isa<EndApplyInst>(instruction) &&
+         !isa<AbortApplyInst>(instruction));
   if (!instruction->mayReadOrWriteMemory())
     return false;
+  if (isa<BuiltinInst>(instruction)) {
+    // Consider all builtins that read/write memory to access pointers.
+    return true;
+  }
   bool retval = false;
   visitAccessedAddress(instruction, [&retval](Operand *operand) {
     auto accessStorage = AccessStorage::compute(operand->get());
@@ -451,6 +457,11 @@ bool swift::mayAccessPointer(SILInstruction *instruction) {
 }
 
 bool swift::mayLoadWeakOrUnowned(SILInstruction *instruction) {
+  assert(!FullApplySite::isa(instruction) && !isa<EndApplyInst>(instruction) &&
+         !isa<AbortApplyInst>(instruction));
+  if (isa<BuiltinInst>(instruction)) {
+    return instruction->mayReadOrWriteMemory();
+  }
   return isa<LoadWeakInst>(instruction) 
       || isa<LoadUnownedInst>(instruction) 
       || isa<StrongCopyUnownedValueInst>(instruction)
@@ -459,17 +470,23 @@ bool swift::mayLoadWeakOrUnowned(SILInstruction *instruction) {
 
 /// Conservatively, whether this instruction could involve a synchronization
 /// point like a memory barrier, lock or syscall.
-bool swift::maySynchronizeNotConsideringSideEffects(SILInstruction *instruction) {
-  return FullApplySite::isa(instruction) 
-      || isa<EndApplyInst>(instruction)
-      || isa<AbortApplyInst>(instruction)
-      || isa<HopToExecutorInst>(instruction);
+bool swift::maySynchronize(SILInstruction *instruction) {
+  assert(!FullApplySite::isa(instruction) && !isa<EndApplyInst>(instruction) &&
+         !isa<AbortApplyInst>(instruction));
+  if (isa<BuiltinInst>(instruction)) {
+    return instruction->mayReadOrWriteMemory();
+  }
+  return isa<HopToExecutorInst>(instruction);
 }
 
 bool swift::mayBeDeinitBarrierNotConsideringSideEffects(SILInstruction *instruction) {
+  if (FullApplySite::isa(instruction) || isa<EndApplyInst>(instruction) ||
+      isa<AbortApplyInst>(instruction)) {
+    return true;
+  }
   bool retval = mayAccessPointer(instruction)
              || mayLoadWeakOrUnowned(instruction)
-             || maySynchronizeNotConsideringSideEffects(instruction);
+             || maySynchronize(instruction);
   assert(!retval || !isa<BranchInst>(instruction) && "br as deinit barrier!?");
   return retval;
 }
@@ -775,11 +792,10 @@ LLVM_ATTRIBUTE_USED void AccessBase::dump() const { print(llvm::dbgs()); }
 
 bool swift::isIdentityPreservingRefCast(SingleValueInstruction *svi) {
   // Ignore both copies and other identity and ownership preserving casts
-  return isa<CopyValueInst>(svi) || isa<BeginBorrowInst>(svi)
-         || isa<EndInitLetRefInst>(svi)
-         || isa<BeginDeallocRefInst>(svi)
-         || isa<EndCOWMutationInst>(svi)
-         || isIdentityAndOwnershipPreservingRefCast(svi);
+  return isa<CopyValueInst>(svi) || isa<BeginBorrowInst>(svi) ||
+         isa<EndInitLetRefInst>(svi) || isa<BeginDeallocRefInst>(svi) ||
+         isa<EndCOWMutationInst>(svi) ||
+         isIdentityAndOwnershipPreservingRefCast(svi);
 }
 
 // On some platforms, casting from a metatype to a reference type dynamically
@@ -807,6 +823,7 @@ bool swift::isIdentityAndOwnershipPreservingRefCast(
   // Ignore markers
   case SILInstructionKind::MarkUninitializedInst:
   case SILInstructionKind::MarkDependenceInst:
+  case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
     return true;
   }
 }
@@ -1084,9 +1101,9 @@ class FindAccessStorageVisitor
 
 public:
   struct Result {
-    llvm::Optional<AccessStorage> storage;
+    std::optional<AccessStorage> storage;
     SILValue base;
-    llvm::Optional<AccessStorageCast> seenCast;
+    std::optional<AccessStorageCast> seenCast;
   };
 
 private:
@@ -1122,7 +1139,7 @@ public:
   // may be multiple global_addr bases for identical storage.
   SILValue getBase() const { return result.base; }
 
-  llvm::Optional<AccessStorageCast> getCast() const { return result.seenCast; }
+  std::optional<AccessStorageCast> getCast() const { return result.seenCast; }
 
   // MARK: AccessPhiVisitor::UseDefVisitor implementation.
 
@@ -1196,10 +1213,10 @@ static FunctionTest ComputeAccessStorage("compute_access_storage",
                                       [](auto &function, auto &arguments,
                                          auto &test) {
                                         auto address = arguments.takeValue();
-                                        function.dump();
-                                        llvm::dbgs() << "Address: " << address;
+                                        function.print(llvm::outs());
+                                        llvm::outs() << "Address: " << address;
                                         auto accessStorage = AccessStorage::compute(address);
-                                        accessStorage.dump();
+                                        accessStorage.print(llvm::outs());
                                       });
 } // end namespace swift::test
 
@@ -1418,11 +1435,14 @@ AccessPathWithBase AccessPathWithBase::computeInScope(SILValue address) {
       .findAccessPath(address);
 }
 
-void swift::visitProductLeafAccessPathNodes(
+bool swift::visitProductLeafAccessPathNodes(
     SILValue address, TypeExpansionContext tec, SILModule &module,
     std::function<void(AccessPath::PathNode, SILType)> visitor) {
-  SmallVector<std::pair<SILType, IndexTrieNode *>, 32> worklist;
   auto rootPath = AccessPath::compute(address);
+  if (!rootPath.isValid()) {
+    return false;
+  }
+  SmallVector<std::pair<SILType, IndexTrieNode *>, 32> worklist;
   auto *node = rootPath.getPathNode().node;
   worklist.push_back({address->getType(), node});
   while (!worklist.empty()) {
@@ -1455,6 +1475,7 @@ void swift::visitProductLeafAccessPathNodes(
       visitor(AccessPath::PathNode(node), silType);
     }
   }
+  return true;
 }
 
 void AccessPath::Index::print(raw_ostream &os) const {
@@ -1574,7 +1595,7 @@ class AccessPathDefUseTraversal {
   // apply. For other storage, it is the same as accessPath.getRoot().
   //
   // 'base' is typically invalid, maning that all uses of 'storage' for the
-  // access path will be visited. When 'base' is set, the the visitor is
+  // access path will be visited. When 'base' is set, the visitor is
   // restricted to a specific access base, such as a particular
   // ref_element_addr.
   SILValue base;
@@ -2070,7 +2091,7 @@ static FunctionTest AccessPathBaseTest("accesspath-base", [](auto &function,
                                                              auto &arguments,
                                                              auto &test) {
   auto value = arguments.takeValue();
-  function.dump();
+  function.print(llvm::outs());
   llvm::outs() << "Access path base: " << value;
   auto accessPathWithBase = AccessPathWithBase::compute(value);
   AccessUseTestVisitor visitor;
@@ -2597,6 +2618,7 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
     case BuiltinValueKind::DeallocRaw:
     case BuiltinValueKind::StackAlloc:
     case BuiltinValueKind::UnprotectedStackAlloc:
+    case BuiltinValueKind::AllocVector:
     case BuiltinValueKind::StackDealloc:
     case BuiltinValueKind::Fence:
     case BuiltinValueKind::StaticReport:
@@ -2605,12 +2627,10 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
     case BuiltinValueKind::Unreachable:
     case BuiltinValueKind::CondUnreachable:
     case BuiltinValueKind::DestroyArray:
-    case BuiltinValueKind::Swift3ImplicitObjCEntrypoint:
     case BuiltinValueKind::PoundAssert:
     case BuiltinValueKind::TSanInoutAccess:
     case BuiltinValueKind::CancelAsyncTask:
     case BuiltinValueKind::CreateAsyncTask:
-    case BuiltinValueKind::CreateAsyncTaskInGroup:
     case BuiltinValueKind::AutoDiffCreateLinearMapContextWithType:
     case BuiltinValueKind::AutoDiffAllocateSubcontextWithType:
     case BuiltinValueKind::InitializeDefaultActor:
@@ -2642,6 +2662,13 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
       if (builtin->getAllOperands().size() > 0) {
         visitor(&builtin->getAllOperands()[0]);
       }
+      return;
+
+    // These builtins take a generic 'T' as their operand.
+    case BuiltinValueKind::GetEnumTag:
+    case BuiltinValueKind::InjectEnumTag:
+    case BuiltinValueKind::AddressOfRawLayout:
+      visitor(&builtin->getAllOperands()[0]);
       return;
 
     // Arrays: (T.Type, Builtin.RawPointer, Builtin.RawPointer,

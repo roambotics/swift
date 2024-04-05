@@ -67,7 +67,7 @@
 // CHECK-SAME:    $s4main5ValueVwet
 // CHECK-SAME:    $s4main5ValueVwst
 // CHECK-SAME:    [[INT]] {{[0-9]+}},
-// CHECK-SAMEL    [[INT]] {{[0-9]+}},
+// CHECK-SAME:    [[INT]] {{[0-9]+}},
 // CHECK-SAME:    i32 {{[0-9]+}},
 // CHECK-SAME:    i32 {{[0-9]+}}
 // CHECK-SAME: },
@@ -129,7 +129,7 @@ func doit() {
 }
 doit()
 
-// CHECK: ; Function Attrs: noinline nounwind readnone
+// CHECK: ; Function Attrs: noinline nounwind memory(none)
 // CHECK: define hidden swiftcc %swift.metadata_response @"$s4main5ValueVMa"([[INT]] %0, ptr %1, ptr %2) #{{[0-9]+}} {{(section)?.*}}{
 // CHECK: entry:
 // CHECK:      call swiftcc %swift.metadata_response @__swift_instantiateCanonicalPrespecializedGenericMetadata(

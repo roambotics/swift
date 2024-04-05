@@ -223,6 +223,7 @@ extension _SmallString {
   ) rethrows -> Result {
     let count = self.count
     var raw = self.zeroTerminatedRawCodeUnits
+#if $TypedThrows
     return try Swift._withUnprotectedUnsafeBytes(of: &raw) {
       let rawPtr = $0.baseAddress._unsafelyUnwrappedUnchecked
       // Rebind the underlying (UInt64, UInt64) tuple to UInt8 for the
@@ -234,6 +235,19 @@ extension _SmallString {
       }
       return try f(UnsafeBufferPointer(_uncheckedStart: ptr, count: count))
     }
+#else
+    return try Swift.__abi_se0413_withUnsafeBytes(of: &raw) {
+      let rawPtr = $0.baseAddress._unsafelyUnwrappedUnchecked
+      // Rebind the underlying (UInt64, UInt64) tuple to UInt8 for the
+      // duration of the closure. Accessing self after this rebind is undefined.
+      let ptr = rawPtr.bindMemory(to: UInt8.self, capacity: count)
+      defer {
+        // Restore the memory type of self._storage
+        _ = rawPtr.bindMemory(to: RawBitPattern.self, capacity: 1)
+      }
+      return try f(UnsafeBufferPointer(_uncheckedStart: ptr, count: count))
+    }
+#endif
   }
 
   // Overwrite stored code units, including uninitialized. `f` should return the
@@ -263,7 +277,7 @@ extension _SmallString {
   ) {
     _internalInvariant(index > 0)
     _internalInvariant(index <= _SmallString.capacity)
-    //FIXME: Verify this on big-endian architecture
+    // FIXME: Verify this on big-endian architecture
     let mask0 = (UInt64(bitPattern: ~0) &>> (8 &* ( 8 &- Swift.min(index, 8))))
     let mask1 = (UInt64(bitPattern: ~0) &>> (8 &* (16 &- Swift.max(index, 8))))
     storage.0 &= (index <= 0) ? 0 : mask0.littleEndian
@@ -345,7 +359,7 @@ extension _SmallString {
 extension _SmallString {
   // Resiliently create from a tagged cocoa string
   //
-  @_effects(readonly) @_effects(releasenone) // @opaque
+  @_effects(readonly) // @opaque
   @usableFromInline // testable
   internal init?(taggedCocoa cocoa: AnyObject) {
     self.init()
@@ -367,7 +381,7 @@ extension _SmallString {
     self._invariantCheck()
   }
   
-  @_effects(readonly) @_effects(releasenone) // @opaque
+  @_effects(readonly) // @opaque
   internal init?(taggedASCIICocoa cocoa: AnyObject) {
     self.init()
     var success = true

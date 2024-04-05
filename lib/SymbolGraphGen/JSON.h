@@ -15,7 +15,7 @@
 #ifndef SWIFT_SYMBOLGRAPHGEN_JSON_H
 #define SWIFT_SYMBOLGRAPHGEN_JSON_H
 
-#include "llvm/ADT/Triple.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/VersionTuple.h"
 #include "swift/AST/GenericSignature.h"
@@ -53,7 +53,7 @@ void filterGenericParams(
 /// Filter generic requirements on an extension that aren't relevant
 /// for documentation.
 void filterGenericRequirements(
-    ArrayRef<Requirement> Requirements, const NominalTypeDecl *Self,
+    ArrayRef<Requirement> Requirements, const ProtocolDecl *Self,
     SmallVectorImpl<Requirement> &FilteredRequirements,
     SubstitutionMap SubMap = {},
     ArrayRef<const GenericTypeParamType *> FilteredParams = {});

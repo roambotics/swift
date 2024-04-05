@@ -20,6 +20,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/AST/KnownProtocols.h"
 #include "swift/AST/Types.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/SILValue.h"
@@ -47,6 +48,7 @@
 #include "IRGenDebugInfo.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
+#include "LocalTypeData.h"
 #include "MetadataRequest.h"
 #include "Outlining.h"
 #include "ProtocolInfo.h"
@@ -74,6 +76,25 @@ irgen::emitArchetypeTypeMetadataRef(IRGenFunction &IGF,
       return emitOpaqueTypeMetadataRef(IGF, opaque, request);
   }
 
+#ifndef NDEBUG
+  if (!archetype->getParent()) {
+    llvm::errs() << "Metadata for archetype not bound in function.\n"
+                 << "  The metadata could be missing entirely because it needs "
+                    "to be passed to the function.\n"
+                 << "  Or the metadata is present and not bound in which case "
+                    "setScopedLocalTypeMetadata or similar must be called.\n";
+    llvm::errs() << "Archetype without metadata: " << archetype << "\n";
+    archetype->dump(llvm::errs());
+    llvm::errs() << "Function:\n";
+    IGF.CurFn->print(llvm::errs());
+    if (auto localTypeData = IGF.getLocalTypeData()) {
+      llvm::errs() << "LocalTypeData:\n";
+      localTypeData->dump();
+    } else {
+      llvm::errs() << "No LocalTypeDataCache for this function!\n";
+    }
+  }
+#endif
   // If there's no local or opaque metadata, it must be a nested type.
   assert(archetype->getParent() && "Not a nested archetype");
 
@@ -114,7 +135,7 @@ public:
   void collectMetadataForOutlining(OutliningMetadataCollector &collector,
                                    SILType T) const override {
     // We'll need formal type metadata for this archetype.
-    collector.collectTypeMetadataForLayout(T);
+    collector.collectTypeMetadata(T);
   }
 
   TypeLayoutEntry
@@ -171,7 +192,6 @@ public:
     return new FixedSizeArchetypeTypeInfo(type, size, align, spareBits);
   }
 };
-
 } // end anonymous namespace
 
 /// Emit a single protocol witness table reference.
@@ -254,6 +274,33 @@ llvm::Value *irgen::emitArchetypeWitnessTableRef(IRGenFunction &IGF,
       rootWTable = emitOpaqueTypeWitnessTableRef(IGF, opaqueRoot,
                                                  rootProtocol);
     }
+#ifndef NDEBUG
+    if (!rootWTable) {
+      llvm::errs()
+          << "Root witness table not bound in function.\n"
+          << "  The witness table could be missing entirely because it needs "
+             "to be passed to the function.\n"
+          << "  Or the witness table is present and not bound in which case "
+             "setScopedLocalTypeData or similar must be called.\n";
+      llvm::errs() << "Root archetype for conformance: " << rootArchetype
+                   << "\n";
+      rootArchetype->dump(llvm::errs());
+      llvm::errs() << "Root protocol without wtable: " << rootProtocol << "\n";
+      rootProtocol->dump(llvm::errs());
+      llvm::errs() << "Archetype for conformance: " << archetype << "\n";
+      archetype->dump(llvm::errs());
+      llvm::errs() << "Protocol for conformance: " << protocol << "\n";
+      protocol->dump(llvm::errs());
+      llvm::errs() << "Function:\n";
+      IGF.CurFn->print(llvm::errs());
+      if (auto localTypeData = IGF.getLocalTypeData()) {
+        llvm::errs() << "LocalTypeData:\n";
+        localTypeData->dump();
+      } else {
+        llvm::errs() << "No LocalTypeDataCache for this function!\n";
+      }
+    }
+#endif
     assert(rootWTable && "root witness table not bound in local context!");
   }
 
@@ -361,6 +408,17 @@ const TypeInfo *TypeConverter::convertArchetypeType(ArchetypeType *archetype) {
             ? IsABIAccessible
             : IsNotABIAccessible;
   }
+
+  // TODO: Should this conformance imply isAddressOnlyTrivial is true?
+  auto *bitwiseCopyableProtocol =
+      IGM.getSwiftModule()->getASTContext().getProtocol(
+          KnownProtocolKind::BitwiseCopyable);
+  // The protocol won't be present in swiftinterfaces from older SDKs.
+  if (bitwiseCopyableProtocol && IGM.getSwiftModule()->lookupConformance(
+                                     archetype, bitwiseCopyableProtocol)) {
+    return BitwiseCopyableTypeInfo::create(storageType, abiAccessible);
+  }
+
   return OpaqueArchetypeTypeInfo::create(storageType, abiAccessible);
 }
 
@@ -492,7 +550,7 @@ MetadataResponse irgen::emitOpaqueTypeMetadataRef(IRGenFunction &IGF,
                        {request.get(IGF), genericArgs, descriptor, indexValue});
       result->setDoesNotThrow();
       result->setCallingConv(IGF.IGM.SwiftCC);
-      result->addFnAttr(llvm::Attribute::ReadOnly);
+      result->setOnlyReadsMemory();
     });
   assert(result);
   
@@ -556,7 +614,7 @@ llvm::Value *irgen::emitOpaqueTypeWitnessTableRef(IRGenFunction &IGF,
                                    {genericArgs, descriptor, indexValue});
       result->setDoesNotThrow();
       result->setCallingConv(IGF.IGM.SwiftCC);
-      result->addFnAttr(llvm::Attribute::ReadOnly);
+      result->setOnlyReadsMemory();
     });
   assert(result);
   

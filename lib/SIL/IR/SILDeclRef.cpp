@@ -127,17 +127,17 @@ SILDeclRef::SILDeclRef(ValueDecl *vd, SILDeclRef::Kind kind, bool isForeign,
                        bool isRuntimeAccessible,
                        SILDeclRef::BackDeploymentKind backDeploymentKind,
                        AutoDiffDerivativeFunctionIdentifier *derivativeId)
-    : loc(vd), kind(kind), isForeign(isForeign), 
-      isDistributed(isDistributed), isKnownToBeLocal(isKnownToBeLocal),
+    : loc(vd), kind(kind), isForeign(isForeign), isDistributed(isDistributed),
+      isKnownToBeLocal(isKnownToBeLocal),
       isRuntimeAccessible(isRuntimeAccessible),
       backDeploymentKind(backDeploymentKind), defaultArgIndex(0),
-      pointer(derivativeId) {}
+      isAsyncLetClosure(0), pointer(derivativeId) {}
 
 SILDeclRef::SILDeclRef(SILDeclRef::Loc baseLoc, bool asForeign,
                        bool asDistributed, bool asDistributedKnownToBeLocal)
     : isRuntimeAccessible(false),
       backDeploymentKind(SILDeclRef::BackDeploymentKind::None),
-      defaultArgIndex(0),
+      defaultArgIndex(0), isAsyncLetClosure(0),
       pointer((AutoDiffDerivativeFunctionIdentifier *)nullptr) {
   if (auto *vd = baseLoc.dyn_cast<ValueDecl*>()) {
     if (auto *fd = dyn_cast<FuncDecl>(vd)) {
@@ -170,6 +170,13 @@ SILDeclRef::SILDeclRef(SILDeclRef::Loc baseLoc, bool asForeign,
   } else if (auto *ACE = baseLoc.dyn_cast<AbstractClosureExpr *>()) {
     loc = ACE;
     kind = Kind::Func;
+    if (ACE->getASTContext().LangOpts.hasFeature(
+            Feature::TransferringArgsAndResults)) {
+      if (auto *autoClosure = dyn_cast<AutoClosureExpr>(ACE)) {
+        isAsyncLetClosure =
+            autoClosure->getThunkKind() == AutoClosureExpr::Kind::AsyncLet;
+      }
+    }
   } else {
     llvm_unreachable("impossible SILDeclRef loc");
   }
@@ -185,16 +192,16 @@ SILDeclRef::SILDeclRef(SILDeclRef::Loc baseLoc,
   pointer = prespecializedSig.getPointer();
 }
 
-llvm::Optional<AnyFunctionRef> SILDeclRef::getAnyFunctionRef() const {
+std::optional<AnyFunctionRef> SILDeclRef::getAnyFunctionRef() const {
   switch (getLocKind()) {
   case LocKind::Decl:
     if (auto *afd = getAbstractFunctionDecl())
       return AnyFunctionRef(afd);
-    return llvm::None;
+    return std::nullopt;
   case LocKind::Closure:
     return AnyFunctionRef(getAbstractClosureExpr());
   case LocKind::File:
-    return llvm::None;
+    return std::nullopt;
   }
   llvm_unreachable("Unhandled case in switch");
 }
@@ -219,13 +226,13 @@ ASTContext &SILDeclRef::getASTContext() const {
   return DC->getASTContext();
 }
 
-llvm::Optional<AvailabilityContext>
+std::optional<AvailabilityContext>
 SILDeclRef::getAvailabilityForLinkage() const {
   // Back deployment thunks and fallbacks don't have availability since they
   // are non-ABI.
   // FIXME: Generalize this check to all kinds of non-ABI functions.
   if (backDeploymentKind != SILDeclRef::BackDeploymentKind::None)
-    return llvm::None;
+    return std::nullopt;
 
   return getDecl()->getAvailabilityForLinkage();
 }
@@ -476,7 +483,7 @@ static LinkageLimit getLinkageLimit(SILDeclRef constant) {
                                      : Limit::None;
     }
     // Otherwise, regular property wrapper backing initializers (for properties)
-    // are treated just like stored property intializers.
+    // are treated just like stored property initializers.
     LLVM_FALLTHROUGH;
   }
   case Kind::StoredPropertyInitializer: {
@@ -538,8 +545,13 @@ SILLinkage SILDeclRef::getDefinitionLinkage() const {
   // The main entry-point is public.
   if (kind == Kind::EntryPoint)
     return SILLinkage::Public;
-  if (kind == Kind::AsyncEntryPoint)
-    return SILLinkage::Hidden;
+  if (kind == Kind::AsyncEntryPoint) {
+    // async main entrypoint is referenced only from @main and
+    // they are in the same SIL module. Hiding this entrypoint
+    // from other object file makes it possible to link multiple
+    // executable targets for SwiftPM testing with -entry-point-function-name
+    return SILLinkage::Private;
+  }
 
   // Calling convention thunks have shared linkage.
   if (isForeignToNativeThunk())
@@ -605,6 +617,18 @@ SILLinkage SILDeclRef::getDefinitionLinkage() const {
     return SILLinkage::Hidden;
 
   case AccessLevel::Package:
+    switch (limit) {
+    case Limit::None:
+      return SILLinkage::Package;
+    case Limit::AlwaysEmitIntoClient:
+      return SILLinkage::PackageNonABI;
+    case Limit::OnDemand:
+      return SILLinkage::Shared;
+    case Limit::NeverPublic:
+      return SILLinkage::Hidden;
+    case Limit::Private:
+      llvm_unreachable("Already handled");
+    }
   case AccessLevel::Public:
   case AccessLevel::Open:
     switch (limit) {
@@ -976,6 +1000,10 @@ bool SILDeclRef::isForeignToNativeThunk() const {
   // have a foreign-to-native thunk.
   if (!hasDecl())
     return false;
+  // A default argument generator for a C++ function is a Swift function, so no
+  // thunk needed.
+  if (isDefaultArgGenerator())
+    return false;
   if (requiresForeignToNativeThunk(getDecl()))
     return true;
   // ObjC initializing constructors and factories are foreign.
@@ -998,6 +1026,9 @@ bool SILDeclRef::isNativeToForeignThunk() const {
     // A decl with a clang node doesn't have a native entry-point to forward
     // onto.
     if (getDecl()->hasClangNode())
+      return false;
+    // No thunk is required if the decl directly references an external decl.
+    if (getDecl()->getAttrs().hasAttribute<ExternAttr>())
       return false;
 
     // Only certain kinds of SILDeclRef can expose native-to-foreign thunks.
@@ -1033,11 +1064,42 @@ bool SILDeclRef::isBackDeploymentThunk() const {
 }
 
 /// Use the Clang importer to mangle a Clang declaration.
-static void mangleClangDecl(raw_ostream &buffer,
-                            const clang::NamedDecl *clangDecl,
-                            ASTContext &ctx) {
+static void mangleClangDeclViaImporter(raw_ostream &buffer,
+                                       const clang::NamedDecl *clangDecl,
+                                       ASTContext &ctx) {
   auto *importer = static_cast<ClangImporter *>(ctx.getClangModuleLoader());
   importer->getMangledName(buffer, clangDecl);
+}
+
+static std::string mangleClangDecl(Decl *decl, bool isForeign) {
+  auto clangDecl = decl->getClangDecl();
+
+  if (auto namedClangDecl = dyn_cast<clang::DeclaratorDecl>(clangDecl)) {
+    if (auto asmLabel = namedClangDecl->getAttr<clang::AsmLabelAttr>()) {
+      std::string s(1, '\01');
+      s += asmLabel->getLabel();
+      return s;
+    } else if (namedClangDecl->hasAttr<clang::OverloadableAttr>() ||
+               decl->getASTContext().LangOpts.EnableCXXInterop) {
+      std::string storage;
+      llvm::raw_string_ostream SS(storage);
+      mangleClangDeclViaImporter(SS, namedClangDecl, decl->getASTContext());
+      return SS.str();
+    }
+    return namedClangDecl->getName().str();
+  } else if (auto objcDecl = dyn_cast<clang::ObjCMethodDecl>(clangDecl)) {
+    if (objcDecl->isDirectMethod() && isForeign) {
+      std::string storage;
+      llvm::raw_string_ostream SS(storage);
+      clang::ASTContext &ctx = clangDecl->getASTContext();
+      std::unique_ptr<clang::MangleContext> mangler(ctx.createMangleContext());
+      mangler->mangleObjCMethodName(objcDecl, SS, /*includePrefixByte=*/true,
+                                    /*includeCategoryNamespace=*/false);
+      return SS.str();
+    }
+  }
+
+  return "";
 }
 
 std::string SILDeclRef::mangle(ManglingKind MKind) const {
@@ -1064,33 +1126,12 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
 
   // As a special case, Clang functions and globals don't get mangled at all
   // - except \c objc_direct decls.
-  if (hasDecl()) {
-    if (auto clangDecl = getDecl()->getClangDecl()) {
+  if (hasDecl() && !isDefaultArgGenerator()) {
+    if (getDecl()->getClangDecl()) {
       if (!isForeignToNativeThunk() && !isNativeToForeignThunk()) {
-        if (auto namedClangDecl = dyn_cast<clang::DeclaratorDecl>(clangDecl)) {
-          if (auto asmLabel = namedClangDecl->getAttr<clang::AsmLabelAttr>()) {
-            std::string s(1, '\01');
-            s += asmLabel->getLabel();
-            return s;
-          } else if (namedClangDecl->hasAttr<clang::OverloadableAttr>() ||
-                     getDecl()->getASTContext().LangOpts.EnableCXXInterop) {
-            std::string storage;
-            llvm::raw_string_ostream SS(storage);
-            mangleClangDecl(SS, namedClangDecl, getDecl()->getASTContext());
-            return SS.str();
-          }
-          return namedClangDecl->getName().str();
-        } else if (auto objcDecl = dyn_cast<clang::ObjCMethodDecl>(clangDecl)) {
-          if (objcDecl->isDirectMethod() && isForeign) {
-            std::string storage;
-            llvm::raw_string_ostream SS(storage);
-            clang::ASTContext &ctx = clangDecl->getASTContext();
-            std::unique_ptr<clang::MangleContext> mangler(ctx.createMangleContext());
-            mangler->mangleObjCMethodName(objcDecl, SS, /*includePrefixByte=*/true,
-                                          /*includeCategoryNamespace=*/false);
-            return SS.str();
-          }
-        }
+        auto clangMangling = mangleClangDecl(getDecl(), isForeign);
+        if (!clangMangling.empty())
+          return clangMangling;
       }
     }
   }
@@ -1139,10 +1180,22 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
       if (!NameA->Name.empty() && !isThunk()) {
         return NameA->Name.str();
       }
-      
+
+    if (auto *ExternA = ExternAttr::find(getDecl()->getAttrs(), ExternKind::C)) {
+      assert(isa<FuncDecl>(getDecl()) && "non-FuncDecl with @_extern should be rejected by typechecker");
+      return ExternA->getCName(cast<FuncDecl>(getDecl())).str();
+    }
+
     // Use a given cdecl name for native-to-foreign thunks.
     if (auto CDeclA = getDecl()->getAttrs().getAttribute<CDeclAttr>())
       if (isNativeToForeignThunk()) {
+        // If this is an @implementation @_cdecl, mangle it like the clang
+        // function it implements.
+        if (auto objcInterface = getDecl()->getImplementedObjCDecl()) {
+          auto clangMangling = mangleClangDecl(objcInterface, isForeign);
+          if (!clangMangling.empty())
+            return clangMangling;
+        }
         return CDeclA->Name.str();
       }
 
@@ -1167,6 +1220,15 @@ std::string SILDeclRef::mangle(ManglingKind MKind) const {
                                           SKind);
 
   case SILDeclRef::Kind::Allocator:
+    // As a special case, initializers can have manually mangled names.
+    // Use the SILGen name only for the original non-thunked, non-curried entry
+    // point.
+    if (auto NameA = getDecl()->getAttrs().getAttribute<SILGenNameAttr>()) {
+      if (!NameA->Name.empty() && !isThunk()) {
+        return NameA->Name.str();
+      }
+    }
+
     return mangler.mangleConstructorEntity(cast<ConstructorDecl>(getDecl()),
                                            /*allocating*/ true,
                                            SKind);

@@ -112,7 +112,7 @@ public:
   /// Perform a qualified lookup of a Clang type with this name.
   /// \param kind  Only return results with this type kind.
   /// \param inModule only return results from this module.
-  virtual void lookupValue(StringRef name, llvm::Optional<ClangTypeKind> kind,
+  virtual void lookupValue(StringRef name, std::optional<ClangTypeKind> kind,
                            StringRef inModule,
                            SmallVectorImpl<clang::Decl *> &results) {}
   /// vtable anchor.
@@ -131,6 +131,13 @@ typedef llvm::PointerUnion<const clang::Decl *, const clang::MacroInfo *,
 /// from Clang ASTs over to Swift ASTs.
 class ClangImporter final : public ClangModuleLoader {
   friend class ClangModuleUnit;
+  friend class SwiftDeclSynthesizer;
+
+  // Make requests in the ClangImporter zone friends so they can access `Impl`.
+#define SWIFT_REQUEST(Zone, Name, Sig, Caching, LocOptions)                    \
+  friend class Name;
+#include "swift/ClangImporter/ClangImporterTypeIDZone.def"
+#undef SWIFT_REQUEST
 
 public:
   class Implementation;
@@ -176,14 +183,19 @@ public:
          DWARFImporterDelegate *dwarfImporterDelegate = nullptr);
 
   static std::vector<std::string>
-  getClangArguments(ASTContext &ctx, bool ignoreClangTarget = false);
+  getClangDriverArguments(ASTContext &ctx, bool ignoreClangTarget = false);
+
+  static std::optional<std::vector<std::string>>
+  getClangCC1Arguments(ClangImporter *importer, ASTContext &ctx,
+                       llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+                       bool ignoreClangTarget = false);
 
   static std::unique_ptr<clang::CompilerInvocation>
   createClangInvocation(ClangImporter *importer,
                         const ClangImporterOptions &importerOpts,
                         llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
-                        ArrayRef<std::string> invocationArgStrs,
-                        std::vector<std::string> *CC1Args = nullptr);
+                        std::vector<std::string> &CC1Args);
+
   ClangImporter(const ClangImporter &) = delete;
   ClangImporter(ClangImporter &&) = delete;
   ClangImporter &operator=(const ClangImporter &) = delete;
@@ -434,27 +446,32 @@ public:
 
   void verifyAllModules() override;
 
-  llvm::SmallVector<std::pair<ModuleDependencyID, ModuleDependencyInfo>, 1> bridgeClangModuleDependencies(
-      const clang::tooling::dependencies::ModuleDepsGraph &clangDependencies,
-      StringRef moduleOutputPath);
+  using RemapPathCallback = llvm::function_ref<std::string(StringRef)>;
+  llvm::SmallVector<std::pair<ModuleDependencyID, ModuleDependencyInfo>, 1>
+  bridgeClangModuleDependencies(
+      clang::tooling::dependencies::DependencyScanningTool &clangScanningTool,
+      clang::tooling::dependencies::ModuleDepsGraph &clangDependencies,
+      StringRef moduleOutputPath, RemapPathCallback remapPath = nullptr);
 
   llvm::SmallVector<std::pair<ModuleDependencyID, ModuleDependencyInfo>, 1>
-  getModuleDependencies(StringRef moduleName, StringRef moduleOutputPath,
+  getModuleDependencies(Identifier moduleName, StringRef moduleOutputPath,
                         llvm::IntrusiveRefCntPtr<llvm::cas::CachingOnDiskFileSystem> CacheFS,
                         const llvm::DenseSet<clang::tooling::dependencies::ModuleID> &alreadySeenClangModules,
                         clang::tooling::dependencies::DependencyScanningTool &clangScanningTool,
                         InterfaceSubContextDelegate &delegate,
+                        llvm::TreePathPrefixMapper *mapper,
                         bool isTestableImport = false) override;
 
   void recordBridgingHeaderOptions(
       ModuleDependencyInfo &MDI,
       const clang::tooling::dependencies::TranslationUnitDeps &deps);
 
-  /// Add dependency information for the bridging header.
+  /// Add dependency information for header dependencies
+  /// of a binary Swift module.
   ///
   /// \param moduleID the name of the Swift module whose dependency
   /// information will be augmented with information about the given
-  /// bridging header.
+  /// textual header inputs.
   ///
   /// \param clangScanningTool The clang dependency scanner.
   ///
@@ -462,10 +479,11 @@ public:
   /// about new Clang modules discovered along the way.
   ///
   /// \returns \c true if an error occurred, \c false otherwise
-  bool addBridgingHeaderDependencies(
+  bool addHeaderDependencies(
       ModuleDependencyID moduleID,
       clang::tooling::dependencies::DependencyScanningTool &clangScanningTool,
       ModuleDependenciesCache &cache);
+
   clang::TargetInfo &getModuleAvailabilityTarget() const override;
   clang::ASTContext &getClangASTContext() const override;
   clang::Preprocessor &getClangPreprocessor() const override;
@@ -496,12 +514,15 @@ public:
 
   std::string getClangModuleHash() const;
 
+  /// Get clang import creation cc1 args for swift explicit module build.
+  std::vector<std::string> getSwiftExplicitModuleDirectCC1Args() const;
+
   /// If we already imported a given decl successfully, return the corresponding
   /// Swift decl as an Optional<Decl *>, but if we previously tried and failed
   /// to import said decl then return nullptr.
   /// Otherwise, if we have never encountered this decl previously then return
   /// None.
-  llvm::Optional<Decl *> importDeclCached(const clang::NamedDecl *ClangDecl);
+  std::optional<Decl *> importDeclCached(const clang::NamedDecl *ClangDecl);
 
   // Returns true if it is expected that the macro is ignored.
   bool shouldIgnoreMacro(StringRef Name, const clang::MacroInfo *Macro);
@@ -522,7 +543,7 @@ public:
   void printStatistics() const override;
 
   /// Dump Swift lookup tables.
-  void dumpSwiftLookupTables();
+  void dumpSwiftLookupTables() const override;
 
   /// Given the path of a Clang module, collect the names of all its submodules.
   /// Calling this function does not load the module.
@@ -537,7 +558,7 @@ public:
       const clang::NamedDecl *D,
       clang::DeclarationName givenName = clang::DeclarationName()) override;
 
-  llvm::Optional<Type>
+  std::optional<Type>
   importFunctionReturnType(const clang::FunctionDecl *clangDecl,
                            DeclContext *dc) override;
 
@@ -545,10 +566,10 @@ public:
                          VarDecl *swiftDecl,
                          DeclContext *dc) override;
 
-  llvm::Optional<std::string>
+  std::optional<std::string>
   getOrCreatePCH(const ClangImporterOptions &ImporterOptions,
                  StringRef SwiftPCHHash, bool Cached);
-  llvm::Optional<std::string>
+  std::optional<std::string>
   /// \param isExplicit true if the PCH filename was passed directly
   /// with -import-objc-header option.
   getPCHFilename(const ClangImporterOptions &ImporterOptions,
@@ -580,6 +601,8 @@ public:
 
   bool isUnsafeCXXMethod(const FuncDecl *func) override;
 
+  FuncDecl *getDefaultArgGenerator(const clang::ParmVarDecl *param) override;
+
   bool isAnnotatedWith(const clang::CXXMethodDecl *method, StringRef attr);
 
   /// Find the lookup table that corresponds to the given Clang module.
@@ -609,6 +632,9 @@ public:
   /// Enable the symbolic import experimental feature for the given callback.
   void withSymbolicFeatureEnabled(llvm::function_ref<void(void)> callback);
 
+  /// Returns true when the symbolic import experimental feature is enabled.
+  bool isSymbolicImportEnabled() const;
+
   const clang::TypedefType *getTypeDefForCXXCFOptionsDefinition(
       const clang::Decl *candidateDecl) override;
 
@@ -632,9 +658,14 @@ namespace importer {
 /// Returns true if the given module has a 'cplusplus' requirement.
 bool requiresCPlusPlus(const clang::Module *module);
 
+/// Returns true if the given module is one of the C++ standard library modules.
+/// This could be the top-level std module, or any of the libc++ split modules
+/// (std_vector, std_iosfwd, etc).
+bool isCxxStdModule(const clang::Module *module);
+
 /// Returns the pointee type if the given type is a C++ `const`
 /// reference type, `None` otherwise.
-llvm::Optional<clang::QualType>
+std::optional<clang::QualType>
 getCxxReferencePointeeTypeOrNone(const clang::Type *type);
 
 /// Returns true if the given type is a C++ `const` reference type.
@@ -645,6 +676,7 @@ bool isCxxConstReferenceType(const clang::Type *type);
 struct ClangInvocationFileMapping {
   SmallVector<std::pair<std::string, std::string>, 2> redirectedFiles;
   SmallVector<std::pair<std::string, std::string>, 1> overridenFiles;
+  bool requiresBuiltinHeadersInSystemModules;
 };
 
 /// On Linux, some platform libraries (glibc, libstdc++) are not modularized.

@@ -908,6 +908,27 @@ void ElementUseCollector::collectUses(SILValue Pointer, unsigned BaseEltNo) {
       continue;
     }
 
+    if (auto *TACI = dyn_cast<TupleAddrConstructorInst>(User)) {
+      // If this is the source of the copy_addr, then this is a load.  If it is
+      // the destination, then this is an unknown assignment.  Note that we'll
+      // revisit this instruction and add it to Uses twice if it is both a load
+      // and store to the same aggregate.
+      DIUseKind Kind;
+      if (TACI->getDest() == Op->get()) {
+        if (InStructSubElement)
+          Kind = DIUseKind::PartialStore;
+        else if (TACI->isInitializationOfDest())
+          Kind = DIUseKind::Initialization;
+        else
+          Kind = DIUseKind::InitOrAssign;
+      } else {
+        Kind = DIUseKind::Load;
+      }
+
+      addElementUses(BaseEltNo, PointeeType, User, Kind);
+      continue;
+    }
+
     if (auto *MAI = dyn_cast<MarkUnresolvedMoveAddrInst>(User)) {
       // If this is the source of the copy_addr, then this is a load.  If it is
       // the destination, then this is an unknown assignment.  Note that we'll
@@ -938,7 +959,8 @@ void ElementUseCollector::collectUses(SILValue Pointer, unsigned BaseEltNo) {
       unsigned ArgumentNumber = Op->getOperandNumber() - 1;
 
       // If this is an out-parameter, it is like a store.
-      unsigned NumIndirectResults = substConv.getNumIndirectSILResults();
+      unsigned NumIndirectResults = substConv.getNumIndirectSILResults() +
+                                    substConv.getNumIndirectSILErrorResults();
       if (ArgumentNumber < NumIndirectResults) {
         assert(!InStructSubElement && "We're initializing sub-members?");
         addElementUses(BaseEltNo, PointeeType, User, DIUseKind::Initialization);
@@ -1487,7 +1509,7 @@ static bool isSelfInitUse(SILInstruction *I) {
   if (I->getLoc().isSILFile()) {
     if (auto *AI = dyn_cast<ApplyInst>(I))
       if (auto *Fn = AI->getReferencedFunctionOrNull())
-        if (Fn->getName().startswith("selfinit"))
+        if (Fn->getName().starts_with("selfinit"))
           return true;
 
     return false;

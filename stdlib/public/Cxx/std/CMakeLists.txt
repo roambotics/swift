@@ -24,7 +24,7 @@ add_dependencies(compiler CxxStdlib-apinotes)
 # is built with a different (older) version of the compiler. To workaround this,
 # declare the Darwin overlay as a dependency of CxxStdlib.
 set(swift_cxxstdlib_darwin_dependencies)
-if(SWIFT_BUILD_STDLIB AND (SWIFT_BUILD_SDK_OVERLAY OR SWIFT_BUILD_TEST_SUPPORT_MODULES))
+if(SWIFT_BUILD_STDLIB AND SWIFT_BUILD_SDK_OVERLAY)
   set(swift_cxxstdlib_darwin_dependencies Darwin)
 endif()
 
@@ -35,6 +35,7 @@ endif()
 # as it's not ABI stable.
 add_swift_target_library(swiftCxxStdlib STATIC NO_LINK_NAME IS_STDLIB IS_SWIFT_ONLY IS_FRAGILE
     std.swift
+    Chrono.swift
     String.swift
 
     SWIFT_MODULE_DEPENDS Cxx
@@ -45,11 +46,13 @@ add_swift_target_library(swiftCxxStdlib STATIC NO_LINK_NAME IS_STDLIB IS_SWIFT_O
     SWIFT_MODULE_DEPENDS_MACCATALYST ${swift_cxxstdlib_darwin_dependencies}
 
     SWIFT_COMPILE_FLAGS ${SWIFT_RUNTIME_SWIFT_COMPILE_FLAGS} ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
-    -Xfrontend -enable-experimental-cxx-interop
+    -cxx-interoperability-mode=default
     -Xfrontend -module-interface-preserve-types-as-written
 
     SWIFT_COMPILE_FLAGS_LINUX
     ${SWIFT_SDK_LINUX_CXX_OVERLAY_SWIFT_COMPILE_FLAGS}
+
+    DEPLOYMENT_VERSION_OSX ${COMPATIBILITY_MINIMUM_DEPLOYMENT_VERSION_OSX}
 
     LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
     TARGET_SDKS ALL_APPLE_PLATFORMS LINUX WINDOWS

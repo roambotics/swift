@@ -42,6 +42,9 @@
 
 using namespace swift;
 
+static_assert(IsTriviallyDestructible<ZeroArgDiagnostic>::value,
+              "ZeroArgDiagnostic is meant to be trivially destructable");
+
 namespace {
 enum class DiagnosticOptions {
   /// No options.
@@ -325,13 +328,32 @@ InFlightDiagnostic::limitBehavior(DiagnosticBehavior limit) {
 }
 
 InFlightDiagnostic &
-InFlightDiagnostic::warnUntilSwiftVersion(unsigned majorVersion) {
+InFlightDiagnostic::limitBehaviorUntilSwiftVersion(
+    DiagnosticBehavior limit, unsigned majorVersion) {
   if (!Engine->languageVersion.isVersionAtLeast(majorVersion)) {
-    limitBehavior(DiagnosticBehavior::Warning)
-      .wrapIn(diag::error_in_future_swift_version, majorVersion);
+    // If the behavior limit is a warning or less, wrap the diagnostic
+    // in a message that this will become an error in a later Swift
+    // version. We do this before limiting the behavior, because
+    // wrapIn will result in the behavior of the wrapping diagnostic.
+    if (limit >= DiagnosticBehavior::Warning)
+      wrapIn(diag::error_in_future_swift_version, majorVersion);
+
+    limitBehavior(limit);
+  }
+
+  if (majorVersion == 6) {
+    if (auto stats = Engine->statsReporter) {
+      ++stats->getFrontendCounters().NumSwift6Errors;
+    }
   }
 
   return *this;
+}
+
+InFlightDiagnostic &
+InFlightDiagnostic::warnUntilSwiftVersion(unsigned majorVersion) {
+  return limitBehaviorUntilSwiftVersion(DiagnosticBehavior::Warning,
+                                        majorVersion);
 }
 
 InFlightDiagnostic &
@@ -733,7 +755,8 @@ static void formatDiagnosticArgument(StringRef Modifier,
   }
 
   case DiagnosticArgumentKind::FullyQualifiedType:
-  case DiagnosticArgumentKind::Type: {
+  case DiagnosticArgumentKind::Type:
+  case DiagnosticArgumentKind::WitnessType: {
     assert(Modifier.empty() && "Improper modifier for Type argument");
     
     // Strip extraneous parentheses; they add no value.
@@ -755,8 +778,7 @@ static void formatDiagnosticArgument(StringRef Modifier,
         printOptions.PrintFunctionRepresentationAttrs =
             PrintOptions::FunctionRepresentationMode::Full;
       needsQualification = typeSpellingIsAmbiguous(type, Args, printOptions);
-    } else {
-      assert(Arg.getKind() == DiagnosticArgumentKind::FullyQualifiedType);
+    } else if (Arg.getKind() == DiagnosticArgumentKind::FullyQualifiedType) {
       type = Arg.getAsFullyQualifiedType().getType()->getWithoutParens();
       if (type.isNull()) {
         // FIXME: We should never receive a nullptr here, but this is causing
@@ -769,6 +791,19 @@ static void formatDiagnosticArgument(StringRef Modifier,
         printOptions.PrintFunctionRepresentationAttrs =
             PrintOptions::FunctionRepresentationMode::Full;
       needsQualification = true;
+    } else {
+      assert(Arg.getKind() == DiagnosticArgumentKind::WitnessType);
+      type = Arg.getAsWitnessType().getType()->getWithoutParens();
+      if (type.isNull()) {
+        // FIXME: We should never receive a nullptr here, but this is causing
+        // crashes (rdar://75740683). Remove once ParenType never contains
+        // nullptr as the underlying type.
+        Out << "<null>";
+        break;
+      }
+      printOptions.PrintGenericRequirements = false;
+      printOptions.PrintInverseRequirements = false;
+      needsQualification = typeSpellingIsAmbiguous(type, Args, printOptions);
     }
 
     // If a type has an unresolved type, print it with syntax sugar removed for
@@ -900,33 +935,12 @@ static void formatDiagnosticArgument(StringRef Modifier,
     Out << FormatOpts.OpeningQuotationMark << Arg.getAsLayoutConstraint()
         << FormatOpts.ClosingQuotationMark;
     break;
-  case DiagnosticArgumentKind::ActorIsolation:
+  case DiagnosticArgumentKind::ActorIsolation: {
     assert(Modifier.empty() && "Improper modifier for ActorIsolation argument");
-    switch (auto isolation = Arg.getAsActorIsolation()) {
-    case ActorIsolation::ActorInstance:
-      Out << "actor-isolated";
-      break;
-
-    case ActorIsolation::GlobalActor:
-    case ActorIsolation::GlobalActorUnsafe: {
-      if (isolation.isMainActor()) {
-        Out << "main actor-isolated";
-      } else {
-        Type globalActor = isolation.getGlobalActor();
-        Out << "global actor " << FormatOpts.OpeningQuotationMark
-          << globalActor.getString()
-          << FormatOpts.ClosingQuotationMark << "-isolated";
-      }
-      break;
-    }
-
-    case ActorIsolation::Nonisolated:
-    case ActorIsolation::Unspecified:
-      Out << "nonisolated";
-      break;
-    }
+    auto isolation = Arg.getAsActorIsolation();
+    isolation.printForDiagnostics(Out, FormatOpts.OpeningQuotationMark);
     break;
-
+  }
   case DiagnosticArgumentKind::Diagnostic: {
     assert(Modifier.empty() && "Improper modifier for Diagnostic argument");
     auto diagArg = Arg.getAsDiagnostic();
@@ -1172,11 +1186,11 @@ static AccessLevel getBufferAccessLevel(const Decl *decl) {
   return level;
 }
 
-llvm::Optional<DiagnosticInfo>
+std::optional<DiagnosticInfo>
 DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
   auto behavior = state.determineBehavior(diagnostic);
   if (behavior == DiagnosticBehavior::Ignore)
-    return llvm::None;
+    return std::nullopt;
 
   // Figure out the source location.
   SourceLoc loc = diagnostic.getLoc();
@@ -1226,7 +1240,7 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
           // FIXME: Horrible, horrible hackaround. We're not getting a
           // DeclContext everywhere we should.
           if (!dc) {
-            return llvm::None;
+            return std::nullopt;
           }
 
           while (!dc->isModuleContext()) {
@@ -1240,6 +1254,7 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
 
             case DeclContextKind::FileUnit:
             case DeclContextKind::TopLevelCodeDecl:
+            case DeclContextKind::SerializedTopLevelCodeDecl:
               break;
 
             case DeclContextKind::ExtensionDecl:
@@ -1250,9 +1265,9 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
               ppDecl = cast<GenericTypeDecl>(dc);
               break;
 
-            case DeclContextKind::SerializedLocal:
             case DeclContextKind::Initializer:
             case DeclContextKind::AbstractClosureExpr:
+            case DeclContextKind::SerializedAbstractClosure:
             case DeclContextKind::AbstractFunctionDecl:
             case DeclContextKind::SubscriptDecl:
             case DeclContextKind::EnumElementDecl:
@@ -1349,15 +1364,11 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
     auto bufferID = SourceMgr.findBufferContainingLoc(loc);
     if (auto generatedInfo = SourceMgr.getGeneratedSourceInfo(bufferID)) {
       switch (generatedInfo->kind) {
-      case GeneratedSourceInfo::ExpressionMacroExpansion:
-      case GeneratedSourceInfo::FreestandingDeclMacroExpansion:
-      case GeneratedSourceInfo::AccessorMacroExpansion:
-      case GeneratedSourceInfo::MemberAttributeMacroExpansion:
-      case GeneratedSourceInfo::MemberMacroExpansion:
-      case GeneratedSourceInfo::PeerMacroExpansion:
-      case GeneratedSourceInfo::ConformanceMacroExpansion:
-      case GeneratedSourceInfo::ExtensionMacroExpansion:
+#define MACRO_ROLE(Name, Description)  \
+      case GeneratedSourceInfo::Name##MacroExpansion:
+#include "swift/Basic/MacroRoles.def"
       case GeneratedSourceInfo::PrettyPrinted:
+      case GeneratedSourceInfo::DefaultArgument:
         fixIts = {};
         break;
       case GeneratedSourceInfo::ReplacedFunctionBody:
@@ -1398,14 +1409,10 @@ DiagnosticEngine::getGeneratedSourceBufferNotes(SourceLoc loc) {
         ASTNode::getFromOpaqueValue(generatedInfo->astNode);
 
     switch (generatedInfo->kind) {
-    case GeneratedSourceInfo::ExpressionMacroExpansion:
-    case GeneratedSourceInfo::FreestandingDeclMacroExpansion:
-    case GeneratedSourceInfo::AccessorMacroExpansion:
-    case GeneratedSourceInfo::MemberAttributeMacroExpansion:
-    case GeneratedSourceInfo::MemberMacroExpansion:
-    case GeneratedSourceInfo::PeerMacroExpansion:
-    case GeneratedSourceInfo::ConformanceMacroExpansion:
-    case GeneratedSourceInfo::ExtensionMacroExpansion: {
+#define MACRO_ROLE(Name, Description)  \
+    case GeneratedSourceInfo::Name##MacroExpansion:
+#include "swift/Basic/MacroRoles.def"
+    {
       DeclName macroName = getGeneratedSourceInfoMacroName(*generatedInfo);
 
       // If it was an expansion of an attached macro, increase the range to
@@ -1435,6 +1442,7 @@ DiagnosticEngine::getGeneratedSourceBufferNotes(SourceLoc loc) {
     case GeneratedSourceInfo::PrettyPrinted:
       break;
 
+    case GeneratedSourceInfo::DefaultArgument:
     case GeneratedSourceInfo::ReplacedFunctionBody:
       return childNotes;
     }
@@ -1595,14 +1603,10 @@ DeclName
 swift::getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info) {
   ASTNode expansionNode = ASTNode::getFromOpaqueValue(info.astNode);
   switch (info.kind) {
-  case GeneratedSourceInfo::ExpressionMacroExpansion:
-  case GeneratedSourceInfo::FreestandingDeclMacroExpansion:
-  case GeneratedSourceInfo::AccessorMacroExpansion:
-  case GeneratedSourceInfo::MemberAttributeMacroExpansion:
-  case GeneratedSourceInfo::MemberMacroExpansion:
-  case GeneratedSourceInfo::PeerMacroExpansion:
-  case GeneratedSourceInfo::ConformanceMacroExpansion:
-  case GeneratedSourceInfo::ExtensionMacroExpansion: {
+#define MACRO_ROLE(Name, Description)  \
+    case GeneratedSourceInfo::Name##MacroExpansion:
+#include "swift/Basic/MacroRoles.def"
+  {
     DeclName macroName;
     if (auto customAttr = info.attachedMacroCustomAttr) {
       // FIXME: How will we handle deserialized custom attributes like this?
@@ -1622,6 +1626,7 @@ swift::getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info) {
 
   case GeneratedSourceInfo::PrettyPrinted:
   case GeneratedSourceInfo::ReplacedFunctionBody:
-    return DeclName();
+  case GeneratedSourceInfo::DefaultArgument:
+      return DeclName();
   }
 }

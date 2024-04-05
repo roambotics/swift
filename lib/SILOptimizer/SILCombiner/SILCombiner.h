@@ -241,8 +241,6 @@ public:
   SILInstruction *optimizeStringObject(BuiltinInst *BI);
   SILInstruction *visitBuiltinInst(BuiltinInst *BI);
   SILInstruction *visitCondFailInst(CondFailInst *CFI);
-  SILInstruction *visitCopyValueInst(CopyValueInst *cvi);
-  SILInstruction *visitDestroyValueInst(DestroyValueInst *dvi);
   SILInstruction *visitRefToRawPointerInst(RefToRawPointerInst *RRPI);
   SILInstruction *visitUpcastInst(UpcastInst *UCI);
 
@@ -332,13 +330,7 @@ public:
   SILInstruction *optimizeApplyOfConvertFunctionInst(FullApplySite AI,
                                                      ConvertFunctionInst *CFI);
 
-  bool tryOptimizeKeypath(ApplyInst *AI);
   bool tryOptimizeInoutKeypath(BeginApplyInst *AI);
-  bool tryOptimizeKeypathApplication(ApplyInst *AI, SILFunction *callee);
-  bool tryOptimizeKeypathOffsetOf(ApplyInst *AI, FuncDecl *calleeFn,
-                                  KeyPathInst *kp);
-  bool tryOptimizeKeypathKVCString(ApplyInst *AI, FuncDecl *calleeFn,
-                                  KeyPathInst *kp);
 
   /// Sinks owned forwarding instructions to their uses if they do not have
   /// non-debug non-consuming uses. Deletes any debug_values and destroy_values
@@ -377,11 +369,11 @@ public:
 
 private:
   // Build concrete existential information using findInitExistential.
-  llvm::Optional<ConcreteOpenedExistentialInfo>
+  std::optional<ConcreteOpenedExistentialInfo>
   buildConcreteOpenedExistentialInfo(Operand &ArgOperand);
 
   // Build concrete existential information using SoleConformingType.
-  llvm::Optional<ConcreteOpenedExistentialInfo>
+  std::optional<ConcreteOpenedExistentialInfo>
   buildConcreteOpenedExistentialInfoFromSoleConformingType(Operand &ArgOperand);
 
   // Common utility function to build concrete existential information for all

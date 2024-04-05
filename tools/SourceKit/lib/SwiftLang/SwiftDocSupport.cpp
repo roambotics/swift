@@ -141,8 +141,7 @@ public:
     assert(EntitiesStack.empty());
   }
 
-  bool shouldContinuePre(const Decl *D,
-                         llvm::Optional<BracketOptions> Bracket) {
+  bool shouldContinuePre(const Decl *D, std::optional<BracketOptions> Bracket) {
     assert(Bracket.has_value());
     if (!Bracket.value().shouldOpenExtension(D) &&
         isa<ExtensionDecl>(D))
@@ -151,7 +150,7 @@ public:
   }
 
   bool shouldContinuePost(const Decl *D,
-                          llvm::Optional<BracketOptions> Bracket) {
+                          std::optional<BracketOptions> Bracket) {
     assert(Bracket.has_value());
     if (!Bracket.value().shouldCloseNominal(D) && isa<NominalTypeDecl>(D))
       return false;
@@ -161,9 +160,10 @@ public:
     return true;
   }
 
-  void printSynthesizedExtensionPre(
-      const ExtensionDecl *ED, TypeOrExtensionDecl Target,
-      llvm::Optional<BracketOptions> Bracket) override {
+  void
+  printSynthesizedExtensionPre(const ExtensionDecl *ED,
+                               TypeOrExtensionDecl Target,
+                               std::optional<BracketOptions> Bracket) override {
     assert(!SynthesizedExtensionInfo.first);
     SynthesizedExtensionInfo = {ED, Target};
     if (!shouldContinuePre(ED, Bracket))
@@ -174,7 +174,7 @@ public:
 
   void printSynthesizedExtensionPost(
       const ExtensionDecl *ED, TypeOrExtensionDecl Target,
-      llvm::Optional<BracketOptions> Bracket) override {
+      std::optional<BracketOptions> Bracket) override {
     assert(SynthesizedExtensionInfo.first);
     SynthesizedExtensionInfo = {nullptr, {}};
     if (!shouldContinuePost(ED, Bracket))
@@ -187,7 +187,7 @@ public:
   }
 
   void printDeclPre(const Decl *D,
-                    llvm::Optional<BracketOptions> Bracket) override {
+                    std::optional<BracketOptions> Bracket) override {
     if (isa<ParamDecl>(D))
       return; // Parameters are handled specially in addParameters().
     if (!shouldContinuePre(D, Bracket))
@@ -211,7 +211,7 @@ public:
   }
 
   void printDeclPost(const Decl *D,
-                     llvm::Optional<BracketOptions> Bracket) override {
+                     std::optional<BracketOptions> Bracket) override {
     if (isa<ParamDecl>(D))
       return; // Parameters are handled specially in addParameters().
     if (!shouldContinuePost(D, Bracket))
@@ -335,7 +335,13 @@ static void initDocGenericParams(const Decl *D, DocEntityInfo &Info,
   if (auto *typeDC = GC->getInnermostTypeContext())
     Proto = typeDC->getSelfProtocolDecl();
 
-  for (auto Req: GenericSig.getRequirements()) {
+  SmallVector<Requirement, 2> Reqs;
+  SmallVector<InverseRequirement, 2> InverseReqs;
+  GenericSig->getRequirementsWithInverses(Reqs, InverseReqs);
+  // FIXME: Handle InverseReqs, or change the above to getRequirements()
+  // and update tests to include Copyable/Escapable
+
+  for (auto Req: Reqs) {
     if (Proto &&
         Req.getKind() == RequirementKind::Conformance &&
         Req.getFirstType()->isEqual(Proto->getSelfInterfaceType()) &&
@@ -455,7 +461,7 @@ static bool initDocEntityInfo(const Decl *D,
   }
 
   if (!IsRef) {
-    llvm::raw_svector_ostream OS(Info.DocComment);
+    llvm::raw_svector_ostream OS(Info.DocCommentAsXML);
 
     {
       llvm::SmallString<128> DocBuffer;
@@ -503,12 +509,13 @@ static bool initDocEntityInfo(const Decl *D,
 
   switch(D->getDeclContext()->getContextKind()) {
     case DeclContextKind::AbstractClosureExpr:
+    case DeclContextKind::SerializedAbstractClosure:
     case DeclContextKind::TopLevelCodeDecl:
+    case DeclContextKind::SerializedTopLevelCodeDecl:
     case DeclContextKind::AbstractFunctionDecl:
     case DeclContextKind::SubscriptDecl:
     case DeclContextKind::EnumElementDecl:
     case DeclContextKind::Initializer:
-    case DeclContextKind::SerializedLocal:
     case DeclContextKind::ExtensionDecl:
     case DeclContextKind::GenericTypeDecl:
     case DeclContextKind::MacroDecl:
@@ -667,7 +674,7 @@ getDeclAttributes(const Decl *D, std::vector<const DeclAttribute*> &Scratch) {
     }
   }
 
-  return llvm::makeArrayRef(Scratch);
+  return llvm::ArrayRef(Scratch);
 }
 
 // Only reports @available.
@@ -993,17 +1000,17 @@ public:
 
   PreWalkAction walkToDeclPre(Decl *D) override {
     if (D->isImplicit())
-      return Action::SkipChildren(); // Skip body.
+      return Action::SkipNode(); // Skip body.
 
     if (FuncEnts.empty())
-      return Action::SkipChildren();
+      return Action::SkipNode();
 
     if (!isa<AbstractFunctionDecl>(D) && !isa<SubscriptDecl>(D))
       return Action::Continue();
 
     // Ignore things that don't come from this buffer.
     if (!SM.getRangeForBuffer(BufferID).contains(D->getLoc()))
-      return Action::SkipChildren();
+      return Action::SkipNode();
 
     unsigned Offset = SM.getLocOffsetInBuffer(D->getLoc(), BufferID);
     auto Found = FuncEnts.end();
@@ -1016,14 +1023,14 @@ public:
         });
     }
     if (Found == FuncEnts.end() || (*Found)->LocOffset != Offset)
-      return Action::SkipChildren();
+      return Action::SkipNode();
     if (auto FD = dyn_cast<AbstractFunctionDecl>(D)) {
       addParameters(FD, **Found, SM, BufferID);
     } else {
       addParameters(cast<SubscriptDecl>(D), **Found, SM, BufferID);
     }
     FuncEnts = llvm::MutableArrayRef<TextEntity*>(Found+1, FuncEnts.end());
-    return Action::SkipChildren(); // skip body.
+    return Action::SkipNode(); // skip body.
   }
 };
 } // end anonymous namespace
@@ -1071,7 +1078,7 @@ static bool getModuleInterfaceInfo(ASTContext &Ctx, StringRef ModuleName,
     return true;
 
   PrintOptions Options = PrintOptions::printDocInterface();
-  ModuleTraversalOptions TraversalOptions = llvm::None;
+  ModuleTraversalOptions TraversalOptions = std::nullopt;
   TraversalOptions |= ModuleTraversal::VisitSubmodules;
   TraversalOptions |= ModuleTraversal::VisitHidden;
 
@@ -1079,7 +1086,8 @@ static bool getModuleInterfaceInfo(ASTContext &Ctx, StringRef ModuleName,
   llvm::raw_svector_ostream OS(Text);
   AnnotatingPrinter Printer(OS);
 
-  printModuleInterface(M, llvm::None, TraversalOptions, Printer, Options, true);
+  printModuleInterface(M, std::nullopt, TraversalOptions, Printer, Options,
+                       true);
 
   Info.Text = std::string(OS.str());
   Info.TopEntities = std::move(Printer.TopEntities);
@@ -1190,7 +1198,7 @@ public:
       return true;
     // Ignore things that don't come from this buffer.
     if (!SM.getRangeForBuffer(BufferID).contains(Range.getStart()))
-      return false;
+      return true;
 
     unsigned StartOffset = getOffset(Range.getStart());
     References.emplace_back(D, StartOffset, Range.getByteLength(), Ty);
@@ -1290,9 +1298,8 @@ public:
     std::vector<CategorizedEdits> Results;
     for (unsigned I = 0, N = UIds.size(); I < N; I ++) {
       auto Pair = StartEnds[I];
-      Results.push_back({UIds[I],
-                         llvm::makeArrayRef(AllEdits.data() + Pair.first,
-                                             Pair.second - Pair.first)});
+      Results.push_back({UIds[I], llvm::ArrayRef(AllEdits.data() + Pair.first,
+                                                 Pair.second - Pair.first)});
     }
     Receiver(RequestResult<ArrayRef<CategorizedEdits>>::fromResult(Results));
   }
@@ -1344,32 +1351,18 @@ void RequestRefactoringEditConsumer::handleDiagnostic(
   Impl.DiagConsumer.handleDiagnostic(SM, Info);
 }
 
-class RequestRenameRangeConsumer::Implementation {
-  CategorizedRenameRangesReceiver Receiver;
-  std::string ErrBuffer;
-  llvm::raw_string_ostream OS;
-  std::vector<CategorizedRenameRanges> CategorizedRanges;
+/// Translates a vector of \c SyntacticRenameRangeDetails to a vector of
+/// \c CategorizedRenameRanges.
+static std::vector<CategorizedRenameRanges> getCategorizedRenameRanges(
+    std::vector<SyntacticRenameRangeDetails> SyntacticRenameRanges,
+    SourceManager &SM) {
+  std::vector<CategorizedRenameRanges> Result;
 
-public:
-  PrintingDiagnosticConsumer DiagConsumer;
-
-public:
-  Implementation(CategorizedRenameRangesReceiver Receiver)
-      : Receiver(Receiver), OS(ErrBuffer), DiagConsumer(OS) {}
-
-  ~Implementation() {
-    if (DiagConsumer.didErrorOccur()) {
-      Receiver(RequestResult<ArrayRef<CategorizedRenameRanges>>::fromError(OS.str()));
-      return;
-    }
-    Receiver(RequestResult<ArrayRef<CategorizedRenameRanges>>::fromResult(CategorizedRanges));
-  }
-
-  void accept(SourceManager &SM, RegionType RegionType,
-              ArrayRef<ide::RenameRangeDetail> Ranges) {
-    CategorizedRenameRanges Results;
-    Results.Category = SwiftLangSupport::getUIDForRegionType(RegionType);
-    for (const auto &R : Ranges) {
+  for (SyntacticRenameRangeDetails RangeDetails : SyntacticRenameRanges) {
+    CategorizedRenameRanges CategorizedRanges;
+    CategorizedRanges.Category =
+        SwiftLangSupport::getUIDForRegionType(RangeDetails.Type);
+    for (const auto &R : RangeDetails.Ranges) {
       SourceKit::RenameRangeDetail Result;
       std::tie(Result.StartLine, Result.StartColumn) =
           SM.getLineAndColumnInBuffer(R.Range.getStart());
@@ -1378,92 +1371,50 @@ public:
       Result.ArgIndex = R.Index;
       Result.Kind =
           SwiftLangSupport::getUIDForRefactoringRangeKind(R.RangeKind);
-      Results.Ranges.push_back(std::move(Result));
+      CategorizedRanges.Ranges.push_back(std::move(Result));
     }
-    CategorizedRanges.push_back(std::move(Results));
+    Result.push_back(std::move(CategorizedRanges));
   }
-};
 
-RequestRenameRangeConsumer::RequestRenameRangeConsumer(
-    CategorizedRenameRangesReceiver Receiver)
-    : Impl(*new Implementation(Receiver)) {}
-RequestRenameRangeConsumer::~RequestRenameRangeConsumer() { delete &Impl; }
-
-void RequestRenameRangeConsumer::accept(
-    SourceManager &SM, RegionType RegionType,
-    ArrayRef<ide::RenameRangeDetail> Ranges) {
-  Impl.accept(SM, RegionType, Ranges);
+  return Result;
 }
 
-void RequestRenameRangeConsumer::handleDiagnostic(SourceManager &SM,
-                                                  const DiagnosticInfo &Info) {
-  Impl.DiagConsumer.handleDiagnostic(SM, Info);
-}
-
-static NameUsage getNameUsage(RenameType Type) {
-  switch (Type) {
-  case RenameType::Definition:
-    return NameUsage::Definition;
-  case RenameType::Reference:
-    return NameUsage::Reference;
-  case RenameType::Call:
-    return NameUsage::Call;
-  case RenameType::Unknown:
-    return NameUsage::Unknown;
-  }
-}
-
-static std::vector<RenameLoc>
-getSyntacticRenameLocs(ArrayRef<RenameLocations> RenameLocations);
-
-void SwiftLangSupport::
-syntacticRename(llvm::MemoryBuffer *InputBuf,
-                ArrayRef<RenameLocations> RenameLocations,
-                ArrayRef<const char*> Args,
-                CategorizedEditsReceiver Receiver) {
+CancellableResult<std::vector<CategorizedRenameRanges>>
+SwiftLangSupport::findRenameRanges(llvm::MemoryBuffer *InputBuf,
+                                   ArrayRef<RenameLoc> RenameLocs,
+                                   ArrayRef<const char *> Args) {
+  using ResultType = CancellableResult<std::vector<CategorizedRenameRanges>>;
   std::string Error;
   CompilerInstance ParseCI;
   PrintingDiagnosticConsumer PrintDiags;
   ParseCI.addDiagnosticConsumer(&PrintDiags);
   SourceFile *SF = getSyntacticSourceFile(InputBuf, Args, ParseCI, Error);
   if (!SF) {
-    Receiver(RequestResult<ArrayRef<CategorizedEdits>>::fromError(Error));
-    return;
+    return ResultType::failure(Error);
   }
 
-  auto RenameLocs = getSyntacticRenameLocs(RenameLocations);
-  RequestRefactoringEditConsumer EditConsumer(Receiver);
-  swift::ide::syntacticRename(SF, RenameLocs, EditConsumer, EditConsumer);
-}
+  auto SyntacticRenameRanges =
+      swift::ide::findSyntacticRenameRanges(SF, RenameLocs,
+                                            /*NewName=*/StringRef());
 
-void SwiftLangSupport::findRenameRanges(
-    llvm::MemoryBuffer *InputBuf, ArrayRef<RenameLocations> RenameLocations,
-    ArrayRef<const char *> Args, CategorizedRenameRangesReceiver Receiver) {
-  std::string Error;
-  CompilerInstance ParseCI;
-  PrintingDiagnosticConsumer PrintDiags;
-  ParseCI.addDiagnosticConsumer(&PrintDiags);
-  SourceFile *SF = getSyntacticSourceFile(InputBuf, Args, ParseCI, Error);
-  if (!SF) {
-    Receiver(RequestResult<ArrayRef<CategorizedRenameRanges>>::fromError(Error));
-    return;
-  }
-
-  auto RenameLocs = getSyntacticRenameLocs(RenameLocations);
-  RequestRenameRangeConsumer Consumer(Receiver);
-  swift::ide::findSyntacticRenameRanges(SF, RenameLocs, Consumer, Consumer);
+  SourceManager &SM = SF->getASTContext().SourceMgr;
+  return SyntacticRenameRanges.map<std::vector<CategorizedRenameRanges>>(
+      [&SM](auto &SyntacticRenameRanges) {
+        return getCategorizedRenameRanges(SyntacticRenameRanges, SM);
+      });
 }
 
 void SwiftLangSupport::findLocalRenameRanges(
     StringRef Filename, unsigned Line, unsigned Column, unsigned Length,
     ArrayRef<const char *> Args, SourceKitCancellationToken CancellationToken,
     CategorizedRenameRangesReceiver Receiver) {
+  using ResultType = CancellableResult<std::vector<CategorizedRenameRanges>>;
   std::string Error;
   SwiftInvocationRef Invok =
       ASTMgr->getTypecheckInvocation(Args, Filename, Error);
   if (!Invok) {
     LOG_WARN_FUNC("failed to create an ASTInvocation: " << Error);
-    Receiver(RequestResult<ArrayRef<CategorizedRenameRanges>>::fromError(Error));
+    Receiver(ResultType::failure(Error));
     return;
   }
 
@@ -1479,16 +1430,21 @@ void SwiftLangSupport::findLocalRenameRanges(
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
       auto &SF = AstUnit->getPrimarySourceFile();
       swift::ide::RangeConfig Range{*SF.getBufferID(), Line, Column, Length};
-      RequestRenameRangeConsumer Consumer(std::move(Receiver));
-      swift::ide::findLocalRenameRanges(&SF, Range, Consumer, Consumer);
+      SourceManager &SM = SF.getASTContext().SourceMgr;
+      auto SyntacticRenameRanges =
+          swift::ide::findLocalRenameRanges(&SF, Range);
+      auto Result =
+          SyntacticRenameRanges.map<std::vector<CategorizedRenameRanges>>(
+              [&SM](auto &SyntacticRenameRanges) {
+                return getCategorizedRenameRanges(SyntacticRenameRanges, SM);
+              });
+      Receiver(Result);
     }
 
-    void cancelled() override {
-      Receiver(RequestResult<ArrayRef<CategorizedRenameRanges>>::cancelled());
-    }
+    void cancelled() override { Receiver(ResultType::cancelled()); }
 
     void failed(StringRef Error) override {
-      Receiver(RequestResult<ArrayRef<CategorizedRenameRanges>>::fromError(Error));
+      Receiver(ResultType::failure(Error.str()));
     }
   };
 
@@ -1535,19 +1491,6 @@ SourceFile *SwiftLangSupport::getSyntacticSourceFile(
   if (!SF)
     Error = "Failed to determine SourceFile for input buffer";
   return SF;
-}
-
-static std::vector<RenameLoc>
-getSyntacticRenameLocs(ArrayRef<RenameLocations> RenameLocations) {
-  std::vector<RenameLoc> RenameLocs;
-  for(const auto &Locations: RenameLocations) {
-    for(const auto &Location: Locations.LineColumnLocs) {
-      RenameLocs.push_back({Location.Line, Location.Column,
-        getNameUsage(Location.Type), Locations.OldName, Locations.NewName,
-        Locations.IsFunctionLike, Locations.IsNonProtocolType});
-    }
-  }
-  return RenameLocs;
 }
 
 void SwiftLangSupport::getDocInfo(llvm::MemoryBuffer *InputBuf,

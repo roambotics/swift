@@ -59,9 +59,9 @@ struct LoadOperation {
   ///
   /// TODO: Rather than use an optional here, we should include an invalid
   /// representation in LoadOwnershipQualifier.
-  llvm::Optional<LoadOwnershipQualifier> getOwnershipQualifier() const {
+  std::optional<LoadOwnershipQualifier> getOwnershipQualifier() const {
     if (auto *lbi = value.dyn_cast<LoadBorrowInst *>()) {
-      return llvm::None;
+      return std::nullopt;
     }
 
     return value.get<LoadInst *>()->getOwnershipQualifier();
@@ -111,6 +111,8 @@ struct ConversionOperation {
 
   static bool isa(SILInstruction *inst) {
     switch (inst->getKind()) {
+    case SILInstructionKind::MarkUnresolvedNonCopyableValueInst:
+    case SILInstructionKind::MarkUninitializedInst:
     case SILInstructionKind::ConvertFunctionInst:
     case SILInstructionKind::UpcastInst:
     case SILInstructionKind::AddressToPointerInst:
@@ -135,6 +137,10 @@ struct ConversionOperation {
     case SILInstructionKind::RefToUnownedInst:
     case SILInstructionKind::UnmanagedToRefInst:
     case SILInstructionKind::UnownedToRefInst:
+    case SILInstructionKind::CopyableToMoveOnlyWrapperValueInst:
+    case SILInstructionKind::MoveOnlyWrapperToCopyableValueInst:
+    case SILInstructionKind::MoveOnlyWrapperToCopyableBoxInst:
+    case SILInstructionKind::DropDeinitInst:
       return true;
     default:
       return false;
@@ -254,10 +260,15 @@ public:
   ValueOwnershipKind getForwardingOwnershipKind();
   bool preservesOwnership();
 
+  // ForwardingInstruction.swift mirrors this implementation.
   Operand *getSingleForwardingOperand() const {
     switch (forwardingInst->getKind()) {
-    case SILInstructionKind::StructInst:
     case SILInstructionKind::TupleInst:
+    case SILInstructionKind::StructInst: {
+      if (forwardingInst->getNumRealOperands() != 1)
+        return nullptr;
+      return *forwardingInst->getRealOperands().begin();
+    }
     case SILInstructionKind::LinearFunctionInst:
     case SILInstructionKind::DifferentiableFunctionInst:
       return nullptr;
@@ -268,9 +279,6 @@ public:
         &forwardingInst->getOperandRef(RefToBridgeObjectInst::ConvertedOperand);
     case SILInstructionKind::TuplePackExtractInst:
       return &forwardingInst->getOperandRef(TuplePackExtractInst::TupleOperand);
-    case SILInstructionKind::SelectEnumInst:
-      // ignore trailing case operands
-      return &forwardingInst->getOperandRef(0);
     default:
       int numRealOperands = forwardingInst->getNumRealOperands();
       if (numRealOperands == 0) {

@@ -51,10 +51,10 @@ namespace {
 
 struct SILMoveOnlyWrappedTypeEliminatorVisitor
     : SILInstructionVisitor<SILMoveOnlyWrappedTypeEliminatorVisitor, bool> {
-  const SmallSetVector<SILArgument *, 8> &touchedArgs;
+  const llvm::SmallSetVector<SILArgument *, 8> &touchedArgs;
 
   SILMoveOnlyWrappedTypeEliminatorVisitor(
-      const SmallSetVector<SILArgument *, 8> &touchedArgs)
+      const llvm::SmallSetVector<SILArgument *, 8> &touchedArgs)
       : touchedArgs(touchedArgs) {}
 
   bool visitSILInstruction(SILInstruction *inst) {
@@ -199,6 +199,8 @@ struct SILMoveOnlyWrappedTypeEliminatorVisitor
   NO_UPDATE_NEEDED(BeginAccess)
   NO_UPDATE_NEEDED(EndAccess)
   NO_UPDATE_NEEDED(ClassMethod)
+  NO_UPDATE_NEEDED(FixLifetime)
+  NO_UPDATE_NEEDED(AddressToPointer)
 #undef NO_UPDATE_NEEDED
 
   bool eliminateIdentityCast(SingleValueInstruction *svi) {
@@ -221,11 +223,10 @@ struct SILMoveOnlyWrappedTypeEliminatorVisitor
   // the original function type into a function type without move only. This is
   // safe since adding/removing moveonlywrapped types is ABI neutral.
   bool visitApplySite(ApplySite ai) {
-    auto eliminateMoveOnlyWrapped =
-        [&](TypeBase *type) -> llvm::Optional<Type> {
+    auto eliminateMoveOnlyWrapped = [&](TypeBase *type) -> std::optional<Type> {
       if (auto *moveType = dyn_cast<SILMoveOnlyWrappedType>(type))
         return moveType->getInnerType();
-      return llvm::None;
+      return std::nullopt;
     };
 
     // First fix up the callee.
@@ -294,8 +295,8 @@ static bool isMoveOnlyWrappedTrivial(SILValue value) {
 bool SILMoveOnlyWrappedTypeEliminator::process() {
   bool madeChange = true;
 
-  SmallSetVector<SILArgument *, 8> touchedArgs;
-  SmallSetVector<SILInstruction *, 8> touchedInsts;
+  llvm::SmallSetVector<SILArgument *, 8> touchedArgs;
+  llvm::SmallSetVector<SILInstruction *, 8> touchedInsts;
 
   for (auto &bb : *fn) {
     for (auto *arg : bb.getArguments()) {

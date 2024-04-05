@@ -24,11 +24,11 @@ class CMakeProduct(product.Product):
         return self.args.verbose_build
 
     def build_with_cmake(self, build_targets, build_type, build_args,
-                         prefer_just_built_toolchain=False):
+                         prefer_native_toolchain=False):
         assert self.toolchain.cmake is not None
         cmake_build = []
         _cmake = cmake.CMake(self.args, self.toolchain,
-                             prefer_just_built_toolchain)
+                             prefer_native_toolchain)
 
         if self.toolchain.distcc_pump:
             cmake_build.append(self.toolchain.distcc_pump)
@@ -70,7 +70,10 @@ class CMakeProduct(product.Product):
                            + self.args.extra_cmake_options + [self.source_dir],
                            env=env)
 
-        if not self.args.skip_build or self.product_name() == "llvm":
+        is_llvm = self.product_name() == "llvm"
+        if (not is_llvm and not self.args.skip_build) or (
+            is_llvm and self.args._build_llvm
+        ):
             cmake_opts = [self.build_dir, "--config", build_type]
 
             if self.args.cmake_generator == "Xcode":

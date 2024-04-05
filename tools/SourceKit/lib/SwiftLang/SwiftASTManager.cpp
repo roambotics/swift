@@ -823,7 +823,7 @@ void SwiftASTManager::removeCachedAST(SwiftInvocationRef Invok) {
 ASTProducerRef
 SwiftASTManager::Implementation::getASTProducer(SwiftInvocationRef InvokRef) {
   llvm::sys::ScopedLock L(CacheMtx);
-  llvm::Optional<ASTProducerRef> OptProducer = ASTCache.get(InvokRef->Impl.Key);
+  std::optional<ASTProducerRef> OptProducer = ASTCache.get(InvokRef->Impl.Key);
   if (OptProducer.has_value())
     return OptProducer.value();
   ASTProducerRef Producer = std::make_shared<ASTProducer>(InvokRef);
@@ -884,8 +884,11 @@ SwiftASTManager::Implementation::getMemoryBuffer(
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
     std::string &Error) const {
   assert(FileSystem);
+  // Avoid memory-mapping as it could prevent the user from
+  // saving the file in the editor.
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-      FileSystem->getBufferForFile(Filename);
+      FileSystem->getBufferForFile(Filename, /*FileSize*/-1,
+          /*RequiresNullTerminator*/true, /*IsVolatile*/true);
   if (FileBufOrErr)
     return std::move(FileBufOrErr.get());
 

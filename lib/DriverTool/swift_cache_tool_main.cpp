@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 //
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/FileTypes.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/LLVMInitialize.h"
 #include "swift/Basic/Version.h"
@@ -49,9 +50,8 @@ enum class SwiftCacheToolAction {
 
 struct OutputEntry {
   std::string InputPath;
-  std::string OutputPath;
-  std::string OutputKind;
   std::string CacheKey;
+  std::vector<std::pair<std::string, std::string>> Outputs;
 };
 
 enum ID {
@@ -64,7 +64,10 @@ enum ID {
 #undef OPTION
 };
 
-#define PREFIX(NAME, VALUE) static const char *const NAME[] = VALUE;
+#define PREFIX(NAME, VALUE)                                                    \
+  constexpr llvm::StringLiteral NAME##_init[] = VALUE;                         \
+  constexpr llvm::ArrayRef<llvm::StringLiteral> NAME(                          \
+      NAME##_init, std::size(NAME##_init) - 1);
 #include "SwiftCacheToolOptions.inc"
 #undef PREFIX
 
@@ -77,9 +80,9 @@ static const OptTable::Info InfoTable[] = {
 #undef OPTION
 };
 
-class CacheToolOptTable : public llvm::opt::OptTable {
+class CacheToolOptTable : public llvm::opt::GenericOptTable {
 public:
-  CacheToolOptTable() : OptTable(InfoTable) {}
+  CacheToolOptTable() : GenericOptTable(InfoTable) {}
 };
 
 class SwiftCacheToolInvocation {
@@ -99,18 +102,14 @@ public:
     Instance.addDiagnosticConsumer(&PDC);
   }
 
-  std::unique_ptr<llvm::opt::OptTable> createOptTable() {
-    return std::unique_ptr<OptTable>(new CacheToolOptTable());
-  }
-
   int parseArgs(ArrayRef<const char *> Args) {
     auto &Diags = Instance.getDiags();
 
-    std::unique_ptr<llvm::opt::OptTable> Table = createOptTable();
+    CacheToolOptTable Table;
     unsigned MissingIndex;
     unsigned MissingCount;
     llvm::opt::InputArgList ParsedArgs =
-        Table->ParseArgs(Args, MissingIndex, MissingCount);
+        Table.ParseArgs(Args, MissingIndex, MissingCount);
     if (MissingCount) {
       Diags.diagnose(SourceLoc(), diag::error_missing_arg_value,
                      ParsedArgs.getArgString(MissingIndex), MissingCount);
@@ -120,8 +119,8 @@ public:
     if (ParsedArgs.getLastArg(OPT_help)) {
       std::string ExecutableName =
           llvm::sys::path::stem(MainExecutablePath).str();
-      Table->printHelp(llvm::outs(), ExecutableName.c_str(), "Swift Cache Tool",
-                       0, 0, /*ShowAllAliases*/ false);
+      Table.printHelp(llvm::outs(), ExecutableName.c_str(), "Swift Cache Tool",
+                      0, 0, /*ShowAllAliases*/ false);
       return 0;
     }
 
@@ -186,8 +185,11 @@ private:
       llvm::errs() << "missing swift-frontend command-line after --\n";
       return true;
     }
-    // drop swift-frontend executable path from command-line.
-    if (StringRef(FrontendArgs[0]).endswith("swift-frontend"))
+    // drop swift-frontend executable path and leading `-frontend` from
+    // command-line.
+    if (StringRef(FrontendArgs[0]).ends_with("swift-frontend"))
+      FrontendArgs.erase(FrontendArgs.begin());
+    if (StringRef(FrontendArgs[0]).equals("-frontend"))
       FrontendArgs.erase(FrontendArgs.begin());
 
     SmallVector<std::unique_ptr<llvm::MemoryBuffer>, 4>
@@ -218,7 +220,7 @@ private:
                              MainExecutablePath))
       return true;
 
-    if (!Invocation.getFrontendOptions().EnableCaching) {
+    if (!Invocation.getCASOptions().EnableCaching) {
       llvm::errs() << "Requested command-line arguments do not enable CAS\n";
       return true;
     }
@@ -238,12 +240,12 @@ private:
     return false;
   }
 
-  llvm::Optional<ObjectRef> getBaseKey() {
+  std::optional<ObjectRef> getBaseKey() {
     auto BaseKey = Instance.getCompilerBaseKey();
     if (!BaseKey) {
       Instance.getDiags().diagnose(SourceLoc(), diag::error_cas,
                                    "Base Key doesn't exist");
-      return llvm::None;
+      return std::nullopt;
     }
 
     return *BaseKey;
@@ -282,44 +284,42 @@ int SwiftCacheToolInvocation::printOutputKeys() {
 
   std::vector<OutputEntry> OutputKeys;
   bool hasError = false;
-  auto addOutputKey = [&](StringRef InputPath, file_types::ID OutputKind,
-                          StringRef OutputPath) {
+  auto addFromInputFile = [&](const InputFile &Input, unsigned InputIndex) {
+    auto InputPath = Input.getFileName();
     auto OutputKey =
-        createCompileJobCacheKeyForOutput(CAS, *BaseKey, InputPath, OutputKind);
+        createCompileJobCacheKeyForOutput(CAS, *BaseKey, InputIndex);
     if (!OutputKey) {
-      llvm::errs() << "cannot create cache key for " << OutputPath << ": "
+      llvm::errs() << "cannot create cache key for " << InputPath << ": "
                    << toString(OutputKey.takeError()) << "\n";
       hasError = true;
     }
     OutputKeys.emplace_back(
-        OutputEntry{InputPath.str(), OutputPath.str(),
-                    file_types::getTypeName(OutputKind).str(),
-                    CAS.getID(*OutputKey).toString()});
-  };
-  auto addFromInputFile = [&](const InputFile &Input) {
-    auto InputPath = Input.getFileName();
+        OutputEntry{InputPath, CAS.getID(*OutputKey).toString(), {}});
+    auto &Outputs = OutputKeys.back().Outputs;
     if (!Input.outputFilename().empty())
-      addOutputKey(InputPath,
-                   Invocation.getFrontendOptions()
-                       .InputsAndOutputs.getPrincipalOutputType(),
-                   Input.outputFilename());
+      Outputs.emplace_back(file_types::getTypeName(
+                               Invocation.getFrontendOptions()
+                                   .InputsAndOutputs.getPrincipalOutputType()),
+                           Input.outputFilename());
     Input.getPrimarySpecificPaths()
         .SupplementaryOutputs.forEachSetOutputAndType(
             [&](const std::string &File, file_types::ID ID) {
               // Dont print serialized diagnostics.
-              if (ID == file_types::ID::TY_SerializedDiagnostics)
+              if (file_types::isProducedFromDiagnostics(ID))
                 return;
-
-              addOutputKey(InputPath, ID, File);
+              Outputs.emplace_back(file_types::getTypeName(ID), File);
             });
   };
-  llvm::for_each(
-      Invocation.getFrontendOptions().InputsAndOutputs.getAllInputs(),
-      addFromInputFile);
+  auto AllInputs =
+      Invocation.getFrontendOptions().InputsAndOutputs.getAllInputs();
+  for (unsigned Index = 0; Index < AllInputs.size(); ++Index)
+    addFromInputFile(AllInputs[Index], Index);
 
   // Add diagnostics file.
-  addOutputKey("<cached-diagnostics>", file_types::ID::TY_CachedDiagnostics,
-               "<cached-diagnostics>");
+  if (!OutputKeys.empty())
+    OutputKeys.front().Outputs.emplace_back(
+        file_types::getTypeName(file_types::ID::TY_CachedDiagnostics),
+        "<cached-diagnostics>");
 
   if (hasError)
     return 1;
@@ -328,10 +328,16 @@ int SwiftCacheToolInvocation::printOutputKeys() {
   Out.array([&] {
     for (const auto &E : OutputKeys) {
       Out.object([&] {
-        Out.attribute("OutputPath", E.OutputPath);
-        Out.attribute("OutputKind", E.OutputKind);
         Out.attribute("Input", E.InputPath);
         Out.attribute("CacheKey", E.CacheKey);
+        Out.attributeArray("Outputs", [&] {
+          for (const auto &OutEntry : E.Outputs) {
+            Out.object([&] {
+              Out.attribute("Kind", OutEntry.first);
+              Out.attribute("Path", OutEntry.second);
+            });
+          }
+        });
       });
     }
   });
@@ -348,8 +354,7 @@ readOutputEntriesFromFile(StringRef Path) {
 
   auto JSONValue = llvm::json::parse((*JSONContent)->getBuffer());
   if (!JSONValue)
-    return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                   "failed to parse input file as JSON");
+    return JSONValue.takeError();
 
   auto Keys = JSONValue->getAsArray();
   if (!Keys)
@@ -364,8 +369,21 @@ int SwiftCacheToolInvocation::validateOutputs() {
   if (!DB)
     report_fatal_error(DB.takeError());
 
+  auto &CAS = *DB->first;
+  auto &Cache = *DB->second;
+
   PrintingDiagnosticConsumer PDC;
   Instance.getDiags().addConsumer(PDC);
+
+  auto lookupFailed = [&](StringRef Key) {
+    llvm::errs() << "failed to find output for cache key " << Key << "\n";
+    return true;
+  };
+  auto lookupError = [&](llvm::Error Err, StringRef Key) {
+    llvm::errs() << "failed to find output for cache key " << Key << ": "
+                 << toString(std::move(Err)) << "\n";
+    return true;
+  };
 
   auto validateCacheKeysFromFile = [&](const std::string &Path) {
     auto Keys = readOutputEntriesFromFile(Path);
@@ -378,12 +396,40 @@ int SwiftCacheToolInvocation::validateOutputs() {
     for (const auto& Entry : *Keys) {
       if (auto *Obj = Entry.getAsObject()) {
         if (auto Key = Obj->getString("CacheKey")) {
-          if (auto Buffer = loadCachedCompileResultFromCacheKey(
-                  *DB->first, *DB->second, Instance.getDiags(), *Key))
-            continue;
-          llvm::errs() << "failed to find output for cache key " << *Key
-                       << "\n";
-          return true;
+          auto ID = CAS.parseID(*Key);
+          if (!ID) {
+            llvm::errs() << "failed to parse ID " << Key << ": "
+                         << toString(ID.takeError()) << "\n";
+            return true;
+          }
+          auto Ref = CAS.getReference(*ID);
+          if (!Ref)
+            return lookupFailed(*Key);
+          auto KeyID = CAS.getID(*Ref);
+          auto Lookup = Cache.get(KeyID);
+          if (!Lookup)
+            return lookupError(Lookup.takeError(), *Key);
+
+          if (!*Lookup)
+            return lookupFailed(*Key);
+
+          auto OutputRef = CAS.getReference(**Lookup);
+          if (!OutputRef)
+            return lookupFailed(*Key);
+
+          cas::CachedResultLoader Loader(CAS, *OutputRef);
+          if (auto Err = Loader.replay(
+                  [&](file_types::ID Kind, ObjectRef Ref) -> llvm::Error {
+                    auto Proxy = CAS.getProxy(Ref);
+                    if (!Proxy)
+                      return Proxy.takeError();
+                    return llvm::Error::success();
+                  })) {
+            llvm::errs() << "failed to find output for cache key " << *Key
+                         << ": " << toString(std::move(Err)) << "\n";
+            return true;
+          }
+          continue;
         }
       }
       llvm::errs() << "can't read cache key from " << Path << "\n";
@@ -423,7 +469,8 @@ int SwiftCacheToolInvocation::renderDiags() {
         if (auto Key = Obj->getString("CacheKey")) {
           if (auto Buffer = loadCachedCompileResultFromCacheKey(
                   Instance.getObjectStore(), Instance.getActionCache(),
-                  Instance.getDiags(), *Key)) {
+                  Instance.getDiags(), *Key,
+                  file_types::ID::TY_CachedDiagnostics)) {
             if (auto E = CDP->replayCachedDiagnostics(Buffer->getBuffer())) {
               llvm::errs() << "failed to replay cache: "
                            << toString(std::move(E)) << "\n";

@@ -231,6 +231,8 @@ static bool mayConflictWithGlobalInit(AliasAnalysis *AA,
   if (auto *LI = dyn_cast<LoadInst>(sideEffectInst)) {
     return AA->mayWriteToMemory(globalInitCall, LI->getOperand());
   }
+  if (isa<CondFailInst>(sideEffectInst))
+    return false;
   return true;
 }
 
@@ -1379,7 +1381,7 @@ hoistLoadsAndStores(AccessPath accessPath, SILLoop *loop) {
 
   // Set all stored values as available values in the ssaUpdater.
   // If there are multiple stores in a block, only the last one counts.
-  llvm::Optional<SILLocation> loc;
+  std::optional<SILLocation> loc;
   for (SILInstruction *I : LoadsAndStores) {
     if (auto *SI = isStoreToAccess(I, accessPath)) {
       loc = SI->getLoc();
@@ -1392,7 +1394,8 @@ hoistLoadsAndStores(AccessPath accessPath, SILLoop *loop) {
 
       if (!storeAddr) {
         storeAddr = SI->getDest();
-        ssaUpdater.initialize(storeAddr->getType().getObjectType(),
+        ssaUpdater.initialize(storeAddr->getFunction(),
+                              storeAddr->getType().getObjectType(),
                               storeAddr->getOwnershipKind());
       } else if (SI->getDest()->getType() != storeAddr->getType()) {
         // This transformation assumes that the values of all stores in the loop

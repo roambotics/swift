@@ -174,48 +174,67 @@ public:
   }
 };
 
-llvm::Optional<llvm::VersionTuple>
+std::optional<llvm::VersionTuple>
 getRuntimeVersionThatSupportsDemanglingType(CanType type) {
-  // The Swift 5.5 runtime is the first version able to demangle types
-  // related to concurrency.
-  bool needsConcurrency = type.findIf([](CanType t) -> bool {
-    if (auto fn = dyn_cast<AnyFunctionType>(t)) {
-      if (fn->isAsync() || fn->isSendable() || fn->hasGlobalActor())
-        return true;
+  enum VersionRequirement {
+    None,
+    Swift_5_2,
+    Swift_5_5,
+    Swift_6_0,
 
-      for (const auto &param : fn->getParams()) {
-        if (param.isIsolated())
-          return true;
-      }
+    // Short-circuit if we find this requirement.
+    Latest = Swift_6_0
+  };
+
+  VersionRequirement latestRequirement = None;
+  auto addRequirement = [&](VersionRequirement req) -> bool {
+    if (req > latestRequirement) {
+      latestRequirement = req;
+      return req == Latest;
+    }
+    return false;
+  };
+
+  (void) type.findIf([&](CanType t) -> bool {
+    if (auto fn = dyn_cast<AnyFunctionType>(t)) {
+      // The Swift 6.0 runtime is the first version able to demangle types
+      // that involve typed throws or @isolated(any), or for that matter
+      // represent them at all at runtime.
+      if (!fn.getThrownError().isNull() || fn->getIsolation().isErased())
+        return addRequirement(Swift_6_0);
+
+      // The Swift 5.5 runtime is the first version able to demangle types
+      // related to concurrency.
+      if (fn->isAsync() || fn->isSendable() ||
+          !fn->getIsolation().isNonIsolated())
+        return addRequirement(Swift_5_5);
 
       return false;
     }
+
+    if (auto opaqueArchetype = dyn_cast<OpaqueTypeArchetypeType>(t)) {
+      // Associated types of opaque types weren't mangled in a usable
+      // form by the Swift 5.1 runtime, so we needed to add a new
+      // mangling in 5.2.
+      if (opaqueArchetype->getInterfaceType()->is<DependentMemberType>())
+        return addRequirement(Swift_5_2);
+
+      // Although opaque types in general were only added in Swift 5.1,
+      // declarations that use them are already covered by availability
+      // guards, so we don't need to limit availability of mangled names
+      // involving them.
+    }
+
     return false;
   });
-  if (needsConcurrency) {
-    return llvm::VersionTuple(5, 5);
-  }
 
-  // Associated types of opaque types weren't mangled in a usable form by the
-  // Swift 5.1 runtime, so we needed to add a new mangling in 5.2.
-  if (type->hasOpaqueArchetype()) {
-    auto hasOpaqueAssocType = type.findIf([](CanType t) -> bool {
-      if (auto a = dyn_cast<ArchetypeType>(t)) {
-        return isa<OpaqueTypeArchetypeType>(a) &&
-          a->getInterfaceType()->is<DependentMemberType>();
-      }
-      return false;
-    });
-    
-    if (hasOpaqueAssocType)
-      return llvm::VersionTuple(5, 2);
-    // Although opaque types in general were only added in Swift 5.1,
-    // declarations that use them are already covered by availability
-    // guards, so we don't need to limit availability of mangled names
-    // involving them.
+  switch (latestRequirement) {
+  case Swift_6_0: return llvm::VersionTuple(6, 0);
+  case Swift_5_5: return llvm::VersionTuple(5, 5);
+  case Swift_5_2: return llvm::VersionTuple(5, 2);
+  case None: return std::nullopt;
   }
-
-  return llvm::None;
+  llvm_unreachable("bad kind");
 }
 
 // Produce a fallback mangled type name that uses an open-coded callback
@@ -382,7 +401,7 @@ getTypeRefImpl(IRGenModule &IGM,
     useFlatUnique = true;
     break;
     
-  case MangledTypeRefRole::FieldMetadata:
+  case MangledTypeRefRole::FieldMetadata: {
     // We want to keep fields of noncopyable type from being exposed to
     // in-process runtime reflection libraries in older Swift runtimes, since
     // they more than likely assume they can copy field values, and the language
@@ -391,11 +410,34 @@ getTypeRefImpl(IRGenModule &IGM,
     // noncopyable, use a function to emit the type ref which will look for a
     // signal from future runtimes whether they support noncopyable types before
     // exposing their metadata to them.
-    if (type->isNoncopyable()) {
+    Type contextualTy = type;
+    if (sig) {
+      contextualTy = sig.getGenericEnvironment()->mapTypeIntoContext(type);
+    }
+
+    bool isAlwaysNoncopyable = false;
+    if (contextualTy->isNoncopyable()) {
+      // If the contextual type has any archetypes in it, it's plausible that
+      // we could end up with a copyable type in some instances. Look for those.
+      if (contextualTy->hasArchetype()) {
+        // If this is a nominal type, check whether it can ever be copyable.
+        if (auto nominal = contextualTy->getAnyNominal()) {
+          if (!nominal->canBeCopyable())
+            isAlwaysNoncopyable = true;
+        } else {
+          // Assume that we could end up with a copyable type somehow.
+        }
+      } else {
+        isAlwaysNoncopyable = true;
+      }
+    }
+
+    if (isAlwaysNoncopyable) {
       IGM.IRGen.noteUseOfTypeMetadata(type);
       return getTypeRefByFunction(IGM, sig, type);
     }
-    LLVM_FALLTHROUGH;
+  }
+  LLVM_FALLTHROUGH;
 
   case MangledTypeRefRole::DefaultAssociatedTypeWitness:
   case MangledTypeRefRole::Metadata:
@@ -680,7 +722,7 @@ protected:
   using GetAddrOfEntityFn = llvm::Constant* (IRGenModule &, ConstantInit);
 
   llvm::GlobalVariable *
-  emit(llvm::Optional<llvm::function_ref<GetAddrOfEntityFn>> getAddr,
+  emit(std::optional<llvm::function_ref<GetAddrOfEntityFn>> getAddr,
        const char *section) {
     layout();
 
@@ -714,15 +756,8 @@ protected:
     return var;
   }
 
-  // Helpers to guide the C++ type system into converting lambda arguments
-  // to llvm::Optional<function_ref>
-  llvm::GlobalVariable *emit(llvm::function_ref<GetAddrOfEntityFn> getAddr,
-                             const char *section) {
-    return emit(llvm::Optional<llvm::function_ref<GetAddrOfEntityFn>>(getAddr),
-                section);
-  }
-  llvm::GlobalVariable *emit(llvm::NoneType none, const char *section) {
-    return emit(llvm::Optional<llvm::function_ref<GetAddrOfEntityFn>>(),
+  llvm::GlobalVariable *emit(std::nullopt_t none, const char *section) {
+    return emit(std::optional<llvm::function_ref<GetAddrOfEntityFn>>(),
                 section);
   }
 
@@ -1113,54 +1148,44 @@ public:
   void layout() override {
     auto &strategy = getEnumImplStrategy(IGM, typeInContext);
     bool isMPE = strategy.getElementsWithPayload().size() > 1;
-    assert(isMPE && "Cannot emit Multi-Payload Enum data for an enum that doesn't have multiple payloads");
+    assert(isMPE && "Cannot emit Multi-Payload Enum data for an enum that "
+                    "doesn't have multiple payloads");
 
     const TypeInfo &TI = strategy.getTypeInfo();
     auto fixedTI = dyn_cast<FixedTypeInfo>(&TI);
-    assert(fixedTI != nullptr
-           && "MPE reflection records can only be emitted for fixed-layout enums");
+    assert(fixedTI != nullptr &&
+           "MPE reflection records can only be emitted for fixed-layout enums");
 
-    // Get the spare bits mask for the enum payloads.
-    SpareBitVector spareBits;
-    for (auto enumCase : strategy.getElementsWithPayload()) {
-      cast<FixedTypeInfo>(enumCase.ti)->applyFixedSpareBitsMask(IGM, spareBits);
-    }
-
-    // Trim leading/trailing zero bytes, then pad to a multiple of 32 bits
-    llvm::APInt bits = spareBits.asAPInt();
-    uint32_t byteOffset = bits.countTrailingZeros() / 8;
-    bits.lshrInPlace(byteOffset * 8); // Trim zero bytes from bottom end
-
-    auto bitsInMask = bits.getActiveBits(); // Ignore high-order zero bits
-    auto usesPayloadSpareBits = bitsInMask > 0;
-    uint32_t bytesInMask = (bitsInMask + 7) / 8;
-    auto wordsInMask = (bytesInMask + 3) / 4;
-    bits = bits.zextOrTrunc(wordsInMask * 32);
+    auto spareBitsMaskInfo = strategy.calculateSpareBitsMask();
 
     // Never write an MPE descriptor bigger than 16k
     // The runtime will fall back on its own internal
     // spare bits calculation for this (very rare) case.
-    if (bytesInMask > 16384) {
+    if (!spareBitsMaskInfo)
       return;
-    }
+
+    auto bits = spareBitsMaskInfo->bits;
 
     addTypeRef(type, CanGenericSignature());
 
+    bool usesPayloadSpareBits = spareBitsMaskInfo->bytesInMask > 0;
+
     // MPE record contents are a multiple of 32-bits
     uint32_t contentsSizeInWords = 1; /* Size + flags is mandatory */
-    if (wordsInMask > 0) {
-      contentsSizeInWords +=
-        1 /* SpareBits byte count */
-        + wordsInMask;
+    if (usesPayloadSpareBits) {
+      contentsSizeInWords += 1 /* SpareBits byte count */
+                             + spareBitsMaskInfo->wordsInMask();
     }
+
     uint32_t flags = usesPayloadSpareBits ? 1 : 0;
 
     B.addInt32((contentsSizeInWords << 16) | flags);
 
-    if (bytesInMask > 0) {
-      B.addInt32((byteOffset << 16) | bytesInMask);
+    if (usesPayloadSpareBits) {
+      B.addInt32((spareBitsMaskInfo->byteOffset << 16) |
+                 spareBitsMaskInfo->bytesInMask);
       // TODO: Endianness??
-      for (unsigned i = 0; i < wordsInMask; ++i) {
+      for (unsigned i = 0; i < spareBitsMaskInfo->wordsInMask(); ++i) {
         uint32_t nextWord = bits.extractBitsAsZExtValue(32, 0);
         B.addInt32(nextWord);
         bits.lshrInPlace(32);
@@ -1170,7 +1195,7 @@ public:
 
   llvm::GlobalVariable *emit() {
     auto section = IGM.getMultiPayloadEnumDescriptorSectionName();
-    return ReflectionMetadataBuilder::emit(llvm::None, section);
+    return ReflectionMetadataBuilder::emit(std::nullopt, section);
   }
 };
 
@@ -1196,7 +1221,7 @@ public:
 
   llvm::GlobalVariable *emit() {
     auto section = IGM.getCaptureDescriptorMetadataSectionName();
-    return ReflectionMetadataBuilder::emit(llvm::None, section);
+    return ReflectionMetadataBuilder::emit(std::nullopt, section);
   }
 };
 
@@ -1468,7 +1493,7 @@ public:
 
   llvm::GlobalVariable *emit() {
     auto section = IGM.getCaptureDescriptorMetadataSectionName();
-    return ReflectionMetadataBuilder::emit(llvm::None, section);
+    return ReflectionMetadataBuilder::emit(std::nullopt, section);
   }
 };
 
@@ -1618,26 +1643,38 @@ emitAssociatedTypeMetadataRecord(const RootProtocolConformance *conformance) {
   builder.emit();
 }
 
-void IRGenModule::emitBuiltinReflectionMetadata() {
-  if (getSwiftModule()->isStdlibModule()) {
-    BuiltinTypes.insert(Context.TheNativeObjectType);
-    BuiltinTypes.insert(Context.getAnyObjectType());
-    BuiltinTypes.insert(Context.TheBridgeObjectType);
-    BuiltinTypes.insert(Context.TheRawPointerType);
-    BuiltinTypes.insert(Context.TheUnsafeValueBufferType);
+llvm::ArrayRef<CanType> IRGenModule::getOrCreateSpecialStlibBuiltinTypes() {
+  if (SpecialStdlibBuiltinTypes.empty()) {
+    SpecialStdlibBuiltinTypes.push_back(Context.TheNativeObjectType);
+    SpecialStdlibBuiltinTypes.push_back(Context.getAnyObjectType());
+    SpecialStdlibBuiltinTypes.push_back(Context.TheBridgeObjectType);
+    SpecialStdlibBuiltinTypes.push_back(Context.TheRawPointerType);
+    SpecialStdlibBuiltinTypes.push_back(Context.TheUnsafeValueBufferType);
 
     // This would not be necessary if RawPointer had the same set of
     // extra inhabitants as these. But maybe it's best not to codify
     // that in the ABI anyway.
-    CanType thinFunction = CanFunctionType::get(
-      {}, Context.TheEmptyTupleType,
-      AnyFunctionType::ExtInfo().withRepresentation(
-          FunctionTypeRepresentation::Thin));
-    BuiltinTypes.insert(thinFunction);
+    CanType thinFunction =
+        CanFunctionType::get({}, Context.TheEmptyTupleType,
+                             AnyFunctionType::ExtInfo().withRepresentation(
+                                 FunctionTypeRepresentation::Thin));
+    SpecialStdlibBuiltinTypes.push_back(thinFunction);
 
-    CanType anyMetatype = CanExistentialMetatypeType::get(
-      Context.TheAnyType);
-    BuiltinTypes.insert(anyMetatype);
+    CanType anyMetatype = CanExistentialMetatypeType::get(Context.TheAnyType);
+    SpecialStdlibBuiltinTypes.push_back(anyMetatype);
+  }
+  return SpecialStdlibBuiltinTypes;
+}
+
+void IRGenModule::emitBuiltinReflectionMetadata() {
+  if (getSILModule().getOptions().StopOptimizationAfterSerialization) {
+    // We're asked to emit an empty IR module
+    return;
+  }
+
+  if (getSwiftModule()->isStdlibModule()) {
+    auto SpecialBuiltins = getOrCreateSpecialStlibBuiltinTypes();
+    BuiltinTypes.insert(SpecialBuiltins.begin(), SpecialBuiltins.end());
   }
 
   for (auto builtinType : BuiltinTypes)
@@ -1736,6 +1773,9 @@ void IRGenModule::emitFieldDescriptor(const NominalTypeDecl *D) {
 }
 
 void IRGenModule::emitReflectionMetadataVersion() {
+  if (IRGen.Opts.ReflectionMetadata == ReflectionMetadataMode::None)
+    return;
+
   auto Init =
     llvm::ConstantInt::get(Int16Ty, SWIFT_REFLECTION_METADATA_VERSION);
   auto Version = new llvm::GlobalVariable(Module, Int16Ty, /*constant*/ true,

@@ -7,10 +7,19 @@
 # See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 
 swift_compiler_sources(Optimizer
+  AddressUtils.swift
+  BorrowUtils.swift
+  DiagnosticEngine.swift
+  Devirtualization.swift
   EscapeUtils.swift
+  ForwardingUtils.swift
+  FunctionSignatureTransforms.swift
+  LifetimeDependenceUtils.swift
+  LocalVariableUtils.swift
   OptUtils.swift
-  WalkUtils.swift
-  AccessUtils.swift
+  OwnershipLiveness.swift
   SSAUpdater.swift
   StaticInitCloner.swift
+  Test.swift
+  Verifier.swift
 )

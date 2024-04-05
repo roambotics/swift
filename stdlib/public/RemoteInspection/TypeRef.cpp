@@ -172,6 +172,12 @@ public:
       }
       Indent += 2;
     }
+    if (F->getExtFlags().isIsolatedAny()) {
+      printField("isolated", "any");
+    }
+    if (F->getExtFlags().hasTransferringResult()) {
+      printField("", "transferring-result");
+    }
 
     stream << "\n";
     Indent += 2;
@@ -186,17 +192,17 @@ public:
         stream << "\n";
       }
 
-      switch (flags.getValueOwnership()) {
-      case ValueOwnership::Default:
+      switch (flags.getOwnership()) {
+      case ParameterOwnership::Default:
         /* nothing */
         break;
-      case ValueOwnership::InOut:
+      case ParameterOwnership::InOut:
         printHeader("inout");
         break;
-      case ValueOwnership::Shared:
+      case ParameterOwnership::Shared:
         printHeader("shared");
         break;
-      case ValueOwnership::Owned:
+      case ParameterOwnership::Owned:
         printHeader("owned");
         break;
       }
@@ -206,6 +212,9 @@ public:
 
       if (flags.isVariadic())
         printHeader("variadic");
+
+      if (flags.isTransferring())
+        printHeader("transferring");
 
       printRec(param.getType());
 
@@ -531,6 +540,8 @@ public:
   Demangle::NodePointer visit(const TypeRef *typeRef) {
     auto node = TypeRefVisitor<DemanglingForTypeRef,
                                 Demangle::NodePointer>::visit(typeRef);
+    if (!node)
+      return nullptr;
 
     // Wrap all nodes in a Type node, as consumers generally expect.
     auto typeNode = Dem.createNode(Node::Kind::Type);
@@ -670,22 +681,25 @@ public:
       if (flags.isNoDerivative()) {
         wrapInput(Node::Kind::NoDerivative);
       }
-      switch (flags.getValueOwnership()) {
-      case ValueOwnership::Default:
+      switch (flags.getOwnership()) {
+      case ParameterOwnership::Default:
         /* nothing */
         break;
-      case ValueOwnership::InOut:
+      case ParameterOwnership::InOut:
         wrapInput(Node::Kind::InOut);
         break;
-      case ValueOwnership::Shared:
+      case ParameterOwnership::Shared:
         wrapInput(Node::Kind::Shared);
         break;
-      case ValueOwnership::Owned:
+      case ParameterOwnership::Owned:
         wrapInput(Node::Kind::Owned);
         break;
       }
       if (flags.isIsolated()) {
         wrapInput(Node::Kind::Isolated);
+      }
+      if (flags.isTransferring()) {
+        wrapInput(Node::Kind::Transferring);
       }
 
       inputs.push_back({input, flags.isVariadic()});
@@ -751,10 +765,17 @@ public:
     result->addChild(resultTy, Dem);
 
     auto funcNode = Dem.createNode(kind);
+
     if (auto globalActor = F->getGlobalActor()) {
       auto node = Dem.createNode(Node::Kind::GlobalActorFunctionType);
       auto globalActorNode = visit(globalActor);
       node->addChild(globalActorNode, Dem);
+      funcNode->addChild(node, Dem);
+    } else if (F->getExtFlags().isIsolatedAny()) {
+      auto node = Dem.createNode(Node::Kind::IsolatedAnyFunctionType);
+      funcNode->addChild(node, Dem);
+    } else if (F->getExtFlags().hasTransferringResult()) {
+      auto node = Dem.createNode(Node::Kind::TransferringResultFunctionType);
       funcNode->addChild(node, Dem);
     }
 
@@ -779,8 +800,17 @@ public:
           Dem);
     }
 
-    if (F->getFlags().isThrowing())
-      funcNode->addChild(Dem.createNode(Node::Kind::ThrowsAnnotation), Dem);
+    if (F->getFlags().isThrowing()) {
+      if (auto thrownError = F->getThrownError()) {
+        auto node = Dem.createNode(Node::Kind::TypedThrowsAnnotation);
+        auto thrownErrorNode = visit(thrownError);
+        node->addChild(thrownErrorNode, Dem);
+        funcNode->addChild(node, Dem);
+      } else {
+        funcNode->addChild(Dem.createNode(Node::Kind::ThrowsAnnotation), Dem);
+      }
+    }
+
     if (F->getFlags().isSendable()) {
       funcNode->addChild(
           Dem.createNode(Node::Kind::ConcurrentFunctionType), Dem);
@@ -1025,6 +1055,24 @@ Demangle::NodePointer TypeRef::getDemangling(Demangle::Demangler &Dem) const {
   return DemanglingForTypeRef(Dem).visit(this);
 }
 
+std::optional<std::string> TypeRef::mangle(Demangle::Demangler &Dem) const {
+  NodePointer node = getDemangling(Dem);
+  if (!node)
+    return {};
+
+  // The mangled tree stored in this typeref implicitly assumes the type and
+  // global mangling, so add those back in.
+  auto typeMangling = Dem.createNode(Node::Kind::TypeMangling);
+  typeMangling->addChild(node, Dem);
+  auto global = Dem.createNode(Node::Kind::Global);
+  global->addChild(node, Dem);
+
+  auto mangling = mangleNode(global);
+  if (!mangling.isSuccess())
+    return {};
+  return mangling.result();
+}
+
 bool TypeRef::isConcrete() const {
   GenericArgumentMap Subs;
   return TypeRefIsConcrete(Subs).visit(this);
@@ -1049,7 +1097,7 @@ unsigned NominalTypeTrait::getDepth() const {
   return 0;
 }
 
-llvm::Optional<GenericArgumentMap> TypeRef::getSubstMap() const {
+std::optional<GenericArgumentMap> TypeRef::getSubstMap() const {
   GenericArgumentMap Substitutions;
   switch (getKind()) {
     case TypeRefKind::Nominal: {
@@ -1064,13 +1112,13 @@ llvm::Optional<GenericArgumentMap> TypeRef::getSubstMap() const {
       unsigned Index = 0;
       for (auto Param : BG->getGenericParams()) {
         if (!Param->isConcrete())
-          return llvm::None;
+          return std::nullopt;
         Substitutions.insert({{Depth, Index++}, Param});
       }
       if (auto Parent = BG->getParent()) {
         auto ParentSubs = Parent->getSubstMap();
         if (!ParentSubs)
-          return llvm::None;
+          return std::nullopt;
         Substitutions.insert(ParentSubs->begin(), ParentSubs->end());
       }
       break;
@@ -1148,12 +1196,20 @@ public:
     if (F->getGlobalActor())
       globalActorType = visit(F->getGlobalActor());
 
+    auto extFlags = F->getExtFlags();
+
+    const TypeRef *thrownErrorType = nullptr;
+    if (F->getThrownError()) {
+      thrownErrorType = visit(F->getThrownError());
+      // FIXME: fold Never and any Error to their canonical representation?
+    }
+
     auto SubstitutedResult = visit(F->getResult());
 
     return FunctionTypeRef::create(Builder, SubstitutedParams,
-                                   SubstitutedResult, F->getFlags(),
+                                   SubstitutedResult, F->getFlags(), extFlags,
                                    F->getDifferentiabilityKind(),
-                                   globalActorType);
+                                   globalActorType, thrownErrorType);
   }
 
   const TypeRef *
@@ -1281,14 +1337,23 @@ public:
 
     auto SubstitutedResult = visit(F->getResult());
 
+    auto flags = F->getFlags();
+    auto extFlags = F->getExtFlags();
+
     const TypeRef *globalActorType = nullptr;
     if (F->getGlobalActor())
       globalActorType = visit(F->getGlobalActor());
 
+    const TypeRef *thrownErrorType = nullptr;
+    if (F->getThrownError()) {
+      thrownErrorType = visit(F->getThrownError());
+      // FIXME: fold Never / any Error to their canonical representations?
+    }
+
     return FunctionTypeRef::create(Builder, SubstitutedParams,
-                                   SubstitutedResult, F->getFlags(),
+                                   SubstitutedResult, flags, extFlags,
                                    F->getDifferentiabilityKind(),
-                                   globalActorType);
+                                   globalActorType, thrownErrorType);
   }
 
   const TypeRef *
@@ -1318,11 +1383,11 @@ public:
     return EM;
   }
 
-  llvm::Optional<TypeRefRequirement>
+  std::optional<TypeRefRequirement>
   visitTypeRefRequirement(const TypeRefRequirement &req) {
     auto newFirst = visit(req.getFirstType());
     if (!newFirst)
-      return llvm::None;
+      return std::nullopt;
 
     switch (req.getKind()) {
     case RequirementKind::SameShape:
@@ -1331,7 +1396,7 @@ public:
     case RequirementKind::SameType: {
       auto newSecond = visit(req.getFirstType());
       if (!newSecond)
-        return llvm::None;
+        return std::nullopt;
       return TypeRefRequirement(req.getKind(), newFirst, newSecond);
     }
     case RequirementKind::Layout:

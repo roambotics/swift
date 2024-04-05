@@ -126,9 +126,9 @@ static HeapObject * getNonNullSrcObject(OpaqueValue *srcValue,
 
   std::string srcTypeName = nameForMetadata(srcType);
   std::string destTypeName = nameForMetadata(destType);
-  const char * const msg = "Found unexpected null pointer value"
-                    " while trying to cast value of type '%s' (%p)"
-                    " to '%s' (%p)%s\n";
+  const char * const msg = "Found a null pointer in a value of type '%s' (%p)."
+                    " Non-Optional values are not allowed to hold null pointers."
+                    " (Detected while casting to '%s' (%p))%s\n";
   if (runtime::bincompat::useLegacyPermissiveObjCNullSemanticsInCasting()) {
     // In backwards compatibility mode, this code will warn and return the null
     // reference anyway: If you examine the calls to the function, you'll see
@@ -208,9 +208,8 @@ PROTOCOL_DESCR_SYM(s21_ObjectiveCBridgeable);
 
 static const _ObjectiveCBridgeableWitnessTable *
 findBridgeWitness(const Metadata *T) {
-  static const auto bridgeableProtocol
-    = &PROTOCOL_DESCR_SYM(s21_ObjectiveCBridgeable);
-  auto w = swift_conformsToProtocolCommon(T, bridgeableProtocol);
+  auto w = swift_conformsToProtocolCommon(
+      T, &PROTOCOL_DESCR_SYM(s21_ObjectiveCBridgeable));
   return reinterpret_cast<const _ObjectiveCBridgeableWitnessTable *>(w);
 }
 
@@ -324,7 +323,7 @@ tryCastFromClassToObjCBridgeable(
     return DynamicCastResult::Failure;
   }
 
-  // 1. Sanity check whether the source object can cast to the
+  // 1. Soundness check whether the source object can cast to the
   // type expected by the target.
 
   auto targetBridgedClass =
@@ -1844,29 +1843,29 @@ static DynamicCastResult tryCastToExtendedExistential(
       return DynamicCastResult::Failure;
   }
 
-  llvm::SmallVector<const void *, 8> allGenericArgsVec;
-  unsigned witnessesMark = 0;
+  llvm::SmallVector<const void *, 4> allGenericArgsVec;
+  llvm::SmallVector<const void *, 4> witnessTables;
   {
     // Line up the arguments to the requirement signature.
     auto genArgs = destExistentialType->getGeneralizationArguments();
     allGenericArgsVec.append(genArgs, genArgs + shapeArgumentCount);
     // Tack on the `Self` argument.
     allGenericArgsVec.push_back((const void *)selfType);
-    // Mark the point where the generic arguments end.
-    // _checkGenericRequirements is going to fill in a set of witness tables
-    // after that.
-    witnessesMark = allGenericArgsVec.size();
 
     SubstGenericParametersFromMetadata substitutions(destExistentialShape,
                                                      allGenericArgsVec.data());
     // Verify the requirements in the requirement signature against the
     // arguments from the source value.
+    auto requirementSig = destExistentialShape->getRequirementSignature();
     auto error = swift::_checkGenericRequirements(
-        destExistentialShape->getRequirementSignature().getRequirements(),
-        allGenericArgsVec,
+        requirementSig.getParams(),
+        requirementSig.getRequirements(),
+        witnessTables,
         [&substitutions](unsigned depth, unsigned index) {
-          // FIXME: Variadic generics
-          return substitutions.getMetadata(depth, index).getMetadata();
+          return substitutions.getMetadata(depth, index).Ptr;
+        },
+        [&substitutions](unsigned ordinal) {
+          return substitutions.getMetadataOrdinal(ordinal).Ptr;
         },
         [](const Metadata *type, unsigned index) -> const WitnessTable * {
           swift_unreachable("Resolution of witness tables is not supported");
@@ -1907,7 +1906,7 @@ static DynamicCastResult tryCastToExtendedExistential(
   }
 
   // Fill in the trailing set of witness tables.
-  const unsigned numWitnessTables = allGenericArgsVec.size() - witnessesMark;
+  const unsigned numWitnessTables = witnessTables.size();
   assert(numWitnessTables ==
          llvm::count_if(destExistentialShape->getRequirementSignature().getRequirements(),
                         [](const auto &req) -> bool {
@@ -1915,9 +1914,7 @@ static DynamicCastResult tryCastToExtendedExistential(
                                  GenericRequirementKind::Protocol;
                         }));
   for (unsigned i = 0; i < numWitnessTables; ++i) {
-    const auto witness = i + witnessesMark;
-    destWitnesses[i] =
-        reinterpret_cast<const WitnessTable *>(allGenericArgsVec[witness]);
+    destWitnesses[i] = reinterpret_cast<const WitnessTable *>(witnessTables[i]);
   }
 
   if (takeOnSuccess) {

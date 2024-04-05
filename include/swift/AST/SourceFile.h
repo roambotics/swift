@@ -46,7 +46,45 @@ enum class RestrictedImportKind {
 };
 
 /// Import that limits the access level of imported entities.
-using ImportAccessLevel = llvm::Optional<AttributedImport<ImportedModule>>;
+using ImportAccessLevel = std::optional<AttributedImport<ImportedModule>>;
+
+/// Stores range information for a \c #if block in a SourceFile.
+class IfConfigClauseRangeInfo final {
+public:
+  enum ClauseKind {
+    // Active '#if', '#elseif', or '#else' clause.
+    ActiveClause,
+    // Inactive '#if', '#elseif', or '#else' clause.
+    InactiveClause,
+    // '#endif' directive.
+    EndDirective,
+  };
+
+private:
+  /// Source location of '#if', '#elseif', etc.
+  SourceLoc DirectiveLoc;
+  /// Character source location of body starts.
+  SourceLoc BodyLoc;
+  /// Location of the end of the body.
+  SourceLoc EndLoc;
+
+  ClauseKind Kind;
+
+public:
+  IfConfigClauseRangeInfo(SourceLoc DirectiveLoc, SourceLoc BodyLoc,
+                          SourceLoc EndLoc, ClauseKind Kind)
+      : DirectiveLoc(DirectiveLoc), BodyLoc(BodyLoc), EndLoc(EndLoc),
+        Kind(Kind) {
+    assert(DirectiveLoc.isValid() && BodyLoc.isValid() && EndLoc.isValid());
+  }
+
+  SourceLoc getStartLoc() const { return DirectiveLoc; }
+  CharSourceRange getDirectiveRange(const SourceManager &SM) const;
+  CharSourceRange getWholeRange(const SourceManager &SM) const;
+  CharSourceRange getBodyRange(const SourceManager &SM) const;
+
+  ClauseKind getKind() const { return Kind; }
+};
 
 /// A file containing Swift source code.
 ///
@@ -109,15 +147,17 @@ private:
   /// This is the list of modules that are imported by this module.
   ///
   /// This is \c None until it is filled in by the import resolution phase.
-  llvm::Optional<ArrayRef<AttributedImport<ImportedModule>>> Imports;
+  std::optional<ArrayRef<AttributedImport<ImportedModule>>> Imports;
+
+  /// The underlying clang module, if imported in this file.
+  ModuleDecl *ImportedUnderlyingModule = nullptr;
 
   /// Which imports have made use of @preconcurrency.
   llvm::SmallDenseSet<AttributedImport<ImportedModule>>
       PreconcurrencyImportsUsed;
 
   /// The highest access level of declarations referencing each import.
-  llvm::DenseMap<AttributedImport<ImportedModule>, AccessLevel>
-      ImportsUseAccessLevel;
+  llvm::DenseMap<const ModuleDecl *, AccessLevel> ImportsUseAccessLevel;
 
   /// A unique identifier representing this file; used to mark private decls
   /// within the file to keep them from conflicting with other files in the
@@ -140,7 +180,7 @@ private:
   /// this source file.
   ///
   /// We only collect interface hash for primary input files.
-  llvm::Optional<StableHasher> InterfaceHasher;
+  std::optional<StableHasher> InterfaceHasher;
 
   /// The ID for the memory buffer containing this file's source.
   ///
@@ -182,7 +222,7 @@ private:
   /// they have not yet been parsed.
   /// FIXME: Once addTopLevelDecl/prependTopLevelDecl
   /// have been removed, this can become an optional ArrayRef.
-  llvm::Optional<std::vector<ASTNode>> Items;
+  std::optional<std::vector<ASTNode>> Items;
 
   /// The list of hoisted declarations. See Decl::isHoisted().
   /// This is only used by lldb.
@@ -208,6 +248,19 @@ private:
   /// resume parsing at the code completion token in the file.
   ParserStatePtr DelayedParserState =
       ParserStatePtr(/*ptr*/ nullptr, /*deleter*/ nullptr);
+
+  struct IfConfigClauseRangesData {
+    /// All the \c #if source ranges in this file.
+    std::vector<IfConfigClauseRangeInfo> Ranges;
+
+    /// Whether the elemnts in \c Ranges are sorted in source order within
+    /// this file. We flip this to \c false any time a new range gets recorded,
+    /// and lazily do the sorting when doing a query.
+    bool IsSorted = false;
+  };
+
+  /// Stores all the \c #if source range info in this file.
+  mutable IfConfigClauseRangesData IfConfigClauseRanges;
 
   friend class HasImportsMatchingFlagRequest;
 
@@ -251,10 +304,10 @@ public:
 
   /// Retrieves an immutable view of the top-level items if they have already
   /// been parsed, or \c None if they haven't. Should only be used for dumping.
-  llvm::Optional<ArrayRef<ASTNode>> getCachedTopLevelItems() const {
+  std::optional<ArrayRef<ASTNode>> getCachedTopLevelItems() const {
     if (!Items)
-      return llvm::None;
-    return llvm::makeArrayRef(*Items);
+      return std::nullopt;
+    return llvm::ArrayRef(*Items);
   }
 
   /// Retrieve the parsing options for the file.
@@ -267,9 +320,6 @@ public:
   /// Retrieve the \c ExportedSourceFile instance produced by ASTGen, which
   /// includes the SourceFileSyntax node corresponding to this source file.
   void *getExportedSourceFile() const;
-
-  /// The list of local type declarations in the source file.
-  llvm::SetVector<TypeDecl *> LocalTypeDecls;
 
   /// Defer type checking of `AFD` to the end of `Sema`
   void addDelayedFunction(AbstractFunctionDecl *AFD);
@@ -343,7 +393,7 @@ public:
   /// \c #sourceLocation(file:) declarations.
   llvm::StringMap<SourceFilePathInfo> getInfoForUsedFilePaths() const;
 
-  SourceFile(ModuleDecl &M, SourceFileKind K, llvm::Optional<unsigned> bufferID,
+  SourceFile(ModuleDecl &M, SourceFileKind K, std::optional<unsigned> bufferID,
              ParsingOptions parsingOpts = {}, bool isPrimary = false);
 
   ~SourceFile();
@@ -361,6 +411,18 @@ public:
   /// resolution.
   void setImports(ArrayRef<AttributedImport<ImportedModule>> imports);
 
+  /// Set the imported underlying clang module for this source file. This gets
+  /// called by import resolution.
+  void setImportedUnderlyingModule(ModuleDecl *module) {
+    assert(!ImportedUnderlyingModule && "underlying module already set");
+    ImportedUnderlyingModule = module;
+  }
+
+  /// Finds the import declaration that effectively imports a given module in
+  /// this source file.
+  std::optional<AttributedImport<ImportedModule>>
+  findImport(const ModuleDecl *mod) const;
+
   /// Whether the given import has used @preconcurrency.
   bool hasImportUsedPreconcurrency(
       AttributedImport<ImportedModule> import) const;
@@ -372,7 +434,7 @@ public:
   /// Return the highest access level of the declarations referencing
   /// this import in signature or inlinable code.
   AccessLevel
-  getMaxAccessLevelUsingImport(AttributedImport<ImportedModule> import) const;
+  getMaxAccessLevelUsingImport(const ModuleDecl *import) const;
 
   /// Register the use of \p import from an API with \p accessLevel.
   void registerAccessLevelUsingImport(AttributedImport<ImportedModule> import,
@@ -448,6 +510,17 @@ public:
      const_cast<SourceFile *>(this)->MissingImportedModules.insert(module);
   }
 
+  /// Record the source range info for a parsed \c #if clause.
+  void recordIfConfigClauseRangeInfo(const IfConfigClauseRangeInfo &range);
+
+  /// Retrieve the source range info for any \c #if clauses in the file.
+  ArrayRef<IfConfigClauseRangeInfo> getIfConfigClauseRanges() const;
+
+  /// Retrieve the source range infos for any \c #if clauses contained within a
+  /// given source range of this file.
+  ArrayRef<IfConfigClauseRangeInfo>
+  getIfConfigClausesWithin(SourceRange outer) const;
+
   void getMissingImportedModules(
          SmallVectorImpl<ImportedModule> &imports) const override;
 
@@ -506,16 +579,16 @@ public:
 
   Identifier getDiscriminatorForPrivateDecl(const Decl *D) const override;
   Identifier getPrivateDiscriminator(bool createIfMissing = false) const;
-  llvm::Optional<ExternalSourceLocs::RawLocs>
+  std::optional<ExternalSourceLocs::RawLocs>
   getExternalRawLocsForDecl(const Decl *D) const override;
 
   virtual bool walk(ASTWalker &walker) override;
 
   /// The buffer ID for the file that was imported, or None if there
   /// is no associated buffer.
-  llvm::Optional<unsigned> getBufferID() const {
+  std::optional<unsigned> getBufferID() const {
     if (BufferID == -1)
-      return llvm::None;
+      return std::nullopt;
     return BufferID;
   }
 
@@ -527,6 +600,11 @@ public:
   /// code is in this source file. This will only produce a non-null value when
   /// the \c SourceFileKind is \c MacroExpansion.
   ASTNode getMacroExpansion() const;
+
+  /// For source files created to hold the source code for a macro
+  /// expansion, this is the original source range replaced by the macro
+  /// expansion.
+  SourceRange getMacroInsertionRange() const;
 
   /// For source files created to hold the source code created by expanding
   /// an attached macro, this is the custom attribute that describes the macro
@@ -544,12 +622,17 @@ public:
   ///
   /// \Returns the fulfilled macro role, or \c None if this source file is not
   /// for a macro expansion.
-  llvm::Optional<MacroRole> getFulfilledMacroRole() const;
+  std::optional<MacroRole> getFulfilledMacroRole() const;
 
   /// When this source file is enclosed within another source file, for example
   /// because it describes a macro expansion, return the source file it was
   /// enclosed in.
   SourceFile *getEnclosingSourceFile() const;
+
+  /// If this file has an enclosing source file (because it is the result of
+  /// expanding a macro or default argument), returns the node in the enclosing
+  /// file that this file's contents were expanded from.
+  ASTNode getNodeInEnclosingSourceFile() const;
 
   /// If this buffer corresponds to a file on disk, returns the path.
   /// Otherwise, return an empty string.
@@ -610,6 +693,7 @@ public:
     case SourceFileKind::Interface:
     case SourceFileKind::SIL:
     case SourceFileKind::MacroExpansion:
+    case SourceFileKind::DefaultArgument:
       return false;
     }
     llvm_unreachable("bad SourceFileKind");
@@ -637,6 +721,17 @@ public:
   /// a designated main class.
   bool hasEntryPoint() const override {
     return isScriptMode() || hasMainDecl();
+  }
+
+  ModuleDecl *getUnderlyingModuleIfOverlay() const override {
+    return ImportedUnderlyingModule;
+  }
+
+  const clang::Module *getUnderlyingClangModule() const override {
+    if (!ImportedUnderlyingModule)
+      return nullptr;
+
+    return ImportedUnderlyingModule->findUnderlyingClangModule();
   }
 
   /// Get the root refinement context for the file. The root context may be
@@ -705,11 +800,13 @@ public:
   /// Returns true if the source file contains concurrency in the top-level
   bool isAsyncTopLevelSourceFile() const;
 
+  ArrayRef<TypeDecl *> getLocalTypeDecls() const;
+
 private:
 
   /// If not \c None, the underlying vector contains the parsed tokens of this
   /// source file.
-  llvm::Optional<ArrayRef<Token>> AllCollectedTokens;
+  std::optional<ArrayRef<Token>> AllCollectedTokens;
 };
 
 inline SourceFile::ParsingOptions operator|(SourceFile::ParsingFlags lhs,

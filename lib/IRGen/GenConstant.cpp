@@ -27,6 +27,8 @@
 #include "StructLayout.h"
 #include "Callee.h"
 #include "ConstantBuilder.h"
+#include "DebugTypeInfo.h"
+#include "swift/IRGen/Linking.h"
 #include "swift/Basic/Range.h"
 #include "swift/SIL/SILModule.h"
 #include "llvm/Support/BLAKE3.h"
@@ -104,10 +106,14 @@ llvm::Constant *irgen::emitConstantFP(IRGenModule &IGM, FloatLiteralInst *FLI) {
 
 llvm::Constant *irgen::emitAddrOfConstantString(IRGenModule &IGM,
                                                 StringLiteralInst *SLI) {
-  switch (SLI->getEncoding()) {
+  auto encoding = SLI->getEncoding();
+  bool useOSLogEncoding = encoding == StringLiteralInst::Encoding::UTF8_OSLOG;
+
+  switch (encoding) {
   case StringLiteralInst::Encoding::Bytes:
   case StringLiteralInst::Encoding::UTF8:
-    return IGM.getAddrOfGlobalString(SLI->getValue());
+  case StringLiteralInst::Encoding::UTF8_OSLOG:
+    return IGM.getAddrOfGlobalString(SLI->getValue(), false, useOSLogEncoding);
 
   case StringLiteralInst::Encoding::ObjCSelector:
     llvm_unreachable("cannot get the address of an Objective-C selector");
@@ -178,7 +184,7 @@ Explosion emitConstantStructOrTuple(IRGenModule &IGM, InstTy inst,
 
   for (unsigned i = 0, e = inst->getElements().size(); i != e; ++i) {
     auto operand = inst->getOperand(i);
-    llvm::Optional<unsigned> index = nextIndex(IGM, type, i);
+    std::optional<unsigned> index = nextIndex(IGM, type, i);
     if (index.has_value()) {
       unsigned idx = index.value();
       assert(elements[idx].empty() &&
@@ -372,9 +378,13 @@ Explosion irgen::emitConstantValue(IRGenModule &IGM, SILValue operand,
     SILFunction *fn = FRI->getReferencedFunction();
 
     llvm::Constant *fnPtr = IGM.getAddrOfSILFunction(fn, NotForDefinition);
-    assert(!fn->isAsync() && "TODO: support async functions");
-
     CanSILFunctionType fnType = FRI->getType().getAs<SILFunctionType>();
+
+    if (irgen::classifyFunctionPointerKind(fn).isAsyncFunctionPointer()) {
+      llvm::Constant *asyncFnPtr = IGM.getAddrOfAsyncFunctionPointer(fn);
+      fnPtr = llvm::ConstantExpr::getBitCast(asyncFnPtr, fnPtr->getType());
+    }
+
     auto authInfo = PointerAuthInfo::forFunctionPointer(IGM, fnType);
     if (authInfo.isSigned()) {
       auto constantDiscriminator =
@@ -430,7 +440,7 @@ llvm::Constant *irgen::emitConstantObject(IRGenModule &IGM, ObjectInst *OI,
   // Construct the object header.
   llvm::StructType *ObjectHeaderTy = cast<llvm::StructType>(sTy->getElementType(0));
 
-  if (IGM.canMakeStaticObjectsReadOnly()) {
+  if (IGM.canMakeStaticObjectReadOnly(OI->getType())) {
     if (!IGM.swiftImmortalRefCount) {
       auto *var = new llvm::GlobalVariable(IGM.Module, IGM.Int8Ty,
                                         /*constant*/ true, llvm::GlobalValue::ExternalLinkage,
@@ -438,14 +448,12 @@ llvm::Constant *irgen::emitConstantObject(IRGenModule &IGM, ObjectInst *OI,
       IGM.swiftImmortalRefCount = var;
     }
     if (!IGM.swiftStaticArrayMetadata) {
-
-      // Static arrays can only contain trivial elements. Therefore we can reuse
-      // the metadata of the empty array buffer. The important thing is that its
-      // deinit is a no-op and does not actually destroy any elements.
-      auto *var = new llvm::GlobalVariable(IGM.Module, IGM.TypeMetadataStructTy,
-                                        /*constant*/ true, llvm::GlobalValue::ExternalLinkage,
-                                        /*initializer*/ nullptr, "$ss19__EmptyArrayStorageCN");
-      IGM.swiftStaticArrayMetadata = var;
+      auto *classDecl = IGM.getStaticArrayStorageDecl();
+      assert(classDecl && "no __StaticArrayStorage in stdlib");
+      CanType classTy = CanType(ClassType::get(classDecl, Type(), IGM.Context));
+      LinkEntity entity = LinkEntity::forTypeMetadata(classTy, TypeMetadataAddress::AddressPoint);
+      auto *metatype = IGM.getAddrOfLLVMVariable(entity, NotForDefinition, DebugTypeInfo());
+      IGM.swiftStaticArrayMetadata = cast<llvm::GlobalVariable>(metatype);
     }
     elements[0].add(llvm::ConstantStruct::get(ObjectHeaderTy, {
       IGM.swiftStaticArrayMetadata,
@@ -461,6 +469,6 @@ void ConstantAggregateBuilderBase::addUniqueHash(StringRef data) {
   llvm::BLAKE3 hasher;
   hasher.update(data);
   auto rawHash = hasher.final();
-  auto truncHash = llvm::makeArrayRef(rawHash).slice(0, NumBytes_UniqueHash);
+  auto truncHash = llvm::ArrayRef(rawHash).slice(0, NumBytes_UniqueHash);
   add(llvm::ConstantDataArray::get(IGM().getLLVMContext(), truncHash));
 }

@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/Identifier.h"
 #include "swift/AST/ModuleDependencies.h"
 #include "swift/Frontend/ModuleInterfaceLoader.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
@@ -36,18 +37,18 @@ public:
 private:
   /// Retrieve the module dependencies for the module with the given name.
   ModuleDependencyVector
-  scanFilesystemForModuleDependency(StringRef moduleName,
+  scanFilesystemForModuleDependency(Identifier moduleName,
                                     const ModuleDependenciesCache &cache,
                                     bool isTestableImport = false);
 
   /// Retrieve the module dependencies for the Clang module with the given name.
   ModuleDependencyVector
-  scanFilesystemForClangModuleDependency(StringRef moduleName,
+  scanFilesystemForClangModuleDependency(Identifier moduleName,
                                          const ModuleDependenciesCache &cache);
 
   /// Retrieve the module dependencies for the Swift module with the given name.
   ModuleDependencyVector
-  scanFilesystemForSwiftModuleDependency(StringRef moduleName,
+  scanFilesystemForSwiftModuleDependency(Identifier moduleName,
                                          const ModuleDependenciesCache &cache);
 
   // An AST delegate for interface scanning.
@@ -71,9 +72,8 @@ public:
                           DiagnosticEngine &diags, bool ParallelScan);
 
   /// Identify the scanner invocation's main module's dependencies
-  llvm::ErrorOr<ModuleDependencyInfo> getMainModuleDependencyInfo(
-      ModuleDecl *mainModule,
-      llvm::Optional<SwiftDependencyTracker> tracker = llvm::None);
+  llvm::ErrorOr<ModuleDependencyInfo>
+  getMainModuleDependencyInfo(ModuleDecl *mainModule);
 
   /// Resolve module dependencies of the given module, computing a full
   /// transitive closure dependency graph.
@@ -83,13 +83,13 @@ public:
 
   /// Query the module dependency info for the Clang module with the given name.
   /// Explicit by-name lookups are useful for batch mode scanning.
-  llvm::Optional<const ModuleDependencyInfo *>
+  std::optional<const ModuleDependencyInfo *>
   getNamedClangModuleDependencyInfo(StringRef moduleName,
                                     ModuleDependenciesCache &cache);
 
   /// Query the module dependency info for the Swift module with the given name.
   /// Explicit by-name lookups are useful for batch mode scanning.
-  llvm::Optional<const ModuleDependencyInfo *>
+  std::optional<const ModuleDependencyInfo *>
   getNamedSwiftModuleDependencyInfo(StringRef moduleName,
                                     ModuleDependenciesCache &cache);
 
@@ -106,9 +106,9 @@ private:
                             ModuleDependenciesCache &cache,
                             ModuleDependencyIDSetVector &directDependencies);
 
-  /// If a module has a bridging header, execute a dependency scan
+  /// If a module has a bridging header or other header inputs, execute a dependency scan
   /// on it and record the dependencies.
-  void resolveBridgingHeaderDependencies(
+  void resolveHeaderDependencies(
       const ModuleDependencyID &moduleID, ModuleDependenciesCache &cache,
       std::vector<std::string> &allClangModules,
       llvm::StringSet<> &alreadyKnownModules,
@@ -134,6 +134,8 @@ private:
   /// available to this scanner.
   template <typename Function, typename... Args>
   auto withDependencyScanningWorker(Function &&F, Args &&...ArgList);
+
+  Identifier getModuleImportIdentifier(StringRef moduleName);
 
 private:
   const CompilerInvocation &ScanCompilerInvocation;

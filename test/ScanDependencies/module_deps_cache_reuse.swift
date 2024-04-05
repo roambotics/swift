@@ -44,6 +44,7 @@ import SubE
 // CHECK-DAG:     "clang": "_SwiftConcurrencyShims"
 // CHECK: ],
 
+// CHECK:      "contextHash":
 // CHECK:      "extraPcmArgs": [
 // CHECK-NEXT:    "-Xcc",
 // CHECK-NEXT:    "-target",
@@ -95,7 +96,6 @@ import SubE
 // CHECK: ],
 // CHECK-NEXT: "details": {
 
-// CHECK: "contextHash": "{{.*}}",
 // CHECK: "commandLine": [
 // CHECK: "-compile-module-from-interface"
 // CHECK: "-target"
@@ -104,6 +104,7 @@ import SubE
 // CHECK: "-swift-version"
 // CHECK: "5"
 // CHECK: ],
+// CHECK: "contextHash": "{{.*}}",
 // CHECK" "extraPcmArgs": [
 // CHECK"   "-target",
 // CHECK"   "-fapinotes-swift-version=5"
@@ -142,7 +143,7 @@ import SubE
 // CHECK: "-emit-pcm",
 // CHECK: "-module-name",
 // CHECK-NEXT: "C"
-// CHECK-NEXT: "-only-use-extra-clang-opts
+// CHECK: "-direct-clang-cc1-module-build"
 
 /// --------Clang module B
 // CHECK-LABEL: "modulePath": "{{.*}}/B-{{.*}}.pcm",

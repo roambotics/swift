@@ -11,8 +11,7 @@
 
 /// Check that all access levels are accepted, except for 'open'.
 // RUN: %target-swift-frontend -typecheck %t/Client.swift -I %t \
-// RUN:   -enable-experimental-feature AccessLevelOnImport -verify \
-// RUN:   -package-name package
+// RUN:   -package-name package -verify
 
 //--- PublicLib.swift
 //--- PackageLib.swift
@@ -27,4 +26,4 @@ package import PackageLib // expected-warning {{package import of 'PackageLib' w
 internal import InternalLib
 fileprivate import FileprivateLib
 private import PrivateLib
-open import OpenLib // expected-error {{The access level 'open' is unsupported on imports: only 'public', 'package', 'internal', 'fileprivate' and 'private' are unsupported}}
+open import OpenLib // expected-error {{The access level 'open' is unsupported on imports: only 'public', 'package', 'internal', 'fileprivate' and 'private' are accepted}}

@@ -46,8 +46,8 @@ BUILD_VARIANT = 'Debug'
 CMAKE_GENERATOR = 'Ninja'
 
 COMPILER_VENDOR = 'none'
-SWIFT_USER_VISIBLE_VERSION = Version('5.11')
-CLANG_USER_VISIBLE_VERSION = Version('15.0.0')
+SWIFT_USER_VISIBLE_VERSION = Version('6.0')
+CLANG_USER_VISIBLE_VERSION = Version('17.0.0')
 SWIFT_ANALYZE_CODE_COVERAGE = 'false'
 
 DARWIN_XCRUN_TOOLCHAIN = 'default'
@@ -119,11 +119,10 @@ def llvm_install_components():
     platforms.
     """
     components = ['llvm-ar', 'llvm-cov', 'llvm-profdata', 'IndexStore', 'clang',
-                  'clang-resource-headers', 'compiler-rt', 'clangd', 'LTO']
+                  'clang-resource-headers', 'compiler-rt', 'clangd', 'LTO',
+                  'lld']
     if os.sys.platform == 'darwin':
         components.extend(['dsymutil'])
-    else:
-        components.extend(['lld'])
     return ';'.join(components)
 
 

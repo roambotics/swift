@@ -59,8 +59,7 @@ using namespace constraints;
 
 static Type
 getTypeOfExpressionWithoutApplying(Expr *&expr, DeclContext *dc,
-                                   ConcreteDeclRef &referencedDecl,
-                                 FreeTypeVariableBinding allowFreeTypeVariables) {
+                                   ConcreteDeclRef &referencedDecl) {
   if (isa<AbstractClosureExpr>(dc)) {
     // If the expression is embedded in a closure, the constraint system tries
     // to retrieve that closure's type, which will fail since we won't have
@@ -77,9 +76,6 @@ getTypeOfExpressionWithoutApplying(Expr *&expr, DeclContext *dc,
 
   ConstraintSystemOptions options;
   options |= ConstraintSystemFlags::SuppressDiagnostics;
-  if (!Context.CompletionCallback) {
-    options |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
-  }
 
   // Construct a constraint system from this expression.
   ConstraintSystem cs(dc, options);
@@ -98,15 +94,18 @@ getTypeOfExpressionWithoutApplying(Expr *&expr, DeclContext *dc,
     expr->setType(Type());
   SyntacticElementTarget target(expr, dc, CTP_Unused, Type(),
                                 /*isDiscarded=*/false);
-  auto viable = cs.solve(target, allowFreeTypeVariables);
-  if (!viable) {
+
+  SmallVector<Solution, 2> viable;
+  cs.solveForCodeCompletion(target, viable);
+
+  if (viable.empty()) {
     recoverOriginalType();
     return Type();
   }
 
   // Get the expression's simplified type.
   expr = target.getAsExpr();
-  auto &solution = (*viable)[0];
+  auto &solution = viable.front();
   auto &solutionCS = solution.getConstraintSystem();
   Type exprType = solution.simplifyType(solutionCS.getType(expr));
 
@@ -223,8 +222,7 @@ bool TypeChecker::typeCheckForCodeCompletion(
     // expression and folding sequence expressions.
     auto failedPreCheck =
         ConstraintSystem::preCheckTarget(target,
-                                         /*replaceInvalidRefsWithErrors=*/true,
-                                         /*leaveClosureBodiesUnchecked=*/true);
+                                         /*replaceInvalidRefsWithErrors=*/true);
 
     if (failedPreCheck)
       return false;
@@ -238,10 +236,7 @@ bool TypeChecker::typeCheckForCodeCompletion(
     options |= ConstraintSystemFlags::AllowFixes;
     options |= ConstraintSystemFlags::SuppressDiagnostics;
     options |= ConstraintSystemFlags::ForCodeCompletion;
-    if (!Context.CompletionCallback) {
-      options |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
-    }
-
+    
     ConstraintSystem cs(DC, options);
 
     llvm::SmallVector<Solution, 4> solutions;
@@ -303,15 +298,14 @@ bool TypeChecker::typeCheckForCodeCompletion(
   return true;
 }
 
-static llvm::Optional<Type>
+static std::optional<Type>
 getTypeOfCompletionContextExpr(DeclContext *DC, CompletionTypeCheckKind kind,
                                Expr *&parsedExpr,
                                ConcreteDeclRef &referencedDecl) {
   if (constraints::ConstraintSystem::preCheckExpression(
           parsedExpr, DC,
-          /*replaceInvalidRefsWithErrors=*/true,
-          /*leaveClosureBodiesUnchecked=*/true))
-    return llvm::None;
+          /*replaceInvalidRefsWithErrors=*/true))
+    return std::nullopt;
 
   switch (kind) {
   case CompletionTypeCheckKind::Normal:
@@ -336,12 +330,12 @@ getTypeOfCompletionContextExpr(DeclContext *DC, CompletionTypeCheckKind kind,
       }
     }
 
-    return llvm::None;
+    return std::nullopt;
   }
 
   Type originalType = parsedExpr->getType();
-  if (auto T = getTypeOfExpressionWithoutApplying(parsedExpr, DC,
-                 referencedDecl, FreeTypeVariableBinding::UnresolvedType))
+  if (auto T =
+          getTypeOfExpressionWithoutApplying(parsedExpr, DC, referencedDecl))
     return T;
 
   // Try to recover if we've made any progress.
@@ -354,12 +348,12 @@ getTypeOfCompletionContextExpr(DeclContext *DC, CompletionTypeCheckKind kind,
     return parsedExpr->getType();
   }
 
-  return llvm::None;
+  return std::nullopt;
 }
 
 /// Return the type of an expression parsed during code completion, or
 /// a null \c Type on error.
-llvm::Optional<Type> swift::getTypeOfCompletionContextExpr(
+std::optional<Type> swift::getTypeOfCompletionContextExpr(
     ASTContext &Ctx, DeclContext *DC, CompletionTypeCheckKind kind,
     Expr *&parsedExpr, ConcreteDeclRef &referencedDecl) {
   DiagnosticSuppression suppression(Ctx.Diags);
@@ -372,6 +366,6 @@ llvm::Optional<Type> swift::getTypeOfCompletionContextExpr(
 LookupResult
 swift::lookupSemanticMember(DeclContext *DC, Type ty, DeclName name) {
   return TypeChecker::lookupMember(DC, ty, DeclNameRef(name), SourceLoc(),
-                                   llvm::None);
+                                   std::nullopt);
 }
 

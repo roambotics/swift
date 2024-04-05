@@ -91,7 +91,7 @@ void SILLinkerVisitor::deserializeAndPushToWorklist(SILFunction *F) {
          "the de-serializer did set the wrong serialized flag");
   
   F->setBare(IsBare);
-  F->verify();
+  toVerify.push_back(F);
   Worklist.push_back(F);
   Changed = true;
   ++NumFuncLinked;
@@ -189,6 +189,10 @@ void SILLinkerVisitor::linkInVTable(ClassDecl *D) {
       maybeAddFunctionToWorklist(impl, Vtbl->isSerialized());
     }
   }
+
+  if (auto *S = D->getSuperclassDecl()) {
+    linkInVTable(S);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -235,8 +239,7 @@ static bool mustDeserializeProtocolConformance(SILModule &M,
     return false;
   auto conformance = c.getConcrete()->getRootConformance();
   return M.Types.protocolRequiresWitnessTable(conformance->getProtocol())
-    && isa<ClangModuleUnit>(conformance->getDeclContext()
-                                       ->getModuleScopeContext());
+    && conformance->isSynthesized();
 }
 
 void SILLinkerVisitor::visitProtocolConformance(ProtocolConformanceRef ref) {
@@ -445,8 +448,9 @@ void SILLinkerVisitor::process() {
       Fn->setSerialized(IsSerialized_t::IsNotSerialized);
     }
 
-    // TODO: This should probably be done as a separate SIL pass ("internalize")
-    if (Fn->getModule().getASTContext().LangOpts.hasFeature(Feature::Embedded)) {
+    if (Fn->getModule().getASTContext().LangOpts.hasFeature(Feature::Embedded) &&
+        Fn->getModule().getASTContext().LangOpts.DebuggerSupport) {
+      // LLDB requires that functions with bodies are not external.
       Fn->setLinkage(stripExternalFromLinkage(Fn->getLinkage()));
     }
 
@@ -458,5 +462,10 @@ void SILLinkerVisitor::process() {
         visit(&I);
       }
     }
+  }
+
+  while (!toVerify.empty()) {
+    auto *fn = toVerify.pop_back_val();
+    fn->verify();
   }
 }

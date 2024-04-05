@@ -1137,11 +1137,11 @@ struct TrampolineDest {
   TrampolineDest(TrampolineDest &&) = default;
   TrampolineDest &operator=(TrampolineDest &&) = default;
 
-  bool operator==(const TrampolineDest &rhs) {
+  bool operator==(const TrampolineDest &rhs) const {
     return destBB == rhs.destBB
            && newSourceBranchArgs == rhs.newSourceBranchArgs;
   }
-  bool operator!=(const TrampolineDest &rhs) {
+  bool operator!=(const TrampolineDest &rhs) const {
     return !(*this == rhs);
   }
 
@@ -2319,6 +2319,8 @@ bool SimplifyCFG::simplifyUnreachableBlock(UnreachableInst *UI) {
     case SILInstructionKind::StrongReleaseInst:
     case SILInstructionKind::RetainValueInst:
     case SILInstructionKind::ReleaseValueInst:
+    case SILInstructionKind::DestroyValueInst:
+    case SILInstructionKind::EndBorrowInst:
       break;
     // We can only ignore a dealloc_stack instruction if we can ignore all
     // instructions in the block.
@@ -2550,17 +2552,20 @@ bool SimplifyCFG::simplifyTryApplyBlock(TryApplyInst *TAI) {
     auto context = TAI->getFunction()->getTypeExpansionContext();
     SmallVector<SILValue, 8> Args;
     unsigned numArgs = TAI->getNumArguments();
+    unsigned calleeArgIdx = 0;
     for (unsigned i = 0; i < numArgs; ++i) {
       auto Arg = TAI->getArgument(i);
+      if (origConv.isArgumentIndexOfIndirectErrorResult(i) &&
+          !targetConv.isArgumentIndexOfIndirectErrorResult(i)) {
+        continue;
+      }
       // Cast argument if required.
       std::tie(Arg, std::ignore) = castValueToABICompatibleType(
           &Builder, TAI->getLoc(), Arg, origConv.getSILArgumentType(i, context),
-          targetConv.getSILArgumentType(i, context), {TAI});
+          targetConv.getSILArgumentType(calleeArgIdx, context), {TAI});
       Args.push_back(Arg);
+      calleeArgIdx += 1;
     }
-
-    assert(calleeConv.getNumSILArguments() == Args.size()
-           && "The number of arguments should match");
 
     LLVM_DEBUG(llvm::dbgs() << "replace with apply: " << *TAI);
 
@@ -2809,6 +2814,7 @@ bool SimplifyCFG::simplifyBlocks() {
       Changed |= simplifyTermWithIdenticalDestBlocks(BB);
       break;
     case TermKind::ThrowInst:
+    case TermKind::ThrowAddrInst:
     case TermKind::DynamicMethodBranchInst:
     case TermKind::ReturnInst:
     case TermKind::UnwindInst:
@@ -3010,7 +3016,7 @@ class ArgumentSplitter {
   /// The list of first level projections that Arg can be split into.
   llvm::SmallVector<Projection, 4> Projections;
 
-  llvm::Optional<int> FirstNewArgIndex;
+  std::optional<int> FirstNewArgIndex;
 
 public:
   ArgumentSplitter(SILArgument *A, std::vector<SILArgument *> &W)
@@ -3734,7 +3740,7 @@ bool SimplifyCFG::simplifyArgument(SILBasicBlock *BB, unsigned i) {
   // Okay, we'll replace the BB arg with one with the right type, replace
   // the uses in this block, and then rewrite the branch operands.
   LLVM_DEBUG(llvm::dbgs() << "unwrap argument:" << *A);
-  A->replaceAllUsesWith(SILUndef::get(A->getType(), *BB->getParent()));
+  A->replaceAllUsesWith(SILUndef::get(A));
   auto *NewArg = BB->replacePhiArgument(i, proj->getType(),
                                         BB->getArgument(i)->getOwnershipKind());
   proj->replaceAllUsesWith(NewArg);
@@ -3788,12 +3794,24 @@ static void tryToReplaceArgWithIncomingValue(SILBasicBlock *BB, unsigned i,
   if (!A->getIncomingPhiValues(Incoming) || Incoming.empty())
     return;
   
-  SILValue V = Incoming[0];
-  for (size_t Idx = 1, Size = Incoming.size(); Idx < Size; ++Idx) {
-    if (Incoming[Idx] != V)
+  SILValue V;
+  for (size_t Idx = 0; Idx < Incoming.size(); ++Idx) {
+    if (Incoming[Idx] == A) {
+      continue;
+    }
+    if (!V) {
+      V = Incoming[Idx];
+      continue;
+    }
+    if (Incoming[Idx] != V) {
       return;
+    }
   }
   
+  if (!V) {
+    return;
+  }
+
   // If the incoming values of all predecessors are equal usually this means
   // that the common incoming value dominates the BB. But: this might be not
   // the case if BB is unreachable. Therefore we still have to check it.

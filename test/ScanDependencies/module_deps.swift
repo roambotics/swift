@@ -57,6 +57,7 @@ import SubE
 // CHECK-DAG:     "swift": "_cross_import_E"
 // CHECK: ],
 
+// CHECK:      "contextHash":
 // CHECK:      "extraPcmArgs": [
 // CHECK-NEXT:    "-Xcc",
 // CHECK-NEXT:    "-target",
@@ -103,7 +104,7 @@ import SubE
 
 // CHECK: "commandLine": [
 // CHECK-NEXT: "-frontend"
-// CHECK-NEXT: "-only-use-extra-clang-opts"
+// CHECK: "-direct-clang-cc1-module-build"
 // CHECK-NOT:  "BUILD_DIR/bin/clang"
 // CHECK:      "-Xcc"
 // CHECK-NEXT: "-resource-dir"

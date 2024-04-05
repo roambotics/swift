@@ -1,9 +1,10 @@
 // RUN: %target-swift-frontend -sil-verify-all -verify -emit-sil -enable-experimental-feature MoveOnlyEnumDeinits %s
+// RUN: %target-swift-frontend  -enable-experimental-feature NoncopyableGenerics -sil-verify-all -verify -emit-sil -enable-experimental-feature MoveOnlyEnumDeinits %s
+
 
 func posix_close(_ t: Int) {}
 
-@_moveOnly
-struct GoodFileDescriptor {
+struct GoodFileDescriptor: ~Copyable {
   let _fd: Int = 0
 
   var rawFileDescriptor: Int {
@@ -25,8 +26,7 @@ struct GoodFileDescriptor {
   } // expected-note {{consumed again here}}
 }
 
-@_moveOnly
-struct BadFileDescriptor {
+struct BadFileDescriptor: ~Copyable {
   let _fd: Int = 0
 
   deinit {}
@@ -59,7 +59,7 @@ final class Wallet {
   var ticket1: Ticket = .green
 }
 
-@_moveOnly enum Ticket {
+enum Ticket: ~Copyable {
   case green
   case yellow
   case red

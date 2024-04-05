@@ -310,6 +310,14 @@ static bool canZapInstruction(SILInstruction *Inst, bool acceptRefCountInsts,
   if (isa<BeginAccessInst>(Inst) || isa<EndAccessInst>(Inst))
     return true;
 
+  // The value form of zero init is not a user of any operand. The address
+  // form however is easily zappable because it's always a trivial store.
+  if (auto bi = dyn_cast<BuiltinInst>(Inst)) {
+    if (bi->getBuiltinKind() == BuiltinValueKind::ZeroInitializer) {
+      return true;
+    }
+  }
+
   // If Inst does not read or write to memory, have side effects, and is not a
   // terminator, we can zap it.
   if (!Inst->mayHaveSideEffects() && !Inst->mayReadFromMemory() &&
@@ -328,7 +336,7 @@ static bool onlyStoresToTailObjects(BuiltinInst *destroyArray,
                                     AllocRefInstBase *allocRef) {
   // Get the number of destroyed elements.
   auto *literal = dyn_cast<IntegerLiteralInst>(destroyArray->getArguments()[2]);
-  if (!literal || literal->getValue().getMinSignedBits() > 32)
+  if (!literal || literal->getValue().getSignificantBits() > 32)
     return false;
   int numDestroyed = literal->getValue().getSExtValue();
   
@@ -616,6 +624,13 @@ recursivelyCollectInteriorUses(ValueBase *DefInst,
       AllUsers.insert(User);
       continue;
     }
+    if (auto *MDI = dyn_cast<MarkDependenceInst>(User)) {
+      if (!recursivelyCollectInteriorUses(MDI, AddressNode,
+                                          IsInteriorAddress)) {
+        return false;
+      }
+      continue;
+    }
     if (auto PTAI = dyn_cast<PointerToAddressInst>(User)) {
       // Only one pointer-to-address is allowed for safety.
       if (SeenPtrToAddr)
@@ -717,7 +732,8 @@ static void insertReleases(ArrayRef<StoreInst*> Stores,
   assert(!Stores.empty());
   SILValue StVal = Stores.front()->getSrc();
 
-  SSAUp.initialize(StVal->getType(), StVal->getOwnershipKind());
+  SSAUp.initialize(StVal->getFunction(), StVal->getType(),
+                   StVal->getOwnershipKind());
 
   for (auto *Store : Stores)
     SSAUp.addAvailableValue(Store->getParent(), Store->getSrc());
@@ -755,6 +771,17 @@ class DeadObjectElimination : public SILFunctionTransform {
   DominanceInfo *domInfo = nullptr;
 
   void removeInstructions(ArrayRef<SILInstruction*> toRemove);
+  
+  /// Try to salvage the debug info for a dead instruction removed by
+  /// DeadObjectElimination.
+  ///
+  /// Dead stores will be replaced by a debug value for the object variable,
+  /// using a fragment expression. By walking from the store to the allocation,
+  /// we can know which member of the object is being assigned, and create
+  /// fragments for each member. Other instructions are not salvaged.
+  /// Currently only supports dead stack-allocated objects.
+  void salvageDebugInfo(SILInstruction *toBeRemoved);
+  std::optional<SILDebugVariable> buildDIExpression(SILInstruction *current);
 
   bool processAllocRef(AllocRefInstBase *ARI);
   bool processAllocStack(AllocStackInst *ASI);
@@ -815,6 +842,52 @@ DeadObjectElimination::removeInstructions(ArrayRef<SILInstruction*> toRemove) {
     // Now we know that I should not have any uses... erase it from its parent.
     deleter.forceDelete(I);
   }
+}
+
+void DeadObjectElimination::salvageDebugInfo(SILInstruction *toBeRemoved) {
+  auto *SI = dyn_cast<StoreInst>(toBeRemoved);
+  if (!SI)
+    return;
+
+  auto *parent = SI->getDest()->getDefiningInstruction();
+  auto varInfo = buildDIExpression(parent);
+  if (!varInfo)
+    return;
+
+  SILBuilderWithScope Builder(SI);
+  Builder.createDebugValue(SI->getLoc(), SI->getSrc(), *varInfo);
+}
+
+std::optional<SILDebugVariable>
+DeadObjectElimination::buildDIExpression(SILInstruction *current) {
+  if (!current)
+    return {};
+  if (auto dvci = dyn_cast<AllocStackInst>(current)) {
+    auto var = dvci->getVarInfo();
+    if (!var)
+      return {};
+    var->Type = dvci->getType();
+    return var;
+  }
+  if (auto *tupleAddr = dyn_cast<TupleElementAddrInst>(current)) {
+    auto *definer = tupleAddr->getOperand().getDefiningInstruction();
+    auto path = buildDIExpression(definer);
+    if (!path)
+      return {};
+    path->DIExpr.append(SILDebugInfoExpression::createTupleFragment(
+      tupleAddr->getTupleType(), tupleAddr->getFieldIndex()));
+    return path;
+  }
+  if (auto *structAddr = dyn_cast<StructElementAddrInst>(current)) {
+    auto *definer = structAddr->getOperand().getDefiningInstruction();
+    auto path = buildDIExpression(definer);
+    if (!path)
+      return {};
+    path->DIExpr.append(SILDebugInfoExpression::createFragment(
+      structAddr->getField()));
+    return path;
+  }
+  return {};
 }
 
 bool DeadObjectElimination::processAllocRef(AllocRefInstBase *ARI) {
@@ -941,6 +1014,8 @@ bool DeadObjectElimination::processAllocStack(AllocStackInst *ASI) {
     }
   }
 
+  for (auto *I : UsersToRemove)
+    salvageDebugInfo(I);
   // Remove the AllocRef and all of its users.
   removeInstructions(
     ArrayRef<SILInstruction*>(UsersToRemove.begin(), UsersToRemove.end()));
@@ -1163,9 +1238,15 @@ bool DeadObjectElimination::processAllocApply(ApplyInst *AI,
 
   LLVM_DEBUG(llvm::dbgs() << "    Success! Eliminating apply allocate(...).\n");
 
+  auto *ARI = dyn_cast<AllocRefInst>(AI->getArgument(0));
+
   deleter.forceDeleteWithUsers(AI);
   for (auto *toDelete : instsDeadAfterInitializerRemoved) {
     deleter.trackIfDead(toDelete);
+  }
+
+  if (ARI) {
+    deleter.forceDeleteWithUsers(ARI);
   }
 
   ++DeadAllocApplyEliminated;

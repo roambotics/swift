@@ -1,19 +1,27 @@
-import CBasicBridging
-import CASTBridging
+//===--- SourceFile.swift -------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2022-2023 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
 
+import ASTBridging
 import SwiftDiagnostics
-import SwiftSyntax
+@_spi(ExperimentalLanguageFeatures) import SwiftParser
 import SwiftParserDiagnostics
-
-@_spi(ExperimentalLanguageFeatures)
-import SwiftParser
+import SwiftSyntax
 
 /// Describes a source file that has been "exported" to the C++ part of the
 /// compiler, with enough information to interface with the C++ layer.
-struct ExportedSourceFile {
+public struct ExportedSourceFile {
   /// The underlying buffer within the C++ SourceManager, which is used
   /// for computations of source locations.
-  let buffer: UnsafeBufferPointer<UInt8>
+  public let buffer: UnsafeBufferPointer<UInt8>
 
   /// The name of the enclosing module.
   let moduleName: String
@@ -22,7 +30,20 @@ struct ExportedSourceFile {
   let fileName: String
 
   /// The syntax tree for the complete source file.
-  let syntax: SourceFileSyntax
+  public let syntax: SourceFileSyntax
+
+  /// A source location converter to convert `AbsolutePosition`s in `syntax` to line/column locations.
+  ///
+  /// Cached so we don't need to re-build the line table every time we need to convert a position.
+  let sourceLocationConverter: SourceLocationConverter
+
+  public func position(of location: BridgedSourceLoc) -> AbsolutePosition? {
+    let sourceFileBaseAddress = UnsafeRawPointer(buffer.baseAddress!)
+    guard let opaqueValue = location.getOpaquePointerValue() else {
+      return nil
+    }
+    return AbsolutePosition(utf8Offset: opaqueValue - sourceFileBaseAddress)
+  }
 }
 
 extension Parser.ExperimentalFeatures {
@@ -31,12 +52,29 @@ extension Parser.ExperimentalFeatures {
     guard let context = context else { return }
 
     func mapFeature(_ bridged: BridgedFeature, to feature: Self) {
-      if ASTContext_langOptsHasFeature(context, bridged) {
+      if context.langOptsHasFeature(bridged) {
         insert(feature)
       }
     }
     mapFeature(.ThenStatements, to: .thenStatements)
-    mapFeature(.TypedThrows, to: .typedThrows)
+    mapFeature(.DoExpressions, to: .doExpressions)
+    mapFeature(.NonescapableTypes, to: .nonescapableTypes)
+    mapFeature(.TransferringArgsAndResults, to: .transferringArgsAndResults)
+    mapFeature(.BorrowingSwitch, to: .borrowingSwitch)
+  }
+}
+
+extension Parser.SwiftVersion {
+  init?(from context: BridgedASTContext?) {
+    guard let context else {
+      return nil
+    }
+    switch context.majorLanguageVersion {
+    case 1, 2, 3, 4: self = .v4
+    case 5: self = .v5
+    case 6: self = .v6
+    default: self = .v6
+    }
   }
 }
 
@@ -44,20 +82,32 @@ extension Parser.ExperimentalFeatures {
 /// ExportedSourceFile instance.
 @_cdecl("swift_ASTGen_parseSourceFile")
 public func parseSourceFile(
-  buffer: UnsafePointer<UInt8>, bufferLength: Int,
-  moduleName: UnsafePointer<UInt8>, filename: UnsafePointer<UInt8>,
+  buffer: UnsafePointer<UInt8>,
+  bufferLength: Int,
+  moduleName: UnsafePointer<UInt8>,
+  filename: UnsafePointer<UInt8>,
   ctxPtr: UnsafeMutableRawPointer?
 ) -> UnsafeRawPointer {
   let buffer = UnsafeBufferPointer(start: buffer, count: bufferLength)
 
   let ctx = ctxPtr.map { BridgedASTContext(raw: $0) }
-  let sourceFile = Parser.parse(source: buffer, experimentalFeatures: .init(from: ctx))
+  let sourceFile = Parser.parse(
+    source: buffer,
+    swiftVersion: Parser.SwiftVersion(from: ctx),
+    experimentalFeatures: .init(from: ctx)
+  )
 
   let exportedPtr = UnsafeMutablePointer<ExportedSourceFile>.allocate(capacity: 1)
+  let moduleName = String(cString: moduleName)
+  let fileName = String(cString: filename)
   exportedPtr.initialize(
     to: .init(
-      buffer: buffer, moduleName: String(cString: moduleName),
-      fileName: String(cString: filename), syntax: sourceFile)
+      buffer: buffer,
+      moduleName: moduleName,
+      fileName: fileName,
+      syntax: sourceFile,
+      sourceLocationConverter: SourceLocationConverter(fileName: fileName, tree: sourceFile)
+    )
   )
 
   return UnsafeRawPointer(exportedPtr)
@@ -99,13 +149,14 @@ extension Syntax {
 /// Emit diagnostics within the given source file.
 @_cdecl("swift_ASTGen_emitParserDiagnostics")
 public func emitParserDiagnostics(
-  diagEnginePtr: UnsafeMutablePointer<UInt8>,
+  diagEnginePtr: UnsafeMutableRawPointer,
   sourceFilePtr: UnsafeMutablePointer<UInt8>,
   emitOnlyErrors: CInt,
   downgradePlaceholderErrorsToWarnings: CInt
 ) -> CInt {
   return sourceFilePtr.withMemoryRebound(
-    to: ExportedSourceFile.self, capacity: 1
+    to: ExportedSourceFile.self,
+    capacity: 1
   ) { sourceFile in
     var anyDiags = false
 
@@ -123,7 +174,9 @@ public func emitParserDiagnostics(
       }
 
       let diagnosticSeverity: DiagnosticSeverity
-      if downgradePlaceholderErrorsToWarnings == 1 && diag.diagMessage.diagnosticID == StaticTokenError.editorPlaceholder.diagnosticID {
+      if downgradePlaceholderErrorsToWarnings == 1
+        && diag.diagMessage.diagnosticID == StaticTokenError.editorPlaceholder.diagnosticID
+      {
         diagnosticSeverity = .warning
       } else {
         diagnosticSeverity = diag.diagMessage.severity

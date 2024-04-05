@@ -25,9 +25,12 @@ public protocol Value : AnyObject, CustomStringConvertible {
   var definingInstruction: Instruction? { get }
   
   /// The block where the value is defined.
-  ///
-  /// It's not legal to get the definingBlock of an `Undef` value.
   var parentBlock: BasicBlock { get }
+
+  /// The function where the value lives in.
+  ///
+  /// It's not legal to get the parentFunction of an instruction in a global initializer.
+  var parentFunction: Function { get }
 
   /// True if the value has a trivial type.
   var hasTrivialType: Bool { get }
@@ -75,7 +78,27 @@ public enum Ownership {
   /// points in the SSA graph, where more information about the value is
   /// statically available on some control flow paths.
   case none
-  
+
+  public var hasLifetime: Bool {
+    switch self {
+    case .owned, .guaranteed:
+      return true
+    case .unowned, .none:
+      return false
+    }
+  }
+
+  public init(bridged: BridgedValue.Ownership) {
+    switch bridged {
+    case .Unowned:    self = .unowned
+    case .Owned:      self = .owned
+    case .Guaranteed: self = .guaranteed
+    case .None:       self = .none
+    default:
+      fatalError("unsupported ownership")
+    }
+  }
+
   public var _bridged: BridgedValue.Ownership {
     switch self {
       case .unowned:    return BridgedValue.Ownership.Unowned
@@ -88,12 +111,12 @@ public enum Ownership {
 
 extension Value {
   public var description: String {
-    let stdString = bridged.getDebugDescription()
-    return String(_cxxString: stdString)
+    return String(taking: bridged.getDebugDescription())
   }
 
   public var uses: UseList { UseList(bridged.getFirstUse()) }
   
+  // Default implementation for all values which have a parent block, like instructions and arguments.
   public var parentFunction: Function { parentBlock.parentFunction }
 
   public var type: Type { bridged.getType().type }
@@ -115,6 +138,23 @@ extension Value {
     }
   }
 
+  public var definingInstructionOrTerminator: Instruction? {
+    if let def = definingInstruction {
+      return def
+    } else if let result = TerminatorResult(self) {
+      return result.terminator
+    }
+    return nil
+  }
+
+  public var nextInstruction: Instruction {
+    if self is Argument {
+      return parentBlock.instructions.first!
+    }
+    // Block terminators do not directly produce values.
+    return definingInstruction!.next!
+  }
+
   public var hashable: HashableValue { ObjectIdentifier(self) }
 
   public var bridged: BridgedValue {
@@ -133,6 +173,12 @@ public func ==(_ lhs: Value, _ rhs: Value) -> Bool {
 
 public func !=(_ lhs: Value, _ rhs: Value) -> Bool {
   return !(lhs === rhs)
+}
+
+extension CollectionLikeSequence where Element == Value {
+  public func contains(_ element: Element) -> Bool {
+    return self.contains { $0 == element }
+  }
 }
 
 /// A projected value, which is defined by the original value and a projection path.
@@ -181,8 +227,11 @@ extension BridgedValue {
 public final class Undef : Value {
   public var definingInstruction: Instruction? { nil }
 
+  public var parentFunction: Function { bridged.SILUndef_getParentFunction().function }
+
   public var parentBlock: BasicBlock {
-    fatalError("undef has no defining block")
+    // By convention, undefs are considered to be defined at the entry of the function.
+    parentFunction.entryBlock
   }
 
   /// Undef has not parent function, therefore the default `hasTrivialType` does not work.
@@ -196,9 +245,12 @@ public final class Undef : Value {
 
 final class PlaceholderValue : Value {
   public var definingInstruction: Instruction? { nil }
+
   public var parentBlock: BasicBlock {
     fatalError("PlaceholderValue has no defining block")
   }
+
+  public var parentFunction: Function { bridged.PlaceholderValue_getParentFunction().function }
 }
 
 extension OptionalBridgedValue {
@@ -208,5 +260,20 @@ extension OptionalBridgedValue {
 extension Optional where Wrapped == Value {
   public var bridged: OptionalBridgedValue {
     OptionalBridgedValue(obj: self?.bridged.obj)
+  }
+}
+
+//===----------------------------------------------------------------------===//
+//                            Bridging Utilities
+//===----------------------------------------------------------------------===//
+
+extension Array where Element == Value {
+  public func withBridgedValues<T>(_ c: (BridgedValueArray) -> T) -> T {
+    return self.withUnsafeBufferPointer { bufPtr in
+      assert(bufPtr.count == self.count)
+      return bufPtr.withMemoryRebound(to: BridgeValueExistential.self) { valPtr in
+        return c(BridgedValueArray(base: valPtr.baseAddress, count: self.count))
+      }
+    }
   }
 }

@@ -183,7 +183,7 @@ void AvailableValues::dump() const { print(llvm::dbgs(), nullptr); }
 struct borrowtodestructure::Implementation {
   BorrowToDestructureTransform &interface;
 
-  llvm::Optional<AvailableValueStore> blockToAvailableValues;
+  std::optional<AvailableValueStore> blockToAvailableValues;
 
   /// The liveness that we use for all borrows or for individual switch_enum
   /// arguments.
@@ -311,20 +311,22 @@ bool Implementation::gatherUses(SILValue value) {
         // normal use, so we fall through.
       }
 
-      auto leafRange =
-          TypeTreeLeafTypeRange::get(nextUse->get(), getRootValue());
-      if (!leafRange) {
+      SmallVector<TypeTreeLeafTypeRange, 2> leafRanges;
+      TypeTreeLeafTypeRange::get(nextUse, getRootValue(), leafRanges);
+      if (!leafRanges.size()) {
         LLVM_DEBUG(llvm::dbgs() << "        Failed to compute leaf range?!\n");
         return false;
       }
 
       LLVM_DEBUG(llvm::dbgs() << "        Found non lifetime ending use!\n");
-      blocksToUses.insert(nextUse->getParentBlock(),
-                          {nextUse,
-                           {liveness.getNumSubElements(), *leafRange,
-                            false /*is lifetime ending*/}});
-      liveness.updateForUse(nextUse->getUser(), *leafRange,
-                            false /*is lifetime ending*/);
+      for (auto leafRange : leafRanges) {
+        blocksToUses.insert(nextUse->getParentBlock(),
+                            {nextUse,
+                             {liveness.getNumSubElements(), leafRange,
+                              false /*is lifetime ending*/}});
+        liveness.updateForUse(nextUse->getUser(), leafRange,
+                              false /*is lifetime ending*/);
+      }
       instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
       continue;
     }
@@ -337,9 +339,9 @@ bool Implementation::gatherUses(SILValue value) {
         continue;
       }
 
-      auto leafRange =
-          TypeTreeLeafTypeRange::get(nextUse->get(), getRootValue());
-      if (!leafRange) {
+      SmallVector<TypeTreeLeafTypeRange, 2> leafRanges;
+      TypeTreeLeafTypeRange::get(nextUse, getRootValue(), leafRanges);
+      if (!leafRanges.size()) {
         LLVM_DEBUG(llvm::dbgs() << "        Failed to compute leaf range?!\n");
         return false;
       }
@@ -349,29 +351,59 @@ bool Implementation::gatherUses(SILValue value) {
       SILType type = nextUse->get()->getType();
       if (type.isTrivial(nextUse->getUser()->getFunction())) {
         LLVM_DEBUG(llvm::dbgs() << "        Found non lifetime ending use!\n");
-        blocksToUses.insert(nextUse->getParentBlock(),
-                            {nextUse,
-                             {liveness.getNumSubElements(), *leafRange,
-                              false /*is lifetime ending*/}});
-        liveness.updateForUse(nextUse->getUser(), *leafRange,
-                              false /*is lifetime ending*/);
+        for (auto leafRange : leafRanges) {
+          blocksToUses.insert(nextUse->getParentBlock(),
+                              {nextUse,
+                               {liveness.getNumSubElements(), leafRange,
+                                false /*is lifetime ending*/}});
+          liveness.updateForUse(nextUse->getUser(), leafRange,
+                                false /*is lifetime ending*/);
+        }
         instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
         continue;
       }
 
       LLVM_DEBUG(llvm::dbgs() << "        Found lifetime ending use!\n");
       destructureNeedingUses.push_back(nextUse);
-      blocksToUses.insert(nextUse->getParentBlock(),
-                          {nextUse,
-                           {liveness.getNumSubElements(), *leafRange,
-                            true /*is lifetime ending*/}});
-      liveness.updateForUse(nextUse->getUser(), *leafRange,
-                            true /*is lifetime ending*/);
+      for (auto leafRange : leafRanges) {
+        blocksToUses.insert(nextUse->getParentBlock(),
+                            {nextUse,
+                             {liveness.getNumSubElements(), leafRange,
+                              true /*is lifetime ending*/}});
+        liveness.updateForUse(nextUse->getUser(), leafRange,
+                              true /*is lifetime ending*/);
+      }
       instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
       continue;
     }
 
     case OperandOwnership::GuaranteedForwarding: {
+      // Always treat switches as full liveness uses of the enum being switched
+      // since the control flow is significant, and we can't destructure through
+      // the switch dispatch. If the final pattern match ends up destructuring
+      // the value, then SILGen emits that as a separate access.
+      if (auto switchEnum = dyn_cast<SwitchEnumInst>(nextUse->getUser())) {
+        SmallVector<TypeTreeLeafTypeRange, 2> leafRanges;
+        TypeTreeLeafTypeRange::get(&switchEnum->getOperandRef(), getRootValue(),
+                                   leafRanges);
+        if (!leafRanges.size()) {
+          LLVM_DEBUG(llvm::dbgs() << "        Failed to compute leaf range?!\n");
+          return false;
+        }
+
+        LLVM_DEBUG(llvm::dbgs() << "        Found non lifetime ending use!\n");
+        for (auto leafRange : leafRanges) {
+          blocksToUses.insert(nextUse->getParentBlock(),
+                              {nextUse,
+                               {liveness.getNumSubElements(), leafRange,
+                                false /*is lifetime ending*/}});
+          liveness.updateForUse(nextUse->getUser(), leafRange,
+                                false /*is lifetime ending*/);
+        }
+        instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
+        continue;
+      }
+    
       // Look through guaranteed forwarding if we have at least one non-trivial
       // value. If we have all non-trivial values, treat this as a liveness use.
       SmallVector<SILValue, 8> forwardedValues;
@@ -384,20 +416,22 @@ bool Implementation::gatherUses(SILValue value) {
       });
 
       if (forwardedValues.empty()) {
-        auto leafRange =
-          TypeTreeLeafTypeRange::get(nextUse->get(), getRootValue());
-        if (!leafRange) {
+        SmallVector<TypeTreeLeafTypeRange, 2> leafRanges;
+        TypeTreeLeafTypeRange::get(nextUse, getRootValue(), leafRanges);
+        if (!leafRanges.size()) {
           LLVM_DEBUG(llvm::dbgs() << "        Failed to compute leaf range?!\n");
           return false;
         }
 
         LLVM_DEBUG(llvm::dbgs() << "        Found non lifetime ending use!\n");
-        blocksToUses.insert(nextUse->getParentBlock(),
-                            {nextUse,
-                             {liveness.getNumSubElements(), *leafRange,
-                              false /*is lifetime ending*/}});
-        liveness.updateForUse(nextUse->getUser(), *leafRange,
-                              false /*is lifetime ending*/);
+        for (auto leafRange : leafRanges) {
+          blocksToUses.insert(nextUse->getParentBlock(),
+                              {nextUse,
+                               {liveness.getNumSubElements(), leafRange,
+                                false /*is lifetime ending*/}});
+          liveness.updateForUse(nextUse->getUser(), leafRange,
+                                false /*is lifetime ending*/);
+        }
         instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
         continue;
       }
@@ -412,8 +446,9 @@ bool Implementation::gatherUses(SILValue value) {
       continue;
     }
     case OperandOwnership::Borrow: {
-      // Look through borrows.
-      if (auto *bbi = dyn_cast<BeginBorrowInst>(nextUse->getUser())) {
+      if (auto *bbi = dyn_cast<BeginBorrowInst>(nextUse->getUser());
+          bbi && !bbi->isFixed()) {
+        // Look through non-fixed borrows.
         LLVM_DEBUG(llvm::dbgs() << "        Found recursive borrow!\n");
         for (auto *use : bbi->getUses()) {
           useWorklist.push_back(use);
@@ -421,22 +456,42 @@ bool Implementation::gatherUses(SILValue value) {
         continue;
       }
 
-      auto leafRange =
-          TypeTreeLeafTypeRange::get(nextUse->get(), getRootValue());
-      if (!leafRange) {
+      SmallVector<TypeTreeLeafTypeRange, 2> leafRanges;
+      TypeTreeLeafTypeRange::get(nextUse, getRootValue(), leafRanges);
+      if (!leafRanges.size()) {
         LLVM_DEBUG(llvm::dbgs() << "        Failed to compute leaf range?!\n");
         return false;
       }
 
       // Otherwise, treat it as a normal use.
-      LLVM_DEBUG(llvm::dbgs() << "        Treating non-begin_borrow borrow as "
+      LLVM_DEBUG(llvm::dbgs() << "        Treating borrow as "
                                  "a non lifetime ending use!\n");
-      blocksToUses.insert(nextUse->getParentBlock(),
-                          {nextUse,
-                           {liveness.getNumSubElements(), *leafRange,
-                            false /*is lifetime ending*/}});
-      liveness.updateForUse(nextUse->getUser(), *leafRange,
-                            false /*is lifetime ending*/);
+      for (auto leafRange : leafRanges) {
+        blocksToUses.insert(nextUse->getParentBlock(),
+                            {nextUse,
+                             {liveness.getNumSubElements(), leafRange,
+                              false /*is lifetime ending*/}});
+        liveness.updateForUse(nextUse->getUser(), leafRange,
+                              false /*is lifetime ending*/);
+      }
+      // The liveness extends to the scope-ending uses of the borrow.
+      BorrowingOperand(nextUse).visitScopeEndingUses([&](Operand *end) -> bool {
+        if (end->getOperandOwnership() == OperandOwnership::Reborrow) {
+          return false;
+        }
+        if (PhiOperand(end)) {
+          assert(end->getOperandOwnership() ==
+                 OperandOwnership::ForwardingConsume);
+          return false;
+        }
+        LLVM_DEBUG(llvm::dbgs() << "        ++ Scope-ending use: ";
+                   end->getUser()->print(llvm::dbgs()));
+        for (auto leafRange : leafRanges) {
+          liveness.updateForUse(end->getUser(), leafRange,
+                                false /*is lifetime ending*/);
+        }
+        return true;
+      });
       instToInterestingOperandIndexMap.insert(nextUse->getUser(), nextUse);
 
       continue;
@@ -464,13 +519,15 @@ void Implementation::checkForErrorsOnSameInstruction() {
     // First loop through our uses and handle any consuming twice errors. We
     // also setup usedBits to check for non-consuming uses that may overlap.
     Operand *badOperand = nullptr;
-    llvm::Optional<TypeTreeLeafTypeRange> badRange;
+    std::optional<TypeTreeLeafTypeRange> badRange;
     for (auto *use : instRangePair.second) {
       if (!use->isConsuming())
         continue;
 
-      auto destructureUseSpan =
-          *TypeTreeLeafTypeRange::get(use->get(), getRootValue());
+      SmallVector<TypeTreeLeafTypeRange, 2> destructureUseSpans;
+      TypeTreeLeafTypeRange::get(use, getRootValue(), destructureUseSpans);
+      assert(destructureUseSpans.size() == 1);
+      auto destructureUseSpan = destructureUseSpans[0];
       for (unsigned index : destructureUseSpan.getRange()) {
         if (usedBits[index]) {
           // If we get that we used the same bit twice, we have an error. We set
@@ -497,8 +554,10 @@ void Implementation::checkForErrorsOnSameInstruction() {
         if (use->isConsuming())
           continue;
 
-        auto destructureUseSpan =
-            *TypeTreeLeafTypeRange::get(use->get(), getRootValue());
+        SmallVector<TypeTreeLeafTypeRange, 2> destructureUseSpans;
+        TypeTreeLeafTypeRange::get(use, getRootValue(), destructureUseSpans);
+        assert(destructureUseSpans.size() == 1);
+        auto destructureUseSpan = destructureUseSpans[0];
         for (unsigned index : destructureUseSpan.getRange()) {
           if (!usedBits[index])
             continue;
@@ -538,8 +597,10 @@ void Implementation::checkForErrorsOnSameInstruction() {
       if (!use->isConsuming())
         continue;
 
-      auto destructureUseSpan =
-          *TypeTreeLeafTypeRange::get(use->get(), getRootValue());
+      SmallVector<TypeTreeLeafTypeRange, 2> destructureUseSpans;
+      TypeTreeLeafTypeRange::get(use, getRootValue(), destructureUseSpans);
+      assert(destructureUseSpans.size() == 1);
+      auto destructureUseSpan = destructureUseSpans[0];
       bool emittedError = false;
       for (unsigned index : destructureUseSpan.getRange()) {
         if (!usedBits[index])
@@ -572,9 +633,13 @@ void Implementation::checkDestructureUsesOnBoundary() const {
     LLVM_DEBUG(llvm::dbgs()
                << "    DestructureNeedingUse: " << *use->getUser());
 
-    auto destructureUseSpan =
-        *TypeTreeLeafTypeRange::get(use->get(), getRootValue());
-    if (!liveness.isWithinBoundary(use->getUser(), destructureUseSpan)) {
+    SmallVector<TypeTreeLeafTypeRange, 2> destructureUseSpans;
+    TypeTreeLeafTypeRange::get(use, getRootValue(), destructureUseSpans);
+    assert(destructureUseSpans.size() == 1);
+    auto destructureUseSpan = destructureUseSpans[0];
+    SmallBitVector destructureUseBits(liveness.getNumSubElements());
+    destructureUseSpan.setBits(destructureUseBits);
+    if (!liveness.isWithinBoundary(use->getUser(), destructureUseBits)) {
       LLVM_DEBUG(llvm::dbgs()
                  << "        On boundary or within boundary! No error!\n");
       continue;
@@ -598,7 +663,7 @@ void Implementation::checkDestructureUsesOnBoundary() const {
 
 #ifndef NDEBUG
 static void dumpSmallestTypeAvailable(
-    SmallVectorImpl<llvm::Optional<std::pair<TypeOffsetSizePair, SILType>>>
+    SmallVectorImpl<std::optional<std::pair<TypeOffsetSizePair, SILType>>>
         &smallestTypeAvailable) {
   LLVM_DEBUG(llvm::dbgs() << "            Dumping smallest type available!\n");
   for (auto pair : llvm::enumerate(smallestTypeAvailable)) {
@@ -692,11 +757,11 @@ AvailableValues &Implementation::computeAvailableValues(SILBasicBlock *block) {
         : targetBlockRPO(*pofi->getRPONumber(block)), pe(block->pred_end()),
           pofi(pofi) {}
 
-    llvm::Optional<SILBasicBlock *> operator()(SILBasicBlock *predBlock) const {
+    std::optional<SILBasicBlock *> operator()(SILBasicBlock *predBlock) const {
       // If our predecessor block has a larger RPO number than our target block,
       // then their edge must be a backedge.
       if (targetBlockRPO < *pofi->getRPONumber(predBlock))
-        return llvm::None;
+        return std::nullopt;
       return predBlock;
     }
   };
@@ -728,7 +793,7 @@ AvailableValues &Implementation::computeAvailableValues(SILBasicBlock *block) {
   LLVM_DEBUG(llvm::dbgs() << "        Computing smallest type available for "
                              "available values for block bb"
                           << block->getDebugID() << '\n');
-  SmallVector<llvm::Optional<std::pair<TypeOffsetSizePair, SILType>>, 8>
+  SmallVector<std::optional<std::pair<TypeOffsetSizePair, SILType>>, 8>
       smallestTypeAvailable;
   {
     auto pi = predsSkippingBackEdges.begin();
@@ -755,7 +820,7 @@ AvailableValues &Implementation::computeAvailableValues(SILBasicBlock *block) {
               {{TypeOffsetSizePair(predAvailableValues[i], getRootValue()),
                 predAvailableValues[i]->getType()}});
         else
-          smallestTypeAvailable.emplace_back(llvm::None);
+          smallestTypeAvailable.emplace_back(std::nullopt);
       }
       LLVM_DEBUG(llvm::dbgs() << "        Finished computing initial smallest "
                                  "type available for block bb"
@@ -777,7 +842,7 @@ AvailableValues &Implementation::computeAvailableValues(SILBasicBlock *block) {
           continue;
 
         if (!predAvailableValues[i]) {
-          smallestTypeAvailable[i] = llvm::None;
+          smallestTypeAvailable[i] = std::nullopt;
           continue;
         }
 
@@ -1001,6 +1066,65 @@ dumpIntervalMap(IntervalMapAllocator::Map &map) {
 }
 #endif
 
+// Helper to insert end_borrows after the end of a non-consuming use. If the
+// use is momentary, one end_borrow is inserted after the use. If it is an
+// interior pointer projection or nested borrow, then end_borrows are inserted
+// after every scope-ending instruction for the use.
+static void insertEndBorrowsForNonConsumingUse(Operand *op,
+                                               SILValue borrow) {
+  if (auto iOp = InteriorPointerOperand::get(op)) {
+    LLVM_DEBUG(llvm::dbgs() << "    -- Ending borrow after interior pointer scope:\n"
+                               "    ";
+               op->getUser()->print(llvm::dbgs()));
+    iOp.visitBaseValueScopeEndingUses([&](Operand *endScope) -> bool {
+      auto *endScopeInst = endScope->getUser();
+      LLVM_DEBUG(llvm::dbgs() << "       ";
+                 endScopeInst->print(llvm::dbgs()));
+      SILBuilderWithScope endBuilder(endScopeInst);
+      endBuilder.createEndBorrow(getSafeLoc(endScopeInst), borrow);
+      return true;
+    });
+  } else if (auto bOp = BorrowingOperand(op)) {
+    LLVM_DEBUG(llvm::dbgs() << "    -- Ending borrow after borrow scope:\n"
+                               "    ";
+               op->getUser()->print(llvm::dbgs()));
+    bOp.visitScopeEndingUses([&](Operand *endScope) -> bool {
+      auto *endScopeInst = endScope->getUser();
+      LLVM_DEBUG(llvm::dbgs() << "       ";
+                 endScopeInst->print(llvm::dbgs()));
+      auto afterScopeInst = endScopeInst->getNextInstruction();
+      SILBuilderWithScope endBuilder(afterScopeInst);
+      endBuilder.createEndBorrow(getSafeLoc(afterScopeInst),
+                                 borrow);
+      return true;
+    });
+  } else if (auto swi = dyn_cast<SwitchEnumInst>(op->getUser())) {
+    LLVM_DEBUG(llvm::dbgs() << "    -- Ending borrow for switch:\n"
+                               "    ";
+               swi->print(llvm::dbgs()));
+    // End the borrow where the original borrow of the subject was ended.
+    // TODO: handle if the switch isn't directly on a borrow?
+    auto beginBorrow = cast<BeginBorrowInst>(swi->getOperand());
+    BorrowingOperand(&beginBorrow->getOperandRef())
+      .visitScopeEndingUses([&](Operand *endScope) -> bool {
+        auto *endScopeInst = endScope->getUser();
+        LLVM_DEBUG(llvm::dbgs() << "       ";
+                   endScopeInst->print(llvm::dbgs()));
+        SILBuilderWithScope endBuilder(endScopeInst);
+        endBuilder.createEndBorrow(getSafeLoc(endScopeInst),
+                                   borrow);
+        return true;
+      });
+  } else {
+    auto *nextInst = op->getUser()->getNextInstruction();
+    LLVM_DEBUG(llvm::dbgs() << "    -- Ending borrow after momentary use at: ";
+               nextInst->print(llvm::dbgs()));
+    SILBuilderWithScope endBuilder(nextInst);
+    endBuilder.createEndBorrow(getSafeLoc(nextInst), borrow);
+  }
+  
+}
+
 void Implementation::rewriteUses(InstructionDeleter *deleter) {
   blocksToUses.setFrozen();
 
@@ -1074,8 +1198,10 @@ void Implementation::rewriteUses(InstructionDeleter *deleter) {
         if (!seenOperands.count(&operand))
           continue;
 
-        auto span = *TypeTreeLeafTypeRange::get(operand.get(), getRootValue());
-
+        SmallVector<TypeTreeLeafTypeRange, 2> spans;
+        TypeTreeLeafTypeRange::get(&operand, getRootValue(), spans);
+        assert(spans.size() == 1);
+        auto span = spans[0];
         // All available values in our span should have the same value
         // associated with it.
         SILValue first = availableValues[span.startEltOffset];
@@ -1129,6 +1255,8 @@ void Implementation::rewriteUses(InstructionDeleter *deleter) {
           }
 
           // Otherwise, we need to insert a borrow.
+          LLVM_DEBUG(llvm::dbgs() << "    Inserting borrow for: ";
+                     inst->print(llvm::dbgs()));
           SILBuilderWithScope borrowBuilder(inst);
           SILValue borrow =
               borrowBuilder.createBeginBorrow(getSafeLoc(inst), first);
@@ -1138,21 +1266,10 @@ void Implementation::rewriteUses(InstructionDeleter *deleter) {
                 borrowBuilder.createGuaranteedMoveOnlyWrapperToCopyableValue(
                     getSafeLoc(inst), innerValue);
           }
+          
+          insertEndBorrowsForNonConsumingUse(&operand, borrow);
 
-          if (auto op = InteriorPointerOperand::get(&operand)) {
-            op.visitBaseValueScopeEndingUses([&](Operand *endScope) -> bool {
-              auto *endScopeInst = endScope->getUser();
-              SILBuilderWithScope endBuilder(endScopeInst);
-              endBuilder.createEndBorrow(getSafeLoc(endScopeInst), borrow);
-              return true;
-            });
-          } else {
-            auto *nextInst = inst->getNextInstruction();
-            SILBuilderWithScope endBuilder(nextInst);
-            endBuilder.createEndBorrow(getSafeLoc(nextInst), borrow);
-          }
-
-          // NOTE: This needs to be /after/the interior pointer operand usage
+          // NOTE: This needs to be /after/ the interior pointer operand usage
           // above so that we can use the end scope of our interior pointer base
           // value.
           // NOTE: oldInst may be nullptr if our operand is a SILArgument
@@ -1245,9 +1362,7 @@ void Implementation::rewriteUses(InstructionDeleter *deleter) {
             }
           }
 
-          auto *nextInst = inst->getNextInstruction();
-          SILBuilderWithScope endBuilder(nextInst);
-          endBuilder.createEndBorrow(getSafeLoc(nextInst), borrow);
+          insertEndBorrowsForNonConsumingUse(&operand, borrow);
           continue;
         }
 
@@ -1333,6 +1448,13 @@ void Implementation::rewriteUses(InstructionDeleter *deleter) {
 }
 
 void Implementation::cleanup() {
+  LLVM_DEBUG(llvm::dbgs()
+             << "Performing BorrowToDestructureTransform::cleanup()!\n");
+  SWIFT_DEFER {
+    LLVM_DEBUG(llvm::dbgs() << "Function after cleanup!\n";
+               getMarkedValue()->getFunction()->dump());
+  };
+
   // Then add destroys for any destructure elements that we inserted that we did
   // not actually completely consume.
   auto *fn = getMarkedValue()->getFunction();
@@ -1472,9 +1594,17 @@ static bool gatherBorrows(SILValue rootValue,
 static bool
 gatherSwitchEnum(SILValue value,
                  SmallVectorImpl<SwitchEnumInst *> &switchEnumWorklist) {
+  auto *fn = value->getFunction();
+  auto &C = fn->getASTContext();
+  // TODO: For borrowing switches, we want to leave the switch as a borrowing
+  // operation. This phase of the pass should become moot once borrowing
+  // switch is on by default.
+  if (C.LangOpts.hasFeature(Feature::BorrowingSwitch)) {
+    return true;
+  }
+
   LLVM_DEBUG(llvm::dbgs() << "Gathering switch enums for value: " << *value);
 
-  auto *fn = value->getFunction();
   StackList<Operand *> useWorklist(fn);
   for (auto *use : value->getUses()) {
     useWorklist.push_back(use);
@@ -1590,8 +1720,9 @@ gatherSwitchEnum(SILValue value,
 //===----------------------------------------------------------------------===//
 
 bool BorrowToDestructureTransform::transform() {
-  LLVM_DEBUG(llvm::dbgs() << "Performing Borrow To Destructure Tranform!\n");
   auto *fn = mmci->getFunction();
+  LLVM_DEBUG(llvm::dbgs() << "Performing Borrow To Destructure Transform!\n";
+             fn->print(llvm::dbgs()));
   StackList<BeginBorrowInst *> borrowWorklist(mmci->getFunction());
 
   // If we failed to gather borrows due to the transform not understanding part
@@ -1793,11 +1924,15 @@ bool BorrowToDestructureTransform::transform() {
   // Then clean up all of our borrows/copies/struct_extracts which no longer
   // have any uses...
   {
+    LLVM_DEBUG(llvm::dbgs() << "Deleting dead instructions!\n");
+
     InstructionDeleter deleter;
     while (!borrowWorklist.empty()) {
       deleter.recursivelyForceDeleteUsersAndFixLifetimes(
           borrowWorklist.pop_back_val());
     }
+    LLVM_DEBUG(llvm::dbgs() << "Function after deletion!\n";
+               impl.getMarkedValue()->getFunction()->dump());
   }
 
   return true;

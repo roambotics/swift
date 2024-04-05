@@ -120,7 +120,7 @@ public:
   };
 
 
-  bool operator==(const TypeRefID &Other) {
+  bool operator==(const TypeRefID &Other) const {
     return Bits == Other.Bits;
   }
 };
@@ -192,6 +192,25 @@ public:
   }
 };
 
+class TypeRefInverseRequirement {
+  llvm::PointerIntPair<const TypeRef *, 3, InvertibleProtocolKind> Storage;
+
+public:
+  TypeRefInverseRequirement(const TypeRef *first, InvertibleProtocolKind proto)
+      : Storage(first, proto) {
+    assert(first);
+  }
+
+  /// Retrieve the first type.
+  const TypeRef *getFirstType() const {
+    return Storage.getPointer();
+  }
+
+  /// Determine the kind of requirement.
+  InvertibleProtocolKind getKind() const { return Storage.getInt(); }
+};
+
+
 // On 32-bit systems this needs more than just pointer alignment to fit the
 // extra bits needed by TypeRefRequirement.
 class alignas(8) TypeRef {
@@ -210,6 +229,9 @@ public:
   /// Build a demangle tree from this TypeRef.
   Demangle::NodePointer getDemangling(Demangle::Demangler &Dem) const;
 
+  /// Build the mangled name from this TypeRef.
+  std::optional<std::string> mangle(Demangle::Demangler &Dem) const;
+
   bool isConcrete() const;
   bool isConcreteAfterSubstitutions(const GenericArgumentMap &Subs) const;
 
@@ -220,7 +242,7 @@ public:
                        const GenericArgumentMap &Subs,
                        bool &DidSubstitute) const;
 
-  llvm::Optional<GenericArgumentMap> getSubstMap() const;
+  std::optional<GenericArgumentMap> getSubstMap() const;
 
   virtual ~TypeRef() = default;
 
@@ -480,13 +502,17 @@ class FunctionTypeRef final : public TypeRef {
   std::vector<Param> Parameters;
   const TypeRef *Result;
   FunctionTypeFlags Flags;
+  ExtendedFunctionTypeFlags ExtFlags;
   FunctionMetadataDifferentiabilityKind DifferentiabilityKind;
   const TypeRef *GlobalActor;
+  const TypeRef *ThrownError;
 
   static TypeRefID Profile(const std::vector<Param> &Parameters,
                            const TypeRef *Result, FunctionTypeFlags Flags,
+                           ExtendedFunctionTypeFlags ExtFlags,
                            FunctionMetadataDifferentiabilityKind DiffKind,
-                           const TypeRef *GlobalActor) {
+                           const TypeRef *GlobalActor,
+                           const TypeRef *ThrownError) {
     TypeRefID ID;
     for (const auto &Param : Parameters) {
       ID.addString(Param.getLabel().str());
@@ -495,8 +521,10 @@ class FunctionTypeRef final : public TypeRef {
     }
     ID.addPointer(Result);
     ID.addInteger(static_cast<uint64_t>(Flags.getIntValue()));
+    ID.addInteger(static_cast<uint64_t>(ExtFlags.getIntValue()));
     ID.addInteger(static_cast<uint64_t>(DiffKind.getIntValue()));
     ID.addPointer(GlobalActor);
+    ID.addPointer(ThrownError);
 
     return ID;
   }
@@ -504,19 +532,23 @@ class FunctionTypeRef final : public TypeRef {
 public:
   FunctionTypeRef(std::vector<Param> Params, const TypeRef *Result,
                   FunctionTypeFlags Flags,
+                  ExtendedFunctionTypeFlags ExtFlags,
                   FunctionMetadataDifferentiabilityKind DiffKind,
-                  const TypeRef *GlobalActor)
+                  const TypeRef *GlobalActor,
+                  const TypeRef *ThrownError)
       : TypeRef(TypeRefKind::Function), Parameters(Params), Result(Result),
-        Flags(Flags), DifferentiabilityKind(DiffKind),
-        GlobalActor(GlobalActor) {}
+        Flags(Flags), ExtFlags(ExtFlags), DifferentiabilityKind(DiffKind),
+        GlobalActor(GlobalActor), ThrownError(ThrownError) {}
 
   template <typename Allocator>
   static const FunctionTypeRef *create(
       Allocator &A, std::vector<Param> Params, const TypeRef *Result,
-      FunctionTypeFlags Flags, FunctionMetadataDifferentiabilityKind DiffKind,
-      const TypeRef *GlobalActor) {
+      FunctionTypeFlags Flags, ExtendedFunctionTypeFlags ExtFlags,
+      FunctionMetadataDifferentiabilityKind DiffKind,
+      const TypeRef *GlobalActor, const TypeRef *ThrownError) {
     FIND_OR_CREATE_TYPEREF(
-        A, FunctionTypeRef, Params, Result, Flags, DiffKind, GlobalActor);
+        A, FunctionTypeRef, Params, Result, Flags, ExtFlags, DiffKind,
+        GlobalActor, ThrownError);
   }
 
   const std::vector<Param> &getParameters() const { return Parameters; };
@@ -529,6 +561,10 @@ public:
     return Flags;
   }
 
+  ExtendedFunctionTypeFlags getExtFlags() const {
+    return ExtFlags;
+  }
+
   FunctionMetadataDifferentiabilityKind getDifferentiabilityKind() const {
     return DifferentiabilityKind;
   }
@@ -537,6 +573,10 @@ public:
     return GlobalActor;
   }
 
+  const TypeRef *getThrownError() const {
+    return ThrownError;
+  }
+  
   static bool classof(const TypeRef *TR) {
     return TR->getKind() == TypeRefKind::Function;
   }

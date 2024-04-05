@@ -289,8 +289,9 @@ private:
 /// scope. Reborrows within nested borrows scopes are already summarized by the
 /// outer borrow scope.
 enum class InnerBorrowKind {
-  Contained, // any borrows are fully contained within this live range
-  Reborrowed // at least one immediately nested borrow is reborrowed
+  Contained,  // any borrows are fully contained within this live range
+  Reborrowed, // at least one immediately nested borrow is reborrowed
+  Escaped     // the end of the borrow scope is indeterminate
 };
 
 inline InnerBorrowKind meet(InnerBorrowKind lhs, InnerBorrowKind rhs) {
@@ -332,7 +333,7 @@ struct LiveRangeSummary {
 /// boundary. The client may later use that information to figure out how to
 /// "extend" a lifetime, for example by inserting copies.
 ///
-/// Consequently, a branch intruction may be marked as a non-lifetime-ending
+/// Consequently, a branch instruction may be marked as a non-lifetime-ending
 /// use, but modeled as as a use point in the predecessor block. This can
 /// confusingly result in liveness that ends *before* value's the lifetime ends:
 ///
@@ -863,13 +864,13 @@ class DiagnosticPrunedLiveness : public SSAPrunedLiveness {
   /// A side array that stores any non lifetime ending uses we find in live out
   /// blocks. This is used to enable our callers to emit errors on non-lifetime
   /// ending uses that extend liveness into a loop body.
-  SmallSetVector<SILInstruction *, 8> *nonLifetimeEndingUsesInLiveOut;
+  llvm::SmallSetVector<SILInstruction *, 8> *nonLifetimeEndingUsesInLiveOut;
 
 public:
   DiagnosticPrunedLiveness(
       SILFunction *function,
       SmallVectorImpl<SILBasicBlock *> *discoveredBlocks = nullptr,
-      SmallSetVector<SILInstruction *, 8> *nonLifetimeEndingUsesInLiveOut =
+      llvm::SmallSetVector<SILInstruction *, 8> *nonLifetimeEndingUsesInLiveOut =
           nullptr)
       : SSAPrunedLiveness(function, discoveredBlocks),
         nonLifetimeEndingUsesInLiveOut(nonLifetimeEndingUsesInLiveOut) {}

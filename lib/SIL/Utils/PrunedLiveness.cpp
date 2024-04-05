@@ -182,8 +182,9 @@ static FunctionTest
           while (arguments.hasUntaken()) {
             boundary.lastUsers.push_back(arguments.takeInstruction());
           }
-          boundary.visitInsertionPoints(
-              [](SILBasicBlock::iterator point) { point->dump(); });
+          boundary.visitInsertionPoints([](SILBasicBlock::iterator point) {
+            point->print(llvm::outs());
+          });
         });
 } // end namespace swift::test
 
@@ -233,16 +234,23 @@ PrunedLiveRange<LivenessWithDefs>::updateForBorrowingOperand(Operand *operand) {
   //
   // Note: Ownership liveness should follow reborrows that are dominated by the
   // ownership definition.
-  if (!BorrowingOperand(operand).visitScopeEndingUses([this](Operand *end) {
-        if (end->getOperandOwnership() == OperandOwnership::Reborrow) {
-          return false;
-        }
-        updateForUse(end->getUser(), /*lifetimeEnding*/ false);
-        return true;
-      })) {
-    return InnerBorrowKind::Reborrowed;
+  auto innerBorrowKind = InnerBorrowKind::Contained;
+  if (!BorrowingOperand(operand).visitScopeEndingUses(
+        [&](Operand *end) {
+          if (end->getOperandOwnership() == OperandOwnership::Reborrow) {
+            innerBorrowKind = InnerBorrowKind::Reborrowed;
+          }
+          updateForUse(end->getUser(), /*lifetimeEnding*/ false);
+          return true;
+        }, [&](Operand *unknownUse) {
+          updateForUse(unknownUse->getUser(), /*lifetimeEnding*/ false);
+          innerBorrowKind = InnerBorrowKind::Escaped;
+          return true;
+        })) {
+    // Handle dead borrows.
+    updateForUse(operand->getUser(), /*lifetimeEnding*/ false);
   }
-  return InnerBorrowKind::Contained;
+  return innerBorrowKind;
 }
 
 template <typename LivenessWithDefs>
@@ -417,11 +425,11 @@ static FunctionTest SSAUseLivenessTest("ssa_use_liveness", [](auto &function,
       Ending,
       NonEnding,
     };
-    auto kind = llvm::StringSwitch<llvm::Optional<Kind>>(kindString)
+    auto kind = llvm::StringSwitch<std::optional<Kind>>(kindString)
                     .Case("non-use", Kind::NonUse)
                     .Case("ending", Kind::Ending)
                     .Case("non-ending", Kind::NonEnding)
-                    .Default(llvm::None);
+                    .Default(std::nullopt);
     if (!kind.has_value()) {
       llvm::errs() << "Unknown kind: " << kindString << "\n";
       llvm::report_fatal_error("Bad user kind.  Value must be one of "

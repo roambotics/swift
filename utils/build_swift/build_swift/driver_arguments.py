@@ -208,7 +208,6 @@ def _apply_default_arguments(args):
         args.test_sourcekitlsp = False
         args.test_skstresstester = False
         args.test_swiftformat = False
-        args.test_swiftevolve = False
         args.test_toolchainbenchmarks = False
         args.test_swiftdocc = False
 
@@ -557,6 +556,12 @@ def create_argument_parser():
            help='the maximum number of parallel dsymutil jobs to use when '
                 'extracting symbols. Tweak with caution, since dsymutil '
                 'is memory intensive.')
+    option('--extra-dsymutil-args', append,
+           type=argparse.ShellSplitType(),
+           help='Pass through extra options to dsymutil when extracting '
+                'symbols, in the form of comma separated options '
+                'like "--verbose,--verify-dwarf=none". Can '
+                'be called multiple times to add multiple such options.')
 
     option('--disable-guaranteed-normal-arguments', store_true,
            help='Disable guaranteed normal arguments')
@@ -572,6 +577,9 @@ def create_argument_parser():
            default='-sv',
            metavar='LITARGS',
            help='lit args to use when testing')
+
+    option('--color-in-tests', toggle_true, default=True,
+           help='Enable color output in lit tests')
 
     option('--coverage-db', store_path,
            help='coverage database to use when prioritizing testing')
@@ -688,9 +696,6 @@ def create_argument_parser():
     option(['--swiftformat'], toggle_true('build_swiftformat'),
            help='build swift-format')
 
-    option(['--swiftevolve'], toggle_true('build_swiftevolve'),
-           help='build the swift-evolve tool')
-
     option(['--swift-driver'], toggle_true('build_swift_driver'),
            help='build swift-driver')
     option(['--swiftdocc'], toggle_true('build_swiftdocc'),
@@ -709,6 +714,9 @@ def create_argument_parser():
     option('--test-sourcekit-lsp-sanitize-all',
            toggle_true('test_sourcekitlsp_sanitize_all'),
            help='run sourcekit-lsp tests under all sanitizers')
+    option('--sourcekit-lsp-lint',
+           toggle_true('sourcekitlsp_lint'),
+           help='verify that sourcekit-lsp Source code is formatted correctly')
     option('--install-swiftsyntax', toggle_true('install_swiftsyntax'),
            help='install SwiftSyntax')
     option('--swiftsyntax-verify-generated-files',
@@ -735,8 +743,6 @@ def create_argument_parser():
            help='install the SourceKit stress tester')
     option(['--install-swift-driver'], toggle_true('install_swift_driver'),
            help='install new Swift driver')
-    option(['--install-swiftevolve'], toggle_true('install_swiftevolve'),
-           help='install SwiftEvolve')
     option(['--install-swiftdocc'], toggle_true('install_swiftdocc'),
            help='install Swift DocC')
     option(['--toolchain-benchmarks'],
@@ -750,6 +756,11 @@ def create_argument_parser():
     option(['--build-minimal-stdlib'], toggle_true('build_minimalstdlib'),
            help='build the \'minimal\' freestanding stdlib variant into a '
                 'separate build directory ')
+    option(['--build-wasm-stdlib'], toggle_true('build_wasmstdlib'),
+           help='build the stdlib for WebAssembly target into a'
+                'separate build directory ')
+    option(['--wasmkit'], toggle_true('build_wasmkit'),
+           help='build WasmKit')
 
     option('--xctest', toggle_true('build_xctest'),
            help='build xctest')
@@ -1088,6 +1099,10 @@ def create_argument_parser():
            help='Include Unicode data in the standard library.'
                 'Note: required for full String functionality')
 
+    option('--build-swift-clang-overlays', toggle_true,
+           default=True,
+           help='Build Swift overlays for the clang builtin modules')
+
     option('--build-swift-remote-mirror', toggle_true,
            default=True,
            help='Build Remote Mirror')
@@ -1241,8 +1256,6 @@ def create_argument_parser():
            help='skip testing the SourceKit Stress tester')
     option('--skip-test-swiftformat', toggle_false('test_swiftformat'),
            help='skip testing swift-format')
-    option('--skip-test-swiftevolve', toggle_false('test_swiftevolve'),
-           help='skip testing SwiftEvolve')
     option('--skip-test-toolchain-benchmarks',
            toggle_false('test_toolchainbenchmarks'),
            help='skip testing toolchain benchmarks')
@@ -1251,6 +1264,8 @@ def create_argument_parser():
            help='skip testing swift_inspect')
     option('--skip-test-swiftdocc', toggle_false('test_swiftdocc'),
            help='skip testing swift-docc')
+    option('--skip-test-wasm-stdlib', toggle_false('test_wasmstdlib'),
+           help='skip testing stdlib for WebAssembly')
 
     # -------------------------------------------------------------------------
     in_group('Build settings specific for LLVM')
@@ -1259,7 +1274,7 @@ def create_argument_parser():
            help='enable building llvm using modules')
 
     option('--llvm-targets-to-build', store,
-           default='X86;ARM;AArch64;PowerPC;SystemZ;Mips;RISCV',
+           default='X86;ARM;AArch64;PowerPC;SystemZ;Mips;RISCV;WebAssembly',
            help='LLVM target generators to build')
 
     option('--llvm-ninja-targets', append,
@@ -1334,6 +1349,10 @@ def create_argument_parser():
            default=True,
            help='Enable experimental Swift distributed actors.')
 
+    option('--enable-experimental-nonescapable-types', toggle_true,
+           default=False,
+           help='Enable experimental NonescapableTypes.')
+
     option('--enable-experimental-string-processing', toggle_true,
            default=True,
            help='Enable experimental Swift string processing.')
@@ -1341,6 +1360,10 @@ def create_argument_parser():
     option('--enable-experimental-observation', toggle_true,
            default=True,
            help='Enable experimental Swift observation.')
+
+    option('--enable-synchronization', toggle_true,
+           default=True,
+           help='Enable Swift Synchronization.')
 
     # -------------------------------------------------------------------------
     in_group('Unsupported options')

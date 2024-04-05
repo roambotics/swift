@@ -262,6 +262,10 @@ enum class FixKind : uint8_t {
   /// is declared was not imported.
   SpecifyObjectLiteralTypeImport,
 
+  /// Type of the element in generic pack couldn't be inferred and has to be
+  /// specified explicitly.
+  SpecifyPackElementType,
+
   /// Allow any type (and not just class or class-constrained type) to
   /// be convertible to AnyObject.
   AllowNonClassTypeToConvertToAnyObject,
@@ -375,6 +379,9 @@ enum class FixKind : uint8_t {
   /// `throws` attribute from the source function.
   DropThrowsAttribute,
 
+  /// Ignore a mismatch in the thrown error type.
+  IgnoreThrownErrorMismatch,
+
   /// Fix conversion from async to sync function by removing explicit
   /// `async` attribute from the source function.
   DropAsyncAttribute,
@@ -392,10 +399,6 @@ enum class FixKind : uint8_t {
   /// Allow argument-to-parameter subtyping even when parameter type
   /// is marked as `inout`.
   AllowConversionThroughInOut,
-
-  /// Ignore either capability (read/write) or type mismatch in conversion
-  /// between two key path types.
-  IgnoreKeyPathContextualMismatch,
 
   /// Ignore a type mismatch between deduced element type and externally
   /// imposed one.
@@ -441,6 +444,9 @@ enum class FixKind : uint8_t {
   /// Allow pack expansion expressions in a context that does not support them.
   AllowInvalidPackExpansion,
 
+  /// Ignore `where` clause in a for-in loop with a pack expansion expression.
+  IgnoreWhereClauseInPackIteration,
+
   /// Allow a pack expansion parameter of N elements to be matched
   /// with a single tuple literal argument of the same arity.
   DestructureTupleToMatchPackExpansionParameter,
@@ -464,6 +470,10 @@ enum class FixKind : uint8_t {
   /// Ignore situations when provided number of generic arguments didn't match
   /// expected number of parameters.
   IgnoreGenericSpecializationArityMismatch,
+
+  /// Ignore situations when key path subscript index gets passed an invalid
+  /// type as an argument (something that is not a key path).
+  IgnoreKeyPathSubscriptIndexMismatch,
 };
 
 class ConstraintFix {
@@ -509,7 +519,7 @@ public:
   }
 
   /// Determine the impact of this fix on the solution score, if any.
-  llvm::Optional<ScoreKind> impact() const;
+  std::optional<ScoreKind> impact() const;
 
   virtual std::string getName() const = 0;
 
@@ -813,9 +823,9 @@ public:
   bool coalesceAndDiagnose(const Solution &solution,
                            ArrayRef<ConstraintFix *> secondaryFixes,
                            bool asNote = false) const override {
-    // If the from type or to type is a placeholer type that corresponds to an
+    // If the from type or to type is a placeholder type that corresponds to an
     // ErrorExpr, the issue has already been diagnosed. There's no need to
-    // produce another diagnostic for the contextual mismatch complainting that
+    // produce another diagnostic for the contextual mismatch complaining that
     // a type is not convertible to a placeholder type.
     if (auto fromPlaceholder = getFromType()->getAs<PlaceholderType>()) {
       if (fromPlaceholder->getOriginator().is<ErrorExpr *>()) {
@@ -1005,7 +1015,6 @@ class DropThrowsAttribute final : public ContextualMismatch {
                       FunctionType *toType, ConstraintLocator *locator)
       : ContextualMismatch(cs, FixKind::DropThrowsAttribute, fromType, toType,
                            locator) {
-    assert(fromType->isThrowing() != toType->isThrowing());
   }
 
 public:
@@ -1023,6 +1032,30 @@ public:
   }
 };
 
+/// This is a contextual mismatch between the thrown error types of two
+/// function types, which could be repaired by fixing one of the types.
+class IgnoreThrownErrorMismatch final : public ContextualMismatch {
+  IgnoreThrownErrorMismatch(ConstraintSystem &cs, Type fromErrorType,
+                            Type toErrorType, ConstraintLocator *locator)
+      : ContextualMismatch(cs, FixKind::IgnoreThrownErrorMismatch,
+                           fromErrorType, toErrorType, locator) {
+    assert(!fromErrorType->isEqual(toErrorType));
+  }
+
+public:
+  std::string getName() const override { return "drop 'throws' attribute"; }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static IgnoreThrownErrorMismatch *create(ConstraintSystem &cs,
+                                           Type fromErrorType,
+                                           Type toErrorType,
+                                           ConstraintLocator *locator);
+
+  static bool classof(const ConstraintFix *fix) {
+    return fix->getKind() == FixKind::IgnoreThrownErrorMismatch;
+  }
+};
 /// This is a contextual mismatch between async and non-async
 /// function types, repair it by dropping `async` attribute.
 class DropAsyncAttribute final : public ContextualMismatch {
@@ -1167,36 +1200,6 @@ private:
   }
 };
 
-/// Detect situations where key path doesn't have capability required
-/// by the context e.g. read-only vs. writable, or either root or value
-/// types are incorrect e.g.
-///
-/// ```swift
-/// struct S { let foo: Int }
-/// let _: WritableKeyPath<S, Int> = \.foo
-/// ```
-///
-/// Here context requires a writable key path but `foo` property is
-/// read-only.
-class KeyPathContextualMismatch final : public ContextualMismatch {
-  KeyPathContextualMismatch(ConstraintSystem &cs, Type lhs, Type rhs,
-                            ConstraintLocator *locator)
-      : ContextualMismatch(cs, FixKind::IgnoreKeyPathContextualMismatch, lhs,
-                           rhs, locator) {}
-
-public:
-  std::string getName() const override {
-    return "fix key path contextual mismatch";
-  }
-
-  static KeyPathContextualMismatch *
-  create(ConstraintSystem &cs, Type lhs, Type rhs, ConstraintLocator *locator);
-
-  static bool classof(const ConstraintFix *fix) {
-    return fix->getKind() == FixKind::IgnoreKeyPathContextualMismatch;
-  }
-};
-
 /// Detect situations when argument of the @autoclosure parameter is itself
 /// marked as @autoclosure and is not applied. Form a fix which suggests a
 /// proper way to forward such arguments, e.g.:
@@ -1336,8 +1339,7 @@ class UseWrappedValue final : public ConstraintFix {
         PropertyWrapper(propertyWrapper), Base(base), Wrapper(wrapper) {}
 
   bool usingProjection() const {
-    auto nameStr = PropertyWrapper->getName().str();
-    return !nameStr.startswith("_");
+    return !PropertyWrapper->getName().hasUnderscoredNaming();
   }
 
 public:
@@ -1374,6 +1376,10 @@ public:
 
   std::string getName() const override {
     return "allow invalid property wrapper type";
+  }
+
+  bool diagnoseForAmbiguity(CommonFixesArray commonFixes) const override {
+    return diagnose(*commonFixes.front().first);
   }
 
   bool diagnose(const Solution &solution, bool asNote = false) const override;
@@ -1648,11 +1654,11 @@ class AllowTupleTypeMismatch final : public ContextualMismatch {
   /// If this is an element mismatch, \c Index is the element index where the
   /// type mismatch occurred. If this is an arity or label mismatch, \c Index
   /// will be \c None.
-  llvm::Optional<unsigned> Index;
+  std::optional<unsigned> Index;
 
   AllowTupleTypeMismatch(ConstraintSystem &cs, Type lhs, Type rhs,
                          ConstraintLocator *locator,
-                         llvm::Optional<unsigned> index)
+                         std::optional<unsigned> index)
       : ContextualMismatch(cs, FixKind::AllowTupleTypeMismatch, lhs, rhs,
                            locator),
         Index(index) {}
@@ -1660,7 +1666,7 @@ class AllowTupleTypeMismatch final : public ContextualMismatch {
 public:
   static AllowTupleTypeMismatch *
   create(ConstraintSystem &cs, Type lhs, Type rhs, ConstraintLocator *locator,
-         llvm::Optional<unsigned> index = llvm::None);
+         std::optional<unsigned> index = std::nullopt);
 
   static bool classof(const ConstraintFix *fix) {
     return fix->getKind() == FixKind::AllowTupleTypeMismatch;
@@ -2227,6 +2233,26 @@ public:
   }
 };
 
+class IgnoreWhereClauseInPackIteration final : public ConstraintFix {
+  IgnoreWhereClauseInPackIteration(ConstraintSystem &cs,
+                                   ConstraintLocator *locator)
+      : ConstraintFix(cs, FixKind::IgnoreWhereClauseInPackIteration, locator) {}
+
+public:
+  std::string getName() const override {
+    return "ignore where clause in pack iteration";
+  }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static IgnoreWhereClauseInPackIteration *create(ConstraintSystem &cs,
+                                                  ConstraintLocator *locator);
+
+  static bool classof(const ConstraintFix *fix) {
+    return fix->getKind() == FixKind::IgnoreWhereClauseInPackIteration;
+  }
+};
+
 class CollectionElementContextualMismatch final
     : public ContextualMismatch,
       private llvm::TrailingObjects<CollectionElementContextualMismatch,
@@ -2713,6 +2739,25 @@ public:
     return fix->getKind() == FixKind::SpecifyObjectLiteralTypeImport;
   }
 };
+
+class SpecifyPackElementType final : public ConstraintFix {
+  SpecifyPackElementType(ConstraintSystem &cs, ConstraintLocator *locator)
+        : ConstraintFix(cs, FixKind::SpecifyPackElementType, locator) {}
+public:
+  std::string getName() const override {
+    return "specify pack element type";
+  }
+
+  bool diagnose(const Solution &solution, bool asNote) const override;
+
+  static SpecifyPackElementType *create(ConstraintSystem &cs,
+                                        ConstraintLocator *locator);
+
+  static bool classof(const ConstraintFix *fix) {
+    return fix->getKind() == FixKind::SpecifyPackElementType;
+  }
+};
+
 
 class AddQualifierToAccessTopLevelName final : public ConstraintFix {
   AddQualifierToAccessTopLevelName(ConstraintSystem &cs,
@@ -3414,40 +3459,6 @@ public:
   }
 };
 
-class AddExplicitExistentialCoercion final : public ConstraintFix {
-  Type ErasedResultType;
-
-  AddExplicitExistentialCoercion(ConstraintSystem &cs, Type erasedResultTy,
-                                 ConstraintLocator *locator,
-                                 FixBehavior fixBehavior)
-      : ConstraintFix(cs, FixKind::AddExplicitExistentialCoercion, locator,
-                      fixBehavior),
-        ErasedResultType(erasedResultTy) {}
-
-public:
-  std::string getName() const override {
-    return "add explicit existential type coercion";
-  }
-
-  bool diagnose(const Solution &solution, bool asNote = false) const override;
-
-  static bool
-  isRequired(ConstraintSystem &cs, Type resultTy,
-             ArrayRef<std::pair<TypeVariableType *, OpenedArchetypeType *>>
-                 openedExistentials,
-             ConstraintLocatorBuilder locator);
-
-  static bool
-  isRequired(ConstraintSystem &cs, Type resultTy,
-             llvm::function_ref<llvm::Optional<Type>(TypeVariableType *)>
-                 findExistentialType,
-             ConstraintLocatorBuilder locator);
-
-  static AddExplicitExistentialCoercion *create(ConstraintSystem &cs,
-                                                Type resultTy,
-                                                ConstraintLocator *locator);
-};
-
 class RenameConflictingPatternVariables final
     : public ConstraintFix,
       private llvm::TrailingObjects<RenameConflictingPatternVariables,
@@ -3743,6 +3754,30 @@ public:
 
   static bool classof(const ConstraintFix *fix) {
     return fix->getKind() == FixKind::IgnoreGenericSpecializationArityMismatch;
+  }
+};
+
+class IgnoreKeyPathSubscriptIndexMismatch final : public ConstraintFix {
+  Type ArgType;
+
+  IgnoreKeyPathSubscriptIndexMismatch(ConstraintSystem &cs, Type argTy,
+                                      ConstraintLocator *locator)
+      : ConstraintFix(cs, FixKind::IgnoreKeyPathSubscriptIndexMismatch,
+                      locator),
+        ArgType(argTy) {}
+
+public:
+  std::string getName() const override {
+    return "ignore invalid key path subscript index";
+  }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static IgnoreKeyPathSubscriptIndexMismatch *
+  create(ConstraintSystem &cs, Type argType, ConstraintLocator *locator);
+
+  static bool classof(const ConstraintFix *fix) {
+    return fix->getKind() == FixKind::IgnoreKeyPathSubscriptIndexMismatch;
   }
 };
 

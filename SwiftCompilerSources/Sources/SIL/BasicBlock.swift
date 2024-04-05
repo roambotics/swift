@@ -14,15 +14,14 @@ import Basic
 import SILBridging
 
 @_semantics("arc.immortal")
-final public class BasicBlock : CustomStringConvertible, HasShortDescription, Equatable {
+final public class BasicBlock : CustomStringConvertible, HasShortDescription, Hashable {
   public var next: BasicBlock? { bridged.getNext().block }
   public var previous: BasicBlock? { bridged.getPrevious().block }
 
   public var parentFunction: Function { bridged.getFunction().function }
 
   public var description: String {
-    let stdString = bridged.getDebugDescription()
-    return String(_cxxString: stdString)
+    return String(taking: bridged.getDebugDescription())
   }
   public var shortDescription: String { name }
 
@@ -54,6 +53,10 @@ final public class BasicBlock : CustomStringConvertible, HasShortDescription, Eq
   
   public var hasSinglePredecessor: Bool { singlePredecessor != nil }
 
+  public var singleSuccessor: BasicBlock? {
+    successors.count == 1 ? successors[0] : nil
+  }
+
   /// The index of the basic block in its function.
   /// This has O(n) complexity. Only use it for debugging
   public var index: Int {
@@ -66,6 +69,10 @@ final public class BasicBlock : CustomStringConvertible, HasShortDescription, Eq
   public var name: String { "bb\(index)" }
 
   public static func == (lhs: BasicBlock, rhs: BasicBlock) -> Bool { lhs === rhs }
+
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(ObjectIdentifier(self))
+  }
 
   public var bridged: BridgedBasicBlock { BridgedBasicBlock(SwiftObject(self)) }
 }

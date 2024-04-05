@@ -36,8 +36,6 @@
 // RUN: cat %t/ClientFixed.swiftinterface | %FileCheck -check-prefix ALIASED %s
 // ALIASED: import Module___libB
 
-// REQUIRES: asserts
-
 // BEGIN empty.swift
 
 // BEGIN libA.swift
@@ -60,22 +58,22 @@ extension ImportedType : SomeProtocol {}
 
 /// Client module
 // BEGIN clientFileA-Swift5.swift
-import libA
+public import libA
 
 @inlinable public func bar() {
   let a = ImportedType()
-  a.implicitlyImportedMethod() // expected-warning {{instance method 'implicitlyImportedMethod()' cannot be used in an '@inlinable' function because 'libB' was not imported by this file; this is an error in Swift 6}}
+  a.implicitlyImportedMethod() // expected-warning {{instance method 'implicitlyImportedMethod()' cannot be used in an '@inlinable' function because 'libB' was not imported by this file; this is an error in the Swift 6 language mode}}
   // expected-note@-1 {{The missing import of module 'libB' will be added implicitly}}
 
   // Expected implicit imports are still fine
   a.localModuleMethod()
 
-  conformanceUse(a) // expected-warning {{cannot use conformance of 'ImportedType' to 'SomeProtocol' here; 'libB' was not imported by this file; this is an error in Swift 6}}
+  conformanceUse(a) // expected-warning {{cannot use conformance of 'ImportedType' to 'SomeProtocol' here; 'libB' was not imported by this file; this is an error in the Swift 6 language mode}}
   // expected-note@-1 {{The missing import of module 'libB' will be added implicitly}}
 }
 
 // BEGIN clientFileA-OldCheck.swift
-import libA
+public import libA
 @_implementationOnly import empty
 
 @inlinable public func bar() {
@@ -85,12 +83,12 @@ import libA
   // Expected implicit imports are still fine
   a.localModuleMethod()
 
-  conformanceUse(a) // expected-warning {{cannot use conformance of 'ImportedType' to 'SomeProtocol' here; 'libB' was not imported by this file; this is an error in Swift 6}}
+  conformanceUse(a) // expected-warning {{cannot use conformance of 'ImportedType' to 'SomeProtocol' here; 'libB' was not imported by this file; this is an error in the Swift 6 language mode}}
   // expected-note@-1 {{The missing import of module 'libB' will be added implicitly}}
 }
 
 // BEGIN clientFileA-Swift6.swift
-import libA
+public import libA
 
 @inlinable public func bar() {
   let a = ImportedType()
@@ -104,7 +102,7 @@ import libA
 
 // BEGIN clientFileB.swift
 @_implementationOnly import libB
-import libA
+public import libA
 extension ImportedType {
     public func localModuleMethod() {}
 }

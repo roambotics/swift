@@ -71,7 +71,7 @@ extension Function {
       var effects = definedGlobalEffects
 
       // Even a `[readnone]` function can read from indirect arguments.
-      if (0..<numArguments).contains(where: {getArgumentConvention(for: $0).isIndirectIn}) {
+      if (0..<numArguments).contains(where: {argumentConventions[$0].isIndirectIn}) {
         effects.memory.read = true
       }
       // Even `[readnone]` and `[readonly]` functions write to indirect results.
@@ -350,10 +350,7 @@ public struct EscapeEffects : CustomStringConvertible, NoReflectionChildren {
     }
 
     public func matches(_ rhsArgIdx: Int, _ rhsPath: SmallProjectionPath) -> Bool {
-      if argumentIndex != rhsArgIdx {
-        return false
-      }
-      return rhsPath.matches(pattern: pathPattern)
+      return argumentIndex == rhsArgIdx && rhsPath.matches(pattern: pathPattern)
     }
 
     public var bodyDescription: String {
