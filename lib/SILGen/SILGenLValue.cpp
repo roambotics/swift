@@ -31,6 +31,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/Consumption.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/MemAccessUtils.h"
@@ -948,6 +949,9 @@ namespace {
                          ManagedValue base) && override {
       // Assert that the optional value is present and return the projected out
       // payload.
+      if (isConsumeAccess(getTypeData().getAccessKind())) {
+        base = base.ensurePlusOne(SGF, loc);
+      }
       return SGF.emitPreconditionOptionalHasValue(loc, base, isImplicitUnwrap);
     }
 
@@ -1150,8 +1154,12 @@ namespace {
       // See if we have a noncopyable address from a project_box or global.
       if (Value.getType().isAddress() && Value.getType().isMoveOnly()) {
         SILValue addr = Value.getValue();
-        auto box = dyn_cast<ProjectBoxInst>(addr);
-        if (box || isa<GlobalAddrInst>(addr) || IsLazyInitializedGlobal) {
+        auto boxProject = addr;
+        if (auto m = dyn_cast<CopyableToMoveOnlyWrapperAddrInst>(boxProject)) {
+          boxProject = m->getOperand();
+        }
+        auto box = dyn_cast<ProjectBoxInst>(boxProject);
+        if (box || isa<GlobalAddrInst>(boxProject) || IsLazyInitializedGlobal) {
           if (Enforcement)
             addr = enterAccessScope(SGF, loc, base, addr, getTypeData(),
                                     getAccessKind(), *Enforcement,
@@ -1224,6 +1232,11 @@ namespace {
         return base;
       }
       auto result = SGF.B.createLoadBorrow(loc, base.getValue());
+      // Mark the load_borrow as unchecked. We can't stop the source code from
+      // trying to mutate or consume the same lvalue during this borrow, so
+      // we don't want verifiers to trip before the move checker gets a chance
+      // to diagnose these situations.
+      result->setUnchecked(true);
       return SGF.emitFormalEvaluationManagedBorrowedRValueWithCleanup(loc,
          base.getValue(), result);
     }
@@ -2368,7 +2381,7 @@ namespace {
       }
 
       auto subs = SubstitutionMap::get(sig, replacementTypes,
-                  LookUpConformanceInModule{SGF.getModule().getSwiftModule()});
+                  LookUpConformanceInModule());
 
       base = makeBaseConsumableMaterializedRValue(SGF, loc, base);
 
@@ -2393,9 +2406,7 @@ namespace {
       }
 
       auto keyPathTy = keyPathValue.getType().castTo<BoundGenericType>();
-      auto subs = keyPathTy->getContextSubstitutionMap(
-          keyPathTy->getDecl()->getParentModule(),
-          keyPathTy->getDecl());
+      auto subs = keyPathTy->getContextSubstitutionMap();
 
       auto origType = AbstractionPattern::getOpaque();
       auto loweredTy = SGF.getLoweredType(origType, value.getSubstRValueType());
@@ -2469,9 +2480,7 @@ namespace {
       auto projectFnType = projectFn->getLoweredFunctionType();
 
       auto keyPathTy = keyPathValue.getType().castTo<BoundGenericType>();
-      auto subs = keyPathTy->getContextSubstitutionMap(
-          keyPathTy->getDecl()->getParentModule(),
-          keyPathTy->getDecl());
+      auto subs = keyPathTy->getContextSubstitutionMap();
 
       auto substFnType = projectFnType->substGenericArgs(
           SGF.SGM.M, subs, SGF.getTypeExpansionContext());
@@ -3034,9 +3043,6 @@ public:
         case ParamSpecifier::LegacyOwned:
         case ParamSpecifier::ImplicitlyCopyableConsuming:
           return false;
-        }
-        if (pd->hasResultDependsOn()) {
-          return true;
         }
       }
     }
@@ -4351,6 +4357,16 @@ getOptionalObjectTypeData(SILGenFunction &SGF, SGFAccessKind accessKind,
 LValue SILGenLValue::visitForceValueExpr(ForceValueExpr *e,
                                          SGFAccessKind accessKind,
                                          LValueOptions options) {
+  // Since Sema doesn't reason about borrows, a borrowed force expr
+  // might end up type checked with the load inside of the force.
+  auto subExpr = e->getSubExpr();
+  if (auto load = dyn_cast<LoadExpr>(subExpr)) {
+    assert((isBorrowAccess(accessKind) || isConsumeAccess(accessKind))
+           && "should only see a (force_value (load)) lvalue as part of a "
+              "borrow or consume");
+    subExpr = load->getSubExpr();
+  }
+                                         
   // Like BindOptional, this is a read even if we only write to the result.
   // (But it's unnecessary to use a force this way!)
   LValue lv = visitRec(e->getSubExpr(),
@@ -4394,6 +4410,13 @@ LValue SILGenLValue::visitBindOptionalExpr(BindOptionalExpr *e,
     
     if (optBase.getType().isMoveOnly()) {
       if (optBase.getType().isAddress()) {
+        // Strip the move-only wrapper if any.
+        if (optBase.getType().isMoveOnlyWrapped()) {
+          optBase = ManagedValue::forBorrowedAddressRValue(
+            SGF.B.createMoveOnlyWrapperToCopyableAddr(e,
+                                                      optBase.getValue()));
+        }
+      
         optBase = enterAccessScope(SGF, e, ManagedValue(),
                                    optBase, optTypeData,
                                    baseAccessKind,
@@ -4406,13 +4429,26 @@ LValue SILGenLValue::visitBindOptionalExpr(BindOptionalExpr *e,
       } else {
         optBase = SGF.B.createFormalAccessBeginBorrow(e, optBase, IsNotLexical,
                                                       BeginBorrowInst::IsFixed);
+        // Strip the move-only wrapper if any.
+        if (optBase.getType().isMoveOnlyWrapped()) {
+          optBase
+            = SGF.B.createGuaranteedMoveOnlyWrapperToCopyableValue(e, optBase);
+        }
       }
     }
   } else {
     optBase = SGF.emitAddressOfLValue(e, std::move(optLV));
+    bool isMoveOnly = optBase.getType().isMoveOnly();
+    
+    // Strip the move-only wrapper if any.
+    if (optBase.getType().isMoveOnlyWrapped()) {
+      optBase = ManagedValue::forLValue(
+        SGF.B.createMoveOnlyWrapperToCopyableAddr(e,
+                                                  optBase.getValue()));
+    }
     
     if (isConsumeAccess(baseAccessKind)) {
-      if (optBase.getType().isMoveOnly()) {
+      if (isMoveOnly) {
         optBase = enterAccessScope(SGF, e, ManagedValue(),
                                    optBase, optTypeData,
                                    baseAccessKind,
@@ -4548,8 +4584,7 @@ LValue SILGenFunction::emitPropertyLValue(SILLocation loc, ManagedValue base,
   LValue lv;
 
   auto baseType = base.getType().getASTType();
-  auto subMap = baseType->getContextSubstitutionMap(
-      SGM.M.getSwiftModule(), ivar->getDeclContext());
+  auto subMap = baseType->getContextSubstitutionMap(ivar->getDeclContext());
 
   AccessStrategy strategy =
     ivar->getAccessStrategy(semantics,

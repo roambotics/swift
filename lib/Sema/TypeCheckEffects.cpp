@@ -28,6 +28,7 @@
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 
 using namespace swift;
 
@@ -508,6 +509,10 @@ template <class Impl>
 class EffectsHandlingWalker : public ASTWalker {
   Impl &asImpl() { return *static_cast<Impl*>(this); }
 public:
+  LazyInitializerWalking getLazyInitializerWalkingBehavior() override {
+    return LazyInitializerWalking::InAccessor;
+  }
+
   /// Only look at the expansions for effects checking.
   MacroWalking getMacroWalkingBehavior() const override {
     return MacroWalking::Expansion;
@@ -939,7 +944,7 @@ public:
                                   ConditionalEffectKind conditionalKind,
                                   PotentialEffectReason reason) {
     Classification result;
-    if (!thrownError || isNeverThrownError(thrownError))
+    if (isNeverThrownError(thrownError))
       return result;
 
     assert(!thrownError->hasError());
@@ -1183,6 +1188,13 @@ public:
     return Classification();
   }
 
+  bool isContextPreconcurrency() const {
+    if (!DC)
+      return false;
+
+    return getActorIsolationOfContext(DC).preconcurrency();
+  }
+
   /// Whether a missing 'await' error on accessing an async var should be
   /// downgraded to a warning.
   ///
@@ -1190,7 +1202,7 @@ public:
   /// global or static 'let' variables, which was previously accepted in
   /// compiler versions before 5.10, or for declarations marked preconcurrency.
   bool downgradeAsyncAccessToWarning(Decl *decl) {
-    if (decl->preconcurrency()) {
+    if (decl->preconcurrency() || isContextPreconcurrency()) {
       return true;
     }
 
@@ -1244,6 +1256,7 @@ public:
     Classification classification;
     PotentialEffectReason reason = PotentialEffectReason::forPropertyAccess();
     ConcreteDeclRef declRef = E->getDeclRef();
+
     if (auto getter = getEffectfulGetOnlyAccessor(declRef)) {
       reason = getKindOfEffectfulProp(declRef);
       classification = Classification::forDeclRef(
@@ -1276,7 +1289,7 @@ public:
     thrownValue = removeErasureToExistentialError(thrownValue);
 
     Type thrownType = thrownValue->getType();
-    if (!thrownType)
+    if (!thrownType || thrownType->hasError())
       return Classification::forInvalidCode();
 
     // FIXME: Add a potential effect reason for a throw site.
@@ -1339,7 +1352,8 @@ public:
 
     // Downgrade missing 'await' errors for preconcurrency references.
     result.setDowngradeToWarning(
-        result.hasAsync() && fnRef.isPreconcurrency());
+        result.hasAsync() &&
+        (fnRef.isPreconcurrency() || isContextPreconcurrency()));
 
     auto classifyApplyEffect = [&](EffectKind kind) {
       if (!fnType->hasEffect(kind) &&
@@ -1382,7 +1396,7 @@ public:
             isRethrowLikeTypedThrows(fnRef.getFunction())) {
           // If we are in a rethrowing context and the function we're referring
           // to is a rethrow-like function using typed throws or we are
-          // calling the next() or next(_:) of an async iterator,
+          // calling the next() or next(isolation:) of an async iterator,
           // then look at all of the closure arguments.
           LLVM_FALLTHROUGH;
         } else {
@@ -2010,7 +2024,7 @@ private:
   /// Given the type of an argument, try to determine if it contains
   /// a throws/async function in a way that is permitted to cause a
   /// rethrows/reasync function to throw/async.
-  static Classification 
+  static Classification
   classifyArgumentByType(Type paramType, SubstitutionMap subs,
                          ConditionalEffectKind conditional,
                          PotentialEffectReason reason, EffectKind kind) {
@@ -2076,6 +2090,9 @@ public:
     /// The initializer for a global variable.
     GlobalVarInitializer,
 
+    /// The initializer for a `lazy` variable.
+    LazyVarInitializer,
+
     /// The initializer for an enum element.
     EnumElementInitializer,
 
@@ -2091,8 +2108,12 @@ public:
 
 private:
   static Context getContextForPatternBinding(PatternBindingDecl *pbd) {
+    auto *var = pbd->getSingleVar();
+
     if (!pbd->isStatic() && pbd->getDeclContext()->isTypeContext()) {
       return Context(Kind::IVarInitializer, pbd->getDeclContext());
+    } else if (var && var->getAttrs().hasAttribute<LazyAttr>()) {
+      return Context(Kind::LazyVarInitializer, pbd->getDeclContext());
     } else {
       return Context(Kind::GlobalVarInitializer, pbd->getDeclContext());
     }
@@ -2510,6 +2531,7 @@ public:
 
     case Kind::EnumElementInitializer:
     case Kind::GlobalVarInitializer:
+    case Kind::LazyVarInitializer:
     case Kind::IVarInitializer:
     case Kind::DefaultArgument:
     case Kind::PropertyWrapper:
@@ -2546,6 +2568,7 @@ public:
 
     case Kind::EnumElementInitializer:
     case Kind::GlobalVarInitializer:
+    case Kind::LazyVarInitializer:
     case Kind::IVarInitializer:
     case Kind::DefaultArgument:
     case Kind::PropertyWrapper:
@@ -2572,6 +2595,7 @@ public:
 
     case Kind::EnumElementInitializer:
     case Kind::GlobalVarInitializer:
+    case Kind::LazyVarInitializer:
     case Kind::IVarInitializer:
     case Kind::DefaultArgument:
     case Kind::PropertyWrapper:
@@ -2655,12 +2679,20 @@ public:
   }
 
   /// providing a \c kind helps tailor the emitted message.
-  void
-  diagnoseUnhandledAsyncSite(DiagnosticEngine &Diags, ASTNode node,
+  void diagnoseUnhandledAsyncSite(DiagnosticEngine &Diags, ASTNode node,
                              std::optional<PotentialEffectReason> maybeReason,
                              bool forAwait = false) {
-    if (node.isImplicit())
+    if (node.isImplicit()) {
+      // The reason we return early on implicit nodes is that sometimes we
+      // inject implicit closures, e.g. in 'async let' and we'd end up
+      // "double reporting" some errors, with no great way to make sure the
+      // "more specific diagnostic" is emitted. So instead, we avoid emitting
+      // about implicit code.
+      //
+      // Some synthesized code, like macros, are NOT marked implicit, so we will
+      // report about errors in them properly.
       return;
+    }
 
     switch (getKind()) {
     case Kind::PotentiallyHandled: {
@@ -2673,6 +2705,7 @@ public:
 
     case Kind::EnumElementInitializer:
     case Kind::GlobalVarInitializer:
+    case Kind::LazyVarInitializer:
     case Kind::IVarInitializer:
     case Kind::DefaultArgument:
     case Kind::PropertyWrapper:
@@ -2683,6 +2716,7 @@ public:
       return;
     }
   }
+
 };
 
 /// A class to walk over a local context and validate the correctness
@@ -2715,13 +2749,13 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
 
       /// Do we have a throw site using 'try' in this context?
       HasTryThrowSite = 0x10,
-      
+
       /// Are we in the context of an 'await'?
       IsAsyncCovered = 0x20,
-      
+
       /// Do we have any calls to 'async' functions in this context?
       HasAnyAsyncSite = 0x40,
-      
+
       /// Do we have any 'await's in this context?
       HasAnyAwait = 0x80,
 
@@ -2801,7 +2835,7 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
 
   static bool isEffectAnchor(Expr *e) {
     return isa<AbstractClosureExpr>(e) || isa<DiscardAssignmentExpr>(e) ||
-           isa<AssignExpr>(e);
+           isa<AssignExpr>(e) || (isa<DeclRefExpr>(e) && e->isImplicit());
   }
 
   static bool isAnchorTooEarly(Expr *e) {
@@ -3002,9 +3036,24 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
   Type getCaughtErrorTypeAt(SourceLoc loc) {
     auto dc = CurContext.getDeclContext();
     auto module = dc->getParentModule();
+
+    // Autoclosures can't be found via ASTScope lookup.
+    if (CurContext.isAutoClosure()) {
+      auto *closure = dyn_cast<AutoClosureExpr>(CurContext.getDeclContext());
+      if (auto type = closure->getEffectiveThrownType())
+        return *type;
+
+      // Otherwise, the closure does not throw.
+      return Ctx.getNeverType();
+    }
+
     if (CatchNode catchNode = ASTScope::lookupCatchNode(module, loc)) {
       if (auto caughtType = catchNode.getThrownErrorTypeInContext(Ctx))
         return *caughtType;
+
+      // If a catch node returns null for its thrown error type, we're
+      // in a non-throwing context.
+      return Ctx.getNeverType();
     }
 
     // Fall back to the error existential.
@@ -3285,7 +3334,7 @@ private:
           CEC.Flags.set(ContextFlags::HasAnyThrowSite);
         return Action::Continue(E);
       }
-      
+
       PostWalkResult<Stmt *> walkToStmtPost(Stmt *S) override {
         if (isa<ThrowStmt>(S))
           CEC.Flags.set(ContextFlags::HasAnyThrowSite);
@@ -3297,7 +3346,7 @@ private:
     for (auto &clause : ICD->getClauses()) {
       // Active clauses are handled by the normal AST walk.
       if (clause.isActive) continue;
-      
+
       for (auto elt : clause.Elements)
         elt.walk(ConservativeThrowChecker(*this));
     }
@@ -3581,19 +3630,35 @@ private:
     Ctx.Diags.diagnose(E->getAwaitLoc(), diag::no_async_in_await);
   }
 
+  std::pair<SourceLoc, std::string>
+  getFixItForUncoveredAsyncSite(const Expr *anchor) const {
+    SourceLoc awaitInsertLoc = anchor->getStartLoc();
+    std::string insertText = "await ";
+    if (auto *tryExpr = dyn_cast<AnyTryExpr>(anchor))
+      awaitInsertLoc = tryExpr->getSubExpr()->getStartLoc();
+    else if (auto *autoClosure = dyn_cast<AutoClosureExpr>(anchor)) {
+      if (auto *tryExpr =
+              dyn_cast<AnyTryExpr>(autoClosure->getSingleExpressionBody()))
+        awaitInsertLoc = tryExpr->getSubExpr()->getStartLoc();
+      // Supply a tailored fixIt including the identifier if we are
+      // looking at a shorthand optional binding.
+    } else if (anchor->isImplicit()) {
+      if (auto declRef = dyn_cast<DeclRefExpr>(anchor))
+        if (auto var = dyn_cast_or_null<VarDecl>(declRef->getDecl())) {
+          insertText = " = await " + var->getNameStr().str();
+          awaitInsertLoc = Lexer::getLocForEndOfToken(Ctx.Diags.SourceMgr,
+                                                       anchor->getStartLoc());
+        }
+    }
+    return std::make_pair(awaitInsertLoc, insertText);
+  }
+
   void diagnoseUncoveredAsyncSite(const Expr *anchor) const {
     auto asyncPointIter = uncoveredAsync.find(anchor);
     if (asyncPointIter == uncoveredAsync.end())
       return;
-    const std::vector<DiagnosticInfo> &errors = asyncPointIter->getSecond();
-    SourceLoc awaitInsertLoc = anchor->getStartLoc();
-    if (const AnyTryExpr *tryExpr = dyn_cast<AnyTryExpr>(anchor))
-      awaitInsertLoc = tryExpr->getSubExpr()->getStartLoc();
-    else if (const AutoClosureExpr *autoClosure = dyn_cast<AutoClosureExpr>(anchor)) {
-      if (const AnyTryExpr *tryExpr = dyn_cast<AnyTryExpr>(autoClosure->getSingleExpressionBody()))
-        awaitInsertLoc = tryExpr->getSubExpr()->getStartLoc();
-    }
-
+    const auto &errors = asyncPointIter->getSecond();
+    const auto &[loc, insertText] = getFixItForUncoveredAsyncSite(anchor);
     bool downgradeToWarning = llvm::all_of(errors,
         [&](DiagnosticInfo diag) -> bool {
           return diag.downgradeToWarning;
@@ -3601,7 +3666,7 @@ private:
 
     Ctx.Diags.diagnose(anchor->getStartLoc(), diag::async_expr_without_await)
       .warnUntilSwiftVersionIf(downgradeToWarning, 6)
-      .fixItInsert(awaitInsertLoc, "await ")
+      .fixItInsert(loc, insertText)
       .highlight(anchor->getSourceRange());
 
     for (const DiagnosticInfo &diag: errors) {
@@ -3656,8 +3721,15 @@ private:
            // callee is isolated to an actor.
            auto callee = call->getCalledValue(/*skipFunctionConversions=*/true);
            if (callee) {
-             Ctx.Diags.diagnose(diag.expr.getStartLoc(), diag::actor_isolated_sync_func,
+             auto calleeIsolation = getInferredActorIsolation(callee);
+             Ctx.Diags.diagnose(diag.expr.getStartLoc(),
+                                diag::actor_isolated_sync_func,
                                 callee);
+             if (calleeIsolation.source.isInferred()) {
+               callee->diagnose(diag::actor_isolation_source,
+                                calleeIsolation.isolation,
+                                calleeIsolation.source);
+             }
            } else {
              Ctx.Diags.diagnose(
                  diag.expr.getStartLoc(), diag::actor_isolated_sync_func_value,

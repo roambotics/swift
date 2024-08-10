@@ -28,6 +28,7 @@
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/TypeMemberVisitor.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/IRGen/Linking.h"
@@ -780,6 +781,8 @@ static llvm::Value *stackPromote(IRGenFunction &IGF,
     return nullptr;
   if (!FieldLayout.isFixedLayout())
     return nullptr;
+  if (!FieldLayout.isFixedSize())
+    return nullptr;
 
   // Calculate the total size needed.
   // The first part is the size of the class itself.
@@ -1138,12 +1141,13 @@ namespace {
       return pair.second;
     }
 
-    std::optional<StringRef> getObjCImplCategoryName() const {
-      if (!TheExtension || !TheExtension->isObjCImplementation())
+    std::optional<StringRef> getCustomCategoryName() const {
+      if (!TheExtension)
         return std::nullopt;
-      if (auto ident = TheExtension->getCategoryNameForObjCImplementation()) {
-        assert(!ident->empty());
-        return ident->str();
+      assert(!TheExtension->hasClangNode());
+      auto ident = TheExtension->getObjCCategoryName();
+      if (!ident.empty()) {
+        return ident.str();
       }
       return std::nullopt;
     }
@@ -1397,6 +1401,12 @@ namespace {
       }
 
       auto dataPtr = emitROData(ForMetaClass, DoesNotHaveUpdateCallback);
+
+      // Record the ro-data globals if this is a pre-specialized class.
+      if (specializedGenericType) {
+        IGM.addGenericROData(dataPtr);
+      }
+
       dataPtr = llvm::ConstantExpr::getPtrToInt(dataPtr, IGM.IntPtrTy);
 
       llvm::Constant *fields[] = {
@@ -1425,8 +1435,8 @@ namespace {
     void buildCategoryName(SmallVectorImpl<char> &s) {
       llvm::raw_svector_ostream os(s);
 
-      if (auto implementationCategoryName = getObjCImplCategoryName()) {
-        os << *implementationCategoryName;
+      if (auto customCategoryName = getCustomCategoryName()) {
+        os << *customCategoryName;
         return;
       }
 
@@ -2448,8 +2458,8 @@ namespace {
         os << "@";
         TheExtension->getLoc().print(os, IGM.Context.SourceMgr);
       }
-      if (auto name = getObjCImplCategoryName()) {
-        os << " objc_impl_category_name=" << *name;
+      if (auto name = getCustomCategoryName()) {
+        os << " custom_category_name=" << *name;
       }
       
       if (HasNonTrivialConstructor)
@@ -2561,12 +2571,27 @@ static llvm::Function *emitObjCMetadataUpdateFunction(IRGenModule &IGM,
   Explosion params = IGF.collectParameters();
   (void) params.claimAll();
 
-  // Just directly call our metadata accessor. This should actually
-  // return the same metadata; the Objective-C runtime enforces this.
-  auto type = D->getDeclaredType()->getCanonicalType();
-  auto *metadata = IGF.emitTypeMetadataRef(type,
-                                           MetadataState::Complete)
-    .getMetadata();
+  llvm::Value *metadata;
+  if (D->getObjCImplementationDecl()) {
+    // This is an @objc @implementation class, so it has no metadata completion
+    // function. We must do the completion function's work here, taking care to
+    // fetch the address of the ObjC class without going through either runtime.
+    metadata = IGM.getAddrOfObjCClass(D, NotForDefinition);
+    auto loweredTy = IGM.getLoweredType(D->getDeclaredTypeInContext());
+
+    IGF.emitInitializeFieldOffsetVector(loweredTy, metadata,
+                                        /*isVWTMutable=*/false,
+                                        /*collector=*/nullptr);
+  } else {
+    // Just call our metadata accessor, which will cause the Swift runtime to
+    // call the metadata completion function if there is one. This should
+    // actually return the same metadata; the Objective-C runtime enforces this.
+    auto type = D->getDeclaredType()->getCanonicalType();
+    metadata = IGF.emitTypeMetadataRef(type,
+                                       MetadataState::Complete)
+      .getMetadata();
+  }
+
   IGF.Builder.CreateRet(
     IGF.Builder.CreateBitCast(metadata,
                               IGM.ObjCClassPtrTy));
@@ -2665,7 +2690,14 @@ static llvm::Constant *doEmitClassPrivateData(
   }
 
   // Then build the class RO-data.
-  return builder.emitROData(ForClass, hasUpdater);
+  auto res = builder.emitROData(ForClass, hasUpdater);
+
+  // Record the ro-data globals if this is a pre-specialized class.
+  if (classUnion.isa<std::pair<ClassDecl*, CanType>>()) {
+    IGM.addGenericROData(res);
+  }
+
+  return res;
 }
 
 llvm::Constant *irgen::emitSpecializedGenericClassPrivateData(

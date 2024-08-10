@@ -19,6 +19,7 @@
 #include "IRGenModule.h"
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/SIL/SILGlobalVariable.h"
 #include "swift/SIL/FormalLinkage.h"
@@ -642,6 +643,9 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
     return SILLinkage::Shared;
 
   case Kind::TypeMetadata: {
+    if (isForcedShared())
+      return SILLinkage::Shared;
+
     auto *nominal = getType().getAnyNominal();
     switch (getMetadataAddress()) {
     case TypeMetadataAddress::FullMetadata:
@@ -1298,6 +1302,18 @@ bool LinkEntity::isText() const {
   case Kind::AccessibleFunctionRecord:
     return false;
   }
+}
+
+bool LinkEntity::isDistributedThunk() const {
+  if (!hasDecl())
+    return false;
+
+  auto value = getDecl();
+  if (auto afd = dyn_cast<AbstractFunctionDecl>(value)) {
+    return afd->isDistributedThunk();
+  }
+
+  return false;
 }
 
 bool LinkEntity::isWeakImported(ModuleDecl *module) const {

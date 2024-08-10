@@ -135,7 +135,7 @@ bool SourceKit::CodeCompletion::addCustomCompletions(
     auto *contextFreeResult =
         ContextFreeCodeCompletionResult::createPatternOrBuiltInOperatorResult(
             sink.swiftSink, CodeCompletionResultKind::Pattern, completionString,
-            CodeCompletionOperatorKind::None, /*IsAsync=*/false,
+            CodeCompletionOperatorKind::None,
             /*BriefDocComment=*/"", CodeCompletionResultType::unknown(),
             ContextFreeNotRecommendedReason::None,
             CodeCompletionDiagnosticSeverity::None, /*DiagnosticMessage=*/"");
@@ -175,6 +175,7 @@ bool SourceKit::CodeCompletion::addCustomCompletions(
         addCompletion(custom);
       }
       break;
+    case CompletionKind::TypePossibleFunctionParamBeginning:
     case CompletionKind::TypeDeclResultBeginning:
     case CompletionKind::TypeBeginning:
     case CompletionKind::TypeSimpleOrComposition:
@@ -452,6 +453,7 @@ void CodeCompletionOrganizer::Impl::addCompletionsWithFilter(
   if (filterText.empty()) {
     bool hideLowPriority =
         options.hideLowPriority &&
+        completionKind != CompletionKind::TypePossibleFunctionParamBeginning &&
         completionKind != CompletionKind::TypeDeclResultBeginning &&
         completionKind != CompletionKind::TypeBeginning &&
         completionKind != CompletionKind::TypeSimpleOrComposition &&
@@ -1156,7 +1158,7 @@ Completion *CompletionBuilder::finish() {
             contextFreeBase.getKind(),
             contextFreeBase.getOpaqueAssociatedKind(), opKind,
             contextFreeBase.getMacroRoles(), contextFreeBase.isSystem(),
-            contextFreeBase.isAsync(), contextFreeBase.hasAsyncAlternative(),
+            contextFreeBase.hasAsyncAlternative(),
             newCompletionString, contextFreeBase.getModuleName(),
             contextFreeBase.getBriefDocComment(),
             contextFreeBase.getAssociatedUSRs(),

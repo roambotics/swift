@@ -14,6 +14,7 @@
 
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/FrozenMultiMap.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/SIL/BasicBlockBits.h"
@@ -174,7 +175,9 @@ struct MoveOnlyObjectCheckerPImpl {
       : fn(fn), allocator(allocator), diagnosticEmitter(diagnosticEmitter),
         moveIntroducersToProcess(moveIntroducersToProcess) {}
 
-  void check(DominanceInfo *domTree, PostOrderAnalysis *poa);
+  void check(DominanceInfo *domTree,
+             DeadEndBlocksAnalysis *deadEndBlocksAnalysis,
+             PostOrderAnalysis *poa);
 
   bool convertBorrowExtractsToOwnedDestructures(
       MarkUnresolvedNonCopyableValueInst *mmci, DominanceInfo *domTree,
@@ -330,8 +333,9 @@ bool MoveOnlyObjectCheckerPImpl::checkForSameInstMultipleUseErrors(
 //                          MARK: Main PImpl Routine
 //===----------------------------------------------------------------------===//
 
-void MoveOnlyObjectCheckerPImpl::check(DominanceInfo *domTree,
-                                       PostOrderAnalysis *poa) {
+void MoveOnlyObjectCheckerPImpl::check(
+    DominanceInfo *domTree, DeadEndBlocksAnalysis *deadEndBlocksAnalysis,
+    PostOrderAnalysis *poa) {
   auto callbacks =
       InstModCallbacks().onDelete([&](SILInstruction *instToDelete) {
         if (auto *mvi =
@@ -340,7 +344,7 @@ void MoveOnlyObjectCheckerPImpl::check(DominanceInfo *domTree,
         instToDelete->eraseFromParent();
       });
   InstructionDeleter deleter(std::move(callbacks));
-  OSSACanonicalizer canonicalizer(fn, domTree, deleter);
+  OSSACanonicalizer canonicalizer(fn, domTree, deadEndBlocksAnalysis, deleter);
   diagnosticEmitter.initCanonicalizer(&canonicalizer);
 
   unsigned initialDiagCount = diagnosticEmitter.getDiagnosticCount();
@@ -560,6 +564,6 @@ bool MoveOnlyObjectChecker::check(
          "Should only call this with actual insts to check?!");
   MoveOnlyObjectCheckerPImpl checker(instsToCheck[0]->getFunction(), allocator,
                                      diagnosticEmitter, instsToCheck);
-  checker.check(domTree, poa);
+  checker.check(domTree, deadEndBlocksAnalysis, poa);
   return checker.changed;
 }

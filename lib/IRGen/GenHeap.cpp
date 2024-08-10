@@ -23,6 +23,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Intrinsics.h"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/ABI/MetadataValues.h"
 #include "swift/AST/ASTContext.h"
@@ -82,7 +83,7 @@ namespace {
     } \
     void initializeWithTake(IRGenFunction &IGF, Address destAddr, \
                             Address srcAddr, SILType T, \
-                            bool isOutlined) const override { \
+                            bool isOutlined, bool zeroizeIfSensitive) const override { \
       IGF.emit##Nativeness##Name##TakeInit(destAddr, srcAddr); \
     } \
     void assignWithCopy(IRGenFunction &IGF, Address destAddr, Address srcAddr, \
@@ -1276,7 +1277,7 @@ llvm::Constant *IRGenModule::getFixLifetimeFn() {
                                          llvm::GlobalValue::PrivateLinkage,
                                          "__swift_fixLifetime",
                                          &Module);
-  assert(fixLifetime->getName().equals("__swift_fixLifetime")
+  assert(fixLifetime->getName() == "__swift_fixLifetime"
          && "fixLifetime symbol name got mangled?!");
   // Don't inline the function, so it stays as a signal to the ARC passes.
   // The ARC passes will remove references to the function when they're

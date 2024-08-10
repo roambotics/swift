@@ -107,6 +107,9 @@ typedef uintptr_t SwiftUInt;
 #define BRIDGING_WRAPPER_NULLABLE(Node, Name) \
   BRIDGING_WRAPPER_IMPL(Node, Nullable##Name, _Nullable)
 
+void assertFail(const char * _Nonnull msg, const char * _Nonnull file,
+                SwiftUInt line, const char * _Nonnull function);
+
 //===----------------------------------------------------------------------===//
 // MARK: ArrayRef
 //===----------------------------------------------------------------------===//
@@ -183,14 +186,10 @@ enum ENUM_EXTENSIBILITY_ATTR(open) BridgedFeature {
 };
 
 //===----------------------------------------------------------------------===//
-// MARK: OStream
-//===----------------------------------------------------------------------===//
-
-BRIDGING_WRAPPER_NONNULL(llvm::raw_ostream, OStream)
-
-//===----------------------------------------------------------------------===//
 // MARK: StringRef
 //===----------------------------------------------------------------------===//
+
+class BridgedOStream;
 
 class BridgedStringRef {
   const char *_Nullable Data;
@@ -246,6 +245,39 @@ BRIDGED_INLINE SwiftInt BridgedOwnedString_count(BridgedOwnedString str);
 
 SWIFT_NAME("getter:BridgedOwnedString.isEmpty(self:)")
 BRIDGED_INLINE bool BridgedOwnedString_empty(BridgedOwnedString str);
+
+//===----------------------------------------------------------------------===//
+// MARK: OStream
+//===----------------------------------------------------------------------===//
+
+class BridgedOStream {
+  llvm::raw_ostream * _Nonnull os;
+
+public:
+  SWIFT_UNAVAILABLE("Use init(raw:) instead")
+  BridgedOStream(llvm::raw_ostream * _Nonnull os) : os(os) {}
+
+  SWIFT_UNAVAILABLE("Use '.raw' instead")
+  llvm::raw_ostream * _Nonnull unbridged() const { return os; }
+
+  void write(BridgedStringRef string) const;
+
+  void newLine() const;
+
+  void flush() const;
+};
+
+SWIFT_NAME("getter:BridgedOStream.raw(self:)")
+inline void * _Nonnull BridgedOStream_getRaw(BridgedOStream bridged) {
+  return bridged.unbridged();
+}
+
+SWIFT_NAME("BridgedOStream.init(raw:)")
+inline BridgedOStream BridgedOStream_fromRaw(void * _Nonnull os) {
+  return static_cast<llvm::raw_ostream *>(os);
+}
+
+BridgedOStream Bridged_dbgs();
 
 //===----------------------------------------------------------------------===//
 // MARK: SourceLoc

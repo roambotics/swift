@@ -26,6 +26,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/SILOptions.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
@@ -140,8 +141,11 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   P.addTransferNonSendable();
 
   // Now that we have completed running passes that use region analysis, clear
-  // region analysis.
+  // region analysis and emit diagnostics for unnecessary preconcurrency
+  // imports.
   P.addRegionAnalysisInvalidationTransform();
+  P.addDiagnoseUnnecessaryPreconcurrencyImports();
+
   // Lower tuple addr constructor. Eventually this can be merged into later
   // passes. This ensures we do not need to update later passes for something
   // that is only needed by TransferNonSendable().
@@ -680,7 +684,14 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
 static void addHighLevelFunctionPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("HighLevel,Function+EarlyLoopOpt",
                   true /*isFunctionPassPipeline*/);
-  P.addEagerSpecializer();
+
+  // Skip EagerSpecializer on embedded Swift, which already specializes
+  // everything. Otherwise this would create metatype references for functions
+  // with @_specialize attribute and those are incompatible with Emebdded Swift.
+  if (!P.getOptions().EmbeddedSwift) {
+    P.addEagerSpecializer();
+  }
+
   P.addObjCBridgingOptimization();
 
   addFunctionPasses(P, OptimizationLevelKind::HighLevel);
@@ -732,7 +743,7 @@ static void addMidLevelFunctionPipeline(SILPassPipelinePlan &P) {
   P.addLoopUnroll();
 }
 
-  static void addClosureSpecializePassPipeline(SILPassPipelinePlan &P) {
+static void addClosureSpecializePassPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("ClosureSpecialize");
   P.addDeadFunctionAndGlobalElimination();
   P.addReadOnlyGlobalVariablesPass();
@@ -765,7 +776,11 @@ static void addMidLevelFunctionPipeline(SILPassPipelinePlan &P) {
   P.addCapturePropagation();
 
   // Specialize closure.
-  P.addClosureSpecializer();
+  if (P.getOptions().EnableExperimentalSwiftBasedClosureSpecialization) {
+    P.addExperimentalSwiftBasedClosureSpecialization();
+  } else {
+    P.addClosureSpecializer();
+  }
 
   // Do the second stack promotion on low-level SIL.
   P.addStackPromotion();
@@ -803,6 +818,9 @@ static void addLowLevelPassPipeline(SILPassPipelinePlan &P) {
   P.addDeadObjectElimination();
   P.addObjectOutliner();
   P.addDeadStoreElimination();
+  P.addDCE();
+  P.addSimplification();
+  P.addInitializeStaticGlobals();
 
   // dead-store-elimination can expose opportunities for dead object elimination.
   P.addDeadObjectElimination();
@@ -998,9 +1016,13 @@ SILPassPipelinePlan::getPerformancePassPipeline(const SILOptions &Options) {
   if (Options.StopOptimizationAfterSerialization)
     return P;
 
+  P.addAutodiffClosureSpecialization();
+
   // After serialization run the function pass pipeline to iteratively lower
   // high-level constructs like @_semantics calls.
   addMidLevelFunctionPipeline(P);
+
+  P.addAutodiffClosureSpecialization();
 
   // Perform optimizations that specialize.
   addClosureSpecializePassPipeline(P);

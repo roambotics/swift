@@ -17,6 +17,7 @@
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/AssertImplements.h"
 #include "swift/Basic/Unicode.h"
 #include "swift/Basic/type_traits.h"
@@ -175,7 +176,6 @@ TailAllocatedDebugVariable::TailAllocatedDebugVariable(
   Bits.Data.HasValue = true;
   Bits.Data.Constant = Var->Constant;
   Bits.Data.ArgNo = Var->ArgNo;
-  Bits.Data.Implicit = Var->Implicit;
   Bits.Data.NameLength = Var->Name.size();
   assert(Bits.Data.ArgNo == Var->ArgNo && "Truncation");
   assert(Bits.Data.NameLength == Var->Name.size() && "Truncation");
@@ -200,26 +200,10 @@ StringRef TailAllocatedDebugVariable::getName(const char *buf) const {
 
 std::optional<SILDebugVariable>
 SILDebugVariable::createFromAllocation(const AllocationInst *AI) {
-  std::optional<SILDebugVariable> VarInfo;
   if (const auto *ASI = dyn_cast_or_null<AllocStackInst>(AI))
-    VarInfo = ASI->getVarInfo();
+    return ASI->getVarInfo();
   // TODO: Support AllocBoxInst
-
-  if (!VarInfo)
-    return {};
-
-  // Coalesce the debug loc attached on AI into VarInfo
-  SILType Type = AI->getType();
-  SILLocation InstLoc = AI->getLoc();
-  const SILDebugScope *InstDS = AI->getDebugScope();
-  if (!VarInfo->Type)
-    VarInfo->Type = Type;
-  if (!VarInfo->Loc)
-    VarInfo->Loc = InstLoc;
-  if (!VarInfo->Scope)
-    VarInfo->Scope = InstDS;
-
-  return VarInfo;
+  return {};
 }
 
 AllocStackInst::AllocStackInst(
@@ -256,10 +240,6 @@ AllocStackInst::AllocStackInst(
   assert(sharedUInt32().AllocStackInst.numOperands ==
              TypeDependentOperands.size() &&
          "Truncation");
-  auto *VD = Loc.getLocation().getAsASTNode<VarDecl>();
-  if (Var && VD) {
-    VarInfo.setImplicit(VD->isImplicit() || VarInfo.isImplicit());
-  }
   TrailingOperandsList::InitOperandsList(getAllOperands().begin(), this,
                                          TypeDependentOperands);
 }
@@ -271,6 +251,15 @@ AllocStackInst *AllocStackInst::create(SILDebugLocation Loc,
                                        IsLexical_t isLexical,
                                        IsFromVarDecl_t isFromVarDecl,
                                        UsesMoveableValueDebugInfo_t wasMoved) {
+  // Don't store the same information twice.
+  if (Var) {
+    if (Var->Loc == Loc.getLocation().strippedForDebugVariable())
+      Var->Loc = {};
+    if (Var->Scope == Loc.getScope())
+      Var->Scope = nullptr;
+    if (Var->Type == elementType)
+      Var->Type = {};
+  }
   SmallVector<SILValue, 8> TypeDependentOperands;
   collectTypeDependentOperands(TypeDependentOperands, F,
                                elementType.getASTType());
@@ -282,6 +271,9 @@ AllocStackInst *AllocStackInst::create(SILDebugLocation Loc,
 }
 
 VarDecl *AllocationInst::getDecl() const {
+  if (auto ASI = dyn_cast<AllocStackInst>(this)) {
+    return ASI->getVarLoc().getAsASTNode<VarDecl>();
+  }
   return getLoc().getAsASTNode<VarDecl>();
 }
 
@@ -444,8 +436,8 @@ SILType AllocBoxInst::getAddressType() const {
 
 DebugValueInst::DebugValueInst(
     SILDebugLocation DebugLoc, SILValue Operand, SILDebugVariable Var,
-    bool poisonRefs, UsesMoveableValueDebugInfo_t usesMoveableValueDebugInfo,
-    bool trace)
+    PoisonRefs_t poisonRefs,
+    UsesMoveableValueDebugInfo_t usesMoveableValueDebugInfo, bool trace)
     : UnaryInstructionBase(DebugLoc, Operand),
       SILDebugVariableSupplement(Var.DIExpr.getNumElements(),
                                  Var.Type.has_value(), Var.Loc.has_value(),
@@ -454,8 +446,6 @@ DebugValueInst::DebugValueInst(
               getTrailingObjects<SILLocation>(),
               getTrailingObjects<const SILDebugScope *>(),
               getTrailingObjects<SILDIExprElement>()) {
-  if (auto *VD = DebugLoc.getLocation().getAsASTNode<VarDecl>())
-    VarInfo.setImplicit(VD->isImplicit() || VarInfo.isImplicit());
   setPoisonRefs(poisonRefs);
   if (usesMoveableValueDebugInfo || Operand->getType().isMoveOnly())
     setUsesMoveableValueDebugInfo();
@@ -464,9 +454,17 @@ DebugValueInst::DebugValueInst(
 
 DebugValueInst *DebugValueInst::create(SILDebugLocation DebugLoc,
                                        SILValue Operand, SILModule &M,
-                                       SILDebugVariable Var, bool poisonRefs,
+                                       SILDebugVariable Var,
+                                       PoisonRefs_t poisonRefs,
                                        UsesMoveableValueDebugInfo_t wasMoved,
                                        bool trace) {
+  // Don't store the same information twice.
+  if (Var.Loc == DebugLoc.getLocation().strippedForDebugVariable())
+    Var.Loc = {};
+  if (Var.Scope == DebugLoc.getScope())
+    Var.Scope = nullptr;
+  if (Var.Type == Operand->getType().getObjectType())
+    Var.Type = {};
   void *buf = allocateDebugVarCarryingInst<DebugValueInst>(M, Var);
   return ::new (buf)
     DebugValueInst(DebugLoc, Operand, Var, poisonRefs, wasMoved, trace);
@@ -481,9 +479,8 @@ DebugValueInst::createAddr(SILDebugLocation DebugLoc, SILValue Operand,
   if (!isa<AllocStackInst>(Operand))
     Var.DIExpr.prependElements(
       {SILDIExprElement::createOperator(SILDIExprOperator::Dereference)});
-  void *buf = allocateDebugVarCarryingInst<DebugValueInst>(M, Var);
-  return ::new (buf) DebugValueInst(DebugLoc, Operand, Var,
-                                    /*poisonRefs=*/false, wasMoved, trace);
+  return DebugValueInst::create(DebugLoc, Operand, M, Var, DontPoisonRefs,
+                                wasMoved, trace);
 }
 
 bool DebugValueInst::exprStartsWithDeref() const {
@@ -497,7 +494,7 @@ bool DebugValueInst::exprStartsWithDeref() const {
 }
 
 VarDecl *DebugValueInst::getDecl() const {
-  return getLoc().getAsASTNode<VarDecl>();
+  return getVarLoc().getAsASTNode<VarDecl>();
 }
 
 VarDecl *SILDebugVariable::getDecl() const {
@@ -700,29 +697,41 @@ BeginApplyInst *BeginApplyInst::create(
 
 void BeginApplyInst::getCoroutineEndPoints(
     SmallVectorImpl<EndApplyInst *> &endApplyInsts,
-    SmallVectorImpl<AbortApplyInst *> &abortApplyInsts) const {
+    SmallVectorImpl<AbortApplyInst *> &abortApplyInsts,
+    SmallVectorImpl<EndBorrowInst *> *endBorrowInsts) const {
   for (auto *tokenUse : getTokenResult()->getUses()) {
     auto *user = tokenUse->getUser();
     if (auto *end = dyn_cast<EndApplyInst>(user)) {
       endApplyInsts.push_back(end);
       continue;
     }
-
-    abortApplyInsts.push_back(cast<AbortApplyInst>(user));
+    if (auto *abort = dyn_cast<AbortApplyInst>(user)) {
+      abortApplyInsts.push_back(abort);
+      continue;
+    }
+    auto *end = cast<EndBorrowInst>(user);
+    if (endBorrowInsts) {
+      endBorrowInsts->push_back(end);
+    }
   }
 }
 
 void BeginApplyInst::getCoroutineEndPoints(
     SmallVectorImpl<Operand *> &endApplyInsts,
-    SmallVectorImpl<Operand *> &abortApplyInsts) const {
+    SmallVectorImpl<Operand *> &abortApplyInsts,
+    SmallVectorImpl<Operand *> *endBorrowInsts) const {
   for (auto *tokenUse : getTokenResult()->getUses()) {
     auto *user = tokenUse->getUser();
     if (isa<EndApplyInst>(user)) {
       endApplyInsts.push_back(tokenUse);
       continue;
     }
+    if (isa<AbortApplyInst>(user)) {
+      abortApplyInsts.push_back(tokenUse);
+      continue;
+    }
 
-    assert(isa<AbortApplyInst>(user));
+    assert(isa<EndBorrowInst>(user));
     abortApplyInsts.push_back(tokenUse);
   }
 }
@@ -774,8 +783,11 @@ PartialApplyInst *PartialApplyInst::create(
 TryApplyInstBase::TryApplyInstBase(SILInstructionKind kind,
                                    SILDebugLocation loc,
                                    SILBasicBlock *normalBB,
-                                   SILBasicBlock *errorBB)
-    : TermInst(kind, loc), DestBBs{{{this, normalBB}, {this, errorBB}}} {}
+                                   SILBasicBlock *errorBB,
+                                   ProfileCounter normalCount,
+                                   ProfileCounter errorCount)
+    : TermInst(kind, loc), DestBBs{{{this, normalBB, normalCount},
+                                    {this, errorBB, errorCount}}} {}
 
 TryApplyInst::TryApplyInst(
     SILDebugLocation loc, SILValue callee, SILType substCalleeTy,
@@ -783,10 +795,12 @@ TryApplyInst::TryApplyInst(
     ArrayRef<SILValue> typeDependentOperands, SILBasicBlock *normalBB,
     SILBasicBlock *errorBB, ApplyOptions options,
     const GenericSpecializationInformation *specializationInfo,
-    std::optional<ApplyIsolationCrossing> isolationCrossing)
+    std::optional<ApplyIsolationCrossing> isolationCrossing,
+    ProfileCounter normalCount,
+    ProfileCounter errorCount)
     : InstructionBase(isolationCrossing, loc, callee, substCalleeTy, subs, args,
                       typeDependentOperands, specializationInfo, normalBB,
-                      errorBB) {
+                      errorBB, normalCount, errorCount) {
   setApplyOptions(options);
 }
 
@@ -796,10 +810,23 @@ TryApplyInst::create(SILDebugLocation loc, SILValue callee,
                      SILBasicBlock *normalBB, SILBasicBlock *errorBB,
                      ApplyOptions options, SILFunction &parentFunction,
                      const GenericSpecializationInformation *specializationInfo,
-                     std::optional<ApplyIsolationCrossing> isolationCrossing) {
+                     std::optional<ApplyIsolationCrossing> isolationCrossing,
+                     ProfileCounter normalCount,
+                     ProfileCounter errorCount) {
   SILType substCalleeTy = callee->getType().substGenericArgs(
       parentFunction.getModule(), subs,
       parentFunction.getTypeExpansionContext());
+
+  if (parentFunction.getModule().getOptions().EnableThrowsPrediction &&
+      !normalCount && !errorCount) {
+    // Predict that the error branch is not taken.
+    //
+    // We cannot use the Expect builtin within SIL because try_apply abstracts
+    // over the raw conditional test to see if an error was returned.
+    // So, we synthesize profiling branch weights instead.
+    normalCount = 1999;
+    errorCount = 0;
+  }
 
   SmallVector<SILValue, 32> typeDependentOperands;
   collectTypeDependentOperands(typeDependentOperands, parentFunction,
@@ -808,7 +835,8 @@ TryApplyInst::create(SILDebugLocation loc, SILValue callee,
       parentFunction, getNumAllOperands(args, typeDependentOperands));
   return ::new (buffer) TryApplyInst(
       loc, callee, substCalleeTy, subs, args, typeDependentOperands, normalBB,
-      errorBB, options, specializationInfo, isolationCrossing);
+      errorBB, options, specializationInfo, isolationCrossing,
+      normalCount, errorCount);
 }
 
 SILType DifferentiableFunctionInst::getDifferentiableFunctionType(
@@ -915,7 +943,7 @@ SILType DifferentiableFunctionExtractInst::getExtracteeType(
   auto resultFnTy = originalFnTy->getAutoDiffDerivativeFunctionType(
       fnTy->getDifferentiabilityParameterIndices(),
       fnTy->getDifferentiabilityResultIndices(), *kindOpt, module.Types,
-      LookUpConformanceInModule(module.getSwiftModule()));
+      LookUpConformanceInModule());
   return SILType::getPrimitiveObjectType(resultFnTy);
 }
 
@@ -945,7 +973,7 @@ getExtracteeType(
   case LinearDifferentiableFunctionTypeComponent::Transpose:
     auto transposeFnTy = originalFnTy->getAutoDiffTransposeFunctionType(
         fnTy->getDifferentiabilityParameterIndices(), module.Types,
-        LookUpConformanceInModule(module.getSwiftModule()));
+        LookUpConformanceInModule());
     return SILType::getPrimitiveObjectType(transposeFnTy);
   }
   llvm_unreachable("invalid extractee");
@@ -972,14 +1000,14 @@ SILType DifferentiabilityWitnessFunctionInst::getDifferentiabilityWitnessType(
         witness->getOriginalFunction()->isThunk() == IsReabstractionThunk;
     auto diffFnTy = fnTy->getAutoDiffDerivativeFunctionType(
         parameterIndices, resultIndices, *derivativeKind, module.Types,
-        LookUpConformanceInModule(module.getSwiftModule()), witnessCanGenSig,
+        LookUpConformanceInModule(), witnessCanGenSig,
         isReabstractionThunk);
     return SILType::getPrimitiveObjectType(diffFnTy);
   }
   assert(witnessKind == DifferentiabilityWitnessFunctionKind::Transpose);
   auto transposeFnTy = fnTy->getAutoDiffTransposeFunctionType(
       parameterIndices, module.Types,
-      LookUpConformanceInModule(module.getSwiftModule()), witnessCanGenSig);
+      LookUpConformanceInModule(), witnessCanGenSig);
   return SILType::getPrimitiveObjectType(transposeFnTy);
 }
 
@@ -1482,6 +1510,24 @@ StructInst::StructInst(SILDebugLocation Loc, SILType Ty,
     : InstructionBaseWithTrailingOperands(Elems, Loc, Ty,
                                           forwardingOwnershipKind) {
   assert(!Ty.getStructOrBoundGenericStruct()->hasUnreferenceableStorage());
+}
+
+BorrowedFromInst *BorrowedFromInst::create(SILDebugLocation DebugLoc, SILValue borrowedValue,
+                                           ArrayRef<SILValue> enclosingValues, SILModule &M) {
+  auto Size = totalSizeToAlloc<swift::Operand>(enclosingValues.size() + 1);
+  auto Buffer = M.allocateInst(Size, alignof(StructInst));
+  SmallVector<SILValue, 8> operands;
+  operands.push_back(borrowedValue);
+  for (SILValue ev : enclosingValues) {
+    operands.push_back(ev);
+  }
+  return ::new (Buffer) BorrowedFromInst(DebugLoc, operands);
+}
+
+BorrowedFromInst::BorrowedFromInst(SILDebugLocation DebugLoc, ArrayRef<SILValue> operands)
+    : InstructionBaseWithTrailingOperands(operands, DebugLoc, operands[0]->getType(),
+                                          operands[0]->getOwnershipKind()) {
+  assert(operands[0]->getOwnershipKind() != OwnershipKind::Owned);
 }
 
 ObjectInst *ObjectInst::create(SILDebugLocation Loc, SILType Ty,
@@ -2565,6 +2611,17 @@ BeginCOWMutationInst::create(SILDebugLocation loc, SILValue operand,
 
 UncheckedRefCastInst *
 UncheckedRefCastInst::create(SILDebugLocation DebugLoc, SILValue Operand,
+                             SILType Ty, SILModule &Mod,
+                             ValueOwnershipKind forwardingOwnershipKind) {
+  assert(Operand->getType().getCategory() == SILValueCategory::Object);
+  unsigned size = totalSizeToAlloc<swift::Operand>(1);
+  void *Buffer = Mod.allocateInst(size, alignof(UncheckedRefCastInst));
+  return ::new (Buffer) UncheckedRefCastInst(
+      DebugLoc, Operand, {}, Ty, forwardingOwnershipKind);
+}
+
+UncheckedRefCastInst *
+UncheckedRefCastInst::create(SILDebugLocation DebugLoc, SILValue Operand,
                              SILType Ty, SILFunction &F,
                              ValueOwnershipKind forwardingOwnershipKind) {
   assert(Operand->getType().getCategory() == SILValueCategory::Object);
@@ -2676,6 +2733,15 @@ MetatypeInst *MetatypeInst::create(SILDebugLocation Loc, SILType Ty,
   auto Size = totalSizeToAlloc<swift::Operand>(TypeDependentOperands.size());
   auto Buffer = Mod.allocateInst(Size, alignof(MetatypeInst));
   return ::new (Buffer) MetatypeInst(Loc, Ty, TypeDependentOperands);
+}
+
+UpcastInst *UpcastInst::create(SILDebugLocation DebugLoc, SILValue Operand,
+                               SILType Ty, SILModule &Mod,
+                               ValueOwnershipKind forwardingOwnershipKind) {
+  unsigned size = totalSizeToAlloc<swift::Operand>(1);
+  void *Buffer = Mod.allocateInst(size, alignof(UpcastInst));
+  return ::new (Buffer) UpcastInst(DebugLoc, Operand, {}, Ty,
+                                   forwardingOwnershipKind);
 }
 
 UpcastInst *UpcastInst::create(SILDebugLocation DebugLoc, SILValue Operand,

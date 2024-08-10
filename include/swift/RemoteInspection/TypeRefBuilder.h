@@ -638,6 +638,8 @@ public:
               auto substitutedDemangleTree = Builder.demangleTypeRef(
                   substitutedTypeRef,
                   /* useOpaqueTypeSymbolicReferences */ true);
+              if (!substitutedDemangleTree)
+                continue;
 
               // If the substituted type is an opaque type, also gather info
               // about which protocols it is required to conform to and the
@@ -1168,8 +1170,7 @@ public:
     funcFlags = funcFlags.withSendable(flags.isSendable());
     funcFlags = funcFlags.withAsync(flags.isAsync());
     funcFlags = funcFlags.withDifferentiable(flags.isDifferentiable());
-    extFuncFlags =
-        extFuncFlags.withTransferringResult(flags.hasTransferringResult());
+    extFuncFlags = extFuncFlags.withSendingResult(flags.hasSendingResult());
 
     FunctionMetadataDifferentiabilityKind diffKind;
     switch (flags.getDifferentiabilityKind()) {

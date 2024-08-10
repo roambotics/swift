@@ -20,6 +20,7 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsDriver.h"
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/OutputFileMap.h"
@@ -109,7 +110,6 @@ void Driver::parseDriverKind(ArrayRef<const char *> Args) {
           .Case("swift-autolink-extract", DriverKind::AutolinkExtract)
           .Case("swift-indent", DriverKind::SwiftIndent)
           .Case("swift-symbolgraph-extract", DriverKind::SymbolGraph)
-          .Case("swift-api-extract", DriverKind::APIExtract)
           .Case("swift-api-digester", DriverKind::APIDigester)
           .Case("swift-cache-tool", DriverKind::CacheTool)
           .Case("swift-parse-test", DriverKind::ParseTest)
@@ -340,6 +340,7 @@ Driver::buildToolChain(const llvm::opt::InputArgList &ArgList) {
   }
 
   switch (target.getOS()) {
+  case llvm::Triple::XROS:
   case llvm::Triple::IOS:
   case llvm::Triple::TvOS:
   case llvm::Triple::WatchOS:
@@ -934,7 +935,7 @@ void Driver::buildInputs(const ToolChain &TC,
       file_types::ID Ty = file_types::TY_INVALID;
 
       // stdin must be handled specially.
-      if (Value.equals("-")) {
+      if (Value == "-") {
         // By default, treat stdin as Swift input.
         Ty = file_types::TY_Swift;
       } else {
@@ -1939,6 +1940,10 @@ bool Driver::handleImmediateArgs(const ArgList &Args, const ToolChain &TC) {
   if (Args.hasArg(options::OPT_help_hidden)) {
     printHelp(true);
     return false;
+  }
+
+  if (Args.hasArg(options::OPT_compiler_assertions)) {
+    CONDITIONAL_ASSERT_Global_enable_flag = 1;
   }
 
   if (Args.hasArg(options::OPT_version)) {
@@ -3096,7 +3101,6 @@ void Driver::printHelp(bool ShowHidden) const {
   case DriverKind::AutolinkExtract:
   case DriverKind::SwiftIndent:
   case DriverKind::SymbolGraph:
-  case DriverKind::APIExtract:
   case DriverKind::APIDigester:
   case DriverKind::CacheTool:
   case DriverKind::ParseTest:

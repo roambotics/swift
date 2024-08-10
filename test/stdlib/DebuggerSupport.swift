@@ -101,6 +101,18 @@ StringForPrintObjectTests.test("DontBridgeThisStruct") {
 }
 #endif
 
+if #available(SwiftStdlib 6.1, *) {
+  StringForPrintObjectTests.test("String") {
+    let printed = _stringForPrintObject("hello\nworld")
+    expectEqual(printed, "hello\nworld\n")
+  }
+} else {
+  StringForPrintObjectTests.test("String") {
+    let printed = _stringForPrintObject("hello\nworld")
+    expectEqual(printed, "\"hello\\nworld\"\n")
+  }
+}
+
 class RefCountedObj {
   var patatino : Int
   init(_ p : Int) {

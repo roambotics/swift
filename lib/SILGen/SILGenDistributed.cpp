@@ -20,6 +20,7 @@
 #include "SILGenFunctionBuilder.h"
 #include "Scope.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DistributedDecl.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -27,6 +28,7 @@
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/ProtocolConformanceRef.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILDeclRef.h"
@@ -98,7 +100,7 @@ void SILGenFunction::emitDistributedIfRemoteBranch(SILLocation Loc,
   assert(isRemoteFn && "Could not find 'is remote' function, is the "
                        "'Distributed' module available?");
 
-  auto conformances = SGM.M.getSwiftModule()->collectExistentialConformances(
+  auto conformances = collectExistentialConformances(
       selfTy->getCanonicalType(), ctx.getAnyObjectType());
 
   ManagedValue selfAnyObject = B.createInitExistentialRef(
@@ -120,7 +122,6 @@ void SILGenFunction::emitDistributedIfRemoteBranch(SILLocation Loc,
 // MARK: local instance initialization
 
 static SILArgument *findFirstDistributedActorSystemArg(SILFunction &F) {
-  auto *module = F.getModule().getSwiftModule();
   auto &C = F.getASTContext();
 
   auto *DAS = C.getDistributedActorSystemDecl();
@@ -131,8 +132,7 @@ static SILArgument *findFirstDistributedActorSystemArg(SILFunction &F) {
     Type argTy = arg->getType().getASTType();
     auto argDecl = arg->getDecl();
 
-    auto conformsToSystem =
-        module->lookupConformance(argDecl->getInterfaceType(), DAS);
+    auto conformsToSystem = lookupConformance(argDecl->getInterfaceType(), DAS);
 
     // Is it a protocol that conforms to DistributedActorSystem?
     if (argTy->isEqual(systemTy) || conformsToSystem) {
@@ -140,7 +140,7 @@ static SILArgument *findFirstDistributedActorSystemArg(SILFunction &F) {
     }
 
     // Is it some specific DistributedActorSystem?
-    auto result = module->lookupConformance(argTy, DAS);
+    auto result = lookupConformance(argTy, DAS);
     if (!result.isInvalid()) {
       return arg;
     }
@@ -272,6 +272,34 @@ void InitializeDistActorIdentity::dump(SILGenFunction &) const {
                << "State: " << getState()
                << "\n";
 #endif
+}
+
+bool SILGenFunction::shouldReplaceConstantForApplyWithDistributedThunk(
+    FuncDecl *func) const {
+  auto isDistributedFuncOrAccessor =
+      func->isDistributed();
+  if (auto acc = dyn_cast<AccessorDecl>(func)) {
+    isDistributedFuncOrAccessor =
+        acc->getStorage()->isDistributed();
+  }
+
+  if (!isDistributedFuncOrAccessor)
+    return false;
+
+  // If we are inside a distributed thunk, we want to call the "real" method,
+  // in order to avoid infinitely recursively calling the thunk from itself.
+  if (F.isDistributed() && F.isThunk())
+    return false;
+
+  // If caller and called func are isolated to the same (distributed) actor,
+  // (i.e. we are "inside the distributed actor"), there is no need to call
+  // the thunk.
+  if (isSameActorIsolated(func, FunctionDC))
+    return false;
+
+  // In all other situations, we may have to replace the called function,
+  // depending on isolation (to be checked in SILGenApply).
+  return true;
 }
 
 void SILGenFunction::emitDistributedActorImplicitPropertyInits(

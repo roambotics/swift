@@ -163,7 +163,7 @@ class ExplicitSwiftModuleLoader: public SerializedModuleLoaderBase {
       bool SkipBuildingInterface, bool IsFramework,
       bool IsTestableDependencyLookup = false) override;
 
-  bool canImportModule(ImportPath::Module named,
+  bool canImportModule(ImportPath::Module named, SourceLoc loc,
                        ModuleVersionInfo *versionInfo,
                        bool isTestableDependencyLookup = false) override;
 
@@ -212,7 +212,7 @@ class ExplicitCASModuleLoader : public SerializedModuleLoaderBase {
       bool SkipBuildingInterface, bool IsFramework,
       bool IsTestableDependencyLookup = false) override;
 
-  bool canImportModule(ImportPath::Module named,
+  bool canImportModule(ImportPath::Module named, SourceLoc loc,
                        ModuleVersionInfo *versionInfo,
                        bool isTestableDependencyLookup = false) override;
 
@@ -688,7 +688,7 @@ public:
                                   SourceLoc diagLoc,
     llvm::function_ref<std::error_code(ASTContext&, ModuleDecl*,
                                        ArrayRef<StringRef>, ArrayRef<StringRef>,
-                                       StringRef)> action) override;
+                                       StringRef, StringRef)> action) override;
   std::error_code runInSubCompilerInstance(StringRef moduleName,
                                            StringRef interfacePath,
                                            StringRef sdkPath,

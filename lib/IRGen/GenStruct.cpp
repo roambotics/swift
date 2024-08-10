@@ -17,26 +17,32 @@
 #include "GenStruct.h"
 
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/SILFunctionBuilder.h"
 #include "swift/SIL/SILModule.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
+#include "clang/AST/CharUnits.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/AST/GlobalDecl.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/CodeGen/CodeGenABITypes.h"
 #include "clang/CodeGen/SwiftCallingConv.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include <iterator>
 
 #include "GenDecl.h"
 #include "GenMeta.h"
@@ -271,12 +277,11 @@ namespace {
                  bool isOutlined) const override {
       // If the struct has a deinit declared, then call it to destroy the
       // value.
-      if (tryEmitDestroyUsingDeinit(IGF, address, T)) {
-        return;
+      if (!tryEmitDestroyUsingDeinit(IGF, address, T)) {
+        // Otherwise, perform elementwise destruction of the value.
+        super::destroy(IGF, address, T, isOutlined);
       }
-      
-      // Otherwise, perform elementwise destruction of the value.
-      return super::destroy(IGF, address, T, isOutlined);
+      super::fillWithZerosIfSensitive(IGF, address, T);
     }
 
     void verify(IRGenTypeVerifierFunction &IGF,
@@ -519,7 +524,8 @@ namespace {
     }
 
     void initializeWithTake(IRGenFunction &IGF, Address dst, Address src,
-                            SILType T, bool isOutlined) const override {
+                            SILType T, bool isOutlined,
+                            bool zeroizeIfSensitive) const override {
       emitCopyWithCopyFunction(IGF, T, src, dst);
       destroy(IGF, src, T, isOutlined);
     }
@@ -597,7 +603,7 @@ namespace {
 
       // Map the generic parameter to T
       auto subst = SubstitutionMap::get(sig, {T.getASTType()},
-                              LookUpConformanceInModule{IGF.getSwiftModule()});
+                              LookUpConformanceInModule());
       auto ptrType = ptrTypeDecl->getDeclaredInterfaceType().subst(subst);
       SILParameterInfo ptrParam(ptrType->getCanonicalType(),
                                 ParameterConvention::Direct_Unowned);
@@ -688,14 +694,7 @@ namespace {
         return;
       }
 
-      if (!destructor->isUserProvided() &&
-          !destructor->doesThisDeclarationHaveABody()) {
-        assert(!destructor->isDeleted() &&
-               "Swift cannot handle a type with no known destructor.");
-        // Make sure we define the destructor so we have something to call.
-        auto &sema = IGF.IGM.Context.getClangModuleLoader()->getClangSema();
-        sema.DefineImplicitDestructor(clang::SourceLocation(), destructor);
-      }
+      IGF.IGM.ensureImplicitCXXDestructorBodyIsDefined(destructor);
 
       clang::GlobalDecl destructorGlobalDecl(destructor, clang::Dtor_Complete);
       auto *destructorFnAddr =
@@ -801,7 +800,8 @@ namespace {
     }
 
     void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
-                            SILType T, bool isOutlined) const override {
+                            SILType T, bool isOutlined,
+                            bool zeroizeIfSensitive) const override {
       if (auto moveConstructor = findMoveConstructor()) {
         emitCopyWithCopyConstructor(IGF, T, moveConstructor,
                                     src.getAddress(),
@@ -820,7 +820,7 @@ namespace {
 
       StructTypeInfoBase<AddressOnlyCXXClangRecordTypeInfo, FixedTypeInfo,
                          ClangFieldInfo>::initializeWithTake(IGF, dest, src, T,
-                                                             isOutlined);
+                                                             isOutlined, zeroizeIfSensitive);
     }
 
     void assignWithTake(IRGenFunction &IGF, Address dest, Address src, SILType T,
@@ -1003,8 +1003,7 @@ namespace {
         // The given struct type T that we're building is fully concrete, but
         // our like type is still in terms of the potential archetype of the
         // type.
-        auto subs = T.getASTType()->getContextSubstitutionMap(
-          IGM.getSwiftModule(), decl);
+        auto subs = T.getASTType()->getContextSubstitutionMap(decl);
 
         loweredLikeType = loweredLikeType.subst(IGM.getSILModule(), subs);
 
@@ -1124,8 +1123,7 @@ namespace {
         // environment that is different than that which was built our
         // resolved rawLayout like type. Map our like type into the given
         // environment.
-        auto subs = T.getASTType()->getContextSubstitutionMap(
-          IGM.getSwiftModule(), decl);
+        auto subs = T.getASTType()->getContextSubstitutionMap(decl);
 
         loweredLikeType = loweredLikeType.subst(IGM.getSILModule(), subs);
 
@@ -1317,6 +1315,7 @@ class ClangRecordLowering {
   SmallVector<llvm::Type *, 8> LLVMFields;
   SmallVector<ClangFieldInfo, 8> FieldInfos;
   Size NextOffset = Size(0);
+  Size SubobjectAdjustment = Size(0);
   unsigned NextExplosionIndex = 0;
 public:
   ClangRecordLowering(IRGenModule &IGM, StructDecl *swiftDecl,
@@ -1334,8 +1333,8 @@ public:
     if (ClangDecl->isUnion()) {
       collectUnionFields();
     } else {
-      collectBases();
-      collectStructFields();
+      collectBases(ClangDecl);
+      collectStructFields(ClangDecl);
     }
   }
 
@@ -1366,10 +1365,9 @@ private:
     return (swiftField->getClangNode().castAsDecl() == clangField);
   }
 
-  void collectBases() {
-    auto &layout = ClangDecl->getASTContext().getASTRecordLayout(ClangDecl);
-
-    if (auto cxxRecord = dyn_cast<clang::CXXRecordDecl>(ClangDecl)) {
+  void collectBases(const clang::RecordDecl *decl) {
+    auto &layout = decl->getASTContext().getASTRecordLayout(decl);
+    if (auto cxxRecord = dyn_cast<clang::CXXRecordDecl>(decl)) {
       for (auto base : cxxRecord->bases()) {
         if (base.isVirtual())
           continue;
@@ -1382,17 +1380,24 @@ private:
         if (baseCxxRecord->isEmpty())
           continue;
 
-        auto offset = layout.getBaseClassOffset(baseCxxRecord);
-        auto size = ClangDecl->getASTContext().getTypeSizeInChars(baseType);
-        addOpaqueField(Size(offset.getQuantity()), Size(size.getQuantity()));
+        auto baseOffset = Size(layout.getBaseClassOffset(baseCxxRecord).getQuantity());
+        SubobjectAdjustment += baseOffset;
+        collectBases(baseCxxRecord);
+        collectStructFields(baseCxxRecord);
+        SubobjectAdjustment -= baseOffset;
       }
     }
   }
 
-  void collectStructFields() {
-    auto cfi = ClangDecl->field_begin(), cfe = ClangDecl->field_end();
+  void collectStructFields(const clang::RecordDecl *decl) {
+    auto cfi = decl->field_begin(), cfe = decl->field_end();
+    const auto &layout = ClangContext.getASTRecordLayout(decl);
     auto swiftProperties = SwiftDecl->getStoredProperties();
     auto sfi = swiftProperties.begin(), sfe = swiftProperties.end();
+    // When collecting fields from the base subobjects, we do not have corresponding swift
+    // stored properties.
+    if (decl != ClangDecl)
+      sfi = swiftProperties.end();
 
     while (cfi != cfe) {
       const clang::FieldDecl *clangField = *cfi++;
@@ -1402,13 +1407,13 @@ private:
       if (clangField->isBitField()) {
         // Collect all of the following bitfields.
         unsigned bitStart =
-          ClangLayout.getFieldOffset(clangField->getFieldIndex());
+          layout.getFieldOffset(clangField->getFieldIndex());
         unsigned bitEnd = bitStart + clangField->getBitWidthValue(ClangContext);
 
         while (cfi != cfe && (*cfi)->isBitField()) {
           clangField = *cfi++;
           unsigned nextStart =
-            ClangLayout.getFieldOffset(clangField->getFieldIndex());
+            layout.getFieldOffset(clangField->getFieldIndex());
           assert(nextStart >= bitEnd && "laying out bit-fields out of order?");
 
           // In a heuristic effort to reduce the number of weird-sized
@@ -1426,7 +1431,7 @@ private:
         continue;
       }
 
-      VarDecl *swiftField;
+      VarDecl *swiftField = nullptr;
       if (sfi != sfe) {
         swiftField = *sfi;
         if (isImportOfClangField(swiftField, clangField)) {
@@ -1434,33 +1439,33 @@ private:
         } else {
           swiftField = nullptr;
         }
-      } else {
-        swiftField = nullptr;
-      }
+      } 
 
       // Try to position this field.  If this fails, it's because we
       // didn't lay out padding correctly.
-      addStructField(clangField, swiftField);
+      addStructField(clangField, swiftField, layout);
     }
 
     assert(sfi == sfe && "more Swift fields than there were Clang fields?");
 
+    Size objectTotalStride = Size(layout.getSize().getQuantity());
     // We never take advantage of tail padding, because that would prevent
     // us from passing the address of the object off to C, which is a pretty
     // likely scenario for imported C types.
-    assert(NextOffset <= TotalStride);
-    assert(SpareBits.size() <= TotalStride.getValueInBits());
-    if (NextOffset < TotalStride) {
-      addPaddingField(TotalStride);
+    assert(NextOffset <= SubobjectAdjustment + objectTotalStride);
+    assert(SpareBits.size() <= SubobjectAdjustment.getValueInBits() +
+                                   objectTotalStride.getValueInBits());
+    if (NextOffset < objectTotalStride) {
+      addPaddingField(objectTotalStride);
     }
   }
 
   /// Place the next struct field at its appropriate offset.
   void addStructField(const clang::FieldDecl *clangField,
-                      VarDecl *swiftField) {
-    unsigned fieldOffset = ClangLayout.getFieldOffset(clangField->getFieldIndex());
+                      VarDecl *swiftField, const clang::ASTRecordLayout &layout) {
+    unsigned fieldOffset = layout.getFieldOffset(clangField->getFieldIndex());
     assert(!clangField->isBitField());
-    Size offset(fieldOffset / 8);
+    Size offset( SubobjectAdjustment.getValue() + fieldOffset / 8);
 
     // If we have a Swift import of this type, use our lowered information.
     if (swiftField) {
@@ -1705,8 +1710,7 @@ const TypeInfo *TypeConverter::convertStructType(TypeBase *key, CanType type,
         IGM.getSwiftModule()->getASTContext().getProtocol(
             KnownProtocolKind::BitwiseCopyable);
     if (bitwiseCopyableProtocol &&
-        IGM.getSwiftModule()->lookupConformance(D->getDeclaredInterfaceType(),
-                                                bitwiseCopyableProtocol)) {
+        checkConformance(type, bitwiseCopyableProtocol)) {
       return BitwiseCopyableTypeInfo::create(IGM.OpaqueTy, structAccessible);
     }
     return &getResilientStructTypeInfo(copyable, structAccessible);

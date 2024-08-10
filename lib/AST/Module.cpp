@@ -26,6 +26,7 @@
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/FileUnit.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/Import.h"
 #include "swift/AST/ImportCache.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/LinkLibrary.h"
@@ -39,7 +40,9 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/SynthesizedFileUnit.h"
+#include "swift/AST/Type.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
@@ -722,7 +725,9 @@ ModuleDecl::ModuleDecl(Identifier name, ASTContext &ctx,
   Bits.ModuleDecl.IsConcurrencyChecked = 0;
   Bits.ModuleDecl.ObjCNameLookupCachePopulated = 0;
   Bits.ModuleDecl.HasCxxInteroperability = 0;
+  Bits.ModuleDecl.CXXStdlibKind = 0;
   Bits.ModuleDecl.AllowNonResilientAccess = 0;
+  Bits.ModuleDecl.SerializePackageEnabled = 0;
 }
 
 void ModuleDecl::setIsSystemModule(bool flag) {
@@ -903,7 +908,7 @@ ModuleDecl::getOriginalLocation(SourceLoc loc) const {
 
   SourceLoc startLoc = loc;
   unsigned startBufferID = bufferID;
-  while (std::optional<GeneratedSourceInfo> info =
+  while (const GeneratedSourceInfo *info =
              SM.getGeneratedSourceInfo(bufferID)) {
     switch (info->kind) {
 #define MACRO_ROLE(Name, Description)  \
@@ -1287,42 +1292,6 @@ bool ModuleDecl::shouldCollectDisplayDecls() const {
   return true;
 }
 
-void swift::collectParsedExportedImports(const ModuleDecl *M,
-                                         SmallPtrSetImpl<ModuleDecl *> &Imports,
-                                         llvm::SmallDenseMap<ModuleDecl *, SmallPtrSet<Decl *, 4>, 4> &QualifiedImports,
-                                         llvm::function_ref<bool(AttributedImport<ImportedModule>)> includeImport) {
-  for (const FileUnit *file : M->getFiles()) {
-    if (const SourceFile *source = dyn_cast<SourceFile>(file)) {
-      if (source->hasImports()) {
-        for (auto import : source->getImports()) {
-          if (import.options.contains(ImportFlags::Exported) &&
-              (!includeImport || includeImport(import)) &&
-              import.module.importedModule->shouldCollectDisplayDecls()) {
-            auto *TheModule = import.module.importedModule;
-
-            if (import.module.getAccessPath().size() > 0) {
-              if (QualifiedImports.find(TheModule) == QualifiedImports.end()) {
-                QualifiedImports.try_emplace(TheModule);
-              }
-              auto collectDecls = [&](ValueDecl *VD,
-                                      DeclVisibilityKind reason) {
-                if (reason == DeclVisibilityKind::VisibleAtTopLevel)
-                  QualifiedImports[TheModule].insert(VD);
-              };
-              auto consumer = makeDeclConsumer(std::move(collectDecls));
-              TheModule->lookupVisibleDecls(
-                  import.module.getAccessPath(), consumer,
-                  NLKind::UnqualifiedLookup);
-            } else if (!Imports.contains(TheModule)) {
-              Imports.insert(TheModule);
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
 void ModuleDecl::getLocalTypeDecls(SmallVectorImpl<TypeDecl*> &Results) const {
   FORWARD(getLocalTypeDecls, (Results));
 }
@@ -1543,40 +1512,106 @@ SourceFile::getExternalRawLocsForDecl(const Decl *D) const {
   return Result;
 }
 
-void ModuleDecl::getDisplayDecls(SmallVectorImpl<Decl*> &Results, bool Recursive) const {
-  if (Recursive && isParsedModule(this)) {
-    SmallPtrSet<ModuleDecl *, 4> Modules;
-    llvm::SmallDenseMap<ModuleDecl *, SmallPtrSet<Decl *, 4>, 4> QualifiedImports;
-    collectParsedExportedImports(this, Modules, QualifiedImports);
-    for (const auto &QI : QualifiedImports) {
-      auto Module = QI.getFirst();
-      if (Modules.contains(Module)) continue;
+void ModuleDecl::ImportCollector::collect(
+    const ImportedModule &importedModule) {
+  auto *module = importedModule.importedModule;
 
-      auto &Decls = QI.getSecond();
-      Results.append(Decls.begin(), Decls.end());
-    }
-    for (const ModuleDecl *import : Modules) {
-      import->getDisplayDecls(Results, Recursive);
+  if (!module->shouldCollectDisplayDecls())
+    return;
+
+  if (importFilter && !importFilter(module))
+    return;
+
+  if (importedModule.getAccessPath().size() > 0) {
+    auto collectDecls = [&](ValueDecl *VD, DeclVisibilityKind reason) {
+      if (reason == DeclVisibilityKind::VisibleAtTopLevel)
+        this->qualifiedImports[module].insert(VD);
+    };
+    auto consumer = makeDeclConsumer(std::move(collectDecls));
+    module->lookupVisibleDecls(importedModule.getAccessPath(), consumer,
+                               NLKind::UnqualifiedLookup);
+  } else {
+    imports.insert(module);
+  }
+}
+
+static void
+collectExportedImports(const ModuleDecl *topLevelModule,
+                       ModuleDecl::ImportCollector &importCollector) {
+  SmallVector<const ModuleDecl *> stack;
+  stack.push_back(topLevelModule);
+  while (!stack.empty()) {
+    const ModuleDecl *module = stack.pop_back_val();
+
+    for (const FileUnit *file : module->getFiles()) {
+      if (const SourceFile *source = dyn_cast<SourceFile>(file)) {
+        if (source->hasImports()) {
+          for (const auto &import : source->getImports()) {
+            if (import.options.contains(ImportFlags::Exported) &&
+                import.docVisibility.value_or(AccessLevel::Public) >=
+                importCollector.minimumDocVisibility) {
+              importCollector.collect(import.module);
+              stack.push_back(import.module.importedModule);
+            }
+          }
+        }
+      } else {
+        SmallVector<ImportedModule, 8> exportedImports;
+        file->getImportedModules(exportedImports,
+                                 ModuleDecl::ImportFilterKind::Exported);
+        for (const auto &im : exportedImports) {
+          // Skip collecting the underlying clang module as we already have the relevant import.
+          if (module->isClangOverlayOf(im.importedModule))
+            continue;
+          importCollector.collect(im);
+          stack.push_back(im.importedModule);
+        }
+      }
     }
   }
-  // FIXME: Should this do extra access control filtering?
-  FORWARD(getDisplayDecls, (Results));
+}
+
+void ModuleDecl::getDisplayDecls(SmallVectorImpl<Decl*> &Results, bool Recursive) const {
+  if (Recursive) {
+    ImportCollector importCollector;
+    this->getDisplayDeclsRecursivelyAndImports(Results, importCollector);
+  } else {
+    // FIXME: Should this do extra access control filtering?
+    FORWARD(getDisplayDecls, (Results));
+  }
+}
+
+void ModuleDecl::getDisplayDeclsRecursivelyAndImports(
+    SmallVectorImpl<Decl *> &results, ImportCollector &importCollector) const {
+  this->getDisplayDecls(results, /*Recursive=*/false);
+
+  // Look up imports recursively.
+  collectExportedImports(this, importCollector);
+  for (const auto &QI : importCollector.qualifiedImports) {
+    auto Module = QI.getFirst();
+    if (importCollector.imports.contains(Module))
+      continue;
+
+    auto &Decls = QI.getSecond();
+    results.append(Decls.begin(), Decls.end());
+  }
+
+  for (const ModuleDecl *import : importCollector.imports)
+    import->getDisplayDecls(results);
 
 #ifndef NDEBUG
-  if (Recursive) {
-    llvm::DenseSet<Decl *> visited;
-    for (auto *D : Results) {
-      // decls synthesized from implicit clang decls may appear multiple times;
-      // e.g. if multiple modules with underlying clang modules are re-exported.
-      // including duplicates of these is harmless, so skip them when counting
-      // this assertion
-      if (const auto *CD = D->getClangDecl()) {
-        if (CD->isImplicit()) continue;
-      }
-
-      auto inserted = visited.insert(D).second;
-      assert(inserted && "there should be no duplicate decls");
+  llvm::DenseSet<Decl *> visited;
+  for (auto *D : results) {
+    // decls synthesized from implicit clang decls may appear multiple times;
+    // e.g. if multiple modules with underlying clang modules are re-exported.
+    // including duplicates of these is harmless, so skip them when counting
+    // this assertion
+    if (const auto *CD = D->getClangDecl()) {
+      if (CD->isImplicit())
+        continue;
     }
+    auto inserted = visited.insert(D).second;
+    assert(inserted && "there should be no duplicate decls");
   }
 #endif
 }
@@ -1686,9 +1721,57 @@ void ModuleDecl::getImportedModules(SmallVectorImpl<ImportedModule> &modules,
   FORWARD(getImportedModules, (modules, filter));
 }
 
-void ModuleDecl::getMissingImportedModules(
+void ModuleDecl::getImplicitImportsForModuleInterface(
     SmallVectorImpl<ImportedModule> &imports) const {
-  FORWARD(getMissingImportedModules, (imports));
+  FORWARD(getImplicitImportsForModuleInterface, (imports));
+}
+
+const llvm::DenseMap<const clang::Module *, ModuleDecl *> &
+ModuleDecl::getVisibleClangModules(PrintOptions::InterfaceMode contentMode) {
+  if (CachedVisibleClangModuleSet.find(contentMode) != CachedVisibleClangModuleSet.end())
+    return CachedVisibleClangModuleSet[contentMode];
+  else
+    CachedVisibleClangModuleSet.emplace(contentMode, VisibleClangModuleSet{});
+  VisibleClangModuleSet &result = CachedVisibleClangModuleSet[contentMode];
+
+  // For the current module, consider both private and public imports.
+  ModuleDecl::ImportFilter Filter = ModuleDecl::ImportFilterKind::Exported;
+  Filter |= ModuleDecl::ImportFilterKind::Default;
+
+  // For private or package swiftinterfaces, also look through @_spiOnly imports.
+  if (contentMode != PrintOptions::InterfaceMode::Public)
+    Filter |= ModuleDecl::ImportFilterKind::SPIOnly;
+  // Consider package import for package interface
+  if (contentMode == PrintOptions::InterfaceMode::Package)
+    Filter |= ModuleDecl::ImportFilterKind::PackageOnly;
+
+  SmallVector<ImportedModule, 32> Imports;
+  getImportedModules(Imports, Filter);
+
+  SmallVector<ModuleDecl *, 32> ModulesToProcess;
+  for (const auto &Import : Imports)
+    ModulesToProcess.push_back(Import.importedModule);
+
+  SmallPtrSet<ModuleDecl *, 32> Processed;
+  while (!ModulesToProcess.empty()) {
+    ModuleDecl *Mod = ModulesToProcess.back();
+    ModulesToProcess.pop_back();
+
+    if (!Processed.insert(Mod).second)
+      continue;
+
+    if (const clang::Module *ClangModule = Mod->findUnderlyingClangModule())
+      result[ClangModule] = Mod;
+
+    // For transitive imports, consider only public imports.
+    Imports.clear();
+    Mod->getImportedModules(Imports, ModuleDecl::ImportFilterKind::Exported);
+    for (const auto &Import : Imports) {
+      ModulesToProcess.push_back(Import.importedModule);
+    }
+  }
+
+  return result;
 }
 
 void
@@ -1729,9 +1812,9 @@ SourceFile::getImportedModules(SmallVectorImpl<ImportedModule> &modules,
   }
 }
 
-void SourceFile::getMissingImportedModules(
+void SourceFile::getImplicitImportsForModuleInterface(
     SmallVectorImpl<ImportedModule> &modules) const {
-  for (auto module : MissingImportedModules)
+  for (auto module : ImplicitImportsForModuleInterface)
     modules.push_back(module);
 }
 
@@ -2053,12 +2136,23 @@ bool ModuleDecl::registerEntryPointFile(
 }
 
 void ModuleDecl::collectLinkLibraries(LinkLibraryCallback callback) const {
-  // FIXME: The proper way to do this depends on the decls used.
-  FORWARD(collectLinkLibraries, (callback));
-}
+  bool hasSourceFile = false;
 
-void
-SourceFile::collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const {
+  for (auto *file : getFiles()) {
+    if (isa<SourceFile>(file)) {
+      hasSourceFile = true;
+    } else {
+      file->collectLinkLibraries(callback);
+    }
+
+    if (auto *synth = file->getSynthesizedFile()) {
+      synth->collectLinkLibraries(callback);
+    }
+  }
+
+  if (!hasSourceFile)
+    return;
+
   llvm::SmallDenseSet<ModuleDecl *, 32> visited;
   SmallVector<ImportedModule, 32> stack;
 
@@ -2066,17 +2160,15 @@ SourceFile::collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const
       ModuleDecl::ImportFilterKind::Exported,
       ModuleDecl::ImportFilterKind::Default};
 
-  auto *topLevel = getParentModule();
-
   ModuleDecl::ImportFilter topLevelFilter = filter;
   topLevelFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
   topLevelFilter |= ModuleDecl::ImportFilterKind::InternalOrBelow;
   topLevelFilter |= ModuleDecl::ImportFilterKind::PackageOnly,
   topLevelFilter |= ModuleDecl::ImportFilterKind::SPIOnly;
-  topLevel->getImportedModules(stack, topLevelFilter);
+  getImportedModules(stack, topLevelFilter);
 
   // Make sure the top-level module is first; we want pre-order-ish traversal.
-  stack.emplace_back(ImportPath::Access(), topLevel);
+  stack.emplace_back(ImportPath::Access(), const_cast<ModuleDecl *>(this));
 
   while (!stack.empty()) {
     auto next = stack.pop_back_val().importedModule;
@@ -2084,13 +2176,16 @@ SourceFile::collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const
     if (!visited.insert(next).second)
       continue;
 
-    if (next->getName() != getParentModule()->getName()) {
+    if (next->getName() != getName()) {
       next->collectLinkLibraries(callback);
     }
 
     next->getImportedModules(stack, filter);
   }
 }
+
+void
+SourceFile::collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const {}
 
 bool ModuleDecl::walk(ASTWalker &Walker) {
   llvm::SaveAndRestore<ASTWalker::ParentTy> SAR(Walker.Parent, this);
@@ -2393,7 +2488,7 @@ ModuleDecl::getDeclaringModuleAndBystander() {
   return *(declaringModuleAndBystander = {nullptr, Identifier()});
 }
 
-bool ModuleDecl::isClangOverlayOf(ModuleDecl *potentialUnderlying) {
+bool ModuleDecl::isClangOverlayOf(ModuleDecl *potentialUnderlying) const {
   return getUnderlyingModuleIfOverlay() == potentialUnderlying;
 }
 
@@ -2592,9 +2687,11 @@ ImportDeclRequest::evaluate(Evaluator &evaluator, const SourceFile *sf,
   auto &ctx = sf->getASTContext();
   auto imports = sf->getImports();
 
+  auto mutModule = const_cast<ModuleDecl *>(module);
   // Look to see if the owning module was directly imported.
   for (const auto &import : imports) {
-    if (import.module.importedModule == module)
+    if (import.module.importedModule
+            ->isSameModuleLookingThroughOverlays(mutModule))
       return import;
   }
 
@@ -2603,7 +2700,8 @@ ImportDeclRequest::evaluate(Evaluator &evaluator, const SourceFile *sf,
   for (const auto &import : imports) {
     auto &importSet = importCache.getImportSet(import.module.importedModule);
     for (const auto &transitive : importSet.getTransitiveImports()) {
-      if (transitive.importedModule == module) {
+      if (transitive.importedModule
+              ->isSameModuleLookingThroughOverlays(mutModule)) {
         return import;
       }
     }
@@ -2631,15 +2729,33 @@ SourceFile::getMaxAccessLevelUsingImport(
   return known->second;
 }
 
-void SourceFile::registerAccessLevelUsingImport(
-    AttributedImport<ImportedModule> import,
-    AccessLevel accessLevel) {
-  auto mod = import.module.importedModule;
+void SourceFile::registerRequiredAccessLevelForModule(ModuleDecl *mod,
+                                                      AccessLevel accessLevel) {
   auto known = ImportsUseAccessLevel.find(mod);
   if (known == ImportsUseAccessLevel.end())
     ImportsUseAccessLevel[mod] = accessLevel;
   else
     ImportsUseAccessLevel[mod] = std::max(accessLevel, known->second);
+
+  // Also register modules triggering the import of cross-import overlays.
+  auto declaringMod = mod->getDeclaringModuleIfCrossImportOverlay();
+  if (!declaringMod)
+    return;
+
+  SmallVector<Identifier, 1> bystanders;
+  auto bystandersValid =
+    mod->getRequiredBystandersIfCrossImportOverlay(declaringMod, bystanders);
+  if (!bystandersValid)
+    return;
+
+  for (auto &otherImport : *Imports) {
+    auto otherImportMod = otherImport.module.importedModule;
+    auto otherImportModName = otherImportMod->getName();
+    if (otherImportMod == declaringMod ||
+        llvm::find(bystanders, otherImportModName) != bystanders.end()) {
+      registerRequiredAccessLevelForModule(otherImportMod, accessLevel);
+    }
+  }
 }
 
 bool HasImportsMatchingFlagRequest::evaluate(Evaluator &evaluator,
@@ -2700,6 +2816,15 @@ bool SourceFile::hasImportsWithFlag(ImportFlags flag) const {
   auto *mutableThis = const_cast<SourceFile *>(this);
   return evaluateOrDefault(
       ctx.evaluator, HasImportsMatchingFlagRequest{mutableThis, flag}, false);
+}
+
+void SourceFile::forEachImportOfModule(
+    const ModuleDecl *module,
+    llvm::function_ref<void(AttributedImport<ImportedModule> &)> callback) {
+  for (auto import : *Imports) {
+    if (import.module.importedModule == module)
+      callback(import);
+  }
 }
 
 bool SourceFile::hasTestableOrPrivateImport(
@@ -2835,62 +2960,12 @@ IfConfigClauseRangeInfo::getWholeRange(const SourceManager &SM) const {
 
 void SourceFile::recordIfConfigClauseRangeInfo(
     const IfConfigClauseRangeInfo &range) {
+#if SWIFT_BUILD_SWIFT_SYNTAX
+  // Don't record ranges; they'll be extracted from swift-syntax when needed.
+#else
   IfConfigClauseRanges.Ranges.push_back(range);
   IfConfigClauseRanges.IsSorted = false;
-}
-
-ArrayRef<IfConfigClauseRangeInfo> SourceFile::getIfConfigClauseRanges() const {
-  if (!IfConfigClauseRanges.IsSorted) {
-    auto &SM = getASTContext().SourceMgr;
-    // Sort the ranges if we need to.
-    llvm::sort(
-        IfConfigClauseRanges.Ranges, [&](const IfConfigClauseRangeInfo &lhs,
-                                         const IfConfigClauseRangeInfo &rhs) {
-          return SM.isBeforeInBuffer(lhs.getStartLoc(), rhs.getStartLoc());
-        });
-
-    // Be defensive and eliminate duplicates in case we've parsed twice.
-    auto newEnd = llvm::unique(
-        IfConfigClauseRanges.Ranges, [&](const IfConfigClauseRangeInfo &lhs,
-                                         const IfConfigClauseRangeInfo &rhs) {
-          if (lhs.getStartLoc() != rhs.getStartLoc())
-            return false;
-          assert(lhs.getBodyRange(SM) == rhs.getBodyRange(SM) &&
-                 "range changed on a re-parse?");
-          return true;
-        });
-    IfConfigClauseRanges.Ranges.erase(newEnd,
-                                      IfConfigClauseRanges.Ranges.end());
-    IfConfigClauseRanges.IsSorted = true;
-  }
-
-  return IfConfigClauseRanges.Ranges;
-}
-
-ArrayRef<IfConfigClauseRangeInfo>
-SourceFile::getIfConfigClausesWithin(SourceRange outer) const {
-  auto &SM = getASTContext().SourceMgr;
-  assert(SM.getRangeForBuffer(BufferID).contains(outer.Start) &&
-         "Range not within this file?");
-
-  // First let's find the first #if that is after the outer start loc.
-  auto ranges = getIfConfigClauseRanges();
-  auto lower = llvm::lower_bound(
-      ranges, outer.Start,
-      [&](const IfConfigClauseRangeInfo &range, SourceLoc loc) {
-        return SM.isBeforeInBuffer(range.getStartLoc(), loc);
-      });
-  if (lower == ranges.end() ||
-      SM.isBeforeInBuffer(outer.End, lower->getStartLoc())) {
-    return {};
-  }
-  // Next let's find the first #if that's after the outer end loc.
-  auto upper = llvm::upper_bound(
-      ranges, outer.End,
-      [&](SourceLoc loc, const IfConfigClauseRangeInfo &range) {
-        return SM.isBeforeInBuffer(loc, range.getStartLoc());
-      });
-  return llvm::ArrayRef(lower, upper - lower);
+#endif
 }
 
 void ModuleDecl::setPackageName(Identifier name) {
@@ -2995,35 +3070,6 @@ bool SourceFile::isImportedAsSPI(const ValueDecl *targetDecl) const {
   return false;
 }
 
-bool SourceFile::importsModuleAsWeakLinked(const ModuleDecl *module) const {
-  for (auto &import : *Imports) {
-    if (!import.options.contains(ImportFlags::WeakLinked))
-      continue;
-
-    const ModuleDecl *importedModule = import.module.importedModule;
-    if (module == importedModule)
-      return true;
-
-    // Also check whether the target module is actually the underlyingClang
-    // module for this @_weakLinked import.
-    const ModuleDecl *clangModule =
-        importedModule->getUnderlyingModuleIfOverlay();
-    if (module == clangModule)
-      return true;
-
-    // Traverse the exported modules of this weakly-linked module to ensure
-    // that we weak-link declarations from its exported peers.
-    SmallVector<ImportedModule, 8> reexportedModules;
-    importedModule->getImportedModules(reexportedModules,
-                                       ModuleDecl::ImportFilterKind::Exported);
-    for (const ImportedModule &reexportedModule : reexportedModules) {
-      if (module == reexportedModule.importedModule)
-        return true;
-    }
-  }
-  return false;
-}
-
 bool ModuleDecl::isImportedAsSPI(const SpecializeAttr *attr,
                                  const ValueDecl *targetDecl) const {
   auto declSPIGroups = attr->getSPIGroups();
@@ -3055,11 +3101,7 @@ bool ModuleDecl::isImportedAsSPI(Identifier spiGroup,
 }
 
 bool ModuleDecl::isImportedAsWeakLinked(const ModuleDecl *module) const {
-  for (auto file : getFiles()) {
-    if (file->importsModuleAsWeakLinked(module))
-      return true;
-  }
-  return false;
+  return getASTContext().getImportCache().isWeakImportedBy(module, this);
 }
 
 bool Decl::isSPI() const {
@@ -3459,6 +3501,7 @@ void SourceFile::typeCheckDelayedFunctions() {
     auto *AFD = DelayedFunctions[i];
     assert(!AFD->getDeclContext()->isLocalContext());
     AFD->getTypecheckedBody();
+    (void) AFD->getCaptureInfo();
   }
 
   DelayedFunctions.clear();

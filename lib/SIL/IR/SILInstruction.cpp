@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SIL/SILInstruction.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/AssertImplements.h"
 #include "swift/Basic/Unicode.h"
 #include "swift/Basic/type_traits.h"
@@ -125,7 +126,7 @@ void SILInstruction::moveBefore(SILInstruction *Later) {
 }
 
 namespace swift::test {
-FunctionTest MoveBeforeTest("instruction-move-before",
+FunctionTest MoveBeforeTest("instruction_move_before",
                             [](auto &function, auto &arguments, auto &test) {
                               auto *inst = arguments.takeInstruction();
                               auto *other = arguments.takeInstruction();
@@ -537,7 +538,7 @@ namespace {
     bool visitStringLiteralInst(const StringLiteralInst *RHS) {
       auto LHS_ = cast<StringLiteralInst>(LHS);
       return LHS_->getEncoding() == RHS->getEncoding()
-        && LHS_->getValue().equals(RHS->getValue());
+        && LHS_->getValue() == RHS->getValue();
     }
 
     bool visitStructInst(const StructInst *RHS) {
@@ -1417,8 +1418,10 @@ bool SILInstruction::isTriviallyDuplicatable() const {
 
   if (isa<OpenExistentialAddrInst>(this) || isa<OpenExistentialRefInst>(this) ||
       isa<OpenExistentialMetatypeInst>(this) ||
-      isa<OpenExistentialValueInst>(this) || isa<OpenExistentialBoxInst>(this) ||
-      isa<OpenExistentialBoxValueInst>(this)) {
+      isa<OpenExistentialValueInst>(this) ||
+      isa<OpenExistentialBoxInst>(this) ||
+      isa<OpenExistentialBoxValueInst>(this) ||
+      isa<OpenPackElementInst>(this)) {
     // Don't know how to duplicate these properly yet. Inst.clone() per
     // instruction does not work. Because the follow-up instructions need to
     // reuse the same archetype uuid which would only work if we used a
@@ -1478,9 +1481,8 @@ bool SILInstruction::mayTrap() const {
 }
 
 bool SILInstruction::isMetaInstruction() const {
-  // Every instruction that implements getVarInfo() should be in this list.
+  // Every instruction that doesn't generate code should be in this list.
   switch (getKind()) {
-  case SILInstructionKind::AllocBoxInst:
   case SILInstructionKind::AllocStackInst:
   case SILInstructionKind::DebugValueInst:
     return true;
@@ -1811,7 +1813,7 @@ visitRecursivelyLifetimeEndingUses(
     }
     if (auto *ret = dyn_cast<ReturnInst>(use->getUser())) {
       auto fnTy = ret->getFunction()->getLoweredFunctionType();
-      assert(!fnTy->getLifetimeDependenceInfo().empty());
+      assert(!fnTy->getLifetimeDependencies().empty());
       if (!visitScopeEnd(use)) {
         return false;
       }

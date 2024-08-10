@@ -37,6 +37,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Parse/Lexer.h"
@@ -284,7 +285,6 @@ TypeCheckSourceFileRequest::evaluate(Evaluator &eval, SourceFile *SF) const {
     for (auto D : SF->getTopLevelDecls()) {
       if (auto *TLCD = dyn_cast<TopLevelCodeDecl>(D)) {
         TypeChecker::typeCheckTopLevelCodeDecl(TLCD);
-        TypeChecker::contextualizeTopLevelCode(TLCD);
       } else {
         TypeChecker::typeCheckDecl(D);
       }
@@ -316,8 +316,13 @@ TypeCheckSourceFileRequest::evaluate(Evaluator &eval, SourceFile *SF) const {
     SF->typeCheckDelayedFunctions();
   }
 
-  diagnoseUnnecessaryPreconcurrencyImports(*SF);
+  // If region based isolation is enabled, we diagnose unnecessary
+  // preconcurrency imports in the SIL pipeline in the
+  // DiagnoseUnnecessaryPreconcurrencyImports pass.
+  if (!Ctx.LangOpts.hasFeature(Feature::RegionBasedIsolation))
+    diagnoseUnnecessaryPreconcurrencyImports(*SF);
   diagnoseUnnecessaryPublicImports(*SF);
+  diagnoseMissingImports(*SF);
 
   // Check to see if there are any inconsistent imports.
   // Whole-module @_implementationOnly imports.
@@ -377,6 +382,7 @@ void swift::performWholeModuleTypeChecking(SourceFile &SF) {
   case SourceFileKind::Main:
   case SourceFileKind::MacroExpansion:
     diagnoseObjCMethodConflicts(SF);
+    diagnoseObjCCategoryConflicts(SF);
     diagnoseObjCUnsatisfiedOptReqConflicts(SF);
     diagnoseUnintendedObjCMethodOverrides(SF);
     diagnoseAttrsAddedByAccessNote(SF);
@@ -566,9 +572,9 @@ bool swift::typeCheckForCodeCompletion(
                                                  callback);
 }
 
-Expr *swift::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE, DeclContext *Context,
-                                bool replaceInvalidRefsWithErrors) {
-  return TypeChecker::resolveDeclRefExpr(UDRE, Context, replaceInvalidRefsWithErrors);
+Expr *swift::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
+                                DeclContext *Context) {
+  return TypeChecker::resolveDeclRefExpr(UDRE, Context);
 }
 
 void TypeChecker::checkForForbiddenPrefix(ASTContext &C, DeclBaseName Name) {
@@ -591,11 +597,11 @@ DeclTypeCheckingSemantics
 TypeChecker::getDeclTypeCheckingSemantics(ValueDecl *decl) {
   // Check for a @_semantics attribute.
   if (auto semantics = decl->getAttrs().getAttribute<SemanticsAttr>()) {
-    if (semantics->Value.equals("typechecker.type(of:)"))
+    if (semantics->Value == "typechecker.type(of:)")
       return DeclTypeCheckingSemantics::TypeOf;
-    if (semantics->Value.equals("typechecker.withoutActuallyEscaping(_:do:)"))
+    if (semantics->Value == "typechecker.withoutActuallyEscaping(_:do:)")
       return DeclTypeCheckingSemantics::WithoutActuallyEscaping;
-    if (semantics->Value.equals("typechecker._openExistential(_:do:)"))
+    if (semantics->Value == "typechecker._openExistential(_:do:)")
       return DeclTypeCheckingSemantics::OpenExistential;
   }
   return DeclTypeCheckingSemantics::Normal;
@@ -607,7 +613,7 @@ bool TypeChecker::isDifferentiable(Type type, bool tangentVectorEqualsSelf,
   if (stage)
     type = dc->mapTypeIntoContext(type);
   auto tanSpace = type->getAutoDiffTangentSpace(
-      LookUpConformanceInModule(dc->getParentModule()));
+      LookUpConformanceInModule());
   if (!tanSpace)
     return false;
   // If no `Self == Self.TangentVector` requirement, return true.

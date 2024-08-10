@@ -21,6 +21,7 @@
 #include "TypeChecker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -28,6 +29,7 @@
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Sema/ConstraintGraph.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "swift/Sema/IDETypeChecking.h"
@@ -870,6 +872,14 @@ void TypeVarRefCollector::inferTypeVars(Decl *D) {
   TypeVars.insert(typeVars.begin(), typeVars.end());
 }
 
+void TypeVarRefCollector::inferTypeVars(PackExpansionExpr *E) {
+  auto expansionType = CS.getType(E)->castTo<PackExpansionType>();
+
+  SmallPtrSet<TypeVariableType *, 4> referencedVars;
+  expansionType->getTypeVariables(referencedVars);
+  TypeVars.insert(referencedVars.begin(), referencedVars.end());
+}
+
 ASTWalker::PreWalkResult<Expr *>
 TypeVarRefCollector::walkToExprPre(Expr *expr) {
   if (isa<ClosureExpr>(expr))
@@ -891,6 +901,14 @@ TypeVarRefCollector::walkToExprPre(Expr *expr) {
       inferTypeVars(D);
     }
   }
+
+  if (auto *packElement = getAsExpr<PackElementExpr>(expr)) {
+    // If environment hasn't been established yet, it means that pack expansion
+    // appears inside of this closure.
+    if (auto *outerEnvironment = CS.getPackEnvironment(packElement))
+      inferTypeVars(outerEnvironment);
+  }
+
   return Action::Continue(expr);
 }
 
@@ -933,7 +951,7 @@ namespace {
     llvm::MapVector<UnresolvedMemberExpr *, Type> UnresolvedBaseTypes;
 
     /// A stack of pack expansions that can open pack elements.
-    llvm::SmallVector<PackExpansionExpr *, 2> PackElementEnvironments;
+    llvm::SmallVector<PackExpansionExpr *, 1> OuterExpansions;
 
     /// Returns false and emits the specified diagnostic if the member reference
     /// base is a nil literal. Returns true otherwise.
@@ -1000,7 +1018,7 @@ namespace {
       }
       unsigned options = (TVO_CanBindToLValue |
                           TVO_CanBindToNoEscape);
-      if (!PackElementEnvironments.empty())
+      if (!OuterExpansions.empty())
         options |= TVO_CanBindToPack;
 
       auto tv = CS.createTypeVariable(
@@ -1185,6 +1203,12 @@ namespace {
       // result builders could generate constraints for its body
       // in the middle of the solving.
       CS.setPhase(ConstraintSystemPhase::ConstraintGeneration);
+
+      // Pick up the saved stack of pack expansions so we can continue
+      // to handle pack element references inside the closure body.
+      if (auto *ACE = dyn_cast<AbstractClosureExpr>(CurDC)) {
+        OuterExpansions = CS.getCapturedExpansions(ACE);
+      }
     }
 
     virtual ~ConstraintGenerator() {
@@ -1193,8 +1217,8 @@ namespace {
 
     ConstraintSystem &getConstraintSystem() const { return CS; }
 
-    void addPackElementEnvironment(PackExpansionExpr *expr) {
-      PackElementEnvironments.push_back(expr);
+    void pushPackExpansionExpr(PackExpansionExpr *expr) {
+      OuterExpansions.push_back(expr);
 
       SmallVector<ASTNode, 2> expandedPacks;
       collectExpandedPacks(expr, expandedPacks);
@@ -1213,6 +1237,7 @@ namespace {
           CS.getConstraintLocator(expr, ConstraintLocator::PackShape);
       auto *shapeTypeVar = CS.createTypeVariable(
           shapeLoc, TVO_CanBindToPack | TVO_CanBindToHole);
+
       auto expansionType = PackExpansionType::get(patternType, shapeTypeVar);
       CS.setType(expr, expansionType);
     }
@@ -1585,7 +1610,7 @@ namespace {
 
       unsigned options = (TVO_CanBindToLValue |
                           TVO_CanBindToNoEscape);
-      if (!PackElementEnvironments.empty())
+      if (!OuterExpansions.empty())
         options |= TVO_CanBindToPack;
 
       // Create an overload choice referencing this declaration and immediately
@@ -1607,25 +1632,37 @@ namespace {
         return E->getType();
 
       // Resolve the super type of 'self'.
-      return getSuperType(E->getSelf(), E->getLoc(),
-                          diag::super_not_in_class_method,
-                          diag::super_with_no_base_class);
+      auto *selfDecl = E->getSelf();
+
+      DeclContext *typeContext = selfDecl->getDeclContext()->getParent();
+      assert(typeContext);
+
+      auto selfTy =
+          CS.DC->mapTypeIntoContext(typeContext->getDeclaredInterfaceType());
+      auto superclassTy = selfTy->getSuperclass();
+
+      if (!superclassTy)
+        return Type();
+
+      if (selfDecl->getInterfaceType()->is<MetatypeType>())
+        superclassTy = MetatypeType::get(superclassTy);
+
+      return superclassTy;
     }
 
     Type
-    resolveTypeReferenceInExpression(TypeRepr *repr, TypeResolverContext resCtx,
+    resolveTypeReferenceInExpression(TypeRepr *repr,
+                                     TypeResolutionOptions options,
                                      const ConstraintLocatorBuilder &locator) {
-      TypeResolutionOptions options(resCtx);
-
       // Introduce type variables for unbound generics.
       const auto genericOpener = OpenUnboundGenericType(CS, locator);
       const auto placeholderHandler = HandlePlaceholderType(CS, locator);
 
       // Add a PackElementOf constraint for 'each T' type reprs.
       PackExpansionExpr *elementEnv = nullptr;
-      if (!PackElementEnvironments.empty()) {
+      if (!OuterExpansions.empty()) {
         options |= TypeResolutionFlags::AllowPackReferences;
-        elementEnv = PackElementEnvironments.back();
+        elementEnv = OuterExpansions.back();
       }
       const auto packElementOpener = OpenPackElementType(CS, locator, elementEnv);
 
@@ -1640,9 +1677,9 @@ namespace {
                                      TVO_CanBindToHole);
       }
       // Diagnose top-level usages of placeholder types.
-      if (isa<PlaceholderTypeRepr>(repr->getWithoutParens())) {
-        CS.getASTContext().Diags.diagnose(repr->getLoc(),
-                                          diag::placeholder_type_not_allowed);
+      if (auto *ty = dyn_cast<PlaceholderTypeRepr>(repr->getWithoutParens())) {
+        auto *loc = CS.getConstraintLocator(locator, {LocatorPathElt::PlaceholderType(ty)});
+        CS.recordFix(IgnoreInvalidPlaceholder::create(CS, loc));
       }
       return result;
     }
@@ -1867,74 +1904,48 @@ namespace {
     /// introduce them as an explicit generic arguments constraint.
     ///
     /// \returns true if resolving any of the specialization types failed.
-    bool addSpecializationConstraint(
-        ConstraintLocator *locator, Type boundType,
-        ArrayRef<TypeRepr *> specializationArgs) {
+    void addSpecializationConstraint(ConstraintLocator *locator, Type boundType,
+                                     SourceLoc lAngleLoc,
+                                     ArrayRef<TypeRepr *> specializationArgs) {
       // Resolve each type.
       SmallVector<Type, 2> specializationArgTypes;
       auto options =
           TypeResolutionOptions(TypeResolverContext::InExpression);
       for (auto specializationArg : specializationArgs) {
         PackExpansionExpr *elementEnv = nullptr;
-        if (!PackElementEnvironments.empty()) {
+        if (!OuterExpansions.empty()) {
           options |= TypeResolutionFlags::AllowPackReferences;
-          elementEnv = PackElementEnvironments.back();
+          elementEnv = OuterExpansions.back();
         }
-        const auto result = TypeResolution::resolveContextualType(
+        auto result = TypeResolution::resolveContextualType(
             specializationArg, CurDC, options,
             // Introduce type variables for unbound generics.
             OpenUnboundGenericType(CS, locator),
             HandlePlaceholderType(CS, locator),
             OpenPackElementType(CS, locator, elementEnv));
-        if (result->hasError())
-          return true;
-
+        if (result->hasError()) {
+          auto &ctxt = CS.getASTContext();
+          result = PlaceholderType::get(ctxt, specializationArg);
+          ctxt.Diags.diagnose(lAngleLoc,
+                              diag::while_parsing_as_left_angle_bracket);
+        }
         specializationArgTypes.push_back(result);
       }
 
-      CS.addConstraint(
-          ConstraintKind::ExplicitGenericArguments, boundType,
-          PackType::get(CS.getASTContext(), specializationArgTypes),
-          locator);
-      return false;
+      auto constraint = Constraint::create(
+          CS, ConstraintKind::ExplicitGenericArguments, boundType,
+          PackType::get(CS.getASTContext(), specializationArgTypes), locator);
+      CS.addUnsolvedConstraint(constraint);
+      CS.activateConstraint(constraint);
     }
 
     Type visitUnresolvedSpecializeExpr(UnresolvedSpecializeExpr *expr) {
       auto baseTy = CS.getType(expr->getSubExpr());
-
-      if (baseTy->isTypeVariableOrMember()) {
-        return baseTy;
-      }
-
-      // We currently only support explicit specialization of generic types.
-      // FIXME: We could support explicit function specialization.
-      auto &de = CS.getASTContext().Diags;
-      if (baseTy->is<AnyFunctionType>()) {
-        de.diagnose(expr->getSubExpr()->getLoc(),
-                    diag::cannot_explicitly_specialize_generic_function);
-        de.diagnose(expr->getLAngleLoc(),
-                    diag::while_parsing_as_left_angle_bracket);
-        return Type();
-      }
-      
-      if (AnyMetatypeType *meta = baseTy->getAs<AnyMetatypeType>()) {
-        auto *overloadLocator = CS.getConstraintLocator(expr->getSubExpr());
-        if (addSpecializationConstraint(overloadLocator,
-                                        meta->getInstanceType(),
-                                        expr->getUnresolvedParams())) {
-          return Type();
-        }
-
-        return baseTy;
-      }
-
-      // FIXME: If the base type is a type variable, constrain it to a metatype
-      // of a bound generic type.
-      de.diagnose(expr->getSubExpr()->getLoc(),
-                  diag::not_a_generic_definition);
-      de.diagnose(expr->getLAngleLoc(),
-                  diag::while_parsing_as_left_angle_bracket);
-      return Type();
+      auto *overloadLocator = CS.getConstraintLocator(expr->getSubExpr());
+      addSpecializationConstraint(
+          overloadLocator, baseTy->getMetatypeInstanceType(),
+          expr->getLAngleLoc(), expr->getUnresolvedParams());
+      return baseTy;
     }
     
     Type visitSequenceExpr(SequenceExpr *expr) {
@@ -2139,15 +2150,13 @@ namespace {
         if (!contextualType)
           return false;
 
-        auto *M = CS.DC->getParentModule();
-
         auto type = contextualType->lookThroughAllOptionalTypes();
 
-        if (M->lookupConformance(type, arrayProto))
+        if (lookupConformance(type, arrayProto))
           return false;
 
         if (auto *proto = ctx.getProtocol(KnownProtocolKind::ExpressibleByDictionaryLiteral))
-          if (M->lookupConformance(type, proto))
+          if (lookupConformance(type, proto))
             return true;
 
         return false;
@@ -2505,9 +2514,11 @@ namespace {
             return declaredTy;
           }
 
+          auto options =
+              TypeResolutionOptions(TypeResolverContext::InExpression);
+          options.setContext(TypeResolverContext::ClosureExpr);
           const auto resolvedTy = resolveTypeReferenceInExpression(
-              closure->getExplicitResultTypeRepr(),
-              TypeResolverContext::InExpression, resultLocator);
+              closure->getExplicitResultTypeRepr(), options, resultLocator);
           if (resolvedTy)
             return resolvedTy;
         }
@@ -2551,6 +2562,10 @@ namespace {
         return FunctionTypeIsolation::forNonIsolated();
       }();
       extInfo = extInfo.withIsolation(isolation);
+      if (isolation.isGlobalActor() &&
+          CS.getASTContext().LangOpts.hasFeature(Feature::GlobalActorIsolatedTypesUsability)) {
+        extInfo = extInfo.withSendable();
+      }
 
       auto *fnTy = FunctionType::get(closureParams, resultTy, extInfo);
       return CS.replaceInferableTypesWithTypeVars(
@@ -3042,6 +3057,9 @@ namespace {
           Constraint::create(CS, ConstraintKind::FallbackType, closureType,
                              inferredType, locator, referencedVars));
 
+      if (!OuterExpansions.empty())
+        CS.setCapturedExpansions(closure, OuterExpansions);
+
       CS.setClosureType(closure, inferredType);
       return closureType;
     }
@@ -3147,8 +3165,8 @@ namespace {
     }
 
     Type visitPackExpansionExpr(PackExpansionExpr *expr) {
-      assert(PackElementEnvironments.back() == expr);
-      PackElementEnvironments.pop_back();
+      assert(OuterExpansions.back() == expr);
+      OuterExpansions.pop_back();
 
       auto expansionType = CS.getType(expr)->castTo<PackExpansionType>();
       auto elementResultType = CS.getType(expr->getPatternExpr());
@@ -3169,7 +3187,7 @@ namespace {
       for (auto pack : expandedPacks) {
         Type packType;
         /// Skipping over pack elements because the relationship to its
-        /// environment is now established during \c addPackElementEnvironment
+        /// environment is now established during \c pushPackExpansionExpr
         /// upon visiting its pack expansion and the Shape constraint added
         /// upon visiting the pack element.
         if (isExpr<PackElementExpr>(pack)) {
@@ -3298,37 +3316,6 @@ namespace {
       return resultType;
     }
 
-    Type getSuperType(VarDecl *selfDecl,
-                      SourceLoc diagLoc,
-                      Diag<> diag_not_in_class,
-                      Diag<> diag_no_base_class) {
-      DeclContext *typeContext = selfDecl->getDeclContext()->getParent();
-      assert(typeContext && "constructor without parent context?!");
-
-      auto &de = CS.getASTContext().Diags;
-      ClassDecl *classDecl = typeContext->getSelfClassDecl();
-      if (!classDecl) {
-        de.diagnose(diagLoc, diag_not_in_class);
-        return Type();
-      }
-      if (!classDecl->hasSuperclass()) {
-        de.diagnose(diagLoc, diag_no_base_class);
-        return Type();
-      }
-
-      auto selfTy = CS.DC->mapTypeIntoContext(
-        typeContext->getDeclaredInterfaceType());
-      auto superclassTy = selfTy->getSuperclass();
-
-      if (!superclassTy)
-        return Type();
-
-      if (selfDecl->getInterfaceType()->is<MetatypeType>())
-        superclassTy = MetatypeType::get(superclassTy);
-
-      return superclassTy;
-    }
-    
     Type visitRebindSelfInConstructorExpr(RebindSelfInConstructorExpr *expr) {
       // The result is void.
       return TupleType::getEmpty(CS.getASTContext());
@@ -4068,10 +4055,9 @@ namespace {
 
       // Add explicit generic arguments, if there were any.
       if (expr->getGenericArgsRange().isValid()) {
-        if (addSpecializationConstraint(
-              CS.getConstraintLocator(expr), macroRefType,
-              expr->getGenericArgs()))
-          return Type();
+        addSpecializationConstraint(CS.getConstraintLocator(expr), macroRefType,
+                                    expr->getGenericArgsRange().Start,
+                                    expr->getGenericArgs());
       }
 
       // Form the applicable-function constraint. The result type
@@ -4103,7 +4089,7 @@ namespace {
         return false;
 
       auto member = UDE->getName().getBaseName().userFacingName();
-      return member.equals("trigger_fallback_diagnostic");
+      return member == "trigger_fallback_diagnostic";
     }
 
     enum class TypeOperation { None,
@@ -4319,7 +4305,7 @@ namespace {
       }
 
       if (auto *expansion = dyn_cast<PackExpansionExpr>(expr)) {
-        CG.addPackElementEnvironment(expansion);
+        CG.pushPackExpansionExpr(expansion);
       }
 
       return Action::Continue(expr);
@@ -4399,8 +4385,6 @@ static Expr *generateConstraintsFor(ConstraintSystem &cs, Expr *expr,
 
 bool ConstraintSystem::generateWrappedPropertyTypeConstraints(
     VarDecl *wrappedVar, Type initializerType, Type propertyType) {
-  auto dc = wrappedVar->getInnermostDeclContext();
-
   Type wrappedValueType;
   Type wrapperType;
   auto wrapperAttributes = wrappedVar->getAttachedPropertyWrappers();
@@ -4434,7 +4418,7 @@ bool ConstraintSystem::generateWrappedPropertyTypeConstraints(
     setType(typeExpr, wrapperType);
 
     wrappedValueType = wrapperType->getTypeOfMember(
-        dc->getParentModule(), wrapperInfo.valueVar);
+        wrapperInfo.valueVar);
   }
 
   // The property type must be equal to the wrapped value type
@@ -4638,7 +4622,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
     // `next` is always async but witness might not be throwing
     if (isAsync) {
       nextCall =
-          AwaitExpr::createImplicit(ctx, /*awaitLoc=*/SourceLoc(), nextCall);
+          AwaitExpr::createImplicit(ctx, nextCall->getLoc(), nextCall);
     }
 
     // The iterator type must conform to IteratorProtocol.
@@ -4818,11 +4802,11 @@ bool ConstraintSystem::generateConstraints(
         // If we have a placeholder originating from a PlaceholderTypeRepr,
         // tack that on to the locator.
         if (auto *placeholderTy = ty->getAs<PlaceholderType>())
-          if (auto *placeholderRepr = placeholderTy->getOriginator()
-                                          .dyn_cast<PlaceholderTypeRepr *>())
+          if (auto *typeRepr = placeholderTy->getOriginator()
+                                          .dyn_cast<TypeRepr *>())
             return getConstraintLocator(
                 convertTypeLocator,
-                LocatorPathElt::PlaceholderType(placeholderRepr));
+                LocatorPathElt::PlaceholderType(typeRepr));
         return convertTypeLocator;
       };
 

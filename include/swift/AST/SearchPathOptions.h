@@ -20,6 +20,7 @@
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/VersionTuple.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include <optional>
 
@@ -36,6 +37,15 @@ enum class ModuleSearchPathKind {
   Framework,
   DarwinImplicitFramework,
   RuntimeLibrary,
+};
+
+/// Specifies how to load modules when both a module interface and serialized
+/// AST are present, or whether to disallow one format or the other altogether.
+enum class ModuleLoadingMode {
+  PreferInterface,
+  PreferSerialized,
+  OnlyInterface,
+  OnlySerialized
 };
 
 /// A single module search path that can come from different sources, e.g.
@@ -363,10 +373,12 @@ private:
                            FrameworkSearchPaths.size() - 1);
   }
 
-  std::optional<StringRef> WinSDKRoot = std::nullopt;
-  std::optional<StringRef> WinSDKVersion = std::nullopt;
-  std::optional<StringRef> VCToolsRoot = std::nullopt;
-  std::optional<StringRef> VCToolsVersion = std::nullopt;
+  std::optional<std::string> WinSDKRoot = std::nullopt;
+  std::optional<std::string> WinSDKVersion = std::nullopt;
+  std::optional<std::string> VCToolsRoot = std::nullopt;
+  std::optional<std::string> VCToolsVersion = std::nullopt;
+
+  std::optional<StringRef> SysRoot = std::nullopt;
 
 public:
   StringRef getSDKPath() const { return SDKPath; }
@@ -404,6 +416,11 @@ public:
   std::optional<StringRef> getVCToolsVersion() const { return VCToolsVersion; }
   void setVCToolsVersion(StringRef version) {
     VCToolsVersion = version;
+  }
+
+  std::optional<StringRef> getSysRoot() const { return SysRoot; }
+  void setSysRoot(StringRef sysroot) {
+    SysRoot = sysroot;
   }
 
   ArrayRef<std::string> getImportSearchPaths() const {
@@ -459,6 +476,9 @@ public:
   /// Plugin search path options.
   std::vector<PluginSearchOption> PluginSearchOpts;
 
+  /// Path to in-process plugin server shared library.
+  std::string InProcessPluginServerPath;
+
   /// Don't look in for compiler-provided modules.
   bool SkipRuntimeLibraryImportPaths = false;
 
@@ -491,6 +511,26 @@ public:
   /// A file containing a list of protocols whose conformances require const value extraction.
   std::string ConstGatherProtocolListFilePath;
 
+  /// Path to the file that defines platform mapping for availability
+  /// version inheritance.
+  std::optional<std::string> PlatformAvailabilityInheritanceMapPath;
+
+  /// Cross import module information. Map from module name to the list of cross
+  /// import overlay files that associate with that module.
+  using CrossImportMap = llvm::StringMap<std::vector<std::string>>;
+  CrossImportMap CrossImportInfo;
+
+  /// CanImport information passed from scanning.
+  struct CanImportInfo {
+    std::string ModuleName;
+    llvm::VersionTuple Version;
+    llvm::VersionTuple UnderlyingVersion;
+  };
+  std::vector<CanImportInfo> CanImportModuleInfo;
+
+  /// Whether to search for cross import overlay on file system.
+  bool DisableCrossImportOverlaySearch = false;
+
   /// Debug path mappings to apply to serialized search paths. These are
   /// specified in LLDB from the target.source-map entries.
   PathRemapper SearchPathRemapper;
@@ -498,6 +538,13 @@ public:
   /// Recover the search paths deserialized from .swiftmodule files to their
   /// original form.
   PathObfuscator DeserializedPathRecoverer;
+
+  /// Specify the module loading behavior of the compilation.
+  ModuleLoadingMode ModuleLoadMode = ModuleLoadingMode::PreferSerialized;
+
+  /// New scanner search behavior. Validate up-to-date existing Swift module
+  /// dependencies in the scanner itself.
+  bool ScannerModuleValidation = false;
 
   /// Return all module search paths that (non-recursively) contain a file whose
   /// name is in \p Filenames.
@@ -546,7 +593,9 @@ public:
                         RuntimeResourcePath,
                         hash_combine_range(RuntimeLibraryImportPaths.begin(),
                                            RuntimeLibraryImportPaths.end()),
-                        DisableModulesValidateSystemDependencies);
+                        DisableModulesValidateSystemDependencies,
+                        ScannerModuleValidation,
+                        ModuleLoadMode);
   }
 
   /// Return a hash code of any components from these options that should

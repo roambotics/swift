@@ -32,6 +32,7 @@
 #include "swift/AST/AccessScope.h"
 #include "swift/AST/Attr.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/ForeignErrorConvention.h"
@@ -46,7 +47,9 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeWalker.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
+#include "swift/Bridging/ASTGen.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Sema/IDETypeChecking.h"
@@ -210,7 +213,7 @@ public:
       return a.intValue.v0 == b.intValue.v0 &&
              a.intValue.v1 == b.intValue.v1;
     case RawValueKey::Kind::String:
-      return a.stringValue.equals(b.stringValue);
+      return a.stringValue == b.stringValue;
     case RawValueKey::Kind::Bool:
       return a.boolValue == b.boolValue;
     case RawValueKey::Kind::Empty:
@@ -378,8 +381,9 @@ static bool doesAccessorNeedDynamicAttribute(AccessorDecl *accessor) {
 CtorInitializerKind
 InitKindRequest::evaluate(Evaluator &evaluator, ConstructorDecl *decl) const {
   auto &diags = decl->getASTContext().Diags;
+  auto dc = decl->getDeclContext();
 
-  if (auto nominal = decl->getDeclContext()->getSelfNominalTypeDecl()) {
+  if (auto nominal = dc->getSelfNominalTypeDecl()) {
 
     // Convenience inits are only allowed on classes and in extensions thereof.
     if (auto convenAttr = decl->getAttrs().getAttribute<ConvenienceAttr>()) {
@@ -389,6 +393,7 @@ InitKindRequest::evaluate(Evaluator &evaluator, ConstructorDecl *decl) const {
           diags.diagnose(decl->getLoc(),
                 diag::no_convenience_keyword_init, "actors")
             .fixItRemove(convenAttr->getLocation())
+            .warnInSwiftInterface(dc)
             .warnUntilSwiftVersion(6);
 
         } else { // not an actor
@@ -446,7 +451,7 @@ InitKindRequest::evaluate(Evaluator &evaluator, ConstructorDecl *decl) const {
       // (or the same file) to add vtable entries, we can re-evaluate this
       // restriction.
       if (!decl->isSynthesized() &&
-          isa<ExtensionDecl>(decl->getDeclContext()->getImplementedObjCContext()) &&
+          isa<ExtensionDecl>(dc->getImplementedObjCContext()) &&
           !(decl->getAttrs().hasAttribute<DynamicReplacementAttr>())) {
 
         if (classDcl->getForeignClassKind() == ClassDecl::ForeignKind::CFType) {
@@ -475,7 +480,7 @@ InitKindRequest::evaluate(Evaluator &evaluator, ConstructorDecl *decl) const {
   } // end of Nominal context
 
   // initializers in protocol extensions must be convenience inits
-  if (decl->getDeclContext()->getExtendedProtocolDecl()) {
+  if (dc->getExtendedProtocolDecl()) {
     return CtorInitializerKind::Convenience;
   }
 
@@ -682,9 +687,9 @@ ExistentialConformsToSelfRequest::evaluate(Evaluator &evaluator,
                                            ProtocolDecl *decl) const {
   // Marker protocols always self-conform.
   if (decl->isMarkerProtocol()) {
-    // Except for BitwiseCopyable an existential of which is non-trivial.
-    if (decl->getASTContext().LangOpts.hasFeature(Feature::BitwiseCopyable) &&
-        decl->getKnownProtocolKind() == KnownProtocolKind::BitwiseCopyable) {
+    // Except for BitwiseCopyable an existential of which is not bitwise
+    // copyable.
+    if (decl->getKnownProtocolKind() == KnownProtocolKind::BitwiseCopyable) {
       return false;
     }
     return true;
@@ -960,11 +965,6 @@ IsDynamicRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
     return true;
   }
 
-  // @_objcImplementation extension member implementations are implicitly
-  // dynamic.
-  if (decl->isObjCMemberImplementation())
-    return true;
-
   if (auto accessor = dyn_cast<AccessorDecl>(decl)) {
     // Runtime-replaceable accessors are dynamic when their storage declaration
     // is dynamic and they were explicitly defined or they are implicitly defined
@@ -1179,12 +1179,10 @@ swift::computeAutomaticEnumValueKind(EnumDecl *ED) {
   if (ED->getGenericEnvironmentOfContext() != nullptr)
     rawTy = ED->mapTypeIntoContext(rawTy);
 
-  auto *module = ED->getParentModule();
-
   // Swift enums require that the raw type is convertible from one of the
   // primitive literal protocols.
   auto conformsToProtocol = [&](KnownProtocolKind protoKind) {
-    return TypeChecker::conformsToKnownProtocol(rawTy, protoKind, module);
+    return TypeChecker::conformsToKnownProtocol(rawTy, protoKind);
   };
 
   static auto otherLiteralProtocolKinds = {
@@ -2034,7 +2032,12 @@ FunctionOperatorRequest::evaluate(Evaluator &evaluator, FuncDecl *FD) const {
   return op.get();
 }
 
-bool swift::isMemberOperator(FuncDecl *decl, Type type) {
+/// This means two things:
+/// - If selfTy is null, 'decl' is assumed to be a member of a nominal type
+///   or extension. We check if its a valid member operator.
+/// - Otherwise, 'decl' is a member or top-level operator. We check if it
+///   is a suitable witness for the given conforming type.
+bool swift::isMemberOperator(FuncDecl *decl, Type selfTy) {
   // Check that member operators reference the type of 'Self'.
   if (decl->isInvalid())
     return true;
@@ -2042,40 +2045,46 @@ bool swift::isMemberOperator(FuncDecl *decl, Type type) {
   auto *DC = decl->getDeclContext();
 
   auto selfNominal = DC->getSelfNominalTypeDecl();
+  assert(selfNominal || selfTy);
 
-  // Check the parameters for a reference to 'Self'.
+  // Is the operator a member of a protocol or protocol extension?
   bool isProtocol = isa_and_nonnull<ProtocolDecl>(selfNominal);
+
+  // Is the operator a member of a tuple extension?
   bool isTuple = isa_and_nonnull<BuiltinTupleDecl>(selfNominal);
 
+  // Check the parameters for a reference to 'Self'.
   for (auto param : *decl->getParameters()) {
     // Look through a metatype reference, if there is one.
     auto paramType = param->getInterfaceType()->getMetatypeInstanceType();
 
+    if (isProtocol || isTuple) {
+      // For a member of a protocol or tuple extension, is it the 'Self'
+      // type parameter?
+      if (paramType->isEqual(DC->getSelfInterfaceType()))
+        return true;
+
+      continue;
+    }
+
+    // We have a member operator of a concrete nominal type, or a global operator.
     auto nominal = paramType->getAnyNominal();
-    if (type.isNull()) {
-      // Is it the same nominal type?
-      if (selfNominal && nominal == selfNominal)
+
+    if (selfTy.isNull()) {
+      // We're validating a member operator.
+
+      // Does the parameter have the right nominal type?
+      if (nominal == selfNominal)
         return true;
     } else {
-      // Is it the same nominal type? Or a generic (which may or may not match)?
-      if (paramType->is<GenericTypeParamType>() ||
-          nominal == type->getAnyNominal())
+      // We're checking a conformance and this operator is a candidate witness.
+
+      // Does the parameter have the right nominal type for the conformance?
+      if (nominal == selfTy->getAnyNominal())
         return true;
-    }
 
-    if (isProtocol) {
-      // FIXME: Source compatibility hack for Swift 5. The compiler
-      // accepts member operators on protocols with existential
-      // type arguments. We should consider banning this in Swift 6.
-      if (auto existential = paramType->getAs<ExistentialType>()) {
-        if (selfNominal == existential->getConstraintType()->getAnyNominal())
-          return true;
-      }
-    }
-
-    if (isProtocol || isTuple) {
-      // For a protocol or tuple extension, is it the 'Self' type parameter?
-      if (paramType->isEqual(DC->getSelfInterfaceType()))
+      // Otherwise, we might also have a match if the top-level operator is generic.
+      if (paramType->is<GenericTypeParamType>())
         return true;
     }
   }
@@ -2251,10 +2260,16 @@ ParamSpecifierRequest::evaluate(Evaluator &evaluator,
   if (auto isolated = dyn_cast<IsolatedTypeRepr>(nestedRepr))
     nestedRepr = isolated->getBase();
 
-  if (auto transferring = dyn_cast<TransferringTypeRepr>(nestedRepr)) {
-    // If we do not have an Ownership Repr, return implicit copyable consuming.
-    auto *base = transferring->getBase();
-    if (!isa<OwnershipTypeRepr>(base)) {
+  if (auto *lifetime = dyn_cast<LifetimeDependentTypeRepr>(nestedRepr)) {
+    nestedRepr = lifetime->getBase();
+  }
+
+  if (auto sending = dyn_cast<SendingTypeRepr>(nestedRepr)) {
+    // If we do not have an Ownership Repr and do not have a no escape type,
+    // return implicit copyable consuming.
+    auto *base = sending->getBase();
+    if (!param->getInterfaceType()->isNoEscape() &&
+        !isa<OwnershipTypeRepr>(base)) {
       return ParamSpecifier::ImplicitlyCopyableConsuming;
     }
     nestedRepr = base;
@@ -2527,8 +2542,7 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
       ProtocolDecl *errorProto = Context.getErrorDecl();
       if (thrownTy && errorProto) {
         Type thrownTyInContext = AFD->mapTypeIntoContext(thrownTy);
-        if (!AFD->getParentModule()->checkConformance(
-                thrownTyInContext, errorProto)) {
+        if (!checkConformance(thrownTyInContext, errorProto)) {
           SourceLoc loc;
           if (auto thrownTypeRepr = AFD->getThrownTypeRepr())
             loc = thrownTypeRepr->getLoc();
@@ -2550,7 +2564,7 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
       resultTy = TupleType::getEmpty(AFD->getASTContext());
     }
 
-    std::optional<LifetimeDependenceInfo> lifetimeDependenceInfo;
+    auto lifetimeDependenceInfo = AFD->getLifetimeDependencies();
 
     // (Args...) -> Result
     Type funcTy;
@@ -2567,14 +2581,13 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
       // Defer bodies must not escape.
       if (auto fd = dyn_cast<FuncDecl>(D)) {
         infoBuilder = infoBuilder.withNoEscape(fd->isDeferBody());
-        if (fd->hasTransferringResult())
-          infoBuilder = infoBuilder.withTransferringResult();
+        if (fd->hasSendingResult())
+          infoBuilder = infoBuilder.withSendingResult();
       }
 
-      lifetimeDependenceInfo = LifetimeDependenceInfo::get(AFD, resultTy);
       if (lifetimeDependenceInfo.has_value()) {
         infoBuilder =
-            infoBuilder.withLifetimeDependenceInfo(*lifetimeDependenceInfo);
+            infoBuilder.withLifetimeDependencies(*lifetimeDependenceInfo);
       }
 
       auto info = infoBuilder.build();
@@ -2594,7 +2607,7 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
       maybeAddParameterIsolation(selfInfoBuilder, {selfParam});
       if (lifetimeDependenceInfo.has_value()) {
         selfInfoBuilder =
-            selfInfoBuilder.withLifetimeDependenceInfo(*lifetimeDependenceInfo);
+            selfInfoBuilder.withLifetimeDependencies(*lifetimeDependenceInfo);
       }
 
       // FIXME: Verify ExtInfo state is correct, not working by accident.
@@ -2747,9 +2760,15 @@ NamingPatternRequest::evaluate(Evaluator &evaluator, VarDecl *VD) const {
         // We have some other parent stmt. Type check it completely.
         if (auto CS = dyn_cast<CaseStmt>(parentStmt))
           parentStmt = CS->getParentStmt();
+
+        bool LeaveBodyUnchecked = true;
+        // type-checking 'catch' patterns depends on the type checked body.
+        if (isa<DoCatchStmt>(parentStmt))
+          LeaveBodyUnchecked = false;
+
         ASTNode node(parentStmt);
         TypeChecker::typeCheckASTNode(node, VD->getDeclContext(),
-                                      /*LeaveBodyUnchecked=*/true);
+                                      LeaveBodyUnchecked);
       }
       namingPattern = VD->getCanonicalVarDecl()->NamingPattern;
     }
@@ -3097,4 +3116,80 @@ ImplicitKnownProtocolConformanceRequest::evaluate(Evaluator &evaluator,
   default:
     llvm_unreachable("non-implicitly derived KnownProtocol");
   }
+}
+
+std::optional<llvm::ArrayRef<LifetimeDependenceInfo>>
+LifetimeDependenceInfoRequest::evaluate(Evaluator &evaluator,
+                                        AbstractFunctionDecl *decl) const {
+  return LifetimeDependenceInfo::get(decl);
+}
+
+ArrayRef<IfConfigClauseRangeInfo> SourceFile::getIfConfigClauseRanges() const {
+#if SWIFT_BUILD_SWIFT_SYNTAX
+  if (!IfConfigClauseRanges.IsSorted) {
+    IfConfigClauseRanges.Ranges.clear();
+
+    BridgedIfConfigClauseRangeInfo *regions;
+    intptr_t numRegions = swift_ASTGen_configuredRegions(
+        getASTContext(), getExportedSourceFile(), &regions);
+    IfConfigClauseRanges.Ranges.reserve(numRegions);
+    for (intptr_t i = 0; i != numRegions; ++i)
+      IfConfigClauseRanges.Ranges.push_back(regions[i].unbridged());
+    swift_ASTGen_freeConfiguredRegions(regions, numRegions);
+
+    IfConfigClauseRanges.IsSorted = true;
+  }
+#else
+  if (!IfConfigClauseRanges.IsSorted) {
+    auto &SM = getASTContext().SourceMgr;
+    // Sort the ranges if we need to.
+    llvm::sort(
+        IfConfigClauseRanges.Ranges, [&](const IfConfigClauseRangeInfo &lhs,
+                                         const IfConfigClauseRangeInfo &rhs) {
+          return SM.isBeforeInBuffer(lhs.getStartLoc(), rhs.getStartLoc());
+        });
+
+    // Be defensive and eliminate duplicates in case we've parsed twice.
+    auto newEnd = llvm::unique(
+        IfConfigClauseRanges.Ranges, [&](const IfConfigClauseRangeInfo &lhs,
+                                         const IfConfigClauseRangeInfo &rhs) {
+          if (lhs.getStartLoc() != rhs.getStartLoc())
+            return false;
+          assert(lhs.getBodyRange(SM) == rhs.getBodyRange(SM) &&
+                 "range changed on a re-parse?");
+          return true;
+        });
+    IfConfigClauseRanges.Ranges.erase(newEnd,
+                                      IfConfigClauseRanges.Ranges.end());
+    IfConfigClauseRanges.IsSorted = true;
+  }
+#endif
+
+  return IfConfigClauseRanges.Ranges;
+}
+
+ArrayRef<IfConfigClauseRangeInfo>
+SourceFile::getIfConfigClausesWithin(SourceRange outer) const {
+  auto &SM = getASTContext().SourceMgr;
+  assert(SM.getRangeForBuffer(BufferID).contains(outer.Start) &&
+         "Range not within this file?");
+
+  // First let's find the first #if that is after the outer start loc.
+  auto ranges = getIfConfigClauseRanges();
+  auto lower = llvm::lower_bound(
+      ranges, outer.Start,
+      [&](const IfConfigClauseRangeInfo &range, SourceLoc loc) {
+        return SM.isBeforeInBuffer(range.getStartLoc(), loc);
+      });
+  if (lower == ranges.end() ||
+      SM.isBeforeInBuffer(outer.End, lower->getStartLoc())) {
+    return {};
+  }
+  // Next let's find the first #if that's after the outer end loc.
+  auto upper = llvm::upper_bound(
+      ranges, outer.End,
+      [&](SourceLoc loc, const IfConfigClauseRangeInfo &range) {
+        return SM.isBeforeInBuffer(loc, range.getStartLoc());
+      });
+  return llvm::ArrayRef(lower, upper - lower);
 }

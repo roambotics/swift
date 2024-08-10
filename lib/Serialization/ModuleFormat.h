@@ -58,7 +58,7 @@ const uint16_t SWIFTMODULE_VERSION_MAJOR = 0;
 /// describe what change you made. The content of this comment isn't important;
 /// it just ensures a conflict if two people change the module format.
 /// Don't worry about adhering to the 80-column limit for this line.
-const uint16_t SWIFTMODULE_VERSION_MINOR = 869; // @implementation
+const uint16_t SWIFTMODULE_VERSION_MINOR = 882; // CXXStdlibKind
 
 /// A standard hash seed used for all string hashes in a serialized module.
 ///
@@ -388,6 +388,7 @@ enum class ParameterConvention : uint8_t {
   Pack_Owned,
   Pack_Inout,
   Pack_Guaranteed,
+  Indirect_In_CXX,
 };
 using ParameterConventionField = BCFixed<4>;
 
@@ -403,7 +404,7 @@ enum class SILParameterDifferentiability : uint8_t {
 enum class SILParameterInfoFlags : uint8_t {
   NotDifferentiable = 0x1,
   Isolated = 0x2,
-  Transferring = 0x4,
+  Sending = 0x4,
 };
 
 using SILParameterInfoOptions = OptionSet<SILParameterInfoFlags>;
@@ -424,7 +425,7 @@ using ResultConventionField = BCFixed<3>;
 /// module version.
 enum class SILResultInfoFlags : uint8_t {
   NotDifferentiable = 0x1,
-  IsTransferring = 0x2,
+  IsSending = 0x2,
 };
 
 using SILResultInfoOptions = OptionSet<SILResultInfoFlags>;
@@ -862,9 +863,10 @@ namespace control_block {
     TARGET,
     SDK_NAME,
     REVISION,
-    CHANNEL,
     IS_OSSA,
     ALLOWABLE_CLIENT_NAME,
+    CHANNEL,
+    SDK_VERSION,
   };
 
   using MetadataLayout = BCRecordLayout<
@@ -900,11 +902,6 @@ namespace control_block {
     BCBlob
   >;
 
-  using ChannelLayout = BCRecordLayout<
-    CHANNEL,
-    BCBlob
-  >;
-
   using IsOSSALayout = BCRecordLayout<
     IS_OSSA,
     BCFixed<1>
@@ -912,6 +909,16 @@ namespace control_block {
 
   using AllowableClientLayout = BCRecordLayout<
     ALLOWABLE_CLIENT_NAME,
+    BCBlob
+  >;
+
+  using ChannelLayout = BCRecordLayout<
+    CHANNEL,
+    BCBlob
+  >;
+
+  using SDKVersionLayout = BCRecordLayout<
+    SDK_VERSION,
     BCBlob
   >;
 }
@@ -941,6 +948,8 @@ namespace options_block {
     PLUGIN_SEARCH_OPTION,
     HAS_CXX_INTEROPERABILITY_ENABLED,
     ALLOW_NON_RESILIENT_ACCESS,
+    SERIALIZE_PACKAGE_ENABLED,
+    CXX_STDLIB_KIND,
   };
 
   using SDKPathLayout = BCRecordLayout<
@@ -1024,8 +1033,17 @@ namespace options_block {
     HAS_CXX_INTEROPERABILITY_ENABLED
   >;
 
+  using CXXStdlibKindLayout = BCRecordLayout<
+    CXX_STDLIB_KIND,
+    BCFixed<2>
+  >;
+
   using AllowNonResilientAccess = BCRecordLayout<
     ALLOW_NON_RESILIENT_ACCESS
+  >;
+
+  using SerializePackageEnabled = BCRecordLayout<
+    SERIALIZE_PACKAGE_ENABLED
   >;
 }
 
@@ -1239,7 +1257,7 @@ namespace decls_block {
     TypeIDField,                     // thrown error
     DifferentiabilityKindField,      // differentiability kind
     FunctionTypeIsolationField,      // isolation
-    BCFixed<1>                       // has transferring result
+    BCFixed<1>                       // has sending result
     // trailed by parameters
     // Optionally lifetime dependence info
   );
@@ -1256,8 +1274,7 @@ namespace decls_block {
                      BCFixed<1>,              // isolated
                      BCFixed<1>,              // noDerivative?
                      BCFixed<1>,              // compileTimeConst
-                     BCFixed<1>,              // _resultDependsOn
-                     BCFixed<1>               // transferring
+                     BCFixed<1>               // sending
                      >;
 
   TYPE_LAYOUT(MetatypeTypeLayout,
@@ -1339,7 +1356,7 @@ namespace decls_block {
     TypeIDField,                     // thrown error
     DifferentiabilityKindField,      // differentiability kind
     FunctionTypeIsolationField,      // isolation
-    BCFixed<1>,                      // has transferring result
+    BCFixed<1>,                      // has sending result
     GenericSignatureIDField          // generic signature
 
     // trailed by parameters
@@ -1626,7 +1643,7 @@ namespace decls_block {
     BCFixed<1>,              // isAutoClosure?
     BCFixed<1>,              // isIsolated?
     BCFixed<1>,              // isCompileTimeConst?
-    BCFixed<1>,              // isTransferring?
+    BCFixed<1>,              // isSending?
     DefaultArgumentField,    // default argument kind
     TypeIDField,             // default argument type
     ActorIsolationField,     // default argument isolation
@@ -1659,7 +1676,7 @@ namespace decls_block {
     DeclIDField,  // opaque result type decl
     BCFixed<1>,   // isUserAccessible?
     BCFixed<1>,   // is distributed thunk
-    BCFixed<1>,   // has transferring result
+    BCFixed<1>,   // has sending result
     BCArray<IdentifierIDField> // name components,
                                // followed by TypeID dependencies
     // The record is trailed by:
@@ -2154,7 +2171,8 @@ namespace decls_block {
     BCFixed<1>, // implicit
     TypeIDField, // like type
     BCVBR<32>, // size
-    BCVBR<8> // alignment
+    BCVBR<8>, // alignment
+    BCFixed<1> // movesAsLike
   >;
   
   using SwiftNativeObjCRuntimeBaseDeclAttrLayout = BCRecordLayout<
@@ -2201,6 +2219,8 @@ namespace decls_block {
 
   using LifetimeDependenceLayout =
       BCRecordLayout<LIFETIME_DEPENDENCE,
+                     BCVBR<4>,           // targetIndex
+                     BCFixed<1>,         // isImmortal
                      BCFixed<1>,         // hasInheritLifetimeParamIndices
                      BCFixed<1>,         // hasScopeLifetimeParamIndices
                      BCArray<BCFixed<1>> // concatenated param indices

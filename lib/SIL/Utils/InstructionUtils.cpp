@@ -14,6 +14,7 @@
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/NullablePtr.h"
 #include "swift/Basic/STLExtras.h"
@@ -249,6 +250,16 @@ SILValue swift::stripValueProjections(SILValue V) {
   }
 }
 
+SILValue swift::lookThroughAddressAndValueProjections(SILValue V) {
+  while (true) {
+    V = stripSinglePredecessorArgs(V);
+    if (!Projection::isObjectProjection(V) &&
+        !Projection::isAddressProjection(V))
+      return V;
+    V = cast<SingleValueInstruction>(V)->getOperand(0);
+  }
+}
+
 SILValue swift::stripIndexingInsts(SILValue V) {
   while (true) {
     if (!isa<IndexingInst>(V))
@@ -295,7 +306,16 @@ SingleValueInstruction *swift::getSingleValueCopyOrCast(SILInstruction *I) {
   }
 }
 
-// Does this instruction terminate a SIL-level scope?
+bool swift::isBeginScopeMarker(SILInstruction *user) {
+  switch (user->getKind()) {
+  default:
+    return false;
+  case SILInstructionKind::BeginAccessInst:
+  case SILInstructionKind::BeginBorrowInst:
+    return true;
+  }
+}
+
 bool swift::isEndOfScopeMarker(SILInstruction *user) {
   switch (user->getKind()) {
   default:
@@ -506,6 +526,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::LoadInst:
   case SILInstructionKind::LoadBorrowInst:
   case SILInstructionKind::BeginBorrowInst:
+  case SILInstructionKind::BorrowedFromInst:
   case SILInstructionKind::StoreBorrowInst:
   case SILInstructionKind::MarkUninitializedInst:
   case SILInstructionKind::ProjectExistentialBoxInst:
@@ -550,6 +571,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::AssignOrInitInst:
   case SILInstructionKind::MarkFunctionEscapeInst:
   case SILInstructionKind::EndLifetimeInst:
+  case SILInstructionKind::ExtendLifetimeInst:
   case SILInstructionKind::EndApplyInst:
   case SILInstructionKind::AbortApplyInst:
   case SILInstructionKind::CondFailInst:
@@ -607,7 +629,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::StructElementAddrInst:
   case SILInstructionKind::IndexAddrInst:
     // TODO: hasArchetype() ?
-    if (!inst->getOperand(0)->getType().isLoadable(*inst->getFunction())) {
+    if (!inst->getOperand(0)->getType().isFixedABI(*inst->getFunction())) {
       impactType = inst->getOperand(0)->getType();
       return RuntimeEffect::MetaData;
     }
@@ -706,8 +728,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::AllocStackInst:
   case SILInstructionKind::AllocVectorInst:
   case SILInstructionKind::ProjectBoxInst:
-    if (!cast<SingleValueInstruction>(inst)->getType().
-          isLoadable(*inst->getFunction())) {
+    if (cast<SingleValueInstruction>(inst)->getType().hasArchetype()) {
       impactType = cast<SingleValueInstruction>(inst)->getType();
       return RuntimeEffect::MetaData;
     }
@@ -780,9 +801,8 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     switch (cast<StoreInst>(inst)->getOwnershipQualifier()) {
       case StoreOwnershipQualifier::Unqualified:
       case StoreOwnershipQualifier::Trivial:
-        return RuntimeEffect::NoEffect;
       case StoreOwnershipQualifier::Init:
-        return RuntimeEffect::RefCounting;
+        return RuntimeEffect::NoEffect;
       case StoreOwnershipQualifier::Assign:
         return RuntimeEffect::Releasing;
     }
@@ -1007,7 +1027,7 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     case BuiltinValueKind::AtomicLoad:
     case BuiltinValueKind::AtomicStore:
     case BuiltinValueKind::AtomicRMW:
-      return RuntimeEffect::Locking;
+      return RuntimeEffect::NoEffect;
     case BuiltinValueKind::DestroyArray:
       return RuntimeEffect::Releasing;
     case BuiltinValueKind::CopyArray:

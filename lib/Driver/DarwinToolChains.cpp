@@ -14,6 +14,7 @@
 
 #include "swift/AST/DiagnosticsDriver.h"
 #include "swift/AST/PlatformKind.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Platform.h"
 #include "swift/Basic/Range.h"
@@ -112,6 +113,10 @@ getDarwinLibraryNameSuffixForTriple(const llvm::Triple &triple) {
     return "watchos";
   case DarwinPlatformKind::WatchOSSimulator:
     return "watchossim";
+  case DarwinPlatformKind::VisionOS:
+    return "xros";
+  case DarwinPlatformKind::VisionOSSimulator:
+    return "xrossim";
   }
   llvm_unreachable("Unsupported Darwin platform");
 }
@@ -122,31 +127,6 @@ std::string toolchains::Darwin::sanitizerRuntimeLibName(StringRef Sanitizer,
           getDarwinLibraryNameSuffixForTriple(this->getTriple()) +
           (shared ? "_dynamic.dylib" : ".a"))
       .str();
-}
-
-void
-toolchains::Darwin::addPluginArguments(const ArgList &Args,
-                                       ArgStringList &Arguments) const {
-  SmallString<64> pluginPath;
-  auto programPath = getDriver().getSwiftProgramPath();
-  CompilerInvocation::computeRuntimeResourcePathFromExecutablePath(
-      programPath, /*shared=*/true, pluginPath);
-
-  auto defaultPluginPath = pluginPath;
-  llvm::sys::path::append(defaultPluginPath, "host", "plugins");
-
-  // Default plugin path.
-  Arguments.push_back("-plugin-path");
-  Arguments.push_back(Args.MakeArgString(defaultPluginPath));
-
-  // Local plugin path.
-  llvm::sys::path::remove_filename(pluginPath); // Remove "swift"
-  llvm::sys::path::remove_filename(pluginPath); // Remove "lib"
-  llvm::sys::path::append(pluginPath, "local", "lib");
-  llvm::sys::path::append(pluginPath, "swift");
-  llvm::sys::path::append(pluginPath, "host", "plugins");
-  Arguments.push_back("-plugin-path");
-  Arguments.push_back(Args.MakeArgString(pluginPath));
 }
 
 static void addLinkRuntimeLibRPath(const ArgList &Args,
@@ -374,19 +354,19 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
   if (context.Args.hasArg(options::OPT_runtime_compatibility_version)) {
     auto value = context.Args.getLastArgValue(
                                     options::OPT_runtime_compatibility_version);
-    if (value.equals("5.0")) {
+    if (value == "5.0") {
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 0);
-    } else if (value.equals("5.1")) {
+    } else if (value == "5.1") {
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 1);
-    } else if (value.equals("5.5")) {
+    } else if (value == "5.5") {
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 5);
-    } else if (value.equals("5.6")) {
+    } else if (value == "5.6") {
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 6);
-    } else if (value.equals("5.8")) {
+    } else if (value == "5.8") {
       runtimeCompatibilityVersion = llvm::VersionTuple(5, 8);
-    } else if (value.equals("6.0")) {
+    } else if (value == "6.0") {
       runtimeCompatibilityVersion = llvm::VersionTuple(6, 0);
-    } else if (value.equals("none")) {
+    } else if (value == "none") {
       runtimeCompatibilityVersion = std::nullopt;
     } else {
       // TODO: diagnose unknown runtime compatibility version?
@@ -502,6 +482,8 @@ toolchains::Darwin::addProfileGenerationArgs(ArgStringList &Arguments,
         RT = "ios";
     } else if (Triple.isWatchOS()) {
       RT = "watchos";
+    } else if (Triple.isXROS()) {
+      RT = "xros";
     } else {
       assert(Triple.isMacOSX());
       RT = "osx";
@@ -563,6 +545,12 @@ toolchains::Darwin::addDeploymentTargetArgs(ArgStringList &Arguments,
       case DarwinPlatformKind::WatchOSSimulator:
         platformName = "watchos-simulator";
         break;
+      case DarwinPlatformKind::VisionOS:
+        platformName = "xros";
+        break;
+      case DarwinPlatformKind::VisionOSSimulator:
+        platformName = "xros-simulator";
+        break;
       }
     }
 
@@ -612,6 +600,17 @@ toolchains::Darwin::addDeploymentTargetArgs(ArgStringList &Arguments,
       case DarwinPlatformKind::WatchOSSimulator:
         osVersion = triple.getOSVersion();
         break;
+      case DarwinPlatformKind::VisionOS:
+      case DarwinPlatformKind::VisionOSSimulator:
+        osVersion = triple.getOSVersion();
+
+        // The first deployment of 64-bit xrOS simulator is version 1.0.
+        if (triple.isArch64Bit() && triple.isSimulatorEnvironment() &&
+            osVersion.getMajor() < 1) {
+          osVersion = llvm::VersionTuple(/*Major=*/1, /*Minor=*/0);
+        }
+
+        break;
       }
     }
 
@@ -636,23 +635,40 @@ toolchains::Darwin::addDeploymentTargetArgs(ArgStringList &Arguments,
 static unsigned getDWARFVersionForTriple(const llvm::Triple &triple) {
   llvm::VersionTuple osVersion;
   const DarwinPlatformKind kind = getDarwinPlatformKind(triple);
+  // Default to DWARF 2 on OS X 10.10 / iOS 8 and lower.
+  // Default to DWARF 4 on OS X 10.11 - macOS 14 / iOS - iOS 17.
   switch (kind) {
   case DarwinPlatformKind::MacOS:
     triple.getMacOSXVersion(osVersion);
     if (osVersion < llvm::VersionTuple(10, 11))
       return 2;
-    return 4;
+    if (osVersion < llvm::VersionTuple(15))
+      return 4;
+    return 5;
   case DarwinPlatformKind::IPhoneOSSimulator:
   case DarwinPlatformKind::IPhoneOS:
   case DarwinPlatformKind::TvOS:
   case DarwinPlatformKind::TvOSSimulator:
     osVersion = triple.getiOSVersion();
-    if (osVersion < llvm::VersionTuple(9))
-      return 2;
-    return 4;
-  default:
-    return 4;
+   if (osVersion < llvm::VersionTuple(9))
+     return 2;
+    if (osVersion < llvm::VersionTuple(18))
+      return 4;
+    return 5;
+  case DarwinPlatformKind::WatchOS:
+  case DarwinPlatformKind::WatchOSSimulator:
+    osVersion = triple.getWatchOSVersion();
+    if (osVersion < llvm::VersionTuple(11))
+      return 4;
+    return 5;
+  case DarwinPlatformKind::VisionOS:
+  case DarwinPlatformKind::VisionOSSimulator:
+    osVersion = triple.getOSVersion();
+    if (osVersion < llvm::VersionTuple(2))
+      return 4;
+    return 5;
   }
+  llvm_unreachable("unsupported platform kind");
 }
 
 void toolchains::Darwin::addCommonFrontendArgs(

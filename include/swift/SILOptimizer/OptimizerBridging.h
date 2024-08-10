@@ -56,6 +56,7 @@ class SwiftPassInvocation;
 class FixedSizeSlabPayload;
 class FixedSizeSlab;
 class SILVTable;
+class ClosureSpecializationCloner;
 }
 
 struct BridgedPassContext;
@@ -63,21 +64,28 @@ struct BridgedPassContext;
 struct BridgedAliasAnalysis {
   swift::AliasAnalysis * _Nonnull aa;
 
-  BRIDGED_INLINE BridgedMemoryBehavior getMemBehavior(BridgedInstruction inst, BridgedValue addr) const;
+  // Workaround for a compiler bug.
+  // When this unused function is removed, the compiler gives an error.
+  BRIDGED_INLINE bool unused(BridgedValue address1, BridgedValue address2) const;
 
+  typedef void (* _Nonnull InitFn)(BridgedAliasAnalysis aliasAnalysis, SwiftInt size);
+  typedef void (* _Nonnull DestroyFn)(BridgedAliasAnalysis aliasAnalysis);
   typedef BridgedMemoryBehavior (* _Nonnull GetMemEffectFn)(
-        BridgedPassContext context, BridgedValue, BridgedInstruction, SwiftInt);
+        BridgedPassContext context, BridgedAliasAnalysis aliasAnalysis,
+        BridgedValue, BridgedInstruction);
   typedef bool (* _Nonnull Escaping2InstFn)(
-        BridgedPassContext context, BridgedValue, BridgedInstruction, SwiftInt);
-  typedef bool (* _Nonnull Escaping2ValFn)(
-        BridgedPassContext context, BridgedValue, BridgedValue);
+        BridgedPassContext context, BridgedAliasAnalysis aliasAnalysis, BridgedValue, BridgedInstruction);
   typedef bool (* _Nonnull Escaping2ValIntFn)(
-        BridgedPassContext context, BridgedValue, BridgedValue, SwiftInt);
+        BridgedPassContext context, BridgedAliasAnalysis aliasAnalysis, BridgedValue, BridgedValue);
+  typedef bool (* _Nonnull MayAliasFn)(
+        BridgedPassContext context, BridgedAliasAnalysis aliasAnalysis, BridgedValue, BridgedValue);
 
-  static void registerAnalysis(GetMemEffectFn getMemEffectsFn,
+  static void registerAnalysis(InitFn initFn,
+                               DestroyFn destroyFn,
+                               GetMemEffectFn getMemEffectsFn,
                                Escaping2InstFn isObjReleasedFn,
                                Escaping2ValIntFn isAddrVisibleFromObjFn,
-                               Escaping2ValFn mayPointToSameAddrFn);
+                               MayAliasFn mayAliasFn);
 };
 
 struct BridgedCalleeAnalysis {
@@ -131,8 +139,12 @@ struct BridgedPostDomTree {
 
 struct BridgedUtilities {
   typedef void (* _Nonnull VerifyFunctionFn)(BridgedPassContext, BridgedFunction);
+  typedef void (* _Nonnull UpdateBorrowedFromFn)(BridgedPassContext, BridgedFunction);
+  typedef void (* _Nonnull UpdateBorrowedFromPhisFn)(BridgedPassContext, BridgedArrayRef);
 
   static void registerVerifier(VerifyFunctionFn verifyFunctionFn);
+  static void registerBorrowedFromUpdater(UpdateBorrowedFromFn updateBorrowedFromFn,
+                                          UpdateBorrowedFromPhisFn updateBorrowedFromPhisFn);
 };
 
 struct BridgedBasicBlockSet {
@@ -174,6 +186,15 @@ struct BridgedCloner {
   SWIFT_IMPORT_UNSAFE BridgedValue getClonedValue(BridgedValue v);
   bool isValueCloned(BridgedValue v) const;
   void clone(BridgedInstruction inst);
+};
+
+struct BridgedSpecializationCloner {
+  swift::ClosureSpecializationCloner * _Nonnull closureSpecCloner;
+
+  SWIFT_IMPORT_UNSAFE BridgedSpecializationCloner(BridgedFunction emptySpecializedFunction);
+  SWIFT_IMPORT_UNSAFE BridgedFunction getCloned() const;
+  SWIFT_IMPORT_UNSAFE BridgedBasicBlock getClonedBasicBlock(BridgedBasicBlock originalBasicBlock) const;
+  void cloneFunctionBody(BridgedFunction originalFunction, BridgedBasicBlock clonedEntryBlock, BridgedValueArray clonedEntryBlockArgs) const;
 };
 
 struct BridgedPassContext {
@@ -235,6 +256,9 @@ struct BridgedPassContext {
   SWIFT_IMPORT_UNSAFE BridgedOwnedString mangleWithDeadArgs(const SwiftInt * _Nullable deadArgs,
                                                             SwiftInt numDeadArgs,
                                                             BridgedFunction function) const;
+  SWIFT_IMPORT_UNSAFE BridgedOwnedString mangleWithClosureArgs(BridgedValueArray closureArgs,
+                                                               BridgedArrayRef closureArgIndices,
+                                                               BridgedFunction applySiteCallee) const;
 
   SWIFT_IMPORT_UNSAFE BridgedGlobalVar createGlobalVariable(BridgedStringRef name, BridgedType type,
                                                             bool isPrivate) const;
@@ -248,6 +272,7 @@ struct BridgedPassContext {
   SwiftInt getStaticSize(BridgedType type) const;
   SwiftInt getStaticAlignment(BridgedType type) const;
   SwiftInt getStaticStride(BridgedType type) const;
+  bool canMakeStaticObjectReadOnly(BridgedType type) const;
 
   // Sets
 
@@ -317,6 +342,11 @@ struct BridgedPassContext {
   BRIDGED_INLINE void beginTransformFunction(BridgedFunction function) const;
   BRIDGED_INLINE void endTransformFunction() const;
   BRIDGED_INLINE bool continueWithNextSubpassRun(OptionalBridgedInstruction inst) const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedPassContext initializeNestedPassContext(BridgedFunction newFunction) const;
+  BRIDGED_INLINE void deinitializedNestedPassContext() const;
+  BRIDGED_INLINE void
+  addFunctionToPassManagerWorklist(BridgedFunction newFunction,
+                                   BridgedFunction oldFunction) const;
 
   // SSAUpdater
 
@@ -340,6 +370,13 @@ struct BridgedPassContext {
   BRIDGED_INLINE bool enableMoveInoutStackProtection() const;
   BRIDGED_INLINE AssertConfiguration getAssertConfiguration() const;
   bool enableSimplificationFor(BridgedInstruction inst) const;
+
+  // Closure specializer
+  SWIFT_IMPORT_UNSAFE BridgedFunction ClosureSpecializer_createEmptyFunctionWithSpecializedSignature(BridgedStringRef specializedName,
+                                                        const BridgedParameterInfo * _Nullable specializedBridgedParams,
+                                                        SwiftInt paramCount,
+                                                        BridgedFunction bridgedApplySiteCallee,
+                                                        bool isSerialized) const;
 };
 
 bool FullApplySite_canInline(BridgedInstruction apply);
@@ -355,6 +392,8 @@ BridgedDynamicCastResult classifyDynamicCastBridged(BridgedType sourceTy, Bridge
                                                     bool sourceTypeIsExact);
 
 BridgedDynamicCastResult classifyDynamicCastBridged(BridgedInstruction inst);
+
+void verifierError(BridgedStringRef message, OptionalBridgedInstruction atInstruction, OptionalBridgedArgument atArgument);
 
 //===----------------------------------------------------------------------===//
 //                          Pass registration
@@ -384,6 +423,9 @@ void SILCombine_registerInstructionPass(BridgedStringRef instClassName,
 #ifndef PURE_BRIDGING_MODE
 // In _not_ PURE_BRIDGING_MODE, briding functions are inlined and therefore inluded in the header file.
 #include "OptimizerBridgingImpl.h"
+#else
+// For fflush and stdout
+#include <stdio.h>
 #endif
 
 SWIFT_END_NULLABILITY_ANNOTATIONS

@@ -107,6 +107,7 @@ extension ASTGenVisitor {
         .in,
         .inConstant,
         .inGuaranteed,
+        .inCXX,
         .inout,
         .inoutAliasable,
         .moveOnly,
@@ -117,7 +118,7 @@ extension ASTGenVisitor {
         .silUnmanaged,
         .silUnowned,
         .silWeak,
-        .silTransferring,
+        .silSending,
         .unownedInnerPointer:
         break;
 

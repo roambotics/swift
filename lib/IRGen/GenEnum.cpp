@@ -104,10 +104,12 @@
 #include "GenEnum.h"
 
 #include "swift/AST/Types.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/LazyResolver.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/SILModule.h"
 #include "llvm/IR/CFG.h"
@@ -187,7 +189,7 @@ void EnumImplStrategy::initializeFromParams(IRGenFunction &IGF,
   if (TIK >= Loadable)
     return initialize(IGF, params, dest, isOutlined);
   Address src = TI->getAddressForPointer(params.claimNext());
-  TI->initializeWithTake(IGF, dest, src, T, isOutlined);
+  TI->initializeWithTake(IGF, dest, src, T, isOutlined, /*zeroizeIfSensitive=*/ true);
 }
 
 bool EnumImplStrategy::isReflectable() const { return true; }
@@ -619,7 +621,8 @@ namespace {
     }
 
     void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
-                            SILType T, bool isOutlined) const override {
+                            SILType T, bool isOutlined,
+                            bool zeroizeIfSensitive) const override {
       if (!getSingleton()) return;
       if (!ElementsAreABIAccessible) {
         emitInitializeWithTakeCall(IGF, T, dest, src);
@@ -627,7 +630,7 @@ namespace {
         dest = getSingletonAddress(IGF, dest);
         src = getSingletonAddress(IGF, src);
         getSingleton()->initializeWithTake(
-            IGF, dest, src, getSingletonType(IGF.IGM, T), isOutlined);
+            IGF, dest, src, getSingletonType(IGF.IGM, T), isOutlined, zeroizeIfSensitive);
       } else {
         callOutlinedCopy(IGF, dest, src, T, IsInitialization, IsTake);
       }
@@ -1110,7 +1113,8 @@ namespace {
     void emitScalarFixLifetime(IRGenFunction &IGF, llvm::Value *value) const {}
 
     void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
-                            SILType T, bool isOutlined) const override {
+                            SILType T, bool isOutlined,
+                            bool zeroizeIfSensitive) const override {
       // No-payload enums are always POD, so we can always initialize by
       // primitive copy.
       llvm::Value *val = IGF.Builder.CreateLoad(src);
@@ -1685,11 +1689,22 @@ namespace {
       auto payload = EnumPayload::load(IGF, projectPayload(IGF, addr),
                                        PayloadSchema);
       if (ExtraTagBitCount > 0) {
-        extraTag = IGF.Builder.CreateLoad(projectExtraTagBits(IGF, addr));
         if (maskExtraTagBits) {
-          auto maskBits = llvm::NextPowerOf2(NumExtraTagValues) - 1;
+          auto projectedBits = projectExtraTagBits(IGF, addr);
+          // LLVM assumes that loads of fractional byte sizes have been stored
+          // with the same type, so all unused bits would be 0. Since we are
+          // re-using spare bits for tag storage, that assumption is wrong here.
+          // In CVW we have to mask the extra bits, which requires us to make
+          // this cast here, otherwise LLVM would optimize away the bit mask.
+          if (projectedBits.getElementType()->getIntegerBitWidth() < 8) {
+            projectedBits = IGF.Builder.CreateElementBitCast(projectedBits, IGM.Int8Ty);
+          }
+          extraTag = IGF.Builder.CreateLoad(projectedBits);
+          auto maskBits = (1 << ExtraTagBitCount) - 1;
           auto mask = llvm::ConstantInt::get(extraTag->getType(), maskBits);
           extraTag = IGF.Builder.CreateAnd(extraTag, mask);
+        } else {
+          extraTag = IGF.Builder.CreateLoad(projectExtraTagBits(IGF, addr));
         }
       }
       return {std::move(payload), extraTag};
@@ -2666,7 +2681,8 @@ namespace {
         if (Refcounting == ReferenceCounting::Custom) {
           Explosion e;
           e.add(ptr);
-          getPayloadTypeInfo().as<ClassTypeInfo>().strongRetain(IGF, e, IGF.getDefaultAtomicity());
+          getPayloadTypeInfo().as<ClassTypeInfo>().strongCustomRetain(
+              IGF, e, /*needsNullCheck*/ true);
           return;
         }
 
@@ -2702,7 +2718,8 @@ namespace {
         if (Refcounting == ReferenceCounting::Custom) {
           Explosion e;
           e.add(ptr);
-          getPayloadTypeInfo().as<ClassTypeInfo>().strongRelease(IGF, e, IGF.getDefaultAtomicity());
+          getPayloadTypeInfo().as<ClassTypeInfo>().strongCustomRelease(
+              IGF, e, /*needsNullCheck*/ true);
           return;
         }
 
@@ -3277,7 +3294,8 @@ namespace {
     }
 
     void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
-                            SILType T, bool isOutlined) const override {
+                            SILType T, bool isOutlined,
+                            bool zeroizeIfSensitive) const override {
       if (!ElementsAreABIAccessible) {
         emitInitializeWithTakeCall(IGF, T, dest, src);
       } else if (isOutlined || T.hasParameterizedExistential()) {
@@ -5109,7 +5127,7 @@ namespace {
 
           if (isTake)
             payloadTI.initializeWithTake(IGF, destData, srcData, PayloadT,
-                                         isOutlined);
+                                         isOutlined, /*zeroizeIfSensitive=*/ true);
           else
             payloadTI.initializeWithCopy(IGF, destData, srcData, PayloadT,
                                          isOutlined);
@@ -5183,7 +5201,8 @@ namespace {
     }
 
     void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
-                            SILType T, bool isOutlined) const override {
+                            SILType T, bool isOutlined,
+                            bool zeroizeIfSensitive) const override {
       if (!ElementsAreABIAccessible) {
         emitInitializeWithTakeCall(IGF, T, dest, src);
       } else if (isOutlined || T.hasParameterizedExistential()) {
@@ -6121,7 +6140,8 @@ namespace {
     }
 
     void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
-                            SILType T, bool isOutlined) const override {
+                            SILType T, bool isOutlined,
+                            bool zeroizeIfSensitive) const override {
       emitInitializeWithTakeCall(IGF, T,
                                  dest, src);
     }
@@ -6571,8 +6591,10 @@ namespace {
       return Strategy.initializeWithCopy(IGF, dest, src, T, isOutlined);
     }
     void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
-                            SILType T, bool isOutlined) const override {
-      return Strategy.initializeWithTake(IGF, dest, src, T, isOutlined);
+                            SILType T, bool isOutlined,
+                            bool zeroizeIfSensitive) const override {
+      return Strategy.initializeWithTake(IGF, dest, src, T, isOutlined,
+                                         zeroizeIfSensitive);
     }
     void collectMetadataForOutlining(OutliningMetadataCollector &collector,
                                      SILType T) const override {
@@ -7296,17 +7318,18 @@ ResilientEnumImplStrategy::completeEnumTypeLayout(TypeConverter &TC,
                                                   SILType Type,
                                                   EnumDecl *theEnum,
                                                   llvm::StructType *enumTy) {
+  auto cp = !theEnum->canBeCopyable()
+    ? IsNotCopyable : IsCopyable;
   auto abiAccessible = IsABIAccessible_t(TC.IGM.isTypeABIAccessible(Type));
   auto *bitwiseCopyableProtocol =
       IGM.getSwiftModule()->getASTContext().getProtocol(
           KnownProtocolKind::BitwiseCopyable);
   if (bitwiseCopyableProtocol &&
-      IGM.getSwiftModule()->lookupConformance(
-          theEnum->getDeclaredInterfaceType(), bitwiseCopyableProtocol)) {
+      checkConformance(Type.getASTType(), bitwiseCopyableProtocol)) {
     return BitwiseCopyableTypeInfo::create(enumTy, abiAccessible);
   }
   return registerEnumTypeInfo(
-                       new ResilientEnumTypeInfo(*this, enumTy, Copyable,
+                       new ResilientEnumTypeInfo(*this, enumTy, cp,
                                                  abiAccessible));
 }
 

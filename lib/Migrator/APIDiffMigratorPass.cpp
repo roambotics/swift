@@ -12,6 +12,7 @@
 
 #include "swift/AST/USRGeneration.h"
 #include "swift/AST/ASTVisitor.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/StringExtras.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/IDE/Utils.h"
@@ -156,7 +157,7 @@ public:
     return visit(T->getBase());
   }
 
-  FoundResult visitTransferringTypeRepr(TransferringTypeRepr *T) {
+  FoundResult visitSendingTypeRepr(SendingTypeRepr *T) {
     return visit(T->getBase());
   }
 

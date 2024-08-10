@@ -23,6 +23,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/ADT/Statistic.h"
 
 #define DEBUG_TYPE "Protocol conformance checking"
@@ -77,13 +78,9 @@ RequirementEnvironment::RequirementEnvironment(
 
   // Calculate the depth at which the requirement's generic parameters
   // appear in the witness thunk signature.
-  unsigned depth = 0;
-  if (covariantSelf) {
+  unsigned depth = conformanceSig.getNextDepth();
+  if (covariantSelf)
     ++depth;
-  }
-  if (conformanceSig) {
-    depth += conformanceSig.getGenericParams().back()->getDepth() + 1;
-  }
 
   // Build a substitution map to replace the protocol's \c Self and the type
   // parameters of the requirement into a combined context that provides the
@@ -128,8 +125,7 @@ RequirementEnvironment::RequirementEnvironment(
         ProtocolConformance *specialized = conformance;
         if (conformance && conformance->getGenericSignature()) {
           auto concreteSubs =
-            substConcreteType->getContextSubstitutionMap(
-              conformanceDC->getParentModule(), conformanceDC);
+            substConcreteType->getContextSubstitutionMap(conformanceDC);
           specialized =
             ctx.getSpecializedConformance(substConcreteType,
                                           cast<NormalProtocolConformance>(conformance),

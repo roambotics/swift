@@ -31,6 +31,7 @@
 #include "swift/SIL/SILVisitor.h"
 #include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ClassHierarchyAnalysis.h"
+#include "swift/SILOptimizer/Analysis/DeadEndBlocksAnalysis.h"
 #include "swift/SILOptimizer/Analysis/NonLocalAccessBlockAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ProtocolConformanceAnalysis.h"
 #include "swift/SILOptimizer/OptimizerBridging.h"
@@ -72,16 +73,18 @@ class SILCombiner :
   /// lifetimes in OSSA.
   NonLocalAccessBlockAnalysis *NLABA;
 
+public:
   /// Worklist containing all of the instructions primed for simplification.
   SmallSILInstructionWorklist<256> Worklist;
 
+private:
   /// Utility for dead code removal.
   InstructionDeleter deleter;
 
   /// A cache of "dead end blocks" through which all paths it is known that the
   /// program will terminate. This means that we are allowed to leak
   /// objects.
-  DeadEndBlocks deadEndBlocks;
+  DeadEndBlocksAnalysis *DEBA;
 
   /// Variable to track if the SILCombiner made any changes.
   bool MadeChange;
@@ -102,10 +105,12 @@ class SILCombiner :
   // The tracking list is used by `Builder` for newly added
   // instructions, which we will periodically move to our worklist.
   llvm::SmallVector<SILInstruction *, 64> TrackingList;
-  
+
+public:
   /// Builder used to insert instructions.
   SILBuilder Builder;
 
+private:
   SILOptFunctionBuilder FuncBuilder;
 
   /// Cast optimizer

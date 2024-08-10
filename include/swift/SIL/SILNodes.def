@@ -543,6 +543,8 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
                     SingleValueInstruction, MayRead, DoesNotRelease)
   SINGLE_VALUE_INST(BeginBorrowInst, begin_borrow,
                     SingleValueInstruction, MayHaveSideEffects, DoesNotRelease)
+  SINGLE_VALUE_INST(BorrowedFromInst, borrowed,
+                    SingleValueInstruction, None, DoesNotRelease)
   SINGLE_VALUE_INST(StoreBorrowInst, store_borrow,
                     SILInstruction, MayWrite, DoesNotRelease)
   // begin_access may trap. Trapping is unordered with respect to memory access,
@@ -862,6 +864,8 @@ NON_VALUE_INST(DestroyAddrInst, destroy_addr,
                SILInstruction, MayHaveSideEffects, MayRelease)
 NON_VALUE_INST(EndLifetimeInst, end_lifetime,
                SILInstruction, MayHaveSideEffects, MayRelease)
+NON_VALUE_INST(ExtendLifetimeInst, extend_lifetime,
+               SILInstruction, None, DoesNotRelease)
 NON_VALUE_INST(InjectEnumAddrInst, inject_enum_addr,
                SILInstruction, MayWrite, DoesNotRelease)
 NON_VALUE_INST(DeinitExistentialAddrInst, deinit_existential_addr,

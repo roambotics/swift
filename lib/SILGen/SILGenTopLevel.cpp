@@ -14,6 +14,7 @@
 #include "SILGenFunction.h"
 #include "Scope.h"
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/Basic/Assertions.h"
 
 #define DEBUG_TYPE "silgen"
 
@@ -302,7 +303,7 @@ void SILGenFunction::emitCallToMain(FuncDecl *mainFunc) {
       SubstitutionMap subMap = SubstitutionMap::get(
           genericSig, [&](SubstitutableType *dependentType) {
             return errorType.getASTType();
-          }, LookUpConformanceInModule(getModule().getSwiftModule()));
+          }, LookUpConformanceInModule());
 
       // Generic errors are passed indirectly.
       if (!error->getType().isAddress()) {
@@ -335,6 +336,9 @@ void SILGenFunction::emitCallToMain(FuncDecl *mainFunc) {
 }
 
 void SILGenModule::emitEntryPoint(SourceFile *SF) {
+  if (getASTContext().SILOpts.SkipFunctionBodies != FunctionBodySkipping::None)
+    return;
+
   assert(!M.lookUpFunction(getASTContext().getEntryPointFunctionName()) &&
          "already emitted toplevel?!");
 
@@ -366,9 +370,16 @@ void SILGenFunction::emitMarkFunctionEscapeForTopLevelCodeGlobals(
 /// uninitialized global variable
 static void emitMarkFunctionEscape(SILGenFunction &SGF,
                                    AbstractFunctionDecl *AFD) {
+  auto &Ctx = SGF.getASTContext();
+  if (Ctx.TypeCheckerOpts.DeferToRuntime &&
+      Ctx.LangOpts.hasFeature(Feature::LazyImmediate))
+    return;
+
   if (AFD->getDeclContext()->isLocalContext())
     return;
   auto CaptureInfo = AFD->getCaptureInfo();
+  if (!CaptureInfo.hasBeenComputed())
+    return;
   SGF.emitMarkFunctionEscapeForTopLevelCodeGlobals(AFD, std::move(CaptureInfo));
 }
 

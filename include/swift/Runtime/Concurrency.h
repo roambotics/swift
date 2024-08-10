@@ -558,7 +558,7 @@ swift_task_pushTaskExecutorPreference(TaskExecutorRef executor);
 /// signals a bug in record handling by the concurrency library -- a record push
 /// must always be paired with a record pop.
 ///
-/// Runtime availability: Swift 9999.
+/// Runtime availability: Swift 6.0
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_task_popTaskExecutorPreference(TaskExecutorPreferenceStatusRecord* record);
 
@@ -663,7 +663,7 @@ void swift_task_localValuePop();
 /// Its Swift signature is
 ///
 /// \code
-/// func _taskLocalValueGet<Key>(AsyncTask* task)
+/// func swift_task_localsCopyTo<Key>(AsyncTask* task)
 /// \endcode
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_task_localsCopyTo(AsyncTask* target);
@@ -926,15 +926,14 @@ void swift_job_run(Job *job, SerialExecutorRef executor);
 /// Establish that the current thread is running as the given
 /// executor, then run a job.
 ///
-/// Runtime availability: Swift 9999
+/// Runtime availability: Swift 6.0
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_job_run_on_task_executor(Job *job,
-                                    TaskExecutorRef executor);
+void swift_job_run_on_task_executor(Job *job, TaskExecutorRef executor);
 
 /// Establish that the current thread is running as the given
 /// executor, then run a job.
 ///
-/// Runtime availability: Swift 9999
+/// Runtime availability: Swift 6.0
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_job_run_on_serial_and_task_executor(Job *job,
                                     SerialExecutorRef serialExecutor,

@@ -1,5 +1,5 @@
-// RUN: %target-swift-frontend  -disable-availability-checking -strict-concurrency=complete -parse-as-library %s -emit-sil -o /dev/null -verify -enable-experimental-feature GlobalActorIsolatedTypesUsability
-// RUN: %target-swift-frontend  -disable-availability-checking -strict-concurrency=complete -parse-as-library %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -enable-upcoming-feature RegionBasedIsolation -enable-experimental-feature GlobalActorIsolatedTypesUsability
+// RUN: %target-swift-frontend  -disable-availability-checking -strict-concurrency=complete -parse-as-library %s -emit-sil -o /dev/null -verify -enable-upcoming-feature GlobalActorIsolatedTypesUsability
+// RUN: %target-swift-frontend  -disable-availability-checking -strict-concurrency=complete -parse-as-library %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -enable-upcoming-feature RegionBasedIsolation -enable-upcoming-feature GlobalActorIsolatedTypesUsability
 
 // REQUIRES: concurrency
 // REQUIRES: asserts
@@ -14,7 +14,7 @@ struct X1: Equatable, Hashable, Codable {
 @MainActor
 struct X2: Equatable, Hashable, Codable {
   let x: Int
-  var y: String
+  nonisolated var y: String // okay
 }
 
 class NonSendable {
@@ -31,7 +31,7 @@ extension NonSendable: Equatable {
   }
 }
 
-// expected-warning@+3 2{{main actor-isolated property 'x' can not be referenced from a non-isolated context}}
+// expected-warning@+3 2{{main actor-isolated property 'x' can not be referenced from a nonisolated context}}
 // expected-note@+2 2{{in static method '==' for derived conformance to 'Equatable'}}
 @MainActor
 struct X2NonSendable: Equatable {

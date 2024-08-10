@@ -11,11 +11,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SIL/SILArgument.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/GraphNodeWorklist.h"
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/SIL/OwnershipUtils.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace swift;
@@ -291,7 +293,8 @@ bool SILPhiArgument::visitTransitiveIncomingPhiOperands(
     argument->getIncomingPhiOperands(operands);
 
     for (auto *operand : operands) {
-      SILPhiArgument *forwarded = dyn_cast<SILPhiArgument>(operand->get());
+      SILValue opVal = lookThroughBorrowedFromDef(operand->get());
+      SILPhiArgument *forwarded = dyn_cast<SILPhiArgument>(opVal);
       if (forwarded && forwarded->isPhi()) {
         worklist.insert(forwarded);
       }

@@ -20,6 +20,7 @@
 #include "ForeignRepresentationInfo.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/ReferenceCounting.h"
 #include "swift/AST/TypeCheckRequests.h"
@@ -37,6 +38,7 @@
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/TypeLoc.h"
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Compiler.h"
 #include "clang/AST/Type.h"
 #include "llvm/ADT/APFloat.h"
@@ -954,7 +956,7 @@ Type TypeBase::stripConcurrency(bool recurse, bool dropGlobalActor) {
         // If it's a Sendable requirement, skip it.
         const auto &req = requirements[reqIdx];
         if (req.getKind() == RequirementKind::Conformance &&
-            req.getSecondType()->castTo<ProtocolType>()->getDecl()
+            req.getProtocolDecl()
               ->isSpecificProtocol(KnownProtocolKind::Sendable))
           continue;
 
@@ -1301,6 +1303,7 @@ ParameterListInfo::ParameterListInfo(
   implicitSelfCapture.resize(params.size());
   inheritActorContext.resize(params.size());
   variadicGenerics.resize(params.size());
+  isPassedToSending.resize(params.size());
 
   // No parameter owner means no parameter list means no default arguments
   // - hand back the zeroed bitvector.
@@ -1364,6 +1367,10 @@ ParameterListInfo::ParameterListInfo(
     if (param->getInterfaceType()->is<PackExpansionType>()) {
       variadicGenerics.set(i);
     }
+
+    if (param->isSending()) {
+      isPassedToSending.set(i);
+    }
   }
 }
 
@@ -1404,6 +1411,10 @@ bool ParameterListInfo::isVariadicGenericParameter(unsigned paramIdx) const {
       : false;
 }
 
+bool ParameterListInfo::isPassedToSendingParameter(unsigned paramIdx) const {
+  return paramIdx < isPassedToSending.size() ? isPassedToSending[paramIdx]
+                                             : false;
+}
 
 /// Turn a param list into a symbolic and printable representation that does not
 /// include the types, something like (_:, b:, c:)
@@ -2117,9 +2128,7 @@ Type TypeBase::getSuperclass(bool useArchetypes) {
 
   // Gather substitutions from the self type, and apply them to the original
   // superclass type to form the substituted superclass type.
-  ModuleDecl *module = classDecl->getModuleContext();
-  auto subMap = getContextSubstitutionMap(module,
-                                          classDecl,
+  auto subMap = getContextSubstitutionMap(classDecl,
                                           (useArchetypes
                                            ? classDecl->getGenericEnvironment()
                                            : nullptr));
@@ -2235,11 +2244,10 @@ public:
                llvm::dbgs() << "\nto subst type:\n";
                substType->print(llvm::dbgs()););
     
-    auto *moduleDecl = decl->getParentModule();
     auto origSubMap = origType->getContextSubstitutionMap(
-        moduleDecl, decl, decl->getGenericEnvironment());
+        decl, decl->getGenericEnvironment());
     auto substSubMap = substType->getContextSubstitutionMap(
-        moduleDecl, decl, decl->getGenericEnvironment());
+        decl, decl->getGenericEnvironment());
 
     auto genericSig = decl->getGenericSignature();
     
@@ -2294,14 +2302,13 @@ public:
       if (didChange) {
         auto newSubstTy = req.getFirstType().subst(
           QueryTypeSubstitutionMap{newParamsMap},
-          LookUpConformanceInModule(moduleDecl));
+          LookUpConformanceInModule());
         
         if (newSubstTy->isTypeParameter()) {
           newConformances.push_back(ProtocolConformanceRef(proto));
         } else {
           auto newConformance
-            = moduleDecl->lookupConformance(
-                  newSubstTy, proto, /*allowMissing=*/true);
+            = lookupConformance(newSubstTy, proto, /*allowMissing=*/true);
           if (!newConformance)
             return CanType();
           newConformances.push_back(newConformance);
@@ -3036,8 +3043,7 @@ getForeignRepresentable(Type type, ForeignLanguage language,
       auto specialized = type->getASTContext()
         .getSpecializedConformance(type,
              cast<NormalProtocolConformance>(result.getConformance()),
-             boundGenericType->getContextSubstitutionMap(dc->getParentModule(),
-                                                 boundGenericType->getDecl()));
+             boundGenericType->getContextSubstitutionMap());
       result = ForeignRepresentationInfo::forBridged(specialized);
     }
   }
@@ -3300,6 +3306,37 @@ static bool matches(CanType t1, CanType t2, TypeMatchOptions matchMode,
                opaque1->getInterfaceType()->getCanonicalType()->matches(
                    opaque2->getInterfaceType()->getCanonicalType(), matchMode);
 
+  if (matchMode.contains(TypeMatchFlags::IgnoreSendability)) {
+    // Support `any Sendable` -> `Any` matching inside generic types
+    // e.g. collections and optionals (i.e. `[String: (any Sendable)?]`).
+    if (auto *generic1 = t1->getAs<BoundGenericType>()) {
+      if (auto *generic2 = t2->getAs<BoundGenericType>()) {
+        if (generic1->getDecl() == generic2->getDecl()) {
+          auto genericArgs1 = generic1->getGenericArgs();
+          auto genericArgs2 = generic2->getGenericArgs();
+
+          if (genericArgs1.size() == genericArgs2.size() &&
+              llvm::all_of(llvm::zip_equal(genericArgs1, genericArgs2),
+                           [&](const auto &elt) -> bool {
+                             return matches(
+                                 std::get<0>(elt)->getCanonicalType(),
+                                 std::get<1>(elt)->getCanonicalType(),
+                                 matchMode, ParameterPosition::NotParameter,
+                                 OptionalUnwrapping::None);
+                           }))
+            return true;
+        }
+      }
+    }
+
+    // Attempting to match `any Sendable` by `Any` is allowed in this mode.
+    if (t1->isAny()) {
+      auto *PD = dyn_cast_or_null<ProtocolDecl>(t2->getAnyNominal());
+      if (PD && PD->isSpecificProtocol(KnownProtocolKind::Sendable))
+        return true;
+    }
+  }
+
   return false;
 }
 
@@ -3454,7 +3491,7 @@ PrimaryArchetypeType::PrimaryArchetypeType(const ASTContext &Ctx,
                                      ArrayRef<ProtocolDecl *> ConformsTo,
                                      Type Superclass, LayoutConstraint Layout)
   : ArchetypeType(TypeKind::PrimaryArchetype, Ctx,
-                  RecursiveTypeProperties::HasArchetype,
+                  RecursiveTypeProperties::HasPrimaryArchetype,
                   InterfaceType, ConformsTo, Superclass, Layout, GenericEnv)
 {
   assert(!InterfaceType->isParameterPack());
@@ -3518,8 +3555,7 @@ OpenedArchetypeType::OpenedArchetypeType(
     LayoutConstraint layout)
   : LocalArchetypeType(TypeKind::OpenedArchetype,
                        interfaceType->getASTContext(),
-                       RecursiveTypeProperties::HasArchetype
-                         | RecursiveTypeProperties::HasOpenedExistential,
+                       RecursiveTypeProperties::HasOpenedExistential,
                        interfaceType, conformsTo, superclass, layout,
                        environment)
 {
@@ -3535,8 +3571,8 @@ PackArchetypeType::PackArchetypeType(
     ArrayRef<ProtocolDecl *> ConformsTo, Type Superclass,
     LayoutConstraint Layout, PackShape Shape)
     : ArchetypeType(TypeKind::PackArchetype, Ctx,
-                    RecursiveTypeProperties::HasArchetype |
-                        RecursiveTypeProperties::HasPackArchetype,
+                    RecursiveTypeProperties::HasPrimaryArchetype |
+                    RecursiveTypeProperties::HasPackArchetype,
                     InterfaceType, ConformsTo, Superclass, Layout, GenericEnv) {
   assert(InterfaceType->isParameterPack());
   *getTrailingObjects<PackShape>() = Shape;
@@ -3586,7 +3622,6 @@ ElementArchetypeType::ElementArchetypeType(
     ArrayRef<ProtocolDecl *> ConformsTo, Type Superclass,
     LayoutConstraint Layout)
     : LocalArchetypeType(TypeKind::ElementArchetype, Ctx,
-                         RecursiveTypeProperties::HasArchetype |
                          RecursiveTypeProperties::HasElementArchetype,
                          InterfaceType,
                          ConformsTo, Superclass, Layout, GenericEnv) {
@@ -3669,7 +3704,7 @@ void ParameterizedProtocolType::getRequirements(
     auto *assocType = assocTypes[i];
     auto subjectType = assocType->getDeclaredInterfaceType()
         ->castTo<DependentMemberType>()
-        ->substBaseType(protoDecl->getParentModule(), baseType);
+        ->substBaseType(baseType);
     reqs.emplace_back(RequirementKind::SameType, subjectType, argType);
   }
 }
@@ -3896,11 +3931,6 @@ Type AnyFunctionType::getThrownError() const {
 }
 
 bool AnyFunctionType::isSendable() const {
-  auto &ctx = getASTContext();
-  if (ctx.LangOpts.hasFeature(Feature::GlobalActorIsolatedTypesUsability)) {
-    // Global-actor-isolated function types are implicitly Sendable.
-    return getExtInfo().isSendable() || getIsolation().isGlobalActor();
-  }
   return getExtInfo().isSendable();
 }
 
@@ -3915,17 +3945,38 @@ Type AnyFunctionType::getGlobalActor() const {
   }
 }
 
-const LifetimeDependenceInfo *
-AnyFunctionType::getLifetimeDependenceInfoOrNull() const {
+llvm::ArrayRef<LifetimeDependenceInfo>
+AnyFunctionType::getLifetimeDependencies() const {
   switch (getKind()) {
   case TypeKind::Function:
-    return cast<FunctionType>(this)->getLifetimeDependenceInfoOrNull();
+    return cast<FunctionType>(this)->getLifetimeDependencies();
   case TypeKind::GenericFunction:
-    return cast<GenericFunctionType>(this)->getLifetimeDependenceInfoOrNull();
+    return cast<GenericFunctionType>(this)->getLifetimeDependencies();
 
   default:
     llvm_unreachable("Illegal type kind for AnyFunctionType.");
   }
+}
+
+std::optional<LifetimeDependenceInfo>
+AnyFunctionType::getLifetimeDependenceFor(unsigned targetIndex) const {
+  switch (getKind()) {
+  case TypeKind::Function:
+    return cast<FunctionType>(this)->getLifetimeDependenceFor(targetIndex);
+  case TypeKind::GenericFunction:
+    return cast<GenericFunctionType>(this)->getLifetimeDependenceFor(
+        targetIndex);
+
+  default:
+    llvm_unreachable("Illegal type kind for AnyFunctionType.");
+  }
+}
+
+std::optional<LifetimeDependenceInfo>
+AnyFunctionType::getLifetimeDependenceForResult(const ValueDecl *decl) const {
+  auto resultIndex =
+      decl->hasCurriedSelf() ? getNumParams() + 1 : getNumParams();
+  return getLifetimeDependenceFor(resultIndex);
 }
 
 ClangTypeInfo AnyFunctionType::getCanonicalClangTypeInfo() const {
@@ -3967,7 +4018,7 @@ AnyFunctionType::getCanonicalExtInfo(bool useClangFunctionType) const {
   return ExtInfo(bits,
                  useClangFunctionType ? getCanonicalClangTypeInfo()
                                       : ClangTypeInfo(),
-                 globalActor, thrownError, getLifetimeDependenceInfo());
+                 globalActor, thrownError, getLifetimeDependencies());
 }
 
 bool AnyFunctionType::hasNonDerivableClangType() {
@@ -3999,17 +4050,6 @@ ClangTypeInfo SILFunctionType::getClangTypeInfo() const {
   assert(!info->empty() &&
          "If the ClangTypeInfo was empty, we shouldn't have stored it.");
   return *info;
-}
-
-const LifetimeDependenceInfo *SILFunctionType::
-getLifetimeDependenceInfoOrNull() const {
-  if (!Bits.SILFunctionType.HasLifetimeDependenceInfo)
-    return nullptr;
-  auto *info = getTrailingObjects<LifetimeDependenceInfo>();
-  assert(
-      !info->empty() &&
-      "If the LifetimeDependenceInfo was empty, we shouldn't have stored it.");
-  return info;
 }
 
 bool SILFunctionType::hasNonDerivableClangType() {
@@ -4465,7 +4505,7 @@ case TypeKind::Id:
     auto newSubMap =
       SubstitutionMap::get(sig,
         QueryReplacementTypeArray{sig, newSubs},
-        LookUpConformanceInModule(opaque->getDecl()->getModuleContext()));
+        LookUpConformanceInModule());
     return OpaqueTypeArchetypeType::get(opaque->getDecl(),
                                         opaque->getInterfaceType(),
                                         newSubMap);

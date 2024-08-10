@@ -1,7 +1,5 @@
 // RUN: %target-swift-frontend %s -emit-sil \
-// RUN:   -enable-experimental-feature NonescapableTypes \
-// RUN:   -enable-experimental-feature NoncopyableGenerics \
-// RUN:   -disable-lifetime-dependence-diagnostics
+// RUN:   -enable-experimental-feature NonescapableTypes
 
 // REQUIRES: asserts
 // REQUIRES: swift_in_compiler
@@ -169,3 +167,4 @@ public func array_view_element(a: ContiguousArray<Int> , i: BufferViewIndex<Int>
 public func array_view_slice_element(a: ContiguousArray<Int> , sliceIdx: FakeRange<BufferViewIndex<Int>>, Idx: BufferViewIndex<Int>) -> Int {
   a.view[sliceIdx][Idx]
 }
+

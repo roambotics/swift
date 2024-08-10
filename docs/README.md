@@ -136,6 +136,9 @@ documentation, please create a thread on the Swift forums under the
     operations on [currency](/docs/Lexicon.md#currency-type) data types and 
     optimizes accordingly.
     Includes a thorough discussion of the `@_semantics` attribute.
+  - [HowToUpdateDebugInfo.md](/docs/HowToUpdateDebugInfo.md): A guide for SIL
+    optimization pass authors for how to properly update debug info in SIL
+    program transformations.
 - Runtime specifics:
   - [Backtracing.rst](/docs/Backtracing.rst):
     Describes Swift's backtracing and crash catching support.
@@ -267,11 +270,11 @@ documentation, please create a thread on the Swift forums under the
 ### Proposals
 
 Old proposals are present in the [/docs/proposals](/docs/proposals) directory.
-More recent proposals are located in the [apple/swift-evolution][] repository.
+More recent proposals are located in the [swiftlang/swift-evolution][] repository.
 You can see the status of different proposals at
 <https://apple.github.io/swift-evolution/>.
 
-[apple/swift-evolution]: https://github.com/apple/swift-evolution
+[swiftlang/swift-evolution]: https://github.com/swiftlang/swift-evolution
 
 ### Surveys
 

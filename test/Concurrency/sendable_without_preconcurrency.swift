@@ -3,8 +3,7 @@
 // RUN: %target-swift-frontend -emit-module -emit-module-path %t/NonStrictModule.swiftmodule -module-name NonStrictModule %S/Inputs/NonStrictModule.swift
 // RUN: %target-swift-frontend -strict-concurrency=minimal -disable-availability-checking -I %t -verify %s -o /dev/null -emit-sil
 // RUN: %target-swift-frontend -strict-concurrency=targeted -disable-availability-checking -I %t -verify %s -o /dev/null -emit-sil -verify-additional-prefix targeted-complete-
-// RUN: %target-swift-frontend -strict-concurrency=complete -disable-availability-checking -I %t -verify %s -o /dev/null -emit-sil -verify-additional-prefix complete- -verify-additional-prefix targeted-complete-
-// RUN: %target-swift-frontend -strict-concurrency=complete -disable-availability-checking -I %t -verify %s -o /dev/null -emit-sil -verify-additional-prefix complete- -verify-additional-prefix targeted-complete- -enable-upcoming-feature RegionBasedIsolation
+// RUN: %target-swift-frontend -strict-concurrency=complete -disable-availability-checking -I %t -verify %s -o /dev/null -emit-sil -verify-additional-prefix complete- -verify-additional-prefix targeted-complete- -verify-additional-prefix tns-
 
 // REQUIRES: concurrency
 
@@ -15,24 +14,24 @@ actor A {
   func f() -> [StrictStruct: NonStrictClass] { [:] }
 }
 
-class NS { } // expected-targeted-complete-note{{class 'NS' does not conform to the 'Sendable' protocol}}
+class NS { }
 
-struct MyType { // expected-complete-note {{consider making struct 'MyType' conform to the 'Sendable' protocol}}
+struct MyType {
   var nsc: NonStrictClass
 }
 
-struct MyType2 { // expected-targeted-complete-note{{consider making struct 'MyType2' conform to the 'Sendable' protocol}}
+struct MyType2 {
   var nsc: NonStrictClass
   var ns: NS
 }
 
 func testA(ns: NS, mt: MyType, mt2: MyType2, sc: StrictClass, nsc: NonStrictClass) async {
-  Task {
-    print(ns) // expected-targeted-complete-warning{{capture of 'ns' with non-sendable type 'NS' in a `@Sendable` closure}}
+  Task { // expected-tns-warning {{sending value of non-Sendable type '() async -> ()' risks causing data races; this is an error in the Swift 6 language mode}}
+    // expected-tns-note @-1 {{Passing task-isolated value of non-Sendable type '() async -> ()' as a 'sending' parameter risks causing races inbetween task-isolated uses and uses reachable from the callee}}
+    print(ns)
     print(mt) // no warning by default: MyType is Sendable because we suppressed NonStrictClass's warning
-    // expected-complete-warning @-1 {{capture of 'mt' with non-sendable type 'MyType' in a `@Sendable` closure}}
-    print(mt2) // expected-targeted-complete-warning{{capture of 'mt2' with non-sendable type 'MyType2' in a `@Sendable` closure}}
-    print(sc) // expected-warning{{capture of 'sc' with non-sendable type 'StrictClass' in a `@Sendable` closure}}
+    print(mt2)
+    print(sc)
   }
 }
 

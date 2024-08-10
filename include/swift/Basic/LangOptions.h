@@ -18,6 +18,8 @@
 #ifndef SWIFT_BASIC_LANGOPTIONS_H
 #define SWIFT_BASIC_LANGOPTIONS_H
 
+#include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/CXXStdlibKind.h"
 #include "swift/Basic/Feature.h"
 #include "swift/Basic/FixedBitSet.h"
 #include "swift/Basic/FunctionBodySkipping.h"
@@ -31,6 +33,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Option/ArgList.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/VersionTuple.h"
 #include "llvm/Support/raw_ostream.h"
@@ -185,9 +188,6 @@ namespace swift {
     /// Disable API availability checking.
     bool DisableAvailabilityChecking = false;
 
-    /// Enable optimization to bypass resilience checks in a package
-    bool EnableBypassResilienceInPackage = false;
-
     /// Optimization mode for unavailable declarations.
     std::optional<UnavailableDeclOptimization> UnavailableDeclOptimizationMode;
 
@@ -265,6 +265,10 @@ namespace swift {
     /// Enable features useful for running in the debugger.
     bool DebuggerSupport = false;
 
+    /// Used only by the debugger. When set, the module loader will try to
+    /// import non-public transitive dependencies.
+    bool ImportNonPublicDependencies = false;
+
     /// Enable the MemoryBufferSerializedModuleImporter.
     /// Only used by lldb-moduleimport-test.
     bool EnableMemoryBufferImporter = false;
@@ -319,6 +323,19 @@ namespace swift {
     /// to the Swift language version.
     version::Version cxxInteropCompatVersion;
 
+    void setCxxInteropFromArgs(llvm::opt::ArgList &Args,
+                               swift::DiagnosticEngine &Diags);
+
+    /// The C++ standard library used for the current build. This can differ
+    /// from the default C++ stdlib on a particular platform when `-Xcc
+    /// -stdlib=xyz` was passed to the compiler.
+    CXXStdlibKind CXXStdlib = CXXStdlibKind::Unknown;
+    CXXStdlibKind PlatformDefaultCXXStdlib = CXXStdlibKind::Unknown;
+
+    bool isUsingPlatformDefaultCXXStdlib() const {
+      return CXXStdlib == PlatformDefaultCXXStdlib;
+    }
+
     bool CForeignReferenceTypes = false;
 
     /// Imports getters and setters as computed properties.
@@ -327,6 +344,9 @@ namespace swift {
     /// Should the compiler require C++ interoperability to be enabled
     /// when importing Swift modules that enable C++ interoperability.
     bool RequireCxxInteropToImportCxxInteropModule = true;
+
+    // Workaround for bug when building SwiftCompilerSources (rdar://128013193)
+    bool CxxInteropUseOpaquePointerForMoveOnly = false;
 
     /// On Darwin platforms, use the pre-stable ABI's mark bit for Swift
     /// classes instead of the stable ABI's bit. This is needed when
@@ -399,6 +419,9 @@ namespace swift {
     bool DisableImplicitBacktracingModuleImport =
         !SWIFT_IMPLICIT_BACKTRACING_IMPORT;
 
+    /// Disable the implicit import of the Cxx module.
+    bool DisableImplicitCxxModuleImport = false;
+
     // Whether to use checked continuations when making an async call from
     // Swift into ObjC. If false, will use unchecked continuations instead.
     bool UseCheckedAsyncObjCBridging = false;
@@ -451,12 +474,11 @@ namespace swift {
     /// Diagnose implicit 'override'.
     bool WarnImplicitOverrides = false;
 
+    /// Diagnose use of declarations that are soft-deprecated.
+    bool WarnSoftDeprecated = false;
+
     /// Diagnose uses of NSCoding with classes that have unstable mangled names.
     bool EnableNSKeyedArchiverDiagnostics = true;
-
-    /// Diagnose switches over non-frozen enums that do not have catch-all
-    /// cases.
-    bool EnableNonFrozenEnumExhaustivityDiagnostics = false;
 
     /// Regex for the passes that should report passed and missed optimizations.
     ///
@@ -488,6 +510,12 @@ namespace swift {
 
     /// Enable verification when every SubstitutionMap is constructed.
     bool VerifyAllSubstitutionMaps = false;
+
+    /// If set to true, the source manager will avoid memory mapping source files
+    /// with the expectation they may change on disk. This is most useful when
+    /// opening files under sourcekitd on Windows, as memory mapping on Windows
+    /// prevents files from being written.
+    bool OpenSourcesAsVolatile = false;
 
     /// Load swiftmodule files in memory as volatile and avoid mmap.
     bool EnableVolatileModules = false;
@@ -523,6 +551,9 @@ namespace swift {
     };
     ASTVerifierOverrideKind ASTVerifierOverride =
         ASTVerifierOverrideKind::NoOverride;
+
+    /// Dumps request evaluator cache statistics at the end of compilation.
+    bool AnalyzeRequestEvaluator = false;
 
     /// Enables dumping rewrite systems from the requirement machine.
     bool DumpRequirementMachine = false;
@@ -573,7 +604,7 @@ namespace swift {
     /// Skips decls that cannot be referenced externally.
     bool SkipNonExportableDecls = false;
 
-    /// True if -experimental-allow-non-resilient-access is passed and built
+    /// True if -allow-non-resilient-access is passed and built
     /// from source.
     bool AllowNonResilientAccess = false;
 
@@ -593,6 +624,9 @@ namespace swift {
     /// type-checking, SIL verification, and IR emission,
     bool BypassResilienceChecks = false;
 
+    /// Disables `DynamicActorIsolation` feature.
+    bool DisableDynamicActorIsolation = false;
+
     /// Whether or not to allow experimental features that are only available
     /// in "production".
 #ifdef NDEBUG
@@ -603,6 +637,11 @@ namespace swift {
 
     bool isConcurrencyModelTaskToThread() const {
       return ActiveConcurrencyModel == ConcurrencyModel::TaskToThread;
+    }
+
+    bool isDynamicActorIsolationCheckingEnabled() const {
+      return !DisableDynamicActorIsolation &&
+             hasFeature(Feature::DynamicActorIsolation);
     }
 
     LangOptions();
@@ -626,6 +665,8 @@ namespace swift {
       } else if (Target.isiOS()) {
         return Target.getiOSVersion();
       } else if (Target.isWatchOS()) {
+        return Target.getOSVersion();
+      } else if (Target.isXROS()) {
         return Target.getOSVersion();
       }
       return llvm::VersionTuple(/*Major=*/0, /*Minor=*/0, /*Subminor=*/0);
@@ -704,18 +745,23 @@ namespace swift {
       switch (maxWidth) {
       case 128:
         AtomicBitWidths.emplace_back("_128");
+        AtomicBitWidthValues.push_back(128);
         LLVM_FALLTHROUGH;
       case 64:
         AtomicBitWidths.emplace_back("_64");
+        AtomicBitWidthValues.push_back(64);
         LLVM_FALLTHROUGH;
       case 32:
         AtomicBitWidths.emplace_back("_32");
+        AtomicBitWidthValues.push_back(32);
         LLVM_FALLTHROUGH;
       case 16:
         AtomicBitWidths.emplace_back("_16");
+        AtomicBitWidthValues.push_back(16);
         LLVM_FALLTHROUGH;
       case 8:
         AtomicBitWidths.emplace_back("_8");
+        AtomicBitWidthValues.push_back(8);
         break;
       default:
         return;
@@ -725,6 +771,11 @@ namespace swift {
     /// Removes all atomic bit widths.
     void clearAtomicBitWidths() {
       AtomicBitWidths.clear();
+      AtomicBitWidthValues.clear();
+    }
+
+    llvm::ArrayRef<unsigned> getAtomicBitWidthValues() const {
+      return AtomicBitWidthValues;
     }
 
     /// Returns true if the given platform condition argument represents
@@ -765,6 +816,7 @@ namespace swift {
 
   private:
     llvm::SmallVector<std::string, 2> AtomicBitWidths;
+    llvm::SmallVector<unsigned, 2> AtomicBitWidthValues;
     llvm::SmallVector<std::pair<PlatformConditionKind, std::string>, 10>
         PlatformConditionValues;
     llvm::SmallVector<std::string, 2> CustomConditionalCompilationFlags;

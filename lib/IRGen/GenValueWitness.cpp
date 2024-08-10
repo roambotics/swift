@@ -26,6 +26,7 @@
 #include "swift/AST/DiagnosticsIRGen.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/BlockList.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/TypeLowering.h"
@@ -555,7 +556,8 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
             conditionallyGetTypeLayoutEntry(IGM, concreteType)) {
       typeLayoutEntry->initWithTake(IGF, dest, src);
     } else {
-      type.initializeWithTake(IGF, dest, src, concreteType, true);
+      type.initializeWithTake(IGF, dest, src, concreteType, true,
+                              /*zeroizeIfSensitive=*/ true);
     }
     dest = IGF.Builder.CreateElementBitCast(dest, IGF.IGM.OpaqueTy);
     IGF.Builder.CreateRet(dest.getAddress());
@@ -1221,8 +1223,7 @@ static void addValueWitness(IRGenModule &IGM, ConstantStructBuilder &B,
   case ValueWitness::GetEnumTag: {
     assert(concreteType.getEnumOrBoundGenericEnum());
 
-    if (IGM.Context.LangOpts.hasFeature(Feature::LayoutStringValueWitnesses) &&
-        IGM.getOptions().EnableLayoutStringValueWitnesses) {
+    if (layoutStringsEnabled(IGM)) {
       auto ty = boundGenericCharacteristics
                     ? boundGenericCharacteristics->concreteType
                     : concreteType;
@@ -1244,8 +1245,7 @@ static void addValueWitness(IRGenModule &IGM, ConstantStructBuilder &B,
   }
   case ValueWitness::DestructiveInjectEnumTag: {
     assert(concreteType.getEnumOrBoundGenericEnum());
-    if (IGM.Context.LangOpts.hasFeature(Feature::LayoutStringValueWitnesses) &&
-        IGM.getOptions().EnableLayoutStringValueWitnesses) {
+    if (layoutStringsEnabled(IGM)) {
       auto ty = boundGenericCharacteristics
                     ? boundGenericCharacteristics->concreteType
                     : concreteType;

@@ -132,11 +132,11 @@ public enum Optional<Wrapped: ~Copyable>: ~Copyable {
   case some(Wrapped)
 }
 
-extension Optional: Copyable /* where Wrapped: Copyable */ {}
+extension Optional: Copyable where Wrapped: Copyable {}
 
 extension Optional: Sendable where Wrapped: ~Copyable & Sendable { }
 
-extension Optional: _BitwiseCopyable where Wrapped: _BitwiseCopyable { }
+extension Optional: BitwiseCopyable where Wrapped: BitwiseCopyable { }
 
 @_preInverseGenerics
 extension Optional: ExpressibleByNilLiteral where Wrapped: ~Copyable {
@@ -185,9 +185,21 @@ extension Optional {
   ///   of the instance.
   /// - Returns: The result of the given closure. If this instance is `nil`,
   ///   returns `nil`.
-  @inlinable
-  public func map<U>(
-    // FIXME: This needs to support typed throws.
+  @_alwaysEmitIntoClient
+  public func map<E: Error, U: ~Copyable>(
+    _ transform: (Wrapped) throws(E) -> U
+  ) throws(E) -> U? {
+    switch self {
+    case .some(let y):
+      return .some(try transform(y))
+    case .none:
+      return .none
+    }
+  }
+
+  @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+  @usableFromInline
+  internal func map<U>(
     _ transform: (Wrapped) throws -> U
   ) rethrows -> U? {
     switch self {
@@ -218,16 +230,12 @@ extension Optional where Wrapped: ~Copyable {
   public borrowing func _borrowingMap<U: ~Copyable, E: Error>(
     _ transform: (borrowing Wrapped) throws(E) -> U
   ) throws(E) -> U? {
-    #if $NoncopyableGenerics
     switch self {
-    case .some(_borrowing y):
+    case .some(let y):
       return .some(try transform(y))
     case .none:
       return .none
     }
-    #else
-    fatalError("unsupported compiler")
-    #endif
   }
 }
 
@@ -251,9 +259,21 @@ extension Optional {
   ///   of the instance.
   /// - Returns: The result of the given closure. If this instance is `nil`,
   ///   returns `nil`.
-  @inlinable
-  public func flatMap<U>(
-    // FIXME: This needs to support typed throws.
+  @_alwaysEmitIntoClient
+  public func flatMap<E: Error, U: ~Copyable>(
+    _ transform: (Wrapped) throws(E) -> U?
+  ) throws(E) -> U? {
+    switch self {
+    case .some(let y):
+      return try transform(y)
+    case .none:
+      return .none
+    }
+  }
+
+  @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+  @usableFromInline
+  internal func flatMap<U>(
     _ transform: (Wrapped) throws -> U?
   ) rethrows -> U? {
     switch self {
@@ -265,7 +285,6 @@ extension Optional {
   }
 }
 
-@_disallowFeatureSuppression(NoncopyableGenerics)
 extension Optional where Wrapped: ~Copyable {
   // FIXME(NCG): Make this public.
   @_alwaysEmitIntoClient
@@ -286,7 +305,7 @@ extension Optional where Wrapped: ~Copyable {
     _ transform: (borrowing Wrapped) throws(E) -> U?
   ) throws(E) -> U? {
     switch self {
-    case .some(_borrowing y):
+    case .some(let y):
       return try transform(y)
     case .none:
       return .none
@@ -391,8 +410,8 @@ extension Optional where Wrapped: ~Copyable {
   ///
   /// - Returns: The wrapped value being stored in this instance. If this
   ///   instance is `nil`, returns `nil`.
-  @_alwaysEmitIntoClient // FIXME(NCG): Make this public.
-  public mutating func _take() -> Self {
+  @_alwaysEmitIntoClient
+  public mutating func take() -> Self {
     let result = consume self
     self = nil
     return result
@@ -407,7 +426,12 @@ extension Optional: CustomDebugStringConvertible {
     case .some(let value):
 #if !SWIFT_STDLIB_STATIC_PRINT
       var result = "Optional("
+      #if !$Embedded
       debugPrint(value, terminator: "", to: &result)
+      #else
+      _ = value
+      "(cannot print value in embedded Swift)".write(to: &result)
+      #endif
       result += ")"
       return result
 #else
@@ -770,10 +794,9 @@ extension Optional where Wrapped: ~Copyable {
 ///     type as the `Wrapped` type of `optional`.
 @_transparent
 @_alwaysEmitIntoClient
-// FIXME: This needs to support typed throws.
 public func ?? <T: ~Copyable>(
   optional: consuming T?,
-  defaultValue: @autoclosure () throws -> T
+  defaultValue: @autoclosure () throws -> T // FIXME: typed throw
 ) rethrows -> T {
   switch consume optional {
   case .some(let value):
@@ -784,8 +807,9 @@ public func ?? <T: ~Copyable>(
 }
 
 @_spi(SwiftStdlibLegacyABI) @available(swift, obsoleted: 1)
+@_silgen_name("$ss2qqoiyxxSg_xyKXKtKlF")
 @usableFromInline
-internal func ?? <T>(
+internal func _legacy_abi_optionalNilCoalescingOperator <T>(
   optional: T?,
   defaultValue: @autoclosure () throws -> T
 ) rethrows -> T {

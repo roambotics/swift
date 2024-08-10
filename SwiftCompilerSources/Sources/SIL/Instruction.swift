@@ -48,7 +48,8 @@ public class Instruction : CustomStringConvertible, Hashable {
     return OperandArray(base: operands.base, count: operands.count)
   }
 
-  // All operands defined by the operation. Returns the prefix of `operands` that does not include trailing type dependent operands.
+  // All operands defined by the operation.
+  // Returns the prefix of `operands` that does not include trailing type dependent operands.
   final public var definedOperands: OperandArray {
     let operands = bridged.getOperands()
     let typeOperands = bridged.getTypeDependentOperands()
@@ -237,7 +238,7 @@ public class MultipleValueInstruction : Instruction {
   }
 }
 
-/// Instructions, which have a single operand.
+/// Instructions, which have a single operand (not including type-dependent operands).
 public protocol UnaryInstruction : Instruction {
   var operand: Operand { get }
 }
@@ -311,14 +312,13 @@ public protocol SourceDestAddrInstruction : Instruction {
 }
 
 extension SourceDestAddrInstruction {
-  public var sourceOperand: Operand { return operands[0] }
-  public var destinationOperand: Operand { return operands[1] }
+  public var sourceOperand: Operand { operands[0] }
+  public var destinationOperand: Operand { operands[1] }
+  public var source: Value { sourceOperand.value }
+  public var destination: Value { destinationOperand.value }
 }
 
 final public class CopyAddrInst : Instruction, SourceDestAddrInstruction {
-  public var source: Value { return sourceOperand.value }
-  public var destination: Value { return destinationOperand.value }
-  
   public var isTakeOfSrc: Bool {
     bridged.CopyAddrInst_isTakeOfSrc()
   }
@@ -418,7 +418,16 @@ public protocol DebugVariableInstruction : VarDeclInstruction {
   var debugVariable: DebugVariable { get }
 }
 
-final public class DebugValueInst : Instruction, UnaryInstruction, DebugVariableInstruction {
+/// A meta instruction is an instruction whose location is not interesting as
+/// it is impossible to set a breakpoint on it.
+/// That could be because the instruction does not generate code (such as
+/// `debug_value`), or because the generated code would be in the prologue
+/// (`alloc_stack`).
+/// When we are moving code onto an unknown instruction (such as the start of a
+/// basic block), we want to ignore any meta instruction that might be there.
+public protocol MetaInstruction: Instruction {}
+
+final public class DebugValueInst : Instruction, UnaryInstruction, DebugVariableInstruction, MetaInstruction {
   public var varDecl: VarDecl? {
     VarDecl(bridged: bridged.DebugValue_getDecl())
   }
@@ -497,6 +506,11 @@ final public class UnmanagedAutoreleaseValueInst : RefCountingInst {}
 
 final public class DestroyValueInst : Instruction, UnaryInstruction {
   public var destroyedValue: Value { operand.value }
+
+  /// True if this `destroy_value` is inside a dead-end block is only needed to formally
+  /// end the lifetime of its operand.
+  /// Such `destroy_value` instructions are lowered to no-ops.
+  public var isDeadEnd: Bool { bridged.DestroyValueInst_isDeadEnd() }
 }
 
 final public class DestroyAddrInst : Instruction, UnaryInstruction {
@@ -504,6 +518,8 @@ final public class DestroyAddrInst : Instruction, UnaryInstruction {
 }
 
 final public class EndLifetimeInst : Instruction, UnaryInstruction {}
+
+final public class ExtendLifetimeInst : Instruction, UnaryInstruction {}
 
 final public class InjectEnumAddrInst : Instruction, UnaryInstruction, EnumInstruction {
   public var `enum`: Value { operand.value }
@@ -670,7 +686,7 @@ final public
 class InitExistentialAddrInst : SingleValueInstruction, UnaryInstruction {}
 
 final public
-class DeinitExistentialAddrInst : Instruction {}
+class DeinitExistentialAddrInst : Instruction, UnaryInstruction {}
 
 final public
 class DeinitExistentialValueInst : Instruction {}
@@ -862,6 +878,8 @@ final public class RefElementAddrInst : SingleValueInstruction, UnaryInstruction
 
 final public class RefTailAddrInst : SingleValueInstruction, UnaryInstruction {
   public var instance: Value { operand.value }
+
+  public var isImmutable: Bool { bridged.RefTailAddrInst_isImmutable() }
 }
 
 final public class KeyPathInst : SingleValueInstruction {
@@ -890,10 +908,20 @@ class UnconditionalCheckedCastInst : SingleValueInstruction, UnaryInstruction {
 final public
 class ConvertFunctionInst : SingleValueInstruction, UnaryInstruction {
   public var fromFunction: Value { operand.value }
+  public var withoutActuallyEscaping: Bool { bridged.ConvertFunctionInst_withoutActuallyEscaping() }
 }
 
 final public
-class ThinToThickFunctionInst : SingleValueInstruction, UnaryInstruction {}
+class ThinToThickFunctionInst : SingleValueInstruction, UnaryInstruction {
+  public var callee: Value { operand.value }
+
+  public var referencedFunction: Function? {
+    if let fri = callee as? FunctionRefInst {
+      return fri.referencedFunction
+    }
+    return nil
+  }
+}
 
 final public class ThickToObjCMetatypeInst : SingleValueInstruction {}
 final public class ObjCToThickMetatypeInst : SingleValueInstruction {}
@@ -956,6 +984,18 @@ final public class BridgeObjectToRefInst : SingleValueInstruction, UnaryInstruct
 
 final public class BridgeObjectToWordInst : SingleValueInstruction, UnaryInstruction {}
 
+final public class BorrowedFromInst : SingleValueInstruction, BorrowIntroducingInstruction {
+  public var borrowedValue: Value { operands[0].value }
+  public var borrowedPhi: Phi { Phi(borrowedValue)! }
+  public var enclosingOperands: OperandArray {
+    let ops = operands
+    return ops[1..<ops.count]
+  }
+  public var enclosingValues: LazyMapSequence<LazySequence<OperandArray>.Elements, Value> {
+    enclosingOperands.values
+  }
+}
+
 final public class ProjectBoxInst : SingleValueInstruction, UnaryInstruction {
   public var box: Value { operand.value }
   public var fieldIndex: Int { bridged.ProjectBoxInst_fieldIndex() }
@@ -982,7 +1022,7 @@ final public class MoveValueInst : SingleValueInstruction, UnaryInstruction {
   public var fromValue: Value { operand.value }
 
   public var isLexical: Bool { bridged.MoveValue_isLexical() }
-
+  public var hasPointerEscape: Bool { bridged.MoveValue_hasPointerEscape() }
   public var isFromVarDecl: Bool { bridged.MoveValue_isFromVarDecl() }
 }
 
@@ -1019,7 +1059,9 @@ final public class PartialApplyInst : SingleValueInstruction, ApplySite {
     return arguments.contains { $0.type.containsNoEscapeFunction }
   }
 
+  public var hasUnknownResultIsolation: Bool { bridged.PartialApplyInst_hasUnknownResultIsolation() }
   public var unappliedArgumentCount: Int { bridged.PartialApply_getCalleeArgIndexOfFirstAppliedArg() }
+  public var calleeConvention: ArgumentConvention { type.bridged.getCalleeConvention().convention }
 }
 
 final public class ApplyInst : SingleValueInstruction, FullApplySite {
@@ -1103,7 +1145,7 @@ final public class InitBlockStorageHeaderInst: SingleValueInstruction {}
 
 public protocol Allocation : SingleValueInstruction { }
 
-final public class AllocStackInst : SingleValueInstruction, Allocation, DebugVariableInstruction {
+final public class AllocStackInst : SingleValueInstruction, Allocation, DebugVariableInstruction, MetaInstruction {
   public var hasDynamicLifetime: Bool { bridged.AllocStackInst_hasDynamicLifetime() }
 
   public var varDecl: VarDecl? {
@@ -1184,7 +1226,9 @@ extension Instruction {
 /// Instructions beginning a borrow-scope which must be ended by `end_borrow`.
 public protocol BorrowIntroducingInstruction : SingleValueInstruction, ScopedInstruction {}
 
-final public class EndBorrowInst : Instruction, UnaryInstruction {}
+final public class EndBorrowInst : Instruction, UnaryInstruction {
+  public var borrow: Value { operand.value }
+}
 
 extension BorrowIntroducingInstruction {
   public var endOperands: LazyFilterSequence<UseList> {
@@ -1196,7 +1240,7 @@ final public class BeginBorrowInst : SingleValueInstruction, UnaryInstruction, B
   public var borrowedValue: Value { operand.value }
 
   public var isLexical: Bool { bridged.BeginBorrow_isLexical() }
-
+  public var hasPointerEscape: Bool { bridged.BeginBorrow_hasPointerEscape() }
   public var isFromVarDecl: Bool { bridged.BeginBorrow_isFromVarDecl() }
 
   public var endOperands: LazyFilterSequence<UseList> {
@@ -1229,6 +1273,7 @@ final public class BeginAccessInst : SingleValueInstruction, UnaryInstruction {
   }
 
   public var isStatic: Bool { bridged.BeginAccessInst_isStatic() }
+  public var isUnsafe: Bool { bridged.BeginAccessInst_isUnsafe() }
 
   public var address: Value { operand.value }
 
@@ -1269,8 +1314,15 @@ final public class BeginApplyInst : MultipleValueInstruction, FullApplySite {
   }
 }
 
-final public class EndApplyInst : Instruction, UnaryInstruction {}
-final public class AbortApplyInst : Instruction, UnaryInstruction {}
+final public class EndApplyInst : Instruction, UnaryInstruction {
+  public var token: MultipleValueInstructionResult { operand.value as! MultipleValueInstructionResult }
+  public var beginApply: BeginApplyInst { token.parentInstruction as! BeginApplyInst }
+}
+
+final public class AbortApplyInst : Instruction, UnaryInstruction {
+  public var token: MultipleValueInstructionResult { operand.value as! MultipleValueInstructionResult }
+  public var beginApply: BeginApplyInst { token.parentInstruction as! BeginApplyInst }
+}
 
 extension BeginApplyInst : ScopedInstruction {
   public var endOperands: LazyFilterSequence<UseList> {

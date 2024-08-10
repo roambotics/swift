@@ -17,6 +17,7 @@
 
 #define DEBUG_TYPE "libsil"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/ForeignAsyncConvention.h"
 #include "swift/AST/ForeignErrorConvention.h"
@@ -25,6 +26,7 @@
 #include "swift/AST/ModuleLoader.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/CanTypeVisitor.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/TypeLowering.h"
 #include "swift/SIL/AbstractionPatternGenerators.h"
@@ -284,39 +286,40 @@ LayoutConstraint AbstractionPattern::getLayoutConstraint() const {
   }
 }
 
-bool AbstractionPattern::isNoncopyable(CanType substTy) const {
-  auto copyable
-    = substTy->getASTContext().getProtocol(KnownProtocolKind::Copyable);
+bool AbstractionPattern::conformsToKnownProtocol(
+  CanType substTy, KnownProtocolKind protocolKind) const {
+  auto suppressible
+    = substTy->getASTContext().getProtocol(protocolKind);
     
-  auto isDefinitelyCopyable = [&](CanType t) -> bool {
-    auto result = copyable->getParentModule()
-      ->checkConformanceWithoutContext(substTy, copyable,
-                                       /*allowMissing=*/false);
+  auto definitelyConforms = [&](CanType t) -> bool {
+    auto result =
+      checkConformanceWithoutContext(t, suppressible,
+                                     /*allowMissing=*/false);
     return result.has_value() && !result.value().isInvalid();
   };
     
   // If the substituted type definitely conforms, that's authoritative.
-  if (isDefinitelyCopyable(substTy)) {
-    return false;
+  if (definitelyConforms(substTy)) {
+    return true;
   }
 
   // If the substituted type is fully concrete, that's it. If there are unbound
   // type variables in the type, then we may have to account for the upper
   // abstraction bound from the abstraction pattern.
   if (!substTy->hasTypeParameter()) {
-    return true;
+    return false;
   }
   
   switch (getKind()) {
   case Kind::Opaque: {
     // The abstraction pattern doesn't provide any more specific bounds.
-    return true;
+    return false;
   }
   case Kind::Type:
   case Kind::Discard:
   case Kind::ClangType: {
     // See whether the abstraction pattern's context gives us an upper bound
-    // that ensures the type is copyable.
+    // that ensures the type conforms.
     auto type = getType();
     if (hasGenericSignature() && getType()->hasTypeParameter()) {
       type = GenericEnvironment::mapTypeIntoContext(
@@ -324,22 +327,23 @@ bool AbstractionPattern::isNoncopyable(CanType substTy) const {
         ->getReducedType(getGenericSignature());
     }
     
-    return !isDefinitelyCopyable(type);
+    return definitelyConforms(type);
   }
   case Kind::Tuple: {
-    // A tuple is noncopyable if any element is.
+    // A tuple conforms if all elements do.
     if (doesTupleVanish()) {
       return getVanishingTupleElementPatternType().value()
-        .isNoncopyable(substTy);
+        .conformsToKnownProtocol(substTy, protocolKind);
     }
     auto substTupleTy = cast<TupleType>(substTy);
   
     for (unsigned i = 0, e = getNumTupleElements(); i < e; ++i) {
-      if (getTupleElementType(i).isNoncopyable(substTupleTy.getElementType(i))){
-        return true;
+      if (!getTupleElementType(i).conformsToKnownProtocol(
+            substTupleTy.getElementType(i), protocolKind)) {
+        return false;
       }
     }
-    return false;
+    return true;
   }
   // Functions are, at least for now, always copyable.
   case Kind::CurriedObjCMethodType:
@@ -354,11 +358,19 @@ bool AbstractionPattern::isNoncopyable(CanType substTy) const {
   case Kind::PartialCurriedCXXMethodType:
   case Kind::OpaqueFunction:
   case Kind::OpaqueDerivativeFunction:
-    return false;
+    return true;
   
   case Kind::Invalid:
     llvm_unreachable("asking invalid abstraction pattern");
   }
+}
+
+bool AbstractionPattern::isNoncopyable(CanType substTy) const {
+  return !conformsToKnownProtocol(substTy, KnownProtocolKind::Copyable);
+}
+
+bool AbstractionPattern::isEscapable(CanType substTy) const {
+  return conformsToKnownProtocol(substTy, KnownProtocolKind::Escapable);
 }
 
 bool AbstractionPattern::matchesTuple(CanType substType) const {
@@ -2055,7 +2067,7 @@ const {
   case Kind::ClangType:
   case Kind::Type:
   case Kind::Discard:
-    auto memberTy = getType()->getTypeOfMember(member->getModuleContext(),
+    auto memberTy = getType()->getTypeOfMember(
                                       member, origMemberInterfaceType)
                              ->getReducedType(getGenericSignature());
       
@@ -2513,9 +2525,8 @@ public:
     
     auto decl = orig->getAnyNominal();
 
-    auto moduleDecl = decl->getParentModule();
-    auto origSubMap = orig->getContextSubstitutionMap(moduleDecl, decl);
-    auto substSubMap = subst->getContextSubstitutionMap(moduleDecl, decl);
+    auto origSubMap = orig->getContextSubstitutionMap(decl);
+    auto substSubMap = subst->getContextSubstitutionMap(decl);
     
     auto nomGenericSig = decl->getGenericSignature();
     
@@ -2532,7 +2543,7 @@ public:
     }
 
     auto newSubMap = SubstitutionMap::get(nomGenericSig, replacementTypes,
-      LookUpConformanceInModule(moduleDecl));
+      LookUpConformanceInModule());
     
     for (auto reqt : nomGenericSig.getRequirements()) {
       // Skip conformance requirements to Copyable and Escapable.
@@ -2830,17 +2841,7 @@ const {
     [&](SubstitutableType *dependentType) -> Type {
       auto index = cast<GenericTypeParamType>(dependentType)->getIndex();
       return visitor.substReplacementTypes[index];
-    }, [&](CanType dependentType,
-           Type conformingReplacementType,
-           ProtocolDecl *conformedProtocol) -> ProtocolConformanceRef {
-      // TODO: Should have collected the conformances used in the original
-      // type.
-      if (conformingReplacementType->isTypeParameter())
-        return ProtocolConformanceRef(conformedProtocol);
-    
-      return TC.M.lookupConformance(conformingReplacementType, conformedProtocol,
-                                    /*allowMissing*/ true);
-    });
+    }, LookUpConformanceInModule());
 
   auto yieldType = visitor.substYieldType;
   if (yieldType)

@@ -24,6 +24,7 @@
 #include "swift/AST/TypeLoc.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Subsystems.h"
 
 #include <optional>
@@ -102,30 +103,58 @@ void swift::simple_display(llvm::raw_ostream &out, const TypeLoc source) {
 // Inherited type computation.
 //----------------------------------------------------------------------------//
 
-const TypeLoc &InheritedTypeRequest::getTypeLoc() const {
+const InheritedEntry &InheritedTypeRequest::getInheritedEntry() const {
   const auto &storage = getStorage();
   auto inheritedTypes = InheritedTypes(std::get<0>(storage));
   return inheritedTypes.getEntry(std::get<1>(storage));
 }
 
+ASTContext &InheritedTypeRequest::getASTContext() const {
+  auto declUnion = std::get<0>(getStorage());
+  if (auto *td = declUnion.dyn_cast<const TypeDecl *>()) {
+    return td->getASTContext();
+  }
+  return declUnion.get<const ExtensionDecl *>()->getASTContext();
+}
+
 SourceLoc InheritedTypeRequest::getNearestLoc() const {
-  return getTypeLoc().getLoc();
+  return getInheritedEntry().getLoc();
 }
 
 bool InheritedTypeRequest::isCached() const {
   return std::get<2>(getStorage()) == TypeResolutionStage::Interface;
 }
 
-std::optional<Type> InheritedTypeRequest::getCachedResult() const {
-  auto &typeLoc = getTypeLoc();
-  if (typeLoc.wasValidated())
-    return typeLoc.getType();
+std::optional<InheritedTypeResult>
+InheritedTypeRequest::getCachedResult() const {
+  auto &inheritedEntry = getInheritedEntry();
+  if (inheritedEntry.isSuppressed()) {
+    auto itr = cast_or_null<InverseTypeRepr>(inheritedEntry.getTypeRepr());
+    return InheritedTypeResult::forSuppressed(inheritedEntry.getType(), itr);
+  }
+  if (inheritedEntry.wasValidated()) {
+    return InheritedTypeResult::forInherited(inheritedEntry.getType());
+  }
 
   return std::nullopt;
 }
 
-void InheritedTypeRequest::cacheResult(Type value) const {
-  const_cast<TypeLoc &>(getTypeLoc()).setType(value);
+void InheritedTypeRequest::cacheResult(InheritedTypeResult value) const {
+  auto &inheritedEntry = const_cast<InheritedEntry &>(getInheritedEntry());
+  Type ty;
+  switch (value) {
+  case InheritedTypeResult::Inherited:
+    ty = value.getInheritedType();
+    break;
+  case InheritedTypeResult::Default:
+    ty = Type();
+    break;
+  case InheritedTypeResult::Suppressed:
+    inheritedEntry.setSuppressed();
+    ty = value.getSuppressed().first;
+    break;
+  }
+  inheritedEntry.setType(ty);
 }
 
 //----------------------------------------------------------------------------//
@@ -320,6 +349,49 @@ void IsDynamicRequest::cacheResult(bool value) const {
   // Add an attribute for printing
   if (value && !decl->getAttrs().hasAttribute<DynamicAttr>())
     decl->getAttrs().add(new (decl->getASTContext()) DynamicAttr(/*Implicit=*/true));
+}
+
+//----------------------------------------------------------------------------//
+// DynamicallyReplacedDeclRequest computation.
+//----------------------------------------------------------------------------//
+
+std::optional<ValueDecl *> DynamicallyReplacedDeclRequest::getCachedResult() const {
+  auto *decl = std::get<0>(getStorage());
+
+  if (decl->LazySemanticInfo.noDynamicallyReplacedDecl)
+    return std::optional(nullptr);
+
+  return decl->getASTContext().evaluator.getCachedNonEmptyOutput(*this);
+}
+
+
+void DynamicallyReplacedDeclRequest::cacheResult(ValueDecl *result) const {
+  auto *decl = std::get<0>(getStorage());
+
+  if (!result) {
+    decl->LazySemanticInfo.noDynamicallyReplacedDecl = 1;
+    return;
+  }
+
+  decl->getASTContext().evaluator.cacheNonEmptyOutput(*this, std::move(result));
+}
+
+//----------------------------------------------------------------------------//
+// ApplyAccessNoteRequest computation.
+//----------------------------------------------------------------------------//
+
+std::optional<evaluator::SideEffect>
+ApplyAccessNoteRequest::getCachedResult() const {
+  auto *decl = std::get<0>(getStorage());
+  if (decl->LazySemanticInfo.accessNoteApplied)
+    return evaluator::SideEffect();
+  return std::nullopt;
+}
+
+
+void ApplyAccessNoteRequest::cacheResult(evaluator::SideEffect result) const {
+  auto *decl = std::get<0>(getStorage());
+  decl->LazySemanticInfo.accessNoteApplied = 1;
 }
 
 //----------------------------------------------------------------------------//
@@ -594,6 +666,33 @@ void swift::simple_display(llvm::raw_ostream &out,
 }
 
 //----------------------------------------------------------------------------//
+// AttachedPropertyWrappersRequest computation.
+//----------------------------------------------------------------------------//
+
+std::optional<llvm::TinyPtrVector<CustomAttr *>>
+AttachedPropertyWrappersRequest::getCachedResult() const {
+  auto *decl = std::get<0>(getStorage());
+
+  if (decl->hasNoAttachedPropertyWrappers())
+    return llvm::TinyPtrVector<CustomAttr *>();
+
+  return decl->getASTContext().evaluator.getCachedNonEmptyOutput(*this);
+}
+
+
+void AttachedPropertyWrappersRequest::cacheResult(
+    llvm::TinyPtrVector<CustomAttr *> result) const {
+  auto *decl = std::get<0>(getStorage());
+
+  if (result.empty()) {
+    decl->setHasNoAttachedPropertyWrappers();
+    return;
+  }
+
+  decl->getASTContext().evaluator.cacheNonEmptyOutput(*this, std::move(result));
+}
+
+//----------------------------------------------------------------------------//
 // SelfAccessKindRequest computation.
 //----------------------------------------------------------------------------//
 
@@ -834,6 +933,35 @@ void UnderlyingTypeRequest::diagnoseCycle(DiagnosticEngine &diags) const {
 }
 
 //----------------------------------------------------------------------------//
+// PropertyWrapperAuxiliaryVariablesRequest computation.
+//----------------------------------------------------------------------------//
+
+std::optional<PropertyWrapperAuxiliaryVariables>
+PropertyWrapperAuxiliaryVariablesRequest::getCachedResult() const {
+  auto storage = getStorage();
+  auto *var = std::get<0>(storage);
+
+  if (var->hasNoPropertyWrapperAuxiliaryVariables())
+    return PropertyWrapperAuxiliaryVariables();
+
+  return var->getASTContext().evaluator.getCachedNonEmptyOutput(*this);
+}
+
+
+void PropertyWrapperAuxiliaryVariablesRequest::cacheResult(
+    PropertyWrapperAuxiliaryVariables value) const {
+  auto storage = getStorage();
+  auto *var = std::get<0>(storage);
+
+  if (!value) {
+    var->setHasNoPropertyWrapperAuxiliaryVariables();
+    return;
+  }
+
+  var->getASTContext().evaluator.cacheNonEmptyOutput(*this, std::move(value));
+}
+
+//----------------------------------------------------------------------------//
 // StructuralTypeRequest computation.
 //----------------------------------------------------------------------------//
 
@@ -1046,7 +1174,9 @@ void InterfaceTypeRequest::cacheResult(Type type) const {
   if (type) {
     assert(!type->hasTypeVariable() && "Type variable in interface type");
     assert(!type->is<InOutType>() && "Interface type must be materializable");
-    assert(!type->hasArchetype() && "Archetype in interface type");
+    assert(!type->hasPrimaryArchetype() && "Archetype in interface type");
+    assert(decl->getDeclContext()->isLocalContext() || !type->hasLocalArchetype() &&
+           "Local archetype in interface type of non-local declaration");
   }
   decl->TypeAndAccess.setPointer(type);
 }
@@ -1188,25 +1318,6 @@ void AssociatedConformanceRequest::cacheResult(
 }
 
 //----------------------------------------------------------------------------//
-// PreCheckResultBuilderRequest computation.
-//----------------------------------------------------------------------------//
-
-void swift::simple_display(llvm::raw_ostream &out,
-                           ResultBuilderBodyPreCheck value) {
-  switch (value) {
-  case ResultBuilderBodyPreCheck::Okay:
-    out << "okay";
-    break;
-  case ResultBuilderBodyPreCheck::HasReturnStmt:
-    out << "has return statement";
-    break;
-  case ResultBuilderBodyPreCheck::Error:
-    out << "error";
-    break;
-  }
-}
-
-//----------------------------------------------------------------------------//
 // HasCircularInheritedProtocolsRequest computation.
 //----------------------------------------------------------------------------//
 
@@ -1271,7 +1382,7 @@ std::optional<Expr *> DefaultArgumentExprRequest::getCachedResult() const {
 
 void DefaultArgumentExprRequest::cacheResult(Expr *expr) const {
   auto *param = std::get<0>(getStorage());
-  param->setDefaultExpr(expr, /*isTypeChecked*/ true);
+  param->setTypeCheckedDefaultExpr(expr);
 }
 
 //----------------------------------------------------------------------------//
@@ -1674,19 +1785,20 @@ ActorIsolation ActorIsolation::subst(SubstitutionMap subs) const {
 }
 
 void ActorIsolation::printForDiagnostics(llvm::raw_ostream &os,
-                                         StringRef openingQuotationMark) const {
+                                         StringRef openingQuotationMark,
+                                         bool asNoun) const {
   switch (*this) {
   case ActorIsolation::ActorInstance:
-    os << "actor-isolated";
+    os << "actor" << (asNoun ? " isolation" : "-isolated");
     break;
 
   case ActorIsolation::GlobalActor: {
     if (isMainActor()) {
-      os << "main actor-isolated";
+      os << "main actor" << (asNoun ? " isolation" : "-isolated");
     } else {
       Type globalActor = getGlobalActor();
       os << "global actor " << openingQuotationMark << globalActor.getString()
-         << openingQuotationMark << "-isolated";
+         << openingQuotationMark << (asNoun ? " isolation" : "-isolated");
     }
     break;
   }
@@ -1703,6 +1815,62 @@ void ActorIsolation::printForDiagnostics(llvm::raw_ostream &os,
     }
     break;
   }
+}
+
+void ActorIsolation::print(llvm::raw_ostream &os) const {
+  switch (getKind()) {
+  case Unspecified:
+    os << "unspecified";
+    return;
+  case ActorInstance:
+    os << "actor_instance";
+    if (auto *vd = getActorInstance()) {
+      os << ". name: '" << vd->getBaseIdentifier() << "'";
+    }
+    return;
+  case Nonisolated:
+    os << "nonisolated";
+    return;
+  case NonisolatedUnsafe:
+    os << "nonisolated_unsafe";
+    return;
+  case GlobalActor:
+    os << "global_actor. type: " << getGlobalActor();
+    return;
+  case Erased:
+    os << "erased";
+    return;
+  }
+  llvm_unreachable("Covered switch isn't covered?!");
+}
+
+void ActorIsolation::printForSIL(llvm::raw_ostream &os) const {
+  switch (getKind()) {
+  case Unspecified:
+    os << "unspecified";
+    return;
+  case ActorInstance:
+    os << "actor_instance";
+    return;
+  case Nonisolated:
+    os << "nonisolated";
+    return;
+  case NonisolatedUnsafe:
+    os << "nonisolated_unsafe";
+    return;
+  case GlobalActor:
+    os << "global_actor";
+    return;
+  case Erased:
+    os << "erased";
+    return;
+  }
+  llvm_unreachable("Covered switch isn't covered?!");
+}
+
+void ActorIsolation::dump() const {
+  print(llvm::dbgs());
+  llvm::dbgs() << '\n';
 }
 
 void ActorIsolation::dumpForDiagnostics() const {
@@ -1756,6 +1924,52 @@ void swift::simple_display(
   }
 }
 
+void IsolationSource::printForDiagnostics(
+    llvm::raw_ostream &os,
+    StringRef openingQuotationMark) const {
+  switch (this->kind) {
+  case IsolationSource::Explicit:
+    os << "explicit isolation";
+    return;
+
+  case IsolationSource::None:
+    os << "unspecified isolation";
+    return;
+
+  case IsolationSource::MainFunction:
+    os << "@main";
+    return;
+
+  case IsolationSource::TopLevelCode:
+    os << "top-level code";
+    return;
+
+  case IsolationSource::LexicalContext:
+    os << "enclosing context";
+    return;
+
+  case IsolationSource::Override:
+    os << "overridden superclass method";
+    return;
+
+  case IsolationSource::Conformance:
+    os << "conformance to ";
+    break;
+
+  case IsolationSource::Superclass:
+    os << "inheritance from ";
+    break;
+  }
+
+  auto *decl = inferenceSource.dyn_cast<Decl *>();
+  os << Decl::getDescriptiveKindName(decl->getDescriptiveKind());
+  if (auto *vd = dyn_cast<ValueDecl>(decl)) {
+    os << " " << openingQuotationMark;
+    vd->getName().printPretty(os);
+    os << openingQuotationMark;
+  }
+}
+
 bool swift::areTypesEqual(Type type1, Type type2) {
   if (!type1 || !type2)
     return !type1 && !type2;
@@ -1779,6 +1993,52 @@ void swift::simple_display(
   simple_display(out, initKindAndExpr.initKind);
   out << " ";
   simple_display(out, initKindAndExpr.initExpr);
+}
+
+//----------------------------------------------------------------------------//
+// GlobalActorAttributeRequest computation.
+//----------------------------------------------------------------------------//
+
+std::optional<std::optional<CustomAttrNominalPair>>
+GlobalActorAttributeRequest::getCachedResult() const {
+  auto storage = getStorage();
+  auto subject = std::get<0>(storage);
+
+  if (auto decl = subject.dyn_cast<Decl *>()) {
+    if (decl->hasNoGlobalActorAttribute())
+      return std::optional(std::optional<CustomAttrNominalPair>());
+
+    return decl->getASTContext().evaluator.getCachedNonEmptyOutput(*this);
+  } else {
+    auto closure = subject.get<ClosureExpr *>();
+    if (closure->hasNoGlobalActorAttribute())
+      return std::optional(std::optional<CustomAttrNominalPair>());
+
+    return closure->getASTContext().evaluator.getCachedNonEmptyOutput(*this);
+  }
+}
+
+void
+GlobalActorAttributeRequest::cacheResult(std::optional<CustomAttrNominalPair> value) const {
+  auto storage = getStorage();
+  auto subject = std::get<0>(storage);
+
+  if (auto decl = subject.dyn_cast<Decl *>()) {
+    if (!value) {
+      decl->setHasNoGlobalActorAttribute();
+      return;
+    }
+
+    decl->getASTContext().evaluator.cacheNonEmptyOutput(*this, std::move(value));
+  } else {
+    auto closure = subject.get<ClosureExpr *>();
+    if (!value) {
+      closure->setHasNoGlobalActorAttribute();
+      return;
+    }
+
+    closure->getASTContext().evaluator.cacheNonEmptyOutput(*this, std::move(value));
+  }
 }
 
 //----------------------------------------------------------------------------//
@@ -1994,6 +2254,25 @@ void ExpandExtensionMacros::noteCycleStep(DiagnosticEngine &diags) const {
                  decl->getName());
 }
 
+std::optional<ArrayRef<unsigned>> ExpandMemberAttributeMacros::getCachedResult() const {
+  auto decl = std::get<0>(getStorage());
+  if (decl->hasNoMemberAttributeMacros())
+    return ArrayRef<unsigned>();
+
+  return decl->getASTContext().evaluator.getCachedNonEmptyOutput(*this);
+}
+
+void ExpandMemberAttributeMacros::cacheResult(ArrayRef<unsigned> result) const {
+  auto decl = std::get<0>(getStorage());
+
+  if (result.empty()) {
+    decl->setHasNoMemberAttributeMacros();
+    return;
+  }
+
+  decl->getASTContext().evaluator.cacheNonEmptyOutput(*this, std::move(result));
+}
+
 void ExpandMemberAttributeMacros::diagnoseCycle(DiagnosticEngine &diags) const {
   auto decl = std::get<0>(getStorage());
   if (auto value = dyn_cast<ValueDecl>(decl)) {
@@ -2048,6 +2327,30 @@ void ExpandSynthesizedMemberMacroRequest::noteCycleStep(DiagnosticEngine &diags)
                    diag::macro_expand_circular_reference_unnamed_through,
                    "member");
   }
+}
+
+//----------------------------------------------------------------------------//
+// ExpandPeerMacroRequest computation.
+//----------------------------------------------------------------------------//
+
+std::optional<ArrayRef<unsigned>> ExpandPeerMacroRequest::getCachedResult() const {
+  auto decl = std::get<0>(getStorage());
+  if (decl->hasNoPeerMacros())
+    return ArrayRef<unsigned>();
+
+  return decl->getASTContext().evaluator.getCachedNonEmptyOutput(*this);
+}
+
+void ExpandPeerMacroRequest::cacheResult(ArrayRef<unsigned> result) const {
+  auto decl = std::get<0>(getStorage());
+
+  if (result.empty()) {
+    decl->setHasNoPeerMacros();
+    return;
+  }
+
+  decl->getASTContext().evaluator
+      .cacheNonEmptyOutput<ExpandPeerMacroRequest>(*this, std::move(result));
 }
 
 void ExpandPeerMacroRequest::diagnoseCycle(DiagnosticEngine &diags) const {
@@ -2199,6 +2502,10 @@ void UniqueUnderlyingTypeSubstitutionsRequest::cacheResult(
       ->LazySemanticInfo.UniqueUnderlyingTypeComputed = true;
 }
 
+//----------------------------------------------------------------------------//
+// ExpandPreambleMacroRequest computation.
+//----------------------------------------------------------------------------//
+
 void ExpandPreambleMacroRequest::diagnoseCycle(DiagnosticEngine &diags) const {
   auto decl = std::get<0>(getStorage());
   diags.diagnose(decl->getLoc(),
@@ -2215,6 +2522,10 @@ void ExpandPreambleMacroRequest::noteCycleStep(DiagnosticEngine &diags) const {
                  decl->getName());
 }
 
+//----------------------------------------------------------------------------//
+// ExpandBodyMacroRequest computation.
+//----------------------------------------------------------------------------//
+
 void ExpandBodyMacroRequest::diagnoseCycle(DiagnosticEngine &diags) const {
   auto decl = std::get<0>(getStorage());
   diags.diagnose(decl->getLoc(),
@@ -2229,4 +2540,60 @@ void ExpandBodyMacroRequest::noteCycleStep(DiagnosticEngine &diags) const {
                  diag::macro_expand_circular_reference_entity_through,
                  "body",
                  decl->getName());
+}
+
+//----------------------------------------------------------------------------//
+// LifetimeDependenceInfoRequest computation.
+//----------------------------------------------------------------------------//
+
+std::optional<std::optional<llvm::ArrayRef<LifetimeDependenceInfo>>>
+LifetimeDependenceInfoRequest::getCachedResult() const {
+  auto *func = std::get<0>(getStorage());
+
+  if (func->LazySemanticInfo.NoLifetimeDependenceInfo)
+    return std::optional(std::optional<LifetimeDependenceInfo>());
+
+  return func->getASTContext().evaluator.getCachedNonEmptyOutput(*this);
+}
+
+void LifetimeDependenceInfoRequest::cacheResult(
+    std::optional<llvm::ArrayRef<LifetimeDependenceInfo>> result) const {
+  auto *func = std::get<0>(getStorage());
+  
+  if (!result) {
+    func->LazySemanticInfo.NoLifetimeDependenceInfo = 1;
+    return;
+  }
+
+  func->getASTContext().evaluator.cacheNonEmptyOutput(*this, std::move(result));
+}
+
+//----------------------------------------------------------------------------//
+// CaptureInfoRequest computation.
+//----------------------------------------------------------------------------//
+
+std::optional<CaptureInfo>
+CaptureInfoRequest::getCachedResult() const {
+  auto *func = std::get<0>(getStorage());
+  return func->getCachedCaptureInfo();
+}
+
+void CaptureInfoRequest::cacheResult(CaptureInfo info) const {
+  auto *func = std::get<0>(getStorage());
+  return func->setCaptureInfo(info);
+}
+
+//----------------------------------------------------------------------------//
+// ParamCaptureInfoRequest computation.
+//----------------------------------------------------------------------------//
+
+std::optional<CaptureInfo>
+ParamCaptureInfoRequest::getCachedResult() const {
+  auto *param = std::get<0>(getStorage());
+  return param->getCachedDefaultArgumentCaptureInfo();
+}
+
+void ParamCaptureInfoRequest::cacheResult(CaptureInfo info) const {
+  auto *param = std::get<0>(getStorage());
+  param->setDefaultArgumentCaptureInfo(info);
 }

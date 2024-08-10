@@ -24,6 +24,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PropertyWrappers.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Generators.h"
 #include "swift/SIL/SILArgument.h"
@@ -189,7 +190,7 @@ static RValue emitImplicitValueConstructorArg(SILGenFunction &SGF,
   auto argType = loweredParamTypes.claimNext();
 
   auto *arg = SGF.F.begin()->createFunctionArgument(argType, VD);
-  bool argIsConsumed = origParamInfo.isConsumed();
+  bool argIsConsumed = origParamInfo.isConsumedInCallee();
 
   // If the lowered parameter is a pack expansion, copy/move the pack
   // into the initialization, which we assume is there.
@@ -321,7 +322,7 @@ static SubstitutionMap getSubstitutionsForPropertyInitializer(
     return SubstitutionMap::get(
       nominal->getGenericSignatureOfContext(),
       QuerySubstitutionMap{genericEnv->getForwardingSubstitutionMap()},
-      LookUpConformanceInModule(dc->getParentModule()));
+      LookUpConformanceInModule());
   }
 
   return SubstitutionMap();
@@ -618,6 +619,19 @@ static bool ctorHopsInjectedByDefiniteInit(ConstructorDecl *ctor,
   }
 }
 
+bool SILGenFunction::isCtorWithHopsInjectedByDefiniteInit() {
+  auto declRef = F.getDeclRef();
+  if (!declRef || !declRef.isConstructor())
+    return false;
+
+  auto ctor = dyn_cast_or_null<ConstructorDecl>(declRef.getDecl());
+  if (!ctor)
+    return false;
+
+  auto isolation = getActorIsolation(ctor);
+  return ctorHopsInjectedByDefiniteInit(ctor, isolation);
+}
+
 void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
   MagicFunctionName = SILGenModule::getMagicFunctionName(ctor);
 
@@ -741,8 +755,6 @@ void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
     // lifetime checker doesn't seem to process trivial locations. But empty
     // move only structs are non-trivial, so we need to handle this here.
     if (nominal->getAttrs().hasAttribute<RawLayoutAttr>()) {
-      auto *module = ctor->getParentModule();
-
       // Raw memory is not directly decomposable, but we still want to mark
       // it as initialized. Use a zero initializer.
       auto &C = ctor->getASTContext();
@@ -752,7 +764,7 @@ void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
                       SubstitutionMap::get(zeroInit->getInnermostDeclContext()
                                                ->getGenericSignatureOfContext(),
                                            {selfDecl->getTypeInContext()},
-                                           LookUpConformanceInModule(module)),
+                                           LookUpConformanceInModule()),
                       selfLV.getLValueAddress());
     } else if (isa<StructDecl>(nominal)
                && lowering.getLoweredType().isMoveOnly()
@@ -1150,7 +1162,7 @@ void SILGenFunction::emitClassConstructorInitializer(ConstructorDecl *ctor) {
     SILLocation PrologueLoc(selfDecl);
     PrologueLoc.markAsPrologue();
     SILDebugVariable DbgVar(selfDecl->isLet(), ++ArgNo);
-    B.createDebugValue(PrologueLoc, selfArg.getValue(), DbgVar);
+    B.emitDebugDescription(PrologueLoc, selfArg.getValue(), DbgVar);
   }
 
   if (selfClassDecl->isRootDefaultActor() && !isDelegating) {
@@ -1706,7 +1718,7 @@ void SILGenFunction::emitIVarInitializer(SILDeclRef ivarInitializer) {
   PrologueLoc.markAsPrologue();
   // Hard-code self as argument number 1.
   SILDebugVariable DbgVar(selfDecl->isLet(), 1);
-  B.createDebugValue(PrologueLoc, selfArg, DbgVar);
+  B.emitDebugDescription(PrologueLoc, selfArg, DbgVar);
   selfArg = B.createMarkUninitialized(selfDecl, selfArg,
                                       MarkUninitializedInst::RootSelf);
   assert(selfTy.hasReferenceSemantics() && "can't emit a value type ctor here");

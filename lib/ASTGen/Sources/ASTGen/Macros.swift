@@ -12,29 +12,18 @@
 
 import ASTBridging
 import BasicBridging
-@_spi(ExperimentalLanguageFeature) import SwiftCompilerPluginMessageHandling
+@_spi(PluginMessage) @_spi(ExperimentalLanguageFeature) import SwiftCompilerPluginMessageHandling
 import SwiftDiagnostics
 import SwiftOperators
+import SwiftParser
 import SwiftSyntax
 import SwiftSyntaxBuilder
 @_spi(ExperimentalLanguageFeature) @_spi(Compiler) import SwiftSyntaxMacroExpansion
-@_spi(ExperimentalLanguageFeature) import SwiftSyntaxMacros
 
-/// Describes a macro that has been "exported" to the C++ part of the
-/// compiler, with enough information to interface with the C++ layer.
-struct ExportedMacro {
-  var macro: Macro.Type
-}
-
-struct ExportedExecutableMacro {
+struct ExportedExternalMacro {
   var moduleName: String
   var typeName: String
   var plugin: CompilerPlugin
-}
-
-enum MacroPluginKind: UInt8 {
-  case InProcess = 0
-  case Executable = 1
 }
 
 extension MacroRole {
@@ -57,40 +46,8 @@ extension MacroRole {
   }
 }
 
-/// Resolve a reference to type metadata into a macro, if posible.
-///
-/// Returns an unmanaged pointer to an ExportedMacro instance that describes
-/// the specified macro. If there is no macro with the given name, produces
-/// nil.
-@_cdecl("swift_ASTGen_resolveMacroType")
-public func resolveMacroType(
-  macroTypePtr: UnsafePointer<UInt8>
-) -> UnsafeRawPointer? {
-  let macroType = unsafeBitCast(macroTypePtr, to: Any.Type.self)
-
-  guard let macro = macroType as? Macro.Type else {
-    return nil
-  }
-
-  // Allocate and initialize the exported macro.
-  let exportedPtr = UnsafeMutablePointer<ExportedMacro>.allocate(capacity: 1)
-  exportedPtr.initialize(to: .init(macro: macro))
-  return UnsafeRawPointer(exportedPtr)
-}
-
-/// Destroys the given macro.
-@_cdecl("swift_ASTGen_destroyMacro")
-public func destroyMacro(
-  macroPtr: UnsafeMutablePointer<UInt8>
-) {
-  macroPtr.withMemoryRebound(to: ExportedMacro.self, capacity: 1) { macro in
-    macro.deinitialize(count: 1)
-    macro.deallocate()
-  }
-}
-
-@_cdecl("swift_ASTGen_resolveExecutableMacro")
-public func resolveExecutableMacro(
+@_cdecl("swift_ASTGen_resolveExternalMacro")
+public func resolveExternalMacro(
   moduleName: UnsafePointer<CChar>,
   typeName: UnsafePointer<CChar>,
   pluginOpaqueHandle: UnsafeMutableRawPointer
@@ -98,7 +55,7 @@ public func resolveExecutableMacro(
   // NOTE: This doesn't actually resolve anything.
   // Executable plugins is "trusted" to have the macro implementation. If not,
   // the actual expansion fails.
-  let exportedPtr = UnsafeMutablePointer<ExportedExecutableMacro>.allocate(capacity: 1)
+  let exportedPtr = UnsafeMutablePointer<ExportedExternalMacro>.allocate(capacity: 1)
   exportedPtr.initialize(
     to: .init(
       moduleName: String(cString: moduleName),
@@ -109,11 +66,11 @@ public func resolveExecutableMacro(
   return UnsafeRawPointer(exportedPtr)
 }
 
-@_cdecl("swift_ASTGen_destroyExecutableMacro")
-public func destroyExecutableMacro(
+@_cdecl("swift_ASTGen_destroyExternalMacro")
+public func destroyExternalMacro(
   macroPtr: UnsafeMutableRawPointer
 ) {
-  let macroPtr = macroPtr.assumingMemoryBound(to: ExportedExecutableMacro.self)
+  let macroPtr = macroPtr.assumingMemoryBound(to: ExportedExternalMacro.self)
   macroPtr.deinitialize(count: 1)
   macroPtr.deallocate()
 }
@@ -243,8 +200,8 @@ func checkDefaultArgumentMacroExpression(
 @_cdecl("swift_ASTGen_checkMacroDefinition")
 func checkMacroDefinition(
   diagEnginePtr: UnsafeMutableRawPointer,
-  sourceFilePtr: UnsafeRawPointer,
-  macroLocationPtr: UnsafePointer<UInt8>,
+  sourceFileBuffer: BridgedStringRef,
+  macroDeclText: BridgedStringRef,
   externalMacroOutPtr: UnsafeMutablePointer<BridgedStringRef>,
   replacementsPtr: UnsafeMutablePointer<UnsafeMutablePointer<Int>?>,
   numReplacementsPtr: UnsafeMutablePointer<Int>,
@@ -255,18 +212,23 @@ func checkMacroDefinition(
   assert(externalMacroOutPtr.pointee.isEmptyInitialized)
   assert(replacementsPtr.pointee == nil && numReplacementsPtr.pointee == 0)
 
-  let sourceFilePtr = sourceFilePtr.bindMemory(to: ExportedSourceFile.self, capacity: 1)
-
-  // Find the macro declaration.
-  guard
-    let macroDecl = findSyntaxNodeInSourceFile(
-      sourceFilePtr: sourceFilePtr,
-      sourceLocationPtr: macroLocationPtr,
-      type: MacroDeclSyntax.self
-    )
-  else {
+  // Parse 'macro' decl.
+  // FIXME: Use 'ExportedSourceFile' when C++ parser is replaced.
+  let textBuffer = UnsafeBufferPointer<UInt8>(start: macroDeclText.data, count: macroDeclText.count)
+  var parser = Parser(textBuffer)
+  guard let macroDecl = DeclSyntax.parse(from: &parser).as(MacroDeclSyntax.self) else {
     // FIXME: Produce an error
     return -1
+  }
+
+  func diagnose(diagnostic: Diagnostic) {
+    emitDiagnostic(
+      diagnosticEngine: BridgedDiagnosticEngine(raw: diagEnginePtr),
+      sourceFileBuffer: UnsafeBufferPointer(start: sourceFileBuffer.data, count: sourceFileBuffer.count),
+      sourceFileBufferOffset: macroDeclText.data! - sourceFileBuffer.data!,
+      diagnostic: diagnostic,
+      diagnosticSeverity: diagnostic.diagMessage.severity
+    )
   }
 
   // Check the definition
@@ -299,9 +261,7 @@ func checkMacroDefinition(
 
         default:
           // Warn about the unknown builtin.
-          let srcMgr = SourceManager(cxxDiagnosticEngine: diagEnginePtr)
-          srcMgr.insert(sourceFilePtr)
-          srcMgr.diagnose(
+          diagnose(
             diagnostic: .init(
               node: node,
               message: ASTGenMacroDiagnostic.unknownBuiltin(type)
@@ -321,9 +281,7 @@ func checkMacroDefinition(
         "#externalMacro(module: \(literal: module), type: \(literal: type))"
 
       // Warn about the use of old-style external macro syntax here.
-      let srcMgr = SourceManager(cxxDiagnosticEngine: diagEnginePtr)
-      srcMgr.insert(sourceFilePtr)
-      srcMgr.diagnose(
+      diagnose(
         diagnostic: .init(
           node: node,
           message: ASTGenMacroDiagnostic.oldStyleExternalMacro,
@@ -350,9 +308,7 @@ func checkMacroDefinition(
         firstArgLabel == "module",
         let module = identifierFromStringLiteral(firstArg.expression)
       else {
-        let srcMgr = SourceManager(cxxDiagnosticEngine: diagEnginePtr)
-        srcMgr.insert(sourceFilePtr)
-        srcMgr.diagnose(
+        diagnose(
           diagnostic: .init(
             node: Syntax(expansionSyntax),
             message: ASTGenMacroDiagnostic.notStringLiteralArgument("module")
@@ -367,9 +323,7 @@ func checkMacroDefinition(
         secondArgLabel == "type",
         let type = identifierFromStringLiteral(secondArg.expression)
       else {
-        let srcMgr = SourceManager(cxxDiagnosticEngine: diagEnginePtr)
-        srcMgr.insert(sourceFilePtr)
-        srcMgr.diagnose(
+        diagnose(
           diagnostic: .init(
             node: Syntax(expansionSyntax),
             message: ASTGenMacroDiagnostic.notStringLiteralArgument("type")
@@ -431,16 +385,12 @@ func checkMacroDefinition(
 #endif
     }
   } catch let errDiags as DiagnosticsError {
-    let srcMgr = SourceManager(cxxDiagnosticEngine: diagEnginePtr)
-    srcMgr.insert(sourceFilePtr)
     for diag in errDiags.diagnostics {
-      srcMgr.diagnose(diagnostic: diag)
+      diagnose(diagnostic: diag)
     }
     return -1
   } catch let error {
-    let srcMgr = SourceManager(cxxDiagnosticEngine: diagEnginePtr)
-    srcMgr.insert(sourceFilePtr)
-    srcMgr.diagnose(
+    diagnose(
       diagnostic: .init(
         node: Syntax(macroDecl),
         message: ASTGenMacroDiagnostic.thrownError(error)
@@ -476,7 +426,6 @@ func makeExpansionOutputResult(
 func expandFreestandingMacro(
   diagEnginePtr: UnsafeMutableRawPointer,
   macroPtr: UnsafeRawPointer,
-  macroKind: UInt8,
   discriminatorText: UnsafePointer<CChar>,
   rawMacroRole: UInt8,
   sourceFilePtr: UnsafeRawPointer,
@@ -514,27 +463,14 @@ func expandFreestandingMacro(
   let discriminator = String(cString: discriminatorText)
 
   let macroRole = MacroRole(rawMacroRole: rawMacroRole)
-  let expandedSource: String?
-  switch MacroPluginKind(rawValue: macroKind)! {
-  case .InProcess:
-    expandedSource = expandFreestandingMacroInProcess(
-      macroPtr: macroPtr,
-      macroRole: macroRole,
-      diagEnginePtr: diagEnginePtr,
-      expansionSyntax: expansion,
-      sourceFilePtr: sourceFilePtr,
-      discriminator: discriminator
-    )
-  case .Executable:
-    expandedSource = expandFreestandingMacroIPC(
-      macroPtr: macroPtr,
-      macroRole: macroRole,
-      diagEnginePtr: diagEnginePtr,
-      expansionSyntax: expansion,
-      sourceFilePtr: sourceFilePtr,
-      discriminator: discriminator
-    )
-  }
+  let expandedSource: String? = expandFreestandingMacroImpl(
+    macroPtr: macroPtr,
+    macroRole: macroRole,
+    diagEnginePtr: diagEnginePtr,
+    expansionSyntax: expansion,
+    sourceFilePtr: sourceFilePtr,
+    discriminator: discriminator
+  )
 
   return makeExpansionOutputResult(
     expandedSource: expandedSource,
@@ -542,7 +478,7 @@ func expandFreestandingMacro(
   )
 }
 
-func expandFreestandingMacroIPC(
+func expandFreestandingMacroImpl(
   macroPtr: UnsafeRawPointer,
   macroRole: MacroRole,
   diagEnginePtr: UnsafeMutableRawPointer,
@@ -560,7 +496,7 @@ func expandFreestandingMacroIPC(
     fatalError("unknown syntax")
   }
 
-  let macro = macroPtr.assumingMemoryBound(to: ExportedExecutableMacro.self).pointee
+  let macro = macroPtr.assumingMemoryBound(to: ExportedExternalMacro.self).pointee
 
   // Map the macro role.
   let pluginMacroRole: PluginMessage.MacroRole
@@ -619,55 +555,6 @@ func expandFreestandingMacroIPC(
     )
     return nil
   }
-}
-
-func expandFreestandingMacroInProcess(
-  macroPtr: UnsafeRawPointer,
-  macroRole: MacroRole,
-  diagEnginePtr: UnsafeMutableRawPointer,
-  expansionSyntax: FreestandingMacroExpansionSyntax,
-  sourceFilePtr: UnsafePointer<ExportedSourceFile>,
-  discriminator: String
-) -> String? {
-  // Get the macro.
-  let macroPtr = macroPtr.bindMemory(to: ExportedMacro.self, capacity: 1)
-  let macro = macroPtr.pointee.macro
-
-  // Create a source manager. This should probably persist and be given to us.
-  let sourceManager = SourceManager(cxxDiagnosticEngine: diagEnginePtr)
-  sourceManager.insert(sourceFilePtr)
-
-  let context = sourceManager.createMacroExpansionContext(
-    lexicalContext: lexicalContext(of: expansionSyntax),
-    discriminator: discriminator
-  )
-
-  let macroName = expansionSyntax.macroName.text
-
-  // Make sure we emit all of the diagnostics from the context.
-  defer {
-    // Emit diagnostics accumulated in the context.
-    for diag in context.diagnostics {
-      sourceManager.diagnose(
-        diagnostic: diag,
-        messageSuffix: " (from macro '\(macroName)')"
-      )
-    }
-
-    context.diagnostics = []
-  }
-
-  let node = sourceManager.detach(
-    expansionSyntax,
-    foldingWith: OperatorTable.standardOperators
-  )
-
-  return SwiftSyntaxMacroExpansion.expandFreestandingMacro(
-    definition: macro,
-    macroRole: macroRole,
-    node: node,
-    in: context
-  )
 }
 
 /// Retrieve a syntax node in the given source file, with the given type.
@@ -736,7 +623,6 @@ func findSyntaxNodeInSourceFile<Node: SyntaxProtocol>(
 func expandAttachedMacro(
   diagEnginePtr: UnsafeMutableRawPointer,
   macroPtr: UnsafeRawPointer,
-  macroKind: UInt8,
   discriminatorText: UnsafePointer<CChar>,
   qualifiedTypeText: UnsafePointer<CChar>,
   conformanceListText: UnsafePointer<CChar>,
@@ -792,39 +678,20 @@ func expandAttachedMacro(
   let qualifiedType = String(cString: qualifiedTypeText)
   let conformanceList = String(cString: conformanceListText)
 
-  let expandedSource: String?
-  switch MacroPluginKind(rawValue: macroKind)! {
-  case .Executable:
-    expandedSource = expandAttachedMacroIPC(
-      diagEnginePtr: diagEnginePtr,
-      macroPtr: macroPtr,
-      rawMacroRole: rawMacroRole,
-      discriminator: discriminator,
-      qualifiedType: qualifiedType,
-      conformanceList: conformanceList,
-      customAttrSourceFilePtr: customAttrSourceFilePtr,
-      customAttrNode: customAttrNode,
-      declarationSourceFilePtr: declarationSourceFilePtr,
-      attachedTo: declarationNode,
-      parentDeclSourceFilePtr: parentDeclSourceFilePtr,
-      parentDeclNode: parentDeclNode
-    )
-  case .InProcess:
-    expandedSource = expandAttachedMacroInProcess(
-      diagEnginePtr: diagEnginePtr,
-      macroPtr: macroPtr,
-      rawMacroRole: rawMacroRole,
-      discriminator: discriminator,
-      qualifiedType: qualifiedType,
-      conformanceList: conformanceList,
-      customAttrSourceFilePtr: customAttrSourceFilePtr,
-      customAttrNode: customAttrNode,
-      declarationSourceFilePtr: declarationSourceFilePtr,
-      attachedTo: declarationNode,
-      parentDeclSourceFilePtr: parentDeclSourceFilePtr,
-      parentDeclNode: parentDeclNode
-    )
-  }
+  let expandedSource: String? = expandAttachedMacroImpl(
+    diagEnginePtr: diagEnginePtr,
+    macroPtr: macroPtr,
+    rawMacroRole: rawMacroRole,
+    discriminator: discriminator,
+    qualifiedType: qualifiedType,
+    conformanceList: conformanceList,
+    customAttrSourceFilePtr: customAttrSourceFilePtr,
+    customAttrNode: customAttrNode,
+    declarationSourceFilePtr: declarationSourceFilePtr,
+    attachedTo: declarationNode,
+    parentDeclSourceFilePtr: parentDeclSourceFilePtr,
+    parentDeclNode: parentDeclNode
+  )
 
   return makeExpansionOutputResult(
     expandedSource: expandedSource,
@@ -846,7 +713,7 @@ private func pluginLexicalContext(of node: some SyntaxProtocol) -> [PluginMessag
   lexicalContext(of: node).compactMap { .init(syntax: $0) }
 }
 
-func expandAttachedMacroIPC(
+func expandAttachedMacroImpl(
   diagEnginePtr: UnsafeMutableRawPointer,
   macroPtr: UnsafeRawPointer,
   rawMacroRole: UInt8,
@@ -861,7 +728,7 @@ func expandAttachedMacroIPC(
   parentDeclNode: DeclSyntax?
 ) -> String? {
   let macroName: String = customAttrNode.attributeName.description
-  let macro = macroPtr.assumingMemoryBound(to: ExportedExecutableMacro.self).pointee
+  let macro = macroPtr.assumingMemoryBound(to: ExportedExternalMacro.self).pointee
 
   // Map the macro role.
   let macroRole: PluginMessage.MacroRole
@@ -894,7 +761,7 @@ func expandAttachedMacroIPC(
 
   let declSyntax = PluginMessage.Syntax(
     syntax: Syntax(declarationNode),
-    in: customAttrSourceFilePtr
+    in: declarationSourceFilePtr
   )!
 
   let parentDeclSyntax: PluginMessage.Syntax?
@@ -994,104 +861,3 @@ func expandAttachedMacroIPC(
   }
 }
 
-func expandAttachedMacroInProcess(
-  diagEnginePtr: UnsafeMutableRawPointer,
-  macroPtr: UnsafeRawPointer,
-  rawMacroRole: UInt8,
-  discriminator: String,
-  qualifiedType: String,
-  conformanceList: String,
-  customAttrSourceFilePtr: UnsafePointer<ExportedSourceFile>,
-  customAttrNode: AttributeSyntax,
-  declarationSourceFilePtr: UnsafePointer<ExportedSourceFile>,
-  attachedTo declarationNode: DeclSyntax,
-  parentDeclSourceFilePtr: UnsafePointer<ExportedSourceFile>?,
-  parentDeclNode: DeclSyntax?
-) -> String? {
-  // Get the macro.
-  let macroPtr = macroPtr.bindMemory(to: ExportedMacro.self, capacity: 1)
-  let macro = macroPtr.pointee.macro
-
-  // Create a source manager covering the files we know about.
-  let sourceManager = SourceManager(cxxDiagnosticEngine: diagEnginePtr)
-  sourceManager.insert(customAttrSourceFilePtr)
-  sourceManager.insert(declarationSourceFilePtr)
-  if let parentDeclSourceFilePtr = parentDeclSourceFilePtr {
-    sourceManager.insert(parentDeclSourceFilePtr)
-  }
-
-  // Create an expansion context
-  let context = sourceManager.createMacroExpansionContext(
-    lexicalContext: lexicalContext(of: declarationNode),
-    discriminator: discriminator
-  )
-
-  let macroName = customAttrNode.attributeName.trimmedDescription
-
-  // Emit all of the accumulated diagnostics before we exit.
-  defer {
-    // Emit diagnostics accumulated in the context.
-    for diag in context.diagnostics {
-      sourceManager.diagnose(
-        diagnostic: diag,
-        messageSuffix: " (from macro '\(macroName)')"
-      )
-    }
-
-    context.diagnostics = []
-  }
-
-  let attributeNode = sourceManager.detach(
-    customAttrNode,
-    foldingWith: OperatorTable.standardOperators
-  )
-  let declarationNode = sourceManager.detach(declarationNode)
-  let parentDeclNode = parentDeclNode.map { sourceManager.detach($0) }
-  let extendedType: TypeSyntax = "\(raw: qualifiedType)"
-
-  let conformanceListSyntax: InheritedTypeListSyntax?
-  if (conformanceList.isEmpty) {
-    conformanceListSyntax = nil
-  } else {
-    let placeholderDecl: DeclSyntax =
-      """
-      struct Placeholder: \(raw: conformanceList) {}
-      """
-    let placeholderStruct = placeholderDecl.cast(StructDeclSyntax.self)
-    if let inheritanceClause = placeholderStruct.inheritanceClause {
-      conformanceListSyntax = inheritanceClause.inheritedTypes
-    } else {
-      conformanceListSyntax = nil
-    }
-  }
-
-  return SwiftSyntaxMacroExpansion.expandAttachedMacro(
-    definition: macro,
-    macroRole: MacroRole(rawMacroRole: rawMacroRole),
-    attributeNode: attributeNode,
-    declarationNode: declarationNode,
-    parentDeclNode: parentDeclNode,
-    extendedType: extendedType,
-    conformanceList: conformanceListSyntax,
-    in: context
-  )
-}
-
-fileprivate extension SyntaxProtocol {
-  /// Perform a format if required and then trim any leading/trailing
-  /// whitespace.
-  func formattedExpansion(_ mode: FormatMode) -> String {
-    let formatted: Syntax
-    switch mode {
-    case .auto:
-      formatted = self.formatted()
-    case .disabled:
-      formatted = Syntax(self)
-#if RESILIENT_SWIFT_SYNTAX
-    @unknown default:
-      fatalError()
-#endif
-    }
-    return formatted.trimmedDescription(matching: { $0.isWhitespace })
-  }
-}

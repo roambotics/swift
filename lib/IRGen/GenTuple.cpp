@@ -20,10 +20,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILType.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -523,7 +525,7 @@ const TypeInfo *TypeConverter::convertTupleType(TupleType *tuple) {
     auto *bitwiseCopyableProtocol =
         IGM.getSwiftModule()->getASTContext().getProtocol(
             KnownProtocolKind::BitwiseCopyable);
-    if (bitwiseCopyableProtocol && IGM.getSwiftModule()->lookupConformance(
+    if (bitwiseCopyableProtocol && checkConformance(
                                        tuple, bitwiseCopyableProtocol)) {
       return BitwiseCopyableTypeInfo::create(IGM.OpaqueTy, IsABIAccessible);
     }

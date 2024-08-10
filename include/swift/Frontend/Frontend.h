@@ -233,6 +233,8 @@ public:
 
   void setRuntimeResourcePath(StringRef Path);
 
+  void setPlatformAvailabilityInheritanceMapPath(StringRef Path);
+
   /// Compute the default prebuilt module cache path for a given resource path
   /// and SDK version. This function is also used by LLDB.
   static std::string
@@ -247,6 +249,16 @@ public:
 
   /// If we haven't explicitly passed -blocklist-paths, set it to the default value.
   void setDefaultBlocklistsIfNecessary();
+
+  /// If we haven't explicitly passed '-in-process-plugin-server-path', infer
+  /// it as a default value.
+  ///
+  /// FIXME: Remove this after all the clients start sending it.
+  void setDefaultInProcessPluginServerPathIfNecessary();
+
+  /// Determine which C++ stdlib should be used for this compilation, and which
+  /// C++ stdlib is the default for the specified target.
+  void computeCXXStdlibOptions();
 
   /// Computes the runtime resource path relative to the given Swift
   /// executable.
@@ -402,6 +414,9 @@ public:
   /// Whether the Swift Backtracing support library should be implicitly
   /// imported.
   bool shouldImportSwiftBacktracing() const;
+
+  /// Whether the CXX module should be implicitly imported.
+  bool shouldImportCxx() const;
 
   /// Performs input setup common to these tools:
   /// sil-opt, sil-func-extractor, sil-llvm-gen, and sil-nm.
@@ -658,6 +673,9 @@ public:
   /// i.e. if it can be found.
   bool canImportSwiftBacktracing() const;
 
+  /// Whether the Cxx library can be imported
+  bool canImportCxx() const;
+
   /// Whether the CxxShim library can be imported
   /// i.e. if it can be found.
   bool canImportCxxShim() const;
@@ -688,6 +706,10 @@ public:
   /// Returns true if there was an error during setup.
   bool setup(const CompilerInvocation &Invocation, std::string &Error,
              ArrayRef<const char *> Args = {});
+
+  /// The fast setup function for cache replay.
+  bool setupForReplay(const CompilerInvocation &Invocation, std::string &Error,
+                      ArrayRef<const char *> Args = {});
 
   const CompilerInvocation &getInvocation() const { return Invocation; }
 

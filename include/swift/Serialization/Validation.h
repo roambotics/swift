@@ -14,6 +14,7 @@
 #define SWIFT_SERIALIZATION_VALIDATION_H
 
 #include "swift/AST/Identifier.h"
+#include "swift/Basic/CXXStdlibKind.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Version.h"
 #include "swift/Serialization/SerializationOptions.h"
@@ -103,6 +104,7 @@ struct ValidationInfo {
   version::Version compatibilityVersion = {};
   llvm::VersionTuple userModuleVersion;
   StringRef sdkName = {};
+  StringRef sdkVersion = {};
   StringRef problematicRevision = {};
   StringRef problematicChannel = {};
   size_t bytes = 0;
@@ -127,6 +129,7 @@ class ExtendedValidationInfo {
   StringRef ModuleABIName;
   StringRef ModulePackageName;
   StringRef ExportAsName;
+  CXXStdlibKind CXXStdlib;
   struct {
     unsigned ArePrivateImportsEnabled : 1;
     unsigned IsSIB : 1;
@@ -141,6 +144,7 @@ class ExtendedValidationInfo {
     unsigned IsConcurrencyChecked : 1;
     unsigned HasCxxInteroperability : 1;
     unsigned AllowNonResilientAccess: 1;
+    unsigned SerializePackageEnabled: 1;
   } Bits;
 public:
   ExtendedValidationInfo() : Bits() {}
@@ -209,6 +213,10 @@ public:
   void setAllowNonResilientAccess(bool val) {
     Bits.AllowNonResilientAccess = val;
   }
+  bool serializePackageEnabled() const { return Bits.SerializePackageEnabled; }
+  void setSerializePackageEnabled(bool val) {
+    Bits.SerializePackageEnabled = val;
+  }
   bool isAllowModuleWithCompilerErrorsEnabled() {
     return Bits.IsAllowModuleWithCompilerErrorsEnabled;
   }
@@ -235,6 +243,9 @@ public:
   void setHasCxxInteroperability(bool val) {
     Bits.HasCxxInteroperability = val;
   }
+
+  CXXStdlibKind getCXXStdlibKind() const { return CXXStdlib; }
+  void setCXXStdlibKind(CXXStdlibKind kind) { CXXStdlib = kind; }
 };
 
 struct SearchPath {

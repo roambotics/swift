@@ -16,11 +16,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "TypeChecker.h"
+#include "TypeCheckConcurrency.h"
 #include "TypeCheckType.h"
 #include "TypoCorrection.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/NameLookup.h"
@@ -30,6 +32,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Parse/Confusables.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Sema/ConstraintSystem.h"
@@ -400,16 +403,108 @@ static BinaryExpr *getCompositionExpr(Expr *expr) {
   return nullptr;
 }
 
+/// Diagnoses an unqualified `init` expression.
+///
+/// \param initExpr The \c init expression.
+/// \param dc The declaration context of \p initExpr.
+///
+/// \returns An expression matching `self.init` or `super.init` that can be used
+/// to recover, or `nullptr` if cannot recover.
+static UnresolvedDotExpr *
+diagnoseUnqualifiedInit(UnresolvedDeclRefExpr *initExpr, DeclContext *dc,
+                        ASTContext &ctx) {
+  const auto loc = initExpr->getLoc();
+
+  enum class Suggestion : unsigned {
+    None = 0,
+    Self = 1,
+    Super = 2,
+  };
+
+  Suggestion suggestion = [dc]() {
+    NominalTypeDecl *nominal = nullptr;
+    {
+      auto *typeDC = dc->getInnermostTypeContext();
+      if (!typeDC) {
+        // No type context--no suggestion.
+        return Suggestion::None;
+      }
+
+      nominal = typeDC->getSelfNominalTypeDecl();
+    }
+
+    auto *classDecl = dyn_cast<ClassDecl>(nominal);
+    if (!classDecl || !classDecl->hasSuperclass()) {
+      // No class or no superclass--suggest 'self.'.
+      return Suggestion::Self;
+    }
+
+    if (auto *initDecl = dyn_cast<ConstructorDecl>(dc)) {
+      if (initDecl->getAttrs().hasAttribute<ConvenienceAttr>()) {
+        // Innermost context is a convenience initializer--suggest 'self.'.
+        return Suggestion::Self;
+      } else {
+        // Innermost context is a designated initializer--suggest 'super.'.
+        return Suggestion::Super;
+      }
+    }
+
+    // Class context but innermost context is not an initializer--suggest
+    // 'self.'. 'super.' might be possible too, but is far lesss likely to be
+    // the right answer.
+    return Suggestion::Self;
+  }();
+
+  auto diag =
+      ctx.Diags.diagnose(loc, diag::unqualified_init, (unsigned)suggestion);
+
+  Expr *base = nullptr;
+  switch (suggestion) {
+  case Suggestion::None:
+    return nullptr;
+  case Suggestion::Self:
+    diag.fixItInsert(loc, "self.");
+    base = new (ctx)
+        UnresolvedDeclRefExpr(DeclNameRef(ctx.Id_self), DeclRefKind::Ordinary,
+                              initExpr->getNameLoc());
+    base->setImplicit(true);
+    break;
+  case Suggestion::Super:
+    diag.fixItInsert(loc, "super.");
+    base = new (ctx) SuperRefExpr(/*Self=*/nullptr, loc, /*Implicit=*/true);
+    break;
+  }
+
+  return new (ctx)
+      UnresolvedDotExpr(base, /*dotloc=*/SourceLoc(), initExpr->getName(),
+                        initExpr->getNameLoc(), /*implicit=*/true);
+}
+
 /// Bind an UnresolvedDeclRefExpr by performing name lookup and
 /// returning the resultant expression. Context is the DeclContext used
 /// for the lookup.
 Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
-                                      DeclContext *DC,
-                                      bool replaceInvalidRefsWithErrors) {
-  // Process UnresolvedDeclRefExpr by doing an unqualified lookup.
+                                      DeclContext *DC) {
+  auto &Context = DC->getASTContext();
   DeclNameRef Name = UDRE->getName();
   SourceLoc Loc = UDRE->getLoc();
 
+  auto errorResult = [&]() -> Expr * {
+    return new (Context) ErrorExpr(UDRE->getSourceRange());
+  };
+
+  TypeChecker::checkForForbiddenPrefix(Context, Name.getBaseName());
+
+  // Try and recover if we have an unqualified 'init'.
+  if (Name.getBaseName().isConstructor()) {
+    auto *recoveryExpr = diagnoseUnqualifiedInit(UDRE, DC, Context);
+    if (!recoveryExpr)
+      return errorResult();
+
+    return recoveryExpr;
+  }
+
+  // Process UnresolvedDeclRefExpr by doing an unqualified lookup.
   DeclNameRef LookupName = Name;
   if (Name.isCompoundName()) {
     auto &context = DC->getASTContext();
@@ -429,12 +524,6 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
     LookupName = DeclNameRef(lookupName);
   }
 
-  auto errorResult = [&]() -> Expr * {
-    if (replaceInvalidRefsWithErrors)
-      return new (DC->getASTContext()) ErrorExpr(UDRE->getSourceRange());
-    return UDRE;
-  };
-
   // Perform standard value name lookup.
   NameLookupOptions lookupOptions = defaultUnqualifiedLookupOptions;
   // TODO: Include all of the possible members to give a solver a
@@ -446,8 +535,6 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
 
   bool AllDeclRefs = true;
   SmallVector<ValueDecl*, 4> ResultValues;
-
-  auto &Context = DC->getASTContext();
 
   // First, look for a local binding in scope.
   if (Loc.isValid() && !Name.isOperator()) {
@@ -485,8 +572,7 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
           Context.Diags.diagnose(Loc, diag::use_local_before_declaration, Name);
           Context.Diags.diagnose(innerDecl, diag::decl_declared_here,
                                  localDeclAfterUse);
-          Expr *error = new (Context) ErrorExpr(UDRE->getSourceRange());
-          return error;
+          return errorResult();
         }
 
         Lookup.shiftDownResults();
@@ -521,9 +607,10 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
     if (inaccessibleResults) {
       // FIXME: What if the unviable candidates have different levels of access?
       const ValueDecl *first = inaccessibleResults.front().getValueDecl();
-      Context.Diags.diagnose(
-          Loc, diag::candidate_inaccessible, first,
-          first->getFormalAccessScope().accessLevelForDiagnostics());
+      auto accessLevel =
+          first->getFormalAccessScope().accessLevelForDiagnostics();
+      Context.Diags.diagnose(Loc, diag::candidate_inaccessible, first,
+                             accessLevel);
 
       // FIXME: If any of the candidates (usually just one) are in the same
       // module we could offer a fix-it.
@@ -531,6 +618,19 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
         auto *VD = lookupResult.getValueDecl();
         VD->diagnose(diag::decl_declared_here, VD);
       }
+
+      // Don't try to recover here; we'll get more access-related diagnostics
+      // downstream if the type of the inaccessible decl is also inaccessible.
+      return errorResult();
+    }
+
+    // Try ignoring missing imports.
+    relookupOptions |= NameLookupFlags::IgnoreMissingImports;
+    auto nonImportedResults =
+        TypeChecker::lookupUnqualified(DC, LookupName, Loc, relookupOptions);
+    if (nonImportedResults) {
+      const ValueDecl *first = nonImportedResults.front().getValueDecl();
+      maybeDiagnoseMissingImportForMember(first, DC, Loc);
 
       // Don't try to recover here; we'll get more access-related diagnostics
       // downstream if the type of the inaccessible decl is also inaccessible.
@@ -689,7 +789,7 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
           UDRE->getRefKind() == DeclRefKind::BinaryOperator
               ? 0
               : UDRE->getRefKind() == DeclRefKind::PrefixOperator ? 1 : 2);
-      return new (Context) ErrorExpr(UDRE->getSourceRange());
+      return errorResult();
     }
 
     // For operators, sort the results so that non-generic operations come
@@ -708,8 +808,8 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
         if (!xGeneric)
           return false;
 
-        unsigned xDepth = xGeneric->getGenericParams().back()->getDepth();
-        unsigned yDepth = yGeneric->getGenericParams().back()->getDepth();
+        unsigned xDepth = xGeneric->getGenericSignature()->getMaxDepth();
+        unsigned yDepth = yGeneric->getGenericSignature()->getMaxDepth();
         return xDepth < yDepth;
       });
     }
@@ -730,6 +830,14 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
           isa<TypeDecl>(ResultValues.front())) {
         return buildTypeExpr(cast<TypeDecl>(ResultValues.front()));
       }
+    }
+
+    // If we are in an @_unsafeInheritExecutor context, swap out
+    // declarations for their _unsafeInheritExecutor_ counterparts if they
+    // exist.
+    if (enclosingUnsafeInheritsExecutor(DC)) {
+      introduceUnsafeInheritExecutorReplacements(
+          DC, UDRE->getNameLoc().getBaseNameLoc(), ResultValues);
     }
 
     return buildRefExpr(ResultValues, DC, UDRE->getNameLoc(),
@@ -820,7 +928,7 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
     auto *Decl = Result.getValueDecl();
     Context.Diags.diagnose(Decl, diag::decl_declared_here, Decl);
   }
-  return new (Context) ErrorExpr(UDRE->getSourceRange());
+  return errorResult();
 }
 
 /// If an expression references 'self.init' or 'super.init' in an
@@ -845,83 +953,6 @@ TypeChecker::getSelfForInitDelegationInConstructor(DeclContext *DC,
         return ctorContext->getImplicitSelfDecl();
   }
   return nullptr;
-}
-
-/// Diagnoses an unqualified `init` expression.
-///
-/// \param initExpr The \c init expression.
-/// \param dc The declaration context of \p initExpr.
-///
-/// \returns An expression matching `self.init` or `super.init` that can be used
-/// to recover, or `nullptr` if cannot recover.
-static UnresolvedDotExpr *
-diagnoseUnqualifiedInit(UnresolvedDeclRefExpr *initExpr, DeclContext *dc,
-                        ASTContext &ctx) {
-  const auto loc = initExpr->getLoc();
-
-  enum class Suggestion : unsigned {
-    None = 0,
-    Self = 1,
-    Super = 2,
-  };
-
-  Suggestion suggestion = [dc]() {
-    NominalTypeDecl *nominal = nullptr;
-    {
-      auto *typeDC = dc->getInnermostTypeContext();
-      if (!typeDC) {
-        // No type context--no suggestion.
-        return Suggestion::None;
-      }
-
-      nominal = typeDC->getSelfNominalTypeDecl();
-    }
-
-    auto *classDecl = dyn_cast<ClassDecl>(nominal);
-    if (!classDecl || !classDecl->hasSuperclass()) {
-      // No class or no superclass--suggest 'self.'.
-      return Suggestion::Self;
-    }
-
-    if (auto *initDecl = dyn_cast<ConstructorDecl>(dc)) {
-      if (initDecl->getAttrs().hasAttribute<ConvenienceAttr>()) {
-        // Innermost context is a convenience initializer--suggest 'self.'.
-        return Suggestion::Self;
-      } else {
-        // Innermost context is a designated initializer--suggest 'super.'.
-        return Suggestion::Super;
-      }
-    }
-
-    // Class context but innermost context is not an initializer--suggest
-    // 'self.'. 'super.' might be possible too, but is far lesss likely to be
-    // the right answer.
-    return Suggestion::Self;
-  }();
-
-  auto diag =
-      ctx.Diags.diagnose(loc, diag::unqualified_init, (unsigned)suggestion);
-
-  Expr *base = nullptr;
-  switch (suggestion) {
-  case Suggestion::None:
-    return nullptr;
-  case Suggestion::Self:
-    diag.fixItInsert(loc, "self.");
-    base = new (ctx)
-        UnresolvedDeclRefExpr(DeclNameRef(ctx.Id_self), DeclRefKind::Ordinary,
-                              initExpr->getNameLoc());
-    base->setImplicit(true);
-    break;
-  case Suggestion::Super:
-    diag.fixItInsert(loc, "super.");
-    base = new (ctx) SuperRefExpr(/*Self=*/nullptr, loc, /*Implicit=*/true);
-    break;
-  }
-
-  return new (ctx)
-      UnresolvedDotExpr(base, /*dotloc=*/SourceLoc(), initExpr->getName(),
-                        initExpr->getNameLoc(), /*implicit=*/true);
 }
 
 namespace {
@@ -1010,12 +1041,6 @@ namespace {
     ASTContext &Ctx;
     DeclContext *DC;
 
-    Expr *ParentExpr;
-
-    /// Indicates whether pre-check is allowed to insert
-    /// implicit `ErrorExpr` in place of invalid references.
-    bool UseErrorExprs;
-
     /// A stack of expressions being walked, used to determine where to
     /// insert RebindSelfInConstructorExpr nodes.
     llvm::SmallVector<Expr *, 8> ExprStack;
@@ -1029,12 +1054,6 @@ namespace {
 
     /// Keep track of acceptable DiscardAssignmentExpr's.
     llvm::SmallPtrSet<DiscardAssignmentExpr*, 2> CorrectDiscardAssignmentExprs;
-
-    /// The current number of nested \c SequenceExprs that we're within.
-    unsigned SequenceExprDepth = 0;
-
-    /// The current number of nested \c SingleValueStmtExprs that we're within.
-    unsigned SingleValueStmtExprDepth = 0;
 
     /// Simplify expressions which are type sugar productions that got parsed
     /// as expressions due to the parser not knowing which identifiers are
@@ -1083,10 +1102,7 @@ namespace {
     void markAcceptableDiscardExprs(Expr *E);
 
   public:
-    PreCheckExpression(DeclContext *dc, Expr *parent,
-                       bool replaceInvalidRefsWithErrors)
-        : Ctx(dc->getASTContext()), DC(dc), ParentExpr(parent),
-          UseErrorExprs(replaceInvalidRefsWithErrors) {}
+    PreCheckExpression(DeclContext *dc) : Ctx(dc->getASTContext()), DC(dc) {}
 
     ASTContext &getASTContext() const { return Ctx; }
 
@@ -1101,6 +1117,18 @@ namespace {
     VarDecl *getImplicitSelfDeclForSuperContext(SourceLoc Loc) ;
 
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
+      auto &diags = Ctx.Diags;
+
+      // Fold sequence expressions.
+      if (auto *seqExpr = dyn_cast<SequenceExpr>(expr)) {
+        auto result = TypeChecker::foldSequence(seqExpr, DC);
+        result = result->walk(*this);
+        if (!result)
+          return Action::Stop();
+        // Already walked.
+        return Action::SkipNode(result);
+      }
+
       // FIXME(diagnostics): `InOutType` could appear here as a result
       // of successful re-typecheck of the one of the sub-expressions e.g.
       // `let _: Int = { (s: inout S) in s.bar() }`. On the first
@@ -1132,22 +1160,48 @@ namespace {
           return Action::Stop();
 
         // If we're going to recurse, record this expression on the stack.
-        if (recursive) {
-          if (isa<SequenceExpr>(expr))
-            SequenceExprDepth++;
+        if (recursive)
           ExprStack.push_back(expr);
-        }
+
         return Action::VisitNodeIf(recursive, expr);
       };
 
       // Resolve 'super' references.
       if (auto *superRef = dyn_cast<SuperRefExpr>(expr)) {
         auto loc = superRef->getLoc();
+
         auto *selfDecl = getImplicitSelfDeclForSuperContext(loc);
         if (selfDecl == nullptr)
-          return finish(true, new (Ctx) ErrorExpr(loc));
+          return finish(false, new (Ctx) ErrorExpr(loc));
 
         superRef->setSelf(selfDecl);
+
+        const bool isValidSuper = [&]() -> bool {
+          auto *parentExpr = Parent.getAsExpr();
+          if (!parentExpr) {
+            return false;
+          }
+
+          if (isa<UnresolvedDotExpr>(parentExpr) ||
+              isa<MemberRefExpr>(parentExpr)) {
+            return true;
+          } else if (auto *SE = dyn_cast<SubscriptExpr>(parentExpr)) {
+            // 'super[]' is valid, but 'x[super]' is not.
+            return superRef == SE->getBase();
+          }
+
+          return false;
+        }();
+
+        // NB: This is done along the happy path because presenting this error
+        // in a context where 'super' is not legal to begin with is not helpful.
+        if (!isValidSuper) {
+          // Diagnose and keep going. It is important for source tooling such
+          // as code completion that Sema is able to provide type information
+          // for 'super' in arbitrary positions inside expressions.
+          diags.diagnose(loc, diag::super_invalid_parent_expr);
+        }
+
         return finish(true, superRef);
       }
 
@@ -1157,46 +1211,8 @@ namespace {
       if (auto closure = dyn_cast<ClosureExpr>(expr))
         return finish(walkToClosureExprPre(closure), expr);
 
-      if (auto *SVE = dyn_cast<SingleValueStmtExpr>(expr)) {
-        // Record the scope of a single value stmt expr, as we want to skip
-        // pre-checking of any patterns, similar to closures.
-        SingleValueStmtExprDepth += 1;
-        return finish(true, expr);
-      }
-
-      if (auto unresolved = dyn_cast<UnresolvedDeclRefExpr>(expr)) {
-        TypeChecker::checkForForbiddenPrefix(
-            getASTContext(), unresolved->getName().getBaseName());
-
-        if (unresolved->getName().getBaseName().isConstructor()) {
-          if (auto *recoveryExpr =
-                  diagnoseUnqualifiedInit(unresolved, DC, Ctx)) {
-            return finish(true, recoveryExpr);
-          }
-
-          return finish(false,
-                        new (Ctx) ErrorExpr(unresolved->getSourceRange()));
-        }
-
-        auto *refExpr =
-            TypeChecker::resolveDeclRefExpr(unresolved, DC, UseErrorExprs);
-
-        // Check whether this is standalone `self` in init accessor, which
-        // is invalid.
-        if (auto *accessor = DC->getInnermostPropertyAccessorContext()) {
-          if (accessor->isInitAccessor() && isa<DeclRefExpr>(refExpr)) {
-            auto *DRE = cast<DeclRefExpr>(refExpr);
-            if (accessor->getImplicitSelfDecl() == DRE->getDecl() &&
-                !isa_and_nonnull<UnresolvedDotExpr>(Parent.getAsExpr())) {
-              Ctx.Diags.diagnose(unresolved->getLoc(),
-                                 diag::invalid_use_of_self_in_init_accessor);
-              refExpr = new (Ctx) ErrorExpr(unresolved->getSourceRange());
-            }
-          }
-        }
-
-        return finish(true, refExpr);
-      }
+      if (auto *unresolved = dyn_cast<UnresolvedDeclRefExpr>(expr))
+        return finish(true, TypeChecker::resolveDeclRefExpr(unresolved, DC));
 
       // Let's try to figure out if `InOutExpr` is out of place early
       // otherwise there is a risk of producing solutions which can't
@@ -1209,25 +1225,26 @@ namespace {
         if (expr->isImplicit())
           return finish(true, expr);
 
-        auto parents = ParentExpr->getParentMap();
+        ArrayRef<Expr *> parents = ExprStack;
+        auto takeNextParent = [&]() -> Expr * {
+          if (parents.empty())
+            return nullptr;
 
-        auto result = parents.find(expr);
-        if (result != parents.end()) {
-          auto *parent = result->getSecond();
-
-          if (isa<SequenceExpr>(parent))
-            return finish(true, expr);
-
+          auto parent = parents.back();
+          parents = parents.drop_back();
+          return parent;
+        };
+        if (auto *parent = takeNextParent()) {
           SourceLoc lastInnerParenLoc;
           // Unwrap to the outermost paren in the sequence.
           // e.g. `foo(((&bar))`
           while (auto *PE = dyn_cast<ParenExpr>(parent)) {
-            auto nextParent = parents.find(parent);
-            if (nextParent == parents.end())
+            auto nextParent = takeNextParent();
+            if (!nextParent)
               break;
 
             lastInnerParenLoc = PE->getLParenLoc();
-            parent = nextParent->second;
+            parent = nextParent;
           }
 
           if (isa<ApplyExpr>(parent) || isa<UnresolvedMemberExpr>(parent)) {
@@ -1235,24 +1252,21 @@ namespace {
             // a member reference, it might be valid to have `&`
             // before all of the parens.
             if (lastInnerParenLoc.isValid()) {
-              auto &DE = getASTContext().Diags;
-              auto diag = DE.diagnose(expr->getStartLoc(),
-                                      diag::extraneous_address_of);
+              auto diag = diags.diagnose(expr->getStartLoc(),
+                                         diag::extraneous_address_of);
               diag.fixItExchange(expr->getLoc(), lastInnerParenLoc);
             }
             return finish(true, expr);
           }
 
           if (isa<SubscriptExpr>(parent)) {
-            getASTContext().Diags.diagnose(
-                expr->getStartLoc(),
-                diag::cannot_pass_inout_arg_to_subscript);
+            diags.diagnose(expr->getStartLoc(),
+                           diag::cannot_pass_inout_arg_to_subscript);
             return finish(false, nullptr);
           }
         }
 
-        getASTContext().Diags.diagnose(expr->getStartLoc(),
-                                       diag::extraneous_address_of);
+        diags.diagnose(expr->getStartLoc(), diag::extraneous_address_of);
         return finish(false, nullptr);
       }
 
@@ -1272,32 +1286,31 @@ namespace {
       assert(ExprStack.back() == expr);
       ExprStack.pop_back();
 
-      // Fold sequence expressions.
-      if (auto *seqExpr = dyn_cast<SequenceExpr>(expr)) {
-        auto result = TypeChecker::foldSequence(seqExpr, DC);
-        SequenceExprDepth--;
-        result = result->walk(*this);
-        if (!result)
-          return Action::Stop();
-
-        return Action::Continue(result);
-      }
-
       // Type check the type parameters in an UnresolvedSpecializeExpr.
       if (auto *us = dyn_cast<UnresolvedSpecializeExpr>(expr)) {
         if (auto *typeExpr = simplifyUnresolvedSpecializeExpr(us))
           return Action::Continue(typeExpr);
       }
-      
+
+      // Check whether this is standalone `self` in init accessor, which
+      // is invalid.
+      if (auto *DRE = dyn_cast<DeclRefExpr>(expr)) {
+        if (auto *accessor = DC->getInnermostPropertyAccessorContext()) {
+          if (accessor->isInitAccessor() &&
+              accessor->getImplicitSelfDecl() == DRE->getDecl() &&
+              !isa_and_nonnull<UnresolvedDotExpr>(Parent.getAsExpr())) {
+            Ctx.Diags.diagnose(DRE->getLoc(),
+                               diag::invalid_use_of_self_in_init_accessor);
+            return Action::Continue(new (Ctx) ErrorExpr(DRE->getSourceRange()));
+          }
+        }
+      }
+
       // If we're about to step out of a ClosureExpr, restore the DeclContext.
       if (auto *ce = dyn_cast<ClosureExpr>(expr)) {
         assert(DC == ce && "DeclContext imbalance");
         DC = ce->getParent();
       }
-
-      // Restore the depth for the single value stmt counter.
-      if (isa<SingleValueStmtExpr>(expr))
-        SingleValueStmtExprDepth -= 1;
 
       if (auto *apply = dyn_cast<ApplyExpr>(expr)) {
         // Mark the direct callee as being a callee.
@@ -1392,12 +1405,9 @@ namespace {
         return Action::Continue(simplified);
 
       // Diagnose a '_' that isn't on the immediate LHS of an assignment. We
-      // skip diagnostics if we've explicitly marked the expression as valid,
-      // or if we're inside a SequenceExpr (since the whole tree will be
-      // re-checked when we finish folding anyway).
+      // skip diagnostics if we've explicitly marked the expression as valid.
       if (auto *DAE = dyn_cast<DiscardAssignmentExpr>(expr)) {
-        if (!CorrectDiscardAssignmentExprs.count(DAE) &&
-            SequenceExprDepth == 0) {
+        if (!CorrectDiscardAssignmentExprs.count(DAE)) {
           ctx.Diags.diagnose(expr->getLoc(),
                              diag::discard_expr_outside_of_assignment);
           return Action::Stop();
@@ -1450,11 +1460,17 @@ namespace {
     }
 
     PreWalkResult<Pattern *> walkToPatternPre(Pattern *pattern) override {
-      // Constraint generation is responsible for pattern verification and
-      // type-checking in the body of the closure and single value stmt expr,
-      // so there is no need to walk into patterns.
-      return Action::SkipNodeIf(
-          isa<ClosureExpr>(DC) || SingleValueStmtExprDepth > 0, pattern);
+      // In general we can't walk into patterns due to the fact that we don't
+      // currently resolve patterns until constraint generation, and therefore
+      // shouldn't walk into any expressions that may turn into patterns.
+      // One exception to this is if the parent is an expression. In that case,
+      // we are type-checking an expression in an ExprPattern, meaning that
+      // the pattern will already be resolved, and that we ought to e.g
+      // diagnose any stray '_' expressions nested within it. This then also
+      // means we should walk into any child pattern if we walked into the
+      // parent pattern.
+      return Action::VisitNodeIf(Parent.getAsExpr() || Parent.getAsPattern(),
+                                 pattern);
     }
   };
 } // end anonymous namespace
@@ -1654,7 +1670,7 @@ bool PreCheckExpression::possiblyInTypeContext(Expr *E) {
 /// been explicitly marked as correct, and the current AST state allows it.
 bool PreCheckExpression::canSimplifyDiscardAssignmentExpr(
     DiscardAssignmentExpr *DAE) {
-  return !CorrectDiscardAssignmentExprs.count(DAE) && SequenceExprDepth == 0 &&
+  return !CorrectDiscardAssignmentExprs.count(DAE) &&
          possiblyInTypeContext(DAE);
 }
 
@@ -1805,8 +1821,26 @@ void PreCheckExpression::markAcceptableDiscardExprs(Expr *E) {
 
 VarDecl *PreCheckExpression::getImplicitSelfDeclForSuperContext(SourceLoc Loc) {
   auto *methodContext = DC->getInnermostMethodContext();
-  if (!methodContext) {
-    Ctx.Diags.diagnose(Loc, diag::super_not_in_class_method);
+
+  if (auto *typeContext = DC->getInnermostTypeContext()) {
+    auto *nominal = typeContext->getSelfNominalTypeDecl();
+    auto *classDecl = dyn_cast<ClassDecl>(nominal);
+
+    if (!classDecl) {
+      Ctx.Diags.diagnose(Loc, diag::super_in_nonclass_type, nominal);
+      return nullptr;
+    } else if (!methodContext) {
+      Ctx.Diags.diagnose(Loc, diag::super_invalid_context);
+      return nullptr;
+    } else if (!classDecl->hasSuperclass()) {
+      Ctx.Diags.diagnose(
+          Loc, diag::super_no_superclass,
+          /*isExtension*/ isa<ExtensionDecl>(typeContext->getAsDecl()),
+          classDecl);
+      return nullptr;
+    }
+  } else {
+    Ctx.Diags.diagnose(Loc, diag::super_invalid_context);
     return nullptr;
   }
 
@@ -2385,59 +2419,35 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
       return nullptr;
   }
 
-  return DC->getParentModule()->lookupConformance(castTy, protocol)
+  return lookupConformance(castTy, protocol)
              ? CoerceExpr::forLiteralInit(getASTContext(), literal,
                                           call->getSourceRange(),
                                           typeExpr->getTypeRepr())
              : nullptr;
 }
 
-bool ConstraintSystem::preCheckTarget(SyntacticElementTarget &target,
-                                      bool replaceInvalidRefsWithErrors) {
+bool ConstraintSystem::preCheckTarget(SyntacticElementTarget &target) {
   auto *DC = target.getDeclContext();
+  auto &ctx = DC->getASTContext();
 
-  bool hadErrors = false;
+  FrontendStatsTracer StatsTracer(ctx.Stats, "precheck-target");
+  PreCheckExpression preCheck(DC);
 
-  if (auto *expr = target.getAsExpr()) {
-    hadErrors |= preCheckExpression(expr, DC, replaceInvalidRefsWithErrors);
-    // Even if the pre-check fails, expression still has to be re-set.
-    target.setExpr(expr);
-  }
+  auto newTarget = target.walk(preCheck);
+  if (!newTarget)
+    return true;
 
-  if (target.isForEachPreamble()) {
-    auto *stmt = target.getAsForEachStmt();
-
-    auto *sequenceExpr = stmt->getParsedSequence();
-    auto *whereExpr = stmt->getWhere();
-
-    hadErrors |= preCheckExpression(sequenceExpr, DC,
-                                    /*replaceInvalidRefsWithErrors=*/true);
-
-    if (whereExpr) {
-      hadErrors |= preCheckExpression(whereExpr, DC,
-                                      /*replaceInvalidRefsWithErrors=*/true);
-    }
-
-    // Update sequence and where expressions to pre-checked versions.
-    if (!hadErrors) {
-      stmt->setParsedSequence(sequenceExpr);
-
-      if (whereExpr)
-        stmt->setWhere(whereExpr);
-    }
-  }
-
-  return hadErrors;
+  target = *newTarget;
+  return false;
 }
 
 /// Pre-check the expression, validating any types that occur in the
 /// expression and folding sequence expressions.
-bool ConstraintSystem::preCheckExpression(Expr *&expr, DeclContext *dc,
-                                          bool replaceInvalidRefsWithErrors) {
+bool ConstraintSystem::preCheckExpression(Expr *&expr, DeclContext *dc) {
   auto &ctx = dc->getASTContext();
   FrontendStatsTracer StatsTracer(ctx.Stats, "precheck-expr", expr);
 
-  PreCheckExpression preCheck(dc, expr, replaceInvalidRefsWithErrors);
+  PreCheckExpression preCheck(dc);
 
   // Perform the pre-check.
   if (auto result = expr->walk(preCheck)) {

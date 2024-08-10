@@ -40,6 +40,7 @@
 #include "swift/AST/SynthesizedFileUnit.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeVisitor.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/FileSystem.h"
 #include "swift/Basic/LLVMExtras.h"
@@ -835,9 +836,10 @@ void Serializer::writeBlockInfoBlock() {
   BLOCK_RECORD(control_block, TARGET);
   BLOCK_RECORD(control_block, SDK_NAME);
   BLOCK_RECORD(control_block, REVISION);
-  BLOCK_RECORD(control_block, CHANNEL);
   BLOCK_RECORD(control_block, IS_OSSA);
   BLOCK_RECORD(control_block, ALLOWABLE_CLIENT_NAME);
+  BLOCK_RECORD(control_block, CHANNEL);
+  BLOCK_RECORD(control_block, SDK_VERSION);
 
   BLOCK(OPTIONS_BLOCK);
   BLOCK_RECORD(options_block, SDK_PATH);
@@ -851,10 +853,12 @@ void Serializer::writeBlockInfoBlock() {
   BLOCK_RECORD(options_block, MODULE_ABI_NAME);
   BLOCK_RECORD(options_block, IS_CONCURRENCY_CHECKED);
   BLOCK_RECORD(options_block, HAS_CXX_INTEROPERABILITY_ENABLED);
+  BLOCK_RECORD(options_block, CXX_STDLIB_KIND);
   BLOCK_RECORD(options_block, MODULE_PACKAGE_NAME);
   BLOCK_RECORD(options_block, MODULE_EXPORT_AS_NAME);
   BLOCK_RECORD(options_block, PLUGIN_SEARCH_OPTION);
   BLOCK_RECORD(options_block, ALLOW_NON_RESILIENT_ACCESS);
+  BLOCK_RECORD(options_block, SERIALIZE_PACKAGE_ENABLED);
 
   BLOCK(INPUT_BLOCK);
   BLOCK_RECORD(input_block, IMPORTED_MODULE);
@@ -983,6 +987,7 @@ void Serializer::writeHeader() {
     control_block::MetadataLayout Metadata(Out);
     control_block::TargetLayout Target(Out);
     control_block::SDKNameLayout SDKName(Out);
+    control_block::SDKVersionLayout SDKVersion(Out);
     control_block::RevisionLayout Revision(Out);
     control_block::ChannelLayout Channel(Out);
     control_block::IsOSSALayout IsOSSA(Out);
@@ -1024,6 +1029,9 @@ void Serializer::writeHeader() {
 
     if (!Options.SDKName.empty())
       SDKName.emit(ScratchRecord, Options.SDKName);
+
+    if (!Options.SDKVersion.empty())
+      SDKVersion.emit(ScratchRecord, Options.SDKVersion);
 
     for (auto &name : Options.AllowableClients) {
       Allowable.emit(ScratchRecord, name);
@@ -1092,6 +1100,11 @@ void Serializer::writeHeader() {
         AllowNonResAcess.emit(ScratchRecord);
       }
 
+      if (M->serializePackageEnabled()) {
+        options_block::SerializePackageEnabled SerializePkgEnabled(Out);
+        SerializePkgEnabled.emit(ScratchRecord);
+      }
+
       if (allowCompilerErrors()) {
         options_block::IsAllowModuleWithCompilerErrorsEnabledLayout
             AllowErrors(Out);
@@ -1122,6 +1135,10 @@ void Serializer::writeHeader() {
         options_block::HasCxxInteroperabilityEnabledLayout
             CxxInteroperabilityEnabled(Out);
         CxxInteroperabilityEnabled.emit(ScratchRecord);
+
+        options_block::CXXStdlibKindLayout CXXStdlibKind(Out);
+        CXXStdlibKind.emit(ScratchRecord,
+                           static_cast<uint8_t>(M->getCXXStdlibKind()));
       }
 
       if (Options.SerializeOptionsForDebugging) {
@@ -1321,21 +1338,25 @@ void Serializer::writeInputBlock() {
     time_t importedHeaderModTime = 0;
     std::string contents;
     auto importedHeaderPath = Options.ImportedHeader;
+    std::string pchIncludeTree;
     // We do not want to serialize the explicitly-specified .pch path if one was
     // provided. Instead we write out the path to the original header source so
     // that clients can consume it.
     if (Options.ExplicitModuleBuild &&
         llvm::sys::path::extension(importedHeaderPath)
-            .ends_with(file_types::getExtension(file_types::TY_PCH)))
-      importedHeaderPath = clangImporter->getClangInstance()
-                               .getASTReader()
-                               ->getModuleManager()
-                               .lookupByFileName(importedHeaderPath)
-                               ->OriginalSourceFileName;
+            .ends_with(file_types::getExtension(file_types::TY_PCH))) {
+      auto *pch = clangImporter->getClangInstance()
+                      .getASTReader()
+                      ->getModuleManager()
+                      .lookupByFileName(importedHeaderPath);
+      pchIncludeTree = pch->IncludeTreeID;
+      importedHeaderPath = pch->OriginalSourceFileName;
+    }
 
     if (!importedHeaderPath.empty()) {
       contents = clangImporter->getBridgingHeaderContents(
-          importedHeaderPath, importedHeaderSize, importedHeaderModTime);
+          importedHeaderPath, importedHeaderSize, importedHeaderModTime,
+          pchIncludeTree);
     }
     assert(publicImportSet.count(bridgingHeaderImport));
     ImportedHeader.emit(ScratchRecord,
@@ -1727,6 +1748,7 @@ void Serializer::writeASTBlockEntity(const SILLayout *layout) {
                         data);
 }
 
+// TODO: DON'T serialize the special conformance for DA-as_A
 void Serializer::writeLocalNormalProtocolConformance(
                                     NormalProtocolConformance *conformance) {
   using namespace decls_block;
@@ -1851,7 +1873,7 @@ Serializer::writeASTBlockEntity(ProtocolConformance *conformance) {
     if (!isDeclXRef(normal->getDeclContext()->getAsDecl())
         && !isa<ClangModuleUnit>(normal->getDeclContext()
                                        ->getModuleScopeContext())) {
-      writeLocalNormalProtocolConformance(normal);
+        writeLocalNormalProtocolConformance(normal);
     } else {
       // A conformance in a different module file.
       unsigned abbrCode = DeclTypeAbbrCodes[ProtocolConformanceXrefLayout::Code];
@@ -1944,8 +1966,10 @@ Serializer::addConformanceRefs(ArrayRef<ProtocolConformanceRef> conformances) {
   using namespace decls_block;
 
   SmallVector<ProtocolConformanceID, 4> results;
-  for (auto conformance : conformances)
-    results.push_back(addConformanceRef(conformance));
+  for (auto conformance : conformances) {
+    auto id = addConformanceRef(conformance);
+      results.push_back(id);
+  }
   return results;
 }
 
@@ -1953,9 +1977,11 @@ SmallVector<ProtocolConformanceID, 4>
 Serializer::addConformanceRefs(ArrayRef<ProtocolConformance*> conformances) {
   using namespace decls_block;
 
+
   SmallVector<ProtocolConformanceID, 4> results;
-  for (auto conformance : conformances)
+  for (auto conformance : conformances) {
     results.push_back(addConformanceRef(conformance));
+  }
   return results;
 }
 
@@ -2551,20 +2577,20 @@ void Serializer::writeASTBlockEntity(const DeclContext *DC) {
   }
 }
 
-void Serializer::writeLifetimeDependenceInfo(
-    LifetimeDependenceInfo lifetimeDependenceInfo, bool skipImplicit) {
-  if (skipImplicit && !lifetimeDependenceInfo.isExplicitlySpecified()) {
-    return;
-  }
+void Serializer::writeLifetimeDependencies(
+    ArrayRef<LifetimeDependenceInfo> lifetimeDependencies) {
   using namespace decls_block;
   SmallVector<bool> paramIndices;
-  lifetimeDependenceInfo.getConcatenatedData(paramIndices);
+  for (auto info : lifetimeDependencies) {
+    info.getConcatenatedData(paramIndices);
 
-  auto abbrCode = DeclTypeAbbrCodes[LifetimeDependenceLayout::Code];
-  LifetimeDependenceLayout::emitRecord(
-      Out, ScratchRecord, abbrCode,
-      lifetimeDependenceInfo.hasInheritLifetimeParamIndices(),
-      lifetimeDependenceInfo.hasScopeLifetimeParamIndices(), paramIndices);
+    auto abbrCode = DeclTypeAbbrCodes[LifetimeDependenceLayout::Code];
+    LifetimeDependenceLayout::emitRecord(
+        Out, ScratchRecord, abbrCode, info.getTargetIndex(), info.isImmortal(),
+        info.hasInheritLifetimeParamIndices(),
+        info.hasScopeLifetimeParamIndices(), paramIndices);
+    paramIndices.clear();
+  }
 }
 
 #define SIMPLE_CASE(TYPENAME, VALUE) \
@@ -3333,7 +3359,7 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       
       RawLayoutDeclAttrLayout::emitRecord(
         S.Out, S.ScratchRecord, abbrCode, attr->isImplicit(),
-        typeID, rawSize, rawAlign);
+        typeID, rawSize, rawAlign, attr->shouldMoveAsLikeType());
     }
     }
   }
@@ -3924,6 +3950,8 @@ public:
       typeRef = (typeRef << 1) | (inherited.isUnchecked() ? 0x01 : 0x00);
       // Encode "preconcurrency" in the low bit.
       typeRef = (typeRef << 1) | (inherited.isPreconcurrency() ? 0x01 : 0x00);
+      // Encode "suppressed" in the next bit.
+      typeRef = (typeRef << 1) | (inherited.isSuppressed() ? 0x01 : 0x00);
 
       result.push_back(typeRef);
     }
@@ -4498,7 +4526,7 @@ public:
         param->isAutoClosure(),
         param->isIsolated(),
         param->isCompileTimeConst(),
-        param->isTransferring(),
+        param->isSending(),
         getRawStableDefaultArgumentKind(argKind),
         S.addTypeRef(defaultExprType),
         getRawStableActorIsolationKind(isolation.getKind()),
@@ -4557,7 +4585,7 @@ public:
                            S.addDeclRef(fn->getOpaqueResultTypeDecl()),
                            fn->isUserAccessible(),
                            fn->isDistributedThunk(),
-                           fn->hasTransferringResult(),
+                           fn->hasSendingResult(),
                            nameComponentsAndDependencies);
 
     writeGenericParams(fn->getGenericParams());
@@ -4567,10 +4595,9 @@ public:
 
     auto fnType = ty->getAs<AnyFunctionType>();
     if (fnType) {
-      if (auto *lifetimeDependenceInfo =
-              fnType->getLifetimeDependenceInfoOrNull()) {
-        S.writeLifetimeDependenceInfo(*lifetimeDependenceInfo,
-                                      /*skipImplicit*/ true);
+      auto lifetimeDependencies = fnType->getLifetimeDependencies();
+      if (!lifetimeDependencies.empty()) {
+        S.writeLifetimeDependencies(lifetimeDependencies);
       }
     }
 
@@ -4695,10 +4722,9 @@ public:
 
     auto fnType = ty->getAs<AnyFunctionType>();
     if (fnType) {
-      if (auto *lifetimeDependenceInfo =
-              fnType->getLifetimeDependenceInfoOrNull()) {
-        S.writeLifetimeDependenceInfo(*lifetimeDependenceInfo,
-                                      /*skipImplicit*/ true);
+      auto lifetimeDependencies = fnType->getLifetimeDependencies();
+      if (!lifetimeDependencies.empty()) {
+        S.writeLifetimeDependencies(lifetimeDependencies);
       }
     }
 
@@ -4866,10 +4892,9 @@ public:
 
     auto fnType = ty->getAs<AnyFunctionType>();
     if (fnType) {
-      if (auto *lifetimeDependenceInfo =
-              fnType->getLifetimeDependenceInfoOrNull()) {
-        S.writeLifetimeDependenceInfo(*lifetimeDependenceInfo,
-                                      /*skipImplicit*/ true);
+      auto lifetimeDependencies = fnType->getLifetimeDependencies();
+      if (!lifetimeDependencies.empty()) {
+        S.writeLifetimeDependencies(lifetimeDependencies);
       }
     }
 
@@ -5169,6 +5194,7 @@ static uint8_t getRawStableParameterConvention(swift::ParameterConvention pc) {
   SIMPLE_CASE(ParameterConvention, Indirect_In_Guaranteed)
   SIMPLE_CASE(ParameterConvention, Indirect_Inout)
   SIMPLE_CASE(ParameterConvention, Indirect_InoutAliasable)
+  SIMPLE_CASE(ParameterConvention, Indirect_In_CXX)
   SIMPLE_CASE(ParameterConvention, Direct_Owned)
   SIMPLE_CASE(ParameterConvention, Direct_Unowned)
   SIMPLE_CASE(ParameterConvention, Direct_Guaranteed)
@@ -5195,9 +5221,9 @@ getRawSILParameterInfoOptions(swift::SILParameterInfo::Options options) {
     result |= SILParameterInfoFlags::Isolated;
   }
 
-  if (options.contains(SILParameterInfo::Transferring)) {
-    options -= SILParameterInfo::Transferring;
-    result |= SILParameterInfoFlags::Transferring;
+  if (options.contains(SILParameterInfo::Sending)) {
+    options -= SILParameterInfo::Sending;
+    result |= SILParameterInfoFlags::Sending;
   }
 
   // If we still have options left, this code is out of sync... return none.
@@ -5232,9 +5258,9 @@ getRawSILResultInfoOptions(swift::SILResultInfo::Options options) {
     result |= SILResultInfoFlags::NotDifferentiable;
   }
 
-  if (options.contains(SILResultInfo::IsTransferring)) {
-    options -= SILResultInfo::IsTransferring;
-    result |= SILResultInfoFlags::IsTransferring;
+  if (options.contains(SILResultInfo::IsSending)) {
+    options -= SILResultInfo::IsSending;
+    result |= SILResultInfoFlags::IsSending;
   }
 
   // If we still have any options set, then this code is out of sync. Signal an
@@ -5567,8 +5593,7 @@ public:
           S.addTypeRef(param.getPlainType()), paramFlags.isVariadic(),
           paramFlags.isAutoClosure(), paramFlags.isNonEphemeral(), rawOwnership,
           paramFlags.isIsolated(), paramFlags.isNoDerivative(),
-          paramFlags.isCompileTimeConst(), paramFlags.hasResultDependsOn(),
-          paramFlags.isTransferring());
+          paramFlags.isCompileTimeConst(), paramFlags.isSending());
     }
   }
 
@@ -5610,13 +5635,13 @@ public:
         S.addTypeRef(fnTy->getThrownError()),
         getRawStableDifferentiabilityKind(fnTy->getDifferentiabilityKind()),
         isolation,
-        fnTy->hasTransferringResult());
+        fnTy->hasSendingResult());
 
     serializeFunctionTypeParams(fnTy);
 
-    if (auto *lifetimeDependenceInfo =
-            fnTy->getLifetimeDependenceInfoOrNull()) {
-      S.writeLifetimeDependenceInfo(*lifetimeDependenceInfo);
+    auto lifetimeDependencies = fnTy->getLifetimeDependencies();
+    if (!lifetimeDependencies.empty()) {
+      S.writeLifetimeDependencies(lifetimeDependencies);
     }
   }
 
@@ -5632,14 +5657,14 @@ public:
         fnTy->isSendable(), fnTy->isAsync(), fnTy->isThrowing(),
         S.addTypeRef(fnTy->getThrownError()),
         getRawStableDifferentiabilityKind(fnTy->getDifferentiabilityKind()),
-        isolation, fnTy->hasTransferringResult(),
+        isolation, fnTy->hasSendingResult(),
         S.addGenericSignatureRef(genericSig));
 
     serializeFunctionTypeParams(fnTy);
 
-    if (auto *lifetimeDependenceInfo =
-            fnTy->getLifetimeDependenceInfoOrNull()) {
-      S.writeLifetimeDependenceInfo(*lifetimeDependenceInfo);
+    auto lifetimeDependencies = fnTy->getLifetimeDependencies();
+    if (!lifetimeDependencies.empty()) {
+      S.writeLifetimeDependencies(lifetimeDependencies);
     }
   }
 
@@ -5730,9 +5755,9 @@ public:
         invocationSigID, invocationSubstMapID, patternSubstMapID,
         clangTypeID, variableData);
 
-    if (auto *lifetimeDependenceInfo =
-            fnTy->getLifetimeDependenceInfoOrNull()) {
-      S.writeLifetimeDependenceInfo(*lifetimeDependenceInfo);
+    auto lifetimeDependencies = fnTy->getLifetimeDependencies();
+    if (!lifetimeDependencies.empty()) {
+      S.writeLifetimeDependencies(lifetimeDependencies);
     }
   }
 

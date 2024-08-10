@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/Pattern.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILGlobalVariable.h"
 #include "swift/IRGen/Linking.h"
@@ -114,5 +115,9 @@ void TemporarySet::destroyAll(IRGenFunction &IGF) const {
 
 void Temporary::destroy(IRGenFunction &IGF) const {
   auto &ti = IGF.getTypeInfo(Type);
+  if (Type.isSensitive()) {
+    llvm::Value *size = ti.getSize(IGF, Type);
+    IGF.emitClearSensitive(Addr.getAddress(), size);
+  }
   ti.deallocateStack(IGF, Addr, Type);
 }

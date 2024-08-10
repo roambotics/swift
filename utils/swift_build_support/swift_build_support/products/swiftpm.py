@@ -16,7 +16,6 @@ from . import cmark
 from . import foundation
 from . import libcxx
 from . import libdispatch
-from . import libicu
 from . import llbuild
 from . import llvm
 from . import product
@@ -84,15 +83,6 @@ class SwiftPM(product.Product):
                 "--dispatch-build-dir", dispatch_build_dir
             ]
 
-        # Pass Foundation directory down if we built it
-        foundation_build_dir = os.path.join(
-            build_root, '%s-%s' % ("foundation", host_target))
-
-        if os.path.exists(foundation_build_dir):
-            helper_cmd += [
-                "--foundation-build-dir", foundation_build_dir
-            ]
-
         # Pass Cross compile host info
         if self.has_cross_compile_hosts():
             if self.is_darwin_host(host_target):
@@ -147,7 +137,6 @@ class SwiftPM(product.Product):
         return [cmark.CMark,
                 llvm.LLVM,
                 libcxx.LibCXX,
-                libicu.LibICU,
                 swift.Swift,
                 libdispatch.LibDispatch,
                 foundation.Foundation,

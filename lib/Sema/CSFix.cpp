@@ -18,12 +18,14 @@
 
 #include "CSDiagnostics.h"
 #include "TypeCheckConcurrency.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/RequirementSignature.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Sema/ConstraintLocator.h"
 #include "swift/Sema/ConstraintSystem.h"
@@ -216,8 +218,8 @@ TreatArrayLiteralAsDictionary::attempt(ConstraintSystem &cs, Type dictionaryTy,
   auto &ctx = cs.getASTContext();
 
   if (auto *proto = ctx.getProtocol(KnownProtocolKind::ExpressibleByDictionaryLiteral))
-      if (!cs.DC->getParentModule()->lookupConformance(unwrappedDict, proto))
-        return nullptr;
+    if (!lookupConformance(unwrappedDict, proto))
+      return nullptr;
 
   auto arrayLoc = cs.getConstraintLocator(arrayExpr);
   return new (cs.getAllocator())
@@ -1151,16 +1153,16 @@ MoveOutOfOrderArgument *MoveOutOfOrderArgument::create(
 
 bool AllowInaccessibleMember::diagnose(const Solution &solution,
                                        bool asNote) const {
-  InaccessibleMemberFailure failure(solution, getMember(), getLocator());
+  InaccessibleMemberFailure failure(solution, getMember(), getLocator(),
+                                    IsMissingImport);
   return failure.diagnose(asNote);
 }
 
-AllowInaccessibleMember *
-AllowInaccessibleMember::create(ConstraintSystem &cs, Type baseType,
-                                ValueDecl *member, DeclNameRef name,
-                                ConstraintLocator *locator) {
-  return new (cs.getAllocator())
-      AllowInaccessibleMember(cs, baseType, member, name, locator);
+AllowInaccessibleMember *AllowInaccessibleMember::create(
+    ConstraintSystem &cs, Type baseType, ValueDecl *member, DeclNameRef name,
+    ConstraintLocator *locator, bool isMissingImport) {
+  return new (cs.getAllocator()) AllowInaccessibleMember(
+      cs, baseType, member, name, locator, isMissingImport);
 }
 
 bool AllowAnyObjectKeyPathRoot::diagnose(const Solution &solution,
@@ -1359,45 +1361,6 @@ bool NotCompileTimeConst::diagnose(const Solution &solution, bool asNote) const 
 
   NotCompileTimeConstFailure failure(solution, locator);
   return failure.diagnose(asNote);
-}
-
-MustBeCopyable::MustBeCopyable(ConstraintSystem &cs,
-                               Type noncopyableTy,
-                               NoncopyableMatchFailure failure,
-                               ConstraintLocator *locator)
-    : ConstraintFix(cs, FixKind::MustBeCopyable, locator, FixBehavior::Error),
-      noncopyableTy(noncopyableTy), failure(failure) {}
-
-bool MustBeCopyable::diagnose(const Solution &solution, bool asNote) const {
-  NotCopyableFailure failDiag(solution, noncopyableTy, failure, getLocator());
-  return failDiag.diagnose(asNote);
-}
-
-MustBeCopyable* MustBeCopyable::create(ConstraintSystem &cs,
-                                              Type noncopyableTy,
-                                              NoncopyableMatchFailure failure,
-                                              ConstraintLocator *locator) {
-  return new (cs.getAllocator()) MustBeCopyable(cs, noncopyableTy,
-                                                failure, locator);
-}
-
-bool MustBeCopyable::diagnoseForAmbiguity(CommonFixesArray commonFixes) const {
-  // Only diagnose if all solutions agreed on the same errant non-copyable type.
-  Type firstNonCopyable;
-  for (const auto &solutionAndFix : commonFixes) {
-    const auto *solution = solutionAndFix.first;
-    const auto *fix = solutionAndFix.second->getAs<MustBeCopyable>();
-
-    auto otherNonCopyable = solution->simplifyType(fix->noncopyableTy);
-    if (!firstNonCopyable)
-      firstNonCopyable = otherNonCopyable;
-
-    if (firstNonCopyable->getCanonicalType() != otherNonCopyable->getCanonicalType()) {
-      return false; // fixes differed, so decline to emit a tailored diagnostic.
-    }
-  }
-
-  return diagnose(*commonFixes.front().first);
 }
 
 bool AllowInvalidPackElement::diagnose(const Solution &solution,
@@ -1884,6 +1847,23 @@ std::string TreatEphemeralAsNonEphemeral::getName() const {
   return name;
 }
 
+bool AllowSendingMismatch::diagnose(const Solution &solution,
+                                    bool asNote) const {
+  SendingMismatchFailure failure(solution, getFromType(), getToType(),
+                                 getLocator(), fixBehavior);
+  return failure.diagnose(asNote);
+}
+
+AllowSendingMismatch *AllowSendingMismatch::create(ConstraintSystem &cs,
+                                                   Type srcType, Type dstType,
+                                                   ConstraintLocator *locator) {
+  auto fixBehavior = cs.getASTContext().LangOpts.isSwiftVersionAtLeast(6)
+                         ? FixBehavior::Error
+                         : FixBehavior::DowngradeToWarning;
+  return new (cs.getAllocator())
+      AllowSendingMismatch(cs, srcType, dstType, locator, fixBehavior);
+}
+
 bool SpecifyBaseTypeForContextualMember::diagnose(const Solution &solution,
                                                   bool asNote) const {
   MissingContextualBaseInMemberRefFailure failure(solution, MemberName,
@@ -2142,6 +2122,18 @@ SpecifyContextualTypeForNil *
 SpecifyContextualTypeForNil::create(ConstraintSystem &cs,
                                     ConstraintLocator *locator) {
   return new (cs.getAllocator()) SpecifyContextualTypeForNil(cs, locator);
+}
+
+bool IgnoreInvalidPlaceholder::diagnose(const Solution &solution,
+                                        bool asNote) const {
+  InvalidPlaceholderFailure failure(solution, getLocator());
+  return failure.diagnose(asNote);
+}
+
+IgnoreInvalidPlaceholder *
+IgnoreInvalidPlaceholder::create(ConstraintSystem &cs,
+                                 ConstraintLocator *locator) {
+  return new (cs.getAllocator()) IgnoreInvalidPlaceholder(cs, locator);
 }
 
 bool SpecifyTypeForPlaceholder::diagnose(const Solution &solution,
@@ -2614,15 +2606,28 @@ AllowInvalidMemberReferenceInInitAccessor::create(ConstraintSystem &cs,
 
 bool AllowConcreteTypeSpecialization::diagnose(const Solution &solution,
                                                bool asNote) const {
-  ConcreteTypeSpecialization failure(solution, ConcreteType, getLocator());
+  ConcreteTypeSpecialization failure(solution, ConcreteType, Decl, getLocator(),
+                                     fixBehavior);
   return failure.diagnose(asNote);
 }
 
-AllowConcreteTypeSpecialization *
-AllowConcreteTypeSpecialization::create(ConstraintSystem &cs, Type concreteTy,
-                                        ConstraintLocator *locator) {
+AllowConcreteTypeSpecialization *AllowConcreteTypeSpecialization::create(
+    ConstraintSystem &cs, Type concreteTy, ValueDecl *decl,
+    ConstraintLocator *locator, FixBehavior fixBehavior) {
+  return new (cs.getAllocator()) AllowConcreteTypeSpecialization(
+      cs, concreteTy, decl, locator, fixBehavior);
+}
+
+bool AllowGenericFunctionSpecialization::diagnose(const Solution &solution,
+                                                  bool asNote) const {
+  GenericFunctionSpecialization failure(solution, Decl, getLocator());
+  return failure.diagnose(asNote);
+}
+
+AllowGenericFunctionSpecialization *AllowGenericFunctionSpecialization::create(
+    ConstraintSystem &cs, ValueDecl *decl, ConstraintLocator *locator) {
   return new (cs.getAllocator())
-      AllowConcreteTypeSpecialization(cs, concreteTy, locator);
+      AllowGenericFunctionSpecialization(cs, decl, locator);
 }
 
 bool IgnoreOutOfPlaceThenStmt::diagnose(const Solution &solution,

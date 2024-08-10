@@ -23,6 +23,7 @@
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Parse/Lexer.h"
@@ -496,9 +497,6 @@ Parser::Parser(std::unique_ptr<Lexer> Lex, SourceFile &SF,
   // Set the token to a sentinel so that we know the lexer isn't primed yet.
   // This cannot be tok::unknown, since that is a token the lexer could produce.
   Tok.setKind(tok::NUM_TOKENS);
-
-  EnabledNoncopyableGenerics =
-      Context.LangOpts.hasFeature(Feature::NoncopyableGenerics);
 }
 
 Parser::~Parser() {

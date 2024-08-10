@@ -467,6 +467,7 @@ public:
   const bool BridgingHeaderExplicitlyRequested;
   const bool DisableOverlayModules;
   const bool EnableClangSPI;
+  const bool UseClangIncludeTree;
   bool importSymbolicCXXDecls;
 
   bool IsReadingBridgingPCH;
@@ -1062,6 +1063,15 @@ public:
   /// Retrieve the placeholder source file for use in parsing Swift attributes
   /// in the given module.
   SourceFile &getClangSwiftAttrSourceFile(ModuleDecl &module);
+
+  /// Utility function to import Clang attributes from a source Swift decl to
+  /// synthesized Swift decl.
+  ///
+  /// \param SourceDecl The Swift decl to copy the atteribute from.
+  /// \param SynthesizedDecl The synthesized Swift decl to attach attributes to.
+  void
+  importAttributesFromClangDeclToSynthesizedSwiftDecl(Decl *SourceDecl,
+                                                      Decl *SynthesizedDecl);
 
   /// Import attributes from the given Clang declaration to its Swift
   /// equivalent.

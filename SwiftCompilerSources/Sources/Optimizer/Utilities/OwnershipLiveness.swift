@@ -64,8 +64,11 @@ func computeLinearLiveness(for definingValue: Value, _ context: Context)
   var range = InstructionRange(for: definingValue, context)
 
   // Compute liveness.
-  definingValue.uses.endingLifetime.forEach {
-    range.insert($0.instruction)
+ for use in definingValue.lookThroughBorrowedFromUser.uses {
+    let instruction = use.instruction
+    if use.endsLifetime || instruction is ExtendLifetimeInst {
+      range.insert(instruction)
+    }
   }
   return range
 }
@@ -272,10 +275,10 @@ protocol OwnershipUseVisitor {
   mutating func pointerEscapingUse(of operand: Operand) -> WalkResult
 
   /// A use that creates an implicit borrow scope over the lifetime of
-  /// an owned dependent value. The operand owership is .borrow, but
+  /// an owned dependent value. The operand ownership is .borrow, but
   /// there are no explicit scope-ending operations. Instead
   /// BorrowingInstruction.scopeEndingOperands will return the final
-  /// consumes in the dependent value's forwaring chain.
+  /// consumes in the dependent value's forwarding chain.
   mutating func dependentUse(of operand: Operand, into value: Value)
     -> WalkResult
 
@@ -487,7 +490,7 @@ extension OwnershipUseVisitor {
 ///
 /// - Does not assume the current lifetime is linear. Transitively
 /// follows guaranteed forwarding and address uses within the current
-/// scope. Phis that are not dominanted by definingValue or an outer
+/// scope. Phis that are not dominated by definingValue or an outer
 /// adjacent phi are marked "unenclosed" to signal an incomplete
 /// lifetime.
 ///
@@ -560,10 +563,7 @@ struct InteriorUseWalker {
     // If the outer value is an owned phi or reborrow, consider inner
     // adjacent phis part of its lifetime.
     if let phi = Phi(definingValue), phi.endsLifetime {
-      var innerPhis = Stack<Phi>(context)
-      defer { innerPhis.deinitialize() }
-      gatherInnerAdjacentPhis(for: phi, in: &innerPhis, context)
-      let result = innerPhis.walk { innerPhi in
+      let result = phi.innerAdjacentPhis.walk { innerPhi in
         if innerPhi.isReborrow {
           // Inner adjacent reborrows are considered inner borrow scopes.
           if handleInner(borrowed: innerPhi.value) == .abortWalk {
@@ -742,7 +742,11 @@ extension InteriorUseWalker: AddressUseVisitor {
   mutating func loadedAddressUse(of operand: Operand, into address: Operand)
     -> WalkResult {
     return .continueWalk
-  }    
+  }
+  
+  mutating func yieldedAddressUse(of operand: Operand) -> WalkResult {
+    return .continueWalk
+  }
 
   mutating func dependentAddressUse(of operand: Operand, into value: Value)
     -> WalkResult {
@@ -855,11 +859,8 @@ extension InteriorUseWalker {
     guard visited.insert(guaranteedPhi.value) else {
       return .continueWalk
     }
-    var enclosingValues = Stack<Value>(context)
-    defer { enclosingValues.deinitialize() }
-    gatherEnclosingValues(for: guaranteedPhi.value, in: &enclosingValues,
-                          context)
-    guard enclosingValues.contains(definingValue) else {
+    let phiValue = guaranteedPhi.value.lookThroughBorrowedFromUser
+    guard phiValue.getEnclosingValues(functionContext).contains(definingValue) else {
       // Since definingValue is not an enclosing value, it must be
       // consumed or reborrowed by some outer adjacent phi in this
       // block. An outer adjacent phi's uses do not contribute to the

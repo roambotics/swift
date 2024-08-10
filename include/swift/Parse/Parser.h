@@ -105,6 +105,15 @@ enum class IfConfigElementsRole {
   Skipped
 };
 
+/// Describes the context in which the '#if' is being parsed.
+enum class IfConfigContext {
+  BraceItems,
+  DeclItems,
+  SwitchStmt,
+  PostfixExpr,
+  DeclAttrs
+};
+
 /// The main class used for parsing a source file (.swift or .sil).
 ///
 /// Rather than instantiating a Parser yourself, use one of the parsing APIs
@@ -147,7 +156,13 @@ public:
   /// Whether this context has an async attribute.
   bool InPatternWithAsyncAttribute = false;
 
+  /// Whether a '#sourceLocation' is currently active.
+  /// NOTE: Do not use this outside of `parseLineDirective`, it doesn't have
+  /// its state restored when parsing delayed bodies (we avoid skipping bodies
+  /// if we see a `#sourceLocation` in them though). Instead, query the
+  /// SourceManager.
   bool InPoundLineEnvironment = false;
+
   bool InPoundIfEnvironment = false;
   /// ASTScopes are not created in inactive clauses and lookups to decls will fail.
   bool InInactiveClauseEnvironment = false;
@@ -157,11 +172,6 @@ public:
   /// This Parser is a fallback parser for ASTGen.
   // Note: This doesn't affect anything in non-SWIFT_BUILD_SWIFT_SYNTAX envs.
   bool IsForASTGen = false;
-
-  // A cached answer to
-  //     Context.LangOpts.hasFeature(Feature::NoncopyableGenerics)
-  // to ensure there's no parsing performance regression.
-  bool EnabledNoncopyableGenerics;
 
   /// Whether we should delay parsing nominal type, extension, and function
   /// bodies.
@@ -998,8 +1008,9 @@ public:
   /// them however they wish. The parsing function will be provided with the
   /// location of the clause token (`#if`, `#else`, etc.), the condition,
   /// whether this is the active clause, and the role of the elements.
-  template<typename Result>
+  template <typename Result>
   Result parseIfConfigRaw(
+      IfConfigContext ifConfigContext,
       llvm::function_ref<void(SourceLoc clauseLoc, Expr *condition,
                               bool isActive, IfConfigElementsRole role)>
           parseElements,
@@ -1008,7 +1019,8 @@ public:
   /// Parse a #if ... #endif directive.
   /// Delegate callback function to parse elements in the blocks.
   ParserResult<IfConfigDecl> parseIfConfig(
-    llvm::function_ref<void(SmallVectorImpl<ASTNode> &, bool)> parseElements);
+      IfConfigContext ifConfigContext,
+      llvm::function_ref<void(SmallVectorImpl<ASTNode> &, bool)> parseElements);
 
   /// Parse an #if ... #endif containing only attributes.
   ParserStatus parseIfConfigDeclAttributes(
@@ -1205,15 +1217,11 @@ public:
         Tok.isContextualKeyword("isolated") ||
         Tok.isContextualKeyword("_const"))
       return true;
-    if (Context.LangOpts.hasFeature(Feature::NonescapableTypes) &&
-        Tok.isContextualKeyword("_resultDependsOn"))
-      return true;
-    if (Context.LangOpts.hasFeature(Feature::TransferringArgsAndResults) &&
-        Tok.isContextualKeyword("transferring"))
+    if (Context.LangOpts.hasFeature(Feature::SendingArgsAndResults) &&
+        Tok.isContextualKeyword("sending"))
       return true;
     if (Context.LangOpts.hasFeature(Feature::NonescapableTypes) &&
-        (Tok.isContextualKeyword("_resultDependsOn") ||
-         isLifetimeDependenceToken()))
+        isLifetimeDependenceToken())
       return true;
     return false;
   }
@@ -1244,7 +1252,7 @@ public:
       if (next.isAny(tok::at_sign, tok::kw_inout, tok::l_paren,
                      tok::identifier, tok::l_square, tok::kw_Any,
                      tok::kw_Self, tok::kw__, tok::kw_var,
-                     tok::kw_let))
+                     tok::kw_let, tok::code_complete))
         return true;
 
       if (next.is(tok::oper_prefix) && next.getText() == "~")
@@ -1254,44 +1262,9 @@ public:
     return isLifetimeDependenceToken();
   }
 
-  struct ParsedTypeAttributeList {
-    ParamDecl::Specifier Specifier = ParamDecl::Specifier::Default;
-    SourceLoc SpecifierLoc;
-    SourceLoc IsolatedLoc;
-    SourceLoc ConstLoc;
-    SourceLoc ResultDependsOnLoc;
-    SourceLoc TransferringLoc;
-    SmallVector<TypeOrCustomAttr> Attributes;
-    SmallVector<LifetimeDependenceSpecifier> lifetimeDependenceSpecifiers;
-
-    /// Main entry point for parsing.
-    ///
-    /// Inline we just have the fast path of failing to match. We call slowParse
-    /// that contains the outline of more complex implementation. This is HOT
-    /// code!
-    ParserStatus parse(Parser &P) {
-      auto &Tok = P.Tok;
-      if (Tok.is(tok::at_sign) || P.isParameterSpecifier())
-        return slowParse(P);
-      return makeParserSuccess();
-    }
-
-    TypeRepr *applyAttributesToType(Parser &P, TypeRepr *Type) const;
-
-  private:
-    /// An out of line implementation of the more complicated cases. This
-    /// ensures on the inlined fast path we handle the case of not matching.
-    ParserStatus slowParse(Parser &P);
-  };
-
   bool parseConventionAttributeInternal(SourceLoc atLoc, SourceLoc attrLoc,
                                         ConventionTypeAttr *&result,
                                         bool justChecking);
-
-  ParserStatus parseTypeAttribute(TypeOrCustomAttr &result, SourceLoc AtLoc,
-                                  SourceLoc AtEndLoc,
-                                  PatternBindingInitializer *&initContext,
-                                  bool justChecking = false);
 
   ParserStatus parseLifetimeDependenceSpecifiers(
       SmallVectorImpl<LifetimeDependenceSpecifier> &specifierList);
@@ -1303,13 +1276,9 @@ public:
   ///
   /// \param allowClassRequirement whether to permit parsing of 'class'
   /// \param allowAnyObject whether to permit parsing of 'AnyObject'
-  /// \param parseTildeCopyable if non-null, permits parsing of `~Copyable`
-  ///   and writes out a valid source location if it was parsed. If null, then a
-  ///   parsing error will be emitted upon the appearance of `~` in the clause.
   ParserStatus parseInheritance(SmallVectorImpl<InheritedEntry> &Inherited,
                                 bool allowClassRequirement,
-                                bool allowAnyObject,
-                                SourceLoc *parseTildeCopyable = nullptr);
+                                bool allowAnyObject);
   ParserStatus parseDeclItem(bool &PreviousHadSemi,
                              llvm::function_ref<void(Decl *)> handler);
   std::pair<std::vector<Decl *>, std::optional<Fingerprint>>
@@ -1435,6 +1404,8 @@ public:
 
     /// Whether the type is for a closure attribute.
     CustomAttribute,
+    /// A type in an inheritance clause.
+    InheritanceClause,
   };
 
   ParserResult<TypeRepr> parseTypeScalar(
@@ -1490,6 +1461,43 @@ public:
 
   /// Parse a dotted type, e.g. 'Foo<X>.Y.Z', 'P.Type', '[X].Y'.
   ParserResult<TypeRepr> parseTypeDotted(ParserResult<TypeRepr> Base);
+
+  struct ParsedTypeAttributeList {
+    ParseTypeReason ParseReason;
+    ParamDecl::Specifier Specifier = ParamDecl::Specifier::Default;
+    SourceLoc SpecifierLoc;
+    SourceLoc IsolatedLoc;
+    SourceLoc ConstLoc;
+    SourceLoc SendingLoc;
+    SmallVector<TypeOrCustomAttr> Attributes;
+    SmallVector<LifetimeDependenceSpecifier> lifetimeDependenceSpecifiers;
+
+    ParsedTypeAttributeList(ParseTypeReason reason) : ParseReason(reason) {}
+
+    /// Main entry point for parsing.
+    ///
+    /// Inline we just have the fast path of failing to match. We call slowParse
+    /// that contains the outline of more complex implementation. This is HOT
+    /// code!
+    ParserStatus parse(Parser &P) {
+      auto &Tok = P.Tok;
+      if (Tok.is(tok::at_sign) || P.isParameterSpecifier())
+        return slowParse(P);
+      return makeParserSuccess();
+    }
+
+    TypeRepr *applyAttributesToType(Parser &P, TypeRepr *Type) const;
+
+  private:
+    /// An out of line implementation of the more complicated cases. This
+    /// ensures on the inlined fast path we handle the case of not matching.
+    ParserStatus slowParse(Parser &P);
+  };
+
+  ParserStatus parseTypeAttribute(TypeOrCustomAttr &result, SourceLoc AtLoc,
+                                  SourceLoc AtEndLoc, ParseTypeReason reason,
+                                  PatternBindingInitializer *&initContext,
+                                  bool justChecking = false);
 
   ParserResult<TypeRepr> parseOldStyleProtocolComposition();
   ParserResult<TypeRepr> parseAnyType();
@@ -1576,11 +1584,8 @@ public:
     /// The location of the '_const' keyword, if present.
     SourceLoc CompileConstLoc;
 
-    /// The location of the '_resultDependsOn' keyword, if present.
-    SourceLoc ResultDependsOnLoc;
-
-    /// The location of the 'transferring' keyword if present.
-    SourceLoc TransferringLoc;
+    /// The location of the 'sending' keyword if present.
+    SourceLoc SendingLoc;
 
     /// The type following the ':'.
     TypeRepr *Type = nullptr;
@@ -1588,9 +1593,6 @@ public:
     /// The default argument for this parameter.
     Expr *DefaultArg = nullptr;
 
-    /// True if this parameter inherits a default argument via '= super'
-    bool hasInheritedDefaultArg = false;
-    
     /// True if we emitted a parse error about this parameter.
     bool isInvalid = false;
 
@@ -1620,6 +1622,11 @@ public:
 
   /// Whether we are at the start of a parameter name when parsing a parameter.
   bool startsParameterName(bool isClosure);
+
+  /// Attempts to perform code completion for the possible start of a function
+  /// parameter type, returning the source location of the consumed completion
+  /// token, or a null location if there is no completion token.
+  SourceLoc tryCompleteFunctionParamTypeBeginning();
 
   /// Parse a parameter-clause.
   ///
@@ -1978,6 +1985,8 @@ public:
   /// this parameter is \c true, the function returns \c false such that an
   /// expression can be parsed.
   bool isStartOfStmt(bool preferExpr);
+
+  bool isStartOfConditionalStmtBody();
 
   bool isTerminatorForBraceItemListKind(BraceItemListKind Kind,
                                         ArrayRef<ASTNode> ParsedDecls);

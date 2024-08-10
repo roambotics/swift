@@ -18,6 +18,7 @@
 #include "swift/AST/Attr.h"
 #include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/EditorPlaceholder.h"
 #include "swift/Basic/StringExtras.h"
@@ -371,6 +372,23 @@ done:
   // If we saw no operators, don't build a sequence.
   if (SequencedExprs.size() == 1)
     return makeParserResult(SequenceStatus, SequencedExprs[0]);
+
+  // If the left-most sequence expr is a 'try', hoist it up to turn
+  // '(try x) + y' into 'try (x + y)'. This is necessary to do in the
+  // parser because 'try' nodes are represented in the ASTScope tree
+  // to look up catch nodes. The scope tree must be syntactic because
+  // it's constructed before sequence folding happens during preCheckExpr.
+  // Otherwise, catch node lookup would find the incorrect catch node for
+  // 'try x + y' at the source location for 'y'.
+  //
+  // 'try' has restrictions for where it can appear within a sequence
+  // expr. This is still diagnosed in TypeChecker::foldSequence.
+  if (auto *tryEval = dyn_cast<AnyTryExpr>(SequencedExprs[0])) {
+    SequencedExprs[0] = tryEval->getSubExpr();
+    auto *sequence = SequenceExpr::create(Context, SequencedExprs);
+    tryEval->setSubExpr(sequence);
+    return makeParserResult(SequenceStatus, tryEval);
+  }
 
   return makeParserResult(SequenceStatus,
                           SequenceExpr::create(Context, SequencedExprs));
@@ -1031,27 +1049,10 @@ void Parser::tryLexRegexLiteral(bool forUnappliedOperator) {
 /// parseExprSuper
 ///
 ///   expr-super:
-///     expr-super-member
-///     expr-super-init
-///     expr-super-subscript
-///   expr-super-member:
-///     'super' '.' identifier
-///   expr-super-init:
-///     'super' '.' 'init'
-///   expr-super-subscript:
-///     'super' '[' expr ']'
+///     'super'
 ParserResult<Expr> Parser::parseExprSuper() {
   // Parse the 'super' reference.
   SourceLoc superLoc = consumeToken(tok::kw_super);
-
-  // 'super.' must be followed by a member ref, explicit initializer ref, or
-  // subscript call.
-  if (!Tok.isAny(tok::period, tok::period_prefix, tok::code_complete) &&
-      !Tok.isFollowingLSquare()) {
-    if (!consumeIf(tok::unknown))
-      diagnose(Tok, diag::expected_dot_or_subscript_after_super);
-    return nullptr;
-  }
 
   return makeParserResult(new (Context) SuperRefExpr(/*selfDecl=*/nullptr,
                                                      superLoc,
@@ -1478,8 +1479,9 @@ Parser::parseExprPostfixSuffix(ParserResult<Expr> Result, bool isExprBasic,
       }
 
       llvm::SmallPtrSet<Expr *, 4> exprsWithBindOptional;
-      auto ICD =
-          parseIfConfig([&](SmallVectorImpl<ASTNode> &elements, bool isActive) {
+      auto ICD = parseIfConfig(
+          IfConfigContext::PostfixExpr,
+          [&](SmallVectorImpl<ASTNode> &elements, bool isActive) {
             // Although we know the '#if' body starts with period,
             // '#elseif'/'#else' bodies might start with invalid tokens.
             if (isAtStartOfPostfixExprSuffix() || Tok.is(tok::pound_if)) {
@@ -1490,13 +1492,6 @@ Parser::parseExprPostfixSuffix(ParserResult<Expr> Result, bool isExprBasic,
               if (exprHasBindOptional)
                 exprsWithBindOptional.insert(expr.get());
               elements.push_back(expr.get());
-            }
-
-            // Don't allow any character other than the postfix expression.
-            if (!Tok.isAny(tok::pound_elseif, tok::pound_else, tok::pound_endif,
-                           tok::eof)) {
-              diagnose(Tok, diag::expr_postfix_ifconfig_unexpectedtoken);
-              skipUntilConditionalBlockClose();
             }
           });
       if (ICD.isNull())
@@ -1732,7 +1727,7 @@ ParserResult<Expr> Parser::parseExprPrimary(Diag<> ID, bool isExprBasic) {
       // If we have a generic argument list, this is something like
       // "case let E<Int>.e(y)", and 'E' should be parsed as a normal name, not
       // a binding.
-      if (peekToken().isAnyOperator() && peekToken().getText().equals("<")) {
+      if (peekToken().isAnyOperator() && peekToken().getText() == "<") {
         BacktrackingScope S(*this);
         consumeToken();
         return !canParseAsGenericArgumentList();
@@ -1931,6 +1926,11 @@ ParserResult<Expr> Parser::parseExprPrimary(Diag<> ID, bool isExprBasic) {
   default:
   UnknownCharacter:
     checkForInputIncomplete();
+    // Enable trailing comma in string literal interpolation
+    // Note that 'Tok.is(tok::r_paren)' is not used because the text is ")\"\n" but the kind is actualy 'eof'
+    if (Tok.is(tok::eof) && Tok.getText() == ")") {
+      return nullptr;
+    }
     // FIXME: offer a fixit: 'Self' -> 'self'
     diagnose(Tok, ID);
     return nullptr;
@@ -2775,7 +2775,7 @@ ParserStatus Parser::parseClosureSignatureIfPresent(
         VD->setIsSelfParamCapture();
 
       captureList.push_back(CLE);
-    } while (HasNext);
+    } while (HasNext && !Tok.is(tok::r_square));
 
     // The capture list needs to be closed off with a ']'.
     SourceLoc rBracketLoc = Tok.getLoc();
@@ -3295,12 +3295,13 @@ ParserStatus Parser::parseExprList(tok leftTok, tok rightTok,
   StructureMarkerRAII ParsingExprList(*this, Tok);
   
   leftLoc = consumeToken(leftTok);
-  return parseList(rightTok, leftLoc, rightLoc, /*AllowSepAfterLast=*/false,
+  return parseList(rightTok, leftLoc, rightLoc, /*AllowSepAfterLast=*/true,
                    rightTok == tok::r_paren ? diag::expected_rparen_expr_list
                                             : diag::expected_rsquare_expr_list,
-                   [&] () -> ParserStatus {
-    return parseExprListElement(rightTok, isArgumentList, leftLoc, elts);
-  });
+                   [&]() -> ParserStatus {
+                     return parseExprListElement(rightTok, isArgumentList,
+                                                 leftLoc, elts);
+                   });
 }
 
 static bool isStartOfLabelledTrailingClosure(Parser &P) {

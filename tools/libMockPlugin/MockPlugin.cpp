@@ -113,7 +113,7 @@ static const llvm::json::Value substitute(const llvm::json::Value &value,
     // '.' <alphanum> -> object key.
     if (path.starts_with(".")) {
       if (subst->kind() != llvm::json::Value::Object)
-        return "<substition error: not an object>";
+        return "<substitution error: not an object>";
       path = path.substr(1);
       auto keyLength =
           path.find_if([](char c) { return !llvm::isAlnum(c) && c != '_'; });
@@ -125,7 +125,7 @@ static const llvm::json::Value substitute(const llvm::json::Value &value,
     // '[' <digit>+ ']' -> array index.
     if (path.starts_with("[")) {
       if (subst->kind() != llvm::json::Value::Array)
-        return "<substition error: not an array>";
+        return "<substitution error: not an array>";
       path = path.substr(1);
       auto idxlength = path.find_if([](char c) { return !llvm::isDigit(c); });
       size_t idx;
@@ -133,12 +133,12 @@ static const llvm::json::Value substitute(const llvm::json::Value &value,
       subst = &(*subst->getAsArray())[idx];
       path = path.substr(idxlength);
       if (!path.starts_with("]"))
-        return "<substition error: missing ']' after digits>";
+        return "<substitution error: missing ']' after digits>";
       path = path.substr(1);
       continue;
     }
     // Malformed.
-    return "<substition error: malformed path>";
+    return "<substitution error: malformed path>";
   }
   return *subst;
 }
@@ -225,7 +225,7 @@ int TestRunner::run() {
     // Handle
     auto *item = findMatchItem(*request_obj);
     if (!item) {
-      llvm::errs() << "cound't find matching item for request: " << *request_obj
+      llvm::errs() << "couldn't find matching item for request: " << *request_obj
                    << "\n";
       return 1;
     }

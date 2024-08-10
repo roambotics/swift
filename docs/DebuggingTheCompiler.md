@@ -36,6 +36,7 @@ benefit of all Swift developers.
         - [Bisecting on SIL optimizer pass counts to identify optimizer bugs](#bisecting-on-sil-optimizer-pass-counts-to-identify-optimizer-bugs)
         - [Using git-bisect in the presence of branch forwarding/feature branches](#using-git-bisect-in-the-presence-of-branch-forwardingfeature-branches)
         - [Reducing SIL test cases using bug_reducer](#reducing-sil-test-cases-using-bug_reducer)
+    - [Disabling PCH Verification](#disabling-pch-verification)
 - [Debugging the Compiler Build](#debugging-the-compiler-build)
     - [Build Dry Run](#build-dry-run)
 - [Debugging the Compiler Driver](#debugging-the-compiler-driver-build)
@@ -49,6 +50,7 @@ benefit of all Swift developers.
     - [Manually symbolication using LLDB](#manually-symbolication-using-lldb)
     - [Viewing allocation history, references, and page-level info](#viewing-allocation-history-references-and-page-level-info)
     - [Printing memory contents](#printing-memory-contents)
+    - [Windows Error Codes](#windows-error-codes)
 - [Debugging LLDB failures](#debugging-lldb-failures)
     - ["Types" Log](#types-log)
     - ["Expression" Log](#expression-log)
@@ -259,7 +261,7 @@ If one builds swift using ninja and wants to dump the SIL of the
 stdlib using some of the SIL dumping options from the previous
 section, one can use the following one-liner:
 
-    ninja -t commands | grep swiftc | grep Swift.o | grep " -c "
+    ninja -t commands | grep swiftc | grep 'Swift\.o'
 
 This should give one a single command line that one can use for
 Swift.o, perfect for applying the previous sections options to.
@@ -300,6 +302,13 @@ swift/Basic/Debug.h includes macros to help contributors declare these methods
 with the proper attributes to ensure they'll be available in the debugger. In
 particular, if you see `SWIFT_DEBUG_DUMP` in a class declaration, that class
 has a `dump()` method you can call.
+
+### Pass statistics
+
+There are options to output a lot of different statistics, including about
+SIL passes. More information is available in
+[Compiler Performance](CompilerPerformance.md) for the unified statistics, and
+[Optimizer Counter Analysis](OptimizerCountersAnalysis.md) for pass counters.
 
 ## Debugging and Profiling on SIL level
 
@@ -821,8 +830,21 @@ For more information and a high level example, see:
 
 When bisecting it might be necessary to run the `update-checkout` script
 each time you change shas. To do this you can pass `--match-timestamp`
-to automatically checkout match the timestamp of the `apple/swift` repo
+to automatically checkout match the timestamp of the `swiftlang/swift` repo
 across the other repos.
+
+## Disabling PCH Verification
+
+Sometimes one needs to try to compile against PCH modules where the PCH version
+verification checking is too strict. To work around this, one can disable the
+checking by passing in to swift:
+
+```sh
+-Xcc -Xclang -Xcc -fno-validate-pch
+```
+
+NOTE: If there are actual differences in between the on disk PCH format and the
+format expected by the compiler crashes and undefined behavior may result.
 
 # Debugging the Compiler Build
 
@@ -837,7 +859,7 @@ such configuration.
 # Debugging the Compiler Driver
 
 The Swift compiler uses a standalone compiler-driver application written in
-Swift: [swift-driver](https://github.com/apple/swift-driver). When building the
+Swift: [swift-driver](https://github.com/swiftlang/swift-driver). When building the
 compiler using `build-script`, by default, the standalone driver will be built
 first, using the host toolchain, if the host toolchain contains a Swift
 compiler. If the host toolchain does not contain Swift, a warning is emitted and
@@ -848,7 +870,7 @@ is updated with a symlink to the standalone driver, ensuring calls to the build
 directory's `swift` and `swiftc` always forward to the standalone driver.
 
 For more information about the driver, see:
-[github.com/apple/swift-driver/blob/main/README.md](https://github.com/apple/swift-driver/blob/main/README.md)
+[github.com/swiftlang/swift-driver/blob/main/README.md](https://github.com/swiftlang/swift-driver/blob/main/README.md)
 
 ## Swift Compiler Driver F.A.Q.
 > What's the difference between invoking 'swiftc' vs. 'swift-driver' at the top
@@ -861,7 +883,7 @@ by examining the invoked program's name. The compiler frontend can be invoked
 directly by invoking the `swift-frontend` executable, or passing in the
 `-frontend` option to `swiftc`.
 
-The standalone [Compiler Driver](https://github.com/apple/swift-driver) is
+The standalone [Compiler Driver](https://github.com/swiftlang/swift-driver) is
 installed as a separate `swift-driver` executable in the Swift toolchain's `bin`
 directory. When a user launches the compiler by invoking `swiftc`, the C++ based
 compiler executable forwards the invocation to the `swift-driver` executable if
@@ -883,7 +905,7 @@ become symbolic links to the `swift-driver` executable directly.
 > Will 'swiftc ... -###' always print the same set of commands for the old/new
   driver? Do they call 'swift-frontend' the same way?
 
-The standalone [Compiler Driver](https://github.com/apple/swift-driver) is meant
+The standalone [Compiler Driver](https://github.com/swiftlang/swift-driver) is meant
 to be a direct drop-in replacement for the C++-based legacy driver. It has the
 exact same command-line interface. The expectation is that its behaviour closely
 matches the legacy driver; however, during, and after the transition to the new
@@ -1058,6 +1080,36 @@ The following specifiers are available:
 * w - word (32-bit value)
 * g - giant word (64-bit value)
 
+## Windows Error Codes
+
+When debugging programs on Windows, sometimes one will run into an error message with a mysterious error code. E.x.:
+
+```
+note: command had no output on stdout or stderr
+error: command failed with exit status: 0xc0000135
+```
+
+These on windows are called HRESULT values. In the case above, the HRESULT is telling me that a DLL was not found. I discovered this
+by running the Microsoft provided [System Error Code Lookup Tool](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-code-lookup-tool). After running
+this tool with the relevant error code on a windows machine, I got back the following result:
+
+```
+# for hex 0xc0000135 / decimal -1073741515
+  STATUS_DLL_NOT_FOUND                                           ntstatus.h   
+# The code execution cannot proceed because %hs was not
+# found. Reinstalling the program may fix this problem.
+# as an HRESULT: Severity: FAILURE (1), FACILITY_NULL (0x0), Code 0x135
+# for hex 0x135 / decimal 309
+  ERROR_NOTIFICATION_GUID_ALREADY_DEFINED                        winerror.h   
+# The specified file already has a notification GUID
+# associated with it.
+```
+
+Some relevant Microsoft documentation:
+
+* https://learn.microsoft.com/en-us/windows/win32/seccrypto/common-hresult-values
+* https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/0642cb2f-2075-4469-918c-4441e69c548a
+* https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-
 
 # Debugging LLDB failures
 

@@ -11,8 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/ASTPrinter.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Sema/ConstraintSystem.h"
@@ -88,17 +90,10 @@ class ContainsSpecializableArchetype : public TypeWalker {
 
   Action walkToTypePre(Type T) override {
     if (auto *Archetype = T->getAs<ArchetypeType>()) {
-      if (auto *GenericTypeParam =
-              Archetype->mapTypeOutOfContext()->getAs<GenericTypeParamType>()) {
-        if (auto GenericTypeParamDecl = GenericTypeParam->getDecl()) {
-          bool ParamMaybeVisibleInCurrentContext =
-              (DC == GenericTypeParamDecl->getDeclContext() ||
-               DC->isChildContextOf(GenericTypeParamDecl->getDeclContext()));
-          if (!ParamMaybeVisibleInCurrentContext) {
-            Result = true;
-            return Action::Stop;
-          }
-        }
+      if (Archetype->getGenericEnvironment() !=
+          DC->getGenericEnvironmentOfContext()) {
+        Result = true;
+        return Action::Stop;
       }
     }
     return Action::Continue;
@@ -116,29 +111,28 @@ public:
   }
 };
 
-/// Returns `true` if `ED` is an extension of `PD` that binds `Self` to a
-/// concrete type, like `extension MyProto where Self == MyStruct {}`.
+/// Returns `true` if `ED` is an extension that binds `Self` to a
+/// concrete type, like `extension MyProto where Self == MyStruct {}`. The
+/// protocol being extended must either be `PD`, or `Self` must be a type
+/// that conforms to `PD`.
 ///
 /// In these cases, it is possible to access static members defined in the
 /// extension when perfoming unresolved member lookup in a type context of
 /// `PD`.
 static bool isExtensionWithSelfBound(const ExtensionDecl *ED,
                                      ProtocolDecl *PD) {
-  if (!ED || !PD) {
+  if (!ED || !PD)
     return false;
-  }
-  if (ED->getExtendedNominal() != PD) {
-    return false;
-  }
+
   GenericSignature genericSig = ED->getGenericSignature();
   Type selfType = genericSig->getConcreteType(ED->getSelfInterfaceType());
-  if (!selfType) {
+  if (!selfType)
     return false;
-  }
-  if (selfType->is<ExistentialType>()) {
+
+  if (selfType->is<ExistentialType>())
     return false;
-  }
-  return true;
+
+  return ED->getExtendedNominal() == PD || checkConformance(selfType, PD);
 }
 
 static bool isExtensionAppliedInternal(const DeclContext *DC, Type BaseTy,
@@ -167,23 +161,21 @@ static bool isExtensionAppliedInternal(const DeclContext *DC, Type BaseTy,
   if (isExtensionWithSelfBound(ED, BaseTypeProtocolDecl)) {
     return true;
   }
-  auto *module = DC->getParentModule();
   GenericSignature genericSig = ED->getGenericSignature();
   SubstitutionMap substMap = BaseTy->getContextSubstitutionMap(
-      module, ED->getExtendedNominal());
-  return checkRequirements(module,
-                           genericSig.getRequirements(),
+      ED->getExtendedNominal());
+  return checkRequirements(genericSig.getRequirements(),
                            QuerySubstitutionMap{substMap}) ==
          CheckRequirementsResult::Success;
 }
 
 static bool isMemberDeclAppliedInternal(const DeclContext *DC, Type BaseTy,
                                         const ValueDecl *VD) {
-  if (BaseTy->isExistentialType() && VD->isStatic() &&
-      !isExtensionWithSelfBound(
+  if (BaseTy->isExistentialType() && VD->isStatic()) {
+    return isExtensionWithSelfBound(
           dyn_cast<ExtensionDecl>(VD->getDeclContext()),
-          dyn_cast_or_null<ProtocolDecl>(BaseTy->getAnyNominal())))
-    return false;
+          dyn_cast_or_null<ProtocolDecl>(BaseTy->getAnyNominal()));
+  }
 
   // We can't leak type variables into another constraint system.
   // We can't do anything if the base type has unbound generic parameters.
@@ -210,19 +202,17 @@ static bool isMemberDeclAppliedInternal(const DeclContext *DC, Type BaseTy,
 
   // The context substitution map for the base type fixes the declaration's
   // outer generic parameters.
-  auto *module = DC->getParentModule();
   auto substMap = BaseTy->getContextSubstitutionMap(
-      module, VD->getDeclContext(), genericDecl->getGenericEnvironment());
+      VD->getDeclContext(), genericDecl->getGenericEnvironment());
 
   // The innermost generic parameters are mapped to error types.
-  unsigned innerDepth = genericSig.getGenericParams().back()->getDepth();
+  unsigned innerDepth = genericSig->getMaxDepth();
   if (!genericDecl->isGeneric())
     ++innerDepth;
 
   // We treat substitution failure as success, to ignore requirements
   // that involve innermost generic parameters.
-  return checkRequirements(module,
-                           genericSig.getRequirements(),
+  return checkRequirements(genericSig.getRequirements(),
                            [&](SubstitutableType *type) -> Type {
                              auto *paramTy = cast<GenericTypeParamType>(type);
                              if (paramTy->getDepth() == innerDepth)
@@ -246,10 +236,14 @@ IsDeclApplicableRequest::evaluate(Evaluator &evaluator,
 bool
 TypeRelationCheckRequest::evaluate(Evaluator &evaluator,
                                    TypeRelationCheckInput Owner) const {
-  std::optional<constraints::ConstraintKind> CKind;
+  using namespace constraints;
+  std::optional<ConstraintKind> CKind;
   switch (Owner.Relation) {
   case TypeRelation::ConvertTo:
-    CKind = constraints::ConstraintKind::Conversion;
+    CKind = ConstraintKind::Conversion;
+    break;
+  case TypeRelation::SubtypeOf:
+    CKind = ConstraintKind::Subtype;
     break;
   }
   assert(CKind.has_value());

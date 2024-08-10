@@ -33,6 +33,7 @@
 #include "swift/AST/AccessNotes.h"
 #include "swift/AST/AccessScope.h"
 #include "swift/AST/Attr.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/DiagnosticsSema.h"
@@ -41,6 +42,7 @@
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Initializer.h"
+#include "swift/AST/KnownProtocols.h"
 #include "swift/AST/MacroDefinition.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/NameLookupRequests.h"
@@ -51,6 +53,7 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeDifferenceVisitor.h"
 #include "swift/AST/TypeWalker.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Bridging/ASTGen.h"
@@ -85,6 +88,94 @@ static Type containsParameterizedProtocolType(Type inheritedTy) {
   }
 
   return Type();
+}
+
+class CheckRepressions {
+  llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> declUnion;
+  ASTContext &ctx;
+
+  llvm::DenseSet<RepressibleProtocolKind> seen;
+
+public:
+  CheckRepressions(
+      llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> declUnion,
+      ASTContext &ctx)
+      : declUnion(declUnion), ctx(ctx) {}
+
+  template <typename... ArgTypes>
+  InFlightDiagnostic diagnoseInvalid(TypeRepr &repr, ArgTypes &&...Args) {
+    auto &diags = ctx.Diags;
+    repr.setInvalid();
+    return diags.diagnose(std::forward<ArgTypes>(Args)...);
+  }
+
+  /// Record the repressed kind indicated by the provided
+  /// InheritedTypeResult.Suppressed (i.e. \p ty and \p repr) if it is in fact
+  /// repressed or return the inverted type.
+  Type add(Type ty, InverseTypeRepr &repr,
+           llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> decl) {
+    if (!ty || ty->hasError())
+      return Type();
+    assert(!ty->is<ExistentialMetatypeType>());
+    auto kp = ty->getKnownProtocol();
+    if (!kp) {
+      diagnoseInvalid(repr, repr.getLoc(), diag::inverse_type_not_invertible,
+                      ty);
+      return Type();
+    }
+    auto ipk = getInvertibleProtocolKind(*kp);
+    if (ipk) {
+      // Gate the '~Escapable' type behind a specific flag for now.
+      // Uses of 'Escapable' itself are already diagnosed; return ErrorType.
+      if (*ipk == InvertibleProtocolKind::Escapable &&
+          !ctx.LangOpts.hasFeature(Feature::NonescapableTypes)) {
+        return ErrorType::get(ctx);
+      }
+
+      return ProtocolCompositionType::getInverseOf(ctx, *ipk);
+    }
+    auto rpk = getRepressibleProtocolKind(*kp);
+    if (!rpk) {
+      diagnoseInvalid(repr, repr.getLoc(),
+                      diag::suppress_nonsuppressable_protocol,
+                      ctx.getProtocol(*kp));
+      return Type();
+    }
+    if (auto *extension = dyn_cast<const ExtensionDecl *>(decl)) {
+      diagnoseInvalid(repr, extension,
+                      diag::suppress_inferrable_protocol_extension,
+                      ctx.getProtocol(*kp));
+      return Type();
+    }
+    if (!seen.insert(*rpk).second) {
+      diagnoseInvalid(repr, repr.getLoc(),
+                      diag::suppress_already_suppressed_protocol,
+                      ctx.getProtocol(getKnownProtocolKind(*rpk)));
+    }
+    return Type();
+  }
+};
+
+/// If the extension adds a conformance to an invertible protocol, ensure that
+/// it does not add a conformance to any other protocol. So these are illegal:
+///
+///     extension S: Copyable & P {}
+///     extension S: Q, Copyable {}
+///
+/// This policy is in place because extensions adding a conformance to an
+/// invertible protocol do _not_ add default requirements on generic parameters,
+/// so it would be confusing to mix them together in the same extension.
+static void checkExtensionAddsSoloInvertibleProtocol(const ExtensionDecl *ext) {
+  auto localConfs = ext->getLocalConformances();
+  if (localConfs.size() <= 1)
+    return;
+
+  for (auto *conf : localConfs) {
+    if (auto ip = conf->getProtocol()->getInvertibleProtocolKind()) {
+      ext->diagnose(diag::extension_conforms_to_invertible_and_others,
+                    getInvertibleProtocolKindName(*ip));
+    }
+  }
 }
 
 /// Check the inheritance clause of a type declaration or extension thereof.
@@ -126,6 +217,8 @@ static void checkInheritanceClause(
   ASTContext &ctx = decl->getASTContext();
   auto &diags = ctx.Diags;
 
+  CheckRepressions checkRepressions(declUnion, ctx);
+
   // Check all of the types listed in the inheritance clause.
   Type superclassTy;
   SourceRange superclassRange;
@@ -135,7 +228,26 @@ static void checkInheritanceClause(
 
     // Validate the type.
     InheritedTypeRequest request{declUnion, i, TypeResolutionStage::Interface};
-    Type inheritedTy = evaluateOrDefault(ctx.evaluator, request, Type());
+    auto result = evaluateOrDefault(ctx.evaluator, request,
+                                    InheritedTypeResult::forDefault());
+
+    Type inheritedTy;
+    switch (result) {
+    case InheritedTypeResult::Inherited:
+      inheritedTy = result.getInheritedType();
+      break;
+    case InheritedTypeResult::Suppressed: {
+      auto pair = result.getSuppressed();
+
+      auto inverted = checkRepressions.add(pair.first, *pair.second, declUnion);
+      if (!inverted)
+        continue;
+      inheritedTy = inverted;
+      break;
+    }
+    case InheritedTypeResult::Default:
+      continue;
+    }
 
     // If we couldn't resolve an the inherited type, or it contains an error,
     // ignore it.
@@ -207,10 +319,15 @@ static void checkInheritanceClause(
       auto layout = inheritedTy->getExistentialLayout();
 
       // An inverse on an extension is an error.
-      if (isa<ExtensionDecl>(decl))
-        if (auto pct = inheritedTy->getAs<ProtocolCompositionType>())
-          if (!pct->getInverses().empty())
-            decl->diagnose(diag::inverse_extension, inheritedTy);
+      if (isa<ExtensionDecl>(decl)) {
+        auto canInheritedTy = inheritedTy->getCanonicalType();
+        if (auto pct = canInheritedTy->getAs<ProtocolCompositionType>()) {
+          for (auto inverse : pct->getInverses()) {
+            decl->diagnose(diag::inverse_extension,
+                           getProtocolName(getKnownProtocolKind(inverse)));
+          }
+        }
+      }
 
       // Subclass existentials are not allowed except on classes and
       // non-@objc protocols.
@@ -229,7 +346,7 @@ static void checkInheritanceClause(
         continue;
 
       // AnyObject is not allowed except on protocols.
-      if (layout.hasExplicitAnyObject) {
+      if (layout.hasExplicitAnyObject && !isa<ClassDecl>(decl)) {
         decl->diagnose(diag::inheritance_from_anyobject);
         continue;
       }
@@ -372,8 +489,7 @@ static void checkForEmptyOptionSet(const VarDecl *VD) {
   // Make sure this type conforms to OptionSet
   bool conformsToOptionSet =
     (bool)TypeChecker::conformsToKnownProtocol(DC->getSelfTypeInContext(),
-                                               KnownProtocolKind::OptionSet,
-                                               DC->getParentModule());
+                                               KnownProtocolKind::OptionSet);
   
   if (!conformsToOptionSet)
     return;
@@ -1056,7 +1172,8 @@ void TypeChecker::notePlaceholderReplacementTypes(Type writtenType,
       }
 
       if (auto *origRepr =
-              placeholder->getOriginator().dyn_cast<PlaceholderTypeRepr *>()) {
+              placeholder->getOriginator().dyn_cast<TypeRepr *>()) {
+        assert(isa<PlaceholderTypeRepr>(origRepr));
         t1->getASTContext()
             .Diags
             .diagnose(origRepr->getLoc(),
@@ -1080,6 +1197,9 @@ static void checkDefaultArguments(ParameterList *params) {
   for (auto *param : *params) {
     auto ifacety = param->getInterfaceType();
     auto *expr = param->getTypeCheckedDefaultExpr();
+
+    // Force captures since this can emit diagnostics.
+    (void) param->getDefaultArgumentCaptureInfo();
 
     // If the default argument has isolation, it must match the
     // isolation of the decl context.
@@ -1302,11 +1422,9 @@ buildDefaultInitializerString(DeclContext *dc, Pattern *pattern) {
     // Special-case the various types we might see here.
     auto type = pattern->getType();
 
-    auto *module = dc->getParentModule();
-
     // For literal-convertible types, form the corresponding literal.
 #define CHECK_LITERAL_PROTOCOL(Kind, String)                                       \
-  if (TypeChecker::conformsToKnownProtocol(type, KnownProtocolKind::Kind, module)) \
+  if (TypeChecker::conformsToKnownProtocol(type, KnownProtocolKind::Kind)) \
     return std::string(String);
 
     CHECK_LITERAL_PROTOCOL(ExpressibleByArrayLiteral, "[]")
@@ -1427,8 +1545,7 @@ static void diagnoseClassWithoutInitializers(ClassDecl *classDecl) {
   if (auto *superclassDecl = classDecl->getSuperclassDecl()) {
     auto *decodableProto = C.getProtocol(KnownProtocolKind::Decodable);
     auto superclassType = superclassDecl->getDeclaredInterfaceType();
-    auto ref = classDecl->getParentModule()->lookupConformance(
-        superclassType, decodableProto);
+    auto ref = lookupConformance(superclassType, decodableProto);
     if (ref) {
       // super conforms to Decodable, so we've failed to inherit init(from:).
       // Let's suggest overriding it here.
@@ -1456,8 +1573,7 @@ static void diagnoseClassWithoutInitializers(ClassDecl *classDecl) {
       // likely that the user forgot to override its encode(to:). In this case,
       // we can produce a slightly different diagnostic to suggest doing so.
       auto *encodableProto = C.getProtocol(KnownProtocolKind::Encodable);
-      auto ref = classDecl->getParentModule()->lookupConformance(
-          superclassType, encodableProto);
+      auto ref = lookupConformance(superclassType, encodableProto);
       if (ref) {
         // We only want to produce this version of the diagnostic if the
         // subclass doesn't directly implement encode(to:).
@@ -1682,8 +1798,7 @@ static void diagnoseRetroactiveConformances(
     proto->walkInheritedProtocols([&](ProtocolDecl *decl) {
 
       // Get the original conformance of the extended type to this protocol.
-      auto conformanceRef = ext->getParentModule()->lookupConformance(
-          extendedType, decl);
+      auto conformanceRef = lookupConformance(extendedType, decl);
       if (!conformanceRef.isConcrete()) {
         return TypeWalker::Action::Continue;
       }
@@ -2421,7 +2536,7 @@ public:
     (void) VD->getPropertyWrapperAuxiliaryVariables();
     (void) VD->getPropertyWrapperInitializerInfo();
     (void) VD->getImplInfo();
-    (void) getActorIsolation(VD);
+    checkGlobalIsolation(VD);
 
     // Visit auxiliary decls first
     VD->visitAuxiliaryDecls([&](VarDecl *var) {
@@ -2470,13 +2585,14 @@ public:
 
     TypeChecker::checkDeclAttributes(VD);
 
+    auto DC = VD->getDeclContext();
+
     if (!checkOverrides(VD)) {
       // If a property has an override attribute but does not override
       // anything, complain.
       auto overridden = VD->getOverriddenDecl();
       if (auto *OA = VD->getAttrs().getAttribute<OverrideAttr>()) {
         if (!overridden) {
-          auto DC = VD->getDeclContext();
           auto isClassContext = DC->getSelfClassDecl() != nullptr;
           auto isStructOrEnumContext = DC->getSelfEnumDecl() != nullptr ||
                                        DC->getSelfStructDecl() != nullptr;
@@ -2531,15 +2647,26 @@ public:
 
     // @_staticExclusiveOnly types cannot be put into 'var's, only 'let'.
     if (auto SD = VD->getInterfaceType()->getStructOrBoundGenericStruct()) {
-      if (SD->getAttrs().hasAttribute<StaticExclusiveOnlyAttr>() &&
-          !VD->isLet()) {
+      if (SD->getAttrs().hasAttribute<StaticExclusiveOnlyAttr>()) {
+        auto isProtocolContext = isa<ProtocolDecl>(DC);
+
+        if (isProtocolContext && !VD->supportsMutation()) {
+          return;
+        }
+
+        if (VD->isLet()) {
+          return;
+        }
+
+        auto diagMsg = isProtocolContext
+                           ? diag::attr_static_exclusive_no_setters
+                           : diag::attr_static_exclusive_only_let_only;
+
         Ctx.Diags.diagnoseWithNotes(
-          VD->diagnose(diag::attr_static_exclusive_only_let_only,
-                       VD->getInterfaceType()),
-          [&]() {
-            SD->diagnose(diag::attr_static_exclusive_only_type_nonmutating,
-                       SD->getDeclaredInterfaceType());
-          });
+            VD->diagnose(diagMsg, VD->getInterfaceType()), [&]() {
+              SD->diagnose(diag::attr_static_exclusive_only_type_nonmutating,
+                           SD->getDeclaredInterfaceType());
+            });
       }
     }
   }
@@ -2722,7 +2849,16 @@ public:
 
         // Trigger a request that will complete typechecking for the
         // initializer.
-        (void)PBD->getCheckedAndContextualizedInit(i);
+        (void) PBD->getCheckedAndContextualizedInit(i);
+
+        if (auto *var = PBD->getSingleVar()) {
+          if (var->hasAttachedPropertyWrapper())
+            return;
+        }
+
+        if (!PBD->getDeclContext()->isLocalContext()) {
+          (void) PBD->getInitializerIsolation(i);
+        }
       }
     }
 
@@ -3221,7 +3357,8 @@ public:
 
       ctx.Diags.diagnose(decl->getLoc(),
                          diag::inverse_on_class,
-                         getProtocolName(getKnownProtocolKind(ip)));
+                         getProtocolName(getKnownProtocolKind(ip)),
+                         decl->isAnyActor());
     }
   }
 
@@ -3523,8 +3660,8 @@ public:
     
     if (FD->getDeclContext()->isLocalContext()) {
       // Check local function bodies right away.
-      (void)FD->getTypecheckedBody();
-      TypeChecker::computeCaptures(FD);
+      (void) FD->getTypecheckedBody();
+      (void) FD->getCaptureInfo();
     } else if (!FD->isBodySkipped()) {
       addDelayedFunction(FD);
     }
@@ -3874,6 +4011,8 @@ public:
     diagnoseExtensionOfMarkerProtocol(ED);
 
     checkTupleExtension(ED);
+
+    checkExtensionAddsSoloInvertibleProtocol(ED);
   }
 
   void visitTopLevelCodeDecl(TopLevelCodeDecl *TLCD) {

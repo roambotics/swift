@@ -372,21 +372,20 @@ struct PrintOptions {
   /// Whether to suppress printing of custom attributes that are expanded macros.
   bool SuppressExpandedMacros = true;
 
-  /// Whether we're supposed to slap a @rethrows on `AsyncSequence` /
-  /// `AsyncIteratorProtocol` for backward-compatibility reasons.
-  bool AsyncSequenceRethrows = false;
-
   /// Suppress the @isolated(any) attribute.
   bool SuppressIsolatedAny = false;
 
   /// Suppress 'isolated' and '#isolation' on isolated parameters with optional type.
   bool SuppressOptionalIsolatedParams = false;
 
-  /// Suppress Noncopyable generics.
-  bool SuppressNoncopyableGenerics = false;
+  /// Suppress 'sending' on arguments and results.
+  bool SuppressSendingArgsAndResults = false;
 
-  /// Suppress printing of `borrowing` and `consuming`.
-  bool SuppressNoncopyableOwnershipModifiers = false;
+  /// Suppress printing of '~Proto' for suppressible, non-invertible protocols.
+  bool SuppressConformanceSuppression = false;
+
+  /// Replace BitwiseCopyable with _BitwiseCopyable.
+  bool SuppressBitwiseCopyable = false;
 
   /// List of attribute kinds that should not be printed.
   std::vector<AnyAttrKind> ExcludeAttrList = {
@@ -608,17 +607,6 @@ struct PrintOptions {
   /// part of the context).
   QualifyNestedDeclarations ShouldQualifyNestedDeclarations =
       QualifyNestedDeclarations::Never;
-
-  /// If true, we print a protocol's primary associated types using the
-  /// primary associated type syntax: `protocol Foo<Type1, ...>`.
-  ///
-  /// If false, we print them as ordinary associated types.
-  bool PrintPrimaryAssociatedTypes = true;
-
-  /// Whether or not to print `@attached(extension)` attributes on
-  /// macro declarations. This is used for feature suppression in
-  /// Swift interface printing.
-  bool PrintExtensionMacroAttributes = true;
 
   /// If this is not \c nullptr then function bodies (including accessors
   /// and constructors) will be printed by this function.

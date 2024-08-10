@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2023 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2024 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -11,14 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 import SwiftShims
-
-@inlinable @_transparent
-internal func unimplemented_utf8_32bit(
-  _ message: String = "",
-  file: StaticString = #file, line: UInt = #line
-) -> Never {
-  fatalError("32-bit: Unimplemented for UTF-8 support", file: file, line: line)
-}
 
 /// A Unicode string value that is a collection of characters.
 ///
@@ -428,13 +420,14 @@ extension String {
   // check in String(decoding:as:).
   @_alwaysEmitIntoClient
   @inline(never) // slow-path
-  private static func _fromNonContiguousUnsafeBitcastUTF8Repairing<
+  internal static func _fromNonContiguousUnsafeBitcastUTF8Repairing<
     C: Collection
   >(_ input: C) -> (result: String, repairsMade: Bool) {
     _internalInvariant(C.Element.self == UInt8.self)
     return Array(input).withUnsafeBufferPointer {
-      let raw = UnsafeRawBufferPointer($0)
-      return String._fromUTF8Repairing(raw.bindMemory(to: UInt8.self))
+      UnsafeRawBufferPointer($0).withMemoryRebound(to: UInt8.self) {
+        String._fromUTF8Repairing($0)
+      }
     }
   }
 
@@ -476,6 +469,7 @@ extension String {
       return
     }
 
+    #if !$Embedded
     // Fast path for untyped raw storage and known stdlib types
     if let contigBytes = codeUnits as? _HasContiguousBytes,
       contigBytes._providesContiguousBytesNoCopy
@@ -489,6 +483,7 @@ extension String {
       }
       return
     }
+    #endif
 
     self = String._fromNonContiguousUnsafeBitcastUTF8Repairing(codeUnits).0
   }
@@ -1159,7 +1154,7 @@ extension _StringGutsSlice {
       }
     }
 
-    for scalar in substring._internalNFC {
+    for scalar in substring.unicodeScalars._internalNFC {
       try scalar.withUTF8CodeUnits {
         for byte in $0 {
           try f(byte)

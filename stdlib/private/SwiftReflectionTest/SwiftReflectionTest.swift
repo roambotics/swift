@@ -28,7 +28,7 @@ let RequestDone = "d"
 let RequestPointerSize = "p"
 
 
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
 import MachO
 import Darwin
 
@@ -131,6 +131,8 @@ import SwiftShims
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(Android)
+import Android
 #endif
 
 let rtldDefault: UnsafeMutableRawPointer? = nil

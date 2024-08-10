@@ -12,6 +12,7 @@
 
 #include "swift/Frontend/CASOutputBackends.h"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/FileTypes.h"
 #include "swift/Frontend/CachingUtils.h"
 #include "swift/Frontend/CompileJobCacheKey.h"
@@ -141,6 +142,21 @@ Error SwiftCASOutputBackend::storeCachedDiagnostics(unsigned InputIndex,
                    file_types::ID::TY_CachedDiagnostics);
 }
 
+Error SwiftCASOutputBackend::storeMCCASObjectID(StringRef OutputFilename,
+                                                llvm::cas::CASID ID) {
+  auto Input = Impl.OutputToInputMap.find(OutputFilename);
+  if (Input == Impl.OutputToInputMap.end())
+    return llvm::createStringError("InputIndex for output file not found!");
+  auto InputIndex = Input->second.first;
+  auto MCRef = Impl.CAS.getReference(ID);
+  if (!MCRef)
+    return createStringError("Invalid CASID: " + ID.toString() +
+                             ". No associated ObjectRef found!");
+
+  Impl.OutputRefs[InputIndex].insert({file_types::TY_Object, *MCRef});
+  return Impl.finalizeCacheKeysFor(InputIndex);
+}
+
 void SwiftCASOutputBackend::Implementation::initBackend(
     const FrontendInputsAndOutputs &InputsAndOutputs) {
   // FIXME: The output to input map might not be enough for example all the
@@ -149,7 +165,10 @@ void SwiftCASOutputBackend::Implementation::initBackend(
   // any commands write output to `-`.
   file_types::ID mainOutputType = InputsAndOutputs.getPrincipalOutputType();
   auto addInput = [&](const InputFile &Input, unsigned Index) {
-    if (!Input.outputFilename().empty())
+    // Ignore the outputFilename for typecheck action since it is not producing
+    // an output file for that.
+    if (!Input.outputFilename().empty() &&
+        Action != FrontendOptions::ActionType::Typecheck)
       OutputToInputMap.insert(
           {Input.outputFilename(), {Index, mainOutputType}});
     Input.getPrimarySpecificPaths()

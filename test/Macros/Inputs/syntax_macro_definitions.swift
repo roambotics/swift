@@ -105,6 +105,20 @@ public struct StringifyAndTryMacro: ExpressionMacro {
   }
 }
 
+public struct TryCallThrowingFuncMacro: ExpressionMacro {
+  public static func expansion(
+    of macro: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    return """
+      try await {
+        print("let's throw")
+        return try await throwingFunc()
+      }()
+      """
+  }
+}
+
 struct SimpleDiagnosticMessage: DiagnosticMessage {
   let message: String
   let diagnosticID: MessageID
@@ -209,6 +223,25 @@ public class NestedDeclInExprMacro: ExpressionMacro {
       return ()
     }
     """
+  }
+}
+
+public class NullaryFunctionCallMacro: ExpressionMacro {
+  public static func expansion(
+    of macro: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    let calls = macro.arguments.compactMap(\.expression).map { "\($0)()" }
+    return "(\(raw: calls.joined(separator: ", ")))"
+  }
+}
+
+public class TupleMacro: ExpressionMacro {
+  public static func expansion(
+    of macro: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    return "(\(raw: macro.arguments.map { "\($0)" }.joined()))"
   }
 }
 
@@ -2199,6 +2232,15 @@ public struct SingleMemberStubMacro: DeclarationMacro {
   }
 }
 
+public struct DeclMacroWithControlFlow: DeclarationMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return ["let _ = .random() ? try throwingFn() : 0"]
+  }
+}
+
 public struct GenerateStubsForProtocolRequirementsMacro: PeerMacro, ExtensionMacro {
   public static func expansion(
     of node: AttributeSyntax,
@@ -2327,6 +2369,20 @@ public struct RemoteBodyMacro: BodyMacro {
       """
       return try await remoteCall(function: \(literal: funcBaseName), arguments: \(passedArgs))
       """
+    ]
+  }
+}
+
+@_spi(ExperimentalLanguageFeature)
+public struct BodyMacroWithControlFlow: BodyMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingBodyFor declaration: some DeclSyntaxProtocol & WithOptionalCodeBlockSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [CodeBlockItemSyntax] {
+    [
+      "guard .random() else { return }",
+      "_ = try throwingFn()"
     ]
   }
 }
@@ -2482,3 +2538,12 @@ public struct AllLexicalContextsMacro: DeclarationMacro {
   }
 }
 
+public struct AddGetterMacro: AccessorMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingAccessorsOf declaration: some DeclSyntaxProtocol,
+    in context: some MacroExpansionContext
+  ) throws -> [AccessorDeclSyntax] {
+    return ["get { 0 }"]
+  }
+}

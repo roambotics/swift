@@ -416,9 +416,48 @@ swift::swift_dynamicCastFailure(const void *sourceType, const char *sourceName,
                     message ? message : "");
 }
 
-SWIFT_NORETURN void swift::swift_dynamicCastFailure(const Metadata *sourceType,
-                                                    const Metadata *targetType,
-                                                    const char *message) {
+SWIFT_NORETURN SWIFT_NOINLINE void
+swift_dynamicCastFailure_SOURCE_AND_TARGET_TYPE_NULL(const char *message) {
+  swift::fatalError(0, "Unconditional cast failed. "
+		    "Both source and target types were NULL. "
+		    "%s\n",
+		    message ? message : "");
+}
+
+SWIFT_NORETURN SWIFT_NOINLINE void
+swift_dynamicCastFailure_SOURCE_TYPE_NULL(const Metadata *targetType, const char *message) {
+  std::string targetName = nameForMetadata(targetType);
+  swift::fatalError(0, "Unconditional cast failed. "
+		    "Source type was NULL, target was '%s' (%p). "
+		    "%s\n",
+		    targetName.c_str(), targetType,
+		    message ? message : "");
+}
+
+SWIFT_NORETURN SWIFT_NOINLINE void
+swift_dynamicCastFailure_TARGET_TYPE_NULL(const Metadata *sourceType, const char *message) {
+  std::string sourceName = nameForMetadata(sourceType);
+  swift::fatalError(0, "Unconditional cast failed. "
+		    "Source type was '%s' (%p), target type was NULL. "
+		    "%s\n",
+		    sourceName.c_str(), sourceType,
+		    message ? message : "");
+}
+
+SWIFT_NORETURN SWIFT_NOINLINE void
+swift::swift_dynamicCastFailure(const Metadata *sourceType,
+				const Metadata *targetType,
+				const char *message) {
+  if (sourceType == nullptr) {
+    if (targetType == nullptr) {
+      swift_dynamicCastFailure_SOURCE_AND_TARGET_TYPE_NULL(message);
+    } else {
+      swift_dynamicCastFailure_SOURCE_TYPE_NULL(targetType, message);
+    }
+  } else if (targetType == nullptr) {
+      swift_dynamicCastFailure_TARGET_TYPE_NULL(sourceType, message);
+  }
+
   std::string sourceName = nameForMetadata(sourceType);
   std::string targetName = nameForMetadata(targetType);
 
@@ -686,6 +725,40 @@ findDynamicValueAndType(OpaqueValue *value, const Metadata *type,
       return findDynamicValueAndType(innerValue, innerType,
                                      outValue, outType, inoutCanTake, false,
                                      isTargetExistentialMetatype);
+    }
+    }
+  }
+
+  case MetadataKind::ExtendedExistential: {
+    auto *existentialType = cast<ExtendedExistentialTypeMetadata>(type);
+
+    switch (existentialType->Shape->Flags.getSpecialKind()) {
+    case ExtendedExistentialTypeShape::SpecialKind::None: {
+      auto opaqueContainer =
+	reinterpret_cast<OpaqueExistentialContainer *>(value);
+      auto innerValue = const_cast<OpaqueValue *>(opaqueContainer->projectValue());
+      auto innerType = opaqueContainer->Type;
+      return findDynamicValueAndType(innerValue, innerType,
+                                     outValue, outType, inoutCanTake, false,
+                                     isTargetExistentialMetatype);
+    }
+    case ExtendedExistentialTypeShape::SpecialKind::Class: {
+      auto classContainer =
+        reinterpret_cast<ClassExistentialContainer *>(value);
+      outType = swift_getObjectType((HeapObject *)classContainer->Value);
+      outValue = reinterpret_cast<OpaqueValue *>(&classContainer->Value);
+      return;
+    }
+    case ExtendedExistentialTypeShape::SpecialKind::Metatype: {
+      auto srcExistentialContainer =
+        reinterpret_cast<ExistentialMetatypeContainer *>(value);
+      outType = swift_getMetatypeMetadata(srcExistentialContainer->Value);
+      outValue = reinterpret_cast<OpaqueValue *>(&srcExistentialContainer->Value);
+      return;
+    }
+    case ExtendedExistentialTypeShape::SpecialKind::ExplicitLayout: {
+      swift_unreachable("Extended Existential with explicit layout not yet implemented");
+      return;
     }
     }
   }

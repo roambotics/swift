@@ -391,22 +391,20 @@ public:
       Ending,
       // The instruction doesn't use the value.
       NonUse,
-    };
-    Value value;
+    } value;
 
     LifetimeEnding(Value value) : value(value) {}
-    explicit LifetimeEnding(bool lifetimeEnding)
-        : value(lifetimeEnding ? Value::Ending : Value::NonEnding) {}
     operator Value() const { return value; }
-    LifetimeEnding meet(LifetimeEnding const other) const {
-      return value < other.value ? *this : other;
+
+    static LifetimeEnding forUse(bool lifetimeEnding) {
+      return lifetimeEnding ? Value::Ending : Value::NonEnding;
     }
-    void meetInPlace(LifetimeEnding const other) { *this = meet(other); }
     bool isEnding() const { return value == Value::Ending; }
 
-    static LifetimeEnding NonUse() { return {Value::NonUse}; };
-    static LifetimeEnding Ending() { return {Value::Ending}; };
-    static LifetimeEnding NonEnding() { return {Value::NonEnding}; };
+    LifetimeEnding meet(LifetimeEnding const other) const {
+      return std::min(value, other.value);
+    }
+    void meetInPlace(LifetimeEnding const other) { *this = meet(other); }
   };
 
 protected:
@@ -467,8 +465,8 @@ public:
     auto useIter = users.find(user);
     if (useIter == users.end())
       return NonUser;
-    return useIter->second == LifetimeEnding::Ending() ? LifetimeEndingUse
-                                                       : NonLifetimeEndingUse;
+    return useIter->second.isEnding() ? LifetimeEndingUse
+                                      : NonLifetimeEndingUse;
   }
 
   using ConstUserRange =
@@ -592,6 +590,8 @@ struct PrunedLivenessBoundary {
 ///
 ///   bool isDef(SILInstruction *inst) const
 ///
+///   bool isDef(SILArgument *arg) const
+///
 ///   bool isDefBlock(SILBasicBlock *block) const
 ///
 template <typename LivenessWithDefs>
@@ -613,9 +613,22 @@ protected:
                                            ValueSet &visited,
                                            SILValue value);
 
-  void updateForUse(SILInstruction *user, LifetimeEnding lifetimeEnding);
+  bool isInstructionLive(SILInstruction *instruction, bool liveOut) const;
+  bool isAvailableOut(SILBasicBlock *block, DeadEndBlocks &deadEndBlocks) const;
+  bool isInstructionAvailable(SILInstruction *user,
+                              DeadEndBlocks &deadEndBlocks) const;
+  /// Whether \p user is within the liveness boundary (never extended into
+  /// dead-end regions).
+  bool isWithinLivenessBoundary(SILInstruction *inst) const;
+  /// Whether \p user is within the boundary extended from live regions into
+  /// dead-end regions up to the availability boundary.
+  bool isWithinExtendedBoundary(SILInstruction *user,
+                                DeadEndBlocks &deadEndBlocks) const;
 
 public:
+  /// Add \p inst to liveness which uses the def as indicated by \p usage.
+  void updateForUse(SILInstruction *inst, LifetimeEnding usage);
+
   /// For flexibility, \p lifetimeEnding is provided by the
   /// caller. PrunedLiveness makes no assumptions about the def-use
   /// relationships that generate liveness. For example, use->isLifetimeEnding()
@@ -650,7 +663,12 @@ public:
 
   /// Check if \p inst occurs in between the definition this def and the
   /// liveness boundary.
-  bool isWithinBoundary(SILInstruction *inst) const;
+  ///
+  /// Pass \p deadEndBlocks when the defs' lifetime isn't known to be complete.
+  /// When passed, the liveness boundary is understood to extend into dead-end
+  /// regions.
+  bool isWithinBoundary(SILInstruction *inst,
+                        DeadEndBlocks *deadEndBlocks) const;
 
   /// Returns true when all \p uses are between this def and the liveness
   /// boundary \p deadEndBlocks is optional.
@@ -735,6 +753,8 @@ public:
   bool isInitialized() const { return bool(def); }
 
   bool isDef(SILInstruction *inst) const { return inst == defInst; }
+
+  bool isDef(SILArgument *arg) const { return def == arg; }
 
   bool isDefBlock(SILBasicBlock *block) const {
     return def->getParentBlock() == block;

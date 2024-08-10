@@ -17,6 +17,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/NullablePtr.h"
 #include "swift/Demangling/Demangle.h"
@@ -1767,6 +1768,7 @@ ConstExprFunctionState::evaluateFlowSensitive(SILInstruction *inst) {
       isa<ReleaseValueInst>(inst) || isa<StrongRetainInst>(inst) ||
       isa<StrongReleaseInst>(inst) || isa<DestroyValueInst>(inst) ||
       isa<EndBorrowInst>(inst) || isa<DebugStepInst>(inst) ||
+      isa<ExtendLifetimeInst>(inst) ||
       // Skip instrumentation
       isInstrumentation(inst))
     return std::nullopt;

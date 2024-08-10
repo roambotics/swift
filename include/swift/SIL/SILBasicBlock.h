@@ -174,6 +174,9 @@ public:
   /// This method unlinks 'self' from the containing SILFunction and deletes it.
   void eraseFromParent();
 
+  /// Replaces usages of this block with 'undef's and then deletes it.
+  void removeDeadBlock();
+
   /// Remove all instructions of a SILGlobalVariable's static initializer block.
   void clearStaticInitializerBlock(SILModule &module);
 
@@ -560,7 +563,6 @@ public:
 
   void printAsOperand(raw_ostream &OS, bool PrintType = true);
 
-#ifndef NDEBUG
   /// Print the ID of the block, bbN.
   void dumpID(bool newline = true) const;
 
@@ -569,7 +571,6 @@ public:
 
   /// Print the ID of the block with \p Ctx, bbN.
   void printID(SILPrintContext &Ctx, bool newline = true) const;
-#endif
 
   /// getSublistAccess() - returns pointer to member of instruction list
   static InstListType SILBasicBlock::*getSublistAccess() {

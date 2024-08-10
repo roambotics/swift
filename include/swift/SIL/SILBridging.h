@@ -64,6 +64,7 @@ class TypeBase;
 class SwiftPassInvocation;
 class GenericSpecializationInformation;
 class LifetimeDependenceInfo;
+class IndexSubset;
 }
 
 bool swiftModulesInitialized();
@@ -136,6 +137,7 @@ enum class BridgedArgumentConvention {
   Indirect_In_Guaranteed,
   Indirect_Inout,
   Indirect_InoutAliasable,
+  Indirect_In_CXX,
   Indirect_Out,
   Direct_Owned,
   Direct_Unowned,
@@ -145,6 +147,44 @@ enum class BridgedArgumentConvention {
   Pack_Guaranteed,
   Pack_Out
 };
+
+#ifdef USED_IN_CPP_SOURCE
+inline swift::ParameterConvention getParameterConvention(BridgedArgumentConvention convention) {
+  switch (convention) {
+    case BridgedArgumentConvention::Indirect_In:             return swift::ParameterConvention::Indirect_In;
+    case BridgedArgumentConvention::Indirect_In_Guaranteed:  return swift::ParameterConvention::Indirect_In_Guaranteed;
+    case BridgedArgumentConvention::Indirect_Inout:          return swift::ParameterConvention::Indirect_Inout;
+    case BridgedArgumentConvention::Indirect_InoutAliasable: return swift::ParameterConvention::Indirect_InoutAliasable;
+    case BridgedArgumentConvention::Indirect_In_CXX:         return swift::ParameterConvention::Indirect_In_CXX;
+    case BridgedArgumentConvention::Indirect_Out:            break;
+    case BridgedArgumentConvention::Direct_Owned:            return swift::ParameterConvention::Direct_Owned;
+    case BridgedArgumentConvention::Direct_Unowned:          return swift::ParameterConvention::Direct_Unowned;
+    case BridgedArgumentConvention::Direct_Guaranteed:       return swift::ParameterConvention::Direct_Guaranteed;
+    case BridgedArgumentConvention::Pack_Owned:              return swift::ParameterConvention::Pack_Owned;
+    case BridgedArgumentConvention::Pack_Inout:              return swift::ParameterConvention::Pack_Inout;
+    case BridgedArgumentConvention::Pack_Guaranteed:         return swift::ParameterConvention::Pack_Guaranteed;
+    case BridgedArgumentConvention::Pack_Out:                break;
+  }
+  llvm_unreachable("invalid parameter convention");
+}
+
+inline BridgedArgumentConvention getArgumentConvention(swift::ParameterConvention convention) {
+  switch (convention) {
+    case swift::ParameterConvention::Indirect_In:              return BridgedArgumentConvention::Indirect_In;
+    case swift::ParameterConvention::Indirect_In_Guaranteed:   return BridgedArgumentConvention::Indirect_In_Guaranteed;
+    case swift::ParameterConvention::Indirect_Inout:           return BridgedArgumentConvention::Indirect_Inout;
+    case swift::ParameterConvention::Indirect_InoutAliasable:  return BridgedArgumentConvention::Indirect_InoutAliasable;
+    case swift::ParameterConvention::Indirect_In_CXX:          return BridgedArgumentConvention::Indirect_In_CXX;
+    case swift::ParameterConvention::Direct_Owned:             return BridgedArgumentConvention::Direct_Owned;
+    case swift::ParameterConvention::Direct_Unowned:           return BridgedArgumentConvention::Direct_Unowned;
+    case swift::ParameterConvention::Direct_Guaranteed:        return BridgedArgumentConvention::Direct_Guaranteed;
+    case swift::ParameterConvention::Pack_Owned:               return BridgedArgumentConvention::Pack_Owned;
+    case swift::ParameterConvention::Pack_Inout:               return BridgedArgumentConvention::Pack_Inout;
+    case swift::ParameterConvention::Pack_Guaranteed:          return BridgedArgumentConvention::Pack_Guaranteed;
+  }
+  llvm_unreachable("invalid parameter convention");
+}
+#endif
 
 struct BridgedParameterInfo {
   swift::TypeBase * _Nonnull type;
@@ -161,24 +201,6 @@ struct BridgedParameterInfo {
       swift::SILArgumentConvention(convention).Value);
   }
 
-  swift::ParameterConvention getParameterConvention() const {
-    switch (convention) {
-      case BridgedArgumentConvention::Indirect_In:             return swift::ParameterConvention::Indirect_In;
-      case BridgedArgumentConvention::Indirect_In_Guaranteed:  return swift::ParameterConvention::Indirect_In_Guaranteed;
-      case BridgedArgumentConvention::Indirect_Inout:          return swift::ParameterConvention::Indirect_Inout;
-      case BridgedArgumentConvention::Indirect_InoutAliasable: return swift::ParameterConvention::Indirect_InoutAliasable;
-      case BridgedArgumentConvention::Indirect_Out:            break;
-      case BridgedArgumentConvention::Direct_Owned:            return swift::ParameterConvention::Direct_Owned;
-      case BridgedArgumentConvention::Direct_Unowned:          return swift::ParameterConvention::Direct_Unowned;
-      case BridgedArgumentConvention::Direct_Guaranteed:       return swift::ParameterConvention::Direct_Guaranteed;
-      case BridgedArgumentConvention::Pack_Owned:              return swift::ParameterConvention::Pack_Owned;
-      case BridgedArgumentConvention::Pack_Inout:              return swift::ParameterConvention::Pack_Inout;
-      case BridgedArgumentConvention::Pack_Guaranteed:         return swift::ParameterConvention::Pack_Guaranteed;
-      case BridgedArgumentConvention::Pack_Out:                break;
-    }
-    llvm_unreachable("invalid parameter convention");
-  }
-
   BridgedParameterInfo(swift::SILParameterInfo parameterInfo):
     type(parameterInfo.getInterfaceType().getPointer()),
     convention(castToArgumentConvention(parameterInfo.getConvention())),
@@ -186,7 +208,7 @@ struct BridgedParameterInfo {
   {}
 
   swift::SILParameterInfo unbridged() const {
-    return swift::SILParameterInfo(swift::CanType(type), getParameterConvention(),
+    return swift::SILParameterInfo(swift::CanType(type), getParameterConvention(convention),
                                    swift::SILParameterInfo::Options(options));
   }
 #endif
@@ -227,15 +249,45 @@ struct BridgedYieldInfoArray {
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE
   BridgedParameterInfo at(SwiftInt resultIndex) const;
 };
-
 struct BridgedLifetimeDependenceInfo {
-  const swift::LifetimeDependenceInfo * _Nullable info = nullptr;
+  swift::IndexSubset *_Nullable inheritLifetimeParamIndices;
+  swift::IndexSubset *_Nullable scopeLifetimeParamIndices;
+  SwiftUInt targetIndex;
+  bool immortal;
+
+#ifdef USED_IN_CPP_SOURCE
+  BridgedLifetimeDependenceInfo(swift::LifetimeDependenceInfo info)
+      : inheritLifetimeParamIndices(info.getInheritIndices()),
+        scopeLifetimeParamIndices(info.getScopeIndices()),
+        targetIndex(info.getTargetIndex()), immortal(info.isImmortal()) {}
+#endif
 
   BRIDGED_INLINE bool empty() const;
   BRIDGED_INLINE bool checkInherit(SwiftInt index) const;
   BRIDGED_INLINE bool checkScope(SwiftInt index) const;
+  BRIDGED_INLINE SwiftInt getTargetIndex() const;
 
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedOwnedString getDebugDescription() const;
+};
+
+struct BridgedLifetimeDependenceInfoArray {
+  BridgedArrayRef lifetimeDependenceInfoArray;
+
+#ifdef USED_IN_CPP_SOURCE
+  BridgedLifetimeDependenceInfoArray(
+      llvm::ArrayRef<swift::LifetimeDependenceInfo> lifetimeDependenceInfo)
+      : lifetimeDependenceInfoArray(lifetimeDependenceInfo) {}
+
+  llvm::ArrayRef<swift::LifetimeDependenceInfo> unbridged() const {
+    return lifetimeDependenceInfoArray
+        .unbridged<swift::LifetimeDependenceInfo>();
+  }
+#endif
+
+  BRIDGED_INLINE SwiftInt count() const;
+
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedLifetimeDependenceInfo
+  at(SwiftInt index) const;
 };
 
 // Temporary access to the AST type within SIL until ASTBridging provides it.
@@ -279,10 +331,13 @@ struct BridgedASTType {
 
   BRIDGED_INLINE bool SILFunctionType_hasSelfParam() const;
 
+  BRIDGED_INLINE bool SILFunctionType_isTrivialNoescape() const;
+
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE
   BridgedYieldInfoArray SILFunctionType_getYields() const;
 
-  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedLifetimeDependenceInfo SILFunctionType_getLifetimeDependenceInfo() const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedLifetimeDependenceInfoArray
+  SILFunctionType_getLifetimeDependencies() const;
 };
 
 struct BridgedType {
@@ -345,9 +400,12 @@ struct BridgedType {
   BRIDGED_INLINE bool isEnumOrBoundGenericEnum() const;
   BRIDGED_INLINE bool isFunction() const;
   BRIDGED_INLINE bool isMetatype() const;
+  BRIDGED_INLINE bool isClassExistential() const;
   BRIDGED_INLINE bool isNoEscapeFunction() const;
   BRIDGED_INLINE bool containsNoEscapeFunction() const;
+  BRIDGED_INLINE bool isThickFunction() const;
   BRIDGED_INLINE bool isAsyncFunction() const;
+  BRIDGED_INLINE bool isVoid() const;
   BRIDGED_INLINE bool isEmpty(BridgedFunction f) const;
   BRIDGED_INLINE TraitResult canBeClass() const;
   BRIDGED_INLINE bool isMoveOnly() const;
@@ -359,7 +417,7 @@ struct BridgedType {
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedType getBuiltinVectorElementType() const;
   BRIDGED_INLINE bool isBuiltinFixedWidthInteger(SwiftInt width) const;
   BRIDGED_INLINE bool isExactSuperclassOf(BridgedType t) const;
-  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedType getInstanceTypeOfMetatype(BridgedFunction f) const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedType getLoweredInstanceTypeOfMetatype(BridgedFunction f) const;
   BRIDGED_INLINE bool isDynamicSelfMetatype() const;
   BRIDGED_INLINE MetatypeRepresentation getRepresentationOfMetatype(BridgedFunction f) const;
   BRIDGED_INLINE bool isCalleeConsumedFunction() const;
@@ -373,8 +431,10 @@ struct BridgedType {
   BRIDGED_INLINE bool isEndCaseIterator(EnumElementIterator i) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedType getEnumCasePayload(EnumElementIterator i, BridgedFunction f) const;
   BRIDGED_INLINE SwiftInt getNumTupleElements() const;
-  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedType getTupleElementType(SwiftInt idx) const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedType
+  getTupleElementType(SwiftInt idx) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedType getFunctionTypeWithNoEscape(bool withNoEscape) const;
+  BRIDGED_INLINE BridgedArgumentConvention getCalleeConvention() const;
 };
 
 // SIL Bridging
@@ -495,6 +555,29 @@ enum class BridgedMemoryBehavior {
   MayHaveSideEffects
 };
 
+struct BridgedLocation {
+  uint64_t storage[3];
+
+#ifdef USED_IN_CPP_SOURCE
+  BridgedLocation(const swift::SILDebugLocation &loc) {
+    *reinterpret_cast<swift::SILDebugLocation *>(&storage) = loc;
+  }
+  const swift::SILDebugLocation &getLoc() const {
+    return *reinterpret_cast<const swift::SILDebugLocation *>(&storage);
+  }
+#endif
+
+  SWIFT_IMPORT_UNSAFE BridgedOwnedString getDebugDescription() const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedLocation getAutogeneratedLocation() const;
+  BRIDGED_INLINE bool hasValidLineNumber() const;
+  BRIDGED_INLINE bool isAutoGenerated() const;
+  BRIDGED_INLINE bool isInlined() const;
+  BRIDGED_INLINE bool isEqualTo(BridgedLocation rhs) const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedSourceLoc getSourceLocation() const;
+  BRIDGED_INLINE bool hasSameSourceLocation(BridgedLocation rhs) const;
+  static BRIDGED_INLINE BridgedLocation getArtificialUnreachableLocation();
+};
+
 struct BridgedFunction {
   SwiftObject obj;
 
@@ -529,9 +612,32 @@ struct BridgedFunction {
     IsSignatureOptimizedThunk
   };
 
+  enum class SerializedKind {
+    IsNotSerialized,
+    IsSerialized,
+    IsSerializedForPackage
+  };
+
+  enum class Linkage {
+    Public,
+    PublicNonABI,
+    Package,
+    PackageNonABI,
+    Hidden,
+    Shared,
+    Private,
+    PublicExternal,
+    PackageExternal,
+    HiddenExternal
+  };
+
+  SWIFT_NAME("init(obj:)") 
+  SWIFT_IMPORT_UNSAFE BridgedFunction(SwiftObject obj) : obj(obj) {}
+  SWIFT_IMPORT_UNSAFE BridgedFunction() {}
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE swift::SILFunction * _Nonnull getFunction() const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedStringRef getName() const;
   SWIFT_IMPORT_UNSAFE BridgedOwnedString getDebugDescription() const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedLocation getLocation() const;
   BRIDGED_INLINE bool hasOwnership() const;
   BRIDGED_INLINE bool hasLoweredAddresses() const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedASTType getLoweredFunctionTypeInContext() const;
@@ -553,12 +659,15 @@ struct BridgedFunction {
   BRIDGED_INLINE bool isGeneric() const;
   BRIDGED_INLINE bool hasSemanticsAttr(BridgedStringRef attrName) const;
   BRIDGED_INLINE bool hasUnsafeNonEscapableResult() const;
-  BRIDGED_INLINE bool hasResultDependsOnSelf() const;
+  BRIDGED_INLINE bool hasDynamicSelfMetadata() const;
   BRIDGED_INLINE EffectsKind getEffectAttribute() const;
   BRIDGED_INLINE PerformanceConstraints getPerformanceConstraints() const;
   BRIDGED_INLINE InlineStrategy getInlineStrategy() const;
   BRIDGED_INLINE bool isSerialized() const;
-  BRIDGED_INLINE bool hasValidLinkageForFragileRef() const;
+  BRIDGED_INLINE bool isAnySerialized() const;
+  BRIDGED_INLINE SerializedKind getSerializedKind() const;
+  BRIDGED_INLINE bool canBeInlinedIntoCaller(SerializedKind) const;
+  BRIDGED_INLINE bool hasValidLinkageForFragileRef(SerializedKind) const;
   BRIDGED_INLINE ThunkKind isThunk() const;
   BRIDGED_INLINE void setThunk(ThunkKind) const;
   BRIDGED_INLINE bool needsStackProtection() const;
@@ -566,6 +675,11 @@ struct BridgedFunction {
   BRIDGED_INLINE void setIsPerformanceConstraint(bool isPerfConstraint) const;
   BRIDGED_INLINE bool isResilientNominalDecl(BridgedNominalTypeDecl decl) const;
   BRIDGED_INLINE BridgedType getLoweredType(BridgedASTType type) const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedType getLoweredType(BridgedType type) const;
+  BRIDGED_INLINE void setLinkage(Linkage linkage) const;
+  bool isTrapNoReturn() const;
+  bool isAutodiffVJP() const;
+  SwiftInt specializationLevel() const;
 
   enum class ParseEffectsMode {
     argumentEffectsFromSource,
@@ -658,6 +772,7 @@ struct BridgedSubstitutionMap {
 
   BRIDGED_INLINE BridgedSubstitutionMap();
   BRIDGED_INLINE bool isEmpty() const;
+  BRIDGED_INLINE bool hasAnySubstitutableParams() const;
 };
 
 struct BridgedTypeArray {
@@ -696,28 +811,6 @@ struct BridgedSILTypeArray {
 
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE
   BridgedType getAt(SwiftInt index) const;
-};
-
-struct BridgedLocation {
-  uint64_t storage[3];
-
-#ifdef USED_IN_CPP_SOURCE
-  BridgedLocation(const swift::SILDebugLocation &loc) {
-    *reinterpret_cast<swift::SILDebugLocation *>(&storage) = loc;
-  }
-  const swift::SILDebugLocation &getLoc() const {
-    return *reinterpret_cast<const swift::SILDebugLocation *>(&storage);
-  }
-#endif
-
-  SWIFT_IMPORT_UNSAFE BridgedOwnedString getDebugDescription() const;
-  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedLocation getAutogeneratedLocation() const;
-  BRIDGED_INLINE bool hasValidLineNumber() const;
-  BRIDGED_INLINE bool isAutoGenerated() const;
-  BRIDGED_INLINE bool isEqualTo(BridgedLocation rhs) const;
-  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedSourceLoc getSourceLocation() const;
-  BRIDGED_INLINE bool hasSameSourceLocation(BridgedLocation rhs) const;
-  static BRIDGED_INLINE BridgedLocation getArtificialUnreachableLocation();
 };
 
 struct BridgedGenericSpecializationInformation {
@@ -850,12 +943,15 @@ struct BridgedInstruction {
   BRIDGED_INLINE OptionalBridgedValue StructInst_getUniqueNonTrivialFieldValue() const;
   BRIDGED_INLINE SwiftInt StructElementAddrInst_fieldIndex() const;
   BRIDGED_INLINE bool BeginBorrow_isLexical() const;
+  BRIDGED_INLINE bool BeginBorrow_hasPointerEscape() const;
   BRIDGED_INLINE bool BeginBorrow_isFromVarDecl() const;
   BRIDGED_INLINE bool MoveValue_isLexical() const;
+  BRIDGED_INLINE bool MoveValue_hasPointerEscape() const;
   BRIDGED_INLINE bool MoveValue_isFromVarDecl() const;
 
   BRIDGED_INLINE SwiftInt ProjectBoxInst_fieldIndex() const;
   BRIDGED_INLINE bool EndCOWMutationInst_doKeepUnique() const;
+  BRIDGED_INLINE bool DestroyValueInst_isDeadEnd() const;
   BRIDGED_INLINE SwiftInt EnumInst_caseIndex() const;
   BRIDGED_INLINE SwiftInt UncheckedEnumDataInst_caseIndex() const;
   BRIDGED_INLINE SwiftInt InitEnumDataAddrInst_caseIndex() const;
@@ -865,6 +961,7 @@ struct BridgedInstruction {
   BRIDGED_INLINE bool RefElementAddrInst_fieldIsLet() const;
   BRIDGED_INLINE bool RefElementAddrInst_isImmutable() const;
   BRIDGED_INLINE void RefElementAddrInst_setImmutable(bool isImmutable) const;
+  BRIDGED_INLINE bool RefTailAddrInst_isImmutable() const;
   BRIDGED_INLINE SwiftInt PartialApplyInst_numArguments() const;
   BRIDGED_INLINE SwiftInt ApplyInst_numArguments() const;
   BRIDGED_INLINE bool ApplyInst_getNonThrowing() const;
@@ -874,6 +971,7 @@ struct BridgedInstruction {
   BRIDGED_INLINE SwiftInt ObjectInst_getNumBaseElements() const;
   BRIDGED_INLINE SwiftInt PartialApply_getCalleeArgIndexOfFirstAppliedArg() const;
   BRIDGED_INLINE bool PartialApplyInst_isOnStack() const;
+  BRIDGED_INLINE bool PartialApplyInst_hasUnknownResultIsolation() const;
   BRIDGED_INLINE bool AllocStackInst_hasDynamicLifetime() const;
   BRIDGED_INLINE bool AllocRefInstBase_isObjc() const;
   BRIDGED_INLINE bool AllocRefInstBase_canAllocOnStack() const;
@@ -891,6 +989,7 @@ struct BridgedInstruction {
   BRIDGED_INLINE void MarkDependenceInst_resolveToNonEscaping() const;
   BRIDGED_INLINE SwiftInt BeginAccessInst_getAccessKind() const;
   BRIDGED_INLINE bool BeginAccessInst_isStatic() const;
+  BRIDGED_INLINE bool BeginAccessInst_isUnsafe() const;
   BRIDGED_INLINE bool CopyAddrInst_isTakeOfSrc() const;
   BRIDGED_INLINE bool CopyAddrInst_isInitializationOfDest() const;
   BRIDGED_INLINE bool ExplicitCopyAddrInst_isTakeOfSrc() const;
@@ -917,7 +1016,9 @@ struct BridgedInstruction {
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedSubstitutionMap ApplySite_getSubstitutionMap() const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedASTType ApplySite_getSubstitutedCalleeType() const;
   BRIDGED_INLINE SwiftInt ApplySite_getNumArguments() const;
+  BRIDGED_INLINE bool ApplySite_isCalleeNoReturn() const;
   BRIDGED_INLINE SwiftInt FullApplySite_numIndirectResultArguments() const;
+  BRIDGED_INLINE bool ConvertFunctionInst_withoutActuallyEscaping() const;
 
   // =========================================================================//
   //                   VarDeclInst and DebugVariableInst
@@ -966,12 +1067,20 @@ struct BridgedArgument {
   BRIDGED_INLINE swift::SILArgument * _Nonnull getArgument() const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedBasicBlock getParent() const;
   BRIDGED_INLINE bool isReborrow() const;
-  BRIDGED_INLINE bool hasResultDependsOn() const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedNullableVarDecl getVarDecl() const;
+  BRIDGED_INLINE void copyFlags(BridgedArgument fromArgument) const;
 };
 
 struct OptionalBridgedArgument {
   OptionalSwiftObject obj;
+
+#ifdef USED_IN_CPP_SOURCE
+  swift::SILArgument * _Nullable unbridged() const {
+    if (!obj)
+      return nullptr;
+    return static_cast<swift::SILArgument *>(obj);
+  }
+#endif
 };
 
 struct OptionalBridgedBasicBlock {
@@ -1108,7 +1217,7 @@ struct OptionalBridgedDefaultWitnessTable {
 struct BridgedBuilder{
 
   enum class InsertAt {
-    beforeInst, endOfBlock, intoGlobal
+    beforeInst, endOfBlock, startOfFunction, intoGlobal
   } insertAt;
 
   SwiftObject insertionObj;
@@ -1122,6 +1231,9 @@ struct BridgedBuilder{
                                loc.getLoc().getScope());
     case BridgedBuilder::InsertAt::endOfBlock:
       return swift::SILBuilder(BridgedBasicBlock(insertionObj).unbridged(),
+                               loc.getLoc().getScope());
+    case BridgedBuilder::InsertAt::startOfFunction:
+      return swift::SILBuilder(BridgedFunction(insertionObj).getFunction()->getEntryBlock(),
                                loc.getLoc().getScope());
     case BridgedBuilder::InsertAt::intoGlobal:
       return swift::SILBuilder(BridgedGlobalVar(insertionObj).getGlobal());
@@ -1156,6 +1268,10 @@ struct BridgedBuilder{
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createBeginDeallocRef(BridgedValue reference,
                                                                               BridgedValue allocation) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createEndInitLetRef(BridgedValue op) const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction
+  createRetainValue(BridgedValue op) const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction
+  createReleaseValue(BridgedValue op) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createStrongRetain(BridgedValue op) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createStrongRelease(BridgedValue op) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createUnownedRetain(BridgedValue op) const;
@@ -1163,6 +1279,8 @@ struct BridgedBuilder{
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createFunctionRef(BridgedFunction function) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createCopyValue(BridgedValue op) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createBeginBorrow(BridgedValue op) const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createBorrowedFrom(BridgedValue borrowedValue,
+                                                                           BridgedValueArray enclosingValues) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createEndBorrow(BridgedValue op) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createCopyAddr(BridgedValue from, BridgedValue to,
                                           bool takeSource, bool initializeDest) const;
@@ -1196,6 +1314,12 @@ struct BridgedBuilder{
                                           BridgedType resultType) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createThinToThickFunction(BridgedValue fn,
                                                                                   BridgedType resultType) const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createPartialApply(BridgedValue fn,
+                                                                           BridgedValueArray bridgedCapturedArgs,
+                                                                           BridgedArgumentConvention calleeConvention,
+                                                                           BridgedSubstitutionMap bridgedSubstitutionMap = BridgedSubstitutionMap(),
+                                                                           bool hasUnknownIsolation = true,
+                                                                           bool isOnStack = false) const;                                                                                  
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createBranch(BridgedBasicBlock destBlock,
                                                                      BridgedValueArray arguments) const;
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createUnreachable() const;
@@ -1236,6 +1360,11 @@ struct BridgedBuilder{
     BridgedValue value, BridgedValue base, BridgedInstruction::MarkDependenceKind dependenceKind) const;
     
   SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createEndAccess(BridgedValue value) const;
+
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createConvertFunction(BridgedValue originalFunction, BridgedType resultType, bool withoutActuallyEscaping) const;
+  SWIFT_IMPORT_UNSAFE BRIDGED_INLINE BridgedInstruction createConvertEscapeToNoEscape(BridgedValue originalFunction, BridgedType resultType, bool isLifetimeGuaranteed) const;
+
+  SWIFT_IMPORT_UNSAFE void destroyCapturedArgs(BridgedInstruction partialApply) const;
 };
 
 // Passmanager and Context

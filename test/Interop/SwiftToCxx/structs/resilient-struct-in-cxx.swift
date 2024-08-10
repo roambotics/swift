@@ -2,7 +2,7 @@
 // RUN: %target-swift-frontend %s -enable-library-evolution -typecheck -module-name Structs -clang-header-expose-decls=all-public -emit-clang-header-path %t/structs.h
 // RUN: %FileCheck %s < %t/structs.h
 
-// RUN: %check-interop-cxx-header-in-clang(%t/structs.h)
+// RUN: %check-interop-cxx-header-in-clang(%t/structs.h -DSWIFT_CXX_INTEROP_HIDE_STL_OVERLAY)
 
 public struct FirstSmallStruct {
     public var x: UInt32
@@ -30,7 +30,7 @@ public struct FirstSmallStruct {
 // CHECK: class SWIFT_SYMBOL("s:7Structs16FirstSmallStructV") FirstSmallStruct;
 
 // CHECK: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<Structs::FirstSmallStruct> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<Structs::FirstSmallStruct> = true;
 
 // CHECK: class SWIFT_SYMBOL("s:7Structs16FirstSmallStructV") FirstSmallStruct final {
 // CHECK-NEXT: public:
@@ -91,9 +91,9 @@ public struct FirstSmallStruct {
 // CHECK-NEXT: };
 // CHECK-NEXT: namespace _impl{
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isValueType<Structs::FirstSmallStruct> = true;
+// CHECK-NEXT: inline const constexpr bool isValueType<Structs::FirstSmallStruct> = true;
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isOpaqueLayout<Structs::FirstSmallStruct> = true;
+// CHECK-NEXT: inline const constexpr bool isOpaqueLayout<Structs::FirstSmallStruct> = true;
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct implClassFor<Structs::FirstSmallStruct> { using type = Structs::_impl::_impl_FirstSmallStruct; };
 // CHECK-NEXT: } // namespace

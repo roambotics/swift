@@ -26,6 +26,9 @@ namespace llvm {
   class Triple;
   class FileCollectorBase;
   template<typename Fn> class function_ref;
+  namespace opt {
+    class InputArgList;
+  }
   namespace vfs {
     class FileSystem;
     class OutputBackend;
@@ -51,6 +54,9 @@ namespace clang {
   class DeclarationName;
   class CompilerInvocation;
   class TargetOptions;
+  namespace driver {
+    class Driver;
+  }
 namespace tooling {
 namespace dependencies {
   struct ModuleDeps;
@@ -74,9 +80,11 @@ class EnumDecl;
 class FuncDecl;
 class ImportDecl;
 class IRGenOptions;
+class LangOptions;
 class ModuleDecl;
 struct ModuleDependencyID;
 class NominalTypeDecl;
+class SearchPathOptions;
 class StructDecl;
 class SwiftLookupTable;
 class TypeDecl;
@@ -194,7 +202,23 @@ public:
   createClangInvocation(ClangImporter *importer,
                         const ClangImporterOptions &importerOpts,
                         llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
-                        std::vector<std::string> &CC1Args);
+                        const std::vector<std::string> &CC1Args);
+
+  /// Creates a Clang Driver based on the Swift compiler options.
+  ///
+  /// \return a pair of the Clang Driver and the diagnostic engine, which needs
+  /// to be alive during the use of the Driver.
+  static std::pair<clang::driver::Driver,
+                   llvm::IntrusiveRefCntPtr<clang::DiagnosticsEngine>>
+  createClangDriver(
+      const LangOptions &LangOpts,
+      const ClangImporterOptions &ClangImporterOpts,
+      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> vfs = nullptr);
+
+  static llvm::opt::InputArgList
+  createClangArgs(const ClangImporterOptions &ClangImporterOpts,
+                  const SearchPathOptions &SearchPathOpts,
+                  clang::driver::Driver &clangDriver);
 
   ClangImporter(const ClangImporter &) = delete;
   ClangImporter(ClangImporter &&) = delete;
@@ -227,7 +251,7 @@ public:
   ///
   /// If a non-null \p versionInfo is provided, the module version will be
   /// parsed and populated.
-  virtual bool canImportModule(ImportPath::Module named,
+  virtual bool canImportModule(ImportPath::Module named, SourceLoc loc,
                                ModuleVersionInfo *versionInfo,
                                bool isTestableImport = false) override;
 
@@ -402,8 +426,10 @@ public:
   getWrapperForModule(const clang::Module *mod,
                       bool returnOverlayIfPossible = false) const override;
 
-  std::string getBridgingHeaderContents(StringRef headerPath, off_t &fileSize,
-                                        time_t &fileModTime);
+  std::string
+  getBridgingHeaderContents(StringRef headerPath, off_t &fileSize,
+                            time_t &fileModTime,
+                            StringRef pchIncludeTree);
 
   /// Makes a temporary replica of the ClangImporter's CompilerInstance, reads
   /// an Objective-C header file into the replica and emits a PCH file of its
@@ -663,6 +689,11 @@ bool requiresCPlusPlus(const clang::Module *module);
 /// (std_vector, std_iosfwd, etc).
 bool isCxxStdModule(const clang::Module *module);
 
+/// Returns true if the given module is one of the C++ standard library modules.
+/// This could be the top-level std module, or any of the libc++ split modules
+/// (std_vector, std_iosfwd, etc).
+bool isCxxStdModule(StringRef moduleName, bool IsSystem);
+
 /// Returns the pointee type if the given type is a C++ `const`
 /// reference type, `None` otherwise.
 std::optional<clang::QualType>
@@ -670,6 +701,19 @@ getCxxReferencePointeeTypeOrNone(const clang::Type *type);
 
 /// Returns true if the given type is a C++ `const` reference type.
 bool isCxxConstReferenceType(const clang::Type *type);
+
+/// Determine whether this typedef is a CF type.
+bool isCFTypeDecl(const clang::TypedefNameDecl *Decl);
+
+/// Determine the imported CF type for the given typedef-name, or the empty
+/// string if this is not an imported CF type name.
+llvm::StringRef getCFTypeName(const clang::TypedefNameDecl *decl);
+
+/// Lookup and return the synthesized conformance operator like '==' '-' or '+='
+/// for the given type.
+ValueDecl *getImportedMemberOperator(const DeclBaseName &name,
+                                     NominalTypeDecl *selfType,
+                                     std::optional<Type> parameterType);
 
 } // namespace importer
 

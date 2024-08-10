@@ -22,6 +22,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsClangImporter.h"
 #include "swift/AST/ExistentialLayout.h"
@@ -37,6 +38,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/ClangImporter/ClangImporterRequests.h"
 #include "swift/Parse/Lexer.h"
@@ -213,9 +215,7 @@ Type FailureDiagnostic::restoreGenericParameters(
 
 bool FailureDiagnostic::conformsToKnownProtocol(
     Type type, KnownProtocolKind protocol) const {
-  auto &cs = getConstraintSystem();
-  return TypeChecker::conformsToKnownProtocol(type, protocol,
-                                              cs.DC->getParentModule());
+  return TypeChecker::conformsToKnownProtocol(type, protocol);
 }
 
 Type RequirementFailure::getOwnerType() const {
@@ -539,6 +539,23 @@ void RequirementFailure::maybeEmitRequirementNote(const Decl *anchor, Type lhs,
     return;
   }
 
+  // If a requirement 'T: InvertibleProtocol' wasn't satisfied, then emit a note
+  // explaining that this requirement was implicit, but is suppressible.
+  if (req.getKind() == RequirementKind::Conformance &&
+      req.getProtocolDecl()->getInvertibleProtocolKind() &&
+      req.getFirstType()->is<SubstitutableType>()) {
+    auto diag = diag::noncopyable_generics_implicit_conformance_req;
+
+    // Handle 'some X' where the '& InvertibleProtocol' is implicit
+    if (auto substTy = req.getFirstType()->getAs<GenericTypeParamType>())
+      if (auto gtpd = substTy->getDecl())
+        if (gtpd->isOpaqueType())
+          diag = diag::noncopyable_generics_implicit_composition;
+
+    emitDiagnosticAt(anchor, diag, req.getFirstType(), req.getSecondType());
+    return;
+  }
+
   if (req.getKind() == RequirementKind::Layout ||
       rhs->isEqual(req.getSecondType())) {
     // If the note is tautological, bail out.
@@ -636,20 +653,6 @@ bool MissingConformanceFailure::diagnoseAsError() {
 
   if (diagnoseAsAmbiguousOperatorRef())
     return true;
-
-  // Use tailored diagnostics for failure to conform to Copyable.
-  if (auto asProtoType = protocolType->getAs<ProtocolType>()) {
-    if (auto *protoDecl = asProtoType->getDecl()) {
-      if (protoDecl->isSpecificProtocol(KnownProtocolKind::Copyable)) {
-        NotCopyableFailure failure(getSolution(),
-                                   nonConformingType,
-                                   NoncopyableMatchFailure::forCopyableConstraint(),
-                                   getLocator());
-        if (failure.diagnoseAsError())
-          return true;
-      }
-    }
-  }
 
   if (nonConformingType->isObjCExistentialType()) {
     emitDiagnostic(diag::protocol_does_not_conform_static, nonConformingType,
@@ -2430,8 +2433,7 @@ AssignmentFailure::getMemberRef(ConstraintLocator *locator) const {
 
   auto *decl = member->choice.getDecl();
   if (isa<SubscriptDecl>(decl) &&
-      isValidDynamicMemberLookupSubscript(cast<SubscriptDecl>(decl),
-                                          getParentModule())) {
+      isValidDynamicMemberLookupSubscript(cast<SubscriptDecl>(decl))) {
     auto *subscript = cast<SubscriptDecl>(decl);
     // If this is a keypath dynamic member lookup, we have to
     // adjust the locator to find member referred by it.
@@ -3192,8 +3194,7 @@ bool ContextualFailure::diagnoseThrowsTypeMismatch() const {
   if (auto errorCodeProtocol =
           Ctx.getProtocol(KnownProtocolKind::ErrorCodeProtocol)) {
     Type errorCodeType = getFromType();
-    auto conformance = getParentModule()->checkConformance(
-        errorCodeType, errorCodeProtocol);
+    auto conformance = checkConformance(errorCodeType, errorCodeProtocol);
     if (conformance && toErrorExistential) {
       Type errorType =
           conformance
@@ -3433,7 +3434,7 @@ bool ContextualFailure::tryProtocolConformanceFixIt(
   SmallVector<std::string, 8> missingProtoTypeStrings;
   SmallVector<ProtocolDecl *, 8> missingProtocols;
   for (auto protocol : layout.getProtocols()) {
-    if (!getParentModule()->checkConformance(fromType, protocol)) {
+    if (!checkConformance(fromType, protocol)) {
       auto protoTy = protocol->getDeclaredInterfaceType();
       missingProtoTypeStrings.push_back(protoTy->getString());
       missingProtocols.push_back(protocol);
@@ -3471,11 +3472,6 @@ bool ContextualFailure::tryProtocolConformanceFixIt(
     auto nameEndLoc = Lexer::getLocForEndOfToken(getASTContext().SourceMgr,
                                                  nominal->getNameLoc());
     conformanceDiag.fixItInsert(nameEndLoc, ": " + protoString);
-  }
-
-  // Emit fix-its to insert requirement stubs if we're in editor mode.
-  if (!getASTContext().LangOpts.DiagnosticsEditorMode) {
-    return true;
   }
 
   {
@@ -4227,7 +4223,7 @@ findImportedCaseWithMatchingSuffix(Type instanceTy, DeclNameRef name) {
 
     // Is one more available than the other?
     WORSE(->getAttrs().isUnavailable(ctx));
-    WORSE(->getAttrs().getDeprecated(ctx));
+    WORSE(->getAttrs().isDeprecated(ctx));
 
     // Does one have a shorter name (so the non-matching prefix is shorter)?
     WORSE(->getName().getBaseName().userFacingName().size());
@@ -6186,66 +6182,13 @@ bool InaccessibleMemberFailure::diagnoseAsError() {
   }
 
   auto loc = nameLoc.isValid() ? nameLoc.getStartLoc() : ::getLoc(anchor);
+  if (IsMissingImport) {
+    maybeDiagnoseMissingImportForMember(Member, getDC(), loc);
+    return true;
+  }
+
   auto accessLevel = Member->getFormalAccessScope().accessLevelForDiagnostics();
-  bool suppressDeclHereNote = false;
-  if (accessLevel == AccessLevel::Public &&
-      !Member->findImport(getDC())) {
-    auto definingModule = Member->getDeclContext()->getParentModule();
-    emitDiagnosticAt(loc, diag::candidate_from_missing_import,
-                     Member->getDescriptiveKind(), Member->getName(),
-                     definingModule->getName());
-
-    auto enclosingSF = getDC()->getParentSourceFile();
-    SourceLoc bestLoc;
-    SourceManager &srcMgr = Member->getASTContext().SourceMgr;
-    for (auto item : enclosingSF->getTopLevelItems()) {
-      // If we found an import declaration, we want to insert after it.
-      if (auto importDecl =
-              dyn_cast_or_null<ImportDecl>(item.dyn_cast<Decl *>())) {
-        SourceLoc loc = importDecl->getEndLoc();
-        if (loc.isValid()) {
-          bestLoc = Lexer::getLocForEndOfLine(srcMgr, loc);
-        }
-
-        // Keep looking for more import declarations.
-        continue;
-      }
-
-      // If we got a location based on import declarations, we're done.
-      if (bestLoc.isValid())
-        break;
-
-      // For any other item, we want to insert before it.
-      SourceLoc loc = item.getStartLoc();
-      if (loc.isValid()) {
-        bestLoc = Lexer::getLocForStartOfLine(srcMgr, loc);
-        break;
-      }
-    }
-
-    if (bestLoc.isValid()) {
-      llvm::SmallString<64> importText;
-
-      // @_spi imports.
-      if (Member->isSPI()) {
-        auto spiGroups = Member->getSPIGroups();
-        if (!spiGroups.empty()) {
-          importText += "@_spi(";
-          importText += spiGroups[0].str();
-          importText += ") ";
-        }
-      }
-
-      importText += "import ";
-      importText += definingModule->getName().str();
-      importText += "\n";
-      emitDiagnosticAt(bestLoc, diag::candidate_add_import,
-                       definingModule->getName())
-        .fixItInsert(bestLoc, importText);
-    }
-
-    suppressDeclHereNote = true;
-  } else if (auto *CD = dyn_cast<ConstructorDecl>(Member)) {
+  if (auto *CD = dyn_cast<ConstructorDecl>(Member)) {
     emitDiagnosticAt(loc, diag::init_candidate_inaccessible,
                      CD->getResultInterfaceType(), accessLevel)
         .highlight(nameLoc.getSourceRange());
@@ -6255,8 +6198,7 @@ bool InaccessibleMemberFailure::diagnoseAsError() {
         .highlight(nameLoc.getSourceRange());
   }
 
-  if (!suppressDeclHereNote)
-    emitDiagnosticAt(Member, diag::decl_declared_here, Member);
+  emitDiagnosticAt(Member, diag::decl_declared_here, Member);
   return true;
 }
 
@@ -6400,112 +6342,6 @@ bool ExtraneousReturnFailure::diagnoseAsError() {
 
 bool NotCompileTimeConstFailure::diagnoseAsError() {
   emitDiagnostic(diag::expect_compile_time_const);
-  return true;
-}
-
-bool NotCopyableFailure::diagnoseAsError() {
-  switch (failure.getKind()) {
-  case NoncopyableMatchFailure::ExistentialCast: {
-    if (noncopyableTy->is<AnyMetatypeType>())
-      emitDiagnostic(diag::noncopyable_generics_metatype_cast,
-                     noncopyableTy,
-                     failure.getType(),
-                     noncopyableTy->getMetatypeInstanceType());
-    else
-      emitDiagnostic(diag::noncopyable_generics_erasure,
-                     noncopyableTy,
-                     failure.getType());
-    return true;
-  }
-
-  case NoncopyableMatchFailure::CopyableConstraint: {
-    ConstraintLocator *loc = getLocator();
-    auto path = loc->getPath();
-
-    if (loc->isLastElement<LocatorPathElt::AnyTupleElement>()) {
-      assert(!noncopyableTy->is<TupleType>() && "will use poor wording");
-      emitDiagnostic(diag::tuple_move_only_not_supported, noncopyableTy);
-      return true;
-    }
-
-    if (loc->isLastElement<LocatorPathElt::PackElement>()) {
-      emitDiagnostic(diag::noncopyable_element_of_pack_not_supported,
-                     noncopyableTy);
-      return true;
-    }
-
-    auto diagnoseGenericTypeParamType = [&](GenericTypeParamType *typeParam) {
-      if (!typeParam)
-        return false;
-
-      if (auto *paramDecl = typeParam->getDecl()) {
-        if (auto *owningDecl =
-            dyn_cast_or_null<ValueDecl>(paramDecl->getDeclContext()->getAsDecl())) {
-
-          // FIXME: these owningDecl names are kinda bad. like just `init(describing:)`
-          if (noncopyableTy->is<AnyMetatypeType>())
-            emitDiagnostic(diag::noncopyable_generics_generic_param_metatype,
-                           noncopyableTy->getMetatypeInstanceType(),
-                           paramDecl->getDescriptiveKind(),
-                           typeParam,
-                           owningDecl->getName(),
-                           noncopyableTy);
-          else
-            emitDiagnostic(diag::noncopyable_generics_generic_param,
-                           noncopyableTy,
-                           paramDecl->getDescriptiveKind(),
-                           typeParam,
-                           owningDecl->getName());
-
-          // If we have a location for the parameter, point it out in a note.
-          if (auto loc = paramDecl->getNameLoc()) {
-            emitDiagnosticAt(loc,
-                             diag::noncopyable_generics_implicit_copyable,
-                             paramDecl->getDescriptiveKind(),
-                             typeParam);
-          }
-
-          return true;
-        }
-      }
-      return false;
-    };
-
-    // NOTE: a non-requirement constraint locator might now be impossible after
-    // having made Copyable a Requirement in Feature::NoncopyableGenerics
-    if (diagnoseGenericTypeParamType(loc->getGenericParameter()))
-      return true;
-
-    if (auto tpr =
-        loc->getLastElementAs<LocatorPathElt::TypeParameterRequirement>()) {
-      auto signature = path[path.size() - 2]
-          .castTo<LocatorPathElt::OpenedGeneric>()
-          .getSignature();
-      auto requirement = signature.getRequirements()[tpr->getIndex()];
-      auto subject = requirement.getFirstType();
-
-      if (diagnoseGenericTypeParamType(subject->getAs<GenericTypeParamType>()))
-        return true;
-    }
-
-    if (loc->getLastElementAs<LocatorPathElt::ConditionalRequirement>())
-      return false; // Allow MissingConformanceFailure to diagnose instead.
-
-    break;
-  }
-  } // end switch
-
-  // emit catch-all diagnostic
-  emitDiagnostic(diag::noncopyable_generics, noncopyableTy);
-
-#ifndef NDEBUG
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    getLocator()->dump(&getConstraintSystem());
-#pragma clang diagnostic pop
-    llvm_unreachable("NoncopyableGenerics: vague diagnostic for locator");
-#endif
-
   return true;
 }
 
@@ -6662,6 +6498,13 @@ bool MissingContextualConformanceFailure::diagnoseAsError() {
     case ConstraintLocator::SequenceElementType: {
       diagnostic = diag::cannot_convert_sequence_element_protocol;
       break;
+    }
+
+    case ConstraintLocator::EnumPatternImplicitCastMatch: {
+      emitDiagnostic(diag::pattern_does_not_conform_to_match, getFromType(),
+                     getToType())
+          .highlight(getSourceRange());
+      return true;
     }
 
     default:
@@ -8076,6 +7919,28 @@ bool NonEphemeralConversionFailure::diagnoseAsError() {
   return true;
 }
 
+bool SendingMismatchFailure::diagnoseAsError() {
+  if (getLocator()->getLastElementAs<LocatorPathElt::FunctionArgument>())
+    return diagnoseArgFailure();
+  return diagnoseResultFailure();
+}
+
+bool SendingMismatchFailure::diagnoseArgFailure() {
+  emitDiagnostic(diag::sending_function_wrong_sending, getFromType(),
+                 getToType())
+      .warnUntilSwiftVersion(6);
+  emitDiagnostic(diag::sending_function_param_with_sending_param_note);
+  return true;
+}
+
+bool SendingMismatchFailure::diagnoseResultFailure() {
+  emitDiagnostic(diag::sending_function_wrong_sending, getFromType(),
+                 getToType())
+      .warnUntilSwiftVersion(6);
+  emitDiagnostic(diag::sending_function_result_with_sending_param_note);
+  return true;
+}
+
 bool AssignmentTypeMismatchFailure::diagnoseMissingConformance() const {
   auto srcType = getFromType();
   auto dstType = getToType()->lookThroughAllOptionalTypes();
@@ -8806,7 +8671,21 @@ bool MissingContextualTypeForNil::diagnoseAsError() {
   return true;
 }
 
+bool InvalidPlaceholderFailure::diagnoseAsError() {
+  auto elt = getLocator()->castLastElementTo<LocatorPathElt::PlaceholderType>();
+  emitDiagnosticAt(elt.getPlaceholderRepr()->getLoc(),
+                   diag::placeholder_type_not_allowed);
+  return true;
+}
+
 bool CouldNotInferPlaceholderType::diagnoseAsError() {
+  // When placeholder type appears in an editor placeholder i.e.
+  // `<#T##() -> _#>` we rely on the parser to produce a diagnostic
+  // about editor placeholder and glance over all placeholder type
+  // inference issues.
+  if (isExpr<EditorPlaceholderExpr>(getAnchor()))
+    return true;
+
   // If this placeholder was explicitly written out by the user, they can maybe
   // fix things by specifying an actual type.
   if (auto *typeExpr = getAsExpr<TypeExpr>(getAnchor())) {
@@ -8816,12 +8695,13 @@ bool CouldNotInferPlaceholderType::diagnoseAsError() {
     }
   }
 
-  // When placeholder type appears in an editor placeholder i.e.
-  // `<#T##() -> _#>` we rely on the parser to produce a diagnostic
-  // about editor placeholder and glance over all placeholder type
-  // inference issues.
-  if (isExpr<EditorPlaceholderExpr>(getAnchor()))
+  // Also check for a placeholder path element.
+  auto *loc = getLocator();
+  if (auto elt = loc->getLastElementAs<LocatorPathElt::PlaceholderType>()) {
+    emitDiagnosticAt(elt->getPlaceholderRepr()->getLoc(),
+                     diag::could_not_infer_placeholder);
     return true;
+  }
 
   return false;
 }
@@ -9199,14 +9079,16 @@ bool CheckedCastToUnrelatedFailure::diagnoseAsError() {
   const auto fromType = getFromType();
   const auto toType = getToType();
   auto *sub = CastExpr->getSubExpr()->getSemanticsProvidingExpr();
-  // FIXME(https://github.com/apple/swift/issues/54529): This literal diagnostics needs to be revisited by a proposal to unify casting semantics for literals.
+  // FIXME(https://github.com/apple/swift/issues/54529): This literal
+  // diagnostics needs to be revisited by a proposal to unify casting
+  // semantics for literals.
   auto &ctx = getASTContext();
-  auto *dc = getDC();
+
   if (isa<LiteralExpr>(sub)) {
     auto *protocol = TypeChecker::getLiteralProtocol(ctx, sub);
     // Special handle for literals conditional checked cast when they can
     // be statically coerced to the cast type.
-    if (protocol && dc->getParentModule()->checkConformance(toType, protocol)) {
+    if (protocol && checkConformance(toType, protocol)) {
       emitDiagnostic(diag::literal_conditional_downcast_to_coercion, fromType,
                      toType);
       return true;
@@ -9244,7 +9126,7 @@ bool InvalidWeakAttributeUse::diagnoseAsError() {
                        ReferenceOwnership::Weak, varType);
 
   auto typeRange = var->getTypeSourceRangeForDiagnostics();
-  if (varType->hasSimpleTypeRepr()) {
+  if (varType->lookThroughSingleOptionalType()->hasSimpleTypeRepr()) {
     diagnostic.fixItInsertAfter(typeRange.End, "?");
   } else {
     diagnostic.fixItInsert(typeRange.Start, "(")
@@ -9473,7 +9355,17 @@ bool InvalidMemberReferenceWithinInitAccessor::diagnoseAsError() {
 }
 
 bool ConcreteTypeSpecialization::diagnoseAsError() {
-  emitDiagnostic(diag::not_a_generic_type, ConcreteType);
+  if (isa<MacroDecl>(Decl)) {
+    emitDiagnostic(diag::not_a_generic_macro, Decl);
+  } else {
+    emitDiagnostic(diag::not_a_generic_type, ConcreteType);
+  }
+  return true;
+}
+
+bool GenericFunctionSpecialization::diagnoseAsError() {
+  emitDiagnostic(diag::cannot_explicitly_specialize_generic_function);
+  emitDiagnosticAt(Decl, diag::decl_declared_here, Decl);
   return true;
 }
 

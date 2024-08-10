@@ -692,6 +692,18 @@ autorelease in the callee.
   type behaves like a non-generic type, as if the substitutions were
   actually applied to the underlying function type.
 
+- SIL functions may optionally mark a function parameter as
+  ``@sil_isolated``. An ``@sil_isolated`` parameter must be one of:
+
+  - An actor or any actor type.
+  - A generic type that conforms to Actor or AnyActor.
+
+  and must be the actor instance that a function is isolated to. Importantly
+  this means that global actor isolated nominal types are never
+  ``@sil_isolated``. Only one parameter can ever be marked as ``@sil_isolated``
+  since a function cannot be isolated to multiple actors at the same time.
+
+
 Async Functions
 ```````````````
 
@@ -792,7 +804,7 @@ the ``@yields`` attribute.  A yielded value may have a convention attribute,
 taken from the set of parameter attributes and interpreted as if the yield
 site were calling back to the calling function.
 
-Currently, a coroutine may not have normal results.
+In addition to yielded values a coroutine could also have normal results.
 
 Coroutine functions may be used in many of the same ways as normal
 function values.  However, they cannot be called with the standard
@@ -3735,7 +3747,7 @@ of ``scalar_pack_index``, ``pack_pack_index``, or ``dynamic_pack_index``),
 and it must index into a pack type with the same shape as the indexed
 pack type.
 
-Third, additional restrictions must be satisifed depending on which
+Third, additional restrictions must be satisfied depending on which
 pack indexing instruction the pack index is:
 
 - For ``scalar_pack_index``, the projected element type must be the
@@ -4167,7 +4179,7 @@ dealloc_box
 ```````````
 ::
 
-  sil-instruction ::= 'dealloc_box' sil-operand
+  sil-instruction ::= 'dealloc_box' '[dead_end]'? sil-operand
 
   dealloc_box %0 : $@box T
 
@@ -4179,6 +4191,9 @@ undefined behavior results.
 This does not destroy the boxed value. The contents of the
 value must have been fully uninitialized or destroyed before
 ``dealloc_box`` is applied.
+
+The optional ``dead_end`` attribute specifies that this instruction was created
+during lifetime completion and is eligible for deletion during OSSA lowering.
 
 project_box
 ```````````
@@ -4297,7 +4312,6 @@ less verbose.
    debug-var-attr ::= 'let'
    debug-var-attr ::= 'name' string-literal
    debug-var-attr ::= 'argno' integer-literal
-   debug-var-attr ::= 'implicit'
 
 There are a number of attributes that provide details about the source
 variable that is being described, including the name of the
@@ -4616,6 +4630,38 @@ We require that ``%1`` and ``%0`` have the same type ignoring SILValueCategory.
 
 This instruction is only valid in functions in Ownership SSA form.
 
+borrowed from
+`````````````
+
+::
+
+   sil-instruction ::= 'borrowed' sil-operand 'from' '(' (sil-operand (',' sil-operand)*)? ')'
+
+   bb1(%1 : @owned $T, %2 : @guaranteed $T):
+     %3 = borrowed %2 : $T from (%1 : $T, %0 : $S)
+     // %3 has type $T and guaranteed ownership
+
+Declares from which enclosing values a guaranteed phi argument is borrowed
+from.
+An enclosing value is either a dominating borrow introducer (``%0``) of the
+borrowed operand (``%2``) or an adjacent phi-argument in the same block
+(``%1``).
+In case of an adjacent phi, all incoming values of the adjacent phi must be
+borrow introducers for the corresponding incoming value of the borrowed
+operand in all predecessor blocks.
+
+The borrowed operand (``%2``) must be a guaranteed phi argument and is
+forwarded to the instruction result.
+
+The list of enclosing values (operands after ``from``) can be empty if the
+borrowed operand stems from a borrow introducer with no enclosing value, e.g.
+a ``load_borrow``.
+
+Guaranteed phi arguments must not have other users than borrowed-from
+instructions.
+
+This instruction is only valid in functions in Ownership SSA form.
+
 end_lifetime
 ````````````
 
@@ -4638,6 +4684,22 @@ The instruction accepts an object or address type.
 `@owned T`. If its argument is an address type, it's an identity projection.
 This instruction is valid only in OSSA and is lowered to a no-op when lowering
 to non-OSSA.
+
+extend_lifetime
+```````````````
+
+::
+
+   sil-instruction ::= 'extend_lifetime' sil-operand
+
+   // Indicate that %0's linear lifetime extends to this point
+   extend_lifetime %0 : $X
+
+Indicates that a value's linear lifetime extends to this point.  Inserted by
+OSSALifetimeCompletion(AvailabilityBoundary) in order to provide the invariant
+that a value is either consumed OR has an `extend_lifetime` user on all paths
+and furthermore that all uses are within the boundary defined by that set of
+instructions (the consumes and the `extend_lifetime`s).
 
 assign
 ``````
@@ -5590,7 +5652,7 @@ strong reference count is greater than 1.
 A discussion of the semantics can be found here:
 `is_unique instruction <arcopts_is_unique_>`_
 
-.. _arcopts_is_unique: https://github.com/apple/swift/blob/main/docs/ARCOptimization.md#is_unique-instruction
+.. _arcopts_is_unique: https://github.com/swiftlang/swift/blob/main/docs/ARCOptimization.md#is_unique-instruction
 
 begin_cow_mutation
 ``````````````````
@@ -6268,6 +6330,16 @@ callee function (and thus said signature). Instead:
    ``@inout_aliasable`` parameter convention is used when a ``@noescape``
    closure captures an ``inout`` argument.
 
+**Coroutines** ``partial_apply`` could be used to create closures over
+coroutines. Overall, the ``partial_apply`` of a coroutine is straightforward: it
+is another coroutine that captures arguments passed to the ``partial_apply``
+instruction. This closure applies the original coroutine (similar to the
+``begin_apply`` instruction) for yields (suspend) and yields the resulting
+values. Then it calls the original coroutine continuation for return or unwind,
+and forwards the results (if any) to the caller as well. Currently only the
+autodiff transformation produces ``partial_apply`` for coroutines while
+differentiating modify accessors.
+
 **NOTE:** If the callee is generic, all of its generic parameters must be bound
 by the given substitution list. The arguments are given with these generic
 substitutions applied, and the resulting closure is of concrete function type
@@ -6605,7 +6677,7 @@ destroy_value
 
 ::
 
-  sil-instruction ::= 'destroy_value' '[poison]'? sil-operand
+  sil-instruction ::= 'destroy_value' '[dead_end]'? '[poison]'? sil-operand
 
   destroy_value %0 : $A
 
@@ -6622,6 +6694,9 @@ are the preferred forms.
 For aggregate types, especially enums, it is typically both easier
 and more efficient to reason about aggregate destroys than it is to
 reason about destroys of the subobjects.
+
+The optional ``dead_end`` attribute specifies that this instruction was created
+during lifetime completion and is eligible for deletion during OSSA lowering.
 
 autorelease_value
 `````````````````
@@ -6958,7 +7033,7 @@ presence or value of the ``enum_extensibility`` Clang attribute.
 
 (See `SE-0192`__ for more information about non-frozen enums.)
 
-__ https://github.com/apple/swift-evolution/blob/main/proposals/0192-non-exhaustive-enums.md
+__ https://github.com/swiftlang/swift-evolution/blob/main/proposals/0192-non-exhaustive-enums.md
 
 enum
 ````

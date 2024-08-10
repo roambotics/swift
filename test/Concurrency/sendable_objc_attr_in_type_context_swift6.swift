@@ -102,19 +102,20 @@ func test_sendable_attr_in_type_context(test: Test) {
 
   _ = TestWithSendableID<SendableValue>() // Ok
 
-  // TOOD(diagnostics): Duplicate diagnostics
+  // TODO(diagnostics): Duplicate diagnostics
   TestWithSendableID().add(MyValue())
   // expected-error@-1 3 {{type 'MyValue' does not conform to the 'Sendable' protocol}}
 
   TestWithSendableSuperclass().add(SendableMyValue()) // Ok
 
-  // TOOD(diagnostics): Duplicate diagnostics
+  // TODO(diagnostics): Duplicate diagnostics
   TestWithSendableSuperclass().add(MyValue())
   // expected-error@-1 3 {{type 'MyValue' does not conform to the 'Sendable' protocol}}
 }
 
 class TestConformanceWithStripping : InnerSendableTypes {
   // expected-error@-1 {{type 'TestConformanceWithStripping' does not conform to protocol 'InnerSendableTypes'}}
+  // expected-note@-2 {{add stubs for conformance}}
 
   func testComposition(_: MyValue) {
     // expected-note@-1 {{candidate has non-matching type '(MyValue) -> ()'}}
@@ -125,7 +126,7 @@ class TestConformanceWithStripping : InnerSendableTypes {
   }
 
   func test(withCallback name: String, handler: @escaping @MainActor ([String : Any], (any Error)?) -> Void) {
-    // expected-note@-1 {{candidate has non-matching type '(String, @escaping @MainActor ([String : Any], (any Error)?) -> Void) -> ()'}}
+    // expected-note@-1 {{candidate has non-matching type '(String, @escaping @MainActor @Sendable ([String : Any], (any Error)?) -> Void) -> ()'}}
   }
 }
 

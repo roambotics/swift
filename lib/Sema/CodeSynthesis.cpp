@@ -24,6 +24,7 @@
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Availability.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DistributedDecl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -33,6 +34,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Sema/ConstraintSystem.h"
@@ -324,14 +326,13 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
   
   // Create the constructor.
   DeclName name(ctx, DeclBaseName::createConstructor(), paramList);
-  auto *ctor =
-    new (ctx) ConstructorDecl(name, Loc,
-                              /*Failable=*/false, /*FailabilityLoc=*/SourceLoc(),
-                              /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-                              /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
-                              /*ThrownType=*/TypeLoc(),
-                              paramList, /*GenericParams=*/nullptr, decl,
-							  /*LifetimeDependentReturnTypeRepr*/ nullptr);
+  auto *ctor = new (ctx) ConstructorDecl(
+      name, Loc,
+      /*Failable=*/false, /*FailabilityLoc=*/SourceLoc(),
+      /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
+      /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+      /*ThrownType=*/TypeLoc(), paramList, /*GenericParams=*/nullptr, decl,
+      /*LifetimeDependentTypeRepr*/ nullptr);
 
   // Mark implicit.
   ctor->setImplicit();
@@ -541,9 +542,7 @@ createDesignatedInitOverrideGenericParams(ASTContext &ctx,
   if (genericParams == nullptr)
     return nullptr;
 
-  unsigned depth = 0;
-  if (auto classSig = classDecl->getGenericSignature())
-    depth = classSig.getGenericParams().back()->getDepth() + 1;
+  unsigned depth = classDecl->getGenericSignature().getNextDepth();
 
   SmallVector<GenericTypeParamDecl *, 4> newParams;
   for (auto *param : genericParams->getParams()) {
@@ -779,7 +778,6 @@ createDesignatedInitOverride(ClassDecl *classDecl,
     // satisfied by the derived class. In this case, we don't want to inherit
     // this initializer; there's no way to call it on the derived class.
     auto checkResult = checkRequirements(
-        classDecl->getParentModule(),
         superclassCtorSig.getRequirements(),
         [&](Type type) -> Type {
           auto substType = type.subst(subMap);
@@ -821,18 +819,16 @@ createDesignatedInitOverride(ClassDecl *classDecl,
   // Create the initializer declaration, inheriting the name,
   // failability, and throws from the superclass initializer.
   auto implCtx = classDecl->getImplementationContext()->getAsGenericContext();
-  auto ctor =
-    new (ctx) ConstructorDecl(superclassCtor->getName(),
-                              classDecl->getBraces().Start,
-                              superclassCtor->isFailable(),
-                              /*FailabilityLoc=*/SourceLoc(),
-                              /*Async=*/superclassCtor->hasAsync(),
-                              /*AsyncLoc=*/SourceLoc(),
-                              /*Throws=*/superclassCtor->hasThrows(),
-                              /*ThrowsLoc=*/SourceLoc(),
-                              TypeLoc::withoutLoc(thrownType),
-                              bodyParams, genericParams, implCtx,
-							  /*LifetimeDependentReturnTypeRepr*/ nullptr);
+  auto ctor = new (ctx) ConstructorDecl(
+      superclassCtor->getName(), classDecl->getBraces().Start,
+      superclassCtor->isFailable(),
+      /*FailabilityLoc=*/SourceLoc(),
+      /*Async=*/superclassCtor->hasAsync(),
+      /*AsyncLoc=*/SourceLoc(),
+      /*Throws=*/superclassCtor->hasThrows(),
+      /*ThrowsLoc=*/SourceLoc(), TypeLoc::withoutLoc(thrownType), bodyParams,
+      genericParams, implCtx,
+      /*LifetimeDependentTypeRepr*/ nullptr);
 
   ctor->setImplicit();
 
@@ -1157,7 +1153,8 @@ static void collectNonOveriddenSuperclassInits(
   superclassDecl->synthesizeSemanticMembersIfNeeded(
     DeclBaseName::createConstructor());
 
-  NLOptions subOptions = (NL_QualifiedDefault | NL_IgnoreAccessControl);
+  NLOptions subOptions =
+      (NL_QualifiedDefault | NL_IgnoreAccessControl | NL_IgnoreMissingImports);
   SmallVector<ValueDecl *, 4> lookupResults;
   subclass->lookupQualified(
       superclassDecl, DeclNameRef::createConstructor(),
@@ -1385,8 +1382,7 @@ ResolveImplicitMemberRequest::evaluate(Evaluator &evaluator,
       return false;
 
     auto targetType = target->getDeclaredInterfaceType();
-    auto ref = target->getParentModule()->lookupConformance(
-        targetType, protocol);
+    auto ref = lookupConformance(targetType, protocol);
     if (ref.isInvalid()) {
       return false;
     }

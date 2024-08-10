@@ -51,6 +51,7 @@ function(get_test_dependencies SDK result_var_name)
 
   if (SWIFT_INCLUDE_TOOLS)
     list(APPEND deps_binaries
+      libMockPlugin
       lldb-moduleimport-test
       swift-frontend
       swift-demangle
@@ -63,6 +64,10 @@ function(get_test_dependencies SDK result_var_name)
 
     if(SWIFT_BUILD_SOURCEKIT)
       list(APPEND deps_binaries sourcekitd-test complete-test)
+    endif()
+
+    if(SWIFT_BUILD_SWIFT_SYNTAX)
+      list(APPEND deps_binaries swift-plugin-server)
     endif()
   endif()
 
@@ -101,12 +106,15 @@ function(get_test_dependencies SDK result_var_name)
   if(("${SDK}" STREQUAL "IOS") OR
      ("${SDK}" STREQUAL "TVOS") OR
      ("${SDK}" STREQUAL "WATCHOS") OR
+     ("${SDK}" STREQUAL "XROS") OR
      ("${SDK}" STREQUAL "OSX") OR
      ("${SDK}" STREQUAL "IOS_SIMULATOR") OR
      ("${SDK}" STREQUAL "TVOS_SIMULATOR") OR
      ("${SDK}" STREQUAL "WATCHOS_SIMULATOR") OR
+     ("${SDK}" STREQUAL "XROS_SIMULATOR") OR
      ("${SDK}" STREQUAL "FREESTANDING") OR
      ("${SDK}" STREQUAL "LINUX") OR
+     ("${SDK}" STREQUAL "LINUX_STATIC") OR
      ("${SDK}" STREQUAL "CYGWIN") OR
      ("${SDK}" STREQUAL "FREEBSD") OR
      ("${SDK}" STREQUAL "OPENBSD") OR
@@ -212,6 +220,10 @@ normalize_boolean_spelling(SWIFT_STDLIB_ENABLE_OBJC_INTEROP)
 normalize_boolean_spelling(SWIFT_ENABLE_BACKTRACING)
 normalize_boolean_spelling(SWIFT_BUILD_SWIFT_SYNTAX)
 normalize_boolean_spelling(SWIFT_ENABLE_SYNCHRONIZATION)
+normalize_boolean_spelling(SWIFT_ENABLE_VOLATILE)
+normalize_boolean_spelling(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
+normalize_boolean_spelling(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING)
+normalize_boolean_spelling(SWIFT_BUILD_REMOTE_MIRROR)
 is_build_type_optimized("${SWIFT_STDLIB_BUILD_TYPE}" SWIFT_OPTIMIZED)
 
 # Get 'SWIFT_HOST_SDKROOT' for lit.site.cfg.in
@@ -313,19 +325,8 @@ foreach(SDK ${SWIFT_SDKS})
         endif()
       endif()
 
-      if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
-        if(TARGET "embedded-stdlib")
-          list(APPEND test_dependencies "embedded-stdlib")
-        endif()
-       if(TARGET "embedded-darwin")
-          list(APPEND test_dependencies "embedded-darwin")
-        endif()
-        if(TARGET "embedded-concurrency")
-          list(APPEND test_dependencies "embedded-concurrency")
-        endif()
-        if(TARGET "embedded-synchronization")
-          list(APPEND test_dependencies "embedded-synchronization")
-        endif()
+      if(TARGET "embedded-libraries")
+        list(APPEND test_dependencies "embedded-libraries")
       endif()
 
       if(NOT "${COVERAGE_DB}" STREQUAL "")
@@ -340,7 +341,7 @@ foreach(SDK ${SWIFT_SDKS})
 
       set(command_upload_stdlib)
       set(command_upload_swift_reflection_test)
-      if("${SDK}" STREQUAL "IOS" OR "${SDK}" STREQUAL "TVOS" OR "${SDK}" STREQUAL "WATCHOS")
+      if("${SDK}" STREQUAL "IOS" OR "${SDK}" STREQUAL "TVOS" OR "${SDK}" STREQUAL "WATCHOS" OR "${SDK}" STREQUAL "XROS")
         # These are supported testing SDKs, but their implementation of
         # `command_upload_stdlib` is hidden.
       elseif("${SDK}" STREQUAL "ANDROID" AND NOT "${SWIFT_HOST_VARIANT}" STREQUAL "android")
@@ -424,6 +425,14 @@ foreach(SDK ${SWIFT_SDKS})
 
         if(SWIFT_ENABLE_SYNCHRONIZATION)
           list(APPEND LIT_ARGS "--param" "synchronization")
+        endif()
+
+        if(SWIFT_ENABLE_VOLATILE)
+          list(APPEND LIT_ARGS "--param" "volatile")
+        endif()
+
+        if(SWIFT_BUILD_REMOTE_MIRROR)
+          list(APPEND LIT_ARGS "--param" "remote_mirror")
         endif()
 
         list(APPEND LIT_ARGS "--param" "threading=${SWIFT_SDK_${SDK}_THREADING_PACKAGE}")

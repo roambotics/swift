@@ -16,6 +16,7 @@
 #include "SemanticARCOptVisitor.h"
 #include "Transforms.h"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
 #include "swift/SILOptimizer/Analysis/DeadEndBlocksAnalysis.h"
@@ -157,7 +158,7 @@ struct SemanticARCOpts : SILFunctionTransform {
            "verification is enabled");
 
     auto *deBlocksAnalysis = getAnalysis<DeadEndBlocksAnalysis>();
-    SemanticARCOptVisitor visitor(f, *deBlocksAnalysis->get(&f),
+    SemanticARCOptVisitor visitor(f, getPassManager(), *deBlocksAnalysis->get(&f),
                                   mandatoryOptsOnly);
 
 #ifndef NDEBUG

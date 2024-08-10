@@ -22,6 +22,7 @@
 #include "SILGenFunctionBuilder.h"
 #include "Scope.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/PropertyWrappers.h"
@@ -29,6 +30,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/TypeMemberVisitor.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILArgument.h"
@@ -262,10 +264,6 @@ public:
   void emitVTable() {
     PrettyStackTraceDecl("silgen emitVTable", theClass);
 
-    // Imported types don't have vtables right now.
-    if (theClass->hasClangNode())
-      return;
-
     // Populate our list of base methods and overrides.
     visitAncestor(theClass);
 
@@ -306,7 +304,7 @@ public:
                                  false);
     }
 
-    IsSerialized_t serialized = IsNotSerialized;
+    SerializedKind_t serialized = IsNotSerialized;
     auto classIsPublic = theClass->getEffectiveAccess() >= AccessLevel::Public;
     // Only public, fixed-layout classes should have serialized vtables.
     if (classIsPublic && !isResilient)
@@ -317,6 +315,10 @@ public:
   }
 
   void visitAncestor(ClassDecl *ancestor) {
+    // Imported types don't have vtables right now.
+    if (ancestor->hasClangNode())
+      return;
+
     auto *superDecl = ancestor->getSuperclassDecl();
     if (superDecl)
       visitAncestor(superDecl);
@@ -400,14 +402,6 @@ template<typename T> class SILGenWitnessTable : public SILWitnessVisitor<T> {
 
 public:
   void addMethod(SILDeclRef requirementRef) {
-    // TODO: here the requirement is thunk_decl of the protocol; it is a FUNC
-    // detect here that it is a func dec + thunk.
-    // walk up to DC, and find storage.
-    // e  requirementRef->getDecl()->dump()
-    //(func_decl implicit "distributedVariable()" interface type="<Self where Self : WorkerProtocol> (Self) -> () async throws -> String" access=internal nonisolated distributed_thunk
-    //  (parameter "self")
-    //  (parameter_list))
-
     auto reqDecl = requirementRef.getDecl();
 
     // Static functions can be witnessed by enum cases with payload
@@ -472,7 +466,6 @@ public:
     // Here we notice a `distributed var` thunk requirement,
     // and witness it with the distributed thunk -- the "getter thunk".
     if (requirementRef.isDistributedThunk()) {
-
       return addMethodImplementation(
           requirementRef, getWitnessRef(requirementRef, witnessStorage->getDistributedThunk()),
           witness);
@@ -515,9 +508,8 @@ private:
   }
 };
 
-static IsSerialized_t isConformanceSerialized(RootProtocolConformance *conf) {
-  return SILWitnessTable::conformanceIsSerialized(conf)
-           ? IsSerialized : IsNotSerialized;
+static SerializedKind_t getConformanceSerializedKind(RootProtocolConformance *conf) {
+  return SILWitnessTable::conformanceSerializedKind(conf);
 }
 
 /// Emit a witness table for a protocol conformance.
@@ -530,13 +522,13 @@ public:
   std::vector<SILWitnessTable::Entry> Entries;
   std::vector<SILWitnessTable::ConditionalConformance> ConditionalConformances;
   SILLinkage Linkage;
-  IsSerialized_t Serialized;
+  SerializedKind_t SerializedKind;
 
   SILGenConformance(SILGenModule &SGM, NormalProtocolConformance *C)
     : SGM(SGM), Conformance(C),
       Linkage(getLinkageForProtocolConformance(Conformance,
                                                ForDefinition)),
-      Serialized(isConformanceSerialized(Conformance))
+      SerializedKind(getConformanceSerializedKind(Conformance))
   {
     auto *proto = Conformance->getProtocol();
 
@@ -554,11 +546,7 @@ public:
     PrettyStackTraceConformance trace("generating SIL witness table",
                                       Conformance);
 
-    // Check whether the conformance is valid first.
     Conformance->resolveValueWitnesses();
-    if (Conformance->isInvalid())
-      return nullptr;
-
     auto *proto = Conformance->getProtocol();
     visitProtocolDecl(proto);
 
@@ -576,7 +564,7 @@ public:
 
       // If we have a declaration, convert the witness table to a definition.
       if (wt->isDeclaration()) {
-        wt->convertToDefinition(Entries, ConditionalConformances, Serialized);
+        wt->convertToDefinition(Entries, ConditionalConformances, SerializedKind);
 
         // Since we had a declaration before, its linkage should be external,
         // ensure that we have a compatible linkage for soundness. *NOTE* we are ok
@@ -593,7 +581,7 @@ public:
     }
 
     // Otherwise if we have no witness table yet, create it.
-    return SILWitnessTable::create(SGM.M, Linkage, Serialized, Conformance,
+    return SILWitnessTable::create(SGM.M, Linkage, SerializedKind, Conformance,
                                    Entries, ConditionalConformances);
   }
 
@@ -619,13 +607,12 @@ public:
     return Conformance->getWitness(decl);
   }
 
-  void addPlaceholder(MissingMemberDecl *placeholder) {
-    llvm_unreachable("generating a witness table with placeholders in it");
-  }
-
-  void addMissingMethod(SILDeclRef requirement) {
-    llvm_unreachable("generating a witness table with placeholders in it");
-  }
+  // Treat placeholders and missing methods as no-ops. These may be encountered
+  // during lazy typechecking when SILGen triggers witness resolution and
+  // discovers and invalid conformance. The diagnostics emitted during witness
+  // resolution should cause compilation to fail.
+  void addPlaceholder(MissingMemberDecl *placeholder) {}
+  void addMissingMethod(SILDeclRef requirement) {}
 
   void addMethodImplementation(SILDeclRef requirementRef,
                                SILDeclRef witnessRef,
@@ -633,11 +620,16 @@ public:
                                Witness witness) {
     // Emit the witness thunk and add it to the table.
     auto witnessLinkage = witnessRef.getLinkage(ForDefinition);
-    auto witnessSerialized = Serialized;
-    if (witnessSerialized &&
-        fixmeWitnessHasLinkageThatNeedsToBePublic(witnessRef)) {
+    auto witnessSerializedKind = SerializedKind;
+    if (witnessSerializedKind != IsNotSerialized &&
+        // If package optimization is enabled, this is false;
+        // witness thunk should get a `shared` linkage in the
+        // else block below.
+        fixmeWitnessHasLinkageThatNeedsToBePublic(
+            witnessRef,
+            witnessRef.getASTContext().SILOpts.EnableSerializePackage)) {
       witnessLinkage = SILLinkage::Public;
-      witnessSerialized = IsNotSerialized;
+      witnessSerializedKind = IsNotSerialized;
     } else {
       // This is the "real" rule; the above case should go away once we
       // figure out what's going on.
@@ -646,7 +638,7 @@ public:
       witnessLinkage = SILLinkage::Private;
 
       // Unless the witness table is going to be serialized.
-      if (witnessSerialized)
+      if (witnessSerializedKind != IsNotSerialized)
         witnessLinkage = SILLinkage::Shared;
 
       // Or even if its not serialized, it might be for an imported
@@ -660,7 +652,7 @@ public:
     }
 
     SILFunction *witnessFn = SGM.emitProtocolWitness(
-        ProtocolConformanceRef(Conformance), witnessLinkage, witnessSerialized,
+        ProtocolConformanceRef(Conformance), witnessLinkage, witnessSerializedKind,
         requirementRef, witnessRef, isFree, witness);
     Entries.push_back(
                     SILWitnessTable::MethodWitness{requirementRef, witnessFn});
@@ -691,9 +683,8 @@ public:
   void addConditionalRequirements() {
     SILWitnessTable::enumerateWitnessTableConditionalConformances(
         Conformance, [&](unsigned, CanType type, ProtocolDecl *protocol) {
-          auto conformance =
-              Conformance->getGenericSignature()->lookupConformance(type,
-                                                                    protocol);
+          auto conformance = lookupConformance(type, protocol,
+                                               /*allowMissing=*/true);
           assert(conformance &&
                  "unable to find conformance that should be known");
 
@@ -722,8 +713,8 @@ SILGenModule::getWitnessTable(NormalProtocolConformance *conformance) {
 
 SILFunction *SILGenModule::emitProtocolWitness(
     ProtocolConformanceRef conformance, SILLinkage linkage,
-    IsSerialized_t isSerialized, SILDeclRef requirement, SILDeclRef witnessRef,
-    IsFreeFunctionWitness_t isFree, Witness witness) {
+    SerializedKind_t serializedKind, SILDeclRef requirement,
+    SILDeclRef witnessRef, IsFreeFunctionWitness_t isFree, Witness witness) {
   auto requirementInfo =
       Types.getConstantInfo(TypeExpansionContext::minimal(), requirement);
 
@@ -849,7 +840,7 @@ SILFunction *SILGenModule::emitProtocolWitness(
   SILGenFunctionBuilder builder(*this);
   auto *f = builder.createFunction(
       linkage, nameBuffer, witnessSILFnType, genericEnv,
-      SILLocation(witnessRef.getDecl()), IsNotBare, IsTransparent, isSerialized,
+      SILLocation(witnessRef.getDecl()), IsNotBare, IsTransparent, serializedKind,
       IsNotDynamic, IsNotDistributed, IsNotRuntimeAccessible, ProfileCounter(),
       IsThunk, SubclassScope::NotApplicable, InlineStrategy);
 
@@ -969,7 +960,7 @@ class SILGenSelfConformanceWitnessTable
   SILGenModule &SGM;
   SelfProtocolConformance *conformance;
   SILLinkage linkage;
-  IsSerialized_t serialized;
+  SerializedKind_t serialized;
 
   SmallVector<SILWitnessTable::Entry, 8> entries;
 public:
@@ -977,7 +968,7 @@ public:
                                     SelfProtocolConformance *conformance)
     : SGM(SGM), conformance(conformance),
       linkage(getLinkageForProtocolConformance(conformance, ForDefinition)),
-      serialized(isConformanceSerialized(conformance)) {
+      serialized(getConformanceSerializedKind(conformance)) {
   }
 
   void emit() {
@@ -1121,7 +1112,7 @@ void SILGenModule::emitNonCopyableTypeDeinitTable(NominalTypeDecl *nom) {
 
   SILDeclRef constant(dd, SILDeclRef::Kind::Deallocator);
   SILFunction *f = getFunction(constant, NotForDefinition);
-  auto serialized = IsSerialized_t::IsNotSerialized;
+  auto serialized = SerializedKind_t::IsNotSerialized;
   bool nomIsPublic = nom->getEffectiveAccess() >= AccessLevel::Public;
   // We only serialize the deinit if the type is public and not resilient.
   if (nomIsPublic && !nom->isResilient())
@@ -1153,8 +1144,10 @@ public:
 
     // Build a vtable if this is a class.
     if (auto theClass = dyn_cast<ClassDecl>(theType)) {
-      SILGenVTable genVTable(SGM, theClass);
-      genVTable.emitVTable();
+      if (!theClass->hasClangNode()) {
+        SILGenVTable genVTable(SGM, theClass);
+        genVTable.emitVTable();
+      }
     }
 
     // If this is a nominal type that is move only, emit a deinit table for it.

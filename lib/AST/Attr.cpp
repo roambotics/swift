@@ -28,6 +28,7 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/QuotedString.h"
 #include "swift/Strings.h"
@@ -143,6 +144,24 @@ const char *TypeAttribute::getAttrName(TypeAttrKind kind) {
 #include "swift/AST/TypeAttr.def"
   }
   llvm_unreachable("unknown type attribute kind");
+}
+
+bool TypeAttribute::isUserInaccessible(TypeAttrKind DK) {
+  // Currently we can base this off whether it is underscored or for SIL.
+  // TODO: We could introduce a similar options scheme to DECL_ATTR if we ever
+  // need a user-inaccessible non-underscored attribute.
+  switch (DK) {
+    // SIL attributes are always considered user-inaccessible.
+#define SIL_TYPE_ATTR(SPELLING, C)                                             \
+  case TypeAttrKind::C:                                                        \
+    return true;
+    // For non-SIL attributes, check whether the spelling is underscored.
+#define TYPE_ATTR(SPELLING, C)                                                 \
+  case TypeAttrKind::C:                                                        \
+    return StringRef(#SPELLING).starts_with("_");
+#include "swift/AST/TypeAttr.def"
+  }
+  llvm_unreachable("unhandled case in switch!");
 }
 
 TypeAttribute *TypeAttribute::createSimple(const ASTContext &context,
@@ -497,6 +516,13 @@ DeclAttributes::getDeprecated(const ASTContext &ctx) const {
         return AvAttr;
 
       std::optional<llvm::VersionTuple> DeprecatedVersion = AvAttr->Deprecated;
+
+      StringRef DeprecatedPlatform = AvAttr->prettyPlatformString();
+      llvm::VersionTuple RemappedDeprecatedVersion;
+      if (AvailabilityInference::updateDeprecatedPlatformForFallback(
+          AvAttr, ctx, DeprecatedPlatform, RemappedDeprecatedVersion))
+        DeprecatedVersion = RemappedDeprecatedVersion;
+
       if (!DeprecatedVersion.has_value())
         continue;
 
@@ -591,7 +617,8 @@ const AvailableAttr *DeclAttributes::getNoAsync(const ASTContext &ctx) const {
 }
 
 const BackDeployedAttr *
-DeclAttributes::getBackDeployed(const ASTContext &ctx) const {
+DeclAttributes::getBackDeployed(const ASTContext &ctx,
+                                bool forTargetVariant) const {
   const BackDeployedAttr *bestAttr = nullptr;
 
   for (auto attr : *this) {
@@ -600,7 +627,7 @@ DeclAttributes::getBackDeployed(const ASTContext &ctx) const {
       continue;
 
     if (backDeployedAttr->isInvalid() ||
-        !backDeployedAttr->isActivePlatform(ctx))
+        !backDeployedAttr->isActivePlatform(ctx, forTargetVariant))
       continue;
 
     // We have an attribute that is active for the platform, but
@@ -1620,12 +1647,6 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
   case DeclAttrKind::MacroRole: {
     auto Attr = cast<MacroRoleAttr>(this);
 
-    // Suppress @attached(extension) if needed.
-    if (!Options.PrintExtensionMacroAttributes &&
-        Attr->getMacroRole() == MacroRole::Extension) {
-      break;
-    }
-
     switch (Attr->getMacroSyntax()) {
     case MacroSyntax::Freestanding:
       Printer.printAttrName("@freestanding");
@@ -2206,8 +2227,9 @@ bool AvailableAttr::isActivePlatform(const ASTContext &ctx) const {
   return isPlatformActive(Platform, ctx.LangOpts);
 }
 
-bool BackDeployedAttr::isActivePlatform(const ASTContext &ctx) const {
-  return isPlatformActive(Platform, ctx.LangOpts);
+bool BackDeployedAttr::isActivePlatform(const ASTContext &ctx,
+                                        bool forTargetVariant) const {
+  return isPlatformActive(Platform, ctx.LangOpts, forTargetVariant);
 }
 
 AvailableAttr *AvailableAttr::clone(ASTContext &C, bool implicit) const {
@@ -2335,18 +2357,32 @@ AvailableVersionComparison AvailableAttr::getVersionAvailability(
     return AvailableVersionComparison::Unavailable;
 
   llvm::VersionTuple queryVersion = getActiveVersion(ctx);
+  std::optional<llvm::VersionTuple> ObsoletedVersion = Obsoleted;
+
+  StringRef ObsoletedPlatform = prettyPlatformString();
+  llvm::VersionTuple RemappedObsoletedVersion;
+  if (AvailabilityInference::updateObsoletedPlatformForFallback(
+      this, ctx, ObsoletedPlatform, RemappedObsoletedVersion))
+    ObsoletedVersion = RemappedObsoletedVersion;
 
   // If this entity was obsoleted before or at the query platform version,
   // consider it obsolete.
-  if (Obsoleted && *Obsoleted <= queryVersion)
+  if (ObsoletedVersion && *ObsoletedVersion <= queryVersion)
     return AvailableVersionComparison::Obsoleted;
+
+  std::optional<llvm::VersionTuple> IntroducedVersion = Introduced;
+  StringRef IntroducedPlatform = prettyPlatformString();
+  llvm::VersionTuple RemappedIntroducedVersion;
+  if (AvailabilityInference::updateIntroducedPlatformForFallback(
+      this, ctx, IntroducedPlatform, RemappedIntroducedVersion))
+    IntroducedVersion = RemappedIntroducedVersion;
 
   // If this entity was introduced after the query version and we're doing a
   // platform comparison, true availability can only be determined dynamically;
   // if we're doing a _language_ version check, the query version is a
   // static requirement, so we treat "introduced later" as just plain
   // unavailable.
-  if (Introduced && *Introduced > queryVersion) {
+  if (IntroducedVersion && *IntroducedVersion > queryVersion) {
     if (isLanguageVersionSpecific() || isPackageDescriptionVersionSpecific())
       return AvailableVersionComparison::Unavailable;
     else

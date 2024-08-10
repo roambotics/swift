@@ -22,6 +22,7 @@
 
 #define DEBUG_TYPE "copy-propagation"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SILOptimizer/Utils/CanonicalizeBorrowScope.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/InstructionUtils.h"
@@ -140,6 +141,7 @@ SILValue CanonicalizeBorrowScope::getCanonicalBorrowedDef(SILValue def) {
 
       case BorrowedValueKind::LoadBorrow:
       case BorrowedValueKind::Phi:
+      case BorrowedValueKind::BeginApplyToken:
         break;
       }
     }
@@ -170,6 +172,7 @@ bool CanonicalizeBorrowScope::computeBorrowLiveness() {
     // can handle persistentCopies.
     return false;
   case BorrowedValueKind::BeginBorrow:
+  case BorrowedValueKind::BeginApplyToken:
     break;
   }
   // Note that there is no need to look through any reborrows. The reborrowed
@@ -857,7 +860,7 @@ namespace swift::test {
 // Dumps:
 // - function after value canonicalization
 static FunctionTest CanonicalizeBorrowScopeTest(
-    "canonicalize-borrow-scope",
+    "canonicalize_borrow_scope",
     [](auto &function, auto &arguments, auto &test) {
       auto value = arguments.takeValue();
       auto borrowedValue = BorrowedValue(value);

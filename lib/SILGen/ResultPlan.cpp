@@ -17,7 +17,9 @@
 #include "LValue.h"
 #include "RValue.h"
 #include "SILGenFunction.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/AbstractionPatternGenerators.h"
 
 using namespace swift;
@@ -783,7 +785,7 @@ public:
           throws ? SGF.SGM.getCreateCheckedThrowingContinuation()
                  : SGF.SGM.getCreateCheckedContinuation();
 
-      auto conformances = SGF.SGM.M.getSwiftModule()->collectExistentialConformances(
+      auto conformances = collectExistentialConformances(
           continuationTy, ctx.TheAnyType);
 
       // In this case block storage captures `Any` which would be initialized
@@ -972,7 +974,7 @@ public:
             SGF.F.mapTypeIntoContext(resumeType)->getCanonicalType()};
         auto subs = SubstitutionMap::get(errorIntrinsic->getGenericSignature(),
                                          replacementTypes,
-                         LookUpConformanceInModule(SGF.SGM.M.getSwiftModule()));
+                                         LookUpConformanceInModule());
 
         SGF.emitApplyOfLibraryIntrinsic(
             loc, errorIntrinsic, subs,

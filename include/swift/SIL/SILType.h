@@ -366,6 +366,9 @@ public:
   /// address-only. This is the opposite of isLoadable.
   bool isAddressOnly(const SILFunction &F) const;
 
+  /// For details see the comment of `IsFixedABI_t`.
+  bool isFixedABI(const SILFunction &F) const;
+
   /// True if the underlying AST type is trivial, meaning it is loadable and can
   /// be trivially copied, moved or destroyed. Returns false for address types
   /// even though they are technically trivial.
@@ -461,13 +464,19 @@ public:
   }
 
   /// Returns true if the referenced type is expressed in terms of one
-  /// or more opened existential types.
+  /// or more opened existential archetypes.
   bool hasOpenedExistential() const {
     return getASTType()->hasOpenedExistential();
   }
 
   TypeTraitResult canBeClass() const {
     return getASTType()->canBeClass();
+  }
+
+  /// Returns true if the referenced type is expressed in terms of one
+  /// or more element archetypes.
+  bool hasElementArchetype() const {
+    return getASTType()->hasElementArchetype();
   }
 
   /// Returns true if the referenced type is expressed in terms of one
@@ -481,7 +490,13 @@ public:
   bool hasParameterizedExistential() const {
     return getASTType()->hasParameterizedExistential();
   }
-  
+
+  bool isSensitive() const {
+    if (auto *nom = getNominalOrBoundGenericNominal())
+      return nom->getAttrs().hasAttribute<SensitiveAttr>();
+    return false;
+  }
+
   /// Returns the representation used by an existential type. If the concrete
   /// type is provided, this may return a specialized representation kind that
   /// can be used for that type. Otherwise, returns the most general
@@ -549,6 +564,13 @@ public:
     // Handle whatever AST types are known to hold functions. Namely tuples.
     return ty->isNoEscape();
   }
+  
+  bool isThickFunction() const {
+    if (auto *fTy = getASTType()->getAs<SILFunctionType>()) {
+      return fTy->getRepresentation() == SILFunctionType::Representation::Thick;
+    }
+    return false;
+  }
 
   bool isAsyncFunction() const {
     if (auto *fTy = getASTType()->getAs<SILFunctionType>()) {
@@ -557,8 +579,13 @@ public:
     return false;
   }
 
-  /// True if the type involves any archetypes.
+  /// True if the type involves any primary or local archetypes.
   bool hasArchetype() const { return getASTType()->hasArchetype(); }
+
+  /// True if the type involves any primary archetypes.
+  bool hasPrimaryArchetype() const {
+    return getASTType()->hasPrimaryArchetype();
+  }
 
   /// True if the type involves any opaque archetypes.
   bool hasOpaqueArchetype() const {
@@ -759,10 +786,6 @@ public:
   /// representation. Class existentials do not always qualify.
   bool isHeapObjectReferenceType() const;
 
-  /// Returns true if this SILType is an aggregate that contains \p Ty
-  bool aggregateContainsRecord(SILType Ty, SILModule &SILMod,
-                               TypeExpansionContext context) const;
-
   /// Returns true if this SILType is an aggregate with unreferenceable storage,
   /// meaning it cannot be fully destructured in SIL.
   bool aggregateHasUnreferenceableStorage() const;
@@ -844,7 +867,15 @@ public:
   ///
   /// DISCUSSION: This is separate from removingMoveOnlyWrapper since this API
   /// requires a SILFunction * and is specialized.
-  SILType removingMoveOnlyWrapperToBoxedType(const SILFunction *fn);
+  SILType removingMoveOnlyWrapperFromBoxedType(const SILFunction *fn);
+
+  /// Whether there's a direct wrapper or a wrapper inside a box.
+  bool hasAnyMoveOnlyWrapping(const SILFunction *fn) {
+    return isMoveOnlyWrapped() || isBoxedMoveOnlyWrappedType(fn);
+  }
+
+  /// Removes a direct wrapper from a type or a wrapper from a type in a box.
+  SILType removingAnyMoveOnlyWrapping(const SILFunction *fn);
 
   /// Returns a SILType with any archetypes mapped out of context.
   SILType mapTypeOutOfContext() const;
@@ -866,6 +897,17 @@ public:
 
   /// Returns true if this SILType is a differentiable type.
   bool isDifferentiable(SILModule &M) const;
+
+  /// Returns the @_rawLayout attribute on this type if it has one.
+  RawLayoutAttr *getRawLayout() const {
+    auto sd = getStructOrBoundGenericStruct();
+
+    if (!sd) {
+      return nullptr;
+    }
+
+    return sd->getAttrs().getAttribute<RawLayoutAttr>();
+  }
 
   /// If this is a SILBoxType, return getSILBoxFieldType(). Otherwise, return
   /// SILType().
@@ -898,7 +940,7 @@ public:
     return getSILBoxFieldType(fn).isMoveOnlyWrapped();
   }
 
-  SILType getInstanceTypeOfMetatype(SILFunction *function) const;
+  SILType getLoweredInstanceTypeOfMetatype(SILFunction *function) const;
 
   MetatypeRepresentation getRepresentationOfMetatype(SILFunction *function) const;
 
@@ -911,7 +953,15 @@ public:
 
   bool isMarkedAsImmortal() const;
 
+  /// Returns true if this type is an actor type. Returns false if this is any
+  /// other type. This includes distributed actors. To check for distributed
+  /// actors and actors, use isAnyActor().
   bool isActor() const { return getASTType()->isActorType(); }
+
+  bool isDistributedActor() const { return getASTType()->isDistributedActor(); }
+
+  /// Returns true if this type is an actor or a distributed actor.
+  bool isAnyActor() const { return getASTType()->isAnyActorType(); }
 
   /// Returns true if this function conforms to the Sendable protocol.
   bool isSendable(SILFunction *fn) const;

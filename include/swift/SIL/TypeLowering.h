@@ -704,6 +704,28 @@ struct FunctionTypeInfo {
   CanSILFunctionType ExpectedLoweredType;
 };
 
+/// Return type of getGenericSignatureWithCapturedEnvironments().
+struct GenericSignatureWithCapturedEnvironments {
+  GenericSignature baseGenericSig;
+  GenericSignature genericSig;
+  ArrayRef<GenericEnvironment *> capturedEnvs;
+
+  explicit GenericSignatureWithCapturedEnvironments() {}
+
+  explicit GenericSignatureWithCapturedEnvironments(
+      GenericSignature baseGenericSig)
+    : baseGenericSig(baseGenericSig),
+      genericSig(baseGenericSig) {}
+
+  GenericSignatureWithCapturedEnvironments(
+      GenericSignature baseGenericSig,
+      GenericSignature genericSig,
+      ArrayRef<GenericEnvironment *> capturedEnvs)
+    : baseGenericSig(baseGenericSig),
+      genericSig(genericSig),
+      capturedEnvs(capturedEnvs) {}
+};
+
 /// TypeConverter - helper class for creating and managing TypeLowerings.
 class TypeConverter {
   friend class TypeLowering;
@@ -1047,11 +1069,25 @@ public:
   const SILConstantInfo &getConstantInfo(TypeExpansionContext context,
                                          SILDeclRef constant);
 
-  /// Get the generic environment for a constant.
-  GenericSignature getConstantGenericSignature(SILDeclRef constant);
+  /// Get the generic signature for a constant.
+  GenericSignatureWithCapturedEnvironments
+  getGenericSignatureWithCapturedEnvironments(SILDeclRef constant);
+
+  /// Get the substitution map for calling a constant.
+  SubstitutionMap
+  getSubstitutionMapWithCapturedEnvironments(SILDeclRef constant,
+                                             const CaptureInfo &captureInfo,
+                                             SubstitutionMap subs);
 
   /// Get the generic environment for a constant.
   GenericEnvironment *getConstantGenericEnvironment(SILDeclRef constant);
+
+  /// Get the generic environment for SILGen to use. The substitution map
+  /// sends the generic parameters of the function's interface type into
+  /// archetypes, which will either be primary archetypes from this
+  /// environment, or local archetypes captured by this function.
+  std::tuple<GenericEnvironment *, ArrayRef<GenericEnvironment *>, SubstitutionMap>
+  getForwardingSubstitutionsForLowering(SILDeclRef constant);
 
   /// Returns the SIL type of a constant reference.
   SILType getConstantType(TypeExpansionContext context, SILDeclRef constant) {
@@ -1217,13 +1253,25 @@ public:
                                         SILDeclRef constant,
                                         CanAnyFunctionType origInterfaceType);
 
-  /// Get the boxed interface type to use for a capture of the given decl.
+  /// Get the interface type for a box that holds a mutable local 'var',
+  /// substituted for a closure that captures some superset of the local
+  /// environments captured by the 'var'.
   CanSILBoxType
   getInterfaceBoxTypeForCapture(ValueDecl *captured,
-                                CanType loweredInterfaceType,
+                                CanType loweredContextType,
+                                GenericSignature genericSig,
+                                ArrayRef<GenericEnvironment *> capturedEnvs,
                                 bool isMutable);
-  /// Get the boxed contextual type to use for a capture of the given decl
-  /// in the given generic environment.
+
+  /// Get the interface type for a box that holds a mutable local 'var',
+  /// given that the interface type of the 'var' might capture local
+  /// archetypes.
+  CanSILBoxType
+  getInterfaceBoxTypeForCapture(ValueDecl *captured,
+                                CanType loweredContextType,
+                                bool isMutable);
+
+  /// Get the contextual type for a box that holds a mutable local 'var'.
   CanSILBoxType
   getContextBoxTypeForCapture(ValueDecl *captured,
                               CanType loweredContextType,

@@ -1317,17 +1317,18 @@ public:
   bool diagnoseAsError() override;
 };
 
-/// Diagnose cases where a member only accessible on generic constraints
-/// requiring conformance to a protocol is used on a value of the
-/// existential protocol type e.g.
+/// Diagnose cases where a protocol member cannot be accessed with an
+/// existential, e.g. due to occurrences of `Self` in non-covariant position in
+/// the type of the member reference:
 ///
 /// ```swift
+/// struct G<T> {}
 /// protocol P {
-///   var foo: Self { get }
+///   func foo() -> G<Self>
 /// }
 ///
-/// func bar<X : P>(p: X) {
-///   p.foo
+/// func bar(p: any P) {
+///   p.foo()
 /// }
 /// ```
 class InvalidMemberRefOnExistential final : public InvalidMemberRefFailure {
@@ -1631,11 +1632,13 @@ private:
 /// ```
 class InaccessibleMemberFailure final : public FailureDiagnostic {
   ValueDecl *Member;
+  bool IsMissingImport;
 
 public:
   InaccessibleMemberFailure(const Solution &solution, ValueDecl *member,
-                            ConstraintLocator *locator)
-      : FailureDiagnostic(solution, locator), Member(member) {}
+                            ConstraintLocator *locator, bool isMissingImport)
+      : FailureDiagnostic(solution, locator), Member(member),
+        IsMissingImport(isMissingImport) {}
 
   bool diagnoseAsError() override;
 };
@@ -1850,20 +1853,6 @@ class NotCompileTimeConstFailure final : public FailureDiagnostic {
 public:
   NotCompileTimeConstFailure(const Solution &solution, ConstraintLocator *locator)
       : FailureDiagnostic(solution, locator) {}
-
-  bool diagnoseAsError() override;
-};
-
-class NotCopyableFailure final : public FailureDiagnostic {
-  Type noncopyableTy;
-  NoncopyableMatchFailure failure;
-public:
-  NotCopyableFailure(const Solution &solution,
-                     Type noncopyableTy,
-                     NoncopyableMatchFailure failure,
-                     ConstraintLocator *locator)
-      : FailureDiagnostic(solution, locator),
-        noncopyableTy(noncopyableTy), failure(failure) {}
 
   bool diagnoseAsError() override;
 };
@@ -2299,6 +2288,19 @@ private:
   void emitSuggestionNotes() const;
 };
 
+class SendingMismatchFailure final : public ContextualFailure {
+public:
+  SendingMismatchFailure(const Solution &solution, Type srcType, Type dstType,
+                         ConstraintLocator *locator, FixBehavior fixBehavior)
+      : ContextualFailure(solution, srcType, dstType, locator, fixBehavior) {}
+
+  bool diagnoseAsError() override;
+
+private:
+  bool diagnoseArgFailure();
+  bool diagnoseResultFailure();
+};
+
 class AssignmentTypeMismatchFailure final : public ContextualFailure {
 public:
   AssignmentTypeMismatchFailure(const Solution &solution,
@@ -2610,6 +2612,20 @@ class MissingContextualTypeForNil final : public FailureDiagnostic {
 public:
   MissingContextualTypeForNil(const Solution &solution,
                               ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator) {}
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose a placeholder type in an invalid place, e.g:
+///
+/// \code
+/// y as? _
+/// \endcode
+class InvalidPlaceholderFailure final : public FailureDiagnostic {
+public:
+  InvalidPlaceholderFailure(const Solution &solution,
+                            ConstraintLocator *locator)
       : FailureDiagnostic(solution, locator) {}
 
   bool diagnoseAsError() override;
@@ -3105,12 +3121,25 @@ public:
 /// \endcode
 class ConcreteTypeSpecialization final : public FailureDiagnostic {
   Type ConcreteType;
+  ValueDecl *Decl;
 
 public:
   ConcreteTypeSpecialization(const Solution &solution, Type concreteTy,
-                             ConstraintLocator *locator)
-      : FailureDiagnostic(solution, locator),
-        ConcreteType(resolveType(concreteTy)) {}
+                             ValueDecl *decl, ConstraintLocator *locator,
+                             FixBehavior fixBehavior)
+      : FailureDiagnostic(solution, locator, fixBehavior),
+        ConcreteType(resolveType(concreteTy)), Decl(decl) {}
+
+  bool diagnoseAsError() override;
+};
+
+class GenericFunctionSpecialization final : public FailureDiagnostic {
+  ValueDecl *Decl;
+
+public:
+  GenericFunctionSpecialization(const Solution &solution, ValueDecl *decl,
+                                ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator), Decl(decl) {}
 
   bool diagnoseAsError() override;
 };

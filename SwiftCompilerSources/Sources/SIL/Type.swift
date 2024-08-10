@@ -56,14 +56,18 @@ public struct Type : CustomStringConvertible, NoReflectionChildren {
   public var isEnum: Bool { bridged.isEnumOrBoundGenericEnum() }
   public var isFunction: Bool { bridged.isFunction() }
   public var isMetatype: Bool { bridged.isMetatype() }
+  public var isClassExistential: Bool { bridged.isClassExistential() }
   public var isNoEscapeFunction: Bool { bridged.isNoEscapeFunction() }
   public var containsNoEscapeFunction: Bool { bridged.containsNoEscapeFunction() }
+  public var isThickFunction: Bool { bridged.isThickFunction() }
   public var isAsyncFunction: Bool { bridged.isAsyncFunction() }
 
   public var canBeClass: BridgedType.TraitResult { bridged.canBeClass() }
 
   public var isMoveOnly: Bool { bridged.isMoveOnly() }
 
+  // Note that invalid types are not considered Escapable. This makes it difficult to make any assumptions about
+  // nonescapable types.
   public func isEscapable(in function: Function) -> Bool {
     bridged.isEscapable(function.bridged)
   }
@@ -91,11 +95,19 @@ public struct Type : CustomStringConvertible, NoReflectionChildren {
     bridged.isExactSuperclassOf(type.bridged)
   }
 
+  public var isVoid: Bool {
+    bridged.isVoid()
+  }
+
   public func isEmpty(in function: Function) -> Bool {
     bridged.isEmpty(function.bridged)
   }
 
   public var tupleElements: TupleElementArray { TupleElementArray(type: self) }
+
+  public func getLoweredType(in function: Function) -> Type {
+    function.bridged.getLoweredType(self.bridged).type
+  }
 
   /// Can only be used if the type is in fact a nominal type (`isNominal` is true).
   /// Returns nil if the nominal is a resilient type because in this case the complete list
@@ -119,8 +131,8 @@ public struct Type : CustomStringConvertible, NoReflectionChildren {
 
   public typealias MetatypeRepresentation = BridgedType.MetatypeRepresentation
 
-  public func instanceTypeOfMetatype(in function: Function) -> Type {
-    bridged.getInstanceTypeOfMetatype(function.bridged).type
+  public func loweredInstanceTypeOfMetatype(in function: Function) -> Type {
+    bridged.getLoweredInstanceTypeOfMetatype(function.bridged).type
   }
 
   public var isDynamicSelfMetatype: Bool {
@@ -142,9 +154,36 @@ public struct Type : CustomStringConvertible, NoReflectionChildren {
     return idx >= 0 ? idx : nil
   }
 
+  /// Returns true if this is a struct, enum or tuple and `otherType` is contained in this type - or is the same type.
+  public func aggregateIsOrContains(_ otherType: Type, in function: Function) -> Bool {
+    if self == otherType {
+      return true
+    }
+    if isStruct {
+      guard let fields = getNominalFields(in: function) else {
+        return true
+      }
+      return fields.contains { $0.aggregateIsOrContains(otherType, in: function) }
+    }
+    if isTuple {
+      return tupleElements.contains { $0.aggregateIsOrContains(otherType, in: function) }
+    }
+    if isEnum {
+      guard let cases = getEnumCases(in: function) else {
+        return true
+      }
+      return cases.contains { $0.payload?.aggregateIsOrContains(otherType, in: function) ?? false }
+    }
+    return false
+  }
+
+// compiling bridged.getFunctionTypeWithNoEscape crashes the 5.10 Windows compiler
+#if !os(Windows)
+  // TODO: https://github.com/apple/swift/issues/73253
   public func getFunctionType(withNoEscape: Bool) -> Type {
     bridged.getFunctionTypeWithNoEscape(withNoEscape).type
   }
+#endif
 
   public var description: String {
     String(taking: bridged.getDebugDescription())

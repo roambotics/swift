@@ -2316,7 +2316,7 @@ public:
   const llvm::VersionTuple Version;
 
   /// Returns true if this attribute is active given the current platform.
-  bool isActivePlatform(const ASTContext &ctx) const;
+  bool isActivePlatform(const ASTContext &ctx, bool forTargetVariant) const;
 
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DeclAttrKind::BackDeployed;
@@ -2422,6 +2422,9 @@ public:
 
 class ObjCImplementationAttr final : public DeclAttribute {
 public:
+  /// Name of the category being implemented. This should only be used with
+  /// the early adopter \@\_objcImplementation syntax, but we support it there
+  /// for backwards compatibility.
   Identifier CategoryName;
 
   ObjCImplementationAttr(Identifier CategoryName, SourceLoc AtLoc,
@@ -2533,6 +2536,8 @@ class RawLayoutAttr final : public DeclAttribute {
   unsigned SizeOrCount;
   /// If `LikeType` is null, the alignment in bytes to use for the raw storage.
   unsigned Alignment;
+  /// If a value of this raw layout type should move like its `LikeType`.
+  bool MovesAsLike = false;
   /// The resolved like type.
   mutable Type CachedResolvedLikeType = Type();
 
@@ -2540,17 +2545,20 @@ class RawLayoutAttr final : public DeclAttribute {
 
 public:
   /// Construct a `@_rawLayout(like: T)` attribute.
-  RawLayoutAttr(TypeRepr *LikeType, SourceLoc AtLoc, SourceRange Range)
-      : DeclAttribute(DeclAttrKind::RawLayout, AtLoc, Range,
-                      /*implicit*/ false),
-        LikeType(LikeType), SizeOrCount(0), Alignment(~0u) {}
-
-  /// Construct a `@_rawLayout(likeArrayOf: T, count: N)` attribute.
-  RawLayoutAttr(TypeRepr *LikeType, unsigned Count, SourceLoc AtLoc,
+  RawLayoutAttr(TypeRepr *LikeType, bool movesAsLike, SourceLoc AtLoc,
                 SourceRange Range)
       : DeclAttribute(DeclAttrKind::RawLayout, AtLoc, Range,
                       /*implicit*/ false),
-        LikeType(LikeType), SizeOrCount(Count), Alignment(0) {}
+        LikeType(LikeType), SizeOrCount(0), Alignment(~0u),
+        MovesAsLike(movesAsLike) {}
+
+  /// Construct a `@_rawLayout(likeArrayOf: T, count: N)` attribute.
+  RawLayoutAttr(TypeRepr *LikeType, unsigned Count, bool movesAsLike,
+                SourceLoc AtLoc, SourceRange Range)
+      : DeclAttribute(DeclAttrKind::RawLayout, AtLoc, Range,
+                      /*implicit*/ false),
+        LikeType(LikeType), SizeOrCount(Count), Alignment(0),
+        MovesAsLike(movesAsLike) {}
 
   /// Construct a `@_rawLayout(size: N, alignment: M)` attribute.
   RawLayoutAttr(unsigned Size, unsigned Alignment, SourceLoc AtLoc,
@@ -2613,6 +2621,11 @@ public:
     if (Alignment == ~0u)
       return std::nullopt;
     return std::make_pair(getResolvedLikeType(sd), SizeOrCount);
+  }
+
+  /// Whether a value of this raw layout should move like its `LikeType`.
+  bool shouldMoveAsLikeType() const {
+    return MovesAsLike;
   }
 
   static bool classof(const DeclAttribute *DA) {
@@ -2693,6 +2706,10 @@ public:
     return getUnavailable(ctx) != nullptr;
   }
 
+  bool isDeprecated(const ASTContext &ctx) const {
+    return getDeprecated(ctx) != nullptr;
+  }
+
   /// Determine whether there is a swiftVersionSpecific attribute that's
   /// unavailable relative to the provided language version.
   bool
@@ -2729,7 +2746,8 @@ public:
 
   /// Returns the `@backDeployed` attribute that is active for the current
   /// platform.
-  const BackDeployedAttr *getBackDeployed(const ASTContext &ctx) const;
+  const BackDeployedAttr *getBackDeployed(const ASTContext &ctx,
+                                          bool forTargetVariant) const;
 
   SWIFT_DEBUG_DUMPER(dump(const Decl *D = nullptr));
   void print(ASTPrinter &Printer, const PrintOptions &Options,
@@ -2859,7 +2877,7 @@ public:
   /// Return whether this attribute set includes the given semantics attribute.
   bool hasSemanticsAttr(StringRef attrValue) const {
     return llvm::any_of(getSemanticsAttrs(), [&](const SemanticsAttr *attr) {
-      return attrValue.equals(attr->Value);
+      return attrValue == attr->Value;
     });
   }
 
@@ -3041,6 +3059,10 @@ public:
 
   /// Return the name (like "autoclosure") for an attribute ID.
   static const char *getAttrName(TypeAttrKind kind);
+
+  /// Returns whether the given attribute is considered "user inaccessible",
+  /// which affects e.g whether it shows up in code completion.
+  static bool isUserInaccessible(TypeAttrKind DK);
 
   static TypeAttribute *createSimple(const ASTContext &context,
                                      TypeAttrKind kind,

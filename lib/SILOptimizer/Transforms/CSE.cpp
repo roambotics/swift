@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-cse"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/InstructionUtils.h"
@@ -1147,7 +1148,7 @@ bool CSE::canHandle(SILInstruction *Inst) {
     // Note that the function also may not contain any retains. And there are
     // functions which are read-none and have a retain, e.g. functions which
     // _convert_ a global_addr to a reference and retain it.
-    auto MB = BCA->getMemoryBehavior(ApplySite(AI), /*observeRetains*/false);
+    auto MB = BCA->getMemoryBehavior(FullApplySite(AI), /*observeRetains*/false);
     if (MB == MemoryBehavior::None)
       return true;
     

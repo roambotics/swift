@@ -12,9 +12,8 @@
 
 import ASTBridging
 import BasicBridging
-import SwiftCompilerPluginMessageHandling
+@_spi(PluginMessage) import SwiftCompilerPluginMessageHandling
 import SwiftSyntax
-import swiftLLVMJSON
 
 enum PluginError: String, Error, CustomStringConvertible {
   case stalePlugin = "plugin is stale"
@@ -117,7 +116,7 @@ struct CompilerPlugin {
   }
 
   private func sendMessage(_ message: HostToPluginMessage) throws {
-    let hadError = try LLVMJSON.encoding(message) { (data) -> Bool in
+    let hadError = try JSON.encode(message).withUnsafeBufferPointer { (data) -> Bool in
       return Plugin_sendMessage(opaqueHandle, BridgedData(baseAddress: data.baseAddress, count: data.count))
     }
     if hadError {
@@ -133,19 +132,21 @@ struct CompilerPlugin {
       throw PluginError.failedToReceiveMessage
     }
     let data = UnsafeBufferPointer(start: result.baseAddress, count: result.count)
-    return try LLVMJSON.decode(PluginToHostMessage.self, from: data)
+    return try data.withMemoryRebound(to: UInt8.self) { buffer in
+      try JSON.decode(PluginToHostMessage.self, from: buffer)
+    }
   }
 
   func sendMessageAndWaitWithoutLock(_ message: HostToPluginMessage) throws -> PluginToHostMessage {
+    guard !Plugin_spawnIfNeeded(opaqueHandle) else {
+      throw PluginError.stalePlugin
+    }
     try sendMessage(message)
     return try waitForNextMessage()
   }
 
   func sendMessageAndWait(_ message: HostToPluginMessage) throws -> PluginToHostMessage {
     try self.withLock {
-      guard !Plugin_spawnIfNeeded(opaqueHandle) else {
-        throw PluginError.stalePlugin
-      }
       return try sendMessageAndWaitWithoutLock(message);
     }
   }
@@ -192,10 +193,6 @@ struct CompilerPlugin {
       return ptr.assumingMemoryBound(to: Capability.self).pointee
     }
     return nil
-  }
-
-  var executableFilePath: String {
-    return String(cString: Plugin_getExecutableFilePath(opaqueHandle))
   }
 }
 
@@ -318,7 +315,7 @@ class PluginDiagnosticsEngine {
     messageSuffix: String? = nil
   ) {
     for diagnostic in diagnostics {
-      self.emit(diagnostic)
+      self.emit(diagnostic, messageSuffix: messageSuffix)
     }
   }
 
@@ -374,6 +371,26 @@ class PluginDiagnosticsEngine {
       return nil
     }
     return (start: start, end: end)
+  }
+}
+
+extension String {
+  /// Retrieve the base name of a string that represents a path, removing the
+  /// directory.
+  var basename: String {
+    guard
+      let lastSlash = lastIndex(where: {
+        #if os(iOS) || os(macOS) || os(tvOS) || os(watchOS) || os(visionOS) || os(Android) || os(Linux)
+        ["/"].contains($0)
+        #else
+        ["/", "\\"].contains($0)
+        #endif
+      })
+    else {
+      return self
+    }
+
+    return String(self[index(after: lastSlash)...])
   }
 }
 

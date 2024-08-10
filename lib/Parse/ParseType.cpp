@@ -19,6 +19,7 @@
 #include "swift/AST/GenericParamList.h"
 #include "swift/AST/SourceFile.h" // only for isMacroSignatureFile
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Nullability.h"
 #include "swift/Parse/IDEInspectionCallbacks.h"
 #include "swift/Parse/Lexer.h"
@@ -53,17 +54,13 @@ Parser::ParsedTypeAttributeList::applyAttributesToType(Parser &p,
     ty = new (p.Context) CompileTimeConstTypeRepr(ty, ConstLoc);
   }
 
-  if (ResultDependsOnLoc.isValid()) {
-    ty = new (p.Context) ResultDependsOnTypeRepr(ty, ResultDependsOnLoc);
-  }
-
-  if (TransferringLoc.isValid()) {
-    ty = new (p.Context) TransferringTypeRepr(ty, TransferringLoc);
+  if (SendingLoc.isValid()) {
+    ty = new (p.Context) SendingTypeRepr(ty, SendingLoc);
   }
 
   if (!lifetimeDependenceSpecifiers.empty()) {
-    ty = LifetimeDependentReturnTypeRepr::create(p.Context, ty,
-                                                 lifetimeDependenceSpecifiers);
+    ty = LifetimeDependentTypeRepr::create(p.Context, ty,
+                                           lifetimeDependenceSpecifiers);
   }
   return ty;
 }
@@ -311,13 +308,7 @@ ParserResult<TypeRepr> Parser::parseTypeSimple(
 
   // Wrap in an InverseTypeRepr if needed.
   if (tildeLoc) {
-    TypeRepr *repr;
-    if (EnabledNoncopyableGenerics)
-      repr = new (Context) InverseTypeRepr(tildeLoc, ty.get());
-    else
-      repr =
-          ErrorTypeRepr::create(Context, tildeLoc, diag::cannot_suppress_here);
-
+    TypeRepr *repr = new (Context) InverseTypeRepr(tildeLoc, ty.get());
     ty = makeParserResult(ty, repr);
   }
 
@@ -405,8 +396,14 @@ ParserResult<TypeRepr> Parser::parseTypeScalar(
   ParserStatus status;
 
   // Parse attributes.
-  ParsedTypeAttributeList parsedAttributeList;
+  ParsedTypeAttributeList parsedAttributeList(reason);
   status |= parsedAttributeList.parse(*this);
+
+  // If we have a completion, create an ErrorType.
+  if (status.hasCodeCompletion()) {
+    auto *ET = ErrorTypeRepr::create(Context, PreviousLoc);
+    return makeParserCodeCompletionResult<TypeRepr>(ET);
+  }
 
   // Parse generic parameters in SIL mode.
   GenericParamList *generics = nullptr;
@@ -1009,7 +1006,7 @@ Parser::parseTypeSimpleOrComposition(Diag<> MessageID, ParseTypeReason reason) {
             .fixItInsert(FirstTypeLoc, keyword.str() + " ");
       }
 
-      const bool isAnyKeyword = keyword.equals("any");
+      const bool isAnyKeyword = keyword == "any";
 
       if (isAnyKeyword) {
         if (anyLoc.isInvalid()) {
@@ -1207,6 +1204,11 @@ ParserResult<TypeRepr> Parser::parseTypeTupleBody() {
       ObsoletedInOutLoc = SourceLoc();
     }
     Backtracking.reset();
+
+    // Try complete the start of a parameter type since the user may be writing
+    // this as a function type.
+    if (tryCompleteFunctionParamTypeBeginning())
+      return makeParserCodeCompletionStatus();
 
     // Parse the type annotation.
     auto type = parseType(diag::expected_type);
@@ -1474,7 +1476,9 @@ static bool isGenericTypeDisambiguatingToken(Parser &P) {
   auto &tok = P.Tok;
   switch (tok.getKind()) {
   default:
-    return false;
+    // If this is the end of the expr (wouldn't match parseExprSequenceElement),
+    // prefer generic type list over an illegal unary postfix '>' operator.
+    return P.isStartOfSwiftDecl() || P.isStartOfStmt(/*prefer expr=*/true);
   case tok::r_paren:
   case tok::r_square:
   case tok::l_brace:
@@ -1508,7 +1512,7 @@ static bool isGenericTypeDisambiguatingToken(Parser &P) {
 }
 
 bool Parser::canParseAsGenericArgumentList() {
-  if (!Tok.isAnyOperator() || !Tok.getText().equals("<"))
+  if (!Tok.isAnyOperator() || Tok.getText() != "<")
     return false;
 
   BacktrackingScope backtrack(*this);
@@ -1556,6 +1560,8 @@ bool Parser::canParseType() {
   } else if (Tok.isContextualKeyword("any")) {
     consumeToken();
   } else if (Tok.isContextualKeyword("each")) {
+    consumeToken();
+  } else if (Tok.isContextualKeyword("sending")) {
     consumeToken();
   }
 

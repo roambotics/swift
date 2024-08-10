@@ -15,8 +15,10 @@
 #include "DIMemoryUseCollector.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/AST/DistributedDecl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/Stmt.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/SIL/BasicBlockBits.h"
 #include "swift/AST/SemanticAttrs.h"
@@ -491,6 +493,7 @@ namespace {
     void handleTypeOfSelfUse(DIMemoryUse &Use);
     void handleInOutUse(const DIMemoryUse &Use);
     void handleEscapeUse(const DIMemoryUse &Use);
+    void handleFlowSensitiveActorIsolationUse(const DIMemoryUse &Use);
 
     bool diagnoseReturnWithoutInitializingStoredProperties(
         const SILInstruction *Inst, SILLocation loc, const DIMemoryUse &Use);
@@ -565,6 +568,7 @@ LifetimeChecker::LifetimeChecker(const DIMemoryObjectInfo &TheMemory,
     case DIUseKind::LoadForTypeOfSelf:
     case DIUseKind::TypeOfSelf:
     case DIUseKind::Escape:
+    case DIUseKind::FlowSensitiveSelfIsolation:
       continue;
     case DIUseKind::Assign:
     case DIUseKind::Set:
@@ -721,8 +725,13 @@ void LifetimeChecker::noteUninitializedMembers(const DIMemoryUse &Use) {
     std::string Name;
     auto *Decl = TheMemory.getPathStringToElement(i, Name);
     SILLocation Loc = Use.Inst->getLoc();
+    auto propertyInitIsolation = ActorIsolation::forUnspecified();
 
     if (Decl) {
+      if (auto *var = dyn_cast<VarDecl>(Decl)) {
+        propertyInitIsolation = var->getInitializerIsolation();
+      }
+
       // If we found a non-implicit declaration, use its source location.
       if (!Decl->isImplicit())
         Loc = SILLocation(Decl);
@@ -737,8 +746,17 @@ void LifetimeChecker::noteUninitializedMembers(const DIMemoryUse &Use) {
       }
     }
 
-    diagnose(Module, Loc, diag::stored_property_not_initialized,
-             StringRef(Name));
+    if (propertyInitIsolation.isGlobalActor()) {
+      auto *init =
+          dyn_cast<ConstructorDecl>(F.getDeclContext()->getAsDecl());
+      diagnose(Module, Loc, diag::isolated_property_initializer,
+               StringRef(Name), propertyInitIsolation,
+               getActorIsolation(init));
+    } else {
+      diagnose(Module, Loc, diag::stored_property_not_initialized,
+               StringRef(Name));
+    }
+
     emittedNote = true;
   }
 
@@ -1160,6 +1178,10 @@ void LifetimeChecker::doIt() {
     case DIUseKind::BadExplicitStore:
       diagnoseBadExplicitStore(Inst);
       break;
+
+    case DIUseKind::FlowSensitiveSelfIsolation:
+      handleFlowSensitiveActorIsolationUse(Use);
+      break;
     }
   }
 
@@ -1342,6 +1364,73 @@ void LifetimeChecker::handleTypeOfSelfUse(DIMemoryUse &Use) {
     // Clear the Inst pointer just to be sure to avoid use-after-free.
     Use.Inst = nullptr;
   }
+}
+
+void LifetimeChecker::handleFlowSensitiveActorIsolationUse(
+    const DIMemoryUse &Use) {
+  bool IsSuperInitComplete, FailedSelfUse;
+
+  ASTContext &ctx = F.getASTContext();
+  auto builtinInst = cast<BuiltinInst>(Use.Inst);
+  SILBuilderWithScope B(builtinInst);
+  SILValue replacement;
+  SILType optExistentialType = builtinInst->getType();
+  SILLocation loc = builtinInst->getLoc();
+  if (isInitializedAtUse(Use, &IsSuperInitComplete, &FailedSelfUse)) {
+    // 'self' is initialized, so replace this builtin with the appropriate
+    // operation to produce `any Actor.
+
+    SILValue anyActorValue;
+    auto conformance = builtinInst->getSubstitutions().getConformances()[0];
+    if (builtinInst->getBuiltinKind() == BuiltinValueKind::FlowSensitiveSelfIsolation) {
+      // Create a copy of the actor argument, which we intentionally did not
+      // copy in SILGen.
+      SILValue actor = B.createCopyValue(loc, builtinInst->getArguments()[0]);
+
+      // Inject 'self' into 'any Actor'.
+      ProtocolConformanceRef conformances[1] = { conformance };
+      SILType existentialType = optExistentialType.getOptionalObjectType();
+      anyActorValue = B.createInitExistentialRef(
+          loc, existentialType, actor->getType().getASTType(), actor,
+          ctx.AllocateCopy(conformances));
+    } else {
+      // Borrow the actor argument, which we need to form the appropriate
+      // call to the asLocalActor getter.
+      SILValue actor = B.createBeginBorrow(loc, builtinInst->getArguments()[0]);
+
+      // Dig out the getter for asLocalActor.
+      auto asLocalActorDecl = getDistributedActorAsLocalActorComputedProperty(
+          F.getDeclContext()->getParentModule());
+      auto asLocalActorGetter = asLocalActorDecl->getAccessor(AccessorKind::Get);
+      SILDeclRef asLocalActorRef = SILDeclRef(
+          asLocalActorGetter, SILDeclRef::Kind::Func);
+      SILFunction *asLocalActorFunc = F.getModule()
+          .lookUpFunction(asLocalActorRef);
+      SILValue asLocalActorValue = B.createFunctionRef(loc, asLocalActorFunc);
+
+      // Call asLocalActor. It produces an 'any Actor'.
+      anyActorValue = B.createApply(
+          loc,
+          asLocalActorValue,
+          SubstitutionMap::get(asLocalActorGetter->getGenericSignature(),
+                               { actor->getType().getASTType() },
+                               { conformance }),
+                               { actor });
+      B.createEndBorrow(loc, actor);
+    }
+
+    // Then, wrap it in an optional.
+    replacement = B.createEnum(
+        loc, anyActorValue, ctx.getOptionalSomeDecl(), optExistentialType);
+  } else {
+    // 'self' is not initialized yet, so use 'nil'.
+    replacement = B.createEnum(
+        loc, SILValue(), ctx.getOptionalNoneDecl(), optExistentialType);
+  }
+
+  // Introduce the replacement.
+  InstModCallbacks callbacks;
+  replaceAllUsesAndErase(builtinInst, replacement, callbacks);
 }
 
 void LifetimeChecker::emitSelfConsumedDiagnostic(SILInstruction *Inst) {
@@ -2607,7 +2696,7 @@ void LifetimeChecker::processUninitializedRelease(SILInstruction *Release,
   // If we see an alloc_box as the pointer, then we're deallocating a 'box' for
   // self. Make sure that the box gets deallocated (not released) since the
   // pointer it contains will be manually cleaned up.
-  auto *MUI = dyn_cast<MarkUninitializedInst>(Release->getOperand(0));
+  auto *MUI = dyn_cast<MarkUninitializedInst>(Pointer);
 
   if (MUI && isa<AllocBoxInst>(MUI->getOperand())) {
     Pointer = MUI->getSingleUserOfType<ProjectBoxInst>();
@@ -2640,6 +2729,12 @@ void LifetimeChecker::processUninitializedRelease(SILInstruction *Release,
       if (classDecl && classDecl->isRootDefaultActor()) {
           emitDefaultActorDestroy(B, Loc, Pointer);
       }
+    }
+
+    // Cast back down from an upcast.
+    if (auto *UI = dyn_cast<UpcastInst>(Pointer)) {
+      Pointer =
+          B.createUncheckedRefCast(Loc, Pointer, UI->getOperand()->getType());
     }
 
     // We've already destroyed any instance variables initialized by this

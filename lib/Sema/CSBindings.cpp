@@ -17,6 +17,7 @@
 #include "TypeChecker.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Sema/ConstraintGraph.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/SetVector.h"
@@ -1671,6 +1672,16 @@ PotentialBindings::inferFromRelational(Constraint *constraint) {
       break;
     }
 
+    case ConstraintKind::OptionalObject: {
+      // Type variable that represents an object type of
+      // an un-inferred optional is adjacent to a type
+      // variable that presents such optional (`bindingTypeVar`
+      // in this case).
+      if (kind == AllowedBindingKind::Supertypes)
+        AdjacentVars.insert({bindingTypeVar, constraint});
+      break;
+    }
+
     default:
       break;
     }
@@ -2517,6 +2528,11 @@ TypeVariableBinding::fixForHole(ConstraintSystem &cs) const {
       ConstraintFix *fix = SpecifyContextualTypeForNil::create(cs, dstLocator);
       return std::make_pair(fix, /*impact=*/(unsigned)10);
     }
+
+    // If the placeholder is in an invalid position, we'll have already
+    // recorded a fix, and can skip recording another.
+    if (cs.hasFixFor(dstLocator, FixKind::IgnoreInvalidPlaceholder))
+      return std::nullopt;
 
     ConstraintFix *fix = SpecifyTypeForPlaceholder::create(cs, srcLocator);
     return std::make_pair(fix, defaultImpact);

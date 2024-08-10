@@ -18,6 +18,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/Notifications.h"
@@ -687,6 +688,28 @@ SILValue SILModule::getRootLocalArchetypeDef(CanLocalArchetypeType archetype,
   return def;
 }
 
+void SILModule::reclaimUnresolvedLocalArchetypeDefinitions() {
+  llvm::DenseMap<LocalArchetypeKey, SILValue> newLocalArchetypeDefs;
+
+  for (auto pair : RootLocalArchetypeDefs) {
+    if (auto *placeholder = dyn_cast<PlaceholderValue>(pair.second)) {
+      // If a placeholder has no uses, the instruction that introduced it
+      // was deleted before the local archetype was resolved. Reclaim the
+      // placeholder so that we don't complain.
+      if (placeholder->use_empty()) {
+        assert(numUnresolvedLocalArchetypes > 0);
+        --numUnresolvedLocalArchetypes;
+        ::delete placeholder;
+        continue;
+      }
+    }
+
+    newLocalArchetypeDefs.insert(pair);
+  }
+
+  std::swap(newLocalArchetypeDefs, RootLocalArchetypeDefs);
+}
+
 bool SILModule::hasUnresolvedLocalArchetypeDefinitions() {
   return numUnresolvedLocalArchetypes != 0;
 }
@@ -753,6 +776,8 @@ void SILModule::notifyAddedInstruction(SILInstruction *inst) {
       auto *placeholder = cast<PlaceholderValue>(val);
       placeholder->replaceAllUsesWith(dependency);
       ::delete placeholder;
+
+      assert(numUnresolvedLocalArchetypes > 0);
       numUnresolvedLocalArchetypes--;
     }
     val = dependency;
@@ -912,7 +937,7 @@ void SILModule::performOnceForPrespecializedImportedExtensions(
 }
 
 SILProperty *
-SILProperty::create(SILModule &M, bool Serialized, AbstractStorageDecl *Decl,
+SILProperty::create(SILModule &M, unsigned Serialized, AbstractStorageDecl *Decl,
                     std::optional<KeyPathPatternComponent> Component) {
   auto prop = new (M) SILProperty(Serialized, Decl, Component);
   M.properties.push_back(prop);

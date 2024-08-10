@@ -27,8 +27,6 @@ func foo() {
     // expected-error @-1 {{cannot find 'skview' in scope}}
 }
 
-super.init() // expected-error {{'super' cannot be used outside of class members}}
-
 switch state { // expected-error {{cannot find 'state' in scope}}
   let duration : Int = 0 // expected-error {{all statements inside a switch must be covered by a 'case' or 'default'}}
   case 1:
@@ -76,12 +74,6 @@ do {
   func f(s Starfish,  // expected-error {{expected ':' following argument label and parameter name}}
             _ ss: Salmon) -> [Int] {}
   func g() { f(Starfish(), Salmon()) }
-}
-
-// https://github.com/apple/swift/issues/43313
-do {
-  func f(_ a: Int, b: Int) {}
-  f(1, b: 2,) // expected-error {{unexpected ',' separator}}
 }
 
 // https://github.com/apple/swift/issues/43591

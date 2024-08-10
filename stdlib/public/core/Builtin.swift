@@ -429,6 +429,8 @@ internal var _objectPointerIsObjCBit: UInt {
     return 0x4000_0000_0000_0000
 #elseif _pointerBitWidth(_32)
     return 0x0000_0002
+#elseif _pointerBitWidth(_16)
+    return 0x0000
 #else
 #error("Unknown platform")
 #endif
@@ -731,9 +733,9 @@ func _isUnique_native<T>(_ object: inout T) -> Bool {
   _internalInvariant(
     (_bitPattern(Builtin.reinterpretCast(object)) & _objectPointerSpareBits)
     == 0)
-  #endif
   _internalInvariant(_usesNativeSwiftReferenceCounting(
       type(of: Builtin.reinterpretCast(object) as AnyObject)))
+  #endif
   return Bool(Builtin.isUnique_native(&object))
 }
 
@@ -1093,7 +1095,6 @@ func __abi_openExistential<ExistentialType, ContainedType, ResultType>(
 /// in the function containing the call to this SPI.
 @_transparent
 @_alwaysEmitIntoClient
-@_unavailableInEmbedded
 public // @SPI(OSLog)
 func _getGlobalStringTablePointer(_ constant: String) -> UnsafePointer<CChar> {
   return UnsafePointer<CChar>(Builtin.globalStringTablePointer(constant));
@@ -1103,9 +1104,5 @@ func _getGlobalStringTablePointer(_ constant: String) -> UnsafePointer<CChar> {
 @_alwaysEmitIntoClient
 public
 func _allocateVector<Element>(elementType: Element.Type, capacity: Int) -> UnsafeMutablePointer<Element> {
-#if $BuiltinAllocVector
   return UnsafeMutablePointer(Builtin.allocVector(elementType, capacity._builtinWordValue))
-#else
-  fatalError("unsupported compiler")
-#endif
 }

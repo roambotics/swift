@@ -14,6 +14,7 @@
 #include "BCReadingExtras.h"
 #include "DeserializationErrors.h"
 #include "ModuleFileCoreTableInfo.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Parse/ParseVersion.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
@@ -197,8 +198,16 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
     case options_block::HAS_CXX_INTEROPERABILITY_ENABLED:
       extendedInfo.setHasCxxInteroperability(true);
       break;
+    case options_block::CXX_STDLIB_KIND:
+      unsigned rawKind;
+      options_block::CXXStdlibKindLayout::readRecord(scratch, rawKind);
+      extendedInfo.setCXXStdlibKind(static_cast<CXXStdlibKind>(rawKind));
+      break;
     case options_block::ALLOW_NON_RESILIENT_ACCESS:
       extendedInfo.setAllowNonResilientAccess(true);
+      break;
+    case options_block::SERIALIZE_PACKAGE_ENABLED:
+      extendedInfo.setSerializePackageEnabled(true);
       break;
     default:
       // Unknown options record, possibly for use by a future version of the
@@ -331,6 +340,12 @@ static ValidationInfo validateControlBlock(
         LLVM_FALLTHROUGH;
       case 3:
         result.shortVersion = blobData.slice(0, scratch[2]);
+
+        // If the format version doesn't match, give up after also getting the
+        // compiler version. This provides better diagnostics.
+        if (result.status != Status::Valid)
+          return result;
+
         LLVM_FALLTHROUGH;
       case 2:
       case 1:
@@ -350,6 +365,9 @@ static ValidationInfo validateControlBlock(
       break;
     case control_block::ALLOWABLE_CLIENT_NAME:
       result.allowableClients.push_back(blobData);
+      break;
+    case control_block::SDK_VERSION:
+      result.sdkVersion = blobData;
       break;
     case control_block::SDK_NAME: {
       result.sdkName = blobData;
@@ -687,9 +705,10 @@ void ModuleFileSharedCore::outputDiagnosticInfo(llvm::raw_ostream &os) const {
      << "', builder version '" << MiscVersion
      << "', built from "
      << (Bits.IsBuiltFromInterface? "swiftinterface": "source")
+     << " against SDK " << SDKVersion
      << ", " << (resilient? "resilient": "non-resilient");
   if (Bits.AllowNonResilientAccess)
-    os << ", built with -experimental-allow-non-resilient-access";
+    os << ", built with -allow-non-resilient-access";
   if (Bits.IsAllowModuleWithCompilerErrorsEnabled)
     os << ", built with -experimental-allow-module-with-compiler-errors";
   if (ModuleInputBuffer)
@@ -1447,8 +1466,11 @@ ModuleFileSharedCore::ModuleFileSharedCore(
           extInfo.isAllowModuleWithCompilerErrorsEnabled();
       Bits.IsConcurrencyChecked = extInfo.isConcurrencyChecked();
       Bits.HasCxxInteroperability = extInfo.hasCxxInteroperability();
+      Bits.CXXStdlibKind = static_cast<uint8_t>(extInfo.getCXXStdlibKind());
       Bits.AllowNonResilientAccess = extInfo.allowNonResilientAccess();
+      Bits.SerializePackageEnabled = extInfo.serializePackageEnabled();
       MiscVersion = info.miscVersion;
+      SDKVersion = info.sdkVersion;
       ModuleABIName = extInfo.getModuleABIName();
       ModulePackageName = extInfo.getModulePackageName();
       ModuleExportAsName = extInfo.getExportAsName();
@@ -1769,10 +1791,23 @@ bool ModuleFileSharedCore::hasSourceInfo() const {
   return !!DeclUSRsTable;
 }
 
+std::string ModuleFileSharedCore::resolveModuleDefiningFilePath(const StringRef SDKPath) const {
+  if (!ModuleInterfacePath.empty()) {
+    std::string interfacePath = ModuleInterfacePath.str();
+    if (llvm::sys::path::is_relative(interfacePath)) {
+      SmallString<128> absoluteInterfacePath(SDKPath);
+      llvm::sys::path::append(absoluteInterfacePath, interfacePath);
+      return absoluteInterfacePath.str().str();
+    } else
+      return interfacePath;
+  } else
+    return ModuleInputBuffer->getBufferIdentifier().str();
+}
+
 ModuleLoadingBehavior
 ModuleFileSharedCore::getTransitiveLoadingBehavior(
                                           const Dependency &dependency,
-                                          bool debuggerMode,
+                                          bool importNonPublicDependencies,
                                           bool isPartialModule,
                                           StringRef packageName,
                                           bool forTestable) const {
@@ -1788,7 +1823,7 @@ ModuleFileSharedCore::getTransitiveLoadingBehavior(
   if (dependency.isImplementationOnly()) {
     // Implementation-only dependencies are not usually loaded from
     // transitive imports.
-    if (debuggerMode || forTestable) {
+    if (importNonPublicDependencies || forTestable) {
       // In the debugger, try to load the module if possible.
       // Same in the case of a testable import, try to load the dependency
       // but don't fail if it's missing as this could be source breaking.
@@ -1806,7 +1841,7 @@ ModuleFileSharedCore::getTransitiveLoadingBehavior(
     // on testable imports.
     if (forTestable || !moduleIsResilient) {
       return ModuleLoadingBehavior::Required;
-    } else if (debuggerMode) {
+    } else if (importNonPublicDependencies) {
       return ModuleLoadingBehavior::Optional;
     } else {
       return ModuleLoadingBehavior::Ignored;
@@ -1820,7 +1855,7 @@ ModuleFileSharedCore::getTransitiveLoadingBehavior(
         forTestable ||
         !moduleIsResilient) {
       return ModuleLoadingBehavior::Required;
-    } else if (debuggerMode) {
+    } else if (importNonPublicDependencies) {
       return ModuleLoadingBehavior::Optional;
     } else {
       return ModuleLoadingBehavior::Ignored;

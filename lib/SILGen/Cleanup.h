@@ -17,6 +17,7 @@
 #ifndef SWIFT_SILGEN_CLEANUP_H
 #define SWIFT_SILGEN_CLEANUP_H
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/DiverseStack.h"
 #include "swift/SIL/SILLocation.h"
@@ -218,6 +219,17 @@ public:
   /// \param branchLoc  The location of the branch instruction.
   /// \param args       Arguments to pass to the destination block.
   void emitBranchAndCleanups(JumpDest dest, SILLocation branchLoc,
+                             ArrayRef<SILValue> args = {},
+                             ForUnwind_t forUnwind = NotForUnwind);
+
+  /// Emit a branch to the given jump destination,
+  /// threading out through any cleanups we need to run. This does not pop the
+  /// cleanup stack.
+  ///
+  /// \param dest       The destination scope and block.
+  /// \param branchLoc  The location of the branch instruction.
+  /// \param args       Arguments to pass to the destination block.
+  void emitCleanupsForBranch(JumpDest dest, SILLocation branchLoc,
                              ArrayRef<SILValue> args = {},
                              ForUnwind_t forUnwind = NotForUnwind);
 

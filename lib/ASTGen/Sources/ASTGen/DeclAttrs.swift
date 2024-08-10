@@ -167,6 +167,8 @@ extension ASTGenVisitor {
         return self.generateSectionAttr(attribute: node)?.asDeclAttribute
       case .semantics:
         return self.generateSemanticsAttr(attribute: node)?.asDeclAttribute
+      case .sensitive:
+        fatalError("unimplemented")
       case .silGenName:
         return self.generateSILGenNameAttr(attribute: node)?.asDeclAttribute
       case .specialize:
@@ -286,7 +288,6 @@ extension ASTGenVisitor {
         .override,
         .indirect,
         .final,
-        .resultDependsOnSelf,
         .knownToBeLocal,
         .compileTimeConst:
 

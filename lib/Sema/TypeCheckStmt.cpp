@@ -24,6 +24,7 @@
 #include "swift/AST/ASTScope.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DiagnosticSuppression.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/Identifier.h"
@@ -33,6 +34,7 @@
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/SourceManager.h"
@@ -60,6 +62,9 @@ using namespace swift;
 #define DEBUG_TYPE "TypeCheckStmt"
 
 namespace {
+  /// After forming autoclosures, we must re-parent any closure expressions
+  /// nested inside the autoclosure, because the autoclosure introduces a new
+  /// DeclContext.
   class ContextualizeClosuresAndMacros : public ASTWalker {
     DeclContext *ParentDC;
   public:
@@ -70,16 +75,10 @@ namespace {
     }
 
     PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
-      // Autoclosures need to be numbered and potentially reparented.
-      // Reparenting is required with:
-      //   - nested autoclosures, because the inner autoclosure will be
-      //     parented to the outer context, not the outer autoclosure
-      //   - non-local initializers
       if (auto CE = dyn_cast<AutoClosureExpr>(E)) {
         CE->setParent(ParentDC);
 
-        // Recurse into the autoclosure body using the same sequence,
-        // but parenting to the autoclosure instead of the outer closure.
+        // Recurse into the autoclosure body with the new ParentDC.
         auto oldParentDC = ParentDC;
         ParentDC = CE;
         CE->getBody()->walk(*this);
@@ -103,13 +102,12 @@ namespace {
         }
       }
 
-      // Explicit closures start their own sequence.
       if (auto CE = dyn_cast<ClosureExpr>(E)) {
         CE->setParent(ParentDC);
 
         // If the closure was type checked within its enclosing context,
-        // we need to walk into it with a new sequence.
-        // Otherwise, it'll have been separately type-checked.
+        // we need to walk into it. Otherwise, it'll have been separately
+        // type-checked.
         if (!CE->isSeparatelyTypeChecked())
           CE->getBody()->walk(ContextualizeClosuresAndMacros(CE));
 
@@ -415,7 +413,8 @@ unsigned LocalDiscriminatorsRequest::evaluate(
   ParameterList *params = nullptr;
   ParamDecl *selfParam = nullptr;
   if (auto func = dyn_cast<AbstractFunctionDecl>(dc)) {
-    node = func->getBody();
+    if (!func->isBodySkipped())
+      node = func->getBody();
     selfParam = func->getImplicitSelfDecl();
     params = func->getParameters();
 
@@ -502,15 +501,14 @@ unsigned LocalDiscriminatorsRequest::evaluate(
 /// \endcode
 static void tryDiagnoseUnnecessaryCastOverOptionSet(ASTContext &Ctx,
                                                     Expr *E,
-                                                    Type ResultType,
-                                                    ModuleDecl *module) {
+                                                    Type ResultType) {
   auto *NTD = ResultType->getAnyNominal();
   if (!NTD)
     return;
   auto optionSetType = dyn_cast_or_null<ProtocolDecl>(Ctx.getOptionSetDecl());
   if (!optionSetType)
     return;
-  if (!module->lookupConformance(ResultType, optionSetType))
+  if (!lookupConformance(ResultType, optionSetType))
     return;
 
   auto *CE = dyn_cast<CallExpr>(E);
@@ -788,46 +786,39 @@ ConcreteDeclRef TypeChecker::getReferencedDeclForHasSymbolCondition(Expr *E) {
   return ConcreteDeclRef();
 }
 
-bool TypeChecker::typeCheckStmtConditionElement(StmtConditionElement &elt,
-                                                bool &isFalsable,
-                                                DeclContext *dc) {
+static bool typeCheckHasSymbolStmtConditionElement(StmtConditionElement &elt,
+                                                   DeclContext *dc) {
+  auto Info = elt.getHasSymbolInfo();
+  auto E = Info->getSymbolExpr();
+  if (!E)
+    return false;
+
+  auto exprTy = TypeChecker::typeCheckExpression(E, dc);
+  Info->setSymbolExpr(E);
+
+  if (!exprTy) {
+    Info->setInvalid();
+    return true;
+  }
+
+  Info->setReferencedDecl(
+      TypeChecker::getReferencedDeclForHasSymbolCondition(E));
+  return false;
+}
+
+static bool typeCheckBooleanStmtConditionElement(StmtConditionElement &elt,
+                                                 DeclContext *dc) {
+  Expr *E = elt.getBoolean();
+  assert(!E->getType() && "the bool condition is already type checked");
+  bool hadError = TypeChecker::typeCheckCondition(E, dc);
+  elt.setBoolean(E);
+  return hadError;
+}
+
+static bool
+typeCheckPatternBindingStmtConditionElement(StmtConditionElement &elt,
+                                            bool &isFalsable, DeclContext *dc) {
   auto &Context = dc->getASTContext();
-
-  // Typecheck a #available or #unavailable condition.
-  if (elt.getKind() == StmtConditionElement::CK_Availability) {
-    isFalsable = true;
-    return false;
-  }
-
-  // Typecheck a #_hasSymbol condition.
-  if (elt.getKind() == StmtConditionElement::CK_HasSymbol) {
-    isFalsable = true;
-
-    auto Info = elt.getHasSymbolInfo();
-    auto E = Info->getSymbolExpr();
-    if (!E)
-      return false;
-
-    auto exprTy = TypeChecker::typeCheckExpression(E, dc);
-    Info->setSymbolExpr(E);
-
-    if (!exprTy) {
-      Info->setInvalid();
-      return true;
-    }
-
-    Info->setReferencedDecl(getReferencedDeclForHasSymbolCondition(E));
-    return false;
-  }
-
-  if (auto E = elt.getBooleanOrNull()) {
-    assert(!E->getType() && "the bool condition is already type checked");
-    bool hadError = TypeChecker::typeCheckCondition(E, dc);
-    elt.setBoolean(E);
-    isFalsable = true;
-    return hadError;
-  }
-  assert(elt.getKind() != StmtConditionElement::CK_Boolean);
 
   // This is cleanup goop run on the various paths where type checking of the
   // pattern binding fails.
@@ -873,6 +864,24 @@ bool TypeChecker::typeCheckStmtConditionElement(StmtConditionElement &elt,
   
   isFalsable |= pattern->isRefutablePattern();
   return hadError;
+}
+
+bool TypeChecker::typeCheckStmtConditionElement(StmtConditionElement &elt,
+                                                bool &isFalsable,
+                                                DeclContext *dc) {
+  switch (elt.getKind()) {
+  case StmtConditionElement::CK_Availability:
+    isFalsable = true;
+    return false;
+  case StmtConditionElement::CK_HasSymbol:
+    isFalsable = true;
+    return typeCheckHasSymbolStmtConditionElement(elt, dc);
+  case StmtConditionElement::CK_Boolean:
+    isFalsable = true;
+    return typeCheckBooleanStmtConditionElement(elt, dc);
+  case StmtConditionElement::CK_PatternBinding:
+    return typeCheckPatternBindingStmtConditionElement(elt, isFalsable, dc);
+  }
 }
 
 /// Type check the given 'if', 'while', or 'guard' statement condition.
@@ -1081,7 +1090,7 @@ public:
       RS->setResult(resultTarget->getAsExpr());
     } else {
       tryDiagnoseUnnecessaryCastOverOptionSet(getASTContext(), RS->getResult(),
-                                              ResultTy, DC->getParentModule());
+                                              ResultTy);
     }
     return RS;
   }
@@ -1669,6 +1678,14 @@ public:
     bool limitExhaustivityChecks = true;
 
     Type caughtErrorType = TypeChecker::catchErrorType(DC, S);
+
+    // If there was no throwing expression in the body, let's pretend it can
+    // throw 'any Error' just for type checking the pattern. That avoids
+    // superfluous diagnostics. Note that we still diagnose unreachable 'catch'
+    // separately in TypeCheckEffects.
+    if (caughtErrorType->isNever())
+      caughtErrorType = Ctx.getErrorExistentialType();
+
     auto catches = S->getCatches();
     checkSiblingCaseStmts(catches.begin(), catches.end(),
                           CaseParentKind::DoCatch, limitExhaustivityChecks,
@@ -2954,7 +2971,6 @@ TypeCheckFunctionBodyRequest::evaluate(Evaluator &eval,
   if (!hadError)
     performAbstractFuncDeclDiagnostics(AFD);
 
-  TypeChecker::computeCaptures(AFD);
   if (!AFD->getDeclContext()->isLocalContext()) {
     checkFunctionActorIsolation(AFD);
     TypeChecker::checkFunctionEffects(AFD);
@@ -2994,12 +3010,10 @@ bool TypeChecker::typeCheckTapBody(TapExpr *expr, DeclContext *DC) {
 }
 
 void TypeChecker::typeCheckTopLevelCodeDecl(TopLevelCodeDecl *TLCD) {
-  // We intentionally use typeCheckStmt instead of typeCheckBody here
-  // because we want to contextualize all the TopLevelCode
-  // declarations simultaneously.
   BraceStmt *Body = TLCD->getBody();
-  StmtChecker(TLCD).typeCheckStmt(Body);
+  StmtChecker(TLCD).typeCheckBody(Body);
   TLCD->setBody(Body);
+
   checkTopLevelActorIsolation(TLCD);
   checkTopLevelEffects(TLCD);
   performTopLevelDeclDiagnostics(TLCD);
@@ -3271,17 +3285,22 @@ FuncDecl *TypeChecker::getForEachIteratorNextFunction(
   if (!isAsync)
     return ctx.getIteratorNext();
 
-  // If AsyncIteratorProtocol.next(_:) isn't available at all,
+  // If AsyncIteratorProtocol.next(isolation:) isn't available at all,
   // we're stuck using AsyncIteratorProtocol.next().
   auto nextElement = ctx.getAsyncIteratorNextIsolated();
   if (!nextElement)
     return ctx.getAsyncIteratorNext();
 
-  // If availability checking is disabled, use next(_:).
+  // If the enclosing function has @_unsafeInheritsExecutor, then #isolation
+  // does not work and we need to avoid relying on it.
+  if (enclosingUnsafeInheritsExecutor(dc))
+    return ctx.getAsyncIteratorNext();
+
+  // If availability checking is disabled, use next(isolation:).
   if (ctx.LangOpts.DisableAvailabilityChecking || loc.isInvalid())
     return nextElement;
 
-  // We can only call next(_:) if we are in an availability context
+  // We can only call next(isolation:) if we are in an availability context
   // that supports typed throws.
   auto availability = overApproximateAvailabilityAtLocation(loc, dc);
   if (availability.isContainedIn(ctx.getTypedThrowsAvailability()))

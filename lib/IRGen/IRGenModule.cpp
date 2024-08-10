@@ -21,6 +21,8 @@
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/IRGenRequests.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/ModuleDependencies.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVMExtras.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/Demangling/ManglingMacros.h"
@@ -218,7 +220,9 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
                                             ModuleName, PrivateDiscriminator)),
       Module(*ClangCodeGen->GetModule()),
       DataLayout(irgen.getClangDataLayoutString()),
-      Triple(irgen.getEffectiveClangTriple()), TargetMachine(std::move(target)),
+      Triple(irgen.getEffectiveClangTriple()),
+      VariantTriple(irgen.getEffectiveClangVariantTriple()),
+      TargetMachine(std::move(target)),
       silConv(irgen.SIL), OutputFilename(OutputFilename),
       MainInputFilenameForDebugInfo(MainInputFilenameForDebugInfo),
       TargetInfo(SwiftTargetInfo::get(*this)), DebugInfo(nullptr),
@@ -708,8 +712,13 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
     SwiftTaskOptionRecordTy, // Base option record
     SwiftExecutorTy,         // Executor
   });
-  SwiftInitialTaskExecutorPreferenceTaskOptionRecordTy =
+  SwiftInitialTaskExecutorUnownedPreferenceTaskOptionRecordTy =
       createStructType(*this, "swift.task_executor_task_option", {
+    SwiftTaskOptionRecordTy, // Base option record
+    SwiftExecutorTy,         // Executor
+  });
+  SwiftInitialTaskExecutorOwnedPreferenceTaskOptionRecordTy =
+      createStructType(*this, "swift.task_executor_owned_task_option", {
     SwiftTaskOptionRecordTy, // Base option record
     SwiftExecutorTy,         // Executor
   });
@@ -963,6 +972,14 @@ namespace RuntimeConstants {
 
   RuntimeAvailability ParameterizedExistentialAvailability(ASTContext &Context) {
     auto featureAvailability = Context.getParameterizedExistentialAvailability();
+    if (!isDeploymentAvailabilityContainedIn(Context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
+  RuntimeAvailability ClearSensitiveAvailability(ASTContext &Context) {
+    auto featureAvailability = Context.getClearSensitiveAvailability();
     if (!isDeploymentAvailabilityContainedIn(Context, featureAvailability)) {
       return RuntimeAvailability::ConditionallyAvailable;
     }
@@ -1575,7 +1592,7 @@ void IRGenModule::addLinkLibrary(const LinkLibrary &linkLib) {
     }
   }
 
-  if (linkLib.shouldForceLoad()) {
+  if (!IRGen.Opts.DisableForceLoadSymbols && linkLib.shouldForceLoad()) {
     llvm::SmallString<64> buf;
     encodeForceLoadSymbolName(buf, linkLib.getName());
     auto ForceImportThunk = cast<llvm::Function>(
@@ -1603,6 +1620,51 @@ void IRGenModule::addLinkLibrary(const LinkLibrary &linkLib) {
   }
 }
 
+void IRGenModule::addLinkLibraries() {
+  auto registerLinkLibrary = [this](const LinkLibrary &ll) {
+    this->addLinkLibrary(ll);
+  };
+
+  getSwiftModule()->collectLinkLibraries(
+    [registerLinkLibrary](LinkLibrary linkLib) {
+      registerLinkLibrary(linkLib);
+    });
+
+  if (ObjCInterop)
+    registerLinkLibrary(LinkLibrary("objc", LibraryKind::Library));
+
+  // If C++ interop is enabled, add -lc++ on Darwin and -lstdc++ on linux.
+  // Also link with C++ bridging utility module (Cxx) and C++ stdlib overlay
+  // (std) if available.
+  if (Context.LangOpts.EnableCXXInterop) {
+    bool hasStaticCxx = false;
+    bool hasStaticCxxStdlib = false;
+    if (const auto *M = Context.getModuleByName("Cxx"))
+      hasStaticCxx = M->isStaticLibrary();
+    if (Context.LangOpts.Target.getOS() == llvm::Triple::Win32)
+      if (const auto *M = Context.getModuleByName("CxxStdlib"))
+        hasStaticCxxStdlib = M->isStaticLibrary();
+    dependencies::registerCxxInteropLibraries(Context.LangOpts.Target,
+                                              getSwiftModule()->getName().str(),
+                                              hasStaticCxx,
+                                              hasStaticCxxStdlib,
+                                              Context.LangOpts.CXXStdlib,
+                                              registerLinkLibrary);
+  }
+
+  // FIXME: It'd be better to have the driver invocation or build system that
+  // executes the linker introduce these compatibility libraries, since at
+  // that point we know whether we're building an executable, which is the only
+  // place where the compatibility libraries take effect. For the benefit of
+  // build systems that build Swift code, but don't use Swift to drive
+  // the linker, we can also use autolinking to pull in the compatibility
+  // libraries. This may however cause the library to get pulled in in
+  // situations where it isn't useful, such as for dylibs, though this is
+  // harmless aside from code size.
+  if (!IRGen.Opts.UseJIT && !Context.LangOpts.hasFeature(Feature::Embedded))
+    dependencies::registerBackDeployLibraries(IRGen.Opts, registerLinkLibrary);
+}
+
 static bool replaceModuleFlagsEntry(llvm::LLVMContext &Ctx,
                                     llvm::Module &Module, StringRef EntryName,
                                     llvm::Module::ModFlagBehavior Behavior,
@@ -1613,7 +1675,7 @@ static bool replaceModuleFlagsEntry(llvm::LLVMContext &Ctx,
     llvm::MDNode *Op = ModuleFlags->getOperand(I);
     llvm::MDString *ID = cast<llvm::MDString>(Op->getOperand(1));
 
-    if (ID->getString().equals(EntryName)) {
+    if (ID->getString() == EntryName) {
 
       // Create the new entry.
       llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
@@ -1857,6 +1919,11 @@ static llvm::GlobalObject *createForceImportThunk(IRGenModule &IGM) {
 }
 
 void IRGenModule::emitAutolinkInfo() {
+  if (getSILModule().getOptions().StopOptimizationAfterSerialization) {
+    // We're asked to emit an empty IR module
+    return;
+  }
+
   auto Autolink =
       AutolinkKind::create(TargetInfo, Triple, IRGen.Opts.LLVMLTOKind);
 
@@ -1950,11 +2017,13 @@ bool IRGenModule::finalize() {
   }
   emitLazyPrivateDefinitions();
 
-  // Finalize clang IR-generation.
-  finalizeClangCodeGen();
-
+  // Finalize Swift debug info before running Clang codegen, because it may
+  // delete the llvm module.
   if (DebugInfo)
     DebugInfo->finalize();
+
+  // Finalize clang IR-generation.
+  finalizeClangCodeGen();
 
   // If that failed, report failure up and skip the final clean-up.
   if (!ClangCodeGen->GetModule())
@@ -2021,8 +2090,14 @@ void IRGenModule::error(SourceLoc loc, const Twine &message) {
 
 bool IRGenModule::useDllStorage() { return ::useDllStorage(Triple); }
 
+// In embedded swift features are available independent of deployment and
+// runtime targets because the runtime library is always statically linked
+// to the program.
+
 #define FEATURE(N, V)                                                   \
 bool IRGenModule::is##N##FeatureAvailable(const ASTContext &context) {  \
+  if (Context.LangOpts.hasFeature(Feature::Embedded))                   \
+    return true;                                                        \
   auto deploymentAvailability                                           \
     = AvailabilityContext::forDeploymentTarget(context);                \
   auto runtimeAvailability                                              \
@@ -2065,7 +2140,7 @@ bool IRGenModule::canMakeStaticObjectReadOnly(SILType objectType) {
 
   // TODO: Support constant static arrays on other platforms, too.
   // See also the comment in GlobalObjects.cpp.
-  if (!Triple.isOSDarwin())
+  if (!Triple.isOSDarwin() && !Context.LangOpts.hasFeature(Feature::Embedded))
     return false;
 
   auto *clDecl = objectType.getClassOrBoundGenericClass();
@@ -2155,6 +2230,13 @@ llvm::Triple IRGenerator::getEffectiveClangTriple() {
       &*SIL.getASTContext().getClangModuleLoader());
   assert(CI && "no clang module loader");
   return llvm::Triple(CI->getTargetInfo().getTargetOpts().Triple);
+}
+
+llvm::Triple IRGenerator::getEffectiveClangVariantTriple() {
+  auto CI = static_cast<ClangImporter *>(
+      &*SIL.getASTContext().getClangModuleLoader());
+  assert(CI && "no clang module loader");
+  return llvm::Triple(CI->getTargetInfo().getTargetOpts().DarwinTargetVariantTriple);
 }
 
 const llvm::StringRef IRGenerator::getClangDataLayoutString() {

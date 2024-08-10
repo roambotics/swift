@@ -19,6 +19,7 @@
 #include "TypeCheckInvertible.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/Basic/Assertions.h"
 #include "TypeChecker.h"
 
 using namespace swift;
@@ -140,10 +141,61 @@ static void checkInvertibleConformanceCommon(DeclContext *dc,
   if (conformance.isConcrete()) {
     auto concrete = conformance.getConcrete();
     if (auto *normalConf = dyn_cast<NormalProtocolConformance>(concrete)) {
-      hasUnconditionalConformance =
-          normalConf->getConditionalRequirements().empty();
       conformanceLoc = normalConf->getLoc();
       assert(conformanceLoc);
+
+      // Conformance must be defined in the same source file as the nominal.
+      auto conformanceDC = concrete->getDeclContext();
+      if (auto *sourceFile = conformanceDC->getOutermostParentSourceFile()) {
+        if (sourceFile != nominalDecl->getOutermostParentSourceFile()) {
+          ctx.Diags.diagnose(conformanceLoc,
+                             diag::invertible_conformance_other_source_file,
+                             getInvertibleProtocolKindName(ip), nominalDecl);
+        }
+      }
+
+      auto condReqs = normalConf->getConditionalRequirements();
+      hasUnconditionalConformance = condReqs.empty();
+      auto *thisProto = normalConf->getProtocol();
+
+      // Ensure that conditional conformance to an invertible protocol IP only
+      // depends conformance requirements involving IP, and its subject is not
+      // a dependent member type.
+      //
+      // In theory, it could depend on any invertible protocol, but it may be
+      // confusing if we permitted that and this simplifies the model a bit.
+      for (auto req : condReqs) {
+        Type illegalSecondType;
+
+        // If we are diagnosing, fill-in the second-type string of this req.
+        switch (req.getKind()) {
+        case RequirementKind::Layout:
+          assert(req.getLayoutConstraint()->isClass());
+          illegalSecondType = ctx.getAnyObjectType();
+          break;
+        case RequirementKind::Conformance:
+          if (req.getProtocolDecl() == thisProto
+              && !req.getFirstType()->is<DependentMemberType>())
+            break; // permitted, don't fill-in.
+        LLVM_FALLTHROUGH;
+        case RequirementKind::Superclass:
+        case RequirementKind::SameType:
+        case RequirementKind::SameShape:
+          illegalSecondType = req.getSecondType();
+          break;
+        }
+
+        static_assert((unsigned)RequirementKind::LAST_KIND == 4,
+                      "update %select in diagnostic!");
+        if (illegalSecondType) {
+          auto t = ctx.Diags.diagnose(conformanceLoc,
+                             diag::inverse_cannot_be_conditional_on_requirement,
+                             thisProto,
+                             req.getFirstType(),
+                             static_cast<unsigned>(req.getKind()),
+                             illegalSecondType);
+        }
+      }
     }
   }
   assert(!conformance.isPack() && "not handled");

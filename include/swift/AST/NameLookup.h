@@ -249,7 +249,10 @@ enum class UnqualifiedLookupFlags {
   ModuleLookup           = 1 << 8,
   /// This lookup should discard 'Self' requirements in protocol extension
   /// 'where' clauses.
-  DisregardSelfBounds    = 1 << 9
+  DisregardSelfBounds    = 1 << 9,
+  /// This lookup should include members that would otherwise be filtered out
+  /// because they come from a module that has not been imported.
+  IgnoreMissingImports = 1 << 10,
 };
 
 using UnqualifiedLookupOptions = OptionSet<UnqualifiedLookupFlags>;
@@ -589,12 +592,16 @@ struct InheritedNominalEntry : Located<NominalTypeDecl *> {
   /// The location of the "preconcurrency" attribute if present.
   SourceLoc preconcurrencyLoc;
 
+  /// Whether this inherited entry was suppressed via "~".
+  bool isSuppressed;
+
   InheritedNominalEntry() { }
 
   InheritedNominalEntry(NominalTypeDecl *item, SourceLoc loc,
-                        SourceLoc uncheckedLoc, SourceLoc preconcurrencyLoc)
+                        SourceLoc uncheckedLoc, SourceLoc preconcurrencyLoc,
+                        bool isSuppressed)
       : Located(item, loc), uncheckedLoc(uncheckedLoc),
-        preconcurrencyLoc(preconcurrencyLoc) {}
+        preconcurrencyLoc(preconcurrencyLoc), isSuppressed(isSuppressed) {}
 };
 
 /// Retrieve the set of nominal type declarations that are directly

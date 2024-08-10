@@ -109,6 +109,9 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
   /// Swift value witness functions.
   PointerAuthSchema ValueWitnesses;
 
+  /// Pointers to Swift value witness tables stored in type metadata.
+  PointerAuthSchema ValueWitnessTable;
+
   /// Swift protocol witness functions.
   PointerAuthSchema ProtocolWitnesses;
 
@@ -337,6 +340,9 @@ public:
   /// Whether we should disable inserting autolink directives altogether.
   unsigned DisableAllAutolinking : 1;
 
+  /// Whether we should disable inserting __swift_FORCE_LOAD_ symbols.
+  unsigned DisableForceLoadSymbols : 1;
+
   /// Print the LLVM inline tree at the end of the LLVM pass pipeline.
   unsigned PrintInlineTree : 1;
 
@@ -469,6 +475,9 @@ public:
 
   unsigned UseFragileResilientProtocolWitnesses : 1;
 
+  // Whether to run the HotColdSplitting pass when optimizing.
+  unsigned EnableHotColdSplit : 1;
+
   /// The number of threads for multi-threaded code generation.
   unsigned NumThreads = 0;
 
@@ -554,10 +563,11 @@ public:
         EnableGlobalISel(false), VirtualFunctionElimination(false),
         WitnessMethodElimination(false), ConditionalRuntimeRecords(false),
         InternalizeAtLink(false), InternalizeSymbols(false),
-        EmitGenericRODatas(false), NoPreallocatedInstantiationCaches(false),
+        EmitGenericRODatas(true), NoPreallocatedInstantiationCaches(false),
         DisableReadonlyStaticObjects(false), CollocatedMetadataFunctions(false),
         ColocateTypeDescriptors(true), UseRelativeProtocolWitnessTables(false),
         UseFragileResilientProtocolWitnesses(false),
+        EnableHotColdSplit(false),
         CmdArgs(), SanitizeCoverage(llvm::SanitizerCoverageOptions()),
         TypeInfoFilter(TypeInfoDumpFilter::All),
         PlatformCCallingConvention(llvm::CallingConv::C), UseCASBackend(false),

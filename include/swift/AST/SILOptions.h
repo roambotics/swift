@@ -118,6 +118,10 @@ public:
   /// Controls whether to run async demotion pass.
   bool EnableAsyncDemotion = false;
 
+  /// Controls whether to always assume that functions rarely throw an Error
+  /// within the optimizer. This influences static branch prediction.
+  bool EnableThrowsPrediction = false;
+
   /// Should we run any SIL performance optimizations
   ///
   /// Useful when you want to enable -O LLVM opts but not -O SIL opts.
@@ -126,12 +130,10 @@ public:
   /// Controls whether cross module optimization is enabled.
   CrossModuleOptimizationMode CMOMode = CrossModuleOptimizationMode::Off;
 
-  /// Optimization to perform default CMO within a package boundary.
-  /// Unlike the existing CMO, package CMO can be built with
-  /// -enable-library-evolution since package modules are required
-  /// to be built in the same project. To enable this optimization, the
-  /// module also needs to opt in to allow non-resilient access with
-  /// -experimental-allow-non-resilient-access.
+  /// Optimization to perform default mode CMO within a package boundary.
+  /// Package CMO can be performed for resiliently built modules as package
+  /// modules are required to be built together in the same project. To enable
+  /// this optimization, the module also needs -allow-non-resilient-access.
   bool EnableSerializePackage = false;
 
   /// Enables the emission of stack protectors in functions.
@@ -290,6 +292,10 @@ public:
   /// Are we building in embedded Swift + -no-allocations?
   bool NoAllocations = false;
 
+  /// Should we use the experimental Swift based closure-specialization
+  /// optimization pass instead of the existing C++ one.
+  bool EnableExperimentalSwiftBasedClosureSpecialization = false;
+
   /// The name of the file to which the backend should save optimization
   /// records.
   std::string OptRecordFile;
@@ -300,6 +306,10 @@ public:
 
   /// The format used for serializing remarks (default: YAML)
   llvm::remarks::Format OptRecordFormat = llvm::remarks::Format::YAML;
+
+  /// Are there any options that indicate that functions should not be preserved
+  /// for the debugger?
+  bool ShouldFunctionsBePreservedToDebugger = true;
 
   SILOptions() {}
 

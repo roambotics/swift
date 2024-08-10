@@ -16,11 +16,13 @@
 
 #include "GenPack.h"
 #include "GenProto.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/PackConformance.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/IRGen/GenericRequirement.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILType.h"
@@ -351,12 +353,10 @@ static void bindElementSignatureRequirementsAtIndex(
                       patternPackArchetype)
                   ->getCanonicalType();
           llvm::Value *_metadata = nullptr;
-          auto packConformance =
-              context.signature->lookupConformance(ty, proto);
+          auto packConformance = ProtocolConformanceRef(proto);
           auto *wtablePack = emitWitnessTableRef(IGF, patternPackArchetype,
                                                  &_metadata, packConformance);
-          auto elementConformance =
-              context.signature->lookupConformance(ty, proto);
+          auto elementConformance = ProtocolConformanceRef(proto);
           auto *wtable = bindWitnessTableAtIndex(
               IGF, elementArchetype, elementConformance, wtablePack, index);
           assert(wtable);
@@ -573,8 +573,7 @@ static llvm::Value *emitPackExpansionElementWitnessTable(
   auto instantiatedPatternTy =
       context.environment->mapContextualPackTypeIntoElementContext(patternTy);
   auto instantiatedConformance =
-      context.environment->getGenericSignature()->lookupConformance(
-          instantiatedPatternTy, conformance.getRequirement());
+      lookupConformance(instantiatedPatternTy, conformance.getRequirement());
 
   // Emit the element witness table.
   auto *wtable = emitWitnessTableRef(IGF, instantiatedPatternTy,

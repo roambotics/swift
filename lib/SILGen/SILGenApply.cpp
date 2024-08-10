@@ -24,6 +24,7 @@
 #include "SpecializedEmitter.h"
 #include "Varargs.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/DistributedDecl.h"
 #include "swift/AST/Effects.h"
@@ -36,6 +37,7 @@
 #include "swift/AST/ModuleLoader.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/ExternalUnion.h"
 #include "swift/Basic/Range.h"
 #include "swift/Basic/STLExtras.h"
@@ -55,6 +57,23 @@ using namespace Lowering;
 //===----------------------------------------------------------------------===//
 //                             Utility Functions
 //===----------------------------------------------------------------------===//
+
+FunctionTypeInfo SILGenFunction::getClosureTypeInfo(AbstractClosureExpr *expr) {
+  auto fnType = cast<AnyFunctionType>(expr->getType()->getCanonicalType());
+
+  // If we have a closure expr that has inherits actor context, work around AST
+  // issues that causes us to be able to get non-Sendable actor isolated
+  // closures.
+  if (auto *ce = dyn_cast<ClosureExpr>(expr)) {
+    if (ce->inheritsActorContext() && fnType->isAsync() &&
+        !fnType->isSendable() && expr->getActorIsolation().isActorIsolated()) {
+      auto newExtInfo = fnType->getExtInfo().withSendable();
+      fnType = fnType.withExtInfo(newExtInfo);
+    }
+  }
+
+  return getFunctionTypeInfo(fnType);
+}
 
 FunctionTypeInfo SILGenFunction::getFunctionTypeInfo(CanAnyFunctionType fnType) {
   return { AbstractionPattern(fnType), fnType,
@@ -258,7 +277,7 @@ static ManagedValue convertOwnershipConventionGivenParamInfo(
     }
   }
 
-  if (param.isConsumed() &&
+  if (param.isConsumedInCaller() &&
       value.getOwnershipKind() == OwnershipKind::Guaranteed) {
     return value.copyUnmanaged(SGF, loc);
   }
@@ -682,20 +701,9 @@ public:
     }
     case Kind::WitnessMethod: {
       if (auto func = constant->getFuncDecl()) {
-        auto isDistributedFuncOrAccessor =
-            func->isDistributed();
-        if (auto acc = dyn_cast<AccessorDecl>(func)) {
-          isDistributedFuncOrAccessor =
-              acc->getStorage()->isDistributed();
-        }
-        if (isa<ProtocolDecl>(func->getDeclContext()) && isDistributedFuncOrAccessor) {
-          // If we're calling cross-actor, we must always use a distributed thunk
-          if (!isSameActorIsolated(func, SGF.FunctionDC)) {
-            // the protocol witness must always be a distributed thunk, as we
-            // may be crossing a remote boundary here.
-            auto thunk = func->getDistributedThunk();
-            constant = SILDeclRef(thunk).asDistributed();
-          }
+        if (SGF.shouldReplaceConstantForApplyWithDistributedThunk(func)) {
+          auto thunk = func->getDistributedThunk();
+          constant = SILDeclRef(thunk).asDistributed();
         }
       }
 
@@ -783,12 +791,8 @@ public:
     }
     case Kind::WitnessMethod: {
       if (auto func = constant->getFuncDecl()) {
-        if (func->isDistributed() && isa<ProtocolDecl>(func->getDeclContext())) {
-          // If we're calling cross-actor, we must always use a distributed thunk
-          if (!isSameActorIsolated(func, SGF.FunctionDC)) {
-            /// We must adjust the constant to use a distributed thunk.
-            constant = constant->asDistributed();
-          }
+        if (SGF.shouldReplaceConstantForApplyWithDistributedThunk(func)) {
+          constant = constant->asDistributed();
         }
       }
 
@@ -1240,9 +1244,8 @@ public:
     auto captureInfo = SGF.SGM.Types.getLoweredLocalCaptures(constant);
     SGF.SGM.Types.setCaptureTypeExpansionContext(constant, SGF.SGM.M);
     
-    if (afd->getDeclContext()->isLocalContext() &&
-        !captureInfo.hasGenericParamCaptures())
-      subs = SubstitutionMap();
+    subs = SGF.SGM.Types.getSubstitutionMapWithCapturedEnvironments(
+        constant, captureInfo, subs);
 
     // Check whether we have to dispatch to the original implementation of a
     // dynamically_replaceable inside of a dynamic_replacement(for:) function.
@@ -1307,8 +1310,7 @@ public:
   void visitAbstractClosureExpr(AbstractClosureExpr *e) {
     SILDeclRef constant(e);
 
-    auto closureType = cast<AnyFunctionType>(e->getType()->getCanonicalType());
-    SGF.SGM.emitClosure(e, SGF.getFunctionTypeInfo(closureType));
+    SGF.SGM.emitClosure(e, SGF.getClosureTypeInfo(e));
 
     // If we're in top-level code, we don't need to physically capture script
     // globals, but we still need to mark them as escaping so that DI can flag
@@ -1319,17 +1321,14 @@ public:
 
     // A directly-called closure can be emitted as a direct call instead of
     // really producing a closure object.
-
-    auto captureInfo = SGF.SGM.M.Types.getLoweredLocalCaptures(constant);
-
     SubstitutionMap subs;
-    if (captureInfo.hasGenericParamCaptures())
-      subs = SGF.getForwardingSubstitutionMap();
+    std::tie(std::ignore, std::ignore, subs)
+        = SGF.SGM.Types.getForwardingSubstitutionsForLowering(constant);
 
     setCallee(Callee::forDirect(SGF, constant, subs, e));
     
     // If the closure requires captures, emit them.
-    if (!captureInfo.getCaptures().empty()) {
+    if (SGF.SGM.Types.hasLoweredLocalCaptures(constant)) {
       SmallVector<ManagedValue, 4> captures;
       SGF.emitCaptures(e, constant, CaptureEmission::ImmediateApplication,
                        captures);
@@ -1905,6 +1904,11 @@ static void emitRawApply(SILGenFunction &SGF,
                          SILValue indirectErrorAddr,
                          SmallVectorImpl<SILValue> &rawResults,
                          ExecutorBreadcrumb prevExecutor) {
+  // We completely drop the generic signature if all generic parameters were
+  // concrete.
+  if (subs && subs.getGenericSignature()->areAllParamsConcrete())
+    subs = SubstitutionMap();
+
   SILFunctionConventions substFnConv(substFnType, SGF.SGM.M);
   // Get the callee value.
   bool isConsumed = substFnType->isCalleeConsumed();
@@ -1940,7 +1944,7 @@ static void emitRawApply(SILGenFunction &SGF,
     auto inputTy =
         substFnConv.getSILType(inputParams[i], SGF.getTypeExpansionContext());
 
-    if (inputParams[i].isConsumed()) {
+    if (inputParams[i].isConsumedInCaller()) {
       argValue = args[i].forward(SGF);
       if (argValue->getType().isMoveOnlyWrapped() &&
           !inputTy.isMoveOnlyWrapped()) {
@@ -3238,6 +3242,14 @@ static StorageRefResult findStorageReferenceExprForBorrow(Expr *e) {
 
 Expr *SILGenFunction::findStorageReferenceExprForMoveOnly(Expr *argExpr,
                                            StorageReferenceOperationKind kind) {
+  ForceValueExpr *forceUnwrap = nullptr;
+  // Check for a force unwrap. This might show up inside or outside of the
+  // load.
+  if (auto *fu = dyn_cast<ForceValueExpr>(argExpr)) {
+    forceUnwrap = fu;
+    argExpr = fu->getSubExpr();
+  }
+  
   // If there's a load around the outer part of this arg expr, look past it.
   bool sawLoad = false;
   if (auto *li = dyn_cast<LoadExpr>(argExpr)) {
@@ -3245,40 +3257,40 @@ Expr *SILGenFunction::findStorageReferenceExprForMoveOnly(Expr *argExpr,
     sawLoad = true;
   }
 
-  // If we have a subscript, strip it off and make sure that our base is
-  // something that we can process. If we do and we succeed below, we return the
-  // subscript instead.
-  SubscriptExpr *subscriptExpr = nullptr;
-  if ((subscriptExpr = dyn_cast<SubscriptExpr>(argExpr))) {
-    auto *decl = cast<SubscriptDecl>(subscriptExpr->getDecl().getDecl());
-    if (decl->getReadImpl() != ReadImplKind::Read) {
-      subscriptExpr = nullptr;
-    } else {
-      argExpr = subscriptExpr->getBase();
-    }
-
-    // If there's a load on the base of the subscript expr, look past it.
-    if (auto *li = dyn_cast<LoadExpr>(argExpr)) {
-      argExpr = li->getSubExpr();
-    }
+  // Check again for a force unwrap before the load.
+  if (auto *fu = dyn_cast<ForceValueExpr>(argExpr)) {
+    forceUnwrap = fu;
+    argExpr = fu->getSubExpr();
   }
 
   // If we're consuming instead, then the load _must_ have been there.
   if (kind == StorageReferenceOperationKind::Consume && !sawLoad)
     return nullptr;
 
-  // If we did not see a load or a subscript expr and our argExpr is a
-  // declref_expr, return nullptr. We have an object not something that will be
-  // in memory. This can happen with classes or with values captured by a
-  // closure.
-  //
-  // NOTE: If we see a member_ref_expr from a decl_ref_expr, we still process it
-  // since the declref_expr could be from a class.
-  if (!sawLoad && !subscriptExpr) {
+  // TODO: This section should be removed eventually. Decl refs should not be
+  // handled different from other storage. Removing it breaks some things
+  // currently.
+  if (!sawLoad) {
     if (auto *declRef = dyn_cast<DeclRefExpr>(argExpr)) {
       assert(!declRef->getType()->is<LValueType>() &&
              "Shouldn't ever have an lvalue type here!");
-      return nullptr;
+             
+      // Proceed if the storage reference is a force unwrap.
+      if (!forceUnwrap) {
+        // Proceed if the storage references a global or static let.
+        // TODO: We should treat any storage reference as a borrow, it seems, but
+        // that currently disrupts what the move checker expects. It would also
+        // be valuable to borrow copyable global lets, but this is a targeted
+        // fix to allow noncopyable globals to work properly.
+        bool isGlobal = false;
+        if (auto vd = dyn_cast<VarDecl>(declRef->getDecl())) {
+          isGlobal = vd->isGlobalStorage();
+        }
+        
+        if (!isGlobal) {
+          return nullptr;
+        }
+      }
     }
   }
 
@@ -3290,18 +3302,27 @@ Expr *SILGenFunction::findStorageReferenceExprForMoveOnly(Expr *argExpr,
   // We want to perform a borrow/consume if the first piece of storage being
   // referenced is a move-only type.
 
-  VarDecl *storage = nullptr;
+  AbstractStorageDecl *storage = nullptr;
   Type type;
   if (auto dre = dyn_cast<DeclRefExpr>(result.getStorageRef())) {
-    storage = dyn_cast<VarDecl>(dre->getDecl());
+    storage = dyn_cast<AbstractStorageDecl>(dre->getDecl());
     type = dre->getType();
   } else if (auto mre = dyn_cast<MemberRefExpr>(result.getStorageRef())) {
-    storage = dyn_cast<VarDecl>(mre->getDecl().getDecl());
+    storage = dyn_cast<AbstractStorageDecl>(mre->getDecl().getDecl());
     type = mre->getType();
+  } else if (auto se = dyn_cast<SubscriptExpr>(result.getStorageRef())) {
+    storage = dyn_cast<AbstractStorageDecl>(se->getDecl().getDecl());
+    type = se->getType();
   }
 
   if (!storage)
     return nullptr;
+  if (!storage->hasStorage()
+      && storage->getReadImpl() != ReadImplKind::Read
+      && storage->getReadImpl() != ReadImplKind::Address) {
+    return nullptr;
+  }
+
   assert(type);
 
   SILType ty =
@@ -3313,12 +3334,10 @@ Expr *SILGenFunction::findStorageReferenceExprForMoveOnly(Expr *argExpr,
   }
   if (!isMoveOnly)
     return nullptr;
-
-  // If we saw a subscript expr and the base of the subscript expr passed our
-  // tests above, we can emit the call to the subscript directly as a borrowed
-  // lvalue. Return the subscript expr here so that we emit it appropriately.
-  if (subscriptExpr)
-    return subscriptExpr;
+    
+  if (forceUnwrap) {
+    return forceUnwrap;
+  }
 
   return result.getTransitiveRoot();
 }
@@ -3538,7 +3557,7 @@ private:
     }
 
     // If we have a guaranteed +0 parameter...
-    if (param.isGuaranteed() || isShared) {
+    if (param.isGuaranteedInCaller() || isShared) {
       // And this is a yield, emit a borrowed r-value.
       if (IsYield) {
         if (tryEmitBorrowed(std::move(arg), loweredSubstArgType,
@@ -3560,7 +3579,7 @@ private:
         return;
     }
 
-    if (param.isConsumed() || isOwned) {
+    if (param.isConsumedInCaller() || isOwned) {
       if (tryEmitConsumedMoveOnly(std::move(arg), loweredSubstArgType,
                                   loweredSubstParamType, origParamType,
                                   paramSlice))
@@ -3761,7 +3780,7 @@ private:
                     ClaimedParamsRef claimedParams) {
     auto emissionKind = SGFAccessKind::BorrowedObjectRead;
     for (auto param : claimedParams) {
-      assert(!param.isConsumed());
+      assert(!param.isConsumedInCaller());
       if (param.isIndirectInGuaranteed() && SGF.silConv.useLoweredAddresses()) {
         emissionKind = SGFAccessKind::BorrowedAddressRead;
         break;
@@ -3885,7 +3904,7 @@ private:
       // happen outside of the formal-evaluation scope we pushed for the
       // expression evaluation, but any copies to be done inside of it.
       // Copies are only done if the parameter is consumed.
-      if (!param.isConsumed())
+      if (!param.isConsumedInCaller())
         S.pop();
 
       Args.push_back(convertOwnershipConvention(value));
@@ -4358,7 +4377,7 @@ private:
     bool requiresReabstraction = loweredArgType.getASTType()
       != param.getInterfaceType();
     // If the parameter is consumed, we have to emit at +1.
-    if (param.isConsumed()) {
+    if (param.isConsumedInCaller()) {
       return {SGFContext(), requiresReabstraction};
     }
 
@@ -5052,7 +5071,7 @@ SILGenFunction::emitBeginApply(SILLocation loc, ManagedValue fn,
          MarkUnresolvedNonCopyableValueInst::CheckKind::ConsumableAndAssignable);
       }
       yields.push_back(ManagedValue::forLValue(value));
-    } else if (info.isConsumed()) {
+    } else if (info.isConsumedInCaller()) {
       if (value->getType().isMoveOnly()) {
         value = B.createMarkUnresolvedNonCopyableValueInst(loc, value,
          MarkUnresolvedNonCopyableValueInst::CheckKind::ConsumableAndAssignable);
@@ -5060,7 +5079,7 @@ SILGenFunction::emitBeginApply(SILLocation loc, ManagedValue fn,
       !useLoweredAddresses && value->getType().isTrivial(getFunction())
           ? yields.push_back(ManagedValue::forRValueWithoutOwnership(value))
           : yields.push_back(emitManagedRValueWithCleanup(value));
-    } else if (info.isGuaranteed()) {
+    } else if (info.isGuaranteedInCaller()) {
       if (value->getType().isMoveOnly()) {
         if (!value->getType().isAddress()) {
           // The move checker uses the lifetime of the "copy" for borrow checking.
@@ -5598,6 +5617,7 @@ RValue SILGenFunction::emitApply(
     case ParameterConvention::Indirect_In:
     case ParameterConvention::Indirect_Inout:
     case ParameterConvention::Indirect_InoutAliasable:
+    case ParameterConvention::Indirect_In_CXX:
     case ParameterConvention::Pack_Guaranteed:
     case ParameterConvention::Pack_Owned:
     case ParameterConvention::Pack_Inout:
@@ -5861,6 +5881,11 @@ SILValue SILGenFunction::emitApplyWithRethrow(SILLocation loc, SILValue fn,
                                               SILType substFnType,
                                               SubstitutionMap subs,
                                               ArrayRef<SILValue> args) {
+  // We completely drop the generic signature if all generic parameters were
+  // concrete.
+  if (subs && subs.getGenericSignature()->areAllParamsConcrete())
+    subs = SubstitutionMap();
+
   CanSILFunctionType silFnType = substFnType.castTo<SILFunctionType>();
   SILFunctionConventions fnConv(silFnType, SGM.M);
   SILType resultType = fnConv.getSILResultType(getTypeExpansionContext());
@@ -5912,9 +5937,8 @@ SILValue SILGenFunction::emitApplyWithRethrow(SILLocation loc, SILValue fn,
         assert(outerErrorType == SILType::getExceptionType(getASTContext()));
 
         ProtocolConformanceRef conformances[1] = {
-          getModule().getSwiftModule()->checkConformance(
-            innerError->getType().getASTType(),
-            getASTContext().getErrorDecl())
+          checkConformance(innerError->getType().getASTType(),
+                           getASTContext().getErrorDecl())
         };
 
         outerError = emitExistentialErasure(
@@ -5969,6 +5993,11 @@ SILGenFunction::emitBeginApplyWithRethrow(SILLocation loc, SILValue fn,
                                           SubstitutionMap subs,
                                           ArrayRef<SILValue> args,
                                           SmallVectorImpl<SILValue> &yields) {
+  // We completely drop the generic signature if all generic parameters were
+  // concrete.
+  if (subs && subs.getGenericSignature()->areAllParamsConcrete())
+    subs = SubstitutionMap();
+
   // TODO: adjust this to create try_begin_apply when appropriate.
   assert(!substFnType.castTo<SILFunctionType>()->hasErrorResult());
 
@@ -6368,7 +6397,7 @@ void SILGenFunction::emitApplyOfUnavailableCodeReached() {
     return;
 
   auto loc = RegularLocation::getAutoGeneratedLocation(F.getLocation());
-  FuncDecl *fd = getASTContext().getDiagnoseUnavailableCodeReachedDecl();
+  FuncDecl *fd = getASTContext().getDiagnoseUnavailableCodeReached();
 
   if (!fd) {
     // Broken stdlib?
@@ -6593,8 +6622,7 @@ SILGenFunction::emitUninitializedArrayAllocation(Type ArrayTy,
   auto allocate = Ctx.getAllocateUninitializedArray();
 
   // Invoke the intrinsic, which returns a tuple.
-  auto subMap = ArrayTy->getContextSubstitutionMap(SGM.M.getSwiftModule(),
-                                                   Ctx.getArrayDecl());
+  auto subMap = ArrayTy->getContextSubstitutionMap();
   auto result = emitApplyOfLibraryIntrinsic(
       Loc, allocate, subMap,
       ManagedValue::forObjectRValueWithoutOwnership(Length), SGFContext());
@@ -6619,8 +6647,7 @@ void SILGenFunction::emitUninitializedArrayDeallocation(SILLocation loc,
   CanType arrayTy = array->getType().getASTType();
 
   // Invoke the intrinsic.
-  auto subMap = arrayTy->getContextSubstitutionMap(SGM.M.getSwiftModule(),
-                                                   Ctx.getArrayDecl());
+  auto subMap = arrayTy->getContextSubstitutionMap();
   emitApplyOfLibraryIntrinsic(loc, deallocate, subMap,
                               ManagedValue::forUnmanagedOwnedValue(array),
                               SGFContext());
@@ -6643,8 +6670,7 @@ ManagedValue SILGenFunction::emitUninitializedArrayFinalization(SILLocation loc,
   CanType arrayTy = arrayVal->getType().getASTType();
 
   // Invoke the intrinsic.
-  auto subMap = arrayTy->getContextSubstitutionMap(SGM.M.getSwiftModule(),
-                                                   Ctx.getArrayDecl());
+  auto subMap = arrayTy->getContextSubstitutionMap();
   RValue result = emitApplyOfLibraryIntrinsic(
       loc, finalize, subMap, ManagedValue::forUnmanagedOwnedValue(arrayVal),
       SGFContext());
@@ -6712,14 +6738,9 @@ static Callee getBaseAccessorFunctionRef(SILGenFunction &SGF,
         subs, loc, true);
   }
 
-  // The accessor might be a local function that does not capture any
-  // generic parameters, in which case we don't want to pass in any
-  // substitutions.
   auto captureInfo = SGF.SGM.Types.getLoweredLocalCaptures(constant);
-  if (decl->getDeclContext()->isLocalContext() &&
-      !captureInfo.hasGenericParamCaptures()) {
-    subs = SubstitutionMap();
-  }
+  subs = SGF.SGM.Types.getSubstitutionMapWithCapturedEnvironments(
+      constant, captureInfo, subs);
 
   // If this is a method in a protocol, generate it as a protocol call.
   if (isa<ProtocolDecl>(decl->getDeclContext())) {
@@ -6848,6 +6869,7 @@ bool AccessorBaseArgPreparer::shouldLoadBaseAddress() const {
   // memory to 'in', and we have pass at +1.
   case ParameterConvention::Indirect_In:
   case ParameterConvention::Indirect_In_Guaranteed:
+  case ParameterConvention::Indirect_In_CXX:
     // TODO: We shouldn't be able to get an lvalue here, but the AST
     // sometimes produces an inout base for non-mutating accessors.
     // rdar://problem/19782170
@@ -6867,22 +6889,21 @@ bool AccessorBaseArgPreparer::shouldLoadBaseAddress() const {
 ArgumentSource AccessorBaseArgPreparer::prepareAccessorAddressBaseArg() {
   // If the base is currently an address, we may have to copy it.
   if (shouldLoadBaseAddress()) {
-    if (selfParam.isConsumed() ||
-        (base.getType().isAddressOnly(SGF.F)
-         // If a move-only base is borrowed, then we have to try our best to
-         // borrow it in-place without copying.
-         // TODO: Can we avoid copying a non-move-only value too in this
-         // circumstance?
-         && !base.getType().isMoveOnly())) {
+    if (selfParam.isConsumedInCaller() || base.getType().isAddressOnly(SGF.F)) {
       // The load can only be a take if the base is a +1 rvalue.
       auto shouldTake = IsTake_t(base.hasCleanup());
 
+      auto isGuaranteed = selfParam.isGuaranteedInCaller();
+
+      auto context =
+          isGuaranteed ? SGFContext::AllowImmediatePlusZero : SGFContext();
+
       base = SGF.emitFormalAccessLoad(loc, base.forward(SGF),
                                       SGF.getTypeLowering(baseLoweredType),
-                                      SGFContext(), shouldTake);
+                                      context, shouldTake, isGuaranteed);
       return ArgumentSource(loc, RValue(SGF, loc, baseFormalType, base));
     }
-    
+
     // If the type is address-only, we can borrow the memory location as is.
     if (base.getType().isAddressOnly(SGF.F)) {
       return ArgumentSource(loc, RValue(SGF, loc, baseFormalType, base));
@@ -6921,7 +6942,7 @@ ArgumentSource AccessorBaseArgPreparer::prepareAccessorObjectBaseArg() {
   assert(!base.isLValue());
 
   // We need to produce the value at +1 if it's going to be consumed.
-  if (selfParam.isConsumed() && !base.hasCleanup()) {
+  if (selfParam.isConsumedInCaller() && !base.hasCleanup()) {
     base = base.copyUnmanaged(SGF, loc);
   }
   // If the parameter is indirect, we'll need to drop the value into

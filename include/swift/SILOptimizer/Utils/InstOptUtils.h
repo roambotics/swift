@@ -194,9 +194,24 @@ SILValue getConcreteValueOfExistentialBoxAddr(SILValue addr,
 /// BranchInst (a phi is never the last guaranteed user). \p builder's current
 /// insertion point must dominate all \p usePoints.
 std::pair<SILValue, bool /* changedCFG */>
-castValueToABICompatibleType(SILBuilder *builder, SILLocation Loc,
+castValueToABICompatibleType(SILBuilder *builder, SILPassManager *pm,
+                             SILLocation Loc,
                              SILValue value, SILType srcTy, SILType destTy,
                              ArrayRef<SILInstruction *> usePoints);
+
+/// Returns true if the layout of a generic nominal type is dependent on its generic parameters.
+/// This is usually the case. Some examples, where they layout is _not_ dependent:
+/// ```
+///    struct S<T> {
+///      var x: Int // no members which depend on T
+///    }
+///
+///    struct S<T> {
+///      var c: SomeClass<T> // a class reference does not depend on the layout of the class
+///    }
+/// ```
+bool layoutIsTypeDependent(NominalTypeDecl *decl);
+
 /// Peek through trivial Enum initialization, typically for pointless
 /// Optionals.
 ///
@@ -233,7 +248,7 @@ SILLinkage getSpecializedLinkage(SILFunction *f, SILLinkage linkage);
 /// Tries to perform jump-threading on all checked_cast_br instruction in
 /// function \p Fn.
 bool tryCheckedCastBrJumpThreading(
-    SILFunction *fn, DominanceInfo *dt, DeadEndBlocks *deBlocks,
+    SILFunction *fn, SILPassManager *pm, DominanceInfo *dt, DeadEndBlocks *deBlocks,
     SmallVectorImpl<SILBasicBlock *> &blocksForWorklist,
     bool EnableOSSARewriteTerminator);
 
@@ -615,6 +630,9 @@ SILValue createEmptyAndUndefValue(SILType ty, SILInstruction *insertionPoint,
 /// Check if a struct or its fields can have unreferenceable storage.
 bool findUnreferenceableStorage(StructDecl *decl, SILType structType,
                                 SILFunction *func);
+
+SILValue getInitOfTemporaryAllocStack(AllocStackInst *asi);
+
 } // end namespace swift
 
 #endif // SWIFT_SILOPTIMIZER_UTILS_INSTOPTUTILS_H

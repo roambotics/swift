@@ -4,13 +4,12 @@ include(macCatalystUtils)
 function(force_add_dependencies TARGET)
   foreach(DEPENDENCY ${ARGN})
     string(REGEX REPLACE [<>:\"/\\|?*] _ sanitized ${DEPENDENCY})
-    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forced-${sanitized}-dep.swift
-      COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/forced-${sanitized}-dep.swift
+    set(depfile "${CMAKE_CURRENT_BINARY_DIR}/forced-${sanitized}-dep.swift")
+    add_custom_command(OUTPUT ${depfile}
+      COMMAND ${CMAKE_COMMAND} -E touch ${depfile}
       DEPENDS ${DEPENDENCY}
     )
-    target_sources(${TARGET} PRIVATE
-      ${CMAKE_CURRENT_BINARY_DIR}/forced-${sanitized}-dep.swift
-    )
+    target_sources(${TARGET} PRIVATE ${depfile})
   endforeach()
 endfunction()
 
@@ -75,6 +74,12 @@ function(_add_host_swift_compile_options name)
   target_compile_options(${name} PRIVATE
     $<$<COMPILE_LANGUAGE:Swift>:-color-diagnostics>
   )
+
+  if(LLVM_ENABLE_ASSERTIONS)
+    target_compile_options(${name} PRIVATE "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xcc -UNDEBUG>")
+  else()
+    target_compile_options(${name} PRIVATE "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-Xcc -DNDEBUG>")
+  endif()
 endfunction()
 
 function(_set_pure_swift_link_flags name relpath_to_lib_dir)
@@ -95,6 +100,26 @@ function(_set_pure_swift_link_flags name relpath_to_lib_dir)
     # RPATH to the builder's runtime.
   endif()
 endfunction()
+
+function(_set_pure_swift_profile_flags target_name)
+  # This replicates the code existing in LLVM llvm/cmake/modules/HandleLLVMOptions.cmake
+  # The second part of the clause replicates the LINKER_IS_LLD_LINK of the
+  # original.
+  if(LLVM_BUILD_INSTRUMENTED AND NOT (SWIFT_COMPILER_IS_MSVC_LIKE AND SWIFT_USE_LINKER STREQUAL "lld"))
+    string(TOUPPER "${LLVM_BUILD_INSTRUMENTED}" uppercase_LLVM_BUILD_INSTRUMENTED)
+    if(LLVM_ENABLE_IR_PGO OR uppercase_LLVM_BUILD_INSTRUMENTED STREQUAL "IR")
+      target_link_options(${target_name} PRIVATE
+        "SHELL:-Xclang-linker -fprofile-generate=\"${LLVM_PROFILE_DATA_DIR}\"")
+    elseif(uppercase_LLVM_BUILD_INSTRUMENTED STREQUAL "CSIR")
+      target_link_options(${target_name} PRIVATE
+        "SHELL:-Xclang-linker -fcs-profile-generate=\"${LLVM_CSPROFILE_DATA_DIR}\"")
+    else()
+      target_link_options(${target_name} PRIVATE
+        "SHELL:-Xclang-linker -fprofile-instr-generate=\"${LLVM_PROFILE_FILE_PATTERN}\"")
+    endif()
+  endif()
+endfunction()
+
 
 # Add a new "pure" Swift host library.
 #
@@ -192,15 +217,6 @@ function(add_pure_swift_host_library name)
   # Depends on all '*.h' files in 'include/module.modulemap'.
   force_add_dependencies(${name} importedHeaderDependencies)
 
-  # Workaround to touch the library and its objects so that we don't
-  # continually rebuild (again, see corresponding change in swift-syntax).
-  add_custom_command(
-      TARGET ${name}
-      POST_BUILD
-      COMMAND "${CMAKE_COMMAND}" -E touch_nocreate $<TARGET_FILE:${name}> $<TARGET_OBJECTS:${name}> "${SWIFT_HOST_LIBRARIES_DEST_DIR}/${name}.swiftmodule" "${CMAKE_CURRENT_BINARY_DIR}/${name}.swiftmodule"
-      COMMAND_EXPAND_LISTS
-      COMMENT "Update mtime of library outputs workaround")
-
   # Link against dependencies.
   target_link_libraries(${name} PUBLIC
     ${APSHL_DEPENDENCIES}
@@ -210,15 +226,7 @@ function(add_pure_swift_host_library name)
     ${APSHL_SWIFT_DEPENDENCIES}
   )
 
-  # Make sure we can use the host libraries.
-  target_include_directories(${name} PUBLIC
-    "${SWIFT_HOST_LIBRARIES_DEST_DIR}")
-  target_link_directories(${name} PUBLIC
-    "${SWIFT_HOST_LIBRARIES_DEST_DIR}")
-
   if(APSHL_EMIT_MODULE)
-    # Determine where Swift modules will be built and installed.
-
     set(module_triple "${SWIFT_HOST_MODULE_TRIPLE}")
     set(module_dir "${SWIFT_HOST_LIBRARIES_DEST_DIR}")
     set(module_base "${module_dir}/${name}.swiftmodule")
@@ -226,14 +234,6 @@ function(add_pure_swift_host_library name)
     set(module_interface_file "${module_base}/${module_triple}.swiftinterface")
     set(module_private_interface_file "${module_base}/${module_triple}.private.swiftinterface")
     set(module_sourceinfo_file "${module_base}/${module_triple}.swiftsourceinfo")
-
-    set_target_properties(${name} PROPERTIES
-        # Set the default module name to the target name.
-        Swift_MODULE_NAME ${name}
-        # Install the Swift module into the appropriate location.
-        Swift_MODULE_DIRECTORY ${module_dir}
-        # NOTE: workaround for CMake not setting up include flags.
-        INTERFACE_INCLUDE_DIRECTORIES ${module_dir})
 
     # Create the module directory.
     add_custom_command(
@@ -254,11 +254,26 @@ function(add_pure_swift_host_library name)
         >)
   else()
     # Emit a swiftmodule in the current directory.
-    set_target_properties(${name} PROPERTIES
-        Swift_MODULE_NAME ${name}
-        Swift_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
-    set(module_file "${CMAKE_CURRENT_BINARY_DIR}/${name}.swiftmodule")
+    set(module_dir "${CMAKE_CURRENT_BINARY_DIR}/modules")
+    set(module_file "${module_dir}/${name}.swiftmodule")
   endif()
+
+  set_target_properties(${name} PROPERTIES
+    # Set the default module name to the target name.
+    Swift_MODULE_NAME ${name}
+    # Install the Swift module into the appropriate location.
+    Swift_MODULE_DIRECTORY ${module_dir}
+    # NOTE: workaround for CMake not setting up include flags.
+    INTERFACE_INCLUDE_DIRECTORIES ${module_dir})
+
+  # Workaround to touch the library and its objects so that we don't
+  # continually rebuild (again, see corresponding change in swift-syntax).
+  add_custom_command(
+      TARGET ${name}
+      POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E touch_nocreate $<TARGET_FILE:${name}> $<TARGET_OBJECTS:${name}> "${module_file}"
+      COMMAND_EXPAND_LISTS
+      COMMENT "Update mtime of library outputs workaround")
 
   # Downstream linking should include the swiftmodule in debug builds to allow lldb to
   # work correctly. Only do this on Darwin since neither gold (currently used by default
@@ -274,21 +289,12 @@ function(add_pure_swift_host_library name)
     )
   endif()
 
-  # This replicates he code existing in LLVM llvm/cmake/modules/HandleLLVMOptions.cmake
-  # The second part of the clause replicates the LINKER_IS_LLD_LINK of the
-  # original.
-  if(LLVM_BUILD_INSTRUMENTED AND NOT (SWIFT_COMPILER_IS_MSVC_LIKE AND SWIFT_USE_LINKER STREQUAL "lld"))
-    string(TOUPPER "${LLVM_BUILD_INSTRUMENTED}" uppercase_LLVM_BUILD_INSTRUMENTED)
-    if(LLVM_ENABLE_IR_PGO OR uppercase_LLVM_BUILD_INSTRUMENTED STREQUAL "IR")
-      target_link_options(${name} PRIVATE
-        "SHELL:-Xclang-linker -fprofile-generate=\"${LLVM_PROFILE_DATA_DIR}\"")
-    elseif(uppercase_LLVM_BUILD_INSTRUMENTED STREQUAL "CSIR")
-      target_link_options(${name} PRIVATE
-        "SHELL:-Xclang-linker -fcs-profile-generate=\"${LLVM_CSPROFILE_DATA_DIR}\"")
-    else()
-      target_link_options(${name} PRIVATE
-        "SHELL:-Xclang-linker -fprofile-instr-generate=\"${LLVM_PROFILE_FILE_PATTERN}\"")
-    endif()
+  _set_pure_swift_profile_flags(${name})
+
+  # Enable build IDs
+  if(SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_USE_BUILD_ID)
+    target_link_options(${name} PRIVATE
+      "SHELL:-Xlinker --build-id=sha1")
   endif()
 
   # Export this target.
@@ -392,6 +398,12 @@ function(add_pure_swift_host_tool name)
     )
   endif()
 
+  # Enable build IDs
+  if(SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_USE_BUILD_ID)
+    target_link_options(${name} PRIVATE
+      "SHELL:-Xlinker --build-id=sha1")
+  endif()
+
   # Workaround to touch the library and its objects so that we don't
   # continually rebuild (again, see corresponding change in swift-syntax).
   add_custom_command(
@@ -424,4 +436,6 @@ function(add_pure_swift_host_tool name)
   else()
     set_property(GLOBAL APPEND PROPERTY SWIFT_EXPORTS ${name})
   endif()
+
+  _set_pure_swift_profile_flags(${name})
 endfunction()

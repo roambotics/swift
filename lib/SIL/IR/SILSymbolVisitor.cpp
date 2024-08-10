@@ -24,6 +24,7 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/SynthesizedFileUnit.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/SIL/FormalLinkage.h"
@@ -279,17 +280,19 @@ class SILSymbolVisitorImpl : public ASTVisitor<SILSymbolVisitorImpl> {
       // FIXME: the logic around visibility in extensions is confusing, and
       // sometimes witness thunks need to be manually made public.
 
-      auto conformanceIsFixed =
-          SILWitnessTable::conformanceIsSerialized(rootConformance);
+      auto conformanceSeializedKind =
+          SILWitnessTable::conformanceSerializedKind(rootConformance);
       auto addSymbolIfNecessary = [&](ValueDecl *requirementDecl,
                                       ValueDecl *witnessDecl) {
         auto witnessRef = SILDeclRef(witnessDecl);
         if (Ctx.getOpts().PublicOrPackageSymbolsOnly) {
-          if (!conformanceIsFixed)
+          if (conformanceSeializedKind == IsNotSerialized)
             return;
 
           if (!isa<SelfProtocolConformance>(rootConformance) &&
-              !fixmeWitnessHasLinkageThatNeedsToBePublic(witnessRef)) {
+              !fixmeWitnessHasLinkageThatNeedsToBePublic(
+                  witnessRef,
+                  witnessRef.getASTContext().SILOpts.EnableSerializePackage)) {
             return;
           }
         }
@@ -577,7 +580,7 @@ public:
 
   void visitVarDecl(VarDecl *VD) {
     // Variables inside non-resilient modules have some additional symbols.
-    if (!VD->isResilient()) {
+    if (!VD->isStrictlyResilient()) {
       // Non-global variables might have an explicit initializer symbol in
       // non-resilient modules.
       if (VD->getAttrs().hasAttribute<HasInitialValueAttr>() &&
@@ -587,17 +590,14 @@ public:
         // Stored property initializers for public properties are public.
         addFunction(declRef);
       }
-
       // Statically/globally stored variables have some special handling.
       if (VD->hasStorage() && isGlobalOrStaticVar(VD)) {
         if (!shouldSkipVisit(getDeclLinkage(VD))) {
           Visitor.addGlobalVar(VD);
         }
-
         if (VD->isLazilyInitializedGlobal())
           addFunction(SILDeclRef(VD, SILDeclRef::Kind::GlobalAccessor));
       }
-
       // Wrapped non-static member properties may have a backing initializer.
       auto initInfo = VD->getPropertyWrapperInitializerInfo();
       if (initInfo.hasInitFromWrappedValue() && !VD->isStatic()) {
@@ -605,7 +605,6 @@ public:
             VD, SILDeclRef::Kind::PropertyWrapperBackingInitializer));
       }
     }
-
     visitAbstractStorageDecl(VD);
   }
 
@@ -812,6 +811,7 @@ public:
                   V.Ctx.getOpts().WitnessMethodElimination} {}
 
         void addMethod(SILDeclRef declRef) {
+          // TODO: alternatively maybe prevent adding distributed thunk here rather than inside those?
           if (Resilient || WitnessMethodElimination) {
             Visitor.addDispatchThunk(declRef);
             Visitor.addMethodDescriptor(declRef);

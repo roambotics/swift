@@ -79,7 +79,7 @@ internal final class CheckedContinuationCanary: @unchecked Sendable {
     // Log if the continuation was never consumed before the instance was
     // destructed.
     if _continuationPtr.pointee != nil {
-      logFailedCheck("SWIFT TASK CONTINUATION MISUSE: \(function) leaked its continuation!\n")
+      logFailedCheck("SWIFT TASK CONTINUATION MISUSE: \(function) leaked its continuation without resuming it. This may cause tasks waiting on it to remain suspended forever.\n")
     }
   }
 }
@@ -159,7 +159,7 @@ public struct CheckedContinuation<T, E: Error>: Sendable {
   /// After `resume` enqueues the task, control immediately returns to
   /// the caller. The task continues executing when its executor is
   /// able to reschedule it.
-  public func resume(returning value: __owned T) {
+  public func resume(returning value: sending T) {
     if let c: UnsafeContinuation<T, E> = canary.takeContinuation() {
       c.resume(returning: value)
     } else {
@@ -206,7 +206,7 @@ extension CheckedContinuation {
   /// the caller. The task continues executing when its executor is
   /// able to reschedule it.
   @_alwaysEmitIntoClient
-  public func resume<Er: Error>(with result: Result<T, Er>) where E == Error {
+  public func resume<Er: Error>(with result: __shared sending Result<T, Er>) where E == Error {
     switch result {
       case .success(let val):
         self.resume(returning: val)
@@ -230,7 +230,7 @@ extension CheckedContinuation {
   /// the caller. The task continues executing when its executor is
   /// able to reschedule it.
   @_alwaysEmitIntoClient
-  public func resume(with result: Result<T, E>) {
+  public func resume(with result: __shared sending Result<T, E>) {
     switch result {
       case .success(let val):
         self.resume(returning: val)
@@ -267,7 +267,7 @@ extension CheckedContinuation {
 /// indefinitely which will result in the task "hanging" as well as being leaked with
 /// no possibility to destroy it.
 ///
-/// The checked continuation offers detection of mis-use, and dropping the last reference
+/// The checked continuation offers detection of misuse, and dropping the last reference
 /// to it, without having resumed it will trigger a warning. Resuming a continuation twice
 /// is also diagnosed and will cause a crash.
 ///
@@ -291,18 +291,25 @@ public func withCheckedContinuation<T>(
   isolation: isolated (any Actor)? = #isolation,
   function: String = #function,
   _ body: (CheckedContinuation<T, Never>) -> Void
-) async -> T {
-  return await withUnsafeContinuation {
-    body(CheckedContinuation(continuation: $0, function: function))
+) async -> sending T {
+  return await Builtin.withUnsafeContinuation {
+    let unsafeContinuation = UnsafeContinuation<T, Never>($0)
+    return body(CheckedContinuation(continuation: unsafeContinuation,
+                                    function: function))
   }
 }
 
+// Note: hack to stage out @_unsafeInheritExecutor forms of various functions
+// in favor of #isolation. The _unsafeInheritExecutor_ prefix is meaningful
+// to the type checker.
+//
+// This function also doubles as an ABI-compatibility shim predating the
+// introduction of #isolation.
 @available(SwiftStdlib 5.1, *)
-@usableFromInline
 @_unsafeInheritExecutor // ABI compatibility with Swift 5.1
 @_unavailableInEmbedded
 @_silgen_name("$ss23withCheckedContinuation8function_xSS_yScCyxs5NeverOGXEtYalF")
-internal func __abi_withCheckedContinuation<T>(
+public func _unsafeInheritExecutor_withCheckedContinuation<T>(
   function: String = #function,
   _ body: (CheckedContinuation<T, Never>) -> Void
 ) async -> T {
@@ -326,7 +333,7 @@ internal func __abi_withCheckedContinuation<T>(
 /// indefinitely which will result in the task "hanging" as well as being leaked with
 /// no possibility to destroy it.
 ///
-/// The checked continuation offers detection of mis-use, and dropping the last reference
+/// The checked continuation offers detection of misuse, and dropping the last reference
 /// to it, without having resumed it will trigger a warning. Resuming a continuation twice
 /// is also diagnosed and will cause a crash.
 ///
@@ -350,18 +357,25 @@ public func withCheckedThrowingContinuation<T>(
   isolation: isolated (any Actor)? = #isolation,
   function: String = #function,
   _ body: (CheckedContinuation<T, Error>) -> Void
-) async throws -> T {
-  return try await withUnsafeThrowingContinuation {
-    body(CheckedContinuation(continuation: $0, function: function))
+) async throws -> sending T {
+  return try await Builtin.withUnsafeThrowingContinuation {
+    let unsafeContinuation = UnsafeContinuation<T, Error>($0)
+    return body(CheckedContinuation(continuation: unsafeContinuation,
+                                    function: function))
   }
 }
 
+// Note: hack to stage out @_unsafeInheritExecutor forms of various functions
+// in favor of #isolation. The _unsafeInheritExecutor_ prefix is meaningful
+// to the type checker.
+//
+// This function also doubles as an ABI-compatibility shim predating the
+// introduction of #isolation.
 @available(SwiftStdlib 5.1, *)
-@usableFromInline
 @_unsafeInheritExecutor // ABI compatibility with Swift 5.1
 @_unavailableInEmbedded
 @_silgen_name("$ss31withCheckedThrowingContinuation8function_xSS_yScCyxs5Error_pGXEtYaKlF")
-internal func __abi_withCheckedThrowingContinuation<T>(
+public func _unsafeInheritExecutor_withCheckedThrowingContinuation<T>(
   function: String = #function,
   _ body: (CheckedContinuation<T, Error>) -> Void
 ) async throws -> T {
@@ -393,7 +407,7 @@ internal func _createCheckedThrowingContinuation<T>(
 @_alwaysEmitIntoClient
 internal func _resumeCheckedContinuation<T>(
   _ continuation: CheckedContinuation<T, Never>,
-  _ value: __owned T
+  _ value: sending T
 ) {
   continuation.resume(returning: value)
 }
@@ -402,7 +416,7 @@ internal func _resumeCheckedContinuation<T>(
 @_alwaysEmitIntoClient
 internal func _resumeCheckedThrowingContinuation<T>(
   _ continuation: CheckedContinuation<T, Error>,
-  _ value: __owned T
+  _ value: sending T
 ) {
   continuation.resume(returning: value)
 }
@@ -411,7 +425,7 @@ internal func _resumeCheckedThrowingContinuation<T>(
 @_alwaysEmitIntoClient
 internal func _resumeCheckedThrowingContinuationWithError<T>(
   _ continuation: CheckedContinuation<T, Error>,
-  _ error: __owned Error
+  _ error: consuming Error
 ) {
   continuation.resume(throwing: error)
 }

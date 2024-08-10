@@ -23,6 +23,7 @@
 #include "swift/AST/GenericParamList.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Statistic.h"
 #include "llvm/ADT/SmallString.h"
@@ -109,14 +110,18 @@ bool TypeRepr::hasOpaque() {
     findIf([](TypeRepr *ty) { return isa<OpaqueReturnTypeRepr>(ty); });
 }
 
+bool TypeRepr::isParenType() const {
+  auto *tuple = dyn_cast<TupleTypeRepr>(this);
+  return tuple && tuple->isParenType();
+}
+
 TypeRepr *TypeRepr::getWithoutParens() const {
-  auto *repr = const_cast<TypeRepr *>(this);
-  while (auto *tupleRepr = dyn_cast<TupleTypeRepr>(repr)) {
-    if (!tupleRepr->isParenType())
-      break;
-    repr = tupleRepr->getElementType(0);
+  auto *result = this;
+  while (result->isParenType()) {
+    result = cast<TupleTypeRepr>(result)->getElementType(0);
   }
-  return repr;
+
+  return const_cast<TypeRepr *>(result);
 }
 
 bool TypeRepr::isSimpleUnqualifiedIdentifier(Identifier identifier) const {
@@ -147,7 +152,7 @@ SourceLoc TypeRepr::findAttrLoc(TypeAttrKind kind) const {
     for (auto attr : attrTypeRepr->getAttrs()) {
       if (auto typeAttr = attr.dyn_cast<TypeAttribute*>())
         if (typeAttr->getKind() == kind)
-          return typeAttr->getAttrLoc();
+          return typeAttr->getStartLoc();
     }
 
     typeRepr = attrTypeRepr->getTypeRepr();
@@ -670,28 +675,28 @@ SourceLoc SILBoxTypeRepr::getLocImpl() const {
   return LBraceLoc;
 }
 
-LifetimeDependentReturnTypeRepr *LifetimeDependentReturnTypeRepr::create(
+LifetimeDependentTypeRepr *LifetimeDependentTypeRepr::create(
     ASTContext &C, TypeRepr *base,
     ArrayRef<LifetimeDependenceSpecifier> specifiers) {
   auto size = totalSizeToAlloc<LifetimeDependenceSpecifier>(specifiers.size());
   auto mem = C.Allocate(size, alignof(LifetimeDependenceSpecifier));
-  return new (mem) LifetimeDependentReturnTypeRepr(base, specifiers);
+  return new (mem) LifetimeDependentTypeRepr(base, specifiers);
 }
 
-SourceLoc LifetimeDependentReturnTypeRepr::getStartLocImpl() const {
+SourceLoc LifetimeDependentTypeRepr::getStartLocImpl() const {
   return getLifetimeDependencies().front().getLoc();
 }
 
-SourceLoc LifetimeDependentReturnTypeRepr::getEndLocImpl() const {
+SourceLoc LifetimeDependentTypeRepr::getEndLocImpl() const {
   return getLifetimeDependencies().back().getLoc();
 }
 
-SourceLoc LifetimeDependentReturnTypeRepr::getLocImpl() const {
+SourceLoc LifetimeDependentTypeRepr::getLocImpl() const {
   return getBase()->getLoc();
 }
 
-void LifetimeDependentReturnTypeRepr::printImpl(
-    ASTPrinter &Printer, const PrintOptions &Opts) const {
+void LifetimeDependentTypeRepr::printImpl(ASTPrinter &Printer,
+                                          const PrintOptions &Opts) const {
   Printer << " ";
   for (auto &dep : getLifetimeDependencies()) {
     Printer << dep.getLifetimeDependenceSpecifierString() << " ";
@@ -847,14 +852,11 @@ void SpecifierTypeRepr::printImpl(ASTPrinter &Printer,
   case TypeReprKind::Isolated:
     Printer.printKeyword("isolated", Opts, " ");
     break;
-  case TypeReprKind::Transferring:
-    Printer.printKeyword("transferring", Opts, " ");
+  case TypeReprKind::Sending:
+    Printer.printKeyword("sending", Opts, " ");
     break;
   case TypeReprKind::CompileTimeConst:
     Printer.printKeyword("_const", Opts, " ");
-    break;
-  case TypeReprKind::ResultDependsOn:
-    Printer.printKeyword("_resultDependsOn", Opts, " ");
     break;
   }
   printTypeRepr(Base, Printer, Opts);

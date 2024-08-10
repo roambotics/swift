@@ -59,6 +59,7 @@
 #include "llvm/Support/Debug.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/Serialization/SerializedSILLoader.h"
@@ -74,20 +75,20 @@ STATISTIC(NumFuncLinked, "Number of SIL functions linked");
 //===----------------------------------------------------------------------===//
 
 void SILLinkerVisitor::deserializeAndPushToWorklist(SILFunction *F) {
-  assert(F->isExternalDeclaration());
+  ASSERT(F->isExternalDeclaration());
 
   LLVM_DEBUG(llvm::dbgs() << "Imported function: "
                           << F->getName() << "\n");
   SILFunction *NewF =
     Mod.getSILLoader()->lookupSILFunction(F, /*onlyUpdateLinkage*/ false);
-  assert(!NewF || NewF == F);
+  ASSERT(!NewF || NewF == F);
   if (!NewF || F->isExternalDeclaration()) {
-    assert((!hasSharedVisibility(F->getLinkage()) || F->hasForeignBody()) &&
+    ASSERT((!hasSharedVisibility(F->getLinkage()) || F->hasForeignBody()) &&
            "cannot deserialize shared function");
     return;
   }
 
-  assert((bool)F->isSerialized() == !Mod.isSerialized() &&
+  ASSERT(!F->isAnySerialized() == Mod.isSerialized() &&
          "the de-serializer did set the wrong serialized flag");
   
   F->setBare(IsBare);
@@ -98,21 +99,23 @@ void SILLinkerVisitor::deserializeAndPushToWorklist(SILFunction *F) {
 }
 
 /// Deserialize a function and add it to the worklist for processing.
-void SILLinkerVisitor::maybeAddFunctionToWorklist(SILFunction *F,
-                                                  bool setToSerializable) {
+void SILLinkerVisitor::maybeAddFunctionToWorklist(
+    SILFunction *F, SerializedKind_t callerSerializedKind) {
   SILLinkage linkage = F->getLinkage();
-  assert((!setToSerializable || F->hasValidLinkageForFragileRef() ||
-         hasSharedVisibility(linkage)) &&
+  ASSERT((callerSerializedKind == IsNotSerialized ||
+            F->hasValidLinkageForFragileRef(callerSerializedKind) ||
+            hasSharedVisibility(linkage) || F->isExternForwardDeclaration()) &&
          "called function has wrong linkage for serialized function");
-                                         
   if (!F->isExternalDeclaration()) {
     // The function is already in the module, so no need to de-serialized it.
     // But check if we need to set the IsSerialized flag.
     // See the top-level comment for SILLinkerVisitor for details.
-    if (setToSerializable && !Mod.isSerialized() &&
-        hasSharedVisibility(linkage) && !F->isSerialized()) {
-      F->setSerialized(IsSerialized);
-      
+    if (callerSerializedKind == IsSerialized &&
+        hasSharedVisibility(linkage) &&
+        !Mod.isSerialized() &&
+        !F->isAnySerialized()) {
+      F->setSerializedKind(IsSerialized);
+
       // Push the function to the worklist so that all referenced shared functions
       // are also set to IsSerialized.
       Worklist.push_back(F);
@@ -148,7 +151,7 @@ void SILLinkerVisitor::maybeAddFunctionToWorklist(SILFunction *F,
 bool SILLinkerVisitor::processFunction(SILFunction *F) {
   // If F is a declaration, first deserialize it.
   if (F->isExternalDeclaration()) {
-    maybeAddFunctionToWorklist(F, /*setToSerializable*/ false);
+    maybeAddFunctionToWorklist(F, /*serializedKind*/ IsNotSerialized);
   } else {
     Worklist.push_back(F);
   }
@@ -171,7 +174,7 @@ void SILLinkerVisitor::linkInVTable(ClassDecl *D) {
   // vtables that might have shared linkage yet, so this is only needed in
   // the performance pipeline to deserialize more functions early, and expose
   // optimization opportunities.
-  assert(isLinkAll());
+  ASSERT(isLinkAll());
 
   // Attempt to lookup the Vtbl from the SILModule.
   SILVTable *Vtbl = Mod.lookUpVTable(D);
@@ -183,10 +186,12 @@ void SILLinkerVisitor::linkInVTable(ClassDecl *D) {
   // for processing.
   for (auto &entry : Vtbl->getEntries()) {
     SILFunction *impl = entry.getImplementation();
-    if (!Vtbl->isSerialized() || impl->hasValidLinkageForFragileRef()) {
+    if (!Vtbl->isAnySerialized() ||
+        impl->hasValidLinkageForFragileRef(Vtbl->getSerializedKind())) {
       // Deserialize and recursively walk any vtable entries that do not have
       // bodies yet.
-      maybeAddFunctionToWorklist(impl, Vtbl->isSerialized());
+      maybeAddFunctionToWorklist(impl, 
+                                 Vtbl->getSerializedKind());
     }
   }
 
@@ -213,19 +218,19 @@ void SILLinkerVisitor::visitPartialApplyInst(PartialApplyInst *PAI) {
 
 void SILLinkerVisitor::visitFunctionRefInst(FunctionRefInst *FRI) {
   maybeAddFunctionToWorklist(FRI->getReferencedFunction(),
-                             FRI->getFunction()->isSerialized());
+                             FRI->getFunction()->getSerializedKind());
 }
 
 void SILLinkerVisitor::visitDynamicFunctionRefInst(
     DynamicFunctionRefInst *FRI) {
   maybeAddFunctionToWorklist(FRI->getInitiallyReferencedFunction(),
-                             FRI->getFunction()->isSerialized());
+                             FRI->getFunction()->getSerializedKind());
 }
 
 void SILLinkerVisitor::visitPreviousDynamicFunctionRefInst(
     PreviousDynamicFunctionRefInst *FRI) {
   maybeAddFunctionToWorklist(FRI->getInitiallyReferencedFunction(),
-                             FRI->getFunction()->isSerialized());
+                             FRI->getFunction()->getSerializedKind());
 }
 
 // Eagerly visiting all used conformances leads to a large blowup
@@ -315,7 +320,8 @@ void SILLinkerVisitor::visitProtocolConformance(ProtocolConformanceRef ref) {
       // Otherwise, deserialize the witness if it has shared linkage, or if
       // we were asked to deserialize everything.
       maybeAddFunctionToWorklist(E.getMethodWitness().Witness,
-        WT->isSerialized() || isAvailableExternally(WT->getLinkage()));
+        (WT->isSerialized() || isAvailableExternally(WT->getLinkage()) ?
+         IsSerialized : WT->getSerializedKind()));
       break;
     }
     
@@ -422,7 +428,7 @@ void SILLinkerVisitor::visitMetatypeInst(MetatypeInst *MI) {
 }
 
 void SILLinkerVisitor::visitGlobalAddrInst(GlobalAddrInst *GAI) {
-  if (!Mod.getASTContext().LangOpts.hasFeature(Feature::Embedded))
+  if (!Mod.getOptions().EmbeddedSwift)
     return;
 
   SILGlobalVariable *G = GAI->getReferencedGlobal();
@@ -445,10 +451,10 @@ void SILLinkerVisitor::process() {
       // If the containing module has been serialized,
       // Remove The Serialized state (if any)
       //  This allows for more optimizations
-      Fn->setSerialized(IsSerialized_t::IsNotSerialized);
+      Fn->setSerializedKind(SerializedKind_t::IsNotSerialized);
     }
 
-    if (Fn->getModule().getASTContext().LangOpts.hasFeature(Feature::Embedded) &&
+    if (Fn->getModule().getOptions().EmbeddedSwift &&
         Fn->getModule().getASTContext().LangOpts.DebuggerSupport) {
       // LLDB requires that functions with bodies are not external.
       Fn->setLinkage(stripExternalFromLinkage(Fn->getLinkage()));

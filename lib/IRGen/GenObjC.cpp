@@ -29,6 +29,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/IRGen/Linking.h"
@@ -948,6 +949,7 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
   case ParameterConvention::Indirect_In:
   case ParameterConvention::Indirect_Inout:
   case ParameterConvention::Indirect_InoutAliasable:
+  case ParameterConvention::Indirect_In_CXX:
   case ParameterConvention::Pack_Guaranteed:
   case ParameterConvention::Pack_Owned:
   case ParameterConvention::Pack_Inout:
@@ -1712,7 +1714,7 @@ void IRGenFunction::emitBlockRelease(llvm::Value *value) {
 }
 
 void IRGenFunction::emitForeignReferenceTypeLifetimeOperation(
-    ValueDecl *fn, llvm::Value *value) {
+    ValueDecl *fn, llvm::Value *value, bool needsNullCheck) {
   assert(fn->getClangDecl() && isa<clang::FunctionDecl>(fn->getClangDecl()));
 
   auto clangFn = cast<clang::FunctionDecl>(fn->getClangDecl());
@@ -1723,6 +1725,28 @@ void IRGenFunction::emitForeignReferenceTypeLifetimeOperation(
       cast<llvm::FunctionType>(llvmFn->getFunctionType())->getParamType(0);
   value = Builder.CreateBitCast(value, argType);
 
-  auto call = Builder.CreateCall(llvmFn->getFunctionType(), llvmFn, value);
+  llvm::CallInst *call = nullptr;
+  if (needsNullCheck) {
+    // Check if the pointer is null.
+    auto nullValue = llvm::Constant::getNullValue(argType);
+    auto hasValue = Builder.CreateICmpNE(value, nullValue);
+
+    auto nonNullValueBB = createBasicBlock("lifetime.nonnull-value");
+    auto contBB = createBasicBlock("lifetime.cont");
+
+    // If null, just continue.
+    Builder.CreateCondBr(hasValue, nonNullValueBB, contBB);
+
+    // If non-null, emit a call to release/retain function.
+    Builder.emitBlock(nonNullValueBB);
+    call = Builder.CreateCall(llvmFn->getFunctionType(), llvmFn, value);
+
+    Builder.CreateBr(contBB);
+
+    Builder.emitBlock(contBB);
+  } else {
+    call = Builder.CreateCall(llvmFn->getFunctionType(), llvmFn, value);
+  }
+
   call->setDoesNotThrow();
 }

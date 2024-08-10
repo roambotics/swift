@@ -145,17 +145,17 @@ func missingWhileInRepeat() {
 func acceptsClosure<T>(t: T) -> Bool { return true }
 
 func missingControllingExprInFor() {
-  for ; { // expected-error {{C-style for statement has been removed in Swift 3}}
+  for ; { // expected-error {{C-style for statement was removed in Swift 3}}
   }
 
-  for ; // expected-error {{C-style for statement has been removed in Swift 3}}
+  for ; // expected-error {{C-style for statement was removed in Swift 3}}
   { 
   }
 
-  for ; true { // expected-error {{C-style for statement has been removed in Swift 3}}
+  for ; true { // expected-error {{C-style for statement was removed in Swift 3}}
   }
 
-  for var i = 0; true { // expected-error {{C-style for statement has been removed in Swift 3}}
+  for var i = 0; true { // expected-error {{C-style for statement was removed in Swift 3}}
     i += 1
   }
 }
@@ -543,15 +543,7 @@ func exprPostfix2() {
 
 //===--- Recovery for expr-super.
 
-class Base {}
-
-class ExprSuper1 {
-  init() {
-    super // expected-error {{expected '.' or '[' after 'super'}}
-  }
-}
-
-class ExprSuper2 {
+class ExprSuper {
   init() {
     super. // expected-error {{expected member name following '.'}} 
   }
@@ -623,6 +615,8 @@ class WrongInheritanceClause6(Int {}
 
 // expected-error@+1 {{expected ':' to begin inheritance clause}} {{33-34=: }} 
 class WrongInheritanceClause7<T>(Int where T:AnyObject {}
+
+class Base {}
 
 // <rdar://problem/18502220> [swift-crashes 078] parser crash on invalid cast in sequence expr
 Base=1 as Base=1 // expected-error{{cannot convert value of type 'Int' to type 'Base' in coercion}}
@@ -765,7 +759,7 @@ let ￼tryx  = 123        // expected-error {{invalid character in source file}}
 
 
 // <rdar://problem/21369926> Malformed Swift Enums crash playground service
-enum Rank: Int {  // expected-error {{'Rank' declares raw type 'Int', but does not conform to RawRepresentable and conformance could not be synthesized}}
+enum Rank: Int {  // expected-error {{'Rank' declares raw type 'Int', but does not conform to RawRepresentable and conformance could not be synthesized}} expected-note {{add stubs for conformance}}
   case Ace = 1
   case Two = 2.1  // expected-error {{cannot convert value of type 'Double' to raw type 'Int'}}
 }

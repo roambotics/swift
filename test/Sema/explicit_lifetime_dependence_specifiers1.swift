@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -disable-availability-checking -enable-experimental-feature NonescapableTypes -enable-experimental-feature NoncopyableGenerics -enable-experimental-feature BitwiseCopyable
+// RUN: %target-typecheck-verify-swift -disable-availability-checking -enable-experimental-feature NonescapableTypes
 // REQUIRES: asserts
 
 struct Container {
@@ -7,16 +7,18 @@ struct Container {
 
 struct AnotherBufferView : ~Escapable {
   let ptr: UnsafeRawBufferPointer
-  @_unsafeNonescapableResult
-  init(_ ptr: UnsafeRawBufferPointer) {
+  init(_ ptr: UnsafeRawBufferPointer) -> dependsOn(ptr) Self {
     self.ptr = ptr
   }
 }
 
 struct BufferView : ~Escapable {
   let ptr: UnsafeRawBufferPointer
+  init(_ ptr: UnsafeRawBufferPointer) -> dependsOn(ptr) Self {
+    self.ptr = ptr
+  }
   @_unsafeNonescapableResult
-  init(_ ptr: UnsafeRawBufferPointer) {
+  init(independent ptr: UnsafeRawBufferPointer) {
     self.ptr = ptr
   }
   init(_ ptr: UnsafeRawBufferPointer, _ arr: borrowing Array<Int>) -> dependsOn(arr) Self {
@@ -27,13 +29,13 @@ struct BufferView : ~Escapable {
     self.ptr = ptr
   }
   // TODO: Once Optional is ~Escapable, the error will go away
-  init?(_ ptr: UnsafeRawBufferPointer, _ arr: borrowing Array<Float>) -> dependsOn(arr) Self? { // expected-error{{lifetime dependence can only be specified on ~Escapable results}}
+  init?(_ ptr: UnsafeRawBufferPointer, _ arr: borrowing Array<Float>) -> dependsOn(arr) Self? { // expected-error{{lifetime dependence can only be specified on ~Escapable types}}
     if (Int.random(in: 1..<100) == 0) {
       return nil
     }
     self.ptr = ptr
   }
-  init?(_ ptr: UnsafeRawBufferPointer, _ arr: borrowing Array<String>) -> dependsOn(arr) Self? { // expected-error{{lifetime dependence can only be specified on ~Escapable results}}
+  init?(_ ptr: UnsafeRawBufferPointer, _ arr: borrowing Array<String>) -> dependsOn(arr) Self? { // expected-error{{lifetime dependence can only be specified on ~Escapable types}}
     if (Int.random(in: 1..<100) == 0) {
       return nil
     }
@@ -53,8 +55,8 @@ struct BufferView : ~Escapable {
     self.ptr = ptr
   }
 
-  consuming func consume() -> dependsOn(scoped self) BufferView { // expected-error{{invalid use of scoped lifetime dependence with consuming ownership}}
-    return BufferView(self.ptr)
+  consuming func consume() -> dependsOn(scoped self) BufferView {
+    return BufferView(independent: self.ptr)
   }
 
   func get() -> dependsOn(self) Self { // expected-note{{'get()' previously declared here}}
@@ -68,8 +70,7 @@ struct BufferView : ~Escapable {
 
 struct MutableBufferView : ~Escapable, ~Copyable {
   let ptr: UnsafeMutableRawBufferPointer
-  @_unsafeNonescapableResult
-  init(_ ptr: UnsafeMutableRawBufferPointer) {
+  init(_ ptr: UnsafeMutableRawBufferPointer) -> dependsOn(ptr) Self {
     self.ptr = ptr
   }
 }
@@ -80,7 +81,7 @@ struct WrapperStruct {
   let k: Klass
 }
 
-func invalidLifetimeDependenceOnEscapableResult(_ w: borrowing WrapperStruct) -> dependsOn(w) Klass { // expected-error{{lifetime dependence can only be specified on ~Escapable results}}
+func invalidLifetimeDependenceOnEscapableResult(_ w: borrowing WrapperStruct) -> dependsOn(w) Klass { // expected-error{{lifetime dependence can only be specified on ~Escapable types}}
   return w.k
 }
 
@@ -104,7 +105,7 @@ func duplicateParamInvalidLifetimeDependence3(_ x: borrowing BufferView) -> depe
   return BufferView(x.ptr)
 }
 
-func consumingParamInvalidLifetimeDependence1(_ x: consuming BufferView) -> dependsOn(scoped x) BufferView { // expected-error{{invalid use of scoped lifetime dependence with consuming ownership}}
+func consumingParamInvalidLifetimeDependence1(_ x: consuming BufferView) -> dependsOn(scoped x) BufferView {
   return BufferView(x.ptr)
 }
 
@@ -128,7 +129,7 @@ func inoutParamLifetimeDependence2(_ x: inout BufferView) -> dependsOn(scoped x)
   return BufferView(x.ptr)
 }
 
-func invalidSpecifierPosition1(_ x: borrowing dependsOn(x) BufferView) -> BufferView { // expected-error{{lifetime dependence specifiers may only be used on result of functions, methods, initializers}}
+func invalidSpecifierPosition1(_ x: borrowing dependsOn(x) BufferView) -> BufferView {
   return BufferView(x.ptr)
 }
 
@@ -139,6 +140,13 @@ func invalidSpecifierPosition2(_ x: borrowing BufferView) -> BufferView {
 
 func invalidTupleLifetimeDependence(_ x: inout BufferView) -> (dependsOn(x) BufferView, BufferView) { // expected-error{{lifetime dependence specifiers cannot be applied to tuple elements}}
   return (BufferView(x.ptr), BufferView(x.ptr))
+}
+
+// TODO: Is this legal ? If not, diagnose in Sema.
+func incorrectLifetimeDependenceInParamPosition1(bv: dependsOn(bv) inout BufferView, to: ContiguousArray<Int>) {
+}
+
+func incorrectLifetimeDependenceInParamPosition1(bv: dependsOn(to) inout ContiguousArray<Int>, to: ContiguousArray<Int>) { // expected-error{{lifetime dependence can only be specified on ~Escapable types}}
 }
 
 struct Wrapper : ~Escapable {
@@ -174,7 +182,7 @@ struct Wrapper : ~Escapable {
     return view
   }
 
-  consuming func consumingMethodInvalidLifetimeDependence1() -> dependsOn(scoped self) BufferView { // expected-error{{invalid use of scoped lifetime dependence with consuming ownership}}
+  consuming func consumingMethodInvalidLifetimeDependence1() -> dependsOn(scoped self) BufferView {
     return view
   }
 
@@ -203,8 +211,7 @@ public struct GenericBufferView<Element> : ~Escapable {
     return self
   }
   // unsafe private API
-  @_unsafeNonescapableResult
-  init(baseAddress: Pointer, count: Int) {
+  init(baseAddress: Pointer, count: Int) -> dependsOn(baseAddress) Self {
     precondition(count >= 0, "Count must not be negative")
     self.baseAddress = baseAddress
     self.count = count
@@ -221,7 +228,6 @@ func derive(_ x: BufferView) -> dependsOn(scoped x) BufferView { // expected-err
 
 struct RawBufferView {
   let ptr: UnsafeRawBufferPointer
-  @_unsafeNonescapableResult
   init(_ ptr: UnsafeRawBufferPointer) {
     self.ptr = ptr
   }
@@ -232,3 +238,8 @@ extension RawBufferView {
     return BufferView(ptr)
   }
 }
+
+func immortalConflict(immortal: UnsafeRawBufferPointer ) -> dependsOn(immortal) BufferView { // expected-error{{conflict between the parameter name and immortal keyword}}
+  return BufferView(immortal)
+}
+

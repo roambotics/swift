@@ -87,15 +87,6 @@ struct QueryTypeSubstitutionMap {
   Type operator()(SubstitutableType *type) const;
 };
 
-/// A function object suitable for use as a \c TypeSubstitutionFn that
-/// queries an underlying \c TypeSubstitutionMap, or returns the original type
-/// if no match was found.
-struct QueryTypeSubstitutionMapOrIdentity {
-  const TypeSubstitutionMap &substitutions;
-  
-  Type operator()(SubstitutableType *type) const;
-};
-
 /// Function used to resolve conformances.
 using GenericFunction = auto(CanType dependentType,
                              Type conformingReplacementType,
@@ -106,10 +97,8 @@ using LookupConformanceFn = llvm::function_ref<GenericFunction>;
 /// Functor class suitable for use as a \c LookupConformanceFn to look up a
 /// conformance through a module.
 class LookUpConformanceInModule {
-  ModuleDecl *M;
 public:
-  explicit LookUpConformanceInModule(ModuleDecl *M)
-    : M(M) {}
+  explicit LookUpConformanceInModule() {}
 
   ProtocolConformanceRef operator()(CanType dependentType,
                                     Type conformingReplacementType,
@@ -124,21 +113,6 @@ public:
   ProtocolConformanceRef operator()(CanType dependentType,
                                     Type conformingReplacementType,
                                     ProtocolDecl *conformedProtocol) const;
-};
-
-/// Functor class suitable for use as a \c LookupConformanceFn that fetches
-/// conformances from a generic signature.
-class LookUpConformanceInSignature {
-  const GenericSignatureImpl *Sig;
-public:
-  LookUpConformanceInSignature(const GenericSignatureImpl *Sig)
-    : Sig(Sig) {
-      assert(Sig && "Cannot lookup conformance in null signature!");
-    }
-
-    ProtocolConformanceRef operator()(CanType dependentType,
-                                      Type conformingReplacementType,
-                                      ProtocolDecl *conformedProtocol) const;
 };
   
 /// Flags that can be passed when substituting into a type.

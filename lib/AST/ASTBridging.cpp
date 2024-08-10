@@ -28,6 +28,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 
 #ifdef PURE_BRIDGING_MODE
 // In PURE_BRIDGING_MODE, bridging functions are not inlined and therefore
@@ -118,6 +119,134 @@ bool BridgedASTContext_langOptsHasFeature(BridgedASTContext cContext,
 
 unsigned BridgedASTContext_majorLanguageVersion(BridgedASTContext cContext) {
   return cContext.unbridged().LangOpts.EffectiveLanguageVersion[0];
+}
+
+bool BridgedASTContext_langOptsCustomConditionSet(BridgedASTContext cContext,
+                                                  BridgedStringRef cName) {
+  ASTContext &ctx = cContext.unbridged();
+  auto name = cName.unbridged();
+  if (name.starts_with("$") && ctx.LangOpts.hasFeature(name.drop_front()))
+    return true;
+
+  return ctx.LangOpts.isCustomConditionalCompilationFlagSet(name);
+}
+
+bool BridgedASTContext_langOptsHasFeatureNamed(BridgedASTContext cContext,
+                                               BridgedStringRef cName) {
+  return cContext.unbridged().LangOpts.hasFeature(cName.unbridged());
+}
+
+bool BridgedASTContext_langOptsHasAttributeNamed(BridgedASTContext cContext,
+                                                 BridgedStringRef cName) {
+  return hasAttribute(cContext.unbridged().LangOpts, cName.unbridged());
+}
+
+bool BridgedASTContext_langOptsIsActiveTargetOS(BridgedASTContext cContext,
+                                                BridgedStringRef cName) {
+  return cContext.unbridged().LangOpts.checkPlatformCondition(
+      PlatformConditionKind::OS, cName.unbridged());
+}
+
+bool BridgedASTContext_langOptsIsActiveTargetArchitecture(BridgedASTContext cContext,
+                                                          BridgedStringRef cName) {
+  return cContext.unbridged().LangOpts.checkPlatformCondition(
+      PlatformConditionKind::Arch, cName.unbridged());
+}
+
+bool BridgedASTContext_langOptsIsActiveTargetEnvironment(BridgedASTContext cContext,
+                                                         BridgedStringRef cName) {
+  return cContext.unbridged().LangOpts.checkPlatformCondition(
+      PlatformConditionKind::TargetEnvironment, cName.unbridged());
+}
+
+bool BridgedASTContext_langOptsIsActiveTargetRuntime(BridgedASTContext cContext,
+                                                     BridgedStringRef cName) {
+  return cContext.unbridged().LangOpts.checkPlatformCondition(
+      PlatformConditionKind::Runtime, cName.unbridged());
+}
+
+bool BridgedASTContext_langOptsIsActiveTargetPtrAuth(BridgedASTContext cContext,
+                                                     BridgedStringRef cName) {
+  return cContext.unbridged().LangOpts.checkPlatformCondition(
+      PlatformConditionKind::PtrAuth, cName.unbridged());
+}
+
+unsigned BridgedASTContext_langOptsTargetPointerBitWidth(BridgedASTContext cContext) {
+  return cContext.unbridged().LangOpts.Target.isArch64Bit() ? 64
+       : cContext.unbridged().LangOpts.Target.isArch32Bit() ? 32
+       : cContext.unbridged().LangOpts.Target.isArch16Bit() ? 16
+       : 0;
+}
+
+BridgedEndianness BridgedASTContext_langOptsTargetEndianness(BridgedASTContext cContext) {
+  return cContext.unbridged().LangOpts.Target.isLittleEndian() ? EndianLittle
+      : EndianBig;
+}
+
+/// Convert an array of numbers into a form we can use in Swift.
+namespace {
+  template<typename Arr>
+  SwiftInt convertArray(const Arr &array, SwiftInt **cElements) {
+    SwiftInt numElements = array.size();
+    *cElements = (SwiftInt *)malloc(sizeof(SwiftInt) * numElements);
+    for (SwiftInt i = 0; i != numElements; ++i)
+      (*cElements)[i] = array[i];
+    return numElements;
+  }
+}
+
+SwiftInt BridgedASTContext_langOptsGetLanguageVersion(BridgedASTContext cContext,
+                                                      SwiftInt** cComponents) {
+  auto theVersion = cContext.unbridged().LangOpts.EffectiveLanguageVersion;
+  return convertArray(theVersion, cComponents);
+}
+
+SWIFT_NAME("BridgedASTContext.langOptsGetCompilerVersion(self:_:)")
+SwiftInt BridgedASTContext_langOptsGetCompilerVersion(BridgedASTContext cContext,
+                                                      SwiftInt** cComponents) {
+  auto theVersion = version::Version::getCurrentLanguageVersion();
+  return convertArray(theVersion, cComponents);
+}
+
+SwiftInt BridgedASTContext_langOptsGetTargetAtomicBitWidths(BridgedASTContext cContext,
+                                                      SwiftInt* _Nullable * _Nonnull cElements) {
+  return convertArray(cContext.unbridged().LangOpts.getAtomicBitWidthValues(),
+                      cElements);
+}
+
+bool BridgedASTContext_canImport(BridgedASTContext cContext,
+                                 BridgedStringRef importPath,
+                                 BridgedSourceLoc canImportLoc,
+                                 BridgedCanImportVersion versionKind,
+                                 const SwiftInt * _Nullable versionComponents,
+                                 SwiftInt numVersionComponents) {
+  // Map the version.
+  llvm::VersionTuple version;
+  switch (numVersionComponents) {
+  case 0:
+    break;
+  case 1:
+    version = llvm::VersionTuple(versionComponents[0]);
+    break;
+  case 2:
+    version = llvm::VersionTuple(versionComponents[0], versionComponents[1]);
+    break;
+  case 3:
+    version = llvm::VersionTuple(versionComponents[0], versionComponents[1],
+                                 versionComponents[2]);
+    break;
+  default:
+    version = llvm::VersionTuple(versionComponents[0], versionComponents[1],
+                                 versionComponents[2], versionComponents[3]);
+    break;
+  }
+
+  ImportPath::Module::Builder builder(
+      cContext.unbridged(), importPath.unbridged(), /*separator=*/'.',
+      canImportLoc.unbridged());
+  return cContext.unbridged().canImportModule(
+      builder.get(), canImportLoc.unbridged(), version,
+      versionKind == CanImportUnderlyingVersion);
 }
 
 //===----------------------------------------------------------------------===//
@@ -840,22 +969,10 @@ BridgedParamDecl BridgedParamDecl_createParsed(
     BridgedSourceLoc cArgNameLoc, BridgedIdentifier cParamName,
     BridgedSourceLoc cParamNameLoc, BridgedNullableTypeRepr opaqueType,
     BridgedNullableExpr opaqueDefaultValue) {
-  auto *declContext = cDeclContext.unbridged();
-
-  auto *defaultValue = opaqueDefaultValue.unbridged();
-  DefaultArgumentKind defaultArgumentKind;
-
-  if (declContext->getParentSourceFile()->Kind == SourceFileKind::Interface &&
-      isa<SuperRefExpr>(defaultValue)) {
-    defaultValue = nullptr;
-    defaultArgumentKind = DefaultArgumentKind::Inherited;
-  } else {
-    defaultArgumentKind = getDefaultArgKind(defaultValue);
-  }
-
-  auto *paramDecl = new (cContext.unbridged()) ParamDecl(
-      cSpecifierLoc.unbridged(), cArgNameLoc.unbridged(), cArgName.unbridged(),
-      cParamNameLoc.unbridged(), cParamName.unbridged(), declContext);
+  auto *paramDecl = ParamDecl::createParsed(
+      cContext.unbridged(), cSpecifierLoc.unbridged(), cArgNameLoc.unbridged(),
+      cArgName.unbridged(), cParamNameLoc.unbridged(), cParamName.unbridged(),
+      opaqueDefaultValue.unbridged(), cDeclContext.unbridged());
 
   if (auto type = opaqueType.unbridged()) {
     paramDecl->setTypeRepr(type);
@@ -888,8 +1005,8 @@ BridgedParamDecl BridgedParamDecl_createParsed(
           paramDecl->setIsolated(true);
         else if (isa<CompileTimeConstTypeRepr>(STR))
           paramDecl->setCompileTimeConst(true);
-        else if (isa<TransferringTypeRepr>(STR))
-          paramDecl->setTransferring(true);
+        else if (isa<SendingTypeRepr>(STR))
+          paramDecl->setSending(true);
 
         unwrappedType = STR->getBase();
         continue;
@@ -898,9 +1015,6 @@ BridgedParamDecl BridgedParamDecl_createParsed(
       break;
     }
   }
-
-  paramDecl->setDefaultExpr(defaultValue, /*isTypeChecked*/ false);
-  paramDecl->setDefaultArgumentKind(defaultArgumentKind);
 
   return paramDecl;
 }
@@ -2237,17 +2351,14 @@ BridgedSpecifierTypeRepr BridgedSpecifierTypeRepr_createParsed(
     return new (context)
         OwnershipTypeRepr(baseType, ParamSpecifier::LegacyOwned, loc);
   }
-  case BridgedAttributedTypeSpecifierTransferring: {
-    return new (context) TransferringTypeRepr(baseType, loc);
+  case BridgedAttributedTypeSpecifierSending: {
+    return new (context) SendingTypeRepr(baseType, loc);
   }
   case BridgedAttributedTypeSpecifierConst: {
     return new (context) CompileTimeConstTypeRepr(baseType, loc);
   }
   case BridgedAttributedTypeSpecifierIsolated: {
     return new (context) IsolatedTypeRepr(baseType, loc);
-  }
-  case BridgedAttributedTypeSpecifierResultDependsOn: {
-    return new (context) ResultDependsOnTypeRepr(baseType, loc);
   }
   }
 }
@@ -2580,32 +2691,27 @@ void BridgedTypeRepr_dump(void *type) { static_cast<TypeRepr *>(type)->dump(); }
 //===----------------------------------------------------------------------===//
 
 PluginCapabilityPtr Plugin_getCapability(PluginHandle handle) {
-  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  auto *plugin = static_cast<CompilerPlugin *>(handle);
   return plugin->getCapability();
 }
 
 void Plugin_setCapability(PluginHandle handle, PluginCapabilityPtr data) {
-  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  auto *plugin = static_cast<CompilerPlugin *>(handle);
   plugin->setCapability(data);
 }
 
-const char *Plugin_getExecutableFilePath(PluginHandle handle) {
-  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
-  return plugin->getExecutablePath().data();
-}
-
 void Plugin_lock(PluginHandle handle) {
-  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  auto *plugin = static_cast<CompilerPlugin *>(handle);
   plugin->lock();
 }
 
 void Plugin_unlock(PluginHandle handle) {
-  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  auto *plugin = static_cast<CompilerPlugin *>(handle);
   plugin->unlock();
 }
 
 bool Plugin_spawnIfNeeded(PluginHandle handle) {
-  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  auto *plugin = static_cast<CompilerPlugin *>(handle);
   auto error = plugin->spawnIfNeeded();
   bool hadError(error);
   llvm::consumeError(std::move(error));
@@ -2613,7 +2719,7 @@ bool Plugin_spawnIfNeeded(PluginHandle handle) {
 }
 
 bool Plugin_sendMessage(PluginHandle handle, const BridgedData data) {
-  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  auto *plugin = static_cast<CompilerPlugin *>(handle);
   StringRef message(data.BaseAddress, data.Length);
   auto error = plugin->sendMessage(message);
   if (error) {
@@ -2629,7 +2735,7 @@ bool Plugin_sendMessage(PluginHandle handle, const BridgedData data) {
 }
 
 bool Plugin_waitForNextMessage(PluginHandle handle, BridgedData *out) {
-  auto *plugin = static_cast<LoadedExecutablePlugin *>(handle);
+  auto *plugin = static_cast<CompilerPlugin *>(handle);
   auto result = plugin->waitForNextMessage();
   if (!result) {
     // FIXME: Pass the error message back to the caller.

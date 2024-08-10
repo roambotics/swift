@@ -18,6 +18,7 @@
 #include "TypeChecker.h"
 #include "swift/Strings.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/ProtocolConformance.h"
@@ -25,7 +26,9 @@
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeVisitor.h"
+#include "swift/AST/ImportCache.h"
 #include "swift/AST/ExistentialLayout.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/AST/ASTPrinter.h"
 
@@ -33,7 +36,7 @@ using namespace swift;
 
 // ==== ------------------------------------------------------------------------
 
-bool swift::ensureDistributedModuleLoaded(Decl *decl) {
+bool swift::ensureDistributedModuleLoaded(const ValueDecl *decl) {
   auto &C = decl->getASTContext();
   auto moduleAvailable = evaluateOrDefault(
       C.evaluator, DistributedModuleIsAvailableRequest{decl}, false);
@@ -42,14 +45,25 @@ bool swift::ensureDistributedModuleLoaded(Decl *decl) {
 
 bool
 DistributedModuleIsAvailableRequest::evaluate(Evaluator &evaluator,
-                                              Decl *decl) const {
+                                              const ValueDecl *decl) const {
   auto &C = decl->getASTContext();
 
-  if (C.getLoadedModule(C.Id_Distributed))
+  auto DistributedModule = C.getLoadedModule(C.Id_Distributed);
+  if (!DistributedModule) {
+    decl->diagnose(diag::distributed_decl_needs_explicit_distributed_import,
+                   decl)
+        .fixItAddImport("Distributed");
+    return false;
+  }
+
+  auto &importCache = C.getImportCache();
+  if (importCache.isImportedBy(DistributedModule, decl->getDeclContext())) {
     return true;
+  }
 
   // seems we're missing the Distributed module, ask to import it explicitly
-  decl->diagnose(diag::distributed_actor_needs_explicit_distributed_import);
+  decl->diagnose(diag::distributed_decl_needs_explicit_distributed_import,
+                 decl);
   return false;
 }
 
@@ -391,7 +405,7 @@ bool swift::checkDistributedActorSystemAdHocProtocolRequirements(
 }
 
 static bool checkDistributedTargetResultType(
-    ModuleDecl *module, ValueDecl *valueDecl,
+    ValueDecl *valueDecl,
     Type serializationRequirement,
     bool diagnose) {
   auto &C = valueDecl->getASTContext();
@@ -407,7 +421,10 @@ static bool checkDistributedTargetResultType(
   if (auto func = dyn_cast<FuncDecl>(valueDecl)) {
     resultType = func->mapTypeIntoContext(func->getResultInterfaceType());
   } else if (auto var = dyn_cast<VarDecl>(valueDecl)) {
-    resultType = var->getInterfaceType();
+    // Distributed computed properties are always getters,
+    // so get the get accessor for mapping the type into context:
+    auto getter = var->getAccessor(swift::AccessorKind::Get);
+    resultType = getter->mapTypeIntoContext(var->getInterfaceType());
   } else {
     llvm_unreachable("Unsupported distributed target");
   }
@@ -428,8 +445,7 @@ static bool checkDistributedTargetResultType(
           C, serializationRequirement);
 
   for (auto serializationReq: serializationRequirements) {
-    auto conformance =
-        module->checkConformance(resultType, serializationReq);
+    auto conformance = checkConformance(resultType, serializationReq);
     if (conformance.isInvalid()) {
       if (diagnose) {
         llvm::StringRef conformanceToSuggest = isCodableRequirement ?
@@ -502,6 +518,10 @@ bool swift::checkDistributedFunction(AbstractFunctionDecl *func) {
   if (!func->isDistributed())
     return false;
 
+  // ==== Ensure the Distributed module is available,
+  if (!swift::ensureDistributedModuleLoaded(func))
+    return true;
+
   auto &C = func->getASTContext();
   return evaluateOrDefault(C.evaluator,
                            CheckDistributedFunctionRequest{func},
@@ -518,16 +538,13 @@ bool CheckDistributedFunctionRequest::evaluate(
   }
 
   auto &C = func->getASTContext();
-  auto module = func->getParentModule();
 
   /// If no distributed module is available, then no reason to even try checks.
-  if (!C.getLoadedModule(C.Id_Distributed))
+  if (!C.getLoadedModule(C.Id_Distributed)) {
+    func->diagnose(diag::distributed_decl_needs_explicit_distributed_import,
+                   func);
     return true;
-
-//  // No checking for protocol requirements because they are not required
-//  // to have `SerializationRequirement`.
-//  if (isa<ProtocolDecl>(func->getDeclContext()))
-//    return false;
+  }
 
   Type serializationReqType =
       getDistributedActorSerializationType(func->getDeclContext());
@@ -545,7 +562,7 @@ bool CheckDistributedFunctionRequest::evaluate(
 
       auto srl = serializationReqType->getExistentialLayout();
       for (auto req: srl.getProtocols()) {
-        if (module->checkConformance(paramTy, req).isInvalid()) {
+        if (checkConformance(paramTy, req).isInvalid()) {
           auto diag = func->diagnose(
               diag::distributed_actor_func_param_not_codable,
               param->getArgumentName().str(), param->getInterfaceType(),
@@ -596,7 +613,7 @@ bool CheckDistributedFunctionRequest::evaluate(
   }
 
   // --- Result type must be either void or a serialization requirement conforming type
-  if (checkDistributedTargetResultType(module, func, serializationReqType,
+  if (checkDistributedTargetResultType(func, serializationReqType,
                                        /*diagnose=*/true)) {
     return true;
   }
@@ -642,8 +659,7 @@ bool swift::checkDistributedActorProperty(VarDecl *var, bool diagnose) {
   auto serializationRequirement =
       getDistributedActorSerializationType(var->getDeclContext());
 
-  auto module = var->getModuleContext();
-  if (checkDistributedTargetResultType(module, var, serializationRequirement, diagnose)) {
+  if (checkDistributedTargetResultType(var, serializationRequirement, diagnose)) {
     return true;
   }
 

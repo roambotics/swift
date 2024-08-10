@@ -285,10 +285,6 @@ private:
   ArrayRef<ProtocolConformanceID>
   claimLazyConformanceLoaderToken(uint64_t token);
 
-  /// If the module-defining `.swiftinterface` file is an SDK-relative path,
-  /// resolve it to be absolute to the context's SDK.
-  std::string resolveModuleDefiningFilename(const ASTContext &ctx);
-
   /// Represents an identifier that may or may not have been deserialized yet.
   ///
   /// If \c Ident is empty, the identifier has not been loaded yet.
@@ -502,7 +498,7 @@ private:
   /// Recursively reads a pattern from \c DeclTypeCursor.
   llvm::Expected<Pattern *> readPattern(DeclContext *owningDC);
 
-  ParameterList *readParameterList();
+  llvm::Expected<ParameterList *> readParameterList();
   
   /// Reads a generic param list from \c DeclTypeCursor.
   ///
@@ -646,6 +642,11 @@ public:
     return Core->Bits.HasCxxInteroperability;
   }
 
+  /// The kind of the C++ stdlib that this module was built with.
+  CXXStdlibKind getCXXStdlibKind() const {
+    return static_cast<CXXStdlibKind>(Core->Bits.CXXStdlibKind);
+  }
+
   /// Whether the module is resilient. ('-enable-library-evolution')
   ResilienceStrategy getResilienceStrategy() const {
     return ResilienceStrategy(Core->Bits.ResilienceStrategy);
@@ -657,6 +658,11 @@ public:
 
   bool allowNonResilientAccess() const {
     return Core->Bits.AllowNonResilientAccess;
+  }
+
+  /// Whether this module was built with -experimental-package-cmo.
+  bool serializePackageEnabled() const {
+    return Core->Bits.SerializePackageEnabled;
   }
 
   /// Whether this module is compiled with implicit dynamic.
@@ -1071,12 +1077,12 @@ public:
 
   // Reads lifetime dependence info from type if present.
   std::optional<LifetimeDependenceInfo>
-  maybeReadLifetimeDependenceInfo(unsigned numParams);
+  maybeReadLifetimeDependence(unsigned numParams);
 
   // Reads lifetime dependence specifier from decl if present
   bool maybeReadLifetimeDependenceSpecifier(
       SmallVectorImpl<LifetimeDependenceSpecifier> &specifierList,
-      unsigned numDeclParams);
+      unsigned numDeclParams, bool hasSelf);
 
   /// Reads inlinable body text from \c DeclTypeCursor, if present.
   std::optional<StringRef> maybeReadInlinableBodyText();

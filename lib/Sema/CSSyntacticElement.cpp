@@ -19,6 +19,7 @@
 #include "MiscDiagnostics.h"
 #include "TypeChecker.h"
 #include "TypeCheckAvailability.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "swift/Sema/IDETypeChecking.h"
 
@@ -150,6 +151,17 @@ public:
           inferVariables(openedTy);
           CS.setType(var, openedTy);
         }
+      }
+    }
+
+    // If closure appears inside of a pack expansion, the elements
+    // that reference pack elements have to bring expansion's shape
+    // type in scope to make sure that the shapes match.
+    if (auto *packElement = getAsExpr<PackElementExpr>(expr)) {
+      if (auto *outerEnvironment = CS.getPackEnvironment(packElement)) {
+        auto *expansionTy = CS.simplifyType(CS.getType(outerEnvironment))
+                                ->castTo<PackExpansionType>();
+        expansionTy->getCountType()->getTypeVariables(ReferencedVars);
       }
     }
 
@@ -545,7 +557,7 @@ public:
   void visitExprPattern(ExprPattern *EP) {
     auto target = SyntacticElementTarget::forExprPattern(EP);
 
-    if (cs.preCheckTarget(target, /*replaceInvalidRefWithErrors=*/true)) {
+    if (cs.preCheckTarget(target)) {
       hadError = true;
       return;
     }
@@ -759,8 +771,7 @@ private:
           init, patternType, patternBinding, index,
           /*bindPatternVarsOneWay=*/false);
 
-      if (ConstraintSystem::preCheckTarget(
-              target, /*replaceInvalidRefsWithErrors=*/true))
+      if (ConstraintSystem::preCheckTarget(target))
         return std::nullopt;
 
       return target;

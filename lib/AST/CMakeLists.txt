@@ -38,6 +38,7 @@ add_swift_host_library(swiftAST STATIC
   Decl.cpp
   DeclContext.cpp
   DeclNameLoc.cpp
+  DiagnosticBridge.cpp
   DiagnosticConsumer.cpp
   DiagnosticEngine.cpp
   DiagnosticList.cpp
@@ -61,6 +62,8 @@ add_swift_host_library(swiftAST STATIC
   IndexSubset.cpp
   InlinableText.cpp
   LayoutConstraint.cpp
+  LifetimeDependence.cpp
+  LocalArchetypeRequirementCollector.cpp
   Module.cpp
   ModuleDependencies.cpp
   ModuleLoader.cpp

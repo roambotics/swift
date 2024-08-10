@@ -29,6 +29,7 @@
 #include "swift/APIDigester/ModuleAnalyzerNodes.h"
 #include "swift/APIDigester/ModuleDiagsConsumer.h"
 #include "swift/AST/DiagnosticsModuleDiffer.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Platform.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
@@ -2177,6 +2178,8 @@ static StringRef getBaselineFilename(llvm::Triple Triple) {
     return "linux.json";
   else if (Triple.isOSWindows())
     return "windows.json";
+  else if (Triple.isXROS())
+    return "xros.json";
   else {
     llvm::errs() << "Unsupported triple target\n";
     exit(1);

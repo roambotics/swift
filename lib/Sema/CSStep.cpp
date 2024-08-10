@@ -20,6 +20,7 @@
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
@@ -438,6 +439,20 @@ StepResult ComponentStep::take(bool prevFailed) {
     // If there are no disjunctions or type variables to bind
     // we can't solve this system unless we have free type variables
     // allowed in the solution.
+    if (CS.isDebugMode()) {
+      PrintOptions PO;
+      PO.PrintTypesForDebugging = true;
+
+      auto &log = getDebugLogger();
+      log << "(failed due to free variables:";
+      for (auto *typeVar : CS.getTypeVariables()) {
+        if (!typeVar->getImpl().hasRepresentativeOrFixed()) {
+          log << " " << typeVar->getString(PO);
+        }
+      }
+      log << ")\n";
+    }
+
     return finalize(/*isSuccess=*/false);
   }
 
@@ -666,7 +681,6 @@ bool IsDeclRefinementOfRequest::evaluate(Evaluator &evaluator,
     return false;
 
   auto result = checkRequirements(
-      declA->getDeclContext()->getParentModule(),
       genericSignatureB.getRequirements(),
       QueryTypeSubstitutionMap{ substMap });
 

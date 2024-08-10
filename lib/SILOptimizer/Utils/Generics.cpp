@@ -21,6 +21,7 @@
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeMatcher.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Demangling/ManglingMacros.h"
@@ -598,11 +599,11 @@ bool ReabstractionInfo::canBeSpecialized(ApplySite Apply, SILFunction *Callee,
 
 ReabstractionInfo::ReabstractionInfo(
     ModuleDecl *targetModule, bool isWholeModule, ApplySite Apply,
-    SILFunction *Callee, SubstitutionMap ParamSubs, IsSerialized_t Serialized,
-    bool ConvertIndirectToDirect, bool dropMetatypeArgs, OptRemark::Emitter *ORE)
+    SILFunction *Callee, SubstitutionMap ParamSubs, SerializedKind_t Serialized,
+    bool ConvertIndirectToDirect, bool dropMetatypeArgs,
+    OptRemark::Emitter *ORE)
     : ConvertIndirectToDirect(ConvertIndirectToDirect),
-      dropMetatypeArgs(dropMetatypeArgs),
-      M(&Callee->getModule()),
+      dropMetatypeArgs(dropMetatypeArgs), M(&Callee->getModule()),
       TargetModule(targetModule), isWholeModule(isWholeModule),
       Serialized(Serialized) {
   if (!prepareAndCheck(Apply, Callee, ParamSubs, ORE))
@@ -770,6 +771,7 @@ void ReabstractionInfo::createSubstitutedAndSpecializedTypes() {
       continue;
 
     switch (PI.getConvention()) {
+    case ParameterConvention::Indirect_In_CXX:
     case ParameterConvention::Indirect_In:
     case ParameterConvention::Indirect_In_Guaranteed: {
       Conversions.set(IdxToInsert);
@@ -813,7 +815,7 @@ getReturnTypeCategory(const SILResultInfo &RI,
                   const SILFunctionConventions &substConv,
                   TypeExpansionContext typeExpansion) {
   auto ResultTy = substConv.getSILType(RI, typeExpansion);
-  ResultTy = Callee->mapTypeIntoContext(ResultTy);
+  ResultTy = mapTypeIntoContext(ResultTy);
   auto &TL = getModule().Types.getTypeLowering(ResultTy, typeExpansion);
 
   if (!TL.isLoadable())
@@ -983,7 +985,7 @@ createSpecializedType(CanSILFunctionType SubstFTy, SILModule &M) const {
     // owned/guaranteed (except it's a trivial type).
     auto C = ParameterConvention::Direct_Unowned;
     if (!isTrivial) {
-      if (PI.isGuaranteed()) {
+      if (PI.isGuaranteedInCallee()) {
         C = ParameterConvention::Direct_Guaranteed;
       } else {
         C = ParameterConvention::Direct_Owned;
@@ -1397,9 +1399,10 @@ public:
       SubstitutionMap::get(
         SpecializedGenericSig,
         [&](SubstitutableType *type) -> Type {
-          return CalleeGenericEnv->mapTypeIntoContext(type);
+          return CalleeGenericEnv->mapTypeIntoContext(
+              SpecializedGenericSig.getReducedType(type));
         },
-        LookUpConformanceInSignature(SpecializedGenericSig.getPointer()));
+        LookUpConformanceInModule());
   }
 
   GenericSignature getSpecializedGenericSignature() {
@@ -1470,7 +1473,7 @@ void FunctionSignaturePartialSpecializer::
       [&](SubstitutableType *type) -> Type {
         return CallerInterfaceToSpecializedInterfaceMapping.lookup(type);
       },
-      LookUpConformanceInSignature(CallerGenericSig.getPointer()));
+      LookUpConformanceInModule());
 
   LLVM_DEBUG(llvm::dbgs() << "\n\nCallerInterfaceToSpecializedInterfaceMap "
                              "map:\n";
@@ -1495,7 +1498,7 @@ void FunctionSignaturePartialSpecializer::
                    else llvm::dbgs() << "Not found!\n";);
         return SpecializedInterfaceToCallerArchetypeMapping.lookup(type);
       },
-      LookUpConformanceInSignature(SpecializedGenericSig.getPointer()));
+      LookUpConformanceInModule());
   LLVM_DEBUG(llvm::dbgs() << "\n\nSpecializedInterfaceToCallerArchetypeMap "
                              "map:\n";
              SpecializedInterfaceToCallerArchetypeMap.dump(llvm::dbgs()));
@@ -1509,7 +1512,7 @@ void FunctionSignaturePartialSpecializer::
       [&](SubstitutableType *type) -> Type {
         return CalleeInterfaceToSpecializedInterfaceMapping.lookup(type);
       },
-      LookUpConformanceInSignature(CalleeGenericSig.getPointer()));
+      LookUpConformanceInModule());
 
   LLVM_DEBUG(llvm::dbgs() << "\n\nCalleeInterfaceToSpecializedInterfaceMap:\n";
              CalleeInterfaceToSpecializedInterfaceMap.dump(llvm::dbgs()));
@@ -1722,7 +1725,7 @@ SubstitutionMap FunctionSignaturePartialSpecializer::computeClonerParamSubs() {
       return SpecializedGenericEnv->mapTypeIntoContext(
           SpecializedInterfaceTy);
     },
-    LookUpConformanceInSignature(SpecializedGenericSig.getPointer()));
+    LookUpConformanceInModule());
 }
 
 SubstitutionMap FunctionSignaturePartialSpecializer::getCallerParamSubs() {
@@ -1742,7 +1745,7 @@ void FunctionSignaturePartialSpecializer::computeCallerInterfaceSubs(
       assert(!SpecializedInterfaceTy->hasError());
       return SpecializedInterfaceTy;
     },
-    LookUpConformanceInSignature(CalleeGenericSig.getPointer()));
+    LookUpConformanceInModule());
 
   LLVM_DEBUG(llvm::dbgs() << "\n\nCallerInterfaceSubs map:\n";
              CallerInterfaceSubs.dump(llvm::dbgs()));
@@ -1948,7 +1951,7 @@ ReabstractionInfo::ReabstractionInfo(ModuleDecl *targetModule,
     : M(&Callee->getModule()), TargetModule(targetModule), isWholeModule(isWholeModule),
       isPrespecialization(isPrespecialization) {
   Serialized =
-      this->isPrespecialization ? IsNotSerialized : Callee->isSerialized();
+      this->isPrespecialization ? IsNotSerialized : Callee->getSerializedKind();
 
   if (shouldNotSpecialize(Callee, nullptr))
     return;
@@ -1987,11 +1990,11 @@ GenericFuncSpecializer::GenericFuncSpecializer(
 
   if (ReInfo.isPartialSpecialization()) {
     Mangle::PartialSpecializationMangler Mangler(
-        GenericFunc, FnTy, ReInfo.isSerialized(), /*isReAbstracted*/ true);
+        GenericFunc, FnTy, ReInfo.getSerializedKind(), /*isReAbstracted*/ true);
     ClonedName = Mangler.mangle();
   } else {
     Mangle::GenericSpecializationMangler Mangler(
-        GenericFunc, ReInfo.isSerialized());
+        GenericFunc, ReInfo.getSerializedKind());
     if (ReInfo.isPrespecialized()) {
       ClonedName = Mangler.manglePrespecialized(ParamSubs);
     } else {
@@ -2265,7 +2268,7 @@ prepareCallArguments(ApplySite AI, SILBuilder &Builder,
       argConv = substConv.getSILArgumentConvention(ArgIdx);
     }
     SILValue Val;
-    if (!argConv.isGuaranteedConvention()) {
+    if (!argConv.isGuaranteedConventionInCaller()) {
       Val = Builder.emitLoadValueOperation(Loc, InputValue,
                                            LoadOwnershipQualifier::Take);
     } else {
@@ -2509,13 +2512,13 @@ public:
         SpecializedFunc(SpecializedFunc), ReInfo(ReInfo), OrigPAI(OrigPAI),
         Loc(RegularLocation::getAutoGeneratedLocation()) {
     if (!ReInfo.isPartialSpecialization()) {
-      Mangle::GenericSpecializationMangler Mangler(OrigF, ReInfo.isSerialized());
+      Mangle::GenericSpecializationMangler Mangler(OrigF, ReInfo.getSerializedKind());
       ThunkName = Mangler.mangleNotReabstracted(
           ReInfo.getCalleeParamSubstitutionMap(),
           ReInfo.hasDroppedMetatypeArgs());
     } else {
       Mangle::PartialSpecializationMangler Mangler(
-          OrigF, ReInfo.getSpecializedType(), ReInfo.isSerialized(),
+          OrigF, ReInfo.getSpecializedType(), ReInfo.getSerializedKind(),
           /*isReAbstracted*/ false);
 
       ThunkName = Mangler.mangle();
@@ -2544,7 +2547,7 @@ SILFunction *ReabstractionThunkGenerator::createThunk() {
   CanSILFunctionType thunkType = ReInfo.createThunkType(OrigPAI);
   SILFunction *Thunk = FunctionBuilder.getOrCreateSharedFunction(
       Loc, ThunkName, thunkType, IsBare, IsTransparent,
-      ReInfo.isSerialized(), ProfileCounter(), IsThunk, IsNotDynamic,
+      ReInfo.getSerializedKind(), ProfileCounter(), IsThunk, IsNotDynamic,
       IsNotDistributed, IsNotRuntimeAccessible);
   // Re-use an existing thunk.
   if (!Thunk->empty())
@@ -2748,7 +2751,7 @@ ReabstractionThunkGenerator::convertReabstractionThunkArguments(
                                Builder.getTypeExpansionContext()));
       assert(ParamTy.isAddress());
       SILFunctionArgument *NewArg = addFunctionArgument(Thunk, ParamTy, specArg);
-      if (!NewArg->getArgumentConvention().isGuaranteedConvention()) {
+      if (!NewArg->getArgumentConvention().isGuaranteedConventionInCallee()) {
         SILValue argVal = Builder.emitLoadValueOperation(
             Loc, NewArg, LoadOwnershipQualifier::Take);
         Arguments.push_back(argVal);
@@ -2808,7 +2811,7 @@ static bool createPrespecialized(StringRef UnspecializedName,
   M.linkFunction(SpecializedF, SILModule::LinkingMode::LinkAll);
 
   SpecializedF->setLinkage(SILLinkage::Public);
-  SpecializedF->setSerialized(IsNotSerialized);
+  SpecializedF->setSerializedKind(IsNotSerialized);
   return true;
 }
 
@@ -3006,7 +3009,7 @@ bool usePrespecialized(
       ReabstractionInfo layoutReInfo = ReabstractionInfo(
           funcBuilder.getModule().getSwiftModule(),
           funcBuilder.getModule().isWholeModule(), apply, refF, newSubstMap,
-          apply.getFunction()->isSerialized() ? IsSerialized : IsNotSerialized,
+          apply.getFunction()->getSerializedKind(),
           /*ConvertIndirectToDirect=*/ true, /*dropMetatypeArgs=*/ false, nullptr);
 
       if (layoutReInfo.getSpecializedType() == reInfo.getSpecializedType()) {
@@ -3018,7 +3021,7 @@ bool usePrespecialized(
     }
 
     SubstitutionMap subs = reInfo.getCalleeParamSubstitutionMap();
-    Mangle::GenericSpecializationMangler mangler(refF, reInfo.isSerialized());
+    Mangle::GenericSpecializationMangler mangler(refF, reInfo.getSerializedKind());
     std::string name = reInfo.isPrespecialized() ?
         mangler.manglePrespecialized(subs) :
         mangler.mangleReabstracted(subs, reInfo.needAlternativeMangling());
@@ -3047,7 +3050,7 @@ bool usePrespecialized(
 
     // TODO: Deduplicate
     SubstitutionMap subs = reInfo.getCalleeParamSubstitutionMap();
-    Mangle::GenericSpecializationMangler mangler(refF, reInfo.isSerialized());
+    Mangle::GenericSpecializationMangler mangler(refF, reInfo.getSerializedKind());
     std::string name = reInfo.isPrespecialized()
                            ? mangler.manglePrespecialized(subs)
                            : mangler.mangleReabstracted(
@@ -3140,10 +3143,10 @@ void swift::trySpecializeApplyOfGeneric(
   // callee either.
   bool needSetLinkage = false;
   if (isMandatory) {
-    if (F->isSerialized() && !RefF->hasValidLinkageForFragileInline())
+    if (!RefF->canBeInlinedIntoCaller(F->getSerializedKind()))
       needSetLinkage = true;
   } else {
-    if (F->isSerialized() && !RefF->hasValidLinkageForFragileInline())
+    if (!RefF->canBeInlinedIntoCaller(F->getSerializedKind()))
         return;
 
     if (shouldNotSpecialize(RefF, F))
@@ -3153,9 +3156,7 @@ void swift::trySpecializeApplyOfGeneric(
   // If the caller and callee are both fragile, preserve the fragility when
   // cloning the callee. Otherwise, strip it off so that we can optimize
   // the body more.
-  IsSerialized_t Serialized = IsNotSerialized;
-  if (F->isSerialized())
-    Serialized = IsSerialized;
+  SerializedKind_t serializedKind = F->getSerializedKind();
 
   // If it is OnoneSupport consider all specializations as non-serialized
   // as we do not SIL serialize their bodies.
@@ -3165,12 +3166,12 @@ void swift::trySpecializeApplyOfGeneric(
     if (createPrespecializations(Apply, RefF, FuncBuilder)) {
       return;
     }
-    Serialized = IsNotSerialized;
+    serializedKind = IsNotSerialized;
   }
 
   ReabstractionInfo ReInfo(FuncBuilder.getModule().getSwiftModule(),
                            FuncBuilder.getModule().isWholeModule(), Apply, RefF,
-                           Apply.getSubstitutionMap(), Serialized,
+                           Apply.getSubstitutionMap(), serializedKind,
                            /*ConvertIndirectToDirect=*/ true,
                            /*dropMetatypeArgs=*/ canDropMetatypeArgs(Apply, RefF),
                            &ORE);
@@ -3266,19 +3267,21 @@ void swift::trySpecializeApplyOfGeneric(
   }
 
   if (needSetLinkage) {
-    assert(F->isSerialized() && !RefF->hasValidLinkageForFragileInline());
+    assert(F->isAnySerialized() &&
+           !RefF->canBeInlinedIntoCaller(F->getSerializedKind()));
     // If called from a serialized function we cannot make the specialized function
     // shared and non-serialized. The only other option is to keep the original
     // function's linkage. It's not great, because it can prevent dead code
     // elimination - usually the original function is a public function.
     SpecializedF->setLinkage(RefF->getLinkage());
-    SpecializedF->setSerialized(IsNotSerialized);
-  } else if (F->isSerialized() && !SpecializedF->hasValidLinkageForFragileInline()) {
+    SpecializedF->setSerializedKind(IsNotSerialized);
+  } else if (F->isAnySerialized() &&
+             !SpecializedF->canBeInlinedIntoCaller(F->getSerializedKind())) {
     // If the specialized function already exists as a "IsNotSerialized" function,
-    // but now it's called from a "IsSerialized" function, we need to mark it as
-    // IsSerialized.
-    SpecializedF->setSerialized(IsSerialized);
-    assert(SpecializedF->hasValidLinkageForFragileInline());
+    // but now it's called from a serialized function, we need to mark it the
+    // same as its SerializedKind.
+    SpecializedF->setSerializedKind(F->getSerializedKind());
+    assert(SpecializedF->canBeInlinedIntoCaller(F->getSerializedKind()));
     
     // ... including all referenced shared functions.
     FuncBuilder.getModule().linkFunction(SpecializedF.getFunction(),

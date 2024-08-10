@@ -17,6 +17,7 @@
 #ifndef SWIFT_AST_LIFETIMEDEPENDENCE_H
 #define SWIFT_AST_LIFETIMEDEPENDENCE_H
 
+#include "swift/AST/DeclContext.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/IndexSubset.h"
 #include "swift/AST/Ownership.h"
@@ -29,8 +30,10 @@
 namespace swift {
 
 class AbstractFunctionDecl;
-class LifetimeDependentReturnTypeRepr;
+class FunctionTypeRepr;
+class LifetimeDependentTypeRepr;
 class SILParameterInfo;
+class SILResultInfo;
 
 enum class ParsedLifetimeDependenceKind : uint8_t {
   Default = 0,
@@ -42,7 +45,7 @@ enum class LifetimeDependenceKind : uint8_t { Inherit = 0, Scope };
 
 class LifetimeDependenceSpecifier {
 public:
-  enum class SpecifierKind { Named, Ordered, Self };
+  enum class SpecifierKind { Named, Ordered, Self, Immortal };
 
 private:
   SourceLoc loc;
@@ -73,6 +76,11 @@ public:
   static LifetimeDependenceSpecifier getNamedLifetimeDependenceSpecifier(
       SourceLoc loc, ParsedLifetimeDependenceKind kind, Identifier name) {
     return {loc, SpecifierKind::Named, kind, name};
+  }
+
+  static LifetimeDependenceSpecifier
+  getImmortalLifetimeDependenceSpecifier(SourceLoc loc) {
+    return {loc, SpecifierKind::Immortal, {}, {}};
   }
 
   static LifetimeDependenceSpecifier getOrderedLifetimeDependenceSpecifier(
@@ -112,6 +120,8 @@ public:
       return "self";
     case SpecifierKind::Ordered:
       return std::to_string(value.Ordered.index);
+    case SpecifierKind::Immortal:
+      return "immortal";
     }
     llvm_unreachable("Invalid LifetimeDependenceSpecifier::SpecifierKind");
   }
@@ -133,23 +143,45 @@ public:
 class LifetimeDependenceInfo {
   IndexSubset *inheritLifetimeParamIndices;
   IndexSubset *scopeLifetimeParamIndices;
-  bool isExplicit;
+  unsigned targetIndex;
+  bool immortal;
 
-  static LifetimeDependenceInfo getForParamIndex(AbstractFunctionDecl *afd,
-                                                 unsigned index,
-                                                 LifetimeDependenceKind kind);
+  static LifetimeDependenceInfo getForIndex(AbstractFunctionDecl *afd,
+                                            unsigned targetIndex,
+                                            unsigned sourceIndex,
+                                            LifetimeDependenceKind kind);
+
+  /// Builds LifetimeDependenceInfo on a result or parameter from a swift decl
+  static std::optional<LifetimeDependenceInfo>
+  fromTypeRepr(AbstractFunctionDecl *afd, LifetimeDependentTypeRepr *typeRepr,
+               unsigned targetIndex);
+
+  /// Infer LifetimeDependenceInfo on result
+  static std::optional<LifetimeDependenceInfo> infer(AbstractFunctionDecl *afd);
+
+  /// Infer LifetimeDependenceInfo on setter
+  static std::optional<LifetimeDependenceInfo>
+  inferSetter(AbstractFunctionDecl *afd);
+
+  /// Infer LifetimeDependenceInfo on mutating self
+  static std::optional<LifetimeDependenceInfo>
+  inferMutatingSelf(AbstractFunctionDecl *afd);
+
+  /// Builds LifetimeDependenceInfo from SIL function type
+  static std::optional<LifetimeDependenceInfo>
+  fromTypeRepr(LifetimeDependentTypeRepr *lifetimeDependentRepr,
+               unsigned targetIndex, ArrayRef<SILParameterInfo> params,
+               DeclContext *dc);
 
 public:
-  LifetimeDependenceInfo()
-      : inheritLifetimeParamIndices(nullptr),
-        scopeLifetimeParamIndices(nullptr), isExplicit(false) {}
   LifetimeDependenceInfo(IndexSubset *inheritLifetimeParamIndices,
                          IndexSubset *scopeLifetimeParamIndices,
-                         bool isExplicit = false)
+                         unsigned targetIndex, bool isImmortal)
       : inheritLifetimeParamIndices(inheritLifetimeParamIndices),
         scopeLifetimeParamIndices(scopeLifetimeParamIndices),
-        isExplicit(isExplicit) {
-    assert(!empty());
+        targetIndex(targetIndex), immortal(isImmortal) {
+    assert(isImmortal || inheritLifetimeParamIndices ||
+           scopeLifetimeParamIndices);
     assert(!inheritLifetimeParamIndices ||
            !inheritLifetimeParamIndices->isEmpty());
     assert(!scopeLifetimeParamIndices || !scopeLifetimeParamIndices->isEmpty());
@@ -158,11 +190,13 @@ public:
   operator bool() const { return !empty(); }
 
   bool empty() const {
-    return inheritLifetimeParamIndices == nullptr &&
+    return !immortal && inheritLifetimeParamIndices == nullptr &&
            scopeLifetimeParamIndices == nullptr;
   }
 
-  bool isExplicitlySpecified() const { return isExplicit; }
+  bool isImmortal() const { return immortal; }
+
+  unsigned getTargetIndex() const { return targetIndex; }
 
   bool hasInheritLifetimeParamIndices() const {
     return inheritLifetimeParamIndices != nullptr;
@@ -170,7 +204,11 @@ public:
   bool hasScopeLifetimeParamIndices() const {
     return scopeLifetimeParamIndices != nullptr;
   }
-  
+
+  IndexSubset *getInheritIndices() const { return inheritLifetimeParamIndices; }
+
+  IndexSubset *getScopeIndices() const { return scopeLifetimeParamIndices; }
+
   bool checkInherit(int index) const {
     return inheritLifetimeParamIndices
       && inheritLifetimeParamIndices->contains(index);
@@ -185,35 +223,40 @@ public:
   void Profile(llvm::FoldingSetNodeID &ID) const;
   void getConcatenatedData(SmallVectorImpl<bool> &concatenatedData) const;
 
-  std::optional<LifetimeDependenceKind>
-  getLifetimeDependenceOnParam(unsigned paramIndex);
-
   /// Builds LifetimeDependenceInfo from a swift decl, either from the explicit
   /// lifetime dependence specifiers or by inference based on types and
   /// ownership modifiers.
-  static std::optional<LifetimeDependenceInfo>
-  get(AbstractFunctionDecl *decl, Type resultType, bool allowIndex = false);
+  static std::optional<ArrayRef<LifetimeDependenceInfo>>
+  get(AbstractFunctionDecl *decl);
 
   /// Builds LifetimeDependenceInfo from the bitvectors passes as parameters.
   static LifetimeDependenceInfo
   get(ASTContext &ctx, const SmallBitVector &inheritLifetimeIndices,
       const SmallBitVector &scopeLifetimeIndices);
 
-  /// Builds LifetimeDependenceInfo from a swift decl
-  static std::optional<LifetimeDependenceInfo>
-  fromTypeRepr(AbstractFunctionDecl *afd, Type resultType, bool allowIndex);
-
   /// Builds LifetimeDependenceInfo from SIL
-  static std::optional<LifetimeDependenceInfo>
-  fromTypeRepr(LifetimeDependentReturnTypeRepr *lifetimeDependentRepr,
-               SmallVectorImpl<SILParameterInfo> &params, bool hasSelfParam,
-               DeclContext *dc);
+  static std::optional<llvm::ArrayRef<LifetimeDependenceInfo>>
+  get(FunctionTypeRepr *funcRepr, ArrayRef<SILParameterInfo> params,
+      ArrayRef<SILResultInfo> results, DeclContext *dc);
 
-  /// Infer LifetimeDependenceInfo
-  static std::optional<LifetimeDependenceInfo> infer(AbstractFunctionDecl *afd,
-                                                     Type resultType);
+  bool operator==(const LifetimeDependenceInfo &other) const {
+    return this->isImmortal() == other.isImmortal() &&
+           this->getTargetIndex() == other.getTargetIndex() &&
+           this->getInheritIndices() == other.getInheritIndices() &&
+           this->getScopeIndices() == other.getScopeIndices();
+  }
+
+  bool operator!=(const LifetimeDependenceInfo &other) const {
+    return this->isImmortal() != other.isImmortal() &&
+           this->getTargetIndex() != other.getTargetIndex() &&
+           this->getInheritIndices() != other.getInheritIndices() &&
+           this->getScopeIndices() != other.getScopeIndices();
+  }
 };
 
+std::optional<LifetimeDependenceInfo>
+getLifetimeDependenceFor(ArrayRef<LifetimeDependenceInfo> lifetimeDependencies,
+                         unsigned index);
 } // namespace swift
 
 #endif

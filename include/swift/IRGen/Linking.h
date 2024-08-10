@@ -127,6 +127,9 @@ class LinkEntity {
     // This field appears in the TypeMetadata and ObjCResilientClassStub kinds.
     MetadataAddressShift = 8, MetadataAddressMask = 0x0300,
 
+    // This field appears in the TypeMetadata kind.
+    ForceSharedShift = 12, ForceSharedMask = 0x1000,
+
     // This field appears in associated type access functions.
     AssociatedTypeIndexShift = 8, AssociatedTypeIndexMask = ~KindMask,
 
@@ -847,12 +850,14 @@ public:
   }
 
   static LinkEntity forTypeMetadata(CanType concreteType,
-                                    TypeMetadataAddress addr) {
+                                    TypeMetadataAddress addr,
+                                    bool forceShared = false) {
     assert(!isObjCImplementation(concreteType));
     assert(!isEmbedded(concreteType) || isMetadataAllowedInEmbedded(concreteType));
     LinkEntity entity;
     entity.setForType(Kind::TypeMetadata, concreteType);
     entity.Data |= LINKENTITY_SET_FIELD(MetadataAddress, unsigned(addr));
+    entity.Data |= LINKENTITY_SET_FIELD(ForceShared, unsigned(forceShared));
     return entity;
   }
 
@@ -1584,6 +1589,10 @@ public:
            getKind() == Kind::ObjCResilientClassStub);
     return (TypeMetadataAddress)LINKENTITY_GET_FIELD(Data, MetadataAddress);
   }
+  bool isForcedShared() const {
+    assert(getKind() == Kind::TypeMetadata);
+    return (bool)LINKENTITY_GET_FIELD(Data, ForceShared);
+  }
   bool isObjCClassRef() const {
     return getKind() == Kind::ObjCClassRef;
   }
@@ -1599,6 +1608,7 @@ public:
   bool isTypeMetadataAccessFunction() const {
     return getKind() == Kind::TypeMetadataAccessFunction;
   }
+  bool isDistributedThunk() const;
   bool isDispatchThunk() const {
     return getKind() == Kind::DispatchThunk ||
            getKind() == Kind::DispatchThunkInitializer ||

@@ -18,6 +18,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/DynamicCasts.h"
@@ -157,6 +158,10 @@ SILCombiner::optimizeApplyOfConvertFunctionInst(FullApplySite AI,
   auto context = AI.getFunction()->getTypeExpansionContext();
   auto oldOpRetTypes = substConventions.getIndirectSILResultTypes(context);
   auto newOpRetTypes = convertConventions.getIndirectSILResultTypes(context);
+  auto oldIndirectErrorResultType =
+      substConventions.getIndirectErrorResultType(context);
+  auto newIndirectErrorResultType =
+      convertConventions.getIndirectErrorResultType(context);
   auto oldOpParamTypes = substConventions.getParameterSILTypes(context);
   auto newOpParamTypes = convertConventions.getParameterSILTypes(context);
 
@@ -186,7 +191,13 @@ SILCombiner::optimizeApplyOfConvertFunctionInst(FullApplySite AI,
        ++OpI, ++newRetI, ++oldRetI) {
     convertOp(Ops[OpI], *oldRetI, *newRetI);
   }
-  
+
+  if (oldIndirectErrorResultType) {
+    assert(newIndirectErrorResultType);
+    convertOp(Ops[OpI], oldIndirectErrorResultType, newIndirectErrorResultType);
+    ++OpI;
+  }
+
   auto newParamI = newOpParamTypes.begin();
   auto oldParamI = oldOpParamTypes.begin();
   for (auto e = newOpParamTypes.end(); newParamI != e;
@@ -654,7 +665,7 @@ bool SILCombiner::eraseApply(FullApplySite FAS, const UserListTy &Users) {
       return false;
     // As we are extending the lifetimes of owned parameters, we have to make
     // sure that no dealloc_ref or dealloc_stack_ref instructions are
-    // within this extended liferange.
+    // within this extended liverange.
     // It could be that the dealloc_ref is deallocating a parameter and then
     // we would have a release after the dealloc.
     if (VLA.containsDeallocRef(Frontier))
@@ -679,6 +690,7 @@ bool SILCombiner::eraseApply(FullApplySite FAS, const UserListTy &Users) {
         case ParameterConvention::Indirect_In_Guaranteed:
         case ParameterConvention::Indirect_Inout:
         case ParameterConvention::Indirect_InoutAliasable:
+        case ParameterConvention::Indirect_In_CXX:
         case ParameterConvention::Direct_Unowned:
         case ParameterConvention::Direct_Guaranteed:
         case ParameterConvention::Pack_Guaranteed:
@@ -1021,7 +1033,7 @@ struct ConcreteArgumentCopy {
     assert(!paramInfo.isIndirectMutating()
            && "A mutated opened existential value can't be replaced");
 
-    if (!paramInfo.isConsumed())
+    if (!paramInfo.isConsumedInCaller())
       return std::nullopt;
 
     SILValue origArg = apply.getArgument(argIdx);
@@ -1420,7 +1432,8 @@ SILCombiner::propagateConcreteTypeOfInitExistential(FullApplySite Apply) {
 ///  getContiguousArrayStorageType<Int>(for:)
 ///    => metatype @thick ContiguousArrayStorage<Int>.Type
 /// We know that `getContiguousArrayStorageType` will not return the AnyObject
-/// type optimization for any non class or objc existential type instantiation.
+/// type optimization for any non class or objc existential type instantiation
+/// or a C++ foreign reference type.
 static bool shouldReplaceCallByMetadataConstructor(CanType storageMetaTy) {
   auto metaTy = dyn_cast<MetatypeType>(storageMetaTy);
   if (!metaTy || metaTy->getRepresentation() != MetatypeRepresentation::Thick)
@@ -1441,8 +1454,18 @@ static bool shouldReplaceCallByMetadataConstructor(CanType storageMetaTy) {
   if (ty->getStructOrBoundGenericStruct() || ty->getEnumOrBoundGenericEnum() ||
       isa<BuiltinVectorType>(ty) || isa<BuiltinIntegerType>(ty) ||
       isa<BuiltinFloatType>(ty) || isa<TupleType>(ty) ||
-      isa<AnyFunctionType>(ty) ||
+      isa<AnyFunctionType>(ty) || ty->isForeignReferenceType() ||
       (ty->isAnyExistentialType() && !ty->isObjCExistentialType()))
+    return true;
+
+  return false;
+}
+
+static bool canBeRemovedIfResultIsNotUsed(SILFunction *f) {
+  if (f->getEffectsKind() < EffectsKind::ReleaseNone)
+    return true;
+
+  if (f->hasSemanticsAttr("string.init_empty_with_capacity"))
     return true;
 
   return false;
@@ -1469,7 +1492,7 @@ SILInstruction *SILCombiner::visitApplyInst(ApplyInst *AI) {
 
   // Optimize readonly functions with no meaningful users.
   SILFunction *SF = AI->getReferencedFunctionOrNull();
-  if (SF && SF->getEffectsKind() < EffectsKind::ReleaseNone) {
+  if (SF && canBeRemovedIfResultIsNotUsed(SF)) {
     UserListTy Users;
     if (recursivelyCollectARCUsers(Users, AI)) {
       if (eraseApply(AI, Users))

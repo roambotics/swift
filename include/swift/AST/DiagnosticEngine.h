@@ -50,6 +50,7 @@ namespace swift {
   class ValueDecl;
   class SourceFile;
 
+  enum class CXXStdlibKind : uint8_t;
   enum class DescriptivePatternKind : uint8_t;
   enum class SelfAccessKind : uint8_t;
   enum class ReferenceOwnership : uint8_t;
@@ -140,6 +141,7 @@ namespace swift {
     VersionTuple,
     LayoutConstraint,
     ActorIsolation,
+    IsolationSource,
     Diagnostic,
     ClangDecl
   };
@@ -175,6 +177,7 @@ namespace swift {
       llvm::VersionTuple VersionVal;
       LayoutConstraint LayoutConstraintVal;
       ActorIsolation ActorIsolationVal;
+      IsolationSource IsolationSourceVal;
       DiagnosticInfo *DiagnosticVal;
       const clang::NamedDecl *ClangDecl;
     };
@@ -281,6 +284,11 @@ namespace swift {
     DiagnosticArgument(ActorIsolation AI)
       : Kind(DiagnosticArgumentKind::ActorIsolation),
         ActorIsolationVal(AI) {
+    }
+
+    DiagnosticArgument(IsolationSource IS)
+      : Kind(DiagnosticArgumentKind::IsolationSource),
+        IsolationSourceVal(IS){
     }
 
     DiagnosticArgument(DiagnosticInfo *D)
@@ -400,6 +408,11 @@ namespace swift {
     ActorIsolation getAsActorIsolation() const {
       assert(Kind == DiagnosticArgumentKind::ActorIsolation);
       return ActorIsolationVal;
+    }
+
+    IsolationSource getAsIsolationSource() const {
+      assert(Kind == DiagnosticArgumentKind::IsolationSource);
+      return IsolationSourceVal;
     }
 
     DiagnosticInfo *getAsDiagnostic() const {
@@ -727,6 +740,9 @@ namespace swift {
 
     static const char *fixItStringFor(const FixItID id);
 
+    /// Get the best location where an 'import' fixit might be offered.
+    SourceLoc getBestAddImportFixItLoc(const Decl *Member) const;
+
     /// Add a token-based replacement fix-it to the currently-active
     /// diagnostic.
     template <typename... ArgTypes>
@@ -782,6 +798,9 @@ namespace swift {
     InFlightDiagnostic &fixItInsert(SourceLoc L, StringRef Str) {
       return fixItReplaceChars(L, L, "%0", {Str});
     }
+
+    /// Add a fix-it suggesting to 'import' some module.
+    InFlightDiagnostic &fixItAddImport(StringRef ModuleName);
 
     /// Add an insertion fix-it to the currently-active diagnostic.  The
     /// text is inserted immediately *after* the token specified.
@@ -1391,6 +1410,11 @@ namespace swift {
     SourceLoc getDefaultDiagnosticLoc() const {
       return bufferIndirectlyCausingDiagnostic;
     }
+    SourceLoc getBestAddImportFixItLoc(const Decl *Member,
+                                       SourceFile *sourceFile) const;
+    SourceLoc getBestAddImportFixItLoc(const Decl *Member) const {
+      return getBestAddImportFixItLoc(Member, nullptr);
+    }
   };
 
   /// Remember details about the state of a diagnostic engine and restore them
@@ -1675,10 +1699,6 @@ namespace swift {
     /// The unescaped message to display to the user.
     const StringRef Message;
   };
-
-/// Retrieve the macro name for a generated source info that represents
-/// a macro expansion.
-DeclName getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info);
 
 } // end namespace swift
 

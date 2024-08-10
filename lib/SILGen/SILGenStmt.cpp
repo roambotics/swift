@@ -21,7 +21,9 @@
 #include "SILGen.h"
 #include "Scope.h"
 #include "SwitchEnumBuilder.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/ProfileCounter.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/AbstractionPatternGenerators.h"
@@ -323,7 +325,7 @@ void StmtEmitter::visitBraceStmt(BraceStmt *S) {
 
       // PatternBindingBecls represent local variable bindings that execute
       // as part of the function's execution.
-      if (!isa<PatternBindingDecl>(D)) {
+      if (!isa<PatternBindingDecl>(D) && !isa<VarDecl>(D)) {
         // Other decls define entities that may be used by the program, such as
         // local function declarations. So handle them here, before checking for
         // reachability, and then continue looping.
@@ -356,21 +358,22 @@ void StmtEmitter::visitBraceStmt(BraceStmt *S) {
           continue;
         }
       } else if (auto *E = ESD.dyn_cast<Expr*>()) {
-        // Optional chaining expressions are wrapped in a structure like.
-        //
-        // (optional_evaluation_expr implicit type='T?'
-        //   (call_expr type='T?'
-        //     (exprs...
-        //
-        // Walk through it to find out if the statement is actually implicit.
-        if (auto *OEE = dyn_cast<OptionalEvaluationExpr>(E)) {
-          if (auto *IIO = dyn_cast<InjectIntoOptionalExpr>(OEE->getSubExpr()))
-            if (IIO->getSubExpr()->isImplicit()) continue;
-          if (auto *C = dyn_cast<CallExpr>(OEE->getSubExpr()))
-            if (C->isImplicit()) continue;
-        } else if (E->isImplicit()) {
-          // Ignore all other implicit expressions.
-          continue;
+        if (E->isImplicit()) {
+          // Some expressions, like `OptionalEvaluationExpr` and
+          // `OpenExistentialExpr`, are implicit but may contain non-implicit
+          // children that should be diagnosed as unreachable. Check
+          // descendants here to see if there is anything to diagnose.
+          bool hasDiagnosableDescendant = false;
+          E->forEachChildExpr([&](auto *childExpr) -> Expr * {
+            if (!childExpr->isImplicit())
+              hasDiagnosableDescendant = true;
+
+            return hasDiagnosableDescendant ? nullptr : childExpr;
+          });
+
+          // If there's nothing to diagnose, ignore this expression.
+          if (!hasDiagnosableDescendant)
+            continue;
         }
       } else if (auto D = ESD.dyn_cast<Decl*>()) {
         // Local declarations aren't unreachable - only their usages can be. To
@@ -428,12 +431,9 @@ void StmtEmitter::visitBraceStmt(BraceStmt *S) {
       SGF.emitIgnoredExpr(E);
     } else {
       auto *D = ESD.get<Decl*>();
-
-      // Only PatternBindingDecls should be emitted here.
-      // Other decls were handled above.
-      auto PBD = cast<PatternBindingDecl>(D);
-
-      SGF.visit(PBD);
+      assert((isa<PatternBindingDecl>(D) || isa<VarDecl>(D)) &&
+             "other decls should be handled before the reachability check");
+      SGF.visit(D);
     }
   }
 }
@@ -1592,7 +1592,7 @@ void SILGenFunction::emitThrow(SILLocation loc, ManagedValue exnMV,
         SubstitutionMap subMap = SubstitutionMap::get(
             genericSig, [&](SubstitutableType *dependentType) {
               return exnMV.getType().getASTType();
-            }, LookUpConformanceInModule(getModule().getSwiftModule()));
+            }, LookUpConformanceInModule());
 
         // Generic errors are passed indirectly.
         if (!exnMV.getType().isAddress() && useLoweredAddresses()) {
@@ -1634,7 +1634,7 @@ void SILGenFunction::emitThrow(SILLocation loc, ManagedValue exnMV,
     assert(destErrorType == SILType::getExceptionType(getASTContext()));
 
     ProtocolConformanceRef conformances[1] = {
-      getModule().getSwiftModule()->checkConformance(
+      checkConformance(
         exn->getType().getASTType(), getASTContext().getErrorDecl())
     };
 
@@ -1660,11 +1660,12 @@ void SILGenFunction::emitThrow(SILLocation loc, ManagedValue exnMV,
     if (exn->getType().isAddress()) {
       B.createCopyAddr(loc, exn, indirectErrorAddr,
                        IsTake, IsInitialization);
-    } else {
-      // An indirect error is written into the destination error address.
-      emitSemanticStore(loc, exn, indirectErrorAddr,
-                        getTypeLowering(destErrorType), IsInitialization);
     }
+    
+    // If the error is represented as a value, then we should forward it into
+    // the indirect error return slot. We have to wait to do that until after
+    // we pop cleanups, though, since the value may have a borrow active in
+    // scope that won't be released until the cleanups pop.
   } else if (!throwBB.getArguments().empty()) {
     // Load if we need to.
     if (exn->getType().isAddress()) {
@@ -1680,5 +1681,16 @@ void SILGenFunction::emitThrow(SILLocation loc, ManagedValue exnMV,
   }
 
   // Branch to the cleanup destination.
-  Cleanups.emitBranchAndCleanups(ThrowDest, loc, args, IsForUnwind);
+  Cleanups.emitCleanupsForBranch(ThrowDest, loc, args, IsForUnwind);
+  
+  if (indirectErrorAddr && !exn->getType().isAddress()) {
+    // Forward the error value into the return slot now. This has to happen
+    // after emitting cleanups because the active scope may be borrowing the
+    // error value, and we can't forward ownership until those borrows are
+    // released.
+    emitSemanticStore(loc, exn, indirectErrorAddr,
+                      getTypeLowering(destErrorType), IsInitialization);
+  }
+  
+  getBuilder().createBranch(loc, ThrowDest.getBlock(), args);
 }

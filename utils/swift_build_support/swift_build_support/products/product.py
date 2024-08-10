@@ -81,7 +81,7 @@ class Product(object):
         """is_ignore_install_all_product -> bool
 
         Whether this product is to ignore the install-all directive
-        and insted always respect its own should_install.
+        and instead always respect its own should_install.
         This is useful when we run -install-all but have products
         which should never be installed into the toolchain
         (e.g. earlyswiftdriver)
@@ -288,12 +288,15 @@ class Product(object):
             target = '{}-apple-watchos{}'.format(
                 arch,
                 self.args.darwin_deployment_version_watchos if include_version else "")
+        elif platform in ['xrsimulator', 'xros']:
+            target = '{}-apple-xros{}'.format(
+                arch, self.args.darwin_deployment_version_xros)
         return target
 
     def generate_darwin_toolchain_file(self, platform, arch):
         """
         Generates a new CMake tolchain file that specifies Darwin as a target
-        plaftorm.
+        platform.
 
             Returns: path on the filesystem to the newly generated toolchain file.
         """
@@ -383,7 +386,7 @@ class Product(object):
     def generate_linux_toolchain_file(self, platform, arch):
         """
         Generates a new CMake tolchain file that specifies Linux as a target
-        plaftorm.
+        platform.
 
             Returns: path on the filesystem to the newly generated toolchain file.
         """
@@ -429,7 +432,7 @@ class Product(object):
     def generate_toolchain_file_for_darwin_or_linux(self, host_target):
         """
         Checks `host_target` platform and generates a new CMake tolchain file
-        appropriate for that target plaftorm (either Darwin or Linux). Defines
+        appropriate for that target platform (either Darwin or Linux). Defines
         `CMAKE_C_FLAGS` and `CMAKE_CXX_FLAGS` as CMake options. Also defines
         `CMAKE_TOOLCHAIN_FILE` with the path of the generated toolchain file
         as a CMake option.

@@ -77,6 +77,7 @@ namespace clang {
   class ASTContext;
   template <class> class CanQual;
   class CodeGenerator;
+  class CXXDestructorDecl;
   class Decl;
   class GlobalDecl;
   class Type;
@@ -553,6 +554,9 @@ public:
   /// Return the effective triple used by clang.
   llvm::Triple getEffectiveClangTriple();
 
+  /// Return the effective variant triple used by clang.
+  llvm::Triple getEffectiveClangVariantTriple();
+
   const llvm::StringRef getClangDataLayoutString();
 };
 
@@ -657,6 +661,7 @@ public:
   llvm::Module &Module;
   const llvm::DataLayout DataLayout;
   const llvm::Triple Triple;
+  const llvm::Triple VariantTriple;
   std::unique_ptr<llvm::TargetMachine> TargetMachine;
   ModuleDecl *getSwiftModule() const;
   AvailabilityContext getAvailabilityContext() const;
@@ -821,7 +826,8 @@ public:
   llvm::StructType  *SwiftTaskOptionRecordTy;
   llvm::StructType  *SwiftInitialSerialExecutorTaskOptionRecordTy;
   llvm::StructType  *SwiftTaskGroupTaskOptionRecordTy;
-  llvm::StructType  *SwiftInitialTaskExecutorPreferenceTaskOptionRecordTy;
+  llvm::StructType  *SwiftInitialTaskExecutorUnownedPreferenceTaskOptionRecordTy;
+  llvm::StructType  *SwiftInitialTaskExecutorOwnedPreferenceTaskOptionRecordTy;
   llvm::StructType  *SwiftResultTypeInfoTaskOptionRecordTy;
   llvm::PointerType *SwiftJobPtrTy;
   llvm::IntegerType *ExecutorFirstTy;
@@ -837,8 +843,8 @@ public:
 
   llvm::GlobalVariable *TheTrivialPropertyDescriptor = nullptr;
 
-  llvm::GlobalVariable *swiftImmortalRefCount = nullptr;
-  llvm::GlobalVariable *swiftStaticArrayMetadata = nullptr;
+  llvm::Constant *swiftImmortalRefCount = nullptr;
+  llvm::Constant *swiftStaticArrayMetadata = nullptr;
 
   /// Used to create unique names for class layout types with tail allocated
   /// elements.
@@ -1562,6 +1568,8 @@ public:
 
   void emitSourceFile(SourceFile &SF);
   void emitSynthesizedFileUnit(SynthesizedFileUnit &SFU);
+
+  void addLinkLibraries();
   void addLinkLibrary(const LinkLibrary &linkLib);
 
   /// Attempt to finalize the module.
@@ -1614,6 +1622,9 @@ public:
                                       llvm::AttributeList &attrs,
                                       ForeignFunctionInfo *foreignInfo=nullptr);
   ForeignFunctionInfo getForeignFunctionInfo(CanSILFunctionType type);
+
+  void
+  ensureImplicitCXXDestructorBodyIsDefined(clang::CXXDestructorDecl *cxxDtor);
 
   llvm::ConstantInt *getInt32(uint32_t value);
   llvm::ConstantInt *getSize(Size size);

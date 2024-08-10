@@ -21,6 +21,7 @@ fileprivate func emitDiagnosticParts(
   message: String,
   severity: DiagnosticSeverity,
   position: AbsolutePosition,
+  offset: Int,
   highlights: [Syntax] = [],
   fixItChanges: [FixIt.Change] = []
 ) {
@@ -28,7 +29,7 @@ fileprivate func emitDiagnosticParts(
   let bridgedSeverity = severity.bridged
 
   func bridgedSourceLoc(at position: AbsolutePosition) -> BridgedSourceLoc {
-    return BridgedSourceLoc(at: position, in: sourceFileBuffer)
+    return BridgedSourceLoc(at: position.advanced(by: offset), in: sourceFileBuffer)
   }
 
   // Emit the diagnostic
@@ -74,6 +75,12 @@ fileprivate func emitDiagnosticParts(
       replaceEndLoc = bridgedSourceLoc(at: oldToken.endPosition)
       newText = newTrivia.description
 
+    case .replaceChild(let replacingChildData):
+      let replacementRange = replacingChildData.replacementRange
+      replaceStartLoc = bridgedSourceLoc(at: replacementRange.lowerBound)
+      replaceEndLoc = bridgedSourceLoc(at: replacementRange.upperBound)
+      newText = replacingChildData.newChild.description
+      
 #if RESILIENT_SWIFT_SYNTAX
     @unknown default:
       fatalError()
@@ -96,6 +103,7 @@ fileprivate func emitDiagnosticParts(
 func emitDiagnostic(
   diagnosticEngine: BridgedDiagnosticEngine,
   sourceFileBuffer: UnsafeBufferPointer<UInt8>,
+  sourceFileBufferOffset: Int = 0,
   diagnostic: Diagnostic,
   diagnosticSeverity: DiagnosticSeverity,
   messageSuffix: String? = nil
@@ -107,6 +115,7 @@ func emitDiagnostic(
     message: diagnostic.diagMessage.message + (messageSuffix ?? ""),
     severity: diagnosticSeverity,
     position: diagnostic.position,
+    offset: sourceFileBufferOffset,
     highlights: diagnostic.highlights
   )
 
@@ -118,6 +127,7 @@ func emitDiagnostic(
       message: fixIt.message.message,
       severity: .note,
       position: diagnostic.position,
+      offset: sourceFileBufferOffset,
       fixItChanges: fixIt.changes
     )
   }
@@ -129,7 +139,8 @@ func emitDiagnostic(
       sourceFileBuffer: sourceFileBuffer,
       message: note.message,
       severity: .note,
-      position: note.position
+      position: note.position,
+      offset: sourceFileBufferOffset
     )
   }
 }
@@ -216,6 +227,18 @@ extension SourceManager {
         )
         newText = newTrivia.description
 
+      case .replaceChild(let replacingChildData):
+        let replacementRange = replacingChildData.replacementRange
+        replaceStartLoc = bridgedSourceLoc(
+          for: replacingChildData.parent,
+          at: replacementRange.lowerBound
+        )
+        replaceEndLoc = bridgedSourceLoc(
+          for: replacingChildData.parent,
+          at: replacementRange.upperBound
+        )
+        newText = replacingChildData.newChild.description
+        
 #if RESILIENT_SWIFT_SYNTAX
       @unknown default:
         fatalError()

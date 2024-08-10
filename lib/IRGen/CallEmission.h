@@ -19,6 +19,7 @@
 
 #include "Address.h"
 #include "Callee.h"
+#include "Explosion.h"
 #include "Temporary.h"
 
 namespace llvm {
@@ -57,6 +58,15 @@ protected:
   /// The function we're going to call.
   Callee CurCallee;
 
+  /// Only valid if the SIL function has indirect return values.
+  /// If the function has multiple indirect return values, this is the address
+  /// of the first indirect return value.
+  Address indirectReturnAddress;
+
+  /// For C-functions: true if the return is indirect in SIL, but direct for a C-function.
+  /// That can happen for "sensitive" structs.
+  bool convertDirectToIndirectReturn = false;
+
   unsigned LastArgWritten;
 
   /// Whether this is a coroutine invocation.
@@ -79,6 +89,7 @@ protected:
 
   unsigned IndirectTypedErrorArgIdx = 0;
 
+  std::optional<Explosion> typedErrorExplosion;
 
   virtual void setFromCallee();
   void emitToUnmappedMemory(Address addr);
@@ -93,6 +104,16 @@ protected:
 
   virtual llvm::CallBase *createCall(const FunctionPointer &fn,
                                      ArrayRef<llvm::Value *> args) = 0;
+
+  void externalizeArguments(IRGenFunction &IGF, const Callee &callee,
+                                   Explosion &in, Explosion &out,
+                                   TemporarySet &temporaries,
+                                   bool isOutlined);
+
+  bool mayReturnTypedErrorDirectly() const;
+  void emitToUnmappedExplosionWithDirectTypedError(SILType resultType,
+                                                   llvm::Value *result,
+                                                   Explosion &out);
 
   CallEmission(IRGenFunction &IGF, llvm::Value *selfValue, Callee &&callee)
       : IGF(IGF), selfValue(selfValue), CurCallee(std::move(callee)) {}
@@ -109,6 +130,10 @@ public:
     return CurCallee.getSubstitutions();
   }
 
+  std::optional<Explosion> &getTypedErrorExplosion() {
+    return typedErrorExplosion;
+  }
+
   virtual void begin();
   virtual void end();
   virtual SILType getParameterType(unsigned index) = 0;
@@ -118,6 +143,8 @@ public:
   virtual Address getCalleeErrorSlot(SILType errorType, bool isCalleeAsync) = 0;
 
   void addFnAttribute(llvm::Attribute::AttrKind Attr);
+
+  void setIndirectReturnAddress(Address addr) { indirectReturnAddress = addr; }
 
   void addParamAttribute(unsigned ParamIndex, llvm::Attribute::AttrKind Attr);
 

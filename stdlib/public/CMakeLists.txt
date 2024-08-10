@@ -148,23 +148,23 @@ option(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB
       "Enable build of the embedded Swift standard library and runtime"
       TRUE)
 
-# Temporarily, by default only build embedded stdlib when building the compiler, to
-# unblock CI jobs that run against old(er) toolchains.
-option(SWIFT_ALLOW_BUILD_EMBEDDED_STDLIB_WITH_HOST_COMPILER
-       "Build embedded Swift standard library and runtime even
-       if we are not building our own compiler"
-       FALSE)
+option(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING
+      "Enable build of the embedded Swift standard library and runtime for cross-compiling targets"
+      FALSE)
 
-if((NOT SWIFT_HOST_VARIANT STREQUAL "macosx") AND (NOT SWIFT_HOST_VARIANT STREQUAL "linux"))
+if((NOT SWIFT_HOST_VARIANT STREQUAL "macosx") AND (NOT SWIFT_HOST_VARIANT STREQUAL "linux") AND (NOT SWIFT_HOST_VARIANT STREQUAL "windows"))
   set(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB FALSE)
-elseif(NOT SWIFT_INCLUDE_TOOLS)
-  set(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB ${SWIFT_ALLOW_BUILD_EMBEDDED_STDLIB_WITH_HOST_COMPILER})
 elseif(BOOTSTRAPPING_MODE STREQUAL "OFF")
   set(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB FALSE)
 endif()
 
 if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
-  set(EMBEDDED_STDLIB_TARGET_TRIPLES)
+  add_custom_target(embedded-libraries ALL)
+endif()
+
+set(EMBEDDED_STDLIB_TARGET_TRIPLES)
+
+if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING)
   if("ARM" IN_LIST LLVM_TARGETS_TO_BUILD)
     list(APPEND EMBEDDED_STDLIB_TARGET_TRIPLES
       # arch    module_name               target triple
@@ -183,6 +183,7 @@ if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
   # the following are all ELF targets
   if("ARM" IN_LIST LLVM_TARGETS_TO_BUILD)
     list(APPEND EMBEDDED_STDLIB_TARGET_TRIPLES
+      "armv4t   armv4t-none-none-eabi     armv4t-none-none-eabi"
       "armv6    armv6-none-none-eabi      armv6-none-none-eabi"
       "armv6m   armv6m-none-none-eabi     armv6m-none-none-eabi"
       "armv7    armv7-none-none-eabi      armv7-none-none-eabi"
@@ -204,10 +205,6 @@ if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
     list(APPEND EMBEDDED_STDLIB_TARGET_TRIPLES
       "i686    i686-unknown-none-elf       i686-unknown-none-elf"
       "x86_64  x86_64-unknown-none-elf     x86_64-unknown-none-elf"
-      # Without specifying the `windows` component LLVM refuses to
-      # generate valid COFF object files.
-      "i686    i686-unknown-windows-msvc   i686-unknown-windows-msvc"
-      "x86_64  x86_64-unknown-windows-msvc x86_64-unknown-windows-msvc"
     )
   endif()
 
@@ -218,20 +215,47 @@ if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
     )
   endif()
 
+  if("AVR" IN_LIST LLVM_TARGETS_TO_BUILD)
+    list(APPEND EMBEDDED_STDLIB_TARGET_TRIPLES
+      "avr  avr-none-none-elf    avr-none-none-elf"
+    )
+  endif()  
+endif()
+
+if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
   if (SWIFT_HOST_VARIANT STREQUAL "linux")
-    set(EMBEDDED_STDLIB_TARGET_TRIPLES ${EMBEDDED_STDLIB_TARGET_TRIPLES}
+    list(APPEND EMBEDDED_STDLIB_TARGET_TRIPLES
       "${SWIFT_HOST_VARIANT_ARCH} ${SWIFT_HOST_VARIANT_ARCH}-unknown-linux-gnu ${SWIFT_HOST_VARIANT_ARCH}-unknown-linux-gnu"
       # In practice this expands to either:
       # "x86_64   x86_64-unknown-linux-gnu  x86_64-unknown-linux-gnu"
       # "aarch64  aarch64-unknown-linux-gnu aarch64-unknown-linux-gnu"
-      )
+    )
   elseif (SWIFT_HOST_VARIANT STREQUAL "macosx")
-    set(EMBEDDED_STDLIB_TARGET_TRIPLES ${EMBEDDED_STDLIB_TARGET_TRIPLES}
-      "x86_64   x86_64-apple-macos        x86_64-apple-macos10.13"
-      "arm64    arm64-apple-macos         arm64-apple-macos10.13"
-      "arm64e   arm64e-apple-macos        arm64e-apple-macos10.13"
-      )
+    list(APPEND EMBEDDED_STDLIB_TARGET_TRIPLES
+      "x86_64   x86_64-apple-macos        x86_64-apple-macos14"
+      "arm64    arm64-apple-macos         arm64-apple-macos14"
+      "arm64e   arm64e-apple-macos        arm64e-apple-macos14"
+    )
+  elseif (SWIFT_HOST_VARIANT STREQUAL "windows")
+    list(APPEND EMBEDDED_STDLIB_TARGET_TRIPLES
+      # Without specifying the `windows` component LLVM refuses to
+      # generate valid COFF object files.
+      "i686    i686-unknown-windows-msvc   i686-unknown-windows-msvc"
+      "x86_64  x86_64-unknown-windows-msvc x86_64-unknown-windows-msvc"
+    )
   endif()
+endif()
+
+if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
+  set(triples)
+  foreach(entry ${EMBEDDED_STDLIB_TARGET_TRIPLES})
+    string(REGEX REPLACE "[ \t]+" ";" list "${entry}")
+    list(GET list 2 triple)
+    list(APPEND triples ${triple})
+  endforeach()
+
+  message(STATUS "Building Embedded Swift standard libraries for targets: ${triples}")
+  message(STATUS "")
 endif()
 
 if(SWIFT_BUILD_STDLIB)
@@ -245,6 +269,16 @@ if(SWIFT_BUILD_STDLIB)
   if(SWIFT_BUILD_CLANG_OVERLAYS)
     add_subdirectory(ClangOverlays)
   endif()
+
+  if(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY)
+    add_subdirectory(Concurrency)
+  endif()
+
+  if(SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING)
+    add_subdirectory(RegexParser)
+    add_subdirectory(StringProcessing)
+    add_subdirectory(RegexBuilder)
+  endif()
 endif()
 
 if(SWIFT_BUILD_STDLIB AND NOT SWIFT_STDLIB_BUILD_ONLY_CORE_MODULES)
@@ -255,18 +289,8 @@ if(SWIFT_BUILD_STDLIB AND NOT SWIFT_STDLIB_BUILD_ONLY_CORE_MODULES)
     add_subdirectory(Differentiation)
   endif()
 
-  if(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY)
-    add_subdirectory(Concurrency)
-  endif()
-
   if(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED)
     add_subdirectory(Distributed)
-  endif()
-
-  if(SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING)
-    add_subdirectory(RegexParser)
-    add_subdirectory(StringProcessing)
-    add_subdirectory(RegexBuilder)
   endif()
 
   if(SWIFT_ENABLE_EXPERIMENTAL_OBSERVATION)
@@ -279,6 +303,10 @@ if(SWIFT_BUILD_STDLIB AND NOT SWIFT_STDLIB_BUILD_ONLY_CORE_MODULES)
 
   if(SWIFT_ENABLE_SYNCHRONIZATION)
     add_subdirectory(Synchronization)
+  endif()
+
+  if(SWIFT_ENABLE_VOLATILE)
+    add_subdirectory(Volatile)
   endif()
 endif()
 

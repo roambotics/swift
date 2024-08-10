@@ -12,7 +12,6 @@
 import SwiftSyntax
 import SwiftSyntaxMacros
 import SwiftDiagnostics
-import SwiftOperators
 import SwiftSyntaxBuilder
 
 public struct ObservableMacro {
@@ -118,6 +117,7 @@ extension DeclModifierListSyntax {
         case .fileprivate: fallthrough
         case .private: fallthrough
         case .internal: fallthrough
+        case .package: fallthrough
         case .public:
           return false
         default:

@@ -1,6 +1,4 @@
 // RUN: %target-swift-emit-sil -sil-verify-all -verify -enable-experimental-feature NoImplicitCopy %s
-// RUN: %target-swift-emit-sil -enable-experimental-feature NoncopyableGenerics -sil-verify-all -verify -enable-experimental-feature NoImplicitCopy %s
-
 
 // This testStruct specifically testStructs how DI and the move checkers interact with each other
 
@@ -66,7 +64,7 @@ func testEnumNoInit() {
 }
 
 func testEnumNoInitWithPayload() {
-    @_moveOnly struct Empty {}
+    struct Empty: ~Copyable {}
 
     enum E : ~Copyable {
         case first(Empty)
@@ -78,7 +76,7 @@ func testEnumNoInitWithPayload() {
 }
 
 func testEnumNoInitWithGenericPayload() {
-    @_moveOnly struct Empty {}
+    struct Empty: ~Copyable {}
 
     enum E<T> : ~Copyable {
         case first(Empty)

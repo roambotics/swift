@@ -26,6 +26,7 @@
 #include "swift/Frontend/CachingUtils.h"
 #include "swift/Frontend/CompileJobCacheKey.h"
 #include "swift/Frontend/CompileJobCacheResult.h"
+#include "swift/Frontend/DiagnosticHelper.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/Option/Options.h"
@@ -245,7 +246,7 @@ bool swiftscan_cas_prune_ondisk_data(swiftscan_cas_t cas,
   return false;
 }
 
-/// Expand the invocation if there is repsonseFile into Args that are passed in
+/// Expand the invocation if there is responseFile into Args that are passed in
 /// the parameter. Return swift-frontend arguments in an ArrayRef, which has the
 /// first "-frontend" option dropped if needed.
 static llvm::ArrayRef<const char *>
@@ -275,16 +276,8 @@ computeCacheKey(llvm::cas::ObjectStore &CAS, llvm::ArrayRef<const char *> Args,
   swift::CompilerInvocation Invocation;
   swift::SourceManager SourceMgr;
   swift::DiagnosticEngine Diags(SourceMgr);
-  llvm::SmallString<128> workingDirectory;
-  llvm::sys::fs::current_path(workingDirectory);
-  llvm::SmallVector<std::unique_ptr<llvm::MemoryBuffer>, 4>
-      configurationFileBuffers;
 
-  std::string MainExecutablePath = llvm::sys::fs::getMainExecutable(
-      "swift-frontend", (void *)swiftscan_cache_replay_compilation);
-
-  if (Invocation.parseArgs(Args, Diags, &configurationFileBuffers,
-                           workingDirectory, MainExecutablePath))
+  if (Invocation.parseArgs(Args, Diags, nullptr, {}))
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    "Argument parsing failed");
 
@@ -825,11 +818,7 @@ swiftscan_cache_replay_instance_create(int argc, const char **argv,
   swift::DiagnosticEngine DE(SrcMgr);
   DE.addConsumer(Diags);
 
-  std::string MainExecutablePath = llvm::sys::fs::getMainExecutable(
-      "swift-frontend", (void *)swiftscan_cache_replay_compilation);
-
-  if (Instance->Invocation.parseArgs(Args, DE, nullptr, {},
-                                     MainExecutablePath)) {
+  if (Instance->Invocation.parseArgs(Args, DE, nullptr, {})) {
     delete Instance;
     *error = swift::c_string_utils::create_clone(err_msg.c_str());
     return nullptr;
@@ -917,22 +906,11 @@ static llvm::Error replayCompilation(SwiftScanReplayInstance &Instance,
   const auto &Input = AllInputs[Comp.InputIndex];
 
   // Setup DiagnosticsConsumers.
-  // FIXME: Reduce code duplication against `performFrontend()` and add support
-  // for JSONFIXIT, SerializedDiagnostics, etc.
-  PrintingDiagnosticConsumer PDC(Err);
-  Inst.addDiagnosticConsumer(&PDC);
-
-  if (Invocation.getDiagnosticOptions().UseColor)
-    PDC.forceColors();
-  PDC.setPrintEducationalNotes(
-      Invocation.getDiagnosticOptions().PrintEducationalNotes);
-  PDC.setFormattingStyle(
-      Invocation.getDiagnosticOptions().PrintedFormattingStyle);
-  PDC.setEmitMacroExpansionFiles(
-      Invocation.getDiagnosticOptions().EmitMacroExpansionFiles);
+  DiagnosticHelper DH = DiagnosticHelper::create(Inst, Err, /*QuasiPID=*/true);
 
   std::string InstanceSetupError;
-  if (Inst.setup(Instance.Invocation, InstanceSetupError, Instance.Args))
+  if (Inst.setupForReplay(Instance.Invocation, InstanceSetupError,
+                          Instance.Args))
     return createStringError(inconvertibleErrorCode(), InstanceSetupError);
 
   auto *CDP = Inst.getCachingDiagnosticsProcessor();
@@ -976,7 +954,7 @@ static llvm::Error replayCompilation(SwiftScanReplayInstance &Instance,
               return Proxy.takeError();
 
             if (Kind == file_types::ID::TY_CachedDiagnostics) {
-              assert(!DiagnosticsOutput && "more than 1 diagnotics found");
+              assert(!DiagnosticsOutput && "more than 1 diagnostics found");
               DiagnosticsOutput = std::move(*Proxy);
             } else
               OutputProxies.emplace_back(
@@ -988,14 +966,31 @@ static llvm::Error replayCompilation(SwiftScanReplayInstance &Instance,
   // Replay diagnostics first.
   // FIXME: Currently, the diagnostics is replay from the first file.
   if (DiagnosticsOutput) {
-    if (auto E = CDP->replayCachedDiagnostics(DiagnosticsOutput->getData()))
+    DH.initDiagConsumers(Invocation);
+    DH.beginMessage(Invocation, Instance.Args);
+
+    if (auto E = CDP->replayCachedDiagnostics(DiagnosticsOutput->getData())) {
+      DH.endMessage(/*ReturnCode=*/1);
+      Inst.getDiags().finishProcessing();
       return E;
+    }
 
     if (Remarks)
       Inst.getDiags().diagnose(SourceLoc(), diag::replay_output,
                                "<cached-diagnostics>",
                                CAS.getID(Comp.Key).toString());
+  } else {
+    // Don't write anything when parseable output is requested.
+    if (Invocation.getFrontendOptions().FrontendParseableOutput)
+      DH.setSuppressOutput(true);
   }
+
+  SWIFT_DEFER {
+    if (DiagnosticsOutput) {
+      DH.endMessage(0);
+      Inst.getDiags().finishProcessing();
+    }
+  };
 
   // OutputBackend for replay.
   ReplayOutputBackend Backend(

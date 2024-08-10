@@ -29,6 +29,7 @@
 #include "swift/Runtime/Debug.h"
 #include "swift/Runtime/EnvironmentVariables.h"
 #include "swift/Runtime/HeapObject.h"
+#include "swift/Runtime/LibPrespecialized.h"
 #include "swift/Runtime/Metadata.h"
 #include "swift/Strings.h"
 #include "swift/Threading/Mutex.h"
@@ -54,6 +55,10 @@ using namespace reflection;
 #include <objc/message.h>
 #include <objc/objc.h>
 #include <dlfcn.h>
+#endif
+
+#if __has_include(<mach-o/dyld_priv.h>)
+#include <mach-o/dyld_priv.h>
 #endif
 
 /// A Demangler suitable for resolving runtime type metadata strings.
@@ -132,11 +137,13 @@ ResolveAsSymbolicReference::operator()(SymbolicReferenceKind kind,
       if (symInfo->getSymbolName())
         symbolName = symInfo->getSymbolName();
     }
+    uintptr_t ptrLocation = detail::applyRelativeOffset(base, offset);
     swift::fatalError(
         0,
         "Failed to look up symbolic reference at %p - offset %" PRId32
-        " - symbol %s in %s\n",
-        base, offset, symbolName, fileName);
+        " - symbol %s in %s - pointer at %#" PRIxPTR
+        " is likely a reference to a missing weak symbol\n",
+        base, offset, symbolName, fileName, ptrLocation);
   }
 
   // Figure out this symbolic reference's grammatical role.
@@ -322,14 +329,38 @@ namespace {
   };
 } // end anonymous namespace
 
+#if DYLD_GET_SWIFT_PRESPECIALIZED_DATA_DEFINED
+struct SharedCacheInfoState {
+  uintptr_t dyldSharedCacheStart;
+  uintptr_t dyldSharedCacheEnd;
+
+  bool inSharedCache(const void *ptr) {
+    auto uintPtr = reinterpret_cast<uintptr_t>(ptr);
+    return dyldSharedCacheStart <= uintPtr && uintPtr < dyldSharedCacheEnd;
+  }
+
+  SharedCacheInfoState() {
+    size_t length;
+    dyldSharedCacheStart = (uintptr_t)_dyld_get_shared_cache_range(&length);
+    dyldSharedCacheEnd =
+        dyldSharedCacheStart ? dyldSharedCacheStart + length : 0;
+  }
+};
+
+static Lazy<SharedCacheInfoState> SharedCacheInfo;
+#endif
+
 struct TypeMetadataPrivateState {
   ConcurrentReadableHashMap<NominalTypeDescriptorCacheEntry> NominalCache;
   ConcurrentReadableArray<TypeMetadataSection> SectionsToScan;
-  
+
+#if DYLD_GET_SWIFT_PRESPECIALIZED_DATA_DEFINED
+  ConcurrentReadableArray<TypeMetadataSection> SharedCacheSectionsToScan;
+#endif
+
   TypeMetadataPrivateState() {
     initializeTypeMetadataRecordLookup();
   }
-
 };
 
 static Lazy<TypeMetadataPrivateState> TypeMetadataRecords;
@@ -338,6 +369,12 @@ static void
 _registerTypeMetadataRecords(TypeMetadataPrivateState &T,
                              const TypeMetadataRecord *begin,
                              const TypeMetadataRecord *end) {
+#if DYLD_GET_SWIFT_PRESPECIALIZED_DATA_DEFINED
+  if (SharedCacheInfo.get().inSharedCache(begin)) {
+    T.SharedCacheSectionsToScan.push_back(TypeMetadataSection{begin, end});
+    return;
+  }
+#endif
   T.SectionsToScan.push_back(TypeMetadataSection{begin, end});
 }
 
@@ -346,6 +383,8 @@ void swift::addImageTypeMetadataRecordBlockCallbackUnsafe(
     const void *records, uintptr_t recordsSize) {
   assert(recordsSize % sizeof(TypeMetadataRecord) == 0
          && "weird-sized type metadata section?!");
+
+  libPrespecializedImageLoaded();
 
   // If we have a section, enqueue the type metadata for lookup.
   auto recordBytes = reinterpret_cast<const char *>(records);
@@ -397,6 +436,38 @@ _findExtendedTypeContextDescriptor(const ContextDescriptor *maybeExtension,
   Demangle::NodePointer &node = demangledNode ? *demangledNode : localNode;
 
   auto mangledName = extension->getMangledExtendedContext();
+  
+  // A extension of the form `extension Protocol where Self == ConcreteType`
+  // is formally a protocol extension, so the formal generic parameter list
+  // is `<Self>`, but because of the same type constraint, the extended context
+  // looks like a reference to that nominal type. We want to match the
+  // extension's formal generic environment rather than the nominal type's
+  // in this case, so we should skip out on this case.
+  //
+  // We can detect this by looking at whether the generic context of the
+  // extension has a first generic parameter, which would be the Self parameter,
+  // with a same type constraint matching the extended type.
+  for (auto &reqt : extension->getGenericRequirements()) {
+    if (reqt.getKind() != GenericRequirementKind::SameType) {
+      continue;
+    }
+    // 'x' is the mangling of the first generic parameter
+    if (!reqt.getParam().equals("x")) {
+      continue;
+    }
+    // Is the generic parameter same-type-constrained to the same type
+    // we're extending? Then this is a `Self == ExtendedType` constraint.
+    // This is impossible for normal generic nominal type extensions because
+    // that would mean that you had:
+    //   struct Foo<T> {...}
+    //   extension Foo where T == Foo<T> {...}
+    // which would mean that the extended type is the infinite expansion
+    // Foo<Foo<Foo<Foo<...>>>>, which we don't allow.
+    if (reqt.getMangledTypeName().data() == mangledName.data()) {
+      return nullptr;
+    }
+  }
+  
   node = demangler.demangleType(mangledName,
                                 ResolveAsSymbolicReference(demangler));
   if (!node)
@@ -738,6 +809,111 @@ swift::_contextDescriptorMatchesMangling(const ContextDescriptor *context,
   return true;
 }
 
+// Helper functions to allow _searchTypeMetadataRecordsInSections to work with
+// both type and protocol records.
+static const ContextDescriptor *
+getContextDescriptor(const TypeMetadataRecord &record) {
+  return record.getContextDescriptor();
+}
+
+static const ContextDescriptor *
+getContextDescriptor(const ProtocolRecord &record) {
+  return record.Protocol.getPointer();
+}
+
+// Perform a linear scan of the given records section, searching for a
+// descriptor that matches the mangling passed in `node`. `sectionsToScan` is a
+// ConcurrentReadableHashMap containing sections of type/protocol records.
+template <typename SectionsContainer>
+static const ContextDescriptor *
+_searchTypeMetadataRecordsInSections(SectionsContainer &sectionsToScan,
+                                     Demangle::NodePointer node) {
+  for (auto &section : sectionsToScan.snapshot()) {
+    for (const auto &record : section) {
+      if (auto context = getContextDescriptor(record)) {
+        if (_contextDescriptorMatchesMangling(context, node)) {
+          return context;
+        }
+      }
+    }
+  }
+
+  return nullptr;
+}
+
+// Search for a context descriptor matching the mangling passed in `node`.
+// `state` is `TypeMetadataPrivateState` or `ProtocolMetadataPrivateState` and
+// the search will use the sections in those structures. `traceBegin` is a
+// function returning a trace state which is called around the linear scans of
+// type/protocol records. When available, the search will consult the
+// LibPrespecialized table, and perform validation on the result when validation
+// is enabled.
+template <typename State, typename TraceBegin>
+static const ContextDescriptor *
+_searchForContextDescriptor(State &state, NodePointer node,
+                            TraceBegin traceBegin) {
+#if DYLD_GET_SWIFT_PRESPECIALIZED_DATA_DEFINED
+  // Try LibPrespecialized first.
+  auto result = getLibPrespecializedTypeDescriptor(node);
+
+  // Validate the result if requested.
+  if (SWIFT_UNLIKELY(
+          runtime::environment::
+              SWIFT_DEBUG_VALIDATE_LIB_PRESPECIALIZED_DESCRIPTOR_LOOKUP())) {
+    // Only validate a definitive result.
+    if (result.first == LibPrespecializedLookupResult::Found ||
+        result.first == LibPrespecializedLookupResult::DefinitiveNotFound) {
+      // Perform a scan of the shared cache sections and see if the result
+      // matches.
+      auto scanResult = _searchTypeMetadataRecordsInSections(
+          state.SharedCacheSectionsToScan, node);
+
+      // Ignore a result that's outside the shared cache. This can happen for
+      // indirect descriptor records that get fixed up to point to a root.
+      if (SharedCacheInfo.get().inSharedCache(scanResult)) {
+        // We may find a different but equivalent context if they're not unique,
+        // as iteration order may be different between the two. Use
+        // equalContexts to compare distinct but equal non-unique contexts
+        // properly.
+        if (!equalContexts(result.second, scanResult)) {
+          auto tree = getNodeTreeAsString(node);
+          swift::fatalError(
+              0,
+              "Searching for type descriptor, prespecialized descriptor map "
+              "returned %p, but scan returned %p. Node tree:\n%s",
+              result.second, scanResult, tree.c_str());
+        }
+      }
+    }
+  }
+
+  // If we found something, we're done, return it.
+  if (result.first == LibPrespecializedLookupResult::Found) {
+    assert(result.second);
+    return result.second;
+  }
+
+  // If a negative result was not definitive, then we must search the shared
+  // cache sections.
+  if (result.first == LibPrespecializedLookupResult::NonDefinitiveNotFound) {
+    auto traceState = traceBegin(node);
+    auto descriptor = _searchTypeMetadataRecordsInSections(
+        state.SharedCacheSectionsToScan, node);
+    traceState.end(descriptor);
+    if (descriptor)
+      return descriptor;
+  }
+
+  // If we didn't find anything in the shared cache, then search the rest.
+#endif
+
+  auto traceState = traceBegin(node);
+  auto foundDescriptor =
+      _searchTypeMetadataRecordsInSections(state.SectionsToScan, node);
+  traceState.end(foundDescriptor);
+  return foundDescriptor;
+}
+
 // returns the nominal type descriptor for the type named by typeName
 static const ContextDescriptor *
 _searchTypeMetadataRecords(TypeMetadataPrivateState &T,
@@ -752,19 +928,8 @@ _searchTypeMetadataRecords(TypeMetadataPrivateState &T,
           return nullptr;
 #endif
 
-  auto traceState = runtime::trace::metadata_scan_begin(node);
-
-  for (auto &section : T.SectionsToScan.snapshot()) {
-    for (const auto &record : section) {
-      if (auto context = record.getContextDescriptor()) {
-        if (_contextDescriptorMatchesMangling(context, node)) {
-          return traceState.end(context);
-        }
-      }
-    }
-  }
-
-  return nullptr;
+  return _searchForContextDescriptor(T, node,
+                                     runtime::trace::metadata_scan_begin);
 }
 
 #define DESCRIPTOR_MANGLING_SUFFIX_Structure Mn
@@ -803,18 +968,18 @@ descriptorFromStandardMangling(Demangle::NodePointer symbolicNode) {
   // Fast-path lookup for standard library type references with short manglings.
   if (symbolicNode->getNumChildren() >= 2
       && symbolicNode->getChild(0)->getKind() == Node::Kind::Module
-      && symbolicNode->getChild(0)->getText().equals("Swift")
+      && stringRefEqualsCString(symbolicNode->getChild(0)->getText(), "Swift")
       && symbolicNode->getChild(1)->getKind() == Node::Kind::Identifier) {
     auto name = symbolicNode->getChild(1)->getText();
 
-#define STANDARD_TYPE(KIND, MANGLING, TYPENAME) \
-    if (name.equals(#TYPENAME)) { \
+#define STANDARD_TYPE(KIND, MANGLING, TYPENAME)                                \
+    if (stringRefEqualsCString(name, #TYPENAME)) {                             \
       return &DESCRIPTOR_MANGLING(MANGLING, DESCRIPTOR_MANGLING_SUFFIX(KIND)); \
     }
   // FIXME: When the _Concurrency library gets merged into the Standard Library,
   // we will be able to reference those symbols directly as well.
 #define STANDARD_TYPE_CONCURRENCY(KIND, MANGLING, TYPENAME)                    \
-  if (concurrencyDescriptors && name.equals(#TYPENAME)) {                      \
+  if (concurrencyDescriptors && stringRefEqualsCString(name, #TYPENAME)) {     \
     return concurrencyDescriptors->TYPENAME;                                   \
   }
 #if !SWIFT_OBJC_INTEROP
@@ -943,6 +1108,10 @@ namespace {
     ConcurrentReadableHashMap<ProtocolDescriptorCacheEntry> ProtocolCache;
     ConcurrentReadableArray<ProtocolSection> SectionsToScan;
 
+#if DYLD_GET_SWIFT_PRESPECIALIZED_DATA_DEFINED
+    ConcurrentReadableArray<ProtocolSection> SharedCacheSectionsToScan;
+#endif
+
     ProtocolMetadataPrivateState() {
       initializeProtocolLookup();
     }
@@ -955,6 +1124,12 @@ static void
 _registerProtocols(ProtocolMetadataPrivateState &C,
                    const ProtocolRecord *begin,
                    const ProtocolRecord *end) {
+#if DYLD_GET_SWIFT_PRESPECIALIZED_DATA_DEFINED
+  if (SharedCacheInfo.get().inSharedCache(begin)) {
+    C.SharedCacheSectionsToScan.push_back(ProtocolSection{begin, end});
+    return;
+  }
+#endif
   C.SectionsToScan.push_back(ProtocolSection{begin, end});
 }
 
@@ -992,18 +1167,12 @@ void swift::swift_registerProtocols(const ProtocolRecord *begin,
 static const ProtocolDescriptor *
 _searchProtocolRecords(ProtocolMetadataPrivateState &C,
                        NodePointer node) {
-  auto traceState = runtime::trace::protocol_scan_begin(node);
-
-  for (auto &section : C.SectionsToScan.snapshot()) {
-    for (const auto &record : section) {
-      if (auto protocol = record.Protocol.getPointer()) {
-        if (_contextDescriptorMatchesMangling(protocol, node))
-          return traceState.end(protocol);
-      }
-    }
-  }
-
-  return nullptr;
+  auto descriptor =
+      _searchForContextDescriptor(C, node, runtime::trace::protocol_scan_begin);
+  assert(!descriptor ||
+         isa<ProtocolDescriptor>(descriptor) &&
+             "Protocol record search found non-protocol descriptor.");
+  return reinterpret_cast<const ProtocolDescriptor *>(descriptor);
 }
 
 static const ProtocolDescriptor *
@@ -1190,7 +1359,7 @@ public:
         genericParamCounts(genericParamCounts) {}
 
   MetadataOrPack getMetadata(unsigned depth, unsigned index) const;
-  MetadataOrPack getMetadataOrdinal(unsigned ordinal) const;
+  MetadataOrPack getMetadataFullOrdinal(unsigned ordinal) const;
   const WitnessTable *getWitnessTable(const Metadata *type,
                                       unsigned index) const;
 };
@@ -1249,7 +1418,8 @@ _gatherGenericParameters(const ContextDescriptor *context,
   (void)_gatherGenericParameterCounts(context,
                                       genericParamCounts, demangler);
   unsigned numTotalGenericParams =
-    genericParamCounts.empty() ? 0 : genericParamCounts.back();
+    genericParamCounts.empty() ? context->getNumGenericParams()
+                               : genericParamCounts.back();
   
   // Check whether we have the right number of generic arguments.
   if (genericArgs.size() == getLocalGenericParams(context).size()) {
@@ -1410,8 +1580,8 @@ _gatherGenericParameters(const ContextDescriptor *context,
         [&substitutions](unsigned depth, unsigned index) {
           return substitutions.getMetadata(depth, index).Ptr;
         },
-        [&substitutions](unsigned ordinal) {
-          return substitutions.getMetadataOrdinal(ordinal).Ptr;
+        [&substitutions](unsigned fullOrdinal, unsigned keyOrdinal) {
+          return substitutions.getMetadataFullOrdinal(fullOrdinal).Ptr;
         },
         [&substitutions](const Metadata *type, unsigned index) {
           return substitutions.getWitnessTable(type, index);
@@ -1844,12 +2014,12 @@ public:
           // FIXME: variadic generics
           return genArgs[index].getMetadata();
         },
-        [genArgs](unsigned ordinal) {
-          if (ordinal >= genArgs.size())
+        [genArgs](unsigned fullOrdinal, unsigned keyOrdinal) {
+          if (fullOrdinal >= genArgs.size())
             return (const Metadata*)nullptr;
 
           // FIXME: variadic generics
-          return genArgs[ordinal].getMetadata();
+          return genArgs[fullOrdinal].getMetadata();
         },
         [](const Metadata *type, unsigned index) -> const WitnessTable * {
           swift_unreachable("never called");
@@ -1865,7 +2035,7 @@ public:
   TypeLookupErrorOr<BuiltType> createBuiltinType(StringRef builtinName,
                                                  StringRef mangledName) const {
 #define BUILTIN_TYPE(Symbol, _) \
-    if (mangledName.equals(#Symbol)) \
+    if (stringRefEqualsCString(mangledName, #Symbol)) \
       return BuiltType(&METADATA_SYM(Symbol).base);
 #if !SWIFT_STDLIB_ENABLE_VECTOR_TYPES
 #define BUILTIN_VECTOR_TYPE(ElementSymbol, ElementName, Width)
@@ -2809,8 +2979,8 @@ swift_distributed_getWitnessTables(GenericEnvironmentDescriptor *genericEnv,
       [&substFn](unsigned depth, unsigned index) {
         return substFn.getMetadata(depth, index).Ptr;
       },
-      [&substFn](unsigned ordinal) {
-        return substFn.getMetadataOrdinal(ordinal).Ptr;
+      [&substFn](unsigned fullOrdinal, unsigned keyOrdinal) {
+        return substFn.getMetadataKeyArgOrdinal(keyOrdinal).Ptr;
       },
       [&substFn](const Metadata *type, unsigned index) {
         return substFn.getWitnessTable(type, index);
@@ -3238,8 +3408,8 @@ SubstGenericParametersFromMetadata::getMetadata(
   return MetadataOrPack(genericArgs[flatIndex]);
 }
 
-MetadataOrPack
-SubstGenericParametersFromMetadata::getMetadataOrdinal(unsigned ordinal) const {
+MetadataOrPack SubstGenericParametersFromMetadata::getMetadataKeyArgOrdinal(
+    unsigned ordinal) const {
   // Don't attempt anything if we have no generic parameters.
   if (genericArgs == nullptr)
     return MetadataOrPack();
@@ -3276,8 +3446,8 @@ MetadataOrPack SubstGenericParametersFromWrittenArgs::getMetadata(
   return MetadataOrPack();
 }
 
-MetadataOrPack SubstGenericParametersFromWrittenArgs::getMetadataOrdinal(
-                                        unsigned ordinal) const {
+MetadataOrPack SubstGenericParametersFromWrittenArgs::getMetadataFullOrdinal(
+    unsigned ordinal) const {
   if (ordinal < allGenericArgs.size()) {
     return MetadataOrPack(allGenericArgs[ordinal]);
   }

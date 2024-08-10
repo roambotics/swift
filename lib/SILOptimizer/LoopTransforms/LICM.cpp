@@ -12,6 +12,7 @@
 
 #define DEBUG_TYPE "sil-licm"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/MemAccessUtils.h"
@@ -1020,6 +1021,8 @@ void LoopTreeOptimization::analyzeCurrentLoop(
         std::any_of(sideEffects.begin(), sideEffects.end(),
                     [&](SILInstruction *W) { return W->mayRelease(); });
     for (auto *FL : FixLifetimes) {
+      if (!FL->getOperand()->getType().isAddress())
+        continue;
       if (!sideEffectsMayRelease || !mayWriteTo(AA, sideEffects, FL)) {
         SinkDown.push_back(FL);
       }
@@ -1048,8 +1051,13 @@ computeInnerAccessPath(AccessPath::PathNode outerPath,
   if (outerPath == innerPath)
     return true;
 
-  if (!isa<StructElementAddrInst>(innerAddress)
-      && !isa<TupleElementAddrInst>(innerAddress)) {
+  auto *sea = dyn_cast<StructElementAddrInst>(innerAddress);
+
+  if (sea && sea->getStructDecl()->hasUnreferenceableStorage()) {
+    return false;
+  }
+
+  if (!sea && !isa<TupleElementAddrInst>(innerAddress)) {
     return false;
   }
   assert(ProjectionIndex(innerAddress).Index

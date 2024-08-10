@@ -1437,6 +1437,19 @@ FUNCTION(UpdateClassMetadata2,
          EFFECT(MetaData),
          UNKNOWN_MEMEFFECTS)
 
+// objc_class *swift_updatePureObjCClassMetadata(
+//             objc_class *self,
+//             ClassLayoutFlags flags,
+//             size_t numFields,
+//             TypeLayout * const *fieldTypes);
+FUNCTION(UpdatePureObjCClassMetadata,
+         swift_updatePureObjCClassMetadata, SwiftCC, AlwaysAvailable,
+         RETURNS(ObjCClassPtrTy),
+         ARGS(ObjCClassPtrTy, SizeTy, SizeTy, Int8PtrPtrTy->getPointerTo()),
+         ATTRS(NoUnwind),
+         EFFECT(MetaData),
+         UNKNOWN_MEMEFFECTS)
+
 // void *swift_lookUpClassMethod(Metadata *metadata,
 //                               ClassDescriptor *description,
 //                               MethodDescriptor *method);
@@ -2138,6 +2151,21 @@ FUNCTION(PlatformVersionAtLeast, __isPlatformVersionAtLeast,
          EFFECT(NoEffect),
          UNKNOWN_MEMEFFECTS)
 
+// int32 __isPlatformOrVariantPlatformVersionAtLeast(uint32_t platform1,
+//            uint32_t major1, uint32_t minor1, uint32_t patch1,
+//            uint32_t platform2, uint32_t major2, uint32_t minor2,
+//            uint32_t patch2);
+// This is a C builtin provided by compiler-rt.
+FUNCTION(TargetOSVersionOrVariantOSVersionAtLeast,
+         __isPlatformOrVariantPlatformVersionAtLeast,
+         C_CC, AlwaysAvailable,
+         RETURNS(Int32Ty),
+         ARGS(Int32Ty, Int32Ty, Int32Ty, Int32Ty, Int32Ty, Int32Ty, Int32Ty,
+              Int32Ty),
+         ATTRS(NoUnwind),
+         EFFECT(NoEffect),
+         UNKNOWN_MEMEFFECTS)
+
 FUNCTION(GetKeyPath, swift_getKeyPath, C_CC, AlwaysAvailable,
          RETURNS(RefCountedPtrTy),
          ARGS(Int8PtrTy, Int8PtrTy),
@@ -2821,6 +2849,20 @@ FUNCTION(ExceptionPersonality,
               Int64Ty,
               Int8PtrTy,
               Int8PtrTy),
+         ATTRS(NoUnwind),
+         EFFECT(NoEffect),
+         UNKNOWN_MEMEFFECTS)
+
+FUNCTION(ClearSensitive, swift_clearSensitive, C_CC, ClearSensitiveAvailability,
+         RETURNS(VoidTy),
+         ARGS(PtrTy, SizeTy),
+         ATTRS(NoUnwind),
+         EFFECT(NoEffect),
+         UNKNOWN_MEMEFFECTS)
+
+FUNCTION(MemsetS, memset_s, C_CC, AlwaysAvailable,
+         RETURNS(Int32Ty),
+         ARGS(PtrTy, SizeTy, Int32Ty, SizeTy),
          ATTRS(NoUnwind),
          EFFECT(NoEffect),
          UNKNOWN_MEMEFFECTS)

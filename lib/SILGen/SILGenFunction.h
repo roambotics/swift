@@ -22,6 +22,7 @@
 #include "SILGen.h"
 #include "SILGenBuilder.h"
 #include "swift/AST/AnyFunctionRef.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/NoDiscard.h"
 #include "swift/Basic/ProfileCounter.h"
 #include "swift/Basic/Statistic.h"
@@ -728,6 +729,10 @@ public:
   /// without any contextual overrides.
   FunctionTypeInfo getFunctionTypeInfo(CanAnyFunctionType fnType);
 
+  /// A helper method that calls getFunctionTypeInfo that also marks global
+  /// actor isolated async closures that are not sendable as sendable.
+  FunctionTypeInfo getClosureTypeInfo(AbstractClosureExpr *expr);
+
   bool isEmittingTopLevelCode() { return IsEmittingTopLevelCode; }
   void stopEmittingTopLevelCode() { IsEmittingTopLevelCode = false; }
 
@@ -819,6 +824,10 @@ public:
   /// Generates code for the deinit of the move only type and destroys all of
   /// the fields.
   void emitDeallocatingMoveOnlyDestructor(DestructorDecl *dd);
+
+  /// Whether we are inside a constructor whose hops are injected by
+  /// definite initialization.
+  bool isCtorWithHopsInjectedByDefiniteInit();
 
   /// Generates code for a struct constructor.
   /// This allocates the new 'self' value, emits the
@@ -1582,7 +1591,19 @@ public:
   // Patterns
   //===--------------------------------------------------------------------===//
 
-  SILValue emitOSVersionRangeCheck(SILLocation loc, const VersionRange &range);
+  SILValue emitOSVersionRangeCheck(SILLocation loc, const VersionRange &range,
+                                   bool forTargetVariant = false);
+  SILValue
+  emitOSVersionOrVariantVersionRangeCheck(SILLocation loc,
+                                          const VersionRange &targetRange,
+                                          const VersionRange &variantRange);
+  /// Emits either a single OS version range check or an OS version & variant
+  /// version range check automatically, depending on the active target triple
+  /// and requested versions.
+  SILValue emitZipperedOSVersionRangeCheck(SILLocation loc,
+                                           const VersionRange &targetRange,
+                                           const VersionRange &variantRange);
+
   void emitStmtCondition(StmtCondition Cond, JumpDest FalseDest, SILLocation loc,
                          ProfileCounter NumTrueTaken = ProfileCounter(),
                          ProfileCounter NumFalseTaken = ProfileCounter());
@@ -2181,9 +2202,8 @@ public:
     emitOpenExistentialExprImpl(e, emitSubExpr);
   }
 
-  /// Mapping from active opaque value expressions to their values.
-  llvm::SmallDenseMap<OpaqueValueExpr *, ManagedValue>
-    OpaqueValues;
+  /// Mapping from OpaqueValueExpr/PackElementExpr to their values.
+  llvm::SmallDenseMap<Expr *, ManagedValue> OpaqueValues;
 
   /// A mapping from opaque value expressions to the open-existential
   /// expression that determines them, used while lowering lvalues.
@@ -2451,6 +2471,34 @@ public:
   //===---------------------------------------------------------------------===//
   // Distributed Actors
   //===---------------------------------------------------------------------===//
+
+  /// Determine if the target `func` should be replaced with a
+  /// 'distributed thunk'.
+  ///
+  /// This only applies to distributed functions when calls are made cross-actor
+  /// isolation. One notable exception is a distributed thunk calling the "real
+  /// underlying method", in which case (to avoid the thunk calling into itself,
+  /// the real method must be called).
+  ///
+  /// Witness calls which may need to be replaced with a distributed thunk call
+  /// happen either when the target type is generic, or if we are inside an
+  /// extension on a protocol. This method checks if we are in a context
+  /// where we should be calling the distributed thunk of the `func` or not.
+  /// Notably, if we are inside a distributed thunk already and are trying to
+  /// apply distributed method calls, all those must be to the "real" method,
+  /// because the thunks' responsibility is to call the real method, so this
+  /// replacement cannot be applied (or we'd recursively keep calling the same
+  /// thunk via witness).
+  ///
+  /// In situations which do not use a witness call, distributed methods are always
+  /// invoked Direct, and never ClassMethod, because distributed are effectively
+  /// final.
+  ///
+  /// \param func the target func that we are trying to "apply"
+  /// \return true when the function should be considered for replacement
+  ///         with distributed thunk when applying it
+  bool
+  shouldReplaceConstantForApplyWithDistributedThunk(FuncDecl *func) const;
 
   /// Initializes the implicit stored properties of a distributed actor that correspond to
   /// its transport and identity.

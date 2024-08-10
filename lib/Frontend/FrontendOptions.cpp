@@ -14,6 +14,7 @@
 
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/ModuleLoader.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Option/Options.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Strings.h"
@@ -230,7 +231,6 @@ bool FrontendOptions::supportCompilationCaching(ActionType action) {
   case ActionType::EmitImportedModules:
   case ActionType::ScanDependencies:
   case ActionType::ResolveImports:
-  case ActionType::Typecheck:
   case ActionType::DumpAST:
   case ActionType::PrintAST:
   case ActionType::PrintASTDecl:
@@ -240,6 +240,7 @@ bool FrontendOptions::supportCompilationCaching(ActionType action) {
   case ActionType::Immediate:
   case ActionType::DumpTypeInfo:
     return false;
+  case ActionType::Typecheck:
   case ActionType::TypecheckModuleFromInterface:
   case ActionType::CompileModuleFromInterface:
   case ActionType::EmitPCH:

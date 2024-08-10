@@ -24,6 +24,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "dead-object-elim"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/IndexTrie.h"
 #include "swift/AST/ResilienceExpansion.h"
 #include "swift/SIL/BasicBlockUtils.h"
@@ -854,7 +855,10 @@ void DeadObjectElimination::salvageDebugInfo(SILInstruction *toBeRemoved) {
   if (!varInfo)
     return;
 
-  SILBuilderWithScope Builder(SI);
+  // Note: The instruction should logically be in SI's scope.
+  // However, LLVM does not support variables and stores in different scopes,
+  // so we use the variable's scope.
+  SILBuilder Builder(SI, varInfo->Scope);
   Builder.createDebugValue(SI->getLoc(), SI->getSrc(), *varInfo);
 }
 
@@ -866,7 +870,8 @@ DeadObjectElimination::buildDIExpression(SILInstruction *current) {
     auto var = dvci->getVarInfo();
     if (!var)
       return {};
-    var->Type = dvci->getType();
+    if (!var->Type)
+      var->Type = dvci->getElementType();
     return var;
   }
   if (auto *tupleAddr = dyn_cast<TupleElementAddrInst>(current)) {

@@ -28,6 +28,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Config.h"
 #include "swift/Localization/LocalizationFormat.h"
@@ -299,6 +300,75 @@ InFlightDiagnostic::fixItReplaceChars(SourceLoc Start, SourceLoc End,
     Engine->getActiveDiagnostic().addFixIt(
         Diagnostic::FixIt(toCharSourceRange(Engine->SourceMgr, Start, End),
                           FormatString, Args));
+  return *this;
+}
+
+SourceLoc
+DiagnosticEngine::getBestAddImportFixItLoc(const Decl *Member,
+                                           SourceFile *sourceFile) const {
+  auto &SM = SourceMgr;
+
+  SourceLoc bestLoc;
+
+  auto SF =
+      sourceFile ? sourceFile : Member->getDeclContext()->getParentSourceFile();
+  if (!SF) {
+    return bestLoc;
+  }
+
+  for (auto item : SF->getTopLevelItems()) {
+    // If we found an import declaration, we want to insert after it.
+    if (auto importDecl =
+            dyn_cast_or_null<ImportDecl>(item.dyn_cast<Decl *>())) {
+      SourceLoc loc = importDecl->getEndLoc();
+      if (loc.isValid()) {
+        bestLoc = Lexer::getLocForEndOfLine(SM, loc);
+      }
+
+      // Keep looking for more import declarations.
+      continue;
+    }
+
+    // If we got a location based on import declarations, we're done.
+    if (bestLoc.isValid())
+      break;
+
+    // For any other item, we want to insert before it.
+    SourceLoc loc = item.getStartLoc();
+    if (loc.isValid()) {
+      bestLoc = Lexer::getLocForStartOfLine(SM, loc);
+      break;
+    }
+  }
+
+  return bestLoc;
+}
+
+InFlightDiagnostic &InFlightDiagnostic::fixItAddImport(StringRef ModuleName) {
+  assert(IsActive && "Cannot modify an inactive diagnostic");
+  auto Member = Engine->ActiveDiagnostic->getDecl();
+  SourceLoc bestLoc = Engine->getBestAddImportFixItLoc(Member);
+
+  if (bestLoc.isValid()) {
+    llvm::SmallString<64> importText;
+
+    // @_spi imports.
+    if (Member->isSPI()) {
+      auto spiGroups = Member->getSPIGroups();
+      if (!spiGroups.empty()) {
+        importText += "@_spi(";
+        importText += spiGroups[0].str();
+        importText += ") ";
+      }
+    }
+
+    importText += "import ";
+    importText += ModuleName;
+    importText += "\n";
+
+    return fixItInsert(bestLoc, importText);
+  }
+
   return *this;
 }
 
@@ -757,7 +827,13 @@ static void formatDiagnosticArgument(StringRef Modifier,
   case DiagnosticArgumentKind::FullyQualifiedType:
   case DiagnosticArgumentKind::Type:
   case DiagnosticArgumentKind::WitnessType: {
-    assert(Modifier.empty() && "Improper modifier for Type argument");
+    std::optional<DiagnosticFormatOptions> TypeFormatOpts;
+    if (Modifier == "noformat") {
+      TypeFormatOpts.emplace(DiagnosticFormatOptions::formatForFixIts());
+    } else {
+      assert(Modifier.empty() && "Improper modifier for Type argument");
+      TypeFormatOpts.emplace(FormatOpts);
+    }
     
     // Strip extraneous parentheses; they add no value.
     Type type;
@@ -829,7 +905,7 @@ static void formatDiagnosticArgument(StringRef Modifier,
 
       auto descriptiveKind = opaqueTypeDecl->getDescriptiveKind();
 
-      Out << llvm::format(FormatOpts.OpaqueResultFormatString.c_str(),
+      Out << llvm::format(TypeFormatOpts->OpaqueResultFormatString.c_str(),
                           type->getString(printOptions).c_str(),
                           Decl::getDescriptiveKindName(descriptiveKind).data(),
                           NamingDeclText.c_str());
@@ -843,11 +919,11 @@ static void formatDiagnosticArgument(StringRef Modifier,
         llvm::raw_svector_ostream OutAka(AkaText);
 
         getAkaTypeForDisplay(type)->print(OutAka, printOptions);
-        Out << llvm::format(FormatOpts.AKAFormatString.c_str(),
+        Out << llvm::format(TypeFormatOpts->AKAFormatString.c_str(),
                             typeName.c_str(), AkaText.c_str());
       } else {
-        Out << FormatOpts.OpeningQuotationMark << typeName
-            << FormatOpts.ClosingQuotationMark;
+        Out << TypeFormatOpts->OpeningQuotationMark << typeName
+            << TypeFormatOpts->ClosingQuotationMark;
       }
     }
     break;
@@ -936,8 +1012,16 @@ static void formatDiagnosticArgument(StringRef Modifier,
         << FormatOpts.ClosingQuotationMark;
     break;
   case DiagnosticArgumentKind::ActorIsolation: {
-    assert(Modifier.empty() && "Improper modifier for ActorIsolation argument");
+    assert((Modifier.empty() || Modifier == "noun") &&
+           "Improper modifier for ActorIsolation argument");
     auto isolation = Arg.getAsActorIsolation();
+    isolation.printForDiagnostics(Out, FormatOpts.OpeningQuotationMark,
+                                  /*asNoun*/ Modifier == "noun");
+    break;
+  }
+  case DiagnosticArgumentKind::IsolationSource: {
+    assert(Modifier.empty() && "Improper modifier for IsolationSource argument");
+    auto isolation = Arg.getAsIsolationSource();
     isolation.printForDiagnostics(Out, FormatOpts.OpeningQuotationMark);
     break;
   }
@@ -1387,6 +1471,37 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
       diagnostic.isChildNote());
 }
 
+static DeclName
+getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info) {
+  ASTNode expansionNode = ASTNode::getFromOpaqueValue(info.astNode);
+  switch (info.kind) {
+#define MACRO_ROLE(Name, Description)                                          \
+  case GeneratedSourceInfo::Name##MacroExpansion:
+#include "swift/Basic/MacroRoles.def"
+    {
+      if (auto customAttr = info.attachedMacroCustomAttr) {
+        // FIXME: How will we handle deserialized custom attributes like this?
+        auto declRefType = cast<DeclRefTypeRepr>(customAttr->getTypeRepr());
+        return declRefType->getNameRef().getFullName();
+      }
+
+      if (auto expansionExpr = dyn_cast_or_null<MacroExpansionExpr>(
+              expansionNode.dyn_cast<Expr *>())) {
+        return expansionExpr->getMacroName().getFullName();
+      }
+
+      auto expansionDecl =
+          cast<MacroExpansionDecl>(expansionNode.get<Decl *>());
+      return expansionDecl->getMacroName().getFullName();
+    }
+
+  case GeneratedSourceInfo::PrettyPrinted:
+  case GeneratedSourceInfo::ReplacedFunctionBody:
+  case GeneratedSourceInfo::DefaultArgument:
+    return DeclName();
+  }
+}
+
 std::vector<Diagnostic>
 DiagnosticEngine::getGeneratedSourceBufferNotes(SourceLoc loc) {
   // The set of child notes we're building up.
@@ -1598,35 +1713,3 @@ EncodedDiagnosticMessage::EncodedDiagnosticMessage(StringRef S)
     : Message(Lexer::getEncodedStringSegment(S, Buf, /*IsFirstSegment=*/true,
                                              /*IsLastSegment=*/true,
                                              /*IndentToStrip=*/~0U)) {}
-
-DeclName
-swift::getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info) {
-  ASTNode expansionNode = ASTNode::getFromOpaqueValue(info.astNode);
-  switch (info.kind) {
-#define MACRO_ROLE(Name, Description)  \
-    case GeneratedSourceInfo::Name##MacroExpansion:
-#include "swift/Basic/MacroRoles.def"
-  {
-    DeclName macroName;
-    if (auto customAttr = info.attachedMacroCustomAttr) {
-      // FIXME: How will we handle deserialized custom attributes like this?
-      auto declRefType = cast<DeclRefTypeRepr>(customAttr->getTypeRepr());
-      return declRefType->getNameRef().getFullName();
-    }
-
-    if (auto expansionExpr = dyn_cast_or_null<MacroExpansionExpr>(
-            expansionNode.dyn_cast<Expr *>())) {
-      return expansionExpr->getMacroName().getFullName();
-    }
-
-    auto expansionDecl =
-        cast<MacroExpansionDecl>(expansionNode.get<Decl *>());
-      return expansionDecl->getMacroName().getFullName();
-  }
-
-  case GeneratedSourceInfo::PrettyPrinted:
-  case GeneratedSourceInfo::ReplacedFunctionBody:
-  case GeneratedSourceInfo::DefaultArgument:
-      return DeclName();
-  }
-}

@@ -14,6 +14,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsClangImporter.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Platform.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "clang/Driver/Driver.h"
@@ -111,15 +112,18 @@ parseClangDriverArgs(const clang::driver::Driver &clangDriver,
   return clangDriver.getOpts().ParseArgs(args, unused1, unused2);
 }
 
-static clang::driver::Driver
-createClangDriver(const ASTContext &ctx,
-                  const llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &vfs) {
+std::pair<clang::driver::Driver,
+          llvm::IntrusiveRefCntPtr<clang::DiagnosticsEngine>>
+ClangImporter::createClangDriver(
+    const LangOptions &LangOpts, const ClangImporterOptions &ClangImporterOpts,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> vfs) {
+  auto *silentDiagConsumer = new clang::DiagnosticConsumer();
   auto clangDiags = clang::CompilerInstance::createDiagnostics(
-      new clang::DiagnosticOptions());
-  clang::driver::Driver clangDriver(ctx.ClangImporterOpts.clangPath,
-                                    ctx.LangOpts.Target.str(), *clangDiags,
+      new clang::DiagnosticOptions(), silentDiagConsumer);
+  clang::driver::Driver clangDriver(ClangImporterOpts.clangPath,
+                                    LangOpts.Target.str(), *clangDiags,
                                     "clang LLVM compiler", vfs);
-  return clangDriver;
+  return {std::move(clangDriver), clangDiags};
 }
 
 /// Given a list of include paths and a list of file names, finds the first
@@ -161,39 +165,38 @@ static std::optional<Path> findFirstIncludeDir(
   return std::nullopt;
 }
 
-static llvm::opt::InputArgList
-createClangArgs(const ASTContext &ctx, clang::driver::Driver &clangDriver) {
+llvm::opt::InputArgList
+ClangImporter::createClangArgs(const ClangImporterOptions &ClangImporterOpts,
+                               const SearchPathOptions &SearchPathOpts,
+                               clang::driver::Driver &clangDriver) {
   // Flags passed to Swift with `-Xcc` might affect include paths.
   std::vector<const char *> clangArgs;
-  for (const auto &each : ctx.ClangImporterOpts.ExtraArgs) {
+  for (const auto &each : ClangImporterOpts.ExtraArgs) {
     clangArgs.push_back(each.c_str());
   }
   llvm::opt::InputArgList clangDriverArgs =
       parseClangDriverArgs(clangDriver, clangArgs);
   // If an SDK path was explicitly passed to Swift, make sure to pass it to
   // Clang driver as well. It affects the resulting include paths.
-  auto sdkPath = ctx.SearchPathOpts.getSDKPath();
+  auto sdkPath = SearchPathOpts.getSDKPath();
   if (!sdkPath.empty())
     clangDriver.SysRoot = sdkPath.str();
+  if (auto sysroot = SearchPathOpts.getSysRoot())
+    clangDriver.SysRoot = sysroot->str();
   return clangDriverArgs;
-}
-
-static bool shouldInjectLibcModulemap(const llvm::Triple &triple) {
-  return triple.isOSGlibc() || triple.isOSOpenBSD() || triple.isOSFreeBSD() ||
-         triple.isAndroid() || triple.isOSWASI();
 }
 
 static SmallVector<std::pair<std::string, std::string>, 2>
 getLibcFileMapping(ASTContext &ctx, StringRef modulemapFileName,
-                   std::optional<StringRef> maybeHeaderFileName,
+                   std::optional<ArrayRef<StringRef>> maybeHeaderFileNames,
                    const llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &vfs) {
   const llvm::Triple &triple = ctx.LangOpts.Target;
-  if (!shouldInjectLibcModulemap(triple))
-    return {};
 
   // Extract the libc path from Clang driver.
-  auto clangDriver = createClangDriver(ctx, vfs);
-  auto clangDriverArgs = createClangArgs(ctx, clangDriver);
+  auto [clangDriver, clangDiagEngine] = ClangImporter::createClangDriver(
+      ctx.LangOpts, ctx.ClangImporterOpts, vfs);
+  auto clangDriverArgs = ClangImporter::createClangArgs(
+      ctx.ClangImporterOpts, ctx.SearchPathOpts, clangDriver);
 
   llvm::opt::ArgStringList includeArgStrings;
   const auto &clangToolchain =
@@ -227,18 +230,20 @@ getLibcFileMapping(ASTContext &ctx, StringRef modulemapFileName,
   SmallVector<std::pair<std::string, std::string>, 2> vfsMappings{
       {std::string(injectedModuleMapPath), std::string(actualModuleMapPath)}};
 
-  if (maybeHeaderFileName) {
-    // TODO: remove the SwiftGlibc.h header and reference all Glibc headers
-    // directly from the modulemap.
-    Path actualHeaderPath = actualModuleMapPath;
-    llvm::sys::path::remove_filename(actualHeaderPath);
-    llvm::sys::path::append(actualHeaderPath, maybeHeaderFileName.value());
+  if (maybeHeaderFileNames) {
+    for (const auto &filename : *maybeHeaderFileNames) {
+      // TODO: remove the SwiftGlibc.h header and reference all Glibc headers
+      // directly from the modulemap.
+      Path actualHeaderPath = actualModuleMapPath;
+      llvm::sys::path::remove_filename(actualHeaderPath);
+      llvm::sys::path::append(actualHeaderPath, filename);
 
-    Path injectedHeaderPath(libcDir);
-    llvm::sys::path::append(injectedHeaderPath, maybeHeaderFileName.value());
+      Path injectedHeaderPath(libcDir);
+      llvm::sys::path::append(injectedHeaderPath, filename);
 
-    vfsMappings.push_back(
-        {std::string(injectedHeaderPath), std::string(actualHeaderPath)});
+      vfsMappings.push_back(
+          {std::string(injectedHeaderPath), std::string(actualHeaderPath)});
+    }
   }
 
   return vfsMappings;
@@ -254,13 +259,20 @@ static void getLibStdCxxFileMapping(
   // We currently only need this when building for Linux.
   if (!triple.isOSLinux())
     return;
-  // Android uses libc++.
-  if (triple.isAndroid())
+  // Android uses libc++, as does our fully static Linux config.
+  if (triple.isAndroid()
+      || (triple.isMusl() && triple.getVendor() == llvm::Triple::Swift))
+    return;
+  // Make sure we are building with libstdc++. On platforms where libstdc++ is
+  // the default C++ stdlib, users can still compile with `-Xcc -stdlib=libc++`.
+  if (ctx.LangOpts.CXXStdlib != CXXStdlibKind::Libstdcxx)
     return;
 
   // Extract the libstdc++ installation path from Clang driver.
-  auto clangDriver = createClangDriver(ctx, vfs);
-  auto clangDriverArgs = createClangArgs(ctx, clangDriver);
+  auto [clangDriver, clangDiagEngine] = ClangImporter::createClangDriver(
+      ctx.LangOpts, ctx.ClangImporterOpts, vfs);
+  auto clangDriverArgs = ClangImporter::createClangArgs(
+      ctx.ClangImporterOpts, ctx.SearchPathOpts, clangDriver);
 
   llvm::opt::ArgStringList stdlibArgStrings;
   const auto &clangToolchain =
@@ -399,18 +411,19 @@ static void getLibStdCxxFileMapping(
 
 namespace {
 std::string
-GetWindowsAuxiliaryFile(StringRef modulemap, const SearchPathOptions &Options) {
+GetPlatformAuxiliaryFile(StringRef Platform, StringRef File,
+                         const SearchPathOptions &Options) {
   StringRef SDKPath = Options.getSDKPath();
   if (!SDKPath.empty()) {
     llvm::SmallString<261> path{SDKPath};
-    llvm::sys::path::append(path, "usr", "share", modulemap);
+    llvm::sys::path::append(path, "usr", "share", File);
     if (llvm::sys::fs::exists(path))
       return path.str().str();
   }
 
   if (!Options.RuntimeResourcePath.empty()) {
     llvm::SmallString<261> path{Options.RuntimeResourcePath};
-    llvm::sys::path::append(path, "windows", modulemap);
+    llvm::sys::path::append(path, Platform, File);
     if (llvm::sys::fs::exists(path))
       return path.str().str();
   }
@@ -430,8 +443,10 @@ SmallVector<std::pair<std::string, std::string>, 2> GetWindowsFileMappings(
   if (!Triple.isWindowsMSVCEnvironment())
     return Mappings;
 
-  clang::driver::Driver Driver = createClangDriver(Context, driverVFS);
-  const llvm::opt::InputArgList Args = createClangArgs(Context, Driver);
+  auto [Driver, clangDiagEngine] = ClangImporter::createClangDriver(
+      Context.LangOpts, Context.ClangImporterOpts, driverVFS);
+  const llvm::opt::InputArgList Args = ClangImporter::createClangArgs(
+      Context.ClangImporterOpts, Context.SearchPathOpts, Driver);
   const clang::driver::ToolChain &ToolChain = Driver.getToolChain(Args, Triple);
   llvm::vfs::FileSystem &VFS = ToolChain.getVFS();
 
@@ -452,7 +467,8 @@ SmallVector<std::pair<std::string, std::string>, 2> GetWindowsFileMappings(
       llvm::sys::path::append(WinSDKInjection, WindowsSDK.IncludeVersion, "um");
     llvm::sys::path::append(WinSDKInjection, "module.modulemap");
 
-    AuxiliaryFile = GetWindowsAuxiliaryFile("winsdk.modulemap", SearchPathOpts);
+    AuxiliaryFile =
+        GetPlatformAuxiliaryFile("windows", "winsdk.modulemap", SearchPathOpts);
     if (!AuxiliaryFile.empty())
       Mappings.emplace_back(std::string(WinSDKInjection), AuxiliaryFile);
   }
@@ -468,7 +484,8 @@ SmallVector<std::pair<std::string, std::string>, 2> GetWindowsFileMappings(
     llvm::sys::path::append(UCRTInjection, "Include", UCRTSDK.Version, "ucrt");
     llvm::sys::path::append(UCRTInjection, "module.modulemap");
 
-    AuxiliaryFile = GetWindowsAuxiliaryFile("ucrt.modulemap", SearchPathOpts);
+    AuxiliaryFile =
+        GetPlatformAuxiliaryFile("windows", "ucrt.modulemap", SearchPathOpts);
     if (!AuxiliaryFile.empty()) {
       // The ucrt module map has the C standard library headers all together.
       // That leads to module cycles with the clang _Builtin_ modules. e.g.
@@ -505,14 +522,16 @@ SmallVector<std::pair<std::string, std::string>, 2> GetWindowsFileMappings(
 
     llvm::sys::path::append(VCToolsInjection, "module.modulemap");
     AuxiliaryFile =
-        GetWindowsAuxiliaryFile("vcruntime.modulemap", SearchPathOpts);
+        GetPlatformAuxiliaryFile("windows", "vcruntime.modulemap",
+                                 SearchPathOpts);
     if (!AuxiliaryFile.empty())
       Mappings.emplace_back(std::string(VCToolsInjection), AuxiliaryFile);
 
     llvm::sys::path::remove_filename(VCToolsInjection);
     llvm::sys::path::append(VCToolsInjection, "vcruntime.apinotes");
     AuxiliaryFile =
-        GetWindowsAuxiliaryFile("vcruntime.apinotes", SearchPathOpts);
+        GetPlatformAuxiliaryFile("windows", "vcruntime.apinotes",
+                                 SearchPathOpts);
     if (!AuxiliaryFile.empty())
       Mappings.emplace_back(std::string(VCToolsInjection), AuxiliaryFile);
   }
@@ -528,37 +547,62 @@ ClangInvocationFileMapping swift::getClangInvocationFileMapping(
     vfs = llvm::vfs::getRealFileSystem();
 
   const llvm::Triple &triple = ctx.LangOpts.Target;
+  llvm::SmallString<256> sysroot;
+
+  // For modulemaps that have all the C standard library headers together in
+  // a single module, we end up with module cycles with the clang _Builtin_
+  // modules.  e.g. <inttypes.h> includes <stdint.h> on these platforms. The
+  // clang builtin <stdint.h> include-nexts <stdint.h>. When both of those
+  // platform headers are in the SwiftLibc module, there's a module cycle
+  // SwiftLibc -> _Builtin_stdint -> SwiftLibc (i.e. inttypes.h (platform) ->
+  // stdint.h (builtin) -> stdint.h (platform)).
+  //
+  // Until these modulemaps can be fixed, the builtin headers need to join
+  // the system modules to avoid the cycle.
+  //
+  // Note that this does nothing to fix the same problem with C++ headers,
+  // and that this is generally a fragile solution.
+  //
+  // We start by assuming we do *not* need to do this, then enable it for
+  // affected modulemaps.
+  result.requiresBuiltinHeadersInSystemModules = false;
 
   SmallVector<std::pair<std::string, std::string>, 2> libcFileMapping;
   if (triple.isOSWASI()) {
     // WASI Mappings
     libcFileMapping =
         getLibcFileMapping(ctx, "wasi-libc.modulemap", std::nullopt, vfs);
-  } else {
-    // Android/BSD/Linux Mappings
+
+    // WASI's module map needs fixing
+    result.requiresBuiltinHeadersInSystemModules = true;
+  } else if (triple.isMusl()) {
+    libcFileMapping =
+        getLibcFileMapping(ctx, "musl.modulemap", StringRef("SwiftMusl.h"), vfs);
+  } else if (triple.isAndroid()) {
+    // Android uses the android-specific module map that overlays the NDK.
+    StringRef headerFiles[] = {"SwiftAndroidNDK.h", "SwiftBionic.h"};
+    libcFileMapping =
+        getLibcFileMapping(ctx, "android.modulemap", headerFiles, vfs);
+
+    if (!libcFileMapping.empty()) {
+      sysroot = libcFileMapping[0].first;
+      llvm::sys::path::remove_filename(sysroot);
+    }
+  } else if (triple.isOSGlibc() || triple.isOSOpenBSD() ||
+             triple.isOSFreeBSD()) {
+    // BSD/Linux Mappings
     libcFileMapping = getLibcFileMapping(ctx, "glibc.modulemap",
                                          StringRef("SwiftGlibc.h"), vfs);
+
+    // glibc.modulemap needs fixing
+    result.requiresBuiltinHeadersInSystemModules = true;
   }
   result.redirectedFiles.append(libcFileMapping);
-  // Both libc module maps have the C standard library headers all together in a
-  // SwiftLibc module. That leads to module cycles with the clang _Builtin_
-  // modules. e.g. <inttypes.h> includes <stdint.h> on these platforms. The
-  // clang builtin <stdint.h> include-nexts <stdint.h>. When both of those
-  // platform headers are in the SwiftLibc module, there's a module cycle
-  // SwiftLibc -> _Builtin_stdint -> SwiftLibc (i.e. inttypes.h (platform) ->
-  // stdint.h (builtin) -> stdint.h (platform)). Until this can be fixed in
-  // these module maps, the clang builtin headers need to join the "system"
-  // modules (SwiftLibc). i.e. when the clang builtin stdint.h is in the
-  // SwiftLibc module too, the cycle goes away. Note that
-  // -fbuiltin-headers-in-system-modules does nothing to fix the same problem
-  // with C++ headers, and is generally fragile.
-  result.requiresBuiltinHeadersInSystemModules = !libcFileMapping.empty();
 
   if (ctx.LangOpts.EnableCXXInterop)
     getLibStdCxxFileMapping(result, ctx, vfs);
 
   result.redirectedFiles.append(GetWindowsFileMappings(
       ctx, vfs, result.requiresBuiltinHeadersInSystemModules));
-
   return result;
 }

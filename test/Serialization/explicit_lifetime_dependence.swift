@@ -1,14 +1,12 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-swift-frontend -emit-module -o %t  %S/Inputs/def_explicit_lifetime_dependence.swift \
 // RUN: -enable-experimental-feature NonescapableTypes \
-// RUN: -enable-experimental-feature NoncopyableGenerics \
 // RUN: -disable-lifetime-dependence-diagnostics
 
 // RUN: llvm-bcanalyzer %t/def_explicit_lifetime_dependence.swiftmodule 
 
 // RUN: %target-swift-frontend -module-name lifetime-dependence -emit-sil -I %t %s \
-// RUN: -enable-experimental-feature NonescapableTypes \
-// RUN: -enable-experimental-feature NoncopyableGenerics | %FileCheck %s
+// RUN: -enable-experimental-feature NonescapableTypes | %FileCheck %s
 
 import def_explicit_lifetime_dependence
 func testBasic() {
@@ -46,9 +44,12 @@ func testReadAccessor() {
   }
 }
 
-// CHECK: sil @$s32def_explicit_lifetime_dependence6deriveyAA10BufferViewVADYlsF : $@convention(thin) (@guaranteed BufferView) -> _scope(1) @owned BufferView
-// CHECK: sil @$s32def_explicit_lifetime_dependence16consumeAndCreateyAA10BufferViewVADnYliF : $@convention(thin) (@owned BufferView) -> _inherit(1) @owned BufferView
-// CHECK: sil @$s32def_explicit_lifetime_dependence15borrowAndCreateyAA10BufferViewVADYlsF : $@convention(thin) (@guaranteed BufferView) -> _scope(1) @owned BufferView
-// CHECK: sil @$s32def_explicit_lifetime_dependence16deriveThisOrThatyAA10BufferViewVADYls_ADYlstF : $@convention(thin) (@guaranteed BufferView, @guaranteed BufferView) -> _scope(1, 2) @owned BufferView
+func testFakeOptional() {
+  _ = FakeOptional<Int>(())
+}
 
-// CHECK: sil @$s32def_explicit_lifetime_dependence10BufferViewVyACSW_SaySiGhYlstcfC : $@convention(method) (UnsafeRawBufferPointer, @guaranteed Array<Int>, @thin BufferView.Type) -> _scope(2) @owned BufferView
+// CHECK-LABEL: sil @$s32def_explicit_lifetime_dependence6deriveyAA10BufferViewVYlsS_ADF : $@convention(thin) (@guaranteed BufferView) -> _scope(0)  @owned BufferView
+// CHECK-LABEL: sil @$s32def_explicit_lifetime_dependence16consumeAndCreateyAA10BufferViewVYliS_ADnF : $@convention(thin) (@owned BufferView) -> _inherit(0)  @owned BufferView
+// CHECK-LABEL: sil @$s32def_explicit_lifetime_dependence15borrowAndCreateyAA10BufferViewVYlsS_ADF : $@convention(thin) (@guaranteed BufferView) -> _scope(0)  @owned BufferView
+// CHECK-LABEL: sil @$s32def_explicit_lifetime_dependence16deriveThisOrThatyAA10BufferViewVYlsSS_AD_ADtF : $@convention(thin) (@guaranteed BufferView, @guaranteed BufferView) -> _scope(0, 1)  @owned BufferView
+// CHECK-LABEL: sil @$s32def_explicit_lifetime_dependence10BufferViewVyACYlsUSU_SW_SaySiGhtcfC : $@convention(method) (UnsafeRawBufferPointer, @guaranteed Array<Int>, @thin BufferView.Type) -> _scope(1)  @owned BufferView

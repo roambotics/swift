@@ -266,7 +266,7 @@ protected:
     Kind : 2
   );
 
-  SWIFT_INLINE_BITFIELD(ClosureExpr, AbstractClosureExpr, 1+1+1+1,
+  SWIFT_INLINE_BITFIELD(ClosureExpr, AbstractClosureExpr, 1+1+1+1+1+1,
     /// True if closure parameters were synthesized from anonymous closure
     /// variables.
     HasAnonymousClosureVars : 1,
@@ -281,7 +281,14 @@ protected:
 
     /// True if this closure's actor isolation behavior was determined by an
     /// \c \@preconcurrency declaration.
-    IsolatedByPreconcurrency : 1
+    IsolatedByPreconcurrency : 1,
+
+    /// True if this is a closure literal that is passed to a sending parameter.
+    IsPassedToSendingParameter : 1,
+
+    /// True if we're in the common case where the GlobalActorAttributeRequest
+    /// request returned a pair of null pointers.
+    NoGlobalActorAttribute : 1
   );
 
   SWIFT_INLINE_BITFIELD_FULL(BindOptionalExpr, Expr, 16,
@@ -3912,8 +3919,21 @@ public:
           std::tuple<CapturedValue, unsigned, ApplyIsolationCrossing>>
           &foundIsolationCrossings);
 
-  CaptureInfo getCaptureInfo() const { return Captures; }
-  void setCaptureInfo(CaptureInfo captures) { Captures = captures; }
+  CaptureInfo getCaptureInfo() const {
+    assert(Captures.hasBeenComputed());
+    return Captures;
+  }
+
+  std::optional<CaptureInfo> getCachedCaptureInfo() const {
+    if (!Captures.hasBeenComputed())
+      return std::nullopt;
+    return Captures;
+  }
+
+  void setCaptureInfo(CaptureInfo captures) {
+    assert(captures.hasBeenComputed());
+    Captures = captures;
+  }
 
   /// Retrieve the parameters of this closure.
   ParameterList *getParameters() { return parameterList; }
@@ -4108,6 +4128,16 @@ private:
   /// The body of the closure.
   BraceStmt *Body;
 
+  friend class GlobalActorAttributeRequest;
+
+  bool hasNoGlobalActorAttribute() const {
+    return Bits.ClosureExpr.NoGlobalActorAttribute;
+  }
+
+  void setHasNoGlobalActorAttribute() {
+    Bits.ClosureExpr.NoGlobalActorAttribute = true;
+  }
+
 public:
   ClosureExpr(const DeclAttributes &attributes,
               SourceRange bracketRange, VarDecl *capturedSelfDecl,
@@ -4126,6 +4156,8 @@ public:
     Bits.ClosureExpr.HasAnonymousClosureVars = false;
     Bits.ClosureExpr.ImplicitSelfCapture = false;
     Bits.ClosureExpr.InheritActorContext = false;
+    Bits.ClosureExpr.IsPassedToSendingParameter = false;
+    Bits.ClosureExpr.NoGlobalActorAttribute = false;
   }
 
   SourceRange getSourceRange() const;
@@ -4179,6 +4211,16 @@ public:
 
   void setIsolatedByPreconcurrency(bool value = true) {
     Bits.ClosureExpr.IsolatedByPreconcurrency = value;
+  }
+
+  /// Whether the closure is a closure literal that is passed to a sending
+  /// parameter.
+  bool isPassedToSendingParameter() const {
+    return Bits.ClosureExpr.IsPassedToSendingParameter;
+  }
+
+  void setIsPassedToSendingParameter(bool value = true) {
+    Bits.ClosureExpr.IsPassedToSendingParameter = value;
   }
 
   /// Determine whether this closure expression has an
@@ -4380,7 +4422,7 @@ struct CaptureListEntry {
   explicit CaptureListEntry(PatternBindingDecl *PBD);
 
   VarDecl *getVar() const;
-  bool isSimpleSelfCapture() const;
+  bool isSimpleSelfCapture(bool excludeWeakCaptures = true) const;
 };
 
 /// CaptureListExpr - This expression represents the capture list on an explicit

@@ -18,6 +18,7 @@
 #include "swift/AST/ProtocolConformanceRef.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Availability.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/InFlightSubstitution.h"
 #include "swift/AST/Module.h"
@@ -25,6 +26,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 
 #define DEBUG_TYPE "AST"
 
@@ -110,8 +112,7 @@ ProtocolConformanceRef::subst(Type origType, InFlightSubstitution &IFS) const {
   // If the type is an existential, it must be self-conforming.
   if (substType->isExistentialType()) {
     auto optConformance =
-        proto->getModuleContext()->lookupExistentialConformance(substType,
-                                                                proto);
+        lookupConformance(substType, proto, /*allowMissing=*/true);
     if (optConformance)
       return optConformance;
 
@@ -287,7 +288,8 @@ bool ProtocolConformanceRef::hasUnavailableConformance() const {
 
   // Check whether this conformance is on an unavailable extension.
   auto concrete = getConcrete();
-  auto ext = dyn_cast<ExtensionDecl>(concrete->getDeclContext());
+  auto *dc = concrete->getRootConformance()->getDeclContext();
+  auto ext = dyn_cast<ExtensionDecl>(dc);
   if (ext && AvailableAttr::isUnavailable(ext))
     return true;
 

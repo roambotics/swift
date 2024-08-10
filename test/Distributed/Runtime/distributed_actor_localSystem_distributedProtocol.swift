@@ -14,9 +14,12 @@
 // rdar://90373022
 // UNSUPPORTED: OS=watchos
 
+// rdar://125628060
+// UNSUPPORTED: CPU=arm64e
+ 
 import Distributed
 
-@_DistributedProtocol
+@Resolvable
 @available(SwiftStdlib 6.0, *)
 protocol WorkerProtocol: DistributedActor where ActorSystem == LocalTestingDistributedActorSystem {
   distributed func distributedMethod() -> String

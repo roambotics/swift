@@ -38,6 +38,8 @@
 #include "swift/AST/PackConformance.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
+#include "swift/Basic/Platform.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/SILDeclRef.h"
@@ -393,6 +395,7 @@ void PolymorphicConvention::considerParameter(SILParameterInfo param,
     case ParameterConvention::Indirect_In_Guaranteed:
     case ParameterConvention::Indirect_Inout:
     case ParameterConvention::Indirect_InoutAliasable:
+    case ParameterConvention::Indirect_In_CXX:
       if (!isSelfParameter) return;
       if (type->getNominalOrBoundGenericNominal()) {
         considerNewTypeSource(IsExact,
@@ -1004,6 +1007,8 @@ static bool hasDependentTypeWitness(
   if (!DC->isGenericContext())
     return false;
 
+  auto genericSig = conformance->getGenericSignature();
+
   // Check whether any of the associated types are dependent.
   if (conformance->forEachTypeWitness(
         [&](AssociatedTypeDecl *requirement, Type type,
@@ -1013,7 +1018,7 @@ static bool hasDependentTypeWitness(
             return false;
 
           // RESILIENCE: this could be an opaque conformance
-          return type->getCanonicalType()->hasTypeParameter();
+          return type->getReducedType(genericSig)->hasTypeParameter();
        },
        /*useResolver=*/true)) {
     return true;
@@ -1026,6 +1031,29 @@ static bool isSynthesizedNonUnique(const RootProtocolConformance *conformance) {
   if (auto normal = dyn_cast<NormalProtocolConformance>(conformance))
     return normal->isSynthesizedNonUnique();
   return false;
+}
+
+/// Determine whether a protocol can ever have a dependent conformance.
+static bool protocolCanHaveDependentConformance(ProtocolDecl *proto) {
+  // Objective-C protocols have never been able to have a dependent conformance.
+  if (proto->isObjC())
+    return false;
+
+  // Prior to Swift 6.0, only Objective-C protocols were never able to have
+  // a dependent conformance. This is overly pessimistic when the protocol
+  // is a marker protocol (since they don't have requirements), but we must
+  // retain backward compatibility with binaries built for earlier deployment
+  // targets that concluded that these protocols might involve dependent
+  // conformances.
+  ASTContext &ctx = proto->getASTContext();
+  if (auto runtimeCompatVersion = getSwiftRuntimeCompatibilityVersionForTarget(
+          ctx.LangOpts.Target)) {
+    if (runtimeCompatVersion < llvm::VersionTuple(6, 0) &&
+        proto->isSpecificProtocol(KnownProtocolKind::Sendable))
+      return true;
+  }
+
+  return Lowering::TypeConverter::protocolRequiresWitnessTable(proto);
 }
 
 static bool isDependentConformance(
@@ -1060,7 +1088,7 @@ static bool isDependentConformance(
       continue;
 
     auto assocProtocol = req.getProtocolDecl();
-    if (!Lowering::TypeConverter::protocolRequiresWitnessTable(assocProtocol))
+    if (!protocolCanHaveDependentConformance(assocProtocol))
       continue;
 
     auto assocConformance =
@@ -2118,24 +2146,30 @@ namespace {
 
       // Compute the inverse requirements from the generic signature where the
       // conformance occurs.
-      SmallVector<Requirement, 2> scratchReqs;
+      SmallVector<Requirement, 2> condReqs;
       SmallVector<InverseRequirement, 2> inverses;
       if (auto genericSig =
               normal->getDeclContext()->getGenericSignatureOfContext()) {
-        genericSig->getRequirementsWithInverses(scratchReqs, inverses);
-        scratchReqs.clear();
+        genericSig->getRequirementsWithInverses(condReqs, inverses);
       }
+      condReqs.clear();
 
-      auto condReqs = normal->getConditionalRequirements();
+      for (auto condReq : normal->getConditionalRequirements()) {
+        // We don't need to collect conditional requirements for invertible
+        // protocol requirements here, since they are encoded in the inverse
+        // list above.
+        if (!condReq.isInvertibleProtocolRequirement()) {
+          condReqs.push_back(condReq);
+        }
+      }
       if (condReqs.empty()) {
         // For a protocol P that conforms to another protocol, introduce a
         // conditional requirement for that P's Self: P. This aligns with
         // SILWitnessTable::enumerateWitnessTableConditionalConformances().
         if (auto selfProto = normal->getDeclContext()->getSelfProtocolDecl()) {
           auto selfType = selfProto->getSelfInterfaceType()->getCanonicalType();
-          scratchReqs.emplace_back(RequirementKind::Conformance, selfType,
+          condReqs.emplace_back(RequirementKind::Conformance, selfType,
                                    selfProto->getDeclaredInterfaceType());
-          condReqs = scratchReqs;
         }
 
         if (condReqs.empty() && inverses.empty())
@@ -2205,6 +2239,12 @@ namespace {
               LinkEntity::forBaseConformanceDescriptor(requirement));
           B.addRelativeAddress(baseConformanceDescriptor);
         } else if (entry.getKind() == SILWitnessTable::Method) {
+          // distributed thunks don't need resilience
+          if (entry.getMethodWitness().Requirement.isDistributedThunk()) {
+            witnesses = witnesses.drop_back();
+            continue;
+          }
+
           // Method descriptor.
           auto declRef = entry.getMethodWitness().Requirement;
           auto requirement =
@@ -2981,8 +3021,7 @@ MetadataResponse MetadataPath::followComponent(IRGenFunction &IGF,
     GenericTypeRequirements requirements(IGF.IGM, nominal);
     auto &requirement = requirements.getRequirements()[reqtIndex];
 
-    auto module = IGF.getSwiftModule();
-    auto subs = sourceKey.Type->getContextSubstitutionMap(module, nominal);
+    auto subs = type->getContextSubstitutionMap();
     auto sub = requirement.getTypeParameter().subst(subs)->getCanonicalType();
 
     // In either case, we need to change the type.

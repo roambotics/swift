@@ -32,6 +32,9 @@ ERROR(error_opening_output,none,
 ERROR(error_closing_output,none,
       "error closing '%0' for output: %1", (StringRef, StringRef))
 
+ERROR(error_mccas,none,
+      "error trying to materialize MCCAS object file: %0", (StringRef))
+
 ERROR(cannot_find_group_info_file,none,
       "cannot find group info file at path: '%0'", (StringRef))
 
@@ -55,11 +58,6 @@ NOTE(while_parsing_as_left_angle_bracket,none,
 // Generic determinism-forcing override.
 REMARK(remark_max_determinism_overriding,none,
          "SWIFTC_MAXIMUM_DETERMINISM overriding %0", (StringRef))
-
-// FIXME: This is used both as a parse error (a literal "super" outside a
-// method) and a type-checker error ("super" in a method of a non-class type).
-ERROR(super_not_in_class_method,none,
-      "'super' cannot be used outside of class members", ())
 
 ERROR(class_func_not_in_class,none,
       "class methods are only allowed within classes; "
@@ -234,8 +232,6 @@ NOTE(in_macro_expansion,none,
 ERROR(macro_experimental,none,
       "%0 macros are an experimental feature that is not enabled %select{|(%1)}1",
       (StringRef, StringRef))
-ERROR(ambiguous_macro_reference,none,
-      "ambiguous reference to macro %0", (DeclName))
 
 //------------------------------------------------------------------------------
 // MARK: bridged diagnostics

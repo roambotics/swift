@@ -27,6 +27,7 @@
 #include "swift/AST/SILGenRequests.h"
 #include "swift/AST/SILOptimizerRequests.h"
 #include "swift/AST/TBDGenRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/MD5Stream.h"
 #include "swift/Basic/Platform.h"
@@ -90,6 +91,7 @@
 #include "llvm/Transforms/Instrumentation/ThreadSanitizer.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/DCE.h"
 
 #include <thread>
 
@@ -136,6 +138,9 @@ swift::getIRTargetOptions(const IRGenOptions &Opts, ASTContext &Ctx) {
   TargetOpts.MCOptions.CASObjMode = Opts.CASObjMode;
 
   auto *Clang = static_cast<ClangImporter *>(Ctx.getClangModuleLoader());
+
+  // Set UseInitArray appropriately.
+  TargetOpts.UseInitArray = Clang->getCodeGenOpts().UseInitArray;
 
   // WebAssembly doesn't support atomics yet, see
   // https://github.com/apple/swift/issues/54533 for more details.
@@ -206,6 +211,7 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
   bool RunSwiftSpecificLLVMOptzns =
       !Opts.DisableSwiftSpecificLLVMOptzns && !Opts.DisableLLVMOptzns;
 
+  bool DoHotColdSplit = false;
   PTO.CallGraphProfile = false;
 
   llvm::OptimizationLevel level = llvm::OptimizationLevel::O0;
@@ -216,6 +222,7 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
     PTO.LoopVectorization = true;
     PTO.SLPVectorization = true;
     PTO.MergeFunctions = true;
+    DoHotColdSplit = Opts.EnableHotColdSplit;
     level = llvm::OptimizationLevel::Os;
   } else {
     level = llvm::OptimizationLevel::O0;
@@ -253,6 +260,8 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
   PB.registerLoopAnalyses(LAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
   ModulePassManager MPM;
+
+  PB.setEnableHotColdSplitting(DoHotColdSplit);
 
   if (RunSwiftSpecificLLVMOptzns) {
     PB.registerScalarOptimizerLateEPCallback(
@@ -329,7 +338,14 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
           MPM.addPass(InstrProfiling(options, false));
         });
   }
-
+  if (Opts.shouldOptimize()) {
+    PB.registerPipelineStartEPCallback(
+        [](ModulePassManager &MPM, OptimizationLevel level) {
+          // Run this before SROA to avoid un-neccessary expansion of dead
+          // loads.
+          MPM.addPass(createModuleToFunctionPassAdaptor(DCEPass()));
+        });
+  }
   bool isThinLTO = Opts.LLVMLTOKind  == IRGenLLVMLTOKind::Thin;
   bool isFullLTO = Opts.LLVMLTOKind  == IRGenLLVMLTOKind::Full;
   if (!Opts.shouldOptimize() || Opts.DisableLLVMOptzns) {
@@ -716,6 +732,9 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
     PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Decl);
   opts.ValueWitnesses =
     PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Decl);
+  opts.ValueWitnessTable =
+    PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Constant,
+                      SpecialPointerAuthDiscriminators::ValueWitnessTable);
   opts.ProtocolWitnesses =
     PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Decl);
   opts.ProtocolAssociatedTypeAccessFunctions =
@@ -1015,6 +1034,22 @@ static void initLLVMModule(const IRGenModule &IGM, SILModule &SIL) {
       assert(Module->getSDKVersion() == *IGM.Context.LangOpts.SDKVersion);
   }
 
+  if (!IGM.VariantTriple.str().empty()) {
+    if (Module->getDarwinTargetVariantTriple().empty()) {
+      Module->setDarwinTargetVariantTriple(IGM.VariantTriple.str());
+    } else {
+      assert(Module->getDarwinTargetVariantTriple() == IGM.VariantTriple.str());
+    }
+  }
+
+  if (IGM.Context.LangOpts.VariantSDKVersion) {
+    if (Module->getDarwinTargetVariantSDKVersion().empty())
+      Module->setDarwinTargetVariantSDKVersion(*IGM.Context.LangOpts.VariantSDKVersion);
+    else
+      assert(Module->getDarwinTargetVariantSDKVersion() ==
+               *IGM.Context.LangOpts.VariantSDKVersion);
+  }
+
   // Set the module's string representation.
   Module->setDataLayout(IGM.DataLayout.getStringRepresentation());
 
@@ -1177,12 +1212,10 @@ GeneratedModule IRGenRequest::evaluate(Evaluator &evaluator,
         if (auto *synthSFU = file->getSynthesizedFile()) {
           IGM.emitSynthesizedFileUnit(*synthSFU);
         }
-      } else {
-        file->collectLinkLibraries([&IGM](LinkLibrary LinkLib) {
-          IGM.addLinkLibrary(LinkLib);
-        });
       }
     }
+
+    IGM.addLinkLibraries();
 
     // Okay, emit any definitions that we suddenly need.
     irgen.emitLazyDefinitions();
@@ -1398,7 +1431,6 @@ static void performParallelIRGeneration(IRGenDescriptor desc) {
     IRGenModule *IGM = new IRGenModule(
         irgen, std::move(targetMachine), nextSF, desc.ModuleName, *OutputIter++,
         nextSF->getFilename(), nextSF->getPrivateDiscriminator().str());
-    IGMcreated = true;
 
     initLLVMModule(*IGM, *SILMod);
     if (!DidRunSILCodeGenPreparePasses) {
@@ -1409,6 +1441,11 @@ static void performParallelIRGeneration(IRGenDescriptor desc) {
     }
 
     (void)layoutStringsEnabled(*IGM, /*diagnose*/ true);
+
+    // Only need to do this once.
+    if (!IGMcreated)
+      IGM->addLinkLibraries();
+    IGMcreated = true;
   }
   
   if (!IGMcreated) {
@@ -1431,10 +1468,6 @@ static void performParallelIRGeneration(IRGenDescriptor desc) {
         CurrentIGMPtr IGM = irgen.getGenModule(synthSFU);
         IGM->emitSynthesizedFileUnit(*synthSFU);
       }
-    } else {
-      File->collectLinkLibraries([&](LinkLibrary LinkLib) {
-        irgen.getPrimaryIGM()->addLinkLibrary(LinkLib);
-      });
     }
   }
   
@@ -1655,8 +1688,10 @@ void swift::createSwiftModuleObjectFile(SILModule &SILMod, StringRef Buffer,
     break;
   }
   }
+  IGM.addUsedGlobal(ASTSym);
   ASTSym->setSection(Section);
   ASTSym->setAlignment(llvm::MaybeAlign(serialization::SWIFTMODULE_ALIGNMENT));
+  IGM.finalize();
   ::performLLVM(Opts, Ctx.Diags, nullptr, nullptr, IGM.getModule(),
                 IGM.TargetMachine.get(),
                 OutputPath, Ctx.getOutputBackend(), Ctx.Stats);

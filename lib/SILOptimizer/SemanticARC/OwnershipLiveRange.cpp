@@ -13,6 +13,7 @@
 #include "OwnershipLiveRange.h"
 #include "OwnershipPhiOperand.h"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/OwnershipUtils.h"
 
@@ -105,8 +106,10 @@ OwnershipLiveRange::OwnershipLiveRange(SILValue value)
     // the users force the live range to be alive.
     if (!ti) {
       for (SILValue v : user->getResults()) {
-        if (v->getOwnershipKind() != OwnershipKind::Owned)
+        if (v->getOwnershipKind() != OwnershipKind::Owned &&
+            !isa<BorrowedFromInst>(user)) {
           continue;
+        }
         llvm::copy(v->getUses(), std::back_inserter(worklist));
       }
       continue;

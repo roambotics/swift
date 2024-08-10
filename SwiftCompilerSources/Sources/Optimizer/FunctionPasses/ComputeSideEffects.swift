@@ -145,7 +145,7 @@ private struct CollectedEffects {
       // In addition to the effects of the apply, also consider the
       // effects of the capture, which reads the captured value in
       // order to move it into the context. This only applies to
-      // addressible values, because capturing does not dereference
+      // addressable values, because capturing does not dereference
       // any class objects.
       //
       // Ignore captures for on-stack partial applies. They only
@@ -215,7 +215,7 @@ private struct CollectedEffects {
   }
   
   mutating func addEffectsForEscapingArgument(argument: FunctionArgument) {
-    var escapeWalker = ArgumentEscapingWalker()
+    var escapeWalker = ArgumentEscapingWalker(context)
 
     if escapeWalker.hasUnknownUses(argument: argument) {
       // Worst case: we don't know anything about how the argument escapes.
@@ -287,6 +287,8 @@ private struct CollectedEffects {
   private mutating func addEffects<Arguments: Sequence>(ofFunctions callees: FunctionArray?,
                                                         withArguments arguments: Arguments)
                                    where Arguments.Element == (calleeArgumentIndex: Int, callerArgument: Value) {
+    // The argument summary for @in_cxx is insufficient in OSSA because the function body does not contain the
+    // destroy. But the call is still effectively a release from the caller's perspective.
     guard let callees = callees else {
       // We don't know which function(s) are called.
       globalEffects = .worstEffects
@@ -330,7 +332,7 @@ private struct CollectedEffects {
   /// Adds effects to a specific value.
   ///
   /// If the value comes from an argument (or multiple arguments), then the effects are added
-  /// to the corrseponding `argumentEffects`. Otherwise they are added to the `global` effects.
+  /// to the corresponding `argumentEffects`. Otherwise they are added to the `global` effects.
   private mutating func addEffects(_ effects: SideEffects.GlobalEffects, to value: Value) {
     addEffects(effects, to: value, fromInitialPath: defaultPath(for: value))
   }
@@ -414,12 +416,17 @@ private func defaultPath(for value: Value) -> SmallProjectionPath {
 /// Checks if an argument escapes to some unknown user.
 private struct ArgumentEscapingWalker : ValueDefUseWalker, AddressDefUseWalker {
   var walkDownCache = WalkerCache<UnusedWalkingPath>()
+  private let calleeAnalysis: CalleeAnalysis
 
   /// True if the argument escapes to a load which (potentially) "takes" the memory location.
   private(set) var foundTakingLoad = false
 
   /// True, if the argument escapes to a closure context which might be destroyed when called.
   private(set) var foundConsumingPartialApply = false
+
+  init(_ context: FunctionPassContext) {
+    self.calleeAnalysis = context.calleeAnalysis
+  }
 
   mutating func hasUnknownUses(argument: FunctionArgument) -> Bool {
     if argument.type.isAddress {
@@ -444,14 +451,23 @@ private struct ArgumentEscapingWalker : ValueDefUseWalker, AddressDefUseWalker {
       return .continueWalk
 
     case let apply as ApplySite:
-      if apply.isCallee(operand: value) {
-        // `CollectedEffects.handleApply` only handles argument operands of an apply, but not the callee operand.
-        return .abortWalk
-      }
       if let pa = apply as? PartialApplyInst, !pa.isOnStack {
         foundConsumingPartialApply = true
       }
-      return .continueWalk
+      // `CollectedEffects.handleApply` only handles argument operands of an apply, but not the callee operand.
+      if let calleeArgIdx = apply.calleeArgumentIndex(of: value),
+         let callees = calleeAnalysis.getCallees(callee: apply.callee)
+      {
+        // If an argument escapes in a called function, we don't know anything about the argument's side effects.
+        // For example, it could escape to the return value and effects might occur in the caller.
+        for callee in callees {
+          if callee.effects.escapeEffects.canEscape(argumentIndex: calleeArgIdx, path: SmallProjectionPath.init(.anyValueFields)) {
+            return .abortWalk
+          }
+        }
+        return .continueWalk
+      }
+      return .abortWalk
     default:
       return .abortWalk
     }
@@ -528,6 +544,6 @@ private extension PartialApplyInst {
       var followTrivialTypes: Bool { true }
     }
 
-    return self.isEscapingWhenWalkingDown(using: EscapesToApply(), context)
+    return self.isEscaping(using: EscapesToApply(), initialWalkingDirection: .down, context)
   }
 }

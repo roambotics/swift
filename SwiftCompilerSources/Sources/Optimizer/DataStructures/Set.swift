@@ -164,7 +164,7 @@ struct InstructionSet : IntrusiveSet {
     var d = "{\n"
     for inst in function.instructions {
       if contains(inst) {
-        d += inst.description
+        d += inst.description + "\n"
       }
     }
     d += "}\n"
@@ -226,5 +226,18 @@ struct OperandSet : IntrusiveSet {
   /// TODO: once we have move-only types, make this a real deinit.
   mutating func deinitialize() {
     context.freeOperandSet(bridged)
+  }
+}
+
+extension IntrusiveSet {
+  mutating func insert(contentsOf source: some Sequence<Element>) {
+    for element in source {
+      _ = insert(element)
+    }
+  }
+
+  init(insertContentsOf source: some Sequence<Element>, _ context: some Context) {
+    self.init(context)
+    insert(contentsOf: source)
   }
 }

@@ -25,10 +25,14 @@ public typealias CUnsignedChar = UInt8
 public typealias CUnsignedShort = UInt16
 
 /// The C 'unsigned int' type.
+#if  _pointerBitWidth(_16)
+public typealias CUnsignedInt = UInt
+#else
 public typealias CUnsignedInt = UInt32
+#endif
 
 /// The C 'unsigned long' type.
-#if os(Windows) && (arch(x86_64) || arch(arm64))
+#if (os(Windows) && (arch(x86_64) || arch(arm64))) || _pointerBitWidth(_16)
 public typealias CUnsignedLong = UInt32
 #else
 public typealias CUnsignedLong = UInt
@@ -44,10 +48,14 @@ public typealias CSignedChar = Int8
 public typealias CShort = Int16
 
 /// The C 'int' type.
+#if  _pointerBitWidth(_16)
+public typealias CInt = Int
+#else
 public typealias CInt = Int32
+#endif
 
 /// The C 'long' type.
-#if os(Windows) && (arch(x86_64) || arch(arm64))
+#if (os(Windows) && (arch(x86_64) || arch(arm64))) || _pointerBitWidth(_16)
 public typealias CLong = Int32
 #else
 public typealias CLong = Int
@@ -69,7 +77,7 @@ public typealias CFloat = Float
 public typealias CDouble = Double
 
 /// The C 'long double' type.
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
 // On Darwin, long double is Float80 on x86, and Double otherwise.
 #if arch(x86_64) || arch(i386)
 public typealias CLongDouble = Float80
@@ -202,7 +210,7 @@ extension OpaquePointer {
   /// Converts a typed `UnsafeMutablePointer` to an opaque C pointer.
   @_transparent
   @_preInverseGenerics
-  public init<T>(@_nonEphemeral _ from: UnsafeMutablePointer<T>) {
+  public init<T: ~Copyable>(@_nonEphemeral _ from: UnsafeMutablePointer<T>) {
     self._rawValue = from._rawValue
   }
 
@@ -211,7 +219,7 @@ extension OpaquePointer {
   /// The result is `nil` if `from` is `nil`.
   @_transparent
   @_preInverseGenerics
-  public init?<T>(@_nonEphemeral _ from: UnsafeMutablePointer<T>?) {
+  public init?<T: ~Copyable>(@_nonEphemeral _ from: UnsafeMutablePointer<T>?) {
     guard let unwrapped = from else { return nil }
     self.init(unwrapped)
   }
@@ -273,7 +281,7 @@ extension UInt {
 }
 
 /// A wrapper around a C `va_list` pointer.
-#if arch(arm64) && !(os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(Windows))
+#if arch(arm64) && !(os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(visionOS) ||  os(Windows))
 @frozen
 public struct CVaListPointer {
   @usableFromInline // unsafe-performance

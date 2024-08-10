@@ -26,6 +26,7 @@
 #include "swift/AST/TypeRepr.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/USRGeneration.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/StringExtras.h"
 #include "swift/IDE/SourceEntityWalker.h"
@@ -73,7 +74,7 @@ printArtificialName(const swift::AbstractStorageDecl *ASD, AccessorKind AK, llvm
   llvm_unreachable("Unhandled AccessorKind in switch.");
 }
 
-static bool printDisplayName(const swift::ValueDecl *D, llvm::raw_ostream &OS) {
+bool index::printDisplayName(const swift::ValueDecl *D, llvm::raw_ostream &OS) {
   if (!D->hasName() && !isa<ParamDecl>(D)) {
     auto *FD = dyn_cast<AccessorDecl>(D);
     if (!FD)
@@ -216,26 +217,39 @@ public:
 
   bool empty() const { return Stack.empty(); }
 
-  void forEachActiveContainer(llvm::function_ref<void(const Decl *)> f) const {
-    if (Stack.empty())
-      return;
+  void forEachActiveContainer(llvm::function_ref<bool(const Decl *)> allowDecl,
+                              llvm::function_ref<void(const Decl *)> f) const {
+    for (const auto &Entry : llvm::reverse(Stack)) {
+      // No active container, we're done.
+      if (!Entry.ActiveKey)
+        return;
 
-    const StackEntry &Entry = Stack.back();
+      auto MapEntry = Entry.Containers.find(Entry.ActiveKey);
+      if (MapEntry == Entry.Containers.end())
+        return;
 
-    if (!Entry.ActiveKey)
-      return;
+      bool hadViableContainer = false;
+      auto tryContainer = [&](const Decl *D) {
+        if (!allowDecl(D))
+          return;
 
-    auto MapEntry = Entry.Containers.find(Entry.ActiveKey);
-
-    if (MapEntry == Entry.Containers.end())
-      return;
-
-    Container C = MapEntry->second;
-
-    if (auto *D = C.dyn_cast<const Decl *>()) {
-      f(D);
-    } else if (auto *P = C.dyn_cast<const Pattern *>()) {
-      P->forEachVariable([&](VarDecl *VD) { f(VD); });
+        f(D);
+        hadViableContainer = true;
+      };
+      if (auto C = MapEntry->second) {
+        if (auto *D = C.dyn_cast<const Decl *>()) {
+          tryContainer(D);
+        } else {
+          auto *P = C.get<const Pattern *>();
+          P->forEachVariable([&](VarDecl *VD) {
+            tryContainer(VD);
+          });
+        }
+      }
+      // If we had a viable containers, we're done. Otherwise continue walking
+      // up the stack.
+      if (hadViableContainer)
+        return;
     }
   }
 
@@ -343,26 +357,10 @@ private:
   }
 
   // AnyPatterns behave differently to other patterns as they've no associated
-  // VarDecl. The given ActivationKey is therefore associated with the current
-  // active container, if any.
+  // VarDecl. We store null here, and will walk up to the parent container in
+  // forEachActiveContainer.
   void associateAnyPattern(ActivationKey K, StackEntry &Entry) const {
-    Entry.Containers[K] = activeContainer();
-  }
-
-  Container activeContainer() const {
-    if (Stack.empty())
-      return nullptr;
-
-    const StackEntry &Entry = Stack.back();
-
-    if (Entry.ActiveKey) {
-      auto ActiveContainer = Entry.Containers.find(Entry.ActiveKey);
-
-      if (ActiveContainer != Entry.Containers.end())
-        return ActiveContainer->second;
-    }
-
-    return nullptr;
+    Entry.Containers[K] = nullptr;
   }
 
   void associateAllPatternElements(const Pattern *P, ActivationKey K,
@@ -547,6 +545,10 @@ class IndexSwiftASTWalker : public SourceEntityWalker {
 
   bool addRelation(IndexSymbol &Info, SymbolRoleSet RelationRoles, Decl *D) {
     assert(D);
+    if (auto *VD = dyn_cast<ValueDecl>(D)) {
+      if (!shouldIndex(VD, /*IsRef*/ true))
+        return true;
+    }
     auto Match = std::find_if(Info.Relations.begin(), Info.Relations.end(),
                               [D](IndexRelation R) { return R.decl == D; });
     if (Match != Info.Relations.end()) {
@@ -924,7 +926,14 @@ private:
   }
 
   void addContainedByRelationIfContained(IndexSymbol &Info) {
-    Containers.forEachActiveContainer([&](const Decl *D) {
+    // Only consider the innermost container that we are allowed to index.
+    auto allowDecl = [&](const Decl *D) {
+      if (auto *VD = dyn_cast<ValueDecl>(D)) {
+        return shouldIndex(VD, /*IsRef*/ true);
+      }
+      return true;
+    };
+    Containers.forEachActiveContainer(allowDecl, [&](const Decl *D) {
       addRelation(Info, (unsigned)SymbolRole::RelationContainedBy,
                   const_cast<Decl *>(D));
     });
@@ -1005,6 +1014,9 @@ private:
     return true;
   }
 
+  /// Whether the given decl should be marked implicit in the index data.
+  bool hasImplicitRole(Decl *D);
+
   bool initIndexSymbol(ValueDecl *D, SourceLoc Loc, bool IsRef,
                        IndexSymbol &Info);
   bool initIndexSymbol(ExtensionDecl *D, ValueDecl *ExtendedD, SourceLoc Loc,
@@ -1044,14 +1056,34 @@ private:
     return {{line, col, inGeneratedBuffer}};
   }
 
-  bool shouldIndex(ValueDecl *D, bool IsRef) const {
+  bool shouldIndexImplicitDecl(const ValueDecl *D, bool IsRef) const {
+    // We index implicit constructors.
+    if (isa<ConstructorDecl>(D))
+      return true;
+
+    // Allow references to implicit getter & setter AccessorDecls on
+    // non-implicit storage, these are "pseudo accessors".
+    if (auto *AD = dyn_cast<AccessorDecl>(D)) {
+      if (!IsRef)
+        return false;
+
+      auto Kind = AD->getAccessorKind();
+      if (Kind != AccessorKind::Get && Kind != AccessorKind::Set)
+        return false;
+
+      return shouldIndex(AD->getStorage(), IsRef);
+    }
+    return false;
+  }
+
+  bool shouldIndex(const ValueDecl *D, bool IsRef) const {
     if (D->isImplicit() && isa<VarDecl>(D) && IsRef) {
       // Bypass the implicit VarDecls introduced in CaseStmt bodies by using the
       // canonical VarDecl for these checks instead.
       D = cast<VarDecl>(D)->getCanonicalVarDecl();
     }
 
-    if (D->isImplicit() && !isa<ConstructorDecl>(D))
+    if (D->isImplicit() && !shouldIndexImplicitDecl(D, IsRef))
       return false;
 
     // Do not handle non-public imported decls.
@@ -1729,6 +1761,21 @@ bool IndexSwiftASTWalker::reportImplicitConformance(ValueDecl *witness, ValueDec
   return finishCurrentEntity();
 }
 
+bool IndexSwiftASTWalker::hasImplicitRole(Decl *D) {
+  if (D->isImplicit())
+    return true;
+
+  // Parsed accessors should be treated as implicit in a module since they won't
+  // have bodies in the generated interface (even if inlinable), and aren't
+  // useful symbols to jump to (the variable itself should be used instead).
+  // Currently generated interfaces don't even record USRs for them, so
+  // findUSRRange will always fail for them.
+  if (isa<AccessorDecl>(D) && IsModuleFile)
+    return true;
+
+  return false;
+}
+
 bool IndexSwiftASTWalker::initIndexSymbol(ValueDecl *D, SourceLoc Loc,
                                           bool IsRef, IndexSymbol &Info) {
   assert(D);
@@ -1760,7 +1807,7 @@ bool IndexSwiftASTWalker::initIndexSymbol(ValueDecl *D, SourceLoc Loc,
     addContainedByRelationIfContained(Info);
   } else {
     Info.roles |= (unsigned)SymbolRole::Definition;
-    if (D->isImplicit())
+    if (hasImplicitRole(D))
       Info.roles |= (unsigned)SymbolRole::Implicit;
     if (auto Group = D->getGroupName())
       Info.group = Group.value();

@@ -59,6 +59,7 @@ namespace irgen {
   class IRGenModule;
   class LinkEntity;
   class LocalTypeDataCache;
+  class MetadataDependencyCollector;
   class MetadataResponse;
   class Scope;
   class TypeInfo;
@@ -101,7 +102,7 @@ public:
   Explosion collectParameters();
   void emitScalarReturn(SILType returnResultType, SILType funcResultType,
                         Explosion &scalars, bool isSwiftCCReturn,
-                        bool isOutlined);
+                        bool isOutlined, SILType errorType = {});
   void emitScalarReturn(llvm::Type *resultTy, Explosion &scalars);
   
   void emitBBForReturn();
@@ -202,6 +203,8 @@ public:
 
   void emitResumeAsyncContinuationThrowing(llvm::Value *continuation,
                                            llvm::Value *error);
+
+  void emitClearSensitive(Address address, llvm::Value *size);
 
   FunctionPointer
   getFunctionPointerForResumeIntrinsic(llvm::Value *resumeIntrinsic);
@@ -355,6 +358,15 @@ public:
                                               llvm::Value *minor,
                                               llvm::Value *patch);
 
+  llvm::Value *emitTargetVariantOSVersionAtLeastCall(llvm::Value *major,
+                                                     llvm::Value *minor,
+                                                     llvm::Value *patch);
+
+  llvm::Value *emitTargetOSVersionOrVariantOSVersionAtLeastCall(
+      llvm::Value *major, llvm::Value *minor, llvm::Value *patch,
+      llvm::Value *variantMajor, llvm::Value *variantMinor,
+      llvm::Value *variantPatch);
+
   llvm::Value *emitProjectBoxCall(llvm::Value *box, llvm::Value *typeMetadata);
 
   llvm::Value *emitAllocEmptyBoxCall();
@@ -404,6 +416,12 @@ public:
   FunctionPointer emitValueWitnessFunctionRef(SILType type,
                                               llvm::Value *&metadataSlot,
                                               ValueWitness index);
+
+  void emitInitializeFieldOffsetVector(SILType T,
+                                       llvm::Value *metadata,
+                                       bool isVWTMutable,
+                                       MetadataDependencyCollector *collector);
+
 
   llvm::Value *optionallyLoadFromConditionalProtocolWitnessTable(
     llvm::Value *wtable);
@@ -573,7 +591,8 @@ public:
   void emitBlockRelease(llvm::Value *value);
 
   void emitForeignReferenceTypeLifetimeOperation(ValueDecl *fn,
-                                                 llvm::Value *value);
+                                                 llvm::Value *value,
+                                                 bool needsNullCheck = false);
 
   // Routines for an unknown reference-counting style (meaning,
   // dynamically something compatible with either the ObjC or Swift styles).
@@ -808,6 +827,21 @@ public:
   LocalTypeDataCache const *getLocalTypeData() { return LocalTypeData; }
 #endif
 
+  /// A forwardable argument is a load that is immediately preceeds the apply it
+  /// is used as argument to. If there is no side-effecting instructions between
+  /// said load and the apply, we can memcpy the loads address to the apply's
+  /// indirect argument alloca.
+  void clearForwardableArguments() {
+    forwardableArguments.clear();
+  }
+
+  void setForwardableArgument(unsigned idx) {
+    forwardableArguments.insert(idx);
+  }
+
+  bool isForwardableArgument(unsigned idx) const {
+    return forwardableArguments.contains(idx);
+  }
 private:
   LocalTypeDataCache &getOrCreateLocalTypeData();
   void destroyLocalTypeData();
@@ -826,6 +860,8 @@ private:
   CanType SelfType;
   bool SelfTypeIsExact = false;
   DynamicSelfKind SelfKind;
+
+  llvm::SmallSetVector<unsigned, 16> forwardableArguments;
 };
 
 using ConditionalDominanceScope = IRGenFunction::ConditionalDominanceScope;

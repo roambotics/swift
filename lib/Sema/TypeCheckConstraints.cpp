@@ -21,12 +21,14 @@
 #include "TypeChecker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DiagnosticSuppression.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/IDE/TypeCheckCompletionCallback.h"
 #include "swift/Sema/ConstraintSystem.h"
@@ -340,7 +342,6 @@ public:
     // We skip out-of-place expr checking here since we've already performed it.
     performSyntacticExprDiagnostics(expr, dcStack.back(), /*ctp*/ std::nullopt,
                                     /*isExprStmt=*/false,
-                                    /*disableAvailabilityChecking*/ false,
                                     /*disableOutOfPlaceExprChecking*/ true);
 
     if (auto closure = dyn_cast<ClosureExpr>(expr)) {
@@ -382,15 +383,14 @@ public:
 } // end anonymous namespace
 
 void constraints::performSyntacticDiagnosticsForTarget(
-    const SyntacticElementTarget &target, bool isExprStmt,
-    bool disableExprAvailabilityChecking) {
+    const SyntacticElementTarget &target, bool isExprStmt) {
   auto *dc = target.getDeclContext();
   switch (target.kind) {
   case SyntacticElementTarget::Kind::expression: {
     // First emit diagnostics for the main expression.
-    performSyntacticExprDiagnostics(
-        target.getAsExpr(), dc, target.getExprContextualTypePurpose(),
-        isExprStmt, disableExprAvailabilityChecking);
+    performSyntacticExprDiagnostics(target.getAsExpr(), dc,
+                                    target.getExprContextualTypePurpose(),
+                                    isExprStmt);
     return;
   }
 
@@ -399,8 +399,7 @@ void constraints::performSyntacticDiagnosticsForTarget(
 
     // First emit diagnostics for the main expression.
     performSyntacticExprDiagnostics(stmt->getTypeCheckedSequence(), dc,
-                                    CTP_ForEachSequence, isExprStmt,
-                                    disableExprAvailabilityChecking);
+                                    CTP_ForEachSequence, isExprStmt);
 
     if (auto *whereExpr = stmt->getWhere())
       performSyntacticExprDiagnostics(whereExpr, dc, CTP_Condition,
@@ -480,10 +479,8 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
 
   // First, pre-check the target, validating any types that occur in the
   // expression and folding sequence expressions.
-  if (ConstraintSystem::preCheckTarget(
-          target, /*replaceInvalidRefsWithErrors=*/true)) {
+  if (ConstraintSystem::preCheckTarget(target))
     return errorResult();
-  }
 
   // Check whether given target has a code completion token which requires
   // special handling. Returns true if handled, in which case we've already
@@ -543,9 +540,7 @@ TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
   // expression now.
   if (!cs.shouldSuppressDiagnostics()) {
     bool isExprStmt = options.contains(TypeCheckExprFlags::IsExprStmt);
-    performSyntacticDiagnosticsForTarget(
-        *resultTarget, isExprStmt,
-        options.contains(TypeCheckExprFlags::DisableExprAvailabilityChecking));
+    performSyntacticDiagnosticsForTarget(*resultTarget, isExprStmt);
   }
 
   return *resultTarget;
@@ -1068,22 +1063,8 @@ bool TypeChecker::typesSatisfyConstraint(Type type1, Type type2,
   }
 
   if (auto solution = cs.solveSingle()) {
-    const auto &score = solution->getFixedScore();
     if (unwrappedIUO)
-      *unwrappedIUO = score.Data[SK_ForceUnchecked] > 0;
-
-    // Make sure that Sendable vs. no-Sendable mismatches are
-    // failures here to establish subtyping relationship
-    // (unlike in the solver where they are warnings until Swift 6).
-    if (kind == ConstraintKind::Subtype) {
-      if (score.Data[SK_MissingSynthesizableConformance] > 0)
-        return false;
-
-      if (llvm::any_of(solution->Fixes, [](const auto *fix) {
-            return fix->getKind() == FixKind::AddSendableAttribute;
-          }))
-        return false;
-    }
+      *unwrappedIUO = solution->getFixedScore().Data[SK_ForceUnchecked] > 0;
 
     return true;
   }
@@ -1786,7 +1767,6 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
     return CheckedCastKind::BridgingCoercion;
   }
 
-  auto *module = dc->getParentModule();
   bool optionalToOptionalCast = false;
 
   // Local function to indicate failure.
@@ -2011,8 +1991,8 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
       auto archetype = toType->castTo<ArchetypeType>();
       conformsToAllProtocols = llvm::all_of(archetype->getConformsTo(),
         [&](ProtocolDecl *proto) {
-          return module->checkConformance(fromType, proto,
-                                          /*allowMissing=*/false);
+          return checkConformance(fromType, proto,
+                                  /*allowMissing=*/false);
         });
     }
 
@@ -2157,7 +2137,7 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
       constraint = existential->getConstraintType();
     if (auto *protocolDecl =
           dyn_cast_or_null<ProtocolDecl>(constraint->getAnyNominal())) {
-      if (!couldDynamicallyConformToProtocol(toType, protocolDecl, module)) {
+      if (!couldDynamicallyConformToProtocol(toType, protocolDecl)) {
         return failed();
       }
     } else if (auto protocolComposition =
@@ -2167,7 +2147,7 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
                          if (auto protocolDecl = dyn_cast_or_null<ProtocolDecl>(
                                  protocolType->getAnyNominal())) {
                            return !couldDynamicallyConformToProtocol(
-                               toType, protocolDecl, module);
+                               toType, protocolDecl);
                          }
                          return false;
                        })) {
@@ -2263,7 +2243,7 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
     auto nsErrorTy = Context.getNSErrorType();
 
     if (auto errorTypeProto = Context.getProtocol(KnownProtocolKind::Error)) {
-      if (module->checkConformance(toType, errorTypeProto)) {
+      if (checkConformance(toType, errorTypeProto)) {
         if (nsErrorTy) {
           if (isSubtypeOf(fromType, nsErrorTy, dc)
               // Don't mask "always true" warnings if NSError is cast to
@@ -2273,7 +2253,7 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
         }
       }
 
-      if (module->checkConformance(fromType, errorTypeProto)) {
+      if (checkConformance(fromType, errorTypeProto)) {
         // Cast of an error-conforming type to NSError or NSObject.
         if ((nsObject && toType->isEqual(nsObject)) ||
              (nsErrorTy && toType->isEqual(nsErrorTy)))
@@ -2331,6 +2311,10 @@ static Expr *lookThroughBridgeFromObjCCall(ASTContext &ctx, Expr *expr) {
 /// underlying forced downcast expression.
 ForcedCheckedCastExpr *swift::findForcedDowncast(ASTContext &ctx, Expr *expr) {
   expr = expr->getSemanticsProvidingExpr();
+
+  // Look through a consume, just in case.
+  if (auto consume = dyn_cast<ConsumeExpr>(expr))
+    expr = consume->getSubExpr();
   
   // Simple case: forced checked cast.
   if (auto forced = dyn_cast<ForcedCheckedCastExpr>(expr)) {
@@ -2380,6 +2364,18 @@ ForcedCheckedCastExpr *swift::findForcedDowncast(ASTContext &ctx, Expr *expr) {
   }
 
   return nullptr;
+}
+
+bool swift::canAddExplicitConsume(ModuleDecl *module, Expr *expr) {
+  expr = expr->getSemanticsProvidingExpr();
+
+  // Is it already wrapped in a `consume`?
+  if (isa<ConsumeExpr>(expr))
+    return false;
+
+  // Is this expression valid to wrap inside a `consume`?
+  auto diags = findSyntacticErrorForConsume(module, SourceLoc(), expr);
+  return diags.empty();
 }
 
 void ConstraintSystem::forEachExpr(

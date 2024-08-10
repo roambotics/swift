@@ -93,6 +93,9 @@ private func registerSwiftPasses() {
   registerPass(lifetimeDependenceDiagnosticsPass, { lifetimeDependenceDiagnosticsPass.run($0) })
   registerPass(lifetimeDependenceInsertionPass, { lifetimeDependenceInsertionPass.run($0) })
   registerPass(lifetimeDependenceScopeFixupPass, { lifetimeDependenceScopeFixupPass.run($0) })
+  registerPass(generalClosureSpecialization, { generalClosureSpecialization.run($0) })
+  registerPass(autodiffClosureSpecialization, { autodiffClosureSpecialization.run($0) })
+
   // Instruction passes
   registerForSILCombine(BeginCOWMutationInst.self, { run(BeginCOWMutationInst.self, $0) })
   registerForSILCombine(GlobalValueInst.self,      { run(GlobalValueInst.self, $0) })
@@ -107,6 +110,7 @@ private func registerSwiftPasses() {
   registerForSILCombine(DestructureTupleInst.self, { run(DestructureTupleInst.self, $0) })
 
   // Test passes
+  registerPass(aliasInfoDumper, { aliasInfoDumper.run($0) })
   registerPass(functionUsesDumper, { functionUsesDumper.run($0) })
   registerPass(silPrinterPass, { silPrinterPass.run($0) })
   registerPass(escapeInfoDumper, { escapeInfoDumper.run($0) })
@@ -117,6 +121,7 @@ private func registerSwiftPasses() {
   registerPass(rangeDumper, { rangeDumper.run($0) })
   registerPass(runUnitTests, { runUnitTests.run($0) })
   registerPass(testInstructionIteration, { testInstructionIteration.run($0) })
+  registerPass(updateBorrowedFromPass, { updateBorrowedFromPass.run($0) })
 }
 
 private func registerSwiftAnalyses() {
@@ -126,4 +131,5 @@ private func registerSwiftAnalyses() {
 
 private func registerUtilities() {
   registerVerifier()
+  registerBorrowedFromUpdater()
 }

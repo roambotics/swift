@@ -175,8 +175,8 @@ public:
     if (F->getExtFlags().isIsolatedAny()) {
       printField("isolated", "any");
     }
-    if (F->getExtFlags().hasTransferringResult()) {
-      printField("", "transferring-result");
+    if (F->getExtFlags().hasSendingResult()) {
+      printField("", "sending-result");
     }
 
     stream << "\n";
@@ -213,8 +213,8 @@ public:
       if (flags.isVariadic())
         printHeader("variadic");
 
-      if (flags.isTransferring())
-        printHeader("transferring");
+      if (flags.isSending())
+        printHeader("sending");
 
       printRec(param.getType());
 
@@ -698,8 +698,8 @@ public:
       if (flags.isIsolated()) {
         wrapInput(Node::Kind::Isolated);
       }
-      if (flags.isTransferring()) {
-        wrapInput(Node::Kind::Transferring);
+      if (flags.isSending()) {
+        wrapInput(Node::Kind::Sending);
       }
 
       inputs.push_back({input, flags.isVariadic()});
@@ -774,8 +774,8 @@ public:
     } else if (F->getExtFlags().isIsolatedAny()) {
       auto node = Dem.createNode(Node::Kind::IsolatedAnyFunctionType);
       funcNode->addChild(node, Dem);
-    } else if (F->getExtFlags().hasTransferringResult()) {
-      auto node = Dem.createNode(Node::Kind::TransferringResultFunctionType);
+    } else if (F->getExtFlags().hasSendingResult()) {
+      auto node = Dem.createNode(Node::Kind::SendingResultFunctionType);
       funcNode->addChild(node, Dem);
     }
 
@@ -895,7 +895,7 @@ public:
       node->addChild(MemberId, Dem);
     } else {
       // Otherwise, build up a DependentAssociatedTR node with
-      // the member Identifer and protocol
+      // the member Identifier and protocol
       auto AssocTy = Dem.createNode(Node::Kind::DependentAssociatedTypeRef);
       AssocTy->addChild(MemberId, Dem);
       auto Proto = Dem.demangleType(MangledProtocol);
@@ -1087,7 +1087,7 @@ unsigned NominalTypeTrait::getDepth() const {
   if (auto P = Parent) {
     switch (P->getKind()) {
     case TypeRefKind::Nominal:
-      return 1 + cast<NominalTypeRef>(P)->getDepth();
+      return cast<NominalTypeRef>(P)->getDepth();
     case TypeRefKind::BoundGeneric:
       return 1 + cast<BoundGenericTypeRef>(P)->getDepth();
     default:
